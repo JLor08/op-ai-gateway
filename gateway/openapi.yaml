@@ -1,0 +1,40 @@
+openapi: 3.1.0
+info:
+  title: OnPrem AI Gateway Management API
+  version: 0.1.0
+  license:
+    name: AGPL-3.0-only
+paths:
+  /healthz:
+    get:
+      summary: Service health
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /api/v1/status:
+    get:
+      summary: Gateway runtime status
+      responses:
+        '200':
+          description: Runtime configuration summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, upstreams]
+                properties:
+                  service:
+                    type: string
+                  upstreams:
+                    type: array
+                    items:
+                      type: string

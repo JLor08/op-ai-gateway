@@ -1,0 +1,8 @@
+:root { font-family: Inter, system-ui, sans-serif; color: #e8edf7; background: #101828; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+main { max-width: 760px; margin: 10vh auto; padding: 2rem; }
+.eyebrow { color: #7dd3fc; font-size: .75rem; font-weight: 700; letter-spacing: .12em; }
+h1 { font-size: clamp(2.4rem, 8vw, 5rem); margin: .2rem 0; }
+section { margin-top: 2rem; padding: 1.25rem; border: 1px solid #334155; border-radius: .75rem; background: #172033; }
+.error { margin-top: 2rem; color: #fca5a5; }
