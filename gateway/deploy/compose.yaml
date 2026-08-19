@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: ../backend
+    environment:
+      GATEWAY_LISTEN_ADDR: ":8080"
+      GATEWAY_UPSTREAMS: ${GATEWAY_UPSTREAMS:-http://host.docker.internal:11434/v1}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+    ports:
+      - "3000:8080"
+    depends_on:
+      - backend
+    restart: unless-stopped
