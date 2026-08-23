@@ -1,0 +1,20 @@
+{
+  "name": "Example",
+  "productName": "AI Gateway",
+  "font": "",
+  "brand": {
+    "type": "text",
+    "text": "Example",
+    "title": "AI Gateway"
+  },
+  "light": {
+    "brandPrimary": "#2563eb",
+    "brandAccent": "#1d4ed8",
+    "sidebarActive": "#2563eb"
+  },
+  "dark": {
+    "brandPrimary": "#60a5fa",
+    "brandAccent": "#3b82f6",
+    "sidebarActive": "#60a5fa"
+  }
+}

@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# One-shot cross-compiler for the server-agent. Bakes the agent module source and
+# runs build-agents.sh at container start, writing all target binaries + manifest.json
+# into the mounted /agents volume. Pinned to a specific PATCH release (>= the agent
+# module's go.mod `go 1.26`): the floating `golang:1.26` tag pulled go1.26.0, which
+# ICEs cross-compiling the std `bytes` package for windows/amd64 ("internal compiler
+# error: 'Replace': two final stores"). Pinning to a patched toolchain fixes it; bump
+# this when you want a newer Go, but never below 1.26.
+FROM golang:1.26.5
+WORKDIR /src
+# Dependency layer cached separately from the source. NOTE: no BuildKit cache
+# mount here — a cache mount is ephemeral and NOT baked into the image, which would
+# leave /go/pkg/mod empty at container RUN time and force the entrypoint's `go build`
+# to re-download every module (failing on an offline/proxied host). Baking the module
+# cache into the image layer keeps the runtime cross-compile fully offline.
+COPY server-agent/go.mod server-agent/go.sum ./
+RUN go mod download
+COPY server-agent/ ./
+COPY gateway/deploy/build-agents.sh /usr/local/bin/build-agents.sh
+RUN chmod +x /usr/local/bin/build-agents.sh
+ENV AGENT_SRC_DIR=/src AGENT_OUT_DIR=/agents
+ENTRYPOINT ["/usr/local/bin/build-agents.sh"]

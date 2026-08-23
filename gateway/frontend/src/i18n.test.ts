@@ -1,0 +1,1800 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+import { describe, expect, it } from 'vitest';
+import { messages } from './i18n';
+
+describe('activityNewRequests interpolation', () => {
+  it('uses singular for one and plural otherwise (de)', () => {
+    expect(messages.de.activityNewRequests(1)).toBe('1 neue Anfrage — aktualisieren');
+    expect(messages.de.activityNewRequests(5)).toBe('5 neue Anfragen — aktualisieren');
+  });
+
+  it('uses singular for one and plural otherwise (en)', () => {
+    expect(messages.en.activityNewRequests(1)).toBe('1 new request — refresh');
+    expect(messages.en.activityNewRequests(3)).toBe('3 new requests — refresh');
+  });
+});
+
+describe('capture-view i18n keys', () => {
+  it('defines all capture keys in de and en', () => {
+    const keys = [
+      'activityColView',
+      'captureDialogTitle',
+      'captureReqHeaders',
+      'captureReqBody',
+      'captureRespHeaders',
+      'captureRespBody',
+      'captureTranslatedReqTitle',
+      'captureTranslatedRespTitle',
+      'captureTranslatedNote',
+      'capturePretty',
+      'captureRaw',
+      'captureChat',
+      'captureCopy',
+      'captureTruncated',
+      'captureHeaderValue',
+      'captureHttpStatus',
+      'captureCreatedAt',
+      'captureClose',
+      'captureSecurityNote',
+      'captureDelete',
+      'captureDeleteConfirm',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('capture_enabled system-setting i18n keys', () => {
+  it('defines captureEnabledLabel and captureEnabledNote in de and en', () => {
+    const keys = ['captureEnabledLabel', 'captureEnabledNote'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('smtp system-setting i18n keys', () => {
+  it('defines the smtp panel + invite-email keys in de and en', () => {
+    const keys = [
+      'smtpTitle',
+      'smtpIntro',
+      'smtpEnabledLabel',
+      'smtpEnabledNote',
+      'smtpHostLabel',
+      'smtpPortLabel',
+      'smtpPortError',
+      'smtpUsernameLabel',
+      'smtpPasswordLabel',
+      'smtpPasswordSetPlaceholder',
+      'smtpPasswordNote',
+      'smtpPasswordClear',
+      'smtpFromLabel',
+      'smtpFromNameLabel',
+      'smtpTlsModeLabel',
+      'smtpTlsStartTls',
+      'smtpTlsSsl',
+      'smtpTlsNone',
+      'smtpTestButton',
+      'smtpTestToLabel',
+      'smtpTestSuccess',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('interpolates the function-typed smtp/invite keys', () => {
+    expect(messages.de.smtpTestError('x')).toBe('Testmail fehlgeschlagen: x');
+    expect(messages.de.smtpTestError('')).toBe('Testmail fehlgeschlagen.');
+    expect(messages.en.userInviteEmailSent('a@b.co')).toBe('Email sent to a@b.co.');
+    expect(messages.de.userInviteEmailFailed('boom')).toBe(
+      'E-Mail konnte nicht gesendet werden: boom',
+    );
+  });
+});
+
+describe('running-connections (active requests) i18n keys', () => {
+  it('defines the active-panel keys in de and en', () => {
+    const keys = [
+      'activityActiveTitle',
+      'activityActiveEmpty',
+      'activityActiveElapsed',
+      'activityActiveSession',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('activity time-series i18n keys', () => {
+  it('defines all time-series chart/control keys in de and en', () => {
+    const keys = [
+      'activityTsWindowLabel',
+      'activityTsBucketLabel',
+      'activityChartsTitle',
+      'activityChartsToggle',
+      'tsUnitMin',
+      'tsUnitHour',
+      'tsUnitDay',
+      'tsUnitDays',
+      'tsUnitWeek',
+      'tsUnitWeeks',
+      'tsUnitMonth',
+      'tsUnitMonths',
+      'tsUnitYear',
+      'tsUnitYears',
+      'activityTsConnections',
+      'activityTsConnectionsThroughput',
+      'activityTsConcurrency',
+      'activityTsPromptThroughput',
+      'activityTsCompletionThroughput',
+      'activityTsUnitReqPerSec',
+      'activityTsUnitTokPerSec',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+    }
+    // The labelled (non-unit) keys are always non-empty.
+    expect(messages.de.activityTsWindowLabel.length).toBeGreaterThan(0);
+    expect(messages.en.activityTsBucketLabel.length).toBeGreaterThan(0);
+    expect(messages.de.activityTsConnections.length).toBeGreaterThan(0);
+    expect(messages.en.activityTsCompletionThroughput.length).toBeGreaterThan(0);
+    expect(messages.de.activityTsUnitTokPerSec.length).toBeGreaterThan(0);
+  });
+});
+
+describe('server performance i18n keys', () => {
+  it('defines all performance view chart/control keys in de and en', () => {
+    const keys = [
+      'serverPerformance',
+      'serverPerfWindowLabel',
+      'serverPerfLive',
+      'serverPerfPaused',
+      'serverPerfPauseToggle',
+      'serverPerfNoAgent',
+      'serverPerfGpuUtil',
+      'serverPerfGpuVram',
+      'serverPerfGpuVramMb',
+      'serverPerfGpuTemp',
+      'serverPerfGpuPower',
+      'serverPerfCpu',
+      'serverPerfCpuCores',
+      'serverPerfCpuPower',
+      'serverPerfCpuTemp',
+      'serverPerfSystemPower',
+      'serverPerfMem',
+      'serverPerfLoad',
+      'serverPerfNet',
+      'serverPerfMemUsed',
+      'serverPerfSwapUsed',
+      'serverPerfLoad1',
+      'serverPerfLoad5',
+      'serverPerfLoad15',
+      'serverPerfNetRx',
+      'serverPerfNetTx',
+      'serverPerfTokThroughput',
+      'serverPerfUnitPct',
+      'serverPerfUnitCelsius',
+      'serverPerfUnitWatt',
+      'serverPerfUnitMb',
+      'serverPerfUnitBytesPerSec',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+    }
+    // The function-typed stale banner renders a numeric-interpolated string.
+    expect(typeof messages.de.serverPerfStale).toBe('function');
+    expect(typeof messages.en.serverPerfStale).toBe('function');
+    expect(messages.de.serverPerfStale(5).length).toBeGreaterThan(0);
+    expect(messages.en.serverPerfStale(5)).toContain('5');
+    // The labelled (non-unit) keys are always non-empty.
+    expect(messages.de.serverPerformance.length).toBeGreaterThan(0);
+    expect(messages.en.serverPerfGpuUtil.length).toBeGreaterThan(0);
+    expect(messages.de.serverPerfNoAgent.length).toBeGreaterThan(0);
+  });
+});
+
+describe('ChatSession row i18n keys', () => {
+  it('defines chatSessionName and chatSessionHint in de and en', () => {
+    const keys = ['chatSessionName', 'chatSessionHint'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('chat remember-unavailable-model i18n keys', () => {
+  it('defines chatModelUnavailable in de and en', () => {
+    const keys = ['chatModelUnavailable'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('activity stat-tile settings i18n keys', () => {
+  it('defines the tile settings-menu keys in de and en', () => {
+    const keys = ['activityTilesButton', 'activityTilesTitle'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('agent-token copy i18n key', () => {
+  it('defines agentTokenCopy in de and en', () => {
+    const keys = ['agentTokenCopy'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines the server-owner resource-group self-service keys in de and en', () => {
+    const keys = [
+      'serverResourceGroupsAction',
+      'serverResourceGroupsTitle',
+      'serverResourceGroupsColGroup',
+      'serverResourceGroupsColMember',
+      'serverResourceGroupsEmpty',
+      'serverResourceGroupsJoinError',
+      'serverResourceGroupsLeaveError',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('agent-binary download i18n keys', () => {
+  it('defines the download section + netbird agent-download-only keys in de and en', () => {
+    const keys = [
+      'agentDownloadHeading',
+      'agentDownloadEmpty',
+      'agentDownloadButton',
+      'agentDownloadVersion',
+      'agentDownloadChecksum',
+      'agentDownloadSelectSystem',
+      'agentDownloadCopyCurl',
+      'agentDownloadMeshNote',
+      'agentDownloadConfig',
+      'settingsNetbirdAgentDownloadOnly',
+      'settingsNetbirdAgentDownloadOnlyHint',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('server override i18n keys', () => {
+  it('defines the picker/force/hint + error-code keys in de and en', () => {
+    const keys = [
+      'serverOverrideLabel',
+      'serverOverrideNote',
+      'serverOverrideNone',
+      'serverOverrideForceLabel',
+      'serverOverrideForceHelp',
+      'serverOverrideFilteredHint',
+      'serverOverrideLockedHint',
+      'errorServerOverrideForbidden',
+      'errorServerOverrideServerUnavailable',
+      'errorServerOverrideModelUnavailable',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('token rotate i18n keys', () => {
+  it('defines the rotate keys in de and en', () => {
+    const keys = [
+      'tokenActionRotate',
+      'tokenRotateConfirmTitle',
+      'tokenRotateConfirmBody',
+      'tokenRotateConfirm',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('uses the agreed rotate copy', () => {
+    expect(messages.de.tokenActionRotate).toBe('Neu erzeugen');
+    expect(messages.en.tokenActionRotate).toBe('Regenerate');
+    expect(messages.de.tokenRotateConfirmTitle).toBe('Token neu erzeugen?');
+    expect(messages.en.tokenRotateConfirmTitle).toBe('Regenerate token?');
+    expect(messages.de.tokenRotateConfirmBody).toBe(
+      'Der bisherige Token wird sofort ungültig. Ein neuer Token wird erzeugt und einmalig angezeigt.',
+    );
+    expect(messages.en.tokenRotateConfirmBody).toBe(
+      'The current token is invalidated immediately. A new token is generated and shown once.',
+    );
+    expect(messages.de.tokenRotateConfirm).toBe('Neu erzeugen');
+    expect(messages.en.tokenRotateConfirm).toBe('Regenerate');
+  });
+});
+
+describe('activity user-column label (Besitzer -> Benutzer)', () => {
+  it('labels the Activity user column as Benutzer/User, not Besitzer/Owner', () => {
+    expect(messages.de.activityColOwner).toBe('Benutzer');
+    expect(messages.en.activityColOwner).toBe('User');
+    expect(messages.de.activityOwnerDisplayLabel).toBe('Benutzer anzeigen');
+    expect(messages.en.activityOwnerDisplayLabel).toBe('User display');
+  });
+
+  it('leaves the AI-Server owner strings unchanged', () => {
+    expect(messages.de.serverOwnersLabel).toBe('Besitzer');
+    expect(messages.de.tableOwners).toBe('Besitzer');
+    expect(messages.de.errorServerOwnerInvalid).toBe('Ungültiger Besitzer');
+  });
+});
+
+describe('invite copy i18n key', () => {
+  it('defines userInviteCopy in de and en with the contract values', () => {
+    expect(messages.de.userInviteCopy).toBe('Einladungslink kopieren');
+    expect(messages.en.userInviteCopy).toBe('Copy invite link');
+  });
+});
+
+describe('activity user/token filter i18n keys', () => {
+  it('defines the filter keys in de and en', () => {
+    const keys = [
+      'activityScopeSpecificUser',
+      'activityUserFilterLabel',
+      'activityTokenFilterLabel',
+      'activityFilterAll',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.activityScopeSpecificUser).toBe('Bestimmter Nutzer');
+    expect(messages.en.activityScopeSpecificUser).toBe('Specific user');
+  });
+});
+
+describe('activity group-by i18n keys', () => {
+  it('defines the group-by keys in de and en', () => {
+    const keys = [
+      'activityGroupBy',
+      'activityGroupAddLevel',
+      'activityGroupRemoveLevel',
+      'activityGroupClear',
+      'activityGroupNone',
+      'activityGroupSession',
+      'activityGroupServer',
+      'activityGroupUser',
+      'activityGroupToken',
+      'activityGroupModel',
+      'activityGroupService',
+      'activityGroupProject',
+      'activityGroupCount',
+      'activityGroupSpan',
+      'activityGroupTokenNone',
+      'activityGroupServiceNone',
+      'activityGroupProjectNone',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.activityGroupBy).toBe('Gruppieren nach');
+    expect(messages.en.activityGroupBy).toBe('Group by');
+    expect(messages.de.activityGroupTokenNone).toBe('(Sitzung)');
+    expect(messages.en.activityGroupTokenNone).toBe('(Session)');
+  });
+});
+
+describe('activity custom time-range i18n keys', () => {
+  it('defines the custom-range keys in de and en', () => {
+    const keys = ['activityRangeCustom', 'activityRangeFrom', 'activityRangeTo'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.activityRangeCustom).toBe('Benutzerdefiniert');
+    expect(messages.en.activityRangeCustom).toBe('Custom');
+  });
+});
+
+describe('totp 2fa i18n keys', () => {
+  it('defines all totp keys in de and en', () => {
+    const keys = [
+      'totpTitle',
+      'totpIntro',
+      'totpStatusEnabled',
+      'totpStatusDisabled',
+      'totpEnrollButton',
+      'totpEnrollScanHint',
+      'totpSecretLabel',
+      'totpQrAlt',
+      'totpCodeLabel',
+      'totpConfirmButton',
+      'totpConfirmSuccess',
+      'totpCopySecret',
+      'totpDisableButton',
+      'totpDisableTitle',
+      'totpDisableHint',
+      'totpDisableSuccess',
+      'loginTotpTitle',
+      'loginTotpIntro',
+      'loginTotpEnrollTitle',
+      'loginVerifyButton',
+      'totpModeLabel',
+      'totpModeNote',
+      'totpModeOff',
+      'totpModeOptional',
+      'totpModeRequired',
+      'settingsVisionSectionTitle',
+      'settingsVisionProbeMode',
+      'settingsVisionProbeModeAccept',
+      'settingsVisionProbeModeVerify',
+      'settingsEnergyTitle',
+      'settingsEnergyPricePerKwh',
+      'settingsEnergyPue',
+      'settingsEnergyWhPerToken',
+      'systemCurrencyFactor',
+      'systemCurrencyFactorHelp',
+      'userActionResetTotp',
+      'userResetTotpConfirmTitle',
+      'userResetTotpConfirmBody',
+      'userResetTotpConfirm',
+      'userResetTotpSuccess',
+      'errorAuthTotpInvalid',
+      'errorTotpInvalidCode',
+      'errorTotpDisableForbidden',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.totpModeRequired).toBe('Erforderlich');
+    expect(messages.en.userActionResetTotp).toBe('Reset TOTP');
+  });
+});
+
+describe('logs view i18n keys', () => {
+  it('defines all logs view/nav keys in de and en', () => {
+    const keys = [
+      'logsNav',
+      'logsTitle',
+      'logsLevelLabel',
+      'logsLevelTrace',
+      'logsLevelDebug',
+      'logsLevelInfo',
+      'logsLevelWarn',
+      'logsLevelError',
+      'logsPause',
+      'logsLive',
+      'logsClear',
+      'logsEmpty',
+      'logsColTime',
+      'logsColLevel',
+      'logsColMsg',
+      'logsTracingLabel',
+      'logsTracingHelp',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.logsLevelLabel).toBe('Loglevel');
+    expect(messages.de.logsEmpty).toBe('Noch keine Logs.');
+  });
+});
+
+describe('model-mapping performance-metric i18n keys', () => {
+  it('defines the mapping metric form/list keys in de and en', () => {
+    const keys = [
+      'mappingMetricsSection',
+      'mappingMetricsHint',
+      'mappingContextSize',
+      'mappingEnergyWhPerToken',
+      'mappingGenTokensPerSecond',
+      'mappingPromptTokensPerSecond',
+      'mappingLoadTimeMs',
+      'mappingIsMtp',
+      'mappingVisionCapable',
+      'mappingMetricsLocked',
+      'mappingMaxConcurrency',
+      'mappingRecommendedConcurrency',
+      'mappingGenTpsAtCapacity',
+      'mappingProbeContext',
+      'mappingProbeContextRunning',
+      'mappingProbeContextFailed',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.mappingContextSize).toBe('Kontextgröße');
+    expect(messages.en.mappingContextSize).toBe('Context size');
+  });
+});
+
+describe('admission-queue timeout i18n keys', () => {
+  it('defines the admission-queue timeout field keys in de and en', () => {
+    const keys = [
+      'applicationAdmissionQueueTimeout',
+      'applicationAdmissionQueueTimeoutHelp',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('benchmark i18n keys', () => {
+  it('defines the benchmark button/status + error-code keys in de and en', () => {
+    const keys = [
+      'runBenchmark',
+      'benchmarkAll',
+      'benchmarking',
+      'benchmarkDone',
+      'benchmarkFailed',
+      'benchmarkLive',
+      'benchmarkProgress',
+      'benchmarkHistory',
+      'benchmarkHistoryEmpty',
+      'benchmarkRunAt',
+      'errorBenchmarkAlreadyRunning',
+      'errorBenchmarkServerInUse',
+      'errorBenchmarkNoModels',
+      'benchmarkArea',
+      'benchmarkScope',
+      'benchmarkScopeServer',
+      'benchmarkScopeApplication',
+      'benchmarkScopeMapping',
+      'benchmarkType',
+      'benchmarkTypeSpeed',
+      'benchmarkTypeCapacity',
+      'benchmarkTypeBoth',
+      'benchmarkTypeVision',
+      'benchmarkStart',
+      'benchmarkServerBusy',
+      'benchmarkRunning',
+      'benchmarkLastCompleted',
+      'modelServerTitle',
+      'modelServerColServer',
+      'modelServerColPrio',
+      'modelServerColModel',
+      'groupServersIntro',
+      'modelServerNotLoaded',
+      'modelServerSource',
+      'modelServerUpdated',
+      'modelServerLoad',
+      'modelServerLoadDisabledPerm',
+      'modelServerLoadDisabledLoaded',
+      'modelServerLoadDisabledBusy',
+      'modelServerLoadStarted',
+      'modelServerLoadSuccess',
+      'modelServerLoadError',
+      'modelServerBusy',
+      'modelServerAlreadyRunning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.benchmarkAll).toBe('Alle benchmarken');
+    expect(messages.en.benchmarkAll).toBe('Benchmark all');
+  });
+});
+
+describe('capacity-benchmark i18n keys', () => {
+  it('defines all capacity keys in de and en', () => {
+    const keys = [
+      'runCapacityBenchmark',
+      'benchmarkCapacityAll',
+      'benchmarkCurrentConcurrency',
+      'benchmarkMaxConcurrency',
+      'benchmarkRecommendedConcurrency',
+      'benchmarkGenTpsAtCapacity',
+      'benchmarkVision',
+      'benchmarkCapacityRuns',
+      'benchmarkVisionRuns',
+      'benchmarkMemoryObserved',
+      'benchmarkColConcurrency',
+      'benchmarkColAggregateTps',
+      'benchmarkColLatency',
+      'benchmarkColErrors',
+      'benchmarkLevelStop',
+    ] as const;
+    for (const k of keys) {
+      expect(messages.de[k]).toBeTruthy();
+      expect(messages.en[k]).toBeTruthy();
+    }
+  });
+});
+
+describe('loaded-model i18n keys', () => {
+  it('defines the loaded-model table/chat/application keys in de and en', () => {
+    const keys = [
+      'tableModelLoaded',
+      'tableModelOffered',
+      'tableModelVision',
+      'tableModelType',
+      'chatModelLoaded',
+      'chatModelLoadedOn',
+      'chatImageModelUnsupported',
+      'applicationLoadedModelsLegend',
+      'applicationLoadedModelsPath',
+      'applicationLoadedModelsFormat',
+      'applicationLoadedModelsNote',
+      'applicationLoadedFormatAuto',
+      'applicationLoadedFormatOpenai',
+      'applicationLoadedFormatLlamaSwap',
+      'applicationLoadedFormatLlamaCpp',
+      'applicationLoadedFormatLitellm',
+      'applicationContextProbePath',
+      'applicationContextProbePathHelp',
+      'applicationContextProbeNote',
+      'applicationMetricsLegend',
+      'applicationScheduledBenchmark',
+      'applicationScheduledBenchmarkIntervalLabel',
+      'applicationOpportunisticMetrics',
+      'applicationMetricsNote',
+      'serverPathSuffixLabel',
+      'serverPathSuffixHelp',
+      'serverAdminGroupLabel',
+      'serverAdminGroupSystemGroupLabel',
+      'serverNoAdminGroupHint',
+      'serverAdminGroupsSectionTitle',
+      'serverAdminGroupsSave',
+      'serverAdminGroupsSaved',
+      'serverEnergySection',
+      'serverEnergySectionIntro',
+      'serverEnergySave',
+      'serverEnergySaved',
+      'serverEstimatedWatts',
+      'serverEstimatedWattsHelp',
+      'serverIdleWatts',
+      'serverIdleWattsHelp',
+      'serverPricePerKwh',
+      'priceUnitLabel',
+      'serverPue',
+      'serverPueHelp',
+      'applicationPathSuffixLabel',
+      'applicationApiTokenLabel',
+      'applicationApiTokenNote',
+      'applicationApiTokenSetPlaceholder',
+      'applicationApiTokenClear',
+      'applicationApiTokenHeaderLabel',
+      'applicationApiTokenHeaderHelp',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.tableModelLoaded).toBe('Geladen');
+    expect(messages.en.tableModelLoaded).toBe('Loaded');
+    // Both admin-group auto-note keys (Phase B, spec 2026-08-10) are
+    // interpolating functions (like serverNetbirdPeerDomainHint), not plain
+    // strings.
+    expect(typeof messages.de.serverAdminGroupAuto).toBe('function');
+    expect(typeof messages.en.serverAdminGroupAuto).toBe('function');
+    expect(messages.de.serverAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(messages.en.serverAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(typeof messages.de.serverAdminGroupSystemGroupAuto).toBe('function');
+    expect(typeof messages.en.serverAdminGroupSystemGroupAuto).toBe('function');
+    expect(messages.de.serverAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+    expect(messages.en.serverAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+  });
+});
+
+describe('netbird enhancement i18n keys', () => {
+  it('defines the enroll + linkage-editor keys in de and en', () => {
+    const keys = [
+      'serverNetbirdEnroll',
+      'serverNetbirdLinkTitle',
+      'serverNetbirdEnabledLabel',
+      'serverNetbirdPeerId',
+      'serverNetbirdGroupId',
+      'serverNetbirdGroups',
+      'serverNetbirdGroupsUnenrolled',
+      'serverNetbirdSetupKeyId',
+      'serverNetbirdLinkSave',
+      'serverNetbirdLinkSaved',
+      'serverNetbirdPeerPick',
+      'serverNetbirdPeerInUse',
+      'serverNetbirdPeerLinked',
+      'serverNetbirdDeletePeer',
+      'serverNetbirdPeerDeleteWarning',
+      'serverNetbirdSetupCommand',
+      'serverNetbirdPeerManagedLabel',
+      'serverNetbirdPeerManagedHelp',
+      'serverNetbirdPeerNotManaged',
+      'serverNetbirdPolicyExclude',
+      'serverNetbirdPolicyExcludeHelp',
+      'serverNetbirdPolicyInclude',
+      'serverNetbirdPolicyIncludeHelp',
+      'serverNetbirdPolicyForcedNote',
+      'serverNetbirdPolicyPrecheckNote',
+      'serverNetbirdPolicyOptOutDenyNote',
+      'serverNetbirdOnlyPolicyWarning',
+      'serverNetbirdOnlyForcedNote',
+      'serverNetbirdOnlyPrecheckWarning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.serverNetbirdLinkTitle).toBe('NetBird-Verknüpfung');
+    expect(messages.en.serverNetbirdEnroll).toBe('NetBird enrollment (setup key)');
+    // The domain hint is an interpolating function (like serverNetbirdError).
+    expect(typeof messages.de.serverNetbirdPeerDomainHint).toBe('function');
+    expect(typeof messages.en.serverNetbirdPeerDomainHint).toBe('function');
+    expect(messages.de.serverNetbirdPeerDomainHint('host.netbird.io')).toContain('host.netbird.io');
+    expect(messages.en.serverNetbirdPeerDomainHint('host.netbird.io')).toContain('host.netbird.io');
+  });
+});
+
+describe('netbird-only transport settings i18n keys', () => {
+  it('defines the netbird_only toggle + gateway-peer + status keys in de and en', () => {
+    const keys = [
+      'settingsNetbirdOnly',
+      'settingsNetbirdOnlyHelp',
+      'settingsNetbirdGatewayPeer',
+      'settingsNetbirdGatewayPeerRestartHelp',
+      'settingsNetbirdGatewayPeerName',
+      'settingsNetbirdGatewayPeerNameHelp',
+      'settingsNetbirdOnlyNoListenerWarning',
+      'settingsNetbirdStatusTitle',
+      'settingsNetbirdListenerInactive',
+      'settingsNetbirdGatewayPeerConnected',
+      'settingsNetbirdGatewayPeerDisconnected',
+      'settingsNetbirdGatewayKeyCreate',
+      'settingsNetbirdGatewayKeyTitle',
+      'settingsNetbirdGatewayKeyHelp',
+      'settingsNetbirdSidecarEnroll',
+      'settingsNetbirdSidecarEnrolled',
+      'settingsNetbirdSidecarNoKeyFile',
+      'settingsNetbirdReenrollConfirmTitle',
+      'settingsNetbirdReenrollConfirmBody',
+      'settingsNetbirdReenrollConfirmAction',
+      'settingsNetbirdGatewayPeerChangeConfirmTitle',
+      'settingsNetbirdGatewayPeerChangeConfirmBody',
+      'settingsNetbirdGatewayPeerChangeConfirmAction',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    // The listener-active label interpolates the bind address (like serverNetbirdError).
+    expect(typeof messages.de.settingsNetbirdListenerActive).toBe('function');
+    expect(typeof messages.en.settingsNetbirdListenerActive).toBe('function');
+    expect(messages.de.settingsNetbirdListenerActive('100.1.2.3:8081')).toContain('100.1.2.3:8081');
+    expect(messages.en.settingsNetbirdListenerActive('100.1.2.3:8081')).toContain('100.1.2.3:8081');
+  });
+});
+
+describe('model-groups + visibility i18n keys', () => {
+  it('defines the group-management + model-visibility keys in de and en', () => {
+    const keys = [
+      'modelGroups',
+      'modelGroupCreate',
+      'modelGroupEditTitle',
+      'modelGroupGatewayName',
+      'modelGroupDisplayName',
+      'modelGroupStatus',
+      'modelGroupMode',
+      'modelGroupModeSticky',
+      'modelGroupModeClimb',
+      'modelGroupModeHelp',
+      'modelGroupMembers',
+      'modelGroupAddMember',
+      'modelGroupMemberCount',
+      'modelGroupEdit',
+      'modelGroupDelete',
+      'modelGroupDeleteConfirm',
+      'modelGroupSave',
+      'modelGroupCancel',
+      'modelGroupEmpty',
+      'modelGroupNameConflict',
+      'modelGroupMoveUp',
+      'modelGroupMoveDown',
+      'modelGroupRemoveMember',
+      'modelGroupChip',
+      'modelGroupTraversal',
+      'modelGroupTraversalDepth',
+      'modelGroupTraversalBreadth',
+      'modelGroupTraversalRoundRobin',
+      'modelGroupTraversalHelp',
+      'modelGroupCycleError',
+      'modelVisibility',
+      'modelVisibilityShown',
+      'modelVisibilityHidden',
+      'modelVisibilityLocked',
+      'modelVisibilityHelp',
+      'modelsIntro',
+      'modelsEmpty',
+      'modelDetailsAction',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.modelGroups).toBe('Modellgruppen');
+    expect(messages.en.modelGroups).toBe('Model groups');
+    expect(messages.de.modelVisibilityLocked).toBe('Gesperrt');
+    expect(messages.en.modelVisibilityLocked).toBe('Locked');
+  });
+});
+
+describe('netbird policy management settings i18n keys', () => {
+  it('defines the manage-policies + scope + deny-by-default + interval keys in de and en', () => {
+    const keys = [
+      'settingsNetbirdManagePolicies',
+      'settingsNetbirdManagePoliciesHelp',
+      'settingsNetbirdPolicyScope',
+      'settingsNetbirdPolicyScopeAuto',
+      'settingsNetbirdPolicyScopeAll',
+      'settingsNetbirdPolicyScopeSelected',
+      'settingsNetbirdDenyByDefault',
+      'settingsNetbirdDenyByDefaultHelp',
+      'settingsNetbirdDenyByDefaultWarn',
+      'settingsNetbirdDenyEnforce',
+      'settingsNetbirdDenyEnforceHelp',
+      'settingsNetbirdPeerInterval',
+      'settingsNetbirdPeerIntervalHelp',
+      'settingsNetbirdReconcileInterval',
+      'settingsNetbirdReconcileIntervalHelp',
+      'settingsNetbirdIntervalError',
+      'settingsNetbirdIntervalOrder',
+      'settingsNetbirdPolicyCouplingWarn',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    // The effective-scope hint is an interpolating function (like serverNetbirdError).
+    expect(typeof messages.de.settingsNetbirdPolicyScopeEffective).toBe('function');
+    expect(typeof messages.en.settingsNetbirdPolicyScopeEffective).toBe('function');
+    expect(messages.de.settingsNetbirdPolicyScopeEffective('Alle')).toContain('Alle');
+    expect(messages.en.settingsNetbirdPolicyScopeEffective('All')).toContain('All');
+  });
+});
+
+describe('netbird ping-allow settings + ping action i18n keys', () => {
+  it('defines the ping-allow toggles + per-server label + ping action keys in de and en', () => {
+    const keys = [
+      'settingsNetbirdAllowPingGateway',
+      'settingsNetbirdAllowPingGatewayHelp',
+      'settingsNetbirdAllowPingAllServers',
+      'settingsNetbirdAllowPingAllServersHelp',
+      'serverNetbirdAllowPing',
+      'serverNetbirdPingExclude',
+      'settingsPingTitle',
+      'settingsPingServerLabel',
+      'settingsPingButton',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    // The ping result strings are interpolating functions (like settingsNetbirdTestFailed).
+    expect(typeof messages.de.settingsPingOk).toBe('function');
+    expect(typeof messages.en.settingsPingOk).toBe('function');
+    expect(messages.de.settingsPingOk(12)).toContain('12');
+    expect(messages.en.settingsPingOk(12)).toContain('12');
+    expect(typeof messages.de.settingsPingFailed).toBe('function');
+    expect(typeof messages.en.settingsPingFailed).toBe('function');
+    expect(messages.de.settingsPingFailed('boom')).toContain('boom');
+    expect(messages.en.settingsPingFailed('boom')).toContain('boom');
+  });
+});
+
+describe('netbird token-rotation i18n keys', () => {
+  it('defines the token validity + rotate-button + threshold-field keys in de and en', () => {
+    const keys = [
+      'settingsNetbirdTokenValidUnknown',
+      'settingsNetbirdTokenRotateBefore',
+      'settingsNetbirdTokenRotateBeforeHelp',
+      'settingsNetbirdRotate',
+      'settingsNetbirdRotateConfirmTitle',
+      'settingsNetbirdRotateConfirmBody',
+      'settingsNetbirdRotateConfirmAction',
+      'settingsNetbirdRotateOldDeleted',
+      'settingsNetbirdRotateOldUnknown',
+      'settingsNetbirdRotateFailed',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    // The validity line + rotation-result strings interpolate the expiry date +
+    // remaining days (like settingsNetbirdListenerActive).
+    expect(typeof messages.de.settingsNetbirdTokenValid).toBe('function');
+    expect(typeof messages.en.settingsNetbirdTokenValid).toBe('function');
+    expect(messages.de.settingsNetbirdTokenValid('2027-01-01', 30)).toContain('2027-01-01');
+    expect(messages.de.settingsNetbirdTokenValid('2027-01-01', 30)).toContain('30');
+    expect(messages.en.settingsNetbirdTokenValid('2027-01-01', 30)).toContain('2027-01-01');
+    expect(messages.en.settingsNetbirdTokenValid('2027-01-01', 30)).toContain('30');
+    expect(typeof messages.de.settingsNetbirdRotateOk).toBe('function');
+    expect(typeof messages.en.settingsNetbirdRotateOk).toBe('function');
+    expect(messages.de.settingsNetbirdRotateOk('2027-01-01', 30)).toContain('2027-01-01');
+    expect(messages.en.settingsNetbirdRotateOk('2027-01-01', 30)).toContain('30');
+  });
+
+  it('defines the NetBird-settings restructure keys (sections + Network panel) in de and en', () => {
+    const keys = [
+      'settingsNetbirdSectionAdmin',
+      'settingsNetbirdSectionNetwork',
+      'settingsNetbirdSectionPeer',
+      'settingsNetbirdSectionPolicies',
+      'settingsNetbirdSectionNetworkIntro',
+      'settingsNetbirdDnsDomain',
+      'settingsNetbirdNetworkRange',
+      'settingsNetbirdNetworkRangeV6',
+      'settingsNetbirdIPv6Groups',
+      'settingsNetbirdIPv6GroupsHelp',
+      'settingsNetbirdNetworkSaved',
+      'settingsNetbirdNetworkRangeInvalid',
+      'settingsNetbirdNetworkSaveConfirmTitle',
+      'settingsNetbirdNetworkSaveConfirmBody',
+      'settingsNetbirdNetworkSaveConfirmAction',
+      'settingsNetbirdTestSaveConfirmTitle',
+      'settingsNetbirdTestSaveConfirmBody',
+      'settingsNetbirdTestSaveConfirmAction',
+      'settingsNetbirdAdminRequired',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('server availability i18n keys', () => {
+  it('defines all availability view keys in de and en', () => {
+    const keys = [
+      'serverAvailability',
+      'availabilityHealthTimeline',
+      'availabilityAgentTimeline',
+      'availabilityUptimeChart',
+      'availabilityAgentChart',
+      'availabilityNoData',
+      'availabilityStateHealthy',
+      'availabilityStateDegraded',
+      'availabilityStateUnhealthy',
+      'availabilityStateUnknown',
+      'availabilityStatePresent',
+      'availabilityStateAbsent',
+      'availabilityNetbirdTimeline',
+      'availabilityNetbirdChart',
+      'availabilityStateConnected',
+      'availabilityStateDisconnected',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+    }
+    expect(typeof messages.de.availabilityUptimeSummary).toBe('function');
+    expect(messages.en.availabilityUptimeSummary('99.4 %')).toContain('99.4');
+    expect(typeof messages.de.availabilityNetbirdSummary).toBe('function');
+    expect(messages.en.availabilityNetbirdSummary('88.8 %')).toContain('88.8');
+  });
+});
+
+describe('server hardware i18n keys', () => {
+  it('defines all hardware view keys in de and en', () => {
+    const keys = [
+      'serverHardware',
+      'hardwareNoReport',
+      'hardwareCollectedAt',
+      'hardwareSystem',
+      'hardwareCpu',
+      'hardwareMemory',
+      'hardwareMainboard',
+      'hardwareBios',
+      'hardwareGpus',
+      'hardwareOs',
+      'hardwareKernel',
+      'hardwareArch',
+      'hardwareHostname',
+      'hardwareAgentVersion',
+      'hardwareCpuModel',
+      'hardwareCpuVendor',
+      'hardwareCpuCores',
+      'hardwareCpuThreads',
+      'hardwareBaseClock',
+      'hardwareRamTotal',
+      'hardwareNoModules',
+      'hardwareDimmLocator',
+      'hardwareDimmSize',
+      'hardwareDimmType',
+      'hardwareDimmSpeed',
+      'hardwareVendor',
+      'hardwareProduct',
+      'hardwareVersion',
+      'hardwareGpuIndex',
+      'hardwareGpuName',
+      'hardwareGpuVram',
+      'hardwareGpuDriver',
+      'hardwareGpuUuid',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+    }
+  });
+});
+
+describe('agent-presence-timeout + Agent column i18n keys', () => {
+  it('defines the column + status + system-field + per-server-field keys in de and en', () => {
+    const keys = [
+      'tableAgent',
+      'agentStatusActive',
+      'agentStatusInactive',
+      'agentStatusUnconfigured',
+      'settingsAgentPresenceTimeoutLabel',
+      'settingsAgentPresenceTimeoutNote',
+      'settingsAgentPresenceTimeoutError',
+      'serverAgentPresenceTimeoutLabel',
+      'serverAgentPresenceTimeoutDefault',
+      'serverAgentPresenceTimeoutCustom',
+      'serverAgentPresenceTimeoutSecondsLabel',
+      'serverAgentPresenceTimeoutNote',
+      'serverAgentPresenceTimeoutCurrent',
+      'serverAgentPresenceTimeoutSaved',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.tableAgent).toBe('Agent');
+    expect(messages.de.agentStatusActive).toBe('Aktiv');
+    expect(messages.de.agentStatusInactive).toBe('Inaktiv');
+    expect(messages.de.agentStatusUnconfigured).toBe('Kein Agent');
+    expect(messages.en.agentStatusUnconfigured).toBe('No agent');
+  });
+});
+
+describe('activity session-id i18n keys', () => {
+  it('defines the session + agent column keys in de and en', () => {
+    const keys = ['activityColSession', 'activityColAgent'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('activity service dimension i18n keys (Phase 1 service accounts)', () => {
+  it('defines the service column + group-by-empty-key keys in de and en', () => {
+    const keys = ['activityColService', 'activityGroupServiceNone'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.activityColService).toBe('Dienst');
+    expect(messages.en.activityColService).toBe('Service');
+  });
+});
+
+describe('route affinity + chat-id i18n keys', () => {
+  it('defines the affinity-mode setting + copy-chat-id keys in de and en', () => {
+    const keys = [
+      'chatCopyId',
+      'settingsRouteAffinityTitle',
+      'settingsRouteAffinityModeLabel',
+      'settingsRouteAffinityModeNote',
+      'settingsRouteAffinityModeClient',
+      'settingsRouteAffinityModeLegacy',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('energy-attribution Activity column i18n keys', () => {
+  it('defines the energy column keys in de and en', () => {
+    const keys = [
+      'activityColEnergyWh',
+      'activityColEnergyMarginalWh',
+      'activityColEnergySource',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('energy attribution P3 T2 (cost column + tiles + chart) i18n keys', () => {
+  it('defines the cost column + energy/cost tile + energy chart keys in de and en', () => {
+    const keys = [
+      'activityColCostEur',
+      'activityEnergyTile',
+      'activityCostTile',
+      'activityEnergyChart',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.activityColCostEur).toBe('Kosten');
+    expect(messages.en.activityColCostEur).toBe('Cost');
+  });
+});
+
+describe('currency unit selector i18n keys', () => {
+  it('defines the cost-unit selector + currency-unit option labels in de and en', () => {
+    const keys = [
+      'activityCostUnit',
+      'currencyUnitEur',
+      'currencyUnitEurCent',
+      'currencyUnitUsd',
+      'currencyUnitUsdCent',
+      'priceUnitLabel',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.currencyUnitEur).toBe('Euro (€)');
+    expect(messages.en.currencyUnitEur).toBe('Euro (€)');
+  });
+});
+
+describe('Service Accounts (Phase 1) i18n keys', () => {
+  it('defines the services nav/list/detail/token-management keys in de and en', () => {
+    const keys = [
+      'services',
+      'servicesIntro',
+      'serviceListTitle',
+      'serviceCreate',
+      'serviceColTokenCount',
+      'serviceColDelegates',
+      'serviceNameLabel',
+      'serviceDescriptionLabel',
+      'serviceStatusLabel',
+      'serviceAllowedModelsLabel',
+      'serviceAllowedModelsHelp',
+      'serviceDelegatesLabel',
+      'serviceDelegatesFullGroup',
+      'serviceDelegatesFullHelp',
+      'serviceDelegatesTokenGroup',
+      'serviceDelegatesTokenHelp',
+      'serviceDelegatesAddLabel',
+      'serviceDelegatesAdd',
+      'serviceDelegatesEmpty',
+      'serviceDelegatesRemove',
+      'serviceSettingsTitle',
+      'serviceSettingsReadOnlyNote',
+      'serviceActionDelete',
+      'serviceDeleteConfirm',
+      'serviceTokensTitle',
+      'serviceTokensIntro',
+      'serviceTokenCreate',
+      'serviceTokenColPrefix',
+      'serviceTokenColExpires',
+      'serviceTokenColLastUsed',
+      'serviceTokenCurlLabel',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    // de/en asymmetric on purpose (per the design's naming decision — "Delegierte",
+    // not "Eigentümer"/"Owner", since a service is delegated, not owned).
+    expect(messages.de.serviceDelegatesLabel).toBe('Delegierte');
+    expect(messages.en.serviceDelegatesLabel).toBe('Delegates');
+  });
+});
+
+describe('Principal Limits (Phase 2) i18n keys', () => {
+  it('defines the shared LimitsEditor + user-limits + error-code keys in de and en', () => {
+    const keys = [
+      'limitsTitle',
+      'limitsSubtitle',
+      'limitRateTitle',
+      'limitRateRequestsLabel',
+      'limitRateWindowLabel',
+      'limitRequestQuotaTitle',
+      'limitRequestQuotaLabel',
+      'limitTokenQuotaTitle',
+      'limitTokenQuotaLabel',
+      'limitCostBudgetTitle',
+      'limitCostBudgetLabel',
+      'limitPeriodLabel',
+      'limitPeriodOff',
+      'limitPeriodHour',
+      'limitPeriodDay',
+      'limitPeriodWeek',
+      'limitPeriodMonth',
+      'errorLimitValidationFailed',
+      'errorLimitUserNotFound',
+      'userActionLimits',
+      'userLimitsDialogSubtitle',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines the usage-line functions in de and en', () => {
+    expect(messages.de.limitUsageRequestsLine(8000, 10000)).toContain('8000');
+    expect(messages.de.limitUsageRequestsLine(8000, 10000)).toContain('10000');
+    expect(messages.en.limitUsageRequestsLine(8000, 10000)).toContain('8000');
+    expect(messages.de.limitUsageTokensLine(1, 2).length).toBeGreaterThan(0);
+    expect(messages.en.limitUsageTokensLine(1, 2).length).toBeGreaterThan(0);
+    expect(messages.de.limitUsageCostLine(1, 2).length).toBeGreaterThan(0);
+    expect(messages.en.limitUsageCostLine(1, 2).length).toBeGreaterThan(0);
+  });
+});
+
+describe('groups i18n keys', () => {
+  it('defines the nav/section/column/action/hint/confirm string keys in de and en', () => {
+    const keys = [
+      'groups',
+      'groupsIntro',
+      'groupsSystemTitle',
+      'groupsAdminTitle',
+      'groupsUserTitle',
+      'groupsInvitationsTitle',
+      'groupsInvitationsEmpty',
+      'groupsInvitedByLabel',
+      'groupsColParent',
+      'groupsColOwner',
+      'groupsColMembers',
+      'groupsColManagers',
+      'groupsColMyRole',
+      'groupsOwnerSelf',
+      'groupsRoleOwner',
+      'groupsRoleManager',
+      'groupsRoleMember',
+      'groupsPermUsers',
+      'groupsPermGroup',
+      'groupsPermServers',
+      'groupsPermServices',
+      'groupsPermResources',
+      'groupsActionRename',
+      'groupsActionMembers',
+      'groupsActionDelete',
+      'groupsActionLeave',
+      'groupsActionAccept',
+      'groupsActionDecline',
+      'groupsActionAdd',
+      'groupsActionInvite',
+      'groupsActionPromote',
+      'groupsActionDemote',
+      'groupsActionRemoveMember',
+      'groupsActionTransfer',
+      'groupsCreateSystemTitle',
+      'groupsCreateAdminTitle',
+      'groupsCreateUserTitle',
+      'groupsEditTitle',
+      'groupsParentLabel',
+      'groupsNoSystemGroupHint',
+      'groupsNoAdminGroupHint',
+      'groupsOwnerLabel',
+      'groupsOwnerNoSystemGroupHint',
+      'groupsAddMembersLabel',
+      'groupsAddMembersHelp',
+      'groupsRosterLabel',
+      'groupsRosterEmpty',
+      'groupsMemberStateInvited',
+      'groupsManageLabel',
+      'groupsPromoteSelectLabel',
+      'groupsDemoteSelectLabel',
+      'groupsTransferSelectLabel',
+      'groupsDeleteConfirmTitle',
+      'groupsDeleteConfirmBody',
+      'groupsLeaveConfirmTitle',
+      'groupsLeaveConfirmBody',
+      'groupsTransferConfirmTitle',
+      'groupsTransferConfirmBody',
+      'errorGroupNotFound',
+      'errorGroupNameConflict',
+      'errorGroupNameInvalid',
+      'errorGroupParentInvalid',
+      'errorGroupTierInvalid',
+      'errorGroupMemberNotVisible',
+      'errorGroupNotParentMember',
+      'errorGroupCandidateInvalid',
+      'errorGroupForbidden',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines the name-interpolating functions in de and en', () => {
+    expect(messages.de.groupsMembersTitle('Team Alpha')).toContain('Team Alpha');
+    expect(messages.en.groupsMembersTitle('Team Alpha')).toContain('Team Alpha');
+    expect(messages.de.groupsParentAuto('System Foo')).toContain('System Foo');
+    expect(messages.en.groupsParentAuto('System Foo')).toContain('System Foo');
+  });
+
+  it('defines the group-delete coupled-projects hint function in de and en', () => {
+    expect(messages.de.groupsDeleteCoupledHint('Alpha, Beta')).toContain('Alpha, Beta');
+    expect(messages.en.groupsDeleteCoupledHint('Alpha, Beta')).toContain('Alpha, Beta');
+  });
+
+  it('defines the invite-form system-group picker keys in de and en (Task 15)', () => {
+    const keys = [
+      'userInviteAdminGroupLabel',
+      'userInviteAdminGroupSelect',
+      'userInviteNoAdminGroupHint',
+      'errorUserNoSystemGroup',
+      'errorUserSystemGroupRequired',
+      'errorUserSystemGroupInvalid',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('service<->admin-group linkage i18n keys (Phase C, spec 2026-08-10)', () => {
+  it('defines the create-form picker + edit-form admin-groups editor string keys in de and en', () => {
+    const keys = [
+      'serviceAdminGroupLabel',
+      'serviceAdminGroupSystemGroupLabel',
+      'serviceNoAdminGroupHint',
+      'serviceAdminGroupsSectionTitle',
+      'serviceAdminGroupsSave',
+      'serviceAdminGroupsSaved',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // Both admin-group auto-note keys (mirrors the server* linkage keys) are
+  // interpolating functions, not plain strings.
+  it('defines the name-interpolating functions in de and en', () => {
+    expect(typeof messages.de.serviceAdminGroupAuto).toBe('function');
+    expect(typeof messages.en.serviceAdminGroupAuto).toBe('function');
+    expect(messages.de.serviceAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(messages.en.serviceAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(typeof messages.de.serviceAdminGroupSystemGroupAuto).toBe('function');
+    expect(typeof messages.en.serviceAdminGroupSystemGroupAuto).toBe('function');
+    expect(messages.de.serviceAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+    expect(messages.en.serviceAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+  });
+});
+
+describe('resource groups i18n keys (Phase 1, spec 2026-08-11)', () => {
+  it('defines the nav/list/create/detail/admin-group-linkage/server-editor string keys in de and en', () => {
+    const keys = [
+      'resourceGroups',
+      'resourceGroupsIntro',
+      'resourceGroupListTitle',
+      'resourceGroupCreate',
+      'resourceGroupNameLabel',
+      'resourceGroupStatusLabel',
+      'resourceGroupColSystemGroup',
+      'resourceGroupColAdminGroups',
+      'resourceGroupColServers',
+      'resourceGroupSettingsTitle',
+      'resourceGroupActionDelete',
+      'resourceGroupDeleteConfirm',
+      'resourceGroupAdminGroupLabel',
+      'resourceGroupAdminGroupSystemGroupLabel',
+      'resourceGroupNoAdminGroupHint',
+      'resourceGroupAdminGroupsSectionTitle',
+      'resourceGroupAdminGroupsSave',
+      'resourceGroupAdminGroupsSaved',
+      'resourceGroupServersSectionTitle',
+      'resourceGroupServersLabel',
+      'resourceGroupServersSave',
+      'resourceGroupServersSaved',
+      'resourceGroupProvisionsSectionTitle',
+      'resourceGroupProvisionsColKind',
+      'resourceGroupProvisionsColTarget',
+      'resourceGroupProvisionsEmpty',
+      'resourceGroupProvisionsAddKindLabel',
+      'resourceGroupProvisionsAddTargetLabel',
+      'resourceGroupProvisionsAddAction',
+      'resourceGroupProvisionsRemoveAction',
+      'resourceGroupProvisionsSave',
+      'resourceGroupProvisionsSaved',
+      'resourceGroupProvisionsNoTargetsHint',
+      'resourceGroupProvisionKindUser',
+      'resourceGroupProvisionKindUserGroup',
+      'resourceGroupProvisionKindAdminGroup',
+      'resourceGroupProvisionKindService',
+      'errorResourceGroupProvisionTargetInvalid',
+      'settingsResourceProvisioningEnforceLabel',
+      'settingsResourceProvisioningEnforceHelp',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // Both admin-group auto-note keys (mirrors the server*/service* linkage
+  // keys) are interpolating functions, not plain strings.
+  it('defines the name-interpolating functions in de and en', () => {
+    expect(typeof messages.de.resourceGroupAdminGroupAuto).toBe('function');
+    expect(typeof messages.en.resourceGroupAdminGroupAuto).toBe('function');
+    expect(messages.de.resourceGroupAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(messages.en.resourceGroupAdminGroupAuto('Alpha')).toContain('Alpha');
+    expect(typeof messages.de.resourceGroupAdminGroupSystemGroupAuto).toBe('function');
+    expect(typeof messages.en.resourceGroupAdminGroupSystemGroupAuto).toBe('function');
+    expect(messages.de.resourceGroupAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+    expect(messages.en.resourceGroupAdminGroupSystemGroupAuto('Beta')).toContain('Beta');
+  });
+});
+
+describe('projects i18n keys', () => {
+  it('defines the nav/section/column/action/confirm/error string keys in de and en', () => {
+    const keys = [
+      'projects',
+      'projectsIntro',
+      'projectName',
+      'projectDescription',
+      'projectsColOwner',
+      'projectsColMyRole',
+      'projectsColMembers',
+      'projectsColGroups',
+      'projectsColTotalTokens',
+      'projectsOwnerSelf',
+      'projectsRoleOwner',
+      'projectsRoleMember',
+      'projectsRoleNone',
+      'projectsActionRename',
+      'projectsActionMembers',
+      'projectsActionTokens',
+      'projectsActionDelete',
+      'projectsActionTransfer',
+      'projectsActionAdd',
+      'projectsActionRemoveMember',
+      'projectsActionRemoveGroup',
+      'projectsCreateTitle',
+      'projectsEditTitle',
+      'projectsMembersLabel',
+      'projectsMembersEmpty',
+      'projectsGroupsLabel',
+      'projectsGroupsEmpty',
+      'projectsAddMembersLabel',
+      'projectsAddGroupsLabel',
+      'projectsTransferLabel',
+      'projectsTransferSelectLabel',
+      'projectsDeleteConfirmTitle',
+      'projectsDeleteConfirmBody',
+      'projectsTransferConfirmTitle',
+      'projectsTransferConfirmBody',
+      'errorProjectNotFound',
+      'errorProjectNameConflict',
+      'errorProjectTransferNotMember',
+      'errorProjectMemberNotVisible',
+      'errorProjectGroupNotVisible',
+      'errorProjectForbidden',
+      'projectsCoupleToggle',
+      'projectsCoupleSelectLabel',
+      'projectsCoupleNewName',
+      'projectsCoupleModeSelect',
+      'projectsCoupleModeCreate',
+      'projectsCoupledNote',
+      'errorProjectCoupled',
+      'errorProjectCoupleGroupInvalid',
+      'errorProjectCoupleAmbiguous',
+      'projectsTokensLabel',
+      'projectsTokensEmpty',
+      'projectsTokenOwner',
+      'projectsTokenDetach',
+      'projectsTokenDetachConfirmTitle',
+      'projectsTokenDetachConfirmBody',
+      'projectsTokenDetached',
+      'projectsTokensColRequests',
+      'projectsTokensColPrompt',
+      'projectsTokensColGenerated',
+      'projectsTokensColTotal',
+      'projectsTokensTotalLabel',
+      'projectsTokensTotalNote',
+      'errorTokenNotFound',
+      'systemAdminModeEnter',
+      'systemAdminModeLeave',
+      'systemAdminModeActive',
+      'systemAdminModeDialogTitle',
+      'systemAdminModeDialogBody',
+      'systemAdminModePasswordLabel',
+      'settingsSystemAdminRequirePassword',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines the name-interpolating function in de and en', () => {
+    expect(messages.de.projectsMembersTitle('Team Alpha')).toContain('Team Alpha');
+    expect(messages.en.projectsMembersTitle('Team Alpha')).toContain('Team Alpha');
+  });
+
+  it('defines the tokens-title name-interpolating function in de and en', () => {
+    expect(messages.de.projectsTokensTitle('Team Alpha')).toContain('Team Alpha');
+    expect(messages.en.projectsTokensTitle('Team Alpha')).toContain('Team Alpha');
+  });
+
+  it('defines the coupled-chip name-interpolating function in de and en', () => {
+    expect(messages.de.projectsCoupledChip('Team Alpha')).toContain('Team Alpha');
+    expect(messages.en.projectsCoupledChip('Team Alpha')).toContain('Team Alpha');
+  });
+});
+
+describe('copy-feedback i18n key', () => {
+  it('defines copied in de and en', () => {
+    const keys = ['copied'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('certificates i18n keys', () => {
+  it('defines the nav/module/settings + CA-panel + list + server-override keys in de and en', () => {
+    const keys = [
+      'confirm',
+      'certificates',
+      'settingsCertificatesTitle',
+      'settingsCertificatesIntro',
+      'certificatesSettingsTitle',
+      'certificatesMeshTitle',
+      'certificatesMeshTLSActive',
+      'certificatesMeshTLSInactive',
+      'certificatesMeshAddress',
+      'certificatesMeshFingerprint',
+      'certificatesMeshExpires',
+      'certificatesMeshCARotationPendingTitle',
+      'certificatesMeshCARotationPending',
+      'certificatesMeshRequireTLS',
+      'certificatesMeshRequireTLSHint',
+      'certificatesMeshRequireTLSNotObserved',
+      'certificatesMeshRequireTLSConfirmTitle',
+      'certificatesMeshRequireTLSConfirmBody',
+      'certificatesMeshRequireTLSPending',
+      'certificatesMeshTLSPortMode',
+      'certificatesMeshTLSPortModeFollowEnv',
+      'certificatesMeshTLSPortModeCombined',
+      'certificatesMeshTLSPortModeSeparate',
+      'certificatesMeshTLSPort',
+      'certificatesMeshTLSPortSeparateActive',
+      'certificatesMeshTLSPortSeparateInactive',
+      'certificatesMeshTLSPortModeConfirmTitle',
+      'certificatesMeshTLSPortModeConfirmBody',
+      'settingsCertEnabled',
+      'settingsAcmeEmail',
+      'settingsAcmeDirectory',
+      'settingsAcmeDirectoryProduction',
+      'settingsAcmeDirectoryStaging',
+      'settingsAcmeDirectoryCustom',
+      'settingsAcmeOwnSettings',
+      'settingsAcmeWeeklyLimit',
+      'settingsAcmeWeeklyLimitUnlimited',
+      'settingsCertBaseDomain',
+      'settingsCertGatewayDomain',
+      'settingsCertServerScope',
+      'settingsCertScopeAll',
+      'settingsCertScopeSelected',
+      'settingsCertManagePublicDomain',
+      'settingsCertPublicDomains',
+      'settingsCertPublicTitle',
+      'settingsCertPublicIssuerMode',
+      'settingsCertPublicIssuerModeFollowGlobal',
+      'certificatesPublicButtonDownloadBundle',
+      'certificatesPublicButtonDownloadKey',
+      'settingsCertRenewBeforeDays',
+      'settingsCertIssuerMode',
+      'settingsCertIssuerAcme',
+      'settingsCertIssuerSelfSigned',
+      'settingsCertSelfSignedValidity',
+      'settingsCertCaRenewBeforeDays',
+      'certificatesCaTitle',
+      'certificatesCaSubject',
+      'certificatesCaNone',
+      'certificatesCaDownloadRoot',
+      'certificatesCaDownloadBundle',
+      'certificatesCaPrevious',
+      'certificatesCaRotate',
+      'certificatesCaRotateConfirmTitle',
+      'certificatesCaRotateConfirmBody',
+      'certificatesCaHint',
+      'certificatesCaStillNeeded',
+      'certificatesReissueAll',
+      'certificatesReissueAllConfirmTitle',
+      'certificatesReissueAllConfirmBody',
+      'certificatesSwitchHint',
+      'certificatesColDomain',
+      'certificatesColKind',
+      'certificatesColStatus',
+      'certificatesColIssued',
+      'certificatesColExpires',
+      'certificatesColRemaining',
+      'certificatesColInstalled',
+      'certificatesInstalledStale',
+      'certificatesInstalledNever',
+      'certificatesColTransport',
+      'certificatesTransportTLS',
+      'certificatesTransportPlain',
+      'certificatesTransportNever',
+      'certificatesColError',
+      'certificatesKindGateway',
+      'certificatesKindServer',
+      'certificatesKindPublic',
+      'certificatesStatusActive',
+      'certificatesStatusPending',
+      'certificatesStatusError',
+      'certificatesStatusSkipped',
+      'certificatesRenewNow',
+      'certificatesEmpty',
+      'certificatesLastErrorTitle',
+      'certificatesScopeFlipConfirmTitle',
+      'certificatesScopeFlipConfirmBody',
+      'certificatesColAttempts',
+      'certificatesColNextAttempt',
+      'certificatesColFingerprint',
+      'certificatesKindEdge',
+      'certificatesEdgeIntro',
+      'settingsCertEdgeEnabled',
+      'settingsCertEdgeIssuerMode',
+      'settingsCertEdgeNames',
+      'certificatesEdgeNone',
+      'certificatesEdgeDeliveryDownloadNote',
+      'certificatesEdgeButtonDownloadBundle',
+      'certificatesEdgeButtonDownloadKey',
+      'certificatesEdgeButtonShowProxyConfig',
+      'certificatesEdgeProxyConfigDialogTitle',
+      'certificatesEdgeProxyConfigSnapshotNote',
+      'certificatesEdgeProxyConfigCopy',
+      'certificatesEdgeProxyConfigClose',
+      'certificatesEdgeButtonReissue',
+      'certificatesEdgeReissueConfirmTitle',
+      'certificatesEdgeReissueConfirmBody',
+      'certificatesEdgeGateTitle',
+      'certificatesEdgeGateIntro',
+      'settingsCertEdgeRequireHttps',
+      'certificatesEdgeGateDisabledHint',
+      'certificatesEdgeGateArmedNotEnforcingHint',
+      'certificatesEdgeGateLastEncryptedNever',
+      'certificatesEdgeGateLastPlainNever',
+      'certificatesEdgeGateProbeButton',
+      'certificatesEdgeGateArmConfirmTitle',
+      'certificatesEdgeGateArmConfirmBody',
+      'errorCertificateEdgeHttpsNotObserved',
+      'errorCertificateEdgeArmRequiresHttps',
+      'certificatesEdgeProbeBootstrap',
+      'certificatesEdgeProbeChainUntrusted',
+      'certificatesEdgeProbeExpired',
+      'certificatesEdgeProbeNotConfigured',
+      'serverCertificateInclude',
+      'serverCertificateExclude',
+      'certificatesHTTPSSwitchTitle',
+      'certificatesHTTPSSwitchMode',
+      'certificatesHTTPSSwitchModeManual',
+      'certificatesHTTPSSwitchModeAuto',
+      'certificatesHTTPSSwitchModeSelected',
+      'certificatesHTTPSSwitchModeConfirmTitle',
+      'certificatesHTTPSSwitchModeConfirmBody',
+      'certificatesProxyListenPortBase',
+      'serverHTTPSSwitchInclude',
+      'serverHTTPSSwitchExclude',
+      'applicationProxyStatus',
+      'applicationProxied',
+      'applicationNotProxied',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});

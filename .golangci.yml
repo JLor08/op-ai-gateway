@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# golangci-lint v2 configuration for OnPrem AI Gateway.
+# Run per module: `cd gateway/backend && golangci-lint run` and likewise in
+# `server-agent`. Format with `golangci-lint fmt`. See `make lint` / `make fmt`.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # Pragmatic-strict set. staticcheck (v2) already subsumes gosimple/stylecheck.
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - unconvert
+    - misspell
+  # unparam intentionally NOT enabled: its findings here are all "param always
+  # receives the same value" on single-caller/flexibility signatures — a weak
+  # signal that produces churn without catching defects.
+  settings:
+    staticcheck:
+      # Keep all correctness (SA*) and simplification (S*) checks; drop the
+      # optional "quickfix" (QF*) refactoring suggestions — they are style
+      # preferences, not defects.
+      checks:
+        - all
+        - -QF1001
+        - -QF1002
+        - -QF1003
+        - -QF1008
+  exclusions:
+    # Skip files carrying the "Code generated ... DO NOT EDIT." marker
+    # (e.g. the gowrap tracing decorators *_gen.go).
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests may ignore errors and have unused params without it being a defect,
+      # and test helpers routinely shadow builtins / take ctx in a later position.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+      - path: _test\.go
+        linters: [revive]
+        text: "redefines-builtin-id:"
+      - path: _test\.go
+        linters: [revive]
+        text: "context-as-argument:"
+      # revive: unused function parameters are idiomatic in Go (interface
+      # conformance, handler signatures) — not a defect worth churning.
+      - linters: [revive]
+        text: "unused-parameter:"
+      # revive: returning an unexported type from an exported func is an
+      # intentional pattern here (constructors returning concrete helpers).
+      - linters: [revive]
+        text: "unexported-return:"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports

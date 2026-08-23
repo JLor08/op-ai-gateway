@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+#
+# Local, headless SonarQube quality gate. Loopback-only (127.0.0.1:9000) --
+# not exposed to the network. Data/logs/extensions persist in named volumes
+# across `sonar.sh down` (removed by `sonar.sh purge`). The `sonar-net`
+# network lets the sonar-scanner-cli container (run ad hoc by `sonar.sh scan`,
+# not part of this compose file) reach the server by its service name.
+#
+# See scripts/sonar/sonar.sh for the CLI that drives this file.
+
+services:
+  sonarqube:
+    image: sonarqube:community
+    container_name: op-ai-gateway-sonarqube
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      # Single-node local use: skip the ES bootstrap checks (max map count,
+      # file descriptor limits) that a throwaway dev container will fail.
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_logs:/opt/sonarqube/logs
+      - sonar_extensions:/opt/sonarqube/extensions
+    networks:
+      - sonar-net
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+      nproc: 8192
+    # mem_limit (not `deploy.resources`) is the form `docker compose` honors
+    # outside swarm mode.
+    mem_limit: 4g
+
+networks:
+  sonar-net:
+    name: sonar-net
+
+volumes:
+  sonar_data:
+    name: op-ai-gateway-sonar-data
+  sonar_logs:
+    name: op-ai-gateway-sonar-logs
+  sonar_extensions:
+    name: op-ai-gateway-sonar-extensions

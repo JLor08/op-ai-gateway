@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Non-secret gateway configuration. Mirrors the non-secret half of
+# gateway/deploy/.env.example. SECRETS (DB DSN + password, bootstrap/agent tokens,
+# capture key, NetBird setup key) live in secret.example.yaml, NOT here.
+#
+# The `backend` container consumes this via `envFrom: configMapRef` (every key
+# becomes an env var). The `netbird` sidecar reads NB_MANAGEMENT_URL / NB_HOSTNAME
+# from here via individual configMapKeyRef (the backend also inherits those two via
+# envFrom, which it harmlessly ignores).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: op-gateway-config
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+data:
+  # Listeners. The management listener binds 0.0.0.0:8080 (fronted by nginx / the
+  # Ingress). AGENT_PORT is the port the Phase-1 agent listener binds on the wt0
+  # NetBird IP (resolved at runtime from the selected gateway peer). Do NOT set
+  # OP_AI_GATEWAY_AGENT_ADDR here — the gateway peer is selected in System Settings
+  # and the wt0 IP is resolved at startup. Hard-pinning an address would override
+  # that peer selection.
+  OP_AI_GATEWAY_ADDR: "0.0.0.0:8080"
+  OP_AI_GATEWAY_AGENT_PORT: "8081"
+
+  # Store: PostgreSQL (the op-gateway-db StatefulSet). The DSN itself carries the
+  # password, so it lives in the Secret; only the driver flag is non-secret here.
+  # Schema migrations run automatically on startup (versioned, apply-only-pending).
+  OP_AI_GATEWAY_DB_DRIVER: "postgres"
+  OP_AI_GATEWAY_AUTO_MIGRATE: "true"
+
+  # Public URL (the Ingress host + /portal). Must match ingress.yaml's host.
+  OP_AI_GATEWAY_PUBLIC_URL: "https://gateway.example.com/portal"
+  # TRUE because the Ingress terminates TLS in front of the gateway. (Set false only
+  # for a plain-HTTP test env, or login breaks — the session cookie must not be Secure
+  # over plain HTTP.)
+  OP_AI_GATEWAY_SESSION_COOKIE_SECURE: "true"
+
+  # Streaming / routing / benchmark / capacity / capture / telemetry tuning knobs
+  # (mirror .env.example defaults).
+  OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT: "120s"
+  OP_AI_GATEWAY_SWAP_PROTECT_WINDOW_SECONDS: "30"
+  OP_AI_GATEWAY_SESSION_RESERVATION_WINDOW_SECONDS: "60"
+  OP_AI_GATEWAY_ADMISSION_QUEUE_MAX_DEPTH: "128"
+  OP_AI_GATEWAY_BENCHMARK_SCHEDULE_DEFAULT_SECONDS: "86400"
+  OP_AI_GATEWAY_CAPACITY_VRAM_SAFETY_MARGIN_PERCENT: "10"
+  OP_AI_GATEWAY_CAPACITY_MAX_CONCURRENCY: "64"
+  OP_AI_GATEWAY_CAPACITY_SETTLE_SECONDS: "5"
+  OP_AI_GATEWAY_CAPTURE_MAX_BYTES: "1048576"
+  OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES: "67108864"
+  OP_AI_GATEWAY_TELEMETRY_RETENTION_HOURS: "168"
+  OP_AI_GATEWAY_LOG_LEVEL: "info"
+  # Cadence (seconds) of the NetBird peer-sync loop. Floor 30s.
+  OP_AI_GATEWAY_NETBIRD_SYNC_INTERVAL_SECONDS: "60"
+  # Autonomous sidecar self-enroll (Phase B): where the gateway WRITES a minted NetBird
+  # setup key (System Settings → "Sidecar enrollen"). The netbird sidecar reads the same
+  # file (NB_ENROLL_KEY_FILE in gateway.yaml — a wrapper-only var, NOT netbird's
+  # NB_SETUP_KEY_FILE) from the shared in-memory /shared volume and self-enrolls. Empty =
+  # the autonomous path is off (use the operator-provided NB_SETUP_KEY Secret instead).
+  # See k8s/README.md §11.
+  OP_AI_GATEWAY_NETBIRD_KEY_FILE: "/shared/netbird-setup-key"
+
+  # Cross-compile the downloadable server-agent binaries in an initContainer. false =
+  # skip (fast; reuse the op-gateway-agent-bin PVC). Set "true" when the agent changed.
+  BUILD_AGENTS: "false"
+
+  # The synthetic TLS self-probe against the gateway's OWN edge (nginx) listener
+  # (Zertifikate view, "TLS jetzt prüfen"): `backend` (this pod) CAN reach the
+  # op-gateway-web Service over the cluster network -- unlike docker-compose's
+  # `web:443`, this is the k8s-specific address (see
+  # gateway/deploy/README-certificates.md §8.6). Leaving this empty disables the
+  # probe endpoint (409 certificate.edge_probe_not_configured), never a guess.
+  OP_AI_GATEWAY_CERT_EDGE_PROBE_TARGET: "op-gateway-web:443"
+
+  # Bootstrap admin identity (non-secret). The one-time set-password invite link is
+  # logged on first start unless OP_AI_GATEWAY_BOOTSTRAP_ADMIN_PASSWORD (a Secret) is set.
+  OP_AI_GATEWAY_BOOTSTRAP_ADMIN_EMAIL: "admin@example.test"
+  OP_AI_GATEWAY_BOOTSTRAP_ADMIN_NAME: "Admin User"
+
+  # --- NetBird sidecar (consumed by the `netbird` container) -----------------------
+  # Self-hosted NetBird management URL, e.g. https://netbird.example.com. Empty = the
+  # NetBird cloud (https://api.netbird.io).
+  NB_MANAGEMENT_URL: ""
+  # Peer name shown in NetBird + the System-Settings gateway-peer picker. Keep stable
+  # (it is the identity the gateway-peer selection points at).
+  NB_HOSTNAME: "op-gateway"
+
+# --- External themes (optional, commented example) --------------------------------
+# The backend image already bakes gateway/deploy/themes/ (incl. the `example` theme)
+# at /themes (OP_AI_GATEWAY_THEMES_DIR, default -- see deploy/themes/README.md). To
+# add or override themes at deploy time without rebuilding the image, mount a
+# SEPARATE ConfigMap over (part of) /themes -- do NOT add theme.json content as keys
+# on op-gateway-config above: envFrom would turn every key here into a backend env
+# var, which is harmless for the existing string values but pointless noise for JSON
+# blobs. Pair this with the commented volume/volumeMount in gateway.yaml.
+#
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: op-gateway-theme-acme
+#   labels:
+#     app.kubernetes.io/name: op-gateway
+#     app.kubernetes.io/part-of: op-ai-gateway
+# data:
+#   theme.json: |
+#     {
+#       "name": "Acme",
+#       "brand": { "type": "text", "text": "Acme", "title": "AI Gateway" },
+#       "light": { "brandPrimary": "#2563eb" },
+#       "dark": { "brandPrimary": "#60a5fa" }
+#     }
+# # binaryData:
+# #   favicon.png: <base64>   # optional; theme.Load also accepts logo.svg/logo.png

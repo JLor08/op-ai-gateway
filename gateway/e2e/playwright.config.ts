@@ -1,32 +1,36 @@
-import { defineConfig, devices } from '@playwright/test'
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
-  testDir: './tests',
-  fullyParallel: true,
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
-  reporter: process.env.CI ? 'github' : 'list',
+  testDir: "./e2e",
+  fullyParallel: false,
+  workers: 1,
+  reporter: "list",
   use: {
-    baseURL: 'http://127.0.0.1:5173',
-    trace: 'on-first-retry'
+    baseURL: "http://127.0.0.1:4173",
+    trace: "on-first-retry"
   },
-  projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'] } }
-  ],
   webServer: [
     {
-      command: 'go run ./cmd/server',
-      cwd: '../backend',
-      url: 'http://127.0.0.1:8080/healthz',
+      command: "go build -o /tmp/op-ai-gateway-e2e ./cmd/gateway && /tmp/op-ai-gateway-e2e",
+      cwd: "../backend",
+      url: "http://127.0.0.1:8091/healthz",
       reuseExistingServer: !process.env.CI,
-      timeout: 30_000
+      timeout: 120000,
+      env: {
+        OP_AI_GATEWAY_ADDR: "127.0.0.1:8091",
+        OP_AI_GATEWAY_PUBLIC_URL: "http://127.0.0.1:4173/portal",
+        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+      }
     },
     {
-      command: 'npm run dev -- --host 127.0.0.1',
-      cwd: '../frontend',
-      url: 'http://127.0.0.1:5173',
+      command: "npm run build && npm run preview",
+      cwd: "../frontend",
+      url: "http://127.0.0.1:4173/portal/",
       reuseExistingServer: !process.env.CI,
-      timeout: 30_000
+      timeout: 120000
     }
   ]
-})
+});

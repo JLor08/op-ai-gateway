@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+#
+# Continuous integration: format check, lint, build, and test for the Go
+# backend + server-agent and the React/TypeScript frontend. Ready to run as
+# soon as a runner is attached to the repository.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go (backend + agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+      - name: Format check + lint + test (backend)
+        working-directory: gateway/backend
+        run: |
+          golangci-lint fmt --diff
+          golangci-lint run
+          go test ./...
+      - name: Format check + lint + test (server-agent)
+        working-directory: server-agent
+        run: |
+          golangci-lint fmt --diff
+          golangci-lint run
+          go test ./...
+
+  frontend:
+    name: Frontend (portal)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: npm ci
+      - name: Format check
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test

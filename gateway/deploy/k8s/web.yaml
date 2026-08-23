@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Public web tier: the built frontend image (nginx serving the SPA + reverse-proxying
+# the backend). The op-gateway-nginx ConfigMap is mounted over the image's default
+# server block. This pod is stateless (rolling updates are fine) and is the only tier
+# the Ingress routes to.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: op-gateway-web
+  labels:
+    app.kubernetes.io/name: op-gateway-web
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: op-gateway-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: op-gateway-web
+        app.kubernetes.io/part-of: op-ai-gateway
+    spec:
+      containers:
+        - name: web
+          image: REGISTRY/op-ai-gateway-frontend:latest
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+          resources:
+            # Starting points — nginx serving the SPA + proxying; tune to your traffic.
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            # Mount the single default.conf key over nginx's default server block.
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+            # The shared location list both server blocks include. Deliberately NOT
+            # under /etc/nginx/conf.d/: the stock nginx.conf includes conf.d/*.conf at
+            # HTTP level, where `location` is illegal — nginx would refuse to start and
+            # take the portal, the API and the login with it.
+            - name: nginx-conf
+              mountPath: /etc/nginx/op-locations.conf
+              subPath: locations.conf
+            # The gateway's OWN edge certificate. In Kubernetes the gateway CANNOT
+            # deliver it — this pod has no writable volume and the backend runs in a
+            # different pod — so the operator creates the Secret from the portal's
+            # download (bundle + key) and rotates it the same way. See README.md.
+            - name: edge-tls
+              mountPath: /etc/nginx/certs
+              readOnly: true
+          readinessProbe:
+            # Probe "/" (nginx returns 302 -> /portal/, a 2xx-3xx success) so web
+            # readiness reflects nginx itself, not the backend (which /healthz proxies to).
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: op-gateway-nginx
+            items:
+              - key: default.conf
+                path: default.conf
+              - key: locations.conf
+                path: locations.conf
+        # REQUIRED for this pod to start: `ssl_certificate` pointing at a missing file
+        # is an nginx load error, and the Secret is mounted (not optional) so a missing
+        # one holds the NEW pod in ContainerCreating while the OLD one keeps serving --
+        # louder and safer than a crash-loop. Create it BEFORE the first apply:
+        #   kubectl -n op-ai-gateway create secret generic op-gateway-edge-tls \
+        #     --from-file=edge-fullchain.pem=<portal bundle download> \
+        #     --from-file=edge-key.pem=<portal key download>
+        # Rotate it the same way (`--dry-run=client -o yaml | kubectl apply -f -`) and
+        # restart this Deployment; nginx reads the certificate only at start/reload.
+        - name: edge-tls
+          secret:
+            secretName: op-gateway-edge-tls
+            items:
+              - key: edge-fullchain.pem
+                path: edge-fullchain.pem
+                mode: 0444
+              - key: edge-key.pem
+                path: edge-key.pem
+                # The nginx MASTER reads the key as root before dropping privileges.
+                mode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: op-gateway-web
+  labels:
+    app.kubernetes.io/name: op-gateway-web
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: op-gateway-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    # The TLS edge. The bundled Ingress still targets :80 (it terminates TLS itself);
+    # this port is for an upstream proxy that must reach the gateway over TLS instead --
+    # point it at op-gateway-web:443, or at an Ingress/Gateway configured for a
+    # re-encrypting (HTTPS) backend.
+    - name: https
+      port: 443
+      targetPort: 443

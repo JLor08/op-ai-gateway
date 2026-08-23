@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Overlay of ../k8s WITHOUT the NetBird sidecar. The gateway backend runs alone in the
+# pod (still binds :8080; nginx already targets the op-gateway-backend Service, so no
+# nginx change is needed — unlike the compose variant). Use this when the gateway is
+# reached only over the public Ingress and must NOT be a NetBird data-plane peer. The
+# NetBird MODULE (admin API / peer management for AI-servers) still works; leave the
+# System-Settings "netbird_only" switch OFF.
+#
+# Apply:  kubectl apply -k gateway/deploy/k8s-no-netbird
+# (Secret is applied separately, exactly as for the base — see ../k8s/README.md.)
+resources:
+  - ../k8s
+
+patches:
+  # Drop ONLY the netbird sidecar (initContainers/0) and its volumes, keeping the
+  # agent-builder initContainer (base index 1 — becomes the sole initContainer here) +
+  # its agent-bin PVC. A JSON6902 patch (not strategic-merge) because deleting a single
+  # volumeMount via `$patch: delete` also drops sibling mounts in kustomize.
+  # containers/0 is `backend` (the only container; netbird/agent-builder are initContainers).
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: op-gateway
+    patch: |
+      - op: remove
+        path: /spec/template/spec/initContainers/0
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: gwdata
+            mountPath: /data
+          - name: agent-bin
+            mountPath: /agents
+            readOnly: true
+      - op: replace
+        path: /spec/template/spec/volumes
+        value:
+          - name: gwdata
+            persistentVolumeClaim:
+              claimName: op-gateway-data
+          - name: agent-bin
+            persistentVolumeClaim:
+              claimName: op-gateway-agent-bin
+  # Clear the shared setup-key path → the System-Settings "Sidecar enrollen" button hides
+  # (there is no sidecar to consume a minted key).
+  - path: patch-configmap.yaml
+  # Without the sidecar's caps + hostPath, the namespace no longer needs PodSecurity
+  # `privileged`; baseline admits the remaining (nonroot, no-hostPath) pods.
+  - path: patch-namespace.yaml
+  # Remove the now-unused NetBird identity PVC.
+  - path: delete-netbird-pvc.yaml

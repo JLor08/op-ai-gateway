@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# ClusterIP Service for the gateway management listener. This is what nginx
+# (op-gateway-web) proxies to. It exposes ONLY 8080 (management).
+#
+# The agent listener (8081) binds the wt0 NetBird IP and is DELIBERATELY not here:
+# agents reach it directly over the mesh at the pod's NetBird IP, never via a
+# cluster Service. Adding 8081 to a Service would put the agent plane on the cluster
+# network, defeating the NetBird-only boundary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: op-gateway-backend
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: op-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

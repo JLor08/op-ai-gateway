@@ -1,40 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import { CssBaseline, ThemeProvider, createTheme } from '@mui/material'
-import App from './App'
-import './styles.css'
+// Copyright (C) 2026 OnPrem AI Gateway contributors
 
-const theme = createTheme({
-  palette: {
-    mode: 'dark',
-    background: {
-      default: '#141414',
-      paper: '#1f2220',
-    },
-    primary: {
-      main: '#4dd4ac',
-    },
-    secondary: {
-      main: '#f6c85f',
-    },
-    error: {
-      main: '#ff8a80',
-    },
-  },
-  shape: {
-    borderRadius: 8,
-  },
-  typography: {
-    fontFamily: ['Inter', 'system-ui', 'sans-serif'].join(','),
-  },
-})
+import { createRoot } from 'react-dom/client';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ThemeProvider theme={theme}>
-      <CssBaseline />
-      <App />
-    </ThemeProvider>
-  </StrictMode>
-)
+import App from './App';
+import { ThemeRoot } from './theme/ThemeRoot';
+
+createRoot(document.getElementById('root') as HTMLElement).render(
+  <ThemeRoot>
+    <App />
+  </ThemeRoot>,
+);

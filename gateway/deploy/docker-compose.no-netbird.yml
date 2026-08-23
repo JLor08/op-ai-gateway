@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Standalone stack WITHOUT the NetBird sidecar.
+#
+# Same gateway as docker-compose.yml, but the backend runs in its OWN network
+# namespace (no shared netns) and nginx proxies straight to backend:8080. Use this
+# when the gateway itself must NOT be a NetBird data-plane peer — i.e. it is reached
+# only over the public ingress. The NetBird MODULE (admin API, peer/setup-key mgmt for
+# AI-servers) still works; only the gateway's own mesh membership + the netbird_only
+# transport are absent, so leave the System-Settings "netbird_only" switch OFF.
+#
+# Run:  docker compose -f gateway/deploy/docker-compose.no-netbird.yml up -d
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    # Override the baked nginx config (which points at netbird:8080) with the variant
+    # that proxies to backend:8080. The shared location list is bind-mounted too, so
+    # the pair always matches the sources in ./nginx (the image bakes both files, but
+    # only default.conf differs between the variants).
+    volumes:
+      - ./nginx/default.no-netbird.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/locations.conf:/etc/nginx/op-locations.conf:ro
+      # The gateway's OWN edge certificate, delivered by the backend into this shared
+      # volume (OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR). The gateway is the only writer of
+      # the REAL pair; nginx only reads it (its master runs as root in
+      # nginx:1.27-alpine, so it can read the 0600 key).
+      #
+      # NOT :ro, deliberately. `ssl_certificate` pointing at a missing file is an nginx
+      # LOAD error, and this nginx is the entrance to the portal, the whole API and the
+      # login. The volume is EMPTY on a first deploy -- and stays empty as long as the
+      # certificate module is off (cert_enabled defaults to false) -- so the image
+      # entrypoint must be able to write a throwaway bootstrap pair here to keep nginx
+      # startable. A read-only mount would trade a total outage for the little that
+      # write protection buys: nginx already reads the private key, so a compromised
+      # web tier gains nothing it did not already have, and the backend rewrites the
+      # real pair on the next reconcile pass anyway.
+      # See deploy/nginx-cert-entrypoint.sh.
+      - certs:/etc/nginx/certs
+    ports:
+      # 8080 -> :80 keeps the plain listener exactly as before (the ACME HTTP-01
+      # challenge route lives there; fleet-wide renewal depends on it).
+      - "8080:80"
+      - "8443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot agent cross-compiler. Populates the agent-bin volume with the
+  # server-agent binaries + manifest.json for the portal/curl download feature.
+  # Gated by BUILD_AGENTS (default false in .env): false → instant no-op that keeps
+  # the last build (fast deploy); true → rebuilds all targets (slow). To ship a new
+  # agent: `docker compose build agent-builder && BUILD_AGENTS=true docker compose up -d`.
+  agent-builder:
+    build:
+      context: ../..
+      dockerfile: gateway/deploy/Dockerfile.agent-builder
+    environment:
+      BUILD_AGENTS: ${BUILD_AGENTS:-false}
+    volumes:
+      - agent-bin:/agents
+    restart: "no"
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    # Own netns (no `network_mode: service:netbird`); nginx reaches it as backend:8080.
+    expose:
+      - "8080"
+    env_file:
+      - .env
+    # No sidecar here → clear the shared key-file path (overrides .env) so the
+    # System-Settings "Sidecar enrollen" button hides (there is nothing to enroll).
+    # OP_AI_GATEWAY_POSTGRES_DSN is assembled from the same POSTGRES_* vars as the
+    # `db` service below (.env only, never edit here) so the two can never drift.
+    environment:
+      OP_AI_GATEWAY_NETBIRD_KEY_FILE: ""
+      OP_AI_GATEWAY_POSTGRES_DSN: postgres://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-gateway}?sslmode=disable
+    volumes:
+      - gwdata:/data
+      - agent-bin:/agents:ro
+      # Edge-certificate delivery: the gateway is the only writer of the real pair.
+      # (`web` mounts the same volume writable too, but only so its entrypoint can
+      # bootstrap when nothing has been delivered -- see the note there.)
+      # Must match OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR in .env
+      # (default /shared/certs).
+      - certs:/shared/certs
+      # External themes (OP_AI_GATEWAY_THEMES_DIR, default /themes; see
+      # deploy/themes/README.md). The image already bakes deploy/themes there
+      # (COPY in Dockerfile.backend) for the example theme. Uncomment to mount a
+      # host directory of operator/private themes over it at runtime, without
+      # rebuilding the image:
+      # - ./themes:/themes:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      agent-builder:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # PostgreSQL store (identical to docker-compose.yml).
+  db:
+    image: postgres:17-alpine
+    environment:
+      # Sourced from `.env` (POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB) -- change
+      # credentials there, never here. Defaults below match today's values exactly.
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  gwdata: {}
+  pgdata: {}
+  # Holds the cross-compiled server-agent binaries + manifest.json (written by
+  # agent-builder, served read-only by backend). Persistent so a BUILD_AGENTS=false
+  # deploy reuses the previous build.
+  agent-bin: {}
+  # The gateway's own edge certificate (edge-fullchain.pem 0644, edge-key.pem 0600,
+  # and in the self_signed issuer mode edge-ca.pem 0644): written by `backend`, read by
+  # `web` (which mounts it writable only so its entrypoint can bootstrap a throwaway
+  # pair when nothing has been delivered). Persistent on purpose, and writable by the nonroot gateway
+  # because Dockerfile.backend ships /shared/certs chowned to UID 65532 -- see the
+  # longer note on the same volume in docker-compose.yml.
+  certs: {}

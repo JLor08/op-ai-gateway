@@ -1,0 +1,6 @@
+# Operator/private themes dropped here are NOT tracked (AGPL: not published).
+*
+!.gitignore
+!README.md
+!example/
+!example/**

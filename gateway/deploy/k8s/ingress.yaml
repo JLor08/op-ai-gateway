@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Public Ingress for the gateway. It fronts the PUBLIC surface only — the portal/admin
+# UI, inference (/v1, /openai, /anthropic), and /api/** — all routed to op-gateway-web:80
+# (nginx), which reverse-proxies the backend management listener.
+#
+# The AGENT plane is NOT here: agents reach the gateway over the NetBird mesh at the
+# pod's wt0 IP (8081), never through this Ingress. (The /api/agent route is technically
+# reachable via /api/ here, but the app-layer `netbird_only` toggle 403s it on the public
+# listener — see the design spec + README.md.)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: op-gateway
+  labels:
+    app.kubernetes.io/name: op-gateway-web
+    app.kubernetes.io/part-of: op-ai-gateway
+  annotations:
+    # cert-manager: uncomment + set your issuer to auto-provision the TLS cert below.
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Inference + capture bodies can be large; lift the ingress-nginx body cap
+    # (0 = unlimited, matching the per-location client_max_body_size 0 inside nginx).
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # SSE streaming: disable proxy buffering so tokens flush immediately.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  # Set to your cluster's Ingress controller class (e.g. nginx, traefik, ...).
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - gateway.example.com
+      secretName: op-gateway-tls   # provide this Secret (or let cert-manager create it)
+  rules:
+    - host: gateway.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: op-gateway-web
+                port:
+                  number: 80

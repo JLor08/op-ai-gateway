@@ -1,0 +1,33 @@
+{{.Import "context" "go.opentelemetry.io/otel/codes"}}
+
+{{ $decorator := (or .Vars.DecoratorName (printf "%sWithTracing" .Interface.Name)) }}
+{{ $prefix := (or .Vars.Prefix .Interface.Name) }}
+
+// {{$decorator}} instruments {{.Interface.Type}} with OpenTelemetry spans
+// (one per ctx-carrying method). Non-ctx methods pass through untraced.
+type {{$decorator}} struct {
+	{{.Interface.Type}}
+}
+
+// New{{$decorator}} wraps base so every ctx-carrying call opens a span.
+func New{{$decorator}}(base {{.Interface.Type}}) {{.Interface.Type}} {
+	return &{{$decorator}}{ {{.Interface.Name}}: base }
+}
+
+{{range $method := .Interface.Methods}}
+func (_d *{{$decorator}}) {{$method.Declaration}} {
+	{{- if $method.AcceptsContext }}
+	ctx, span := Start(ctx, "{{$prefix}}.{{$method.Name}}")
+	defer span.End()
+	{{- if $method.ReturnsError }}
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	{{- end }}
+	{{- end }}
+	{{ $method.Pass (printf "_d.%s." $.Interface.Name) }}
+}
+{{end}}

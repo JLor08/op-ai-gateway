@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Persistent volumes for the op-gateway pod. Both are ReadWriteOnce (single-node),
+# which is why the op-gateway Deployment is replicas:1 + strategy Recreate — two pods
+# must never contend for the same RWO volume. The db uses its own volumeClaimTemplates
+# (see postgres.yaml).
+#
+# op-gateway-netbird-state is THE critical volume: it holds the WireGuard key + peer
+# identity (/var/lib/netbird). It MUST survive pod restart/reschedule so the peer keeps
+# the SAME NetBird IP — never delete it. See README.md "Persistence".
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: op-gateway-netbird-state
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: ""   # uncomment + set to pin a StorageClass; omitted = cluster default
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: op-gateway-data
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: op-gateway-agent-bin
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: ""

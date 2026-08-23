@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+FROM node:24-slim AS build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM nginx:1.27-alpine
+# openssl is NOT in nginx:1.27-alpine. The entrypoint needs it for two things: the
+# throwaway bootstrap certificate (so nginx can always start) and reading the
+# delivered chain's fingerprint (so a renewal reloads nginx).
+RUN apk add --no-cache openssl
+COPY --from=build /app/dist /usr/share/nginx/html/portal
+COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+# The shared location list both server blocks (:80 and :443) include. It must NOT
+# land in /etc/nginx/conf.d/: the stock nginx.conf includes conf.d/*.conf at HTTP
+# level, where `location` is illegal -- nginx would refuse to start and take the
+# portal, the API and the login with it.
+# The no-netbird compose variant bind-mounts BOTH this file and default.conf, so
+# the pair always matches; the netbird variant uses the copies baked in here.
+COPY deploy/nginx/locations.conf /etc/nginx/op-locations.conf
+
+# TLS-edge entrypoint wrapper: writes a throwaway bootstrap certificate when the
+# gateway has not delivered one yet (`ssl_certificate` on a missing file is a LOAD
+# error -- without this the :443 block would take the portal, the API and the login
+# offline on a first deploy), and reloads nginx when a renewed certificate arrives.
+COPY deploy/nginx-cert-entrypoint.sh /usr/local/bin/nginx-cert-entrypoint.sh
+RUN chmod +x /usr/local/bin/nginx-cert-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/nginx-cert-entrypoint.sh"]
+# REQUIRED: declaring ENTRYPOINT RESETS the base image's CMD to empty, so the stock
+# `nginx -g "daemon off;"` has to be restated here -- otherwise the wrapper would
+# exec the stock entrypoint with no arguments and nginx would never start.
+# (STOPSIGNAL SIGQUIT is inherited from the base image and still applies, because the
+# wrapper exec's, so nginx keeps PID 1's process and its graceful shutdown.)
+CMD ["nginx", "-g", "daemon off;"]

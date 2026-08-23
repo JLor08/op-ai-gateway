@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    volumes:
+      # The gateway's OWN edge certificate, delivered by the backend into this shared
+      # volume (OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR). The gateway is the only writer of
+      # the REAL pair; nginx only reads it (its master runs as root in
+      # nginx:1.27-alpine, so it can read the 0600 key).
+      #
+      # NOT :ro, deliberately. `ssl_certificate` pointing at a missing file is an nginx
+      # LOAD error, and this nginx is the entrance to the portal, the whole API and the
+      # login. The volume is EMPTY on a first deploy -- and stays empty as long as the
+      # certificate module is off (cert_enabled defaults to false) -- so the image
+      # entrypoint must be able to write a throwaway bootstrap pair here to keep nginx
+      # startable. A read-only mount would trade a total outage for the little that
+      # write protection buys: nginx already reads the private key, so a compromised
+      # web tier gains nothing it did not already have, and the backend rewrites the
+      # real pair on the next reconcile pass anyway.
+      # See deploy/nginx-cert-entrypoint.sh.
+      - certs:/etc/nginx/certs
+    ports:
+      # 8080 -> :80 keeps the plain listener exactly as before (the ACME HTTP-01
+      # challenge route lives there; fleet-wide renewal depends on it).
+      - "8080:80"
+      - "8443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+      netbird:
+        condition: service_started
+    restart: unless-stopped
+
+  # NetBird client sidecar (data-plane peer for the gateway). It OWNS the network
+  # namespace that `backend` shares (network_mode: service:netbird), so the gateway
+  # process sees the wt0 interface + the 100.x NetBird IP and can bind its agent
+  # listener there. The `netbird-client` named volume persists /var/lib/netbird
+  # (the WireGuard key + peer identity/config) — this is REQUIRED so the peer keeps
+  # the SAME identity/IP across container restarts and image updates. Without it,
+  # every recreate re-enrolls as a NEW peer (new IP), which breaks the gateway-peer
+  # selection + the agent-listener bind and litters the tracking group with dead
+  # peers. NEVER `docker compose down -v` this in production. See README-netbird.md.
+  netbird:
+    # Custom sidecar image = the stock NetBird client + the self-enroll entrypoint wrapper
+    # (Dockerfile.netbird). Built locally on `docker compose up`. The wrapper lets the
+    # gateway hand this sidecar a minted setup key at runtime via the shared key volume
+    # (autonomous enrollment, Phase B). To UPDATE the NetBird client, bump the base tag in
+    # Dockerfile.netbird (ARG NETBIRD_VERSION) and rebuild — nothing else changes.
+    build:
+      context: .
+      dockerfile: Dockerfile.netbird
+    # These three caps are what the official NetBird client image documents for a
+    # containerized peer (NET_ADMIN for wt0 + routes, SYS_ADMIN/SYS_RESOURCE for the
+    # WireGuard/userspace setup). Because `backend` shares this netns, keep the set
+    # minimal — do not add more. A rootless variant (netbirdio/netbird:rootless-latest)
+    # exists if your host policy forbids these.
+    # CAVEAT (autonomous / Phase-B enrollment): the gateway writes the minted key file 0600
+    # owned by the backend's (nonroot) UID; the STOCK sidecar reads it as root, so the read
+    # works. The ROOTLESS variant runs as a DIFFERENT nonroot UID and could NOT read a 0600
+    # file owned by the backend → autonomous enrollment breaks. To use rootless, give it a
+    # matching UID / `fsGroup` on the shared /shared volume, otherwise use the
+    # operator-provided NB_SETUP_KEY path (or the root variant) with it instead.
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # NB_SETUP_KEY is used ONLY when /var/lib/netbird is empty (first enrollment);
+      # with the persisted volume present it is ignored, so leaving it set is
+      # idempotent. NB_MANAGEMENT_URL: your self-hosted NetBird management URL
+      # (defaults to the NetBird cloud when empty). NB_HOSTNAME: the peer name shown
+      # in NetBird + the System-Settings gateway-peer picker.
+      NB_SETUP_KEY: ${NB_SETUP_KEY:-}
+      NB_MANAGEMENT_URL: ${NB_MANAGEMENT_URL:-}
+      NB_HOSTNAME: ${NB_HOSTNAME:-op-gateway}
+      # Autonomous enrollment (Phase B): the entrypoint wrapper WAITS for the gateway to
+      # drop a minted setup key at this path (on the shared /shared volume) on a fresh peer,
+      # then hands it to `netbird up` via NB_SETUP_KEY. Setting NB_SETUP_KEY above DISABLES
+      # this (the wrapper skips the wait and enrolls with the env key the old way). Must
+      # equal the backend's OP_AI_GATEWAY_NETBIRD_KEY_FILE (both point at the same shared
+      # file). NOTE: this is a WRAPPER-only var (NOT netbird's NB_SETUP_KEY_FILE) — netbird
+      # treats setup-key and setup-key-file as mutually exclusive, and with a shared netns a
+      # crashing `netbird up` would 502 the whole gateway; the wrapper hands netbird exactly
+      # one source (NB_SETUP_KEY) and strips any NB_SETUP_KEY_FILE.
+      NB_ENROLL_KEY_FILE: ${NB_ENROLL_KEY_FILE:-/shared/netbird-setup-key}
+    volumes:
+      - netbird-client:/var/lib/netbird
+      # Shared TRANSIENT (tmpfs) key volume: the backend writes the gateway-minted setup
+      # key here and this sidecar reads it. The two containers share a netns but NOT a
+      # filesystem, so the handoff needs a shared volume; tmpfs keeps the key in memory
+      # (it never lands on persistent disk).
+      - netbird-key:/shared
+    # The backend's management listener (0.0.0.0:8080) lives in THIS netns; nginx
+    # reaches it as http://netbird:8080. The agent listener binds the wt0 100.x IP
+    # only (selected in System Settings) and is therefore never on the compose
+    # bridge — reachable exclusively over the mesh by construction.
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  # One-shot agent cross-compiler. Populates the agent-bin volume with the
+  # server-agent binaries + manifest.json for the portal/curl download feature.
+  # Gated by BUILD_AGENTS (default false in .env): false → instant no-op that keeps
+  # the last build (fast deploy); true → rebuilds all targets (slow). To ship a new
+  # agent: `docker compose build agent-builder && BUILD_AGENTS=true docker compose up -d`.
+  agent-builder:
+    build:
+      context: ../..
+      dockerfile: gateway/deploy/Dockerfile.agent-builder
+    environment:
+      BUILD_AGENTS: ${BUILD_AGENTS:-false}
+    volumes:
+      - agent-bin:/agents
+    restart: "no"
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    # Share the NetBird sidecar's network namespace (wt0 + the 100.x IP become local
+    # interfaces). This inherits netbird's networks/ports, so `backend` must NOT
+    # declare its own `expose`/`networks`; nginx proxies to `netbird:8080` instead of
+    # `backend:8080`. `db` is still resolvable because `netbird` is on the compose
+    # network. On a NetBird image update the netns is recreated, so `backend` is
+    # recreated too (compose handles the ordering).
+    network_mode: "service:netbird"
+    env_file:
+      - .env
+    # Assembled from the same POSTGRES_* vars as the `db` service below (.env only,
+    # never edit here) so the two can never drift apart.
+    environment:
+      OP_AI_GATEWAY_POSTGRES_DSN: postgres://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-gateway}?sslmode=disable
+    volumes:
+      - gwdata:/data
+      - agent-bin:/agents:ro
+      # Shared TRANSIENT key volume (see the netbird service). The backend writes the
+      # gateway-minted setup key here at OP_AI_GATEWAY_NETBIRD_KEY_FILE (set in .env,
+      # default /shared/netbird-setup-key); the waiting sidecar reads it and enrolls.
+      - netbird-key:/shared
+      # Edge-certificate delivery: the gateway is the only writer of the real pair.
+      # (`web` mounts the same volume writable too, but only so its entrypoint can
+      # bootstrap when nothing has been delivered -- see the note there.)
+      # Must match OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR in .env
+      # (default /shared/certs). Mounted at a path INSIDE the netbird-key mount
+      # above; Docker applies mounts in path order, so the nesting is fine.
+      - certs:/shared/certs
+      # External themes (OP_AI_GATEWAY_THEMES_DIR, default /themes; see
+      # deploy/themes/README.md). The image already bakes deploy/themes there
+      # (COPY in Dockerfile.backend) for the example theme. Uncomment to mount a
+      # host directory of operator/private themes over it at runtime, without
+      # rebuilding the image:
+      # - ./themes:/themes:ro
+    depends_on:
+      # service_started (not _healthy): the netbird client has no built-in
+      # healthcheck. The Phase-1 agent listener fails SAFE if wt0/the selected peer
+      # isn't ready yet at boot (it degrades to the single public listener), so a
+      # brief race is non-fatal — verify GET /api/system/netbird/status (or the
+      # System-Settings status note) and restart the backend if the agent listener
+      # did not bind. See README-netbird.md for an optional `netbird status`
+      # healthcheck to make the backend wait for the mesh automatically.
+      netbird:
+        condition: service_started
+      db:
+        condition: service_healthy
+      agent-builder:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # PostgreSQL store (the .env default: OP_AI_GATEWAY_DB_DRIVER=postgres). The
+  # backend waits for this to be healthy, then auto-migrates the schema on start.
+  db:
+    image: postgres:17-alpine
+    environment:
+      # Sourced from `.env` (POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB) -- change
+      # credentials there, never here. Defaults below match today's values exactly.
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  gwdata: {}
+  pgdata: {}
+  # Holds the cross-compiled server-agent binaries + manifest.json (written by
+  # agent-builder, served read-only by backend). Persistent so a BUILD_AGENTS=false
+  # deploy reuses the previous build.
+  agent-bin: {}
+  # Persists the NetBird peer identity/state across restarts + updates (critical).
+  netbird-client: {}
+  # The gateway's own edge certificate (edge-fullchain.pem 0644, edge-key.pem 0600,
+  # and in the self_signed issuer mode edge-ca.pem 0644): written by `backend`, read by
+  # `web` (which mounts it writable only so its entrypoint can bootstrap a throwaway
+  # pair when nothing has been delivered). A PERSISTENT named volume on purpose -- with a transient one
+  # every cold start would serve the entrypoint's untrusted bootstrap certificate
+  # until the backend's startup delivery caught up, and a verifying upstream proxy
+  # rejects that, i.e. the edge would be down for that window on every restart.
+  # Writability note: the volume initializes from the backend image's /shared/certs,
+  # which Dockerfile.backend chowns to the nonroot UID (65532) exactly like /data --
+  # a volume created at a path absent from the image comes up root:root 0755 and the
+  # nonroot gateway could never write the certificate.
+  certs: {}
+  # Shared TRANSIENT (in-memory tmpfs) volume for the gateway-minted setup-key handoff
+  # between `backend` (writer) and `netbird` (reader). tmpfs = the key never touches
+  # persistent disk. As a NAMED volume it survives `up`/restart/`down` (without `-v`) — it
+  # does NOT "start empty on every up"; its contents only vanish on first creation,
+  # `docker compose down -v`, or a host reboot that drops the tmpfs backing. That's fine:
+  # correctness does NOT depend on `/shared` being empty. The real re-wait gate is the
+  # wrapper's MARKER on the PERSISTENT /var/lib/netbird volume (netbird-client), not this
+  # volume — a lingering, already-consumed single-use key here is harmless (the wrapper
+  # only waits when the marker is absent). This transient volume exists solely to keep the
+  # minted (single-use, consumed) key off persistent disk. A tmpfs-backed NAMED volume (not
+  # a per-service `tmpfs:` mount) is required so both containers share the SAME in-memory
+  # filesystem.
+  netbird-key:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs

@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+FROM golang:1.25 AS builder
+WORKDIR /src
+COPY backend/go.mod backend/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY backend/ ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /gateway ./cmd/gateway
+RUN mkdir -p /data /shared/certs
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /gateway /gateway
+COPY --from=builder --chown=65532:65532 /data /data
+# Baked external themes (see gateway/deploy/themes/README.md). Matches the
+# default OP_AI_GATEWAY_THEMES_DIR=/themes. Path is relative to this build's
+# context (gateway/), i.e. gateway/deploy/themes -- NOT copied from the
+# builder stage since it is plain data, not a build artifact. A deploy-time
+# volume/ConfigMap mount at /themes (see docker-compose.yml / k8s/gateway.yaml)
+# overlays or replaces these baked themes without rebuilding the image.
+COPY --chown=65532:65532 deploy/themes /themes
+# Edge-certificate output directory (OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR, compose
+# default /shared/certs), shared read-only with the nginx container. Present in the
+# image and chowned to the nonroot UID for the SAME reason as /data above: Docker
+# initializes a fresh named volume from the image's content AND ownership at the
+# mount path, and a volume created at a path the image does not have comes up
+# root:root 0755 -- which this nonroot (65532) process cannot write, so the
+# certificate would never reach nginx. Verified empirically, not assumed.
+COPY --from=builder --chown=65532:65532 /shared/certs /shared/certs
+USER nonroot
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD ["/gateway", "-healthcheck"]
+ENTRYPOINT ["/gateway"]

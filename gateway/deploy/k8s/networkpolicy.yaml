@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# NetworkPolicies hardening the cluster-network (eth0) plane. These require a CNI that
+# ENFORCES NetworkPolicy (Calico, Cilium, ...); on a CNI that ignores them they are a
+# harmless no-op.
+#
+# IMPORTANT SCOPE LIMIT: a NetworkPolicy governs the pod's cluster interface (eth0) only.
+# The agent listener binds the NetBird wt0 interface (8081), which is OUTSIDE the cluster
+# CNI — so NetworkPolicy CANNOT govern the agent plane. Agent-plane isolation comes from
+# the wt0-only socket bind + the NetBird ACL + the host firewall (see README.md). These
+# policies are defense-in-depth on eth0 only.
+---
+# op-gateway: default-deny ingress except from the web tier -> 8080 (management).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: op-gateway
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: op-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the web (nginx) pods may reach the management listener on 8080.
+    # (Agent traffic arrives on wt0, not eth0, so it is unaffected by this rule.)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: op-gateway-web
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution (cluster DNS in kube-system, or wherever).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Everything else the gateway must dial on eth0: PostgreSQL (op-gateway-db:5432), the
+    # NetBird management server + STUN/TURN over the internet, and translate-path upstreams.
+    # (Traffic to AI-server apps over the mesh leaves via wt0 and is not governed here.)
+    - {}
+---
+# op-gateway-db: only the gateway pod may reach PostgreSQL.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: op-gateway-db
+  labels:
+    app.kubernetes.io/name: op-gateway-db
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: op-gateway-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: op-gateway
+      ports:
+        - protocol: TCP
+          port: 5432

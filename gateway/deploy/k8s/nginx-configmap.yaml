@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# nginx config for the op-gateway-web pod (SPA + reverse proxy). Two keys, both
+# mounted by web.yaml via subPath:
+#   default.conf   -> /etc/nginx/conf.d/default.conf  (over the image's server block)
+#   locations.conf -> /etc/nginx/op-locations.conf    (the shared location list)
+#
+# Copied from gateway/deploy/nginx/{default,locations}.conf, but adapted for
+# Kubernetes: a STATIC per-location `proxy_pass http://op-gateway-backend:8080;`
+# (the backend ClusterIP Service) instead of the compose `set $backend http://netbird:8080;`
+# variable. Because the upstream is a fixed literal (not a variable), nginx resolves the
+# Service DNS name once at startup — so NO `resolver` directive is needed. Service DNS
+# (op-gateway-backend.op-ai-gateway.svc.cluster.local) is stable for the Service's lifetime;
+# individual backend pod restarts sit behind the ClusterIP and never change the name.
+# That literal is also why this ConfigMap needs its OWN copy of the location list
+# rather than mounting the compose locations.conf.
+#
+# The include lands at /etc/nginx/op-locations.conf, NOT under /etc/nginx/conf.d/:
+# the stock nginx.conf does `include /etc/nginx/conf.d/*.conf;` at HTTP level, where
+# `location` is not allowed — a conf.d/locations.conf would stop nginx from starting
+# and take the portal, the API and the login down with it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: op-gateway-nginx
+  labels:
+    app.kubernetes.io/name: op-gateway-web
+    app.kubernetes.io/part-of: op-ai-gateway
+data:
+  default.conf: |
+    # X-Forwarded-Proto: prefer what the UPSTREAM proxy (Ingress) sent and fall back
+    # to this hop's own scheme. Before this map nginx always overwrote the header with
+    # $scheme, i.e. always "http" here -- which made every URL the gateway derives
+    # from it (e.g. the agent config's gateway_url) wrong behind a TLS-terminating
+    # Ingress. This header is therefore client-influenced BY DESIGN; the unforgeable
+    # statement about the last hop is X-OP-Edge-Scheme (set, never blanked, below).
+    map $http_x_forwarded_proto $op_fwd_proto {
+        default $http_x_forwarded_proto;
+        ""      $scheme;
+    }
+
+    server {
+        listen 80;
+        server_tokens off;
+        root /usr/share/nginx/html;
+
+        gzip on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        # The gateway management listener runs in the op-gateway pod, exposed by the
+        # op-gateway-backend ClusterIP Service on :8080.
+        # NOTE: /api/agent/v1/telemetry IS still proxied here via `location /api/`
+        # (locations.conf). Its NetBird-only isolation is NOT enforced by nginx — it is
+        # enforced at the app layer (the gateway returns 403 netbird.only on this public
+        # listener when the runtime `netbird_only` toggle is on) PLUS the NetBird
+        # ACL/host-firewall ceiling. The gateway ALSO binds a second listener on the wt0
+        # NetBird IP for agents on the mesh; that one is never on the cluster network and
+        # is not proxied here.
+
+        # Streaming-safe proxy defaults (inherited by the backend locations below).
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $op_fwd_proto;
+        # Defense in depth: the internal trusted-loopback auth headers must ONLY ever
+        # come from the gateway calling itself over loopback. Blank them on every
+        # proxied request so an external client can never inject them via the proxy.
+        proxy_set_header X-OP-Internal-Auth "";
+        proxy_set_header X-OP-Internal-User "";
+        # Same defense in depth for the server_override feature: these headers let
+        # the gateway's own background chat-run executor (calling itself over the
+        # internal trusted-loopback path above) pin a request to one specific
+        # AI-server. They must never be settable by an external client -- blank
+        # them here too (the Go re-authorization gate, AuthorizeServerManage, is
+        # the actual boundary; this just removes the header at the edge entirely).
+        proxy_set_header X-OP-Server-Override "";
+        proxy_set_header X-OP-Server-Override-Force "";
+        # The gateway's own synthetic TLS self-probe marker. Blanked like the internal
+        # headers above: it SUPPRESSES an observation of encrypted traffic (so the probe
+        # cannot satisfy the arming precondition it exists to diagnose), which means a
+        # client that sets it can suppress the gateway's own https observations while
+        # sending plaintext -- on a quiet gateway that makes an armed plaintext gate
+        # extinguish itself against the attacker. Bounded by the fail-safe (worst case is
+        # a denial of ARMING, never a bypass), but free to close at the edge.
+        proxy_set_header X-OP-Edge-Self-Probe "";
+        # The last hop's real scheme. SET from $scheme, never blanked: this is the
+        # gateway's only trustworthy statement about whether the request reached
+        # nginx over TLS, so a client-supplied value must be OVERWRITTEN (which
+        # setting it does) rather than cleared. A blank would make it useless.
+        proxy_set_header X-OP-Edge-Scheme $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+
+        include /etc/nginx/op-locations.conf;
+    }
+
+    # TLS listener. Unlike compose, the gateway CANNOT write this certificate itself
+    # here — the web pod has no writable volume — so the operator creates the
+    # `op-gateway-edge-tls` Secret from the portal download (see web.yaml) and it is
+    # mounted read-only at /etc/nginx/certs.
+    #
+    # `listen 80` above is UNCHANGED: the ACME HTTP-01 challenge route lives there and
+    # certificate renewal for the whole fleet depends on it.
+    server {
+        listen 443 ssl;
+        http2 on;   # nginx >= 1.25.1 (image: nginx:1.27-alpine)
+        server_tokens off;
+        root /usr/share/nginx/html;
+
+        gzip on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        ssl_certificate     /etc/nginx/certs/edge-fullchain.pem;
+        ssl_certificate_key /etc/nginx/certs/edge-key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:SSL:10m;
+
+        # Identical proxy defaults to the :80 block. Every proxy_set_header block must
+        # carry ALL six X-OP-* directives, because setting any header discards the
+        # inherited set -- see the comments on the :80 block for what each is for.
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $op_fwd_proto;
+        proxy_set_header X-OP-Internal-Auth "";
+        proxy_set_header X-OP-Internal-User "";
+        proxy_set_header X-OP-Server-Override "";
+        proxy_set_header X-OP-Server-Override-Force "";
+        # The gateway's own synthetic TLS self-probe marker. Blanked like the internal
+        # headers above: it SUPPRESSES an observation of encrypted traffic (so the probe
+        # cannot satisfy the arming precondition it exists to diagnose), which means a
+        # client that sets it can suppress the gateway's own https observations while
+        # sending plaintext -- on a quiet gateway that makes an armed plaintext gate
+        # extinguish itself against the attacker. Bounded by the fail-safe (worst case is
+        # a denial of ARMING, never a bypass), but free to close at the edge.
+        proxy_set_header X-OP-Edge-Self-Probe "";
+        proxy_set_header X-OP-Edge-Scheme $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+
+        include /etc/nginx/op-locations.conf;
+    }
+  # The shared location list, included by BOTH server blocks above. Mounted at
+  # /etc/nginx/op-locations.conf. Kept in sync with gateway/deploy/nginx/locations.conf;
+  # the only difference is the literal proxy_pass (see the header comment).
+  locations.conf: |
+    location = / {
+        return 302 /portal/;
+    }
+
+    location /portal/ {
+        try_files $uri $uri/ /portal/index.html;
+    }
+
+    location ~* ^/portal/assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # WebSocket agent-telemetry stream: needs the Upgrade/Connection headers, which
+    # the server-level `proxy_set_header Connection "";` would otherwise clear.
+    # Setting ANY proxy_set_header here discards the whole inherited set, so all of
+    # them are re-declared -- including the six X-OP-* directives (the five
+    # blankings plus X-OP-Edge-Scheme). See the server blocks for what each one is for.
+    location = /api/agent/v1/stream {
+        proxy_pass http://op-gateway-backend:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $op_fwd_proto;
+        proxy_set_header X-OP-Internal-Auth "";
+        proxy_set_header X-OP-Internal-User "";
+        proxy_set_header X-OP-Server-Override "";
+        proxy_set_header X-OP-Server-Override-Force "";
+        # The gateway's own synthetic TLS self-probe marker. Blanked like the internal
+        # headers above: it SUPPRESSES an observation of encrypted traffic (so the probe
+        # cannot satisfy the arming precondition it exists to diagnose), which means a
+        # client that sets it can suppress the gateway's own https observations while
+        # sending plaintext -- on a quiet gateway that makes an armed plaintext gate
+        # extinguish itself against the attacker. Bounded by the fail-safe (worst case is
+        # a denial of ARMING, never a bypass), but free to close at the edge.
+        proxy_set_header X-OP-Edge-Self-Probe "";
+        proxy_set_header X-OP-Edge-Scheme $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    # ACME HTTP-01: Let's Encrypt fetches the challenge token anonymously over
+    # plain :80 for every managed name (*.int.<domain> plus, optionally, the
+    # public domain). The Ingress must forward this path for those hosts too.
+    # The gateway answers only tokens of its OWN in-flight orders. In the
+    # self-signed issuer mode no order ever runs, so this location simply 404s --
+    # it is harmless to keep enabled either way.
+    location /.well-known/acme-challenge/ { proxy_pass http://op-gateway-backend:8080; }
+
+    location /api/       { proxy_pass http://op-gateway-backend:8080; }
+    # Inference endpoints carry base64 image data — no body cap (the Go layer keeps
+    # control-plane endpoints at 1 MiB); matches llama-swap's unbounded proxy behavior.
+    location /v1/        { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }
+    location /openai/    { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }
+    location /anthropic/ { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }
+    location /healthz    { proxy_pass http://op-gateway-backend:8080; }

@@ -1,0 +1,4 @@
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="qwen"} 3.0
+vllm:num_requests_waiting{model_name="qwen"} 1.0

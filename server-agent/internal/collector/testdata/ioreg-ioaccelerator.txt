@@ -1,0 +1,38 @@
++-o AGXAcceleratorG16X  <class AGXAcceleratorG16X, id 0x10000073e, registered, matched, active, busy 0 (9416 ms), retain 56>
+    {
+      "SchedulerState" = {"Stamps"=(),"BusyWorkQueues"=()}
+      "IOMatchedAtBoot" = Yes
+      "vendor-id" = <6b100000>
+      "GPURawCounterBundleName" = "AGXGPURawCounterBundle"
+      "AGXParameterBufferMaxSizeEverMemless" = 1296302080
+      "GPURawCounterPluginClassName" = "AGXGPURawCounterSourceGroup"
+      "MetalPluginClassName" = "AGXG16CDevice"
+      "SCMVersionNumber" = ""
+      "AGCInfo" = {"fLastSubmissionPID"=461,"fSubmissionsSinceLastCheck"=0,"fBusyCount"=0}
+      "CommandSubmissionEnabled" = Yes
+      "IONameMatched" = "gpu,t6041"
+      "MetalPluginName" = "AGXMetalG16X"
+      "PerformanceStatistics" = {"In use system memory (driver)"=0,"Alloc system memory"=3171975168,"Tiler Utilization %"=0,"recoveryCount"=0,"lastRecoveryTime"=0,"Renderer Utilization %"=0,"TiledSceneBytes"=0,"Device Utilization %"=0,"SplitSceneCount"=0,"Allocated PB Size"=118489088,"In use system memory"=28360704}
+      "IOGLBundleName" = "AppleMetalOpenGLRenderer"
+      "AGXParameterBufferMaxSizeNeverMemless" = 648151040
+      "IOGLESBundleName" = "AppleMetalGLRenderer"
+      "IOSourceVersion" = "351.2"
+      "IOPersonalityPublisher" = "com.apple.AGXG16X"
+      "IOPowerManagement" = {"CurrentPowerState"=1,"CapabilityFlags"=2,"MaxPowerState"=1,"DriverPowerState"=1}
+      "model" = "Apple M4 Max"
+      "AGXTraceCodeVersion" = "3.44.6"
+      "SCMBuildTime" = ""
+      "CFBundleIdentifier" = "com.apple.AGXG16X"
+      "gpu-core-count" = 32
+      "IOProviderClass" = "AppleARMIODevice"
+      "AGXParameterBufferMaxSize" = 1944453120
+      "IONameMatch" = ("gpu,t8015","gpu,t8027","gpu,t8030","gpu,t8103","gpu,t6031","gpu,t6040","gpu,t6041")
+      "IOReportLegendPublic" = Yes
+      "IOClass" = "AGXAcceleratorG16X"
+      "CFBundleIdentifierKernel" = "com.apple.AGXG16X"
+      "IOGeneralInterest" = "IOCommand is not serializable"
+      "IOMatchCategory" = "IOAccelerator"
+      "IOProbeScore" = 10000
+      "KDebugVersion" = 4294967296
+      "SurfaceList" = ()
+    }
