@@ -109,7 +109,11 @@ type Request struct {
 	ID        string `json:"id,omitempty"`
 	APIFlavor string `json:"api_flavor"`
 	Model     string `json:"model"`
-	SessionID string `json:"session_id,omitempty"`
+	// RequestedModel is the model name exactly as the client sent it, before
+	// any token model override rewrote Model. Recorded on the usage event so
+	// the activity list can show the pre-override name (issue #7).
+	RequestedModel string `json:"-"`
+	SessionID      string `json:"session_id,omitempty"`
 	// ClientSessionID is the best-effort session id EXTRACTED from the client's
 	// natural signal (explicit X-OP-AI-Gateway-Session-ID header, Codex session_id
 	// header / prompt_cache_key, Claude Code x-claude-code-session-id, portal chat

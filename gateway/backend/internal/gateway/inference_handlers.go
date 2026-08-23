@@ -430,6 +430,7 @@ type preflight struct {
 // exactly once, instead of re-deriving any of these fields itself.
 func (pf preflight) mergeInto(req inference.Request) inference.Request {
 	req.Model = pf.Req.Model
+	req.RequestedModel = pf.Req.RequestedModel
 	req.ServerOverrideID = pf.Req.ServerOverrideID
 	req.ServerOverrideForceUnreachable = pf.Req.ServerOverrideForceUnreachable
 	req.SessionID = pf.Req.SessionID
@@ -485,7 +486,7 @@ type inferenceShape struct {
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
-	req := inference.Request{Model: resolveModelOverride(token, shape.model), APIFlavor: shape.apiFlavor, Stream: shape.stream}
+	req := inference.Request{Model: resolveModelOverride(token, shape.model), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream}
 	req, sErr := s.applyServerOverride(r.Context(), r, token, req)
 	if sErr != nil {
 		writeServerOverrideForbidden(w)

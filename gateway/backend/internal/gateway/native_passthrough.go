@@ -185,6 +185,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	si := extractClientSession(r.Header, raw, nativeEndpoint)
 	req := inference.Request{
 		Model:           pfReq.Model,
+		RequestedModel:  pfReq.RequestedModel,
 		APIFlavor:       pfReq.APIFlavor,
 		Stream:          pfReq.Stream,
 		SessionID:       si.ExplicitHeader,
