@@ -30,7 +30,7 @@ AGPL-3.0 §13 requires that users interacting with the software remotely over a 
 flowchart LR
     subgraph Runtime["Running product"]
         Footer["Portal footer<br/>(gateway/frontend/src/App.tsx)"]
-        Flag["`-license` flag<br/>(cmd/gateway, server-agent)"]
+        Flag["-license flag<br/>(cmd/gateway, server-agent)"]
         Log["Startup log line<br/>(cmd/gateway/main.go, server-agent/main.go)"]
     end
     Footer -->|"copyright · AGPL-3.0 link · source repo link"| User["Portal user (any browser session)"]

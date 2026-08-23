@@ -434,7 +434,7 @@ delegate straight up to it:
 flowchart LR
     M["authorizeMapping"] --> A["authorizeApplication"]
     A --> S["authorizeServer"]
-    S --> D{"principal.HasScope\n(\"system\")?"}
+    S --> D{"principal.HasScope\n('system')?"}
     D -- yes --> OK["authorized"]
     D -- no --> E{"principal.UserID in\nserver_owners?"}
     E -- yes --> OK

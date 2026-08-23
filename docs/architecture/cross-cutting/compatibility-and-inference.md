@@ -291,12 +291,12 @@ sequenceDiagram
     participant P as Provider (upstream)
 
     C->>G: POST /v1/responses (stream:true)
-    G->>G: liftInferenceDeadlines(w)\n(clear 30s read/write deadline)
+    G->>G: liftInferenceDeadlines(w)<br/>(clear 30s read/write deadline)
     G->>G: Resolver.Resolve → Target
     G->>C: 200 + text/event-stream headers
     G->>P: CompleteStream(ctx, target, req, emit)
     activate G
-    Note over G: idle watchdog timer armed\n(streamIdleTimeout, default 120s; 0 = disabled)
+    Note over G: idle watchdog timer armed<br/>(streamIdleTimeout, default 120s, 0 = disabled)
     loop per upstream chunk
         P->>G: StreamEvent{text_delta / tool_call}
         G->>G: watchdog.Reset(idle)
