@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+#
+# Pre-commit hook: Go format check + lint on both modules. Install with
+# `make hooks` (sets core.hooksPath). Skip a single commit with `--no-verify`.
+set -euo pipefail
+
+# Only run when Go files are staged.
+if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.go$'; then
+  exit 0
+fi
+
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  echo "pre-commit: golangci-lint not found — run 'make lint-install' (or commit with --no-verify)" >&2
+  exit 1
+fi
+
+root="$(git rev-parse --show-toplevel)"
+for mod in gateway/backend server-agent; do
+  ( cd "$root/$mod" && golangci-lint fmt --diff >/dev/null 2>&1 ) || {
+    echo "pre-commit: $mod is not formatted — run 'make fmt'" >&2; exit 1; }
+  ( cd "$root/$mod" && golangci-lint run ) || {
+    echo "pre-commit: $mod has lint findings — fix them or 'make lint-fix'" >&2; exit 1; }
+done

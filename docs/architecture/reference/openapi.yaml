@@ -1,0 +1,1435 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+#
+# Machine-readable index of the gateway's HTTP surface. The canonical prose
+# reference — auth modes, scopes, object-level authorization, dual-mux agent
+# dispatch — is api-surface.md in this directory; keep both in sync (routes
+# are registered in gateway/backend/internal/gateway/server.go).
+#
+# Scope: this spec is deliberately PATH-LEVEL. It lists every registered
+# route with its verified methods, auth requirements, and purpose. Request/
+# response bodies are typed loosely (the DTOs live in the Go code and change
+# with it); only small, stable payloads are modeled as concrete schemas.
+# Sub-resources that api-surface.md summarizes as "+ sub-paths" are
+# enumerated in the parent path's description instead of being guessed here.
+openapi: 3.1.0
+info:
+  title: OnPrem AI Gateway HTTP API
+  version: 0.1.0
+  description: >
+    HTTP surface of the OnPrem AI Gateway: OpenAI/Anthropic-compatible
+    inference endpoints, the portal application API, system administration,
+    and the ServerAgent ingest API. Error responses use the stable-code
+    envelope `{"error":{"code","message","request_id?"}}`. Session-based
+    non-GET/HEAD/OPTIONS requests additionally require the `X-OP-CSRF: 1`
+    header. See docs/architecture/reference/api-surface.md for the canonical
+    description of auth modes, scopes, and object-level authorization.
+  license:
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development gateway (make run-gateway / make dev)
+  - url: /
+    description: >
+      Bundled deployment — nginx proxies /api/, /v1/, /openai/, /anthropic/,
+      /healthz, and the ACME challenge path to the backend and serves the SPA
+      at /portal/.
+
+tags:
+  - name: inference
+    description: OpenAI/Anthropic/Codex/Claude-Code-compatible endpoints
+  - name: auth
+    description: Login, logout, session state, invite-token password set
+  - name: portal
+    description: Authenticated application API (/api/portal/*)
+  - name: system
+    description: System administration (scope `system` = system_admin role + step-up elevation)
+  - name: agent
+    description: ServerAgent ingest and distribution (/api/agent/v1/*, agent-token bearer)
+  - name: health
+    description: Liveness and public infrastructure endpoints
+
+security: []
+
+paths:
+  # ── 1. Inference / compatibility ─────────────────────────────────────────
+  /v1/chat/completions:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible chat completions (streaming supported)
+      description: >
+        Session-or-bearer, scope `gateway:use` or `llm:invoke`. The only
+        inference path that also accepts the portal session (portal chat runs
+        use it over the internal loopback path). Alias: /openai/v1/chat/completions.
+      security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/chat/completions:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/chat/completions
+      security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/responses:
+    post:
+      tags: [inference]
+      summary: OpenAI Responses API (Codex)
+      description: >
+        Bearer-only, scope `gateway:use` or `llm:invoke`. Attempts native
+        passthrough to an upstream that speaks the Responses API before
+        falling back to translation. Alias: /openai/v1/responses.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/responses:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/responses
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/messages:
+    post:
+      tags: [inference]
+      summary: Anthropic Messages API (Claude Code)
+      description: >
+        Bearer-only, scope `gateway:use` or `llm:invoke`. Native passthrough
+        when the target application supports it — the only path where
+        Anthropic streaming works end-to-end. Alias: /anthropic/v1/messages.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /anthropic/v1/messages:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/messages
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/messages/count_tokens:
+    post:
+      tags: [inference]
+      summary: Anthropic token counting (no upstream inference, no billing)
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /anthropic/v1/messages/count_tokens:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/messages/count_tokens
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/models:
+    get:
+      tags: [inference]
+      summary: OpenAI-shaped model listing
+      description: >
+        Bearer-only. Discovery is unfiltered by a service token's own
+        allowlist but IS filtered by resource-group provisioning visibility.
+        Alias: /openai/v1/models.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/models:
+    get:
+      tags: [inference]
+      summary: Alias of /v1/models
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /anthropic/v1/models:
+    get:
+      tags: [inference]
+      summary: Anthropic-shaped model listing
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v0/models:
+    get:
+      tags: [inference]
+      summary: LM Studio-shaped model listing (emulated metadata only)
+      description: >
+        For LM-Studio-aware clients such as opencode; actual chat still goes
+        over /v1/chat/completions.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── 2. Auth ───────────────────────────────────────────────────────────────
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: Password login; sets the session cookie on success
+      description: 'Public, but requires the `X-OP-CSRF: 1` header.'
+      security: [{ csrfHeader: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      summary: Clears the current session
+      security: [{ sessionCookie: [], csrfHeader: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/auth/session:
+    get:
+      tags: [auth]
+      summary: Current auth state (never errors on "not logged in")
+      description: >
+        Reports `authenticated`, the current-user DTO, and the default
+        language — used by the SPA on load.
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/auth/set-password:
+    post:
+      tags: [auth]
+      summary: Consume a one-time set-password/invite token to set a password
+      security: [{ csrfHeader: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+
+  # ── 3. Portal: account, session, preferences ─────────────────────────────
+  /api/portal/me:
+    get:
+      tags: [portal]
+      summary: Current user DTO (role, elevation state, TOTP mode, …)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/portal/password:
+    post:
+      tags: [portal]
+      summary: Change own password (CSRF-enforced)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/language:
+    get:
+      tags: [portal]
+      summary: Own preferred language
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Set own preferred language
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/currency:
+    get:
+      tags: [portal]
+      summary: System-wide EUR→USD display factor
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/preferences:
+    get:
+      tags: [portal]
+      summary: All own per-key UI preferences
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/preferences/{key}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: One opaque per-key UI preference
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Set one opaque per-key UI preference
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/chat-settings:
+    put:
+      tags: [portal]
+      summary: Own default chat run settings
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/system-admin-mode:
+    post:
+      tags: [portal]
+      summary: Enter System-Admin step-up elevation
+      description: >
+        Requires role `system_admin`; may require re-entering the password
+        per system setting.
+      security: [{ sessionCookie: [], csrfHeader: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [portal]
+      summary: Leave System-Admin step-up elevation
+      security: [{ sessionCookie: [], csrfHeader: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/totp:
+    get:
+      tags: [portal]
+      summary: TOTP 2FA status
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Disable TOTP 2FA
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/totp/{action}:
+    post:
+      tags: [portal]
+      summary: TOTP enroll/confirm
+      parameters:
+        - { name: action, in: path, required: true, schema: { type: string, enum: [enroll, confirm] } }
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+
+  # ── 3. Portal: tokens, chats, usage ───────────────────────────────────────
+  /api/portal/tokens:
+    get:
+      tags: [portal]
+      summary: List own API tokens
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create an API token
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/tokens/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [portal]
+      summary: Update an own API token
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete an own API token
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/tokens/{id}/rotate:
+    post:
+      tags: [portal]
+      summary: Rotate an own API token
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/chats:
+    get:
+      tags: [portal]
+      summary: List own portal chats
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a portal chat
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/chats/{id}:
+    description: >
+      Chat detail plus run sub-paths (run start, SSE run events, run cancel)
+      under /api/portal/chats/{id}/runs… — see api-surface.md.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Chat detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Update a chat
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a chat
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage:
+    get:
+      tags: [portal]
+      summary: Own usage analytics (fleet-wide with `admin` scope + scope=all)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/stats:
+    get:
+      tags: [portal]
+      summary: Usage statistics
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/groups:
+    get:
+      tags: [portal]
+      summary: Usage grouped (by model/server/…)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/timeseries:
+    get:
+      tags: [portal]
+      summary: Usage time series
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/events:
+    get:
+      tags: [portal]
+      summary: Usage event list
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/active:
+    get:
+      tags: [portal]
+      summary: Currently in-flight requests (own; all with `admin` scope)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/usage/captures/{id}:
+    get:
+      tags: [portal]
+      summary: Read a captured request/response payload (capture must be enabled)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/benchmarks/active:
+    get:
+      tags: [portal]
+      summary: Currently running benchmark jobs (visibility-filtered)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/dashboard:
+    get:
+      tags: [portal]
+      summary: Aggregated dashboard payload
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+
+  # ── 3. Portal: models, servers, applications, mappings ───────────────────
+  /api/portal/models:
+    get:
+      tags: [portal]
+      summary: Model catalog visible to the caller
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/model-servers:
+    get:
+      tags: [portal]
+      summary: Servers offering a given model + live benchmark/loaded state
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/model-servers/events:
+    get:
+      tags: [portal]
+      summary: SSE push on model load-state change
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/SSE' }
+  /api/portal/model-group-servers:
+    get:
+      tags: [portal]
+      summary: Candidate servers for a model group, resolver-ranked
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/model-groups:
+    get:
+      tags: [portal]
+      summary: List model groups (admin)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [portal]
+      summary: Create a model group (admin)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/portal/model-groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Model-group detail (admin)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Update a model group (admin)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a model group (admin)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/model-settings/{name}:
+    put:
+      tags: [portal]
+      summary: Set a model's visibility (admin)
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/portal/servers:
+    get:
+      tags: [portal]
+      summary: List AI servers (object-level visibility inside portal.Service)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Register an AI server
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/servers/{id}:
+    description: >
+      Per-server management surface. Sub-paths (see api-surface.md):
+      energy, admin-groups, applications, agent-token, resource-groups,
+      models, certificate, https-switch-override, ping.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Server detail (ownership-checked, no-existence-leak 404)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [portal]
+      summary: Update a server
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a server
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/applications/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Application (inference backend) detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    patch:
+      tags: [portal]
+      summary: Update an application
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete an application
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/mappings/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [portal]
+      summary: Update a model mapping
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a model mapping
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/agent-binaries:
+    get:
+      tags: [portal]
+      summary: List ServerAgent release binaries for manual install
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/agent-binaries/{path}:
+    get:
+      tags: [portal]
+      summary: Download a ServerAgent release binary
+      parameters:
+        - { name: path, in: path, required: true, schema: { type: string } }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { description: Binary stream, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── 3. Portal: groups, projects, services, resource-groups ───────────────
+  /api/portal/groups:
+    description: >
+      User-group collection. Per-group sub-paths (see api-surface.md):
+      members, managers, candidates, accept, decline.
+    get:
+      tags: [portal]
+      summary: List user groups
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a user group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/groups/invitations:
+    get:
+      tags: [portal]
+      summary: Caller's own pending group invitations
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Group detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Update a group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/projects:
+    description: >
+      Project collection. Per-project sub-paths (see api-surface.md):
+      members, candidates, groups, tokens.
+    get:
+      tags: [portal]
+      summary: List projects
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a project
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/projects/mine:
+    get:
+      tags: [portal]
+      summary: Projects the caller belongs to
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/projects/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Project detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Update a project (incl. ownership transfer)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a project
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/services:
+    description: >
+      Service (service-account) collection. Per-service sub-paths (see
+      api-surface.md): tokens, admin-groups.
+    get:
+      tags: [portal]
+      summary: List services
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a service
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/services/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Service detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Update a service
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a service
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/resource-groups:
+    description: >
+      Resource-group collection. Per-resource-group sub-paths (see
+      api-surface.md): servers, admin-groups, provisions, candidates.
+    get:
+      tags: [portal]
+      summary: List resource groups
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a resource group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/resource-groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Resource-group detail
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    patch:
+      tags: [portal]
+      summary: Update a resource group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a resource group
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/server-admin-group-candidates:
+    get:
+      tags: [portal]
+      summary: Addable admin-group candidates for servers
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/service-admin-group-candidates:
+    get:
+      tags: [portal]
+      summary: Addable admin-group candidates for services
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/resource-group-admin-group-candidates:
+    get:
+      tags: [portal]
+      summary: Addable admin-group candidates for resource groups
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/admin-owner-candidates:
+    get:
+      tags: [portal]
+      summary: Addable owner candidates for the admin/owner pickers
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/admin/users/{id}/limits:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Per-user rate/quota/budget limits (admin; no self-service path)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [portal]
+      summary: Set per-user limits (admin)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── 3. Portal: feature flags / read-only status ───────────────────────────
+  /api/portal/netbird/enabled:
+    get:
+      tags: [portal]
+      summary: Whether NetBird integration is enabled (boolean only)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/certificates/enabled:
+    get:
+      tags: [portal]
+      summary: Whether the certificate module is enabled
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/health-check-interval:
+    get:
+      tags: [portal]
+      summary: Live app-health probe cadence (read-only system-setting mirror)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/agent-presence-timeout:
+    get:
+      tags: [portal]
+      summary: Live agent-presence timeout (read-only system-setting mirror)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+
+  # ── 3. Portal: legacy / additional ────────────────────────────────────────
+  /api/usage:
+    get:
+      tags: [portal]
+      summary: Legacy own-usage-by-user endpoint (superseded by /api/portal/usage*)
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/admin/users:
+    get:
+      tags: [portal]
+      summary: Legacy top-level admin user list (admin)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/admin/users/{id}:
+    get:
+      tags: [portal]
+      summary: Legacy admin user detail (admin)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── 4. System (scope `system` unless marked public) ───────────────────────
+  /api/system/theme:
+    get:
+      tags: [system]
+      summary: Active theme descriptor for the pre-login UI (public)
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/themes/{id}/favicon:
+    get:
+      tags: [system]
+      summary: External theme favicon (public; registry-resolved, no path join)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: []
+      responses:
+        '200': { description: Asset bytes }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/system/themes/{id}/logo:
+    get:
+      tags: [system]
+      summary: External theme logo (public; registry-resolved, no path join)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: []
+      responses:
+        '200': { description: Asset bytes }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/system/settings:
+    get:
+      tags: [system]
+      summary: System-wide settings (SMTP, NetBird, certificate gates, currency, …)
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [system]
+      summary: Update system-wide settings
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/system/smtp/test:
+    post:
+      tags: [system]
+      summary: Send a test email with the configured/pending SMTP settings
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/tracing:
+    get:
+      tags: [system]
+      summary: OpenTelemetry tracing status/config
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [system]
+      summary: Update tracing config
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/logs:
+    get:
+      tags: [system]
+      summary: Log buffer snapshot
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/logs/events:
+    get:
+      tags: [system]
+      summary: Live log tail (SSE)
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/SSE' }
+  /api/system/logs/level:
+    get:
+      tags: [system]
+      summary: Runtime log level
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [system]
+      summary: Set runtime log level
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/test:
+    post:
+      tags: [system]
+      summary: NetBird admin API connectivity test
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/network:
+    get:
+      tags: [system]
+      summary: NetBird network configuration
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [system]
+      summary: Update NetBird network configuration
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/groups:
+    get:
+      tags: [system]
+      summary: NetBird group inspection
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/peers:
+    get:
+      tags: [system]
+      summary: NetBird peer inspection
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/gateway-setup-key:
+    post:
+      tags: [system]
+      summary: Issue the gateway's own NetBird setup key
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/enroll-sidecar:
+    post:
+      tags: [system]
+      summary: NetBird sidecar self-enrollment
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/status:
+    get:
+      tags: [system]
+      summary: NetBird connection status
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/token-status:
+    get:
+      tags: [system]
+      summary: NetBird admin-token status
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/netbird/rotate-token:
+    post:
+      tags: [system]
+      summary: Rotate the NetBird admin token
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/servers/{id}/netbird:
+    put:
+      tags: [system]
+      summary: Per-server NetBird management (distinct from the portal's own-server routes)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                netbird_enabled: { type: boolean }
+                netbird_peer_id: { type: string }
+                netbird_group_ids: { type: array, items: { type: string } }
+                netbird_peer_managed: { type: boolean }
+                netbird_policy_override: { type: string }
+                netbird_allow_ping: { type: boolean }
+                netbird_ping_exclude: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/system/certificates:
+    get:
+      tags: [system]
+      summary: Certificate module overview
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/renew:
+    post:
+      tags: [system]
+      summary: Force a certificate renewal pass
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/ca:
+    get:
+      tags: [system]
+      summary: Internal CA status
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/ca/rotate:
+    post:
+      tags: [system]
+      summary: Rotate the internal CA
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/reissue-all:
+    post:
+      tags: [system]
+      summary: Reissue every managed certificate
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/edge:
+    get:
+      tags: [system]
+      summary: Edge (nginx-facing) certificate status
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/edge/reissue:
+    post:
+      tags: [system]
+      summary: Reissue the edge certificate
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/edge/bundle:
+    get:
+      tags: [system]
+      summary: Download the edge certificate bundle
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { description: PEM bundle }
+  /api/system/certificates/edge/key:
+    get:
+      tags: [system]
+      summary: Download the edge certificate private key
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { description: PEM private key }
+  /api/system/certificates/edge/proxy-config:
+    get:
+      tags: [system]
+      summary: Generated nginx proxy config for the edge certificate
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { description: nginx configuration snippet }
+  /api/system/certificates/edge/probe:
+    post:
+      tags: [system]
+      summary: Synthetic TLS self-probe of the edge certificate
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/system/certificates/public/{domain}/bundle:
+    get:
+      tags: [system]
+      summary: Export a public-kind domain's certificate bundle
+      description: >
+        The {domain} wildcard resolves only against real `public`-kind rows,
+        so a name collision can never leak a mesh/edge certificate.
+      parameters:
+        - { name: domain, in: path, required: true, schema: { type: string } }
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { description: PEM bundle }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/system/certificates/public/{domain}/key:
+    get:
+      tags: [system]
+      summary: Export a public-kind domain's certificate private key
+      parameters:
+        - { name: domain, in: path, required: true, schema: { type: string } }
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { description: PEM private key }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── 5. Agent (/api/agent/v1/*, agent-token bearer, dual-mux) ─────────────
+  /api/agent/v1/telemetry:
+    post:
+      tags: [agent]
+      summary: Ingest one telemetry sample (POST transport)
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TelemetrySample' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/stream:
+    get:
+      tags: [agent]
+      summary: Persistent telemetry stream (WebSocket upgrade)
+      description: >
+        WebSocket transport for telemetry plus server-pushed doorbells
+        (e.g. certificate updates).
+      security: [{ agentToken: [] }]
+      responses:
+        '101': { description: Switching Protocols (WebSocket) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/system-report:
+    post:
+      tags: [agent]
+      summary: Ingest the static hardware inventory report
+      security: [{ agentToken: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/certificate:
+    get:
+      tags: [agent]
+      summary: Fetch the agent's current mesh leaf certificate (cert modes files/proxy)
+      security: [{ agentToken: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/ca:
+    get:
+      tags: [agent]
+      summary: Fetch the internal CA bundle
+      security: [{ agentToken: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/proxy-routes:
+    get:
+      tags: [agent]
+      summary: Gateway-provided TLS proxy route topology (cert mode proxy)
+      security: [{ agentToken: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/download/{path}:
+    get:
+      tags: [agent]
+      summary: Download a ServerAgent release binary/manifest/config
+      description: Fetched by operators or scripts; the agent does not update itself.
+      parameters:
+        - { name: path, in: path, required: true, schema: { type: string } }
+      security: [{ agentToken: [] }]
+      responses:
+        '200': { description: Binary/manifest/config stream }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── 6. Health & public infrastructure ─────────────────────────────────────
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe (always HTTP 200 with ok=true)
+      description: >
+        Registered on both the public mux and the agent mux; the Docker
+        healthcheck keys off the status code only. A degraded usage store is
+        surfaced as ADDITIONAL fields, never as a non-200.
+      security: []
+      responses:
+        '200':
+          description: Service is live
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Healthz' }
+  /.well-known/acme-challenge/{token}:
+    get:
+      tags: [health]
+      summary: ACME HTTP-01 challenge response
+      description: >
+        Public mux only — deliberately reachable over plaintext regardless of
+        any HTTPS-require gate, since an ACME order cannot use TLS to prove
+        domain control.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      security: []
+      responses:
+        '200': { description: Key authorization }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: op_ai_gateway_session
+      description: >
+        Browser session. Non-GET/HEAD/OPTIONS requests additionally require
+        the X-OP-CSRF header (modeled as csrfHeader).
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-OP-CSRF
+      description: 'CSRF guard header; send the literal value "1".'
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        User API token or service token. Scopes (enforced server-side, not
+        via OAuth): gateway:use, llm:invoke, admin, system.
+    agentToken:
+      type: http
+      scheme: bearer
+      description: >
+        Per-AI-server agent secret (hashed lookup against agent_tokens),
+        unrelated to user/service API tokens.
+  requestBodies:
+    OpaqueJSON:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: >
+              DTO defined by the Go handler (see api-surface.md and the
+              gateway source); intentionally not duplicated here.
+  responses:
+    OpaqueJSON:
+      description: >
+        JSON DTO defined by the Go handler (see api-surface.md); errors use
+        the Error envelope with a stable code.
+      content:
+        application/json:
+          schema: { type: object }
+    SSE:
+      description: Server-sent event stream
+      content:
+        text/event-stream:
+          schema: { type: string }
+    Unauthorized:
+      description: Missing/invalid credential
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but lacking the required scope/role
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: >
+        Not found — also returned for objects outside the caller's manageable
+        set (no-existence-leak policy).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      description: Stable-code error envelope (internal/apierror).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
+            message: { type: string }
+            request_id: { type: string }
+    Healthz:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, const: true }
+        usage_store_degraded:
+          type: boolean
+          description: Present only while the usage store reports a last error.
+        usage_store_error:
+          type: string
+          description: Present only while the usage store reports a last error.
+    TelemetrySample:
+      type: object
+      description: >
+        One ServerAgent telemetry sample (core fields; the agent may send
+        additional metrics such as per-GPU and per-interface samples — see
+        internal/routing.TelemetrySample and the agent source).
+      additionalProperties: true
+      properties:
+        agent_version: { type: string }
+        reported_at: { type: string, format: date-time }
+        os: { type: string }
+        arch: { type: string }
+        cpu_load: { type: number }
+        active_requests: { type: integer }
+        queue_depth: { type: integer }
+        latency_ms: { type: number }
+        error_rate: { type: number }
+        provider_health: { type: object, additionalProperties: true }
+        capabilities: { type: object, additionalProperties: true }

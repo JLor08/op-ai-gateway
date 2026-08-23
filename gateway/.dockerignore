@@ -1,0 +1,8 @@
+frontend/node_modules
+frontend/dist
+frontend/test-results
+frontend/playwright-report
+frontend/*.tsbuildinfo
+e2e/node_modules
+e2e/test-results
+e2e/playwright-report

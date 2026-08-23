@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: op-ai-gateway
+  labels:
+    app.kubernetes.io/part-of: op-ai-gateway
+    # PodSecurity Admission level for this namespace. The gateway pod runs a NetBird
+    # sidecar needing NET_ADMIN/SYS_ADMIN/SYS_RESOURCE (or privileged: true) + a
+    # hostPath /dev/net/tun for WireGuard, which the `restricted`/`baseline` profiles
+    # reject. `privileged` admits it. Applies to BOTH the capabilities form AND the
+    # privileged:true fallback (both need this level).
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

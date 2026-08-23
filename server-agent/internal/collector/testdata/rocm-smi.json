@@ -1,0 +1,18 @@
+{
+    "card0": {
+        "GPU ID": "0x740f",
+        "Card series": "AMD Instinct MI210",
+        "Card model": "0x0c34",
+        "Card vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+        "GPU use (%)": "42",
+        "VRAM Total Memory (B)": "68702699520",
+        "VRAM Total Used Memory (B)": "12884901888",
+        "Temperature (Sensor edge) (C)": "58.0",
+        "Temperature (Sensor junction) (C)": "60.0",
+        "Temperature (Sensor memory) (C)": "62.0",
+        "Average Graphics Package Power (W)": "170.0"
+    },
+    "system": {
+        "Driver version": "6.7.0"
+    }
+}

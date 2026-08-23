@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# Custom NetBird sidecar: the stock client + a tiny entrypoint wrapper that lets the
+# gateway hand it a setup key at runtime (via a shared-volume file) so the gateway peer
+# self-enrolls. UPDATE THE CLIENT = bump NETBIRD_VERSION (or the base tag) — nothing else.
+# Pin a real version (e.g. NETBIRD_VERSION=0.x.y) in production rather than `latest`, so
+# rebuilds are reproducible and a client update is a deliberate, reviewable version bump.
+ARG NETBIRD_VERSION=latest
+FROM netbirdio/netbird:${NETBIRD_VERSION}
+COPY netbird-enroll-entrypoint.sh /usr/local/bin/netbird-enroll-entrypoint.sh
+RUN chmod +x /usr/local/bin/netbird-enroll-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/netbird-enroll-entrypoint.sh"]

@@ -1,14 +1,30 @@
 {
-  "name": "@onprem-ai-gateway/e2e",
+  "name": "op-ai-gateway-e2e",
   "private": true,
   "version": "0.1.0",
+  "type": "module",
   "scripts": {
-    "test": "playwright test",
-    "test:ui": "playwright test --ui",
-    "test:headed": "playwright test --headed",
-    "report": "playwright show-report"
+    "e2e": "playwright test",
+    "e2e:agent": "playwright test -c playwright.agent.config.ts",
+    "e2e:capture": "playwright test -c playwright.capture.config.ts",
+    "e2e:capture-ram": "playwright test -c playwright.capture-ram.config.ts",
+    "e2e:certificates": "playwright test -c playwright.certificates.config.ts",
+    "e2e:active": "playwright test -c playwright.active.config.ts",
+    "e2e:health": "playwright test -c playwright.health.config.ts",
+    "e2e:health-modelsync": "playwright test -c playwright.health-modelsync.config.ts",
+    "e2e:groups": "playwright test -c playwright.groups.config.ts",
+    "e2e:limits": "playwright test -c playwright.limits.config.ts",
+    "e2e:logs": "playwright test -c playwright.logs.config.ts",
+    "e2e:perf": "playwright test -c playwright.perf.config.ts",
+    "e2e:projects": "playwright test -c playwright.projects.config.ts",
+    "e2e:resource-groups": "playwright test -c playwright.resource-groups.config.ts",
+    "e2e:services": "playwright test -c playwright.services.config.ts",
+    "e2e:servers": "playwright test -c playwright.servers.config.ts",
+    "e2e:smtp": "playwright test -c playwright.smtp.config.ts",
+    "e2e:totp": "playwright test -c playwright.totp.config.ts",
+    "e2e:system-admin-mode": "playwright test -c playwright.system-admin-mode.config.ts"
   },
   "devDependencies": {
-    "@playwright/test": "latest"
+    "@playwright/test": "^1.61.1"
   }
 }

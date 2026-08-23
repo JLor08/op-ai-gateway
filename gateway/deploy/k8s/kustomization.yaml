@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Everything lands in the op-ai-gateway namespace (namespace.yaml creates it).
+namespace: op-ai-gateway
+
+# Shared identity label on every object + selector (includeSelectors keeps Service /
+# workload selectors consistent with pod labels).
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/part-of: op-ai-gateway
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - nginx-configmap.yaml
+  - pvc.yaml
+  - gateway.yaml
+  - backend-service.yaml
+  - web.yaml
+  - postgres.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+  # secret.example.yaml is intentionally NOT listed: it holds CHANGE-ME placeholders, so
+  # `kubectl apply -k` must never ship it. Copy it to secret.yaml, fill in real values,
+  # and `kubectl apply -f secret.yaml` SEPARATELY (before `apply -k`). The workloads only
+  # need the op-gateway-secrets Secret to EXIST in the namespace at apply time.
+
+# Set your real image registry here (or `kustomize edit set image ...`). The manifests
+# use the placeholders below; this block rewrites them cluster-wide in one place.
+images:
+  - name: REGISTRY/op-ai-gateway-backend
+    newName: REGISTRY/op-ai-gateway-backend
+    newTag: latest
+  - name: REGISTRY/op-ai-gateway-frontend
+    newName: REGISTRY/op-ai-gateway-frontend
+    newTag: latest
+  # Custom NetBird sidecar (built from ../Dockerfile.netbird = stock client + the
+  # self-enroll entrypoint wrapper). Build + push it to your registry, then point this at it.
+  - name: REGISTRY/op-ai-gateway-netbird
+    newName: REGISTRY/op-ai-gateway-netbird
+    newTag: latest
+  # Agent cross-compiler initContainer (built from ../Dockerfile.agent-builder). Build +
+  # push it to your registry, then point this at it.
+  - name: REGISTRY/op-ai-gateway-agent-builder
+    newName: REGISTRY/op-ai-gateway-agent-builder
+    newTag: latest

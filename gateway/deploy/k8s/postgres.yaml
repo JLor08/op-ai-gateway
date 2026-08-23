@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# PostgreSQL store (postgres:17-alpine), mirroring the compose `db` service. A
+# StatefulSet gives it a stable identity + its own PVC via volumeClaimTemplates. The
+# gateway DSN (in op-gateway-secrets) points at host `op-gateway-db`, resolved by the
+# headless Service below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: op-gateway-db
+  labels:
+    app.kubernetes.io/name: op-gateway-db
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  # Headless Service: governs the StatefulSet AND resolves `op-gateway-db` to the pod IP
+  # for the gateway DSN. clusterIP:None gives direct pod-IP DNS (fine for a single replica).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: op-gateway-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: op-gateway-db
+  labels:
+    app.kubernetes.io/name: op-gateway-db
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  serviceName: op-gateway-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: op-gateway-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: op-gateway-db
+        app.kubernetes.io/part-of: op-ai-gateway
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_USER
+              value: gateway
+            - name: POSTGRES_DB
+              value: gateway
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: op-gateway-secrets
+                  key: POSTGRES_PASSWORD
+            # Store data in a subdirectory of the mount so initdb does not trip over a
+            # lost+found on the freshly-provisioned volume.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          resources:
+            # Starting points — tune to your dataset + connection load.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gateway"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: op-gateway-db
+          app.kubernetes.io/part-of: op-ai-gateway
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName: ""   # omitted = cluster default StorageClass

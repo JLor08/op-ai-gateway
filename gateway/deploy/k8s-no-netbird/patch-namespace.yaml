@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# No NetBird sidecar → no NET_ADMIN/SYS_ADMIN caps and no /dev/net/tun hostPath, so the
+# namespace no longer needs PodSecurity `privileged`. `baseline` admits the remaining
+# pods (backend runs nonroot with no hostPath; nginx + postgres likewise). Tighten to
+# `restricted` if you add the extra securityContext (seccompProfile + capabilities.drop).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: op-ai-gateway
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline

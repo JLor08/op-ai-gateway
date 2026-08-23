@@ -1,10 +1,17 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 OnPrem AI Gateway contributors -->
+
 <!doctype html>
-<html lang="en">
+<html lang="de">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="OnPrem AI Gateway administration console" />
-    <title>OnPrem AI Gateway</title>
+    <title>OP AI Gateway</title>
+    <!-- Static default-theme favicon: a REAL PNG file (Safari macOS does not
+         render `data:` URI favicons). ThemeRoot swaps this <link>'s href to the
+         active theme's PNG file once JS loads. `%BASE_URL%` is replaced by Vite
+         with the app base (e.g. `/portal/`). -->
+    <link rel="icon" type="image/png" href="%BASE_URL%favicon-default.png" />
   </head>
   <body>
     <div id="root"></div>

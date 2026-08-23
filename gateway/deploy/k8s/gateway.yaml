@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# The gateway pod: the NetBird client sidecar + the gateway backend in ONE pod.
+#
+# Shared network namespace is AUTOMATIC in Kubernetes — all containers in a pod share
+# the netns. So the `netbird` container's wt0 interface + 100.x NetBird IP are directly
+# visible to `backend`, which binds the Phase-1 agent listener there (8081 on wt0). There
+# is NO compose-style `network_mode` here; nothing to declare.
+#
+# replicas:1 + strategy Recreate is REQUIRED: the peer identity is single-instance
+# (RWO PVC op-gateway-netbird-state), and a rolling update must never run two pods against
+# that volume. Recreate tears the old pod down before starting the new one. (A StatefulSet
+# is the idiomatic alternative — see README.md.)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: op-gateway
+  labels:
+    app.kubernetes.io/name: op-gateway
+    app.kubernetes.io/part-of: op-ai-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: op-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: op-gateway
+        app.kubernetes.io/part-of: op-ai-gateway
+    spec:
+      # NetBird runs as a NATIVE SIDECAR (Kubernetes >=1.29, GA): an initContainer with
+      # restartPolicy: Always. It starts BEFORE `backend` and terminates AFTER it, and the
+      # kubelet restarts it independently on crash — so a NetBird crash re-establishes wt0
+      # without taking `backend` down. On k8s <1.29 (no native sidecars) move this entry
+      # into `containers:` as a plain container and drop `restartPolicy: Always` — at the
+      # cost of the boot-race the Phase-1 fail-safe otherwise handles.
+      initContainers:
+        # --- NetBird client sidecar: owns wt0 + the 100.x IP for the shared pod netns ---
+        - name: netbird
+          # Custom sidecar image = the stock NetBird client + the self-enroll entrypoint
+          # wrapper (built from ../Dockerfile.netbird — push it to your registry). The
+          # wrapper lets the gateway hand this sidecar a minted setup key at runtime via the
+          # shared /shared volume (autonomous enrollment, Phase B). To update the NetBird
+          # client, bump the base tag in Dockerfile.netbird and rebuild/push.
+          image: REGISTRY/op-ai-gateway-netbird:latest
+          # restartPolicy: Always on an initContainer IS what makes it a native sidecar:
+          # it runs for the whole pod lifetime and is restarted on its own if it crashes.
+          restartPolicy: Always
+          # OPTIONAL hardening: add a startupProbe here (e.g. `exec: netbird status`, or a
+          # check that wt0 has an IP) so the sidecar is reported ready — and `backend`
+          # gated on mesh-readiness — to fully eliminate the boot-race. NOT enabled by
+          # default: a wrong probe would wedge pod startup, and the Phase-1 fail-safe
+          # (degrade to the public listener, then `rollout restart`) already covers the
+          # race.
+          # WARNING: do NOT enable this startupProbe when using autonomous (Phase B)
+          # sidecar enrollment (see README.md §11). It deadlocks — the Phase-B wrapper
+          # blocks a fresh peer waiting for the gateway to write the minted key, but the
+          # gateway only writes it after `backend` starts, and a `netbird status`
+          # startupProbe holds `backend` (a native-sidecar init step) until the sidecar is
+          # mesh-ready first → the sidecar never connects → the backend never starts → the
+          # key is never written (circular wait). This probe is ONLY for the
+          # operator-provided NB_SETUP_KEY path, where the sidecar enrolls without waiting
+          # on the backend. Example:
+          #   startupProbe:
+          #     exec:
+          #       command: ["netbird", "status"]
+          #     periodSeconds: 3
+          #     failureThreshold: 30
+          resources:
+            # Starting points — tune to your NetBird traffic.
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            # NET_ADMIN for wt0 + routes; SYS_ADMIN/SYS_RESOURCE for the WireGuard/userspace
+            # setup (the set the official NetBird client image documents). Some clusters /
+            # PodSecurity policies require `privileged: true` INSTEAD of these caps — if the
+            # tunnel fails to come up, replace the capabilities block with `privileged: true`.
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_RESOURCE
+          env:
+            - name: NB_SETUP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: op-gateway-secrets
+                  key: NB_SETUP_KEY
+            - name: NB_MANAGEMENT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: op-gateway-config
+                  key: NB_MANAGEMENT_URL
+            - name: NB_HOSTNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: op-gateway-config
+                  key: NB_HOSTNAME
+            # Autonomous enrollment (Phase B): the entrypoint wrapper WAITS for the gateway
+            # to drop a minted setup key at this path (on the shared, in-memory /shared
+            # volume) on a fresh peer, then hands it to `netbird up` via NB_SETUP_KEY. Must
+            # equal the backend's OP_AI_GATEWAY_NETBIRD_KEY_FILE. If NB_SETUP_KEY (from the
+            # Secret) is non-empty the wrapper skips the wait and enrolls with it the old
+            # way. NOTE: this is a WRAPPER-only var (NOT netbird's NB_SETUP_KEY_FILE) —
+            # netbird treats setup-key and setup-key-file as mutually exclusive, and with a
+            # shared pod netns a crashing `netbird up` would 502 the whole gateway; the
+            # wrapper hands netbird exactly one source (NB_SETUP_KEY).
+            - name: NB_ENROLL_KEY_FILE
+              value: /shared/netbird-setup-key
+          volumeMounts:
+            - name: netbird-state
+              mountPath: /var/lib/netbird
+            # Shared TRANSIENT (in-memory) key volume: the backend writes the gateway-minted
+            # setup key here and this sidecar reads it. Pods share a netns but NOT a
+            # filesystem, so the handoff needs a shared volume; emptyDir medium:Memory keeps
+            # the key off disk.
+            - name: netbird-key
+              mountPath: /shared
+            - name: tun
+              mountPath: /dev/net/tun
+        # --- Agent cross-compiler (one-shot init). Populates op-gateway-agent-bin with the
+        #     downloadable server-agent binaries + manifest.json. NOT a native sidecar (no
+        #     restartPolicy) — it runs to completion before `backend` starts. BUILD_AGENTS=false
+        #     makes it an instant no-op that reuses the PVC's previous build. ---
+        - name: agent-builder
+          image: REGISTRY/op-ai-gateway-agent-builder:latest
+          env:
+            - name: BUILD_AGENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: op-gateway-config
+                  key: BUILD_AGENTS
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: agent-bin
+              mountPath: /agents
+      containers:
+        # --- Gateway backend (distroless/nonroot). Binds 8080 (management) + 8081 (agent, wt0). ---
+        # NOTE: the agent-builder initContainer writes world-readable files (binaries 0755,
+        # manifest 0644), so the nonroot backend can read them at /agents. If your storage
+        # provisioner mounts the PVC non-world-readable, add pod securityContext.fsGroup: 65532.
+        - name: backend
+          image: REGISTRY/op-ai-gateway-backend:latest
+          envFrom:
+            - configMapRef:
+                name: op-gateway-config
+            - secretRef:
+                name: op-gateway-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+            # 8081 (the agent listener) binds the wt0 NetBird IP only, resolved at runtime.
+            # It is intentionally NOT declared as a containerPort and NOT in any Service —
+            # agents reach it directly over the mesh at the pod's NetBird IP (see README.md).
+          resources:
+            # Starting points — tune to your inference/portal load.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          # NOTE: the optional System-Settings "Ping ausführen" action runs an
+          # UNPRIVILEGED ICMP echo (no CAP_NET_RAW). It needs the kernel sysctl
+          # net.ipv4.ping_group_range to include the container GID (65532). Docker
+          # sets this by default; on Kubernetes add a POD-level sysctl (see README
+          # §"ICMP ping action") — else the action returns a clear error and
+          # nothing else is affected. Do NOT add CAP_NET_RAW.
+          volumeMounts:
+            - name: gwdata
+              mountPath: /data
+            # Shared TRANSIENT key volume (see the netbird sidecar). The backend writes the
+            # gateway-minted setup key here at OP_AI_GATEWAY_NETBIRD_KEY_FILE (from the
+            # ConfigMap, /shared/netbird-setup-key); the waiting sidecar reads it and enrolls.
+            - name: netbird-key
+              mountPath: /shared
+            # Downloadable server-agent binaries + manifest.json, populated by the
+            # agent-builder initContainer. Read-only — the backend only serves them.
+            - name: agent-bin
+              mountPath: /agents
+              readOnly: true
+            # External themes (optional, commented example). The image already bakes
+            # gateway/deploy/themes/ at /themes (OP_AI_GATEWAY_THEMES_DIR default --
+            # see deploy/themes/README.md). Uncomment this + the matching entry in
+            # `volumes:` below to add a theme from the op-gateway-theme-acme ConfigMap
+            # (see configmap.yaml) at /themes/acme/theme.json via subPath, alongside
+            # the baked themes -- it does not replace the whole /themes directory.
+            # - name: theme-acme
+            #   mountPath: /themes/acme/theme.json
+            #   subPath: theme.json
+            #   readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: netbird-state
+          persistentVolumeClaim:
+            claimName: op-gateway-netbird-state
+        - name: gwdata
+          persistentVolumeClaim:
+            claimName: op-gateway-data
+        # Shared TRANSIENT (in-memory tmpfs) volume that carries the gateway-minted setup
+        # key from `backend` (writer) to `netbird` (reader). medium: Memory = the key never
+        # lands on node disk and the volume is recreated empty on every pod start.
+        - name: netbird-key
+          emptyDir:
+            medium: Memory
+        # /dev/net/tun on the node, for WireGuard. `type: CharDevice` asserts it is a
+        # character device (fails fast if the node lacks it). Some clusters instead run the
+        # netbird container `privileged: true` and let it create the device.
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        # Downloadable server-agent binaries + manifest.json, built by the agent-builder
+        # initContainer and served read-only by the backend.
+        - name: agent-bin
+          persistentVolumeClaim:
+            claimName: op-gateway-agent-bin
+        # External themes (optional, commented example). Matching volumeMount is on
+        # the backend container above; ConfigMap is op-gateway-theme-acme in
+        # configmap.yaml.
+        # - name: theme-acme
+        #   configMap:
+        #     name: op-gateway-theme-acme

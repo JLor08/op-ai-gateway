@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OnPrem AI Gateway contributors
+
+# No sidecar → clear the shared key-file path so EnrollGatewaySidecar reports it as
+# unconfigured and the frontend hides the "Sidecar enrollen" button.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: op-gateway-config
+data:
+  OP_AI_GATEWAY_NETBIRD_KEY_FILE: ""
