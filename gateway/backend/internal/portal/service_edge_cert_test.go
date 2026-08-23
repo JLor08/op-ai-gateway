@@ -1373,14 +1373,18 @@ func edgeGatewayPeerFixture(t *testing.T, gatewayDomain string, handler http.Han
 	}); err != nil {
 		t.Fatalf("settings: %v", err)
 	}
-	// A netbird-touching settings PUT fires its policy fleet reconcile in a
-	// BACKGROUND goroutine, which makes its own NetBird calls against the very
-	// server above. Without this barrier those calls can land AFTER the callers
-	// below snapshot `calls`, so a "made no NetBird request" assertion fails for a
-	// request the fixture itself issued -- a pre-existing flake in this fixture,
-	// load-dependent and therefore intermittent. policySideEffectWG exists exactly
-	// for this ("test determinism", see its doc comment).
+	// A netbird-touching settings PUT fires TWO background goroutines that make
+	// their own NetBird calls against the very server above: the policy fleet
+	// reconcile (policySideEffectWG) and — because the PUT stores a non-empty
+	// NetbirdToken — the token-meta resolve (resolveWG, resolveStoredTokenMeta's
+	// ResolveCurrentUserID request). Without both barriers those calls can land
+	// AFTER the callers below snapshot `calls`, so a "made no NetBird request"
+	// assertion fails for a request the fixture itself issued -- a load-dependent
+	// and therefore intermittent flake (reproduced at ~2/100 locally with only
+	// the policy barrier in place; the policy WaitGroup is even empty here since
+	// this PUT changes no policy-relevant field).
 	svc.waitPolicySideEffects()
+	svc.waitNetbirdResolve()
 	return svc, ctx, &calls
 }
 
