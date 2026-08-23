@@ -26,7 +26,7 @@ sequenceDiagram
     alt streaming
         AI-->>P: SSE chunks
         P-->>GW: chunks
-        GW-->>C: SSE chunks (idle watchdog; deadlines lifted)
+        GW-->>C: SSE chunks (idle watchdog, deadlines lifted)
     else non-streaming
         AI-->>P: response
         P-->>GW: response
@@ -59,7 +59,7 @@ sequenceDiagram
         GW->>T: verify code
     end
     AC->>S: create server-side session
-    GW-->>B: Set-Cookie (session); principal + scopes
+    GW-->>B: Set-Cookie (session), principal + scopes
     B->>GW: GET /api/portal/me (cookie + X-OP-CSRF)
     GW-->>B: current user, role/scopes, session elevation
 ```
@@ -76,11 +76,11 @@ sequenceDiagram
     loop every interval
         AG->>AG: collect host/GPU/power/temp
         AG->>GW: POST /api/agent/v1/telemetry (Bearer agent token)
-        GW->>GW: derive server from token; whitelist fields
-        GW->>R: store sample; update availability
+        GW->>GW: derive server from token, whitelist fields
+        GW->>R: store sample, update availability
         R-->>SSE: fan out live sample (per-server /events)
     end
-    Note over AG,GW: WebSocket transport (/api/agent/v1/stream) is an<br/>alternative to per-interval POSTs; liveness via active Ping
+    Note over AG,GW: WebSocket transport (/api/agent/v1/stream) is an<br/>alternative to per-interval POSTs — liveness via active Ping
     AG->>GW: POST /api/agent/v1/system-report (hardware inventory)
 ```
 
@@ -117,9 +117,9 @@ sequenceDiagram
     GW->>R: run capacity + speed probes
     R->>AI: probe requests (context size, throughput, concurrency)
     AI-->>R: measurements
-    R->>R: persist metrics; update selection inputs
+    R->>R: persist metrics, update selection inputs
     R-->>SSE: live progress
-    Note over R: metrics feed candidate scoring;<br/>hybrid swap-protection avoids thrashing
+    Note over R: metrics feed candidate scoring —<br/>hybrid swap-protection avoids thrashing
 ```
 
 ## 6.6 Mesh certificate issuance & HTTPS auto-switch
@@ -139,7 +139,7 @@ sequenceDiagram
     AG->>AG: start TLS-terminating proxy (cert_mode=proxy)
     AG->>GW: telemetry proxy_routes[] (tls_active:true)
     GW->>GW: ReconcileHTTPSSwitch → set application scheme=https
-    Note over GW,APP: gateway now dispatches over HTTPS to the<br/>agent proxy; a scope-exit reverts to http
+    Note over GW,APP: gateway now dispatches over HTTPS to the<br/>agent proxy — a scope-exit reverts to http
 ```
 
 ## 6.7 Theme resolution (built-in vs external)
@@ -155,7 +155,7 @@ sequenceDiagram
     alt external
         TH-->>GW: theme data (tokens, brand, product name)
         GW-->>B: {theme, source: external, data}
-        B->>B: apply data as CSS variables; favicon/logo via /api/system/themes/{id}/…
+        B->>B: apply data as CSS variables, favicon/logo via /api/system/themes/{id}/…
     else built-in
         GW-->>B: {theme, source: builtin, data: null}
         B->>B: apply compiled built-in theme

@@ -355,7 +355,7 @@ result:
 
 ```mermaid
 flowchart TD
-    Start["Un-priced usage.Event\n(energy_source == \"\")"] --> T1{"Tier 1: measured\nContinuous power-telemetry\ncoverage of [start,end]?\n(max gap 2× the 1s cadence)"}
+    Start["Un-priced usage.Event\n(energy_source == '')"] --> T1{"Tier 1: measured\nContinuous power-telemetry\ncoverage of [start,end]?\n(max gap 2× the 1s cadence)"}
     T1 -->|yes| M["Integrate ∫ power(t)/concurrency(t) dt\nover the request's own window,\nshared with concurrent sibling requests"]
     T1 -->|no| T2{"Tier 2: estimated\nServer.EstimatedWatts set?"}
     T2 -->|yes| E["Integrate a flat wattage,\nsame concurrency-sharing model"]

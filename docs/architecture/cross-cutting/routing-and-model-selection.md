@@ -87,7 +87,7 @@ flowchart TD
     Override -->|no| IsGroup{"req.Model is an\nactive ModelGroup?"}
     IsGroup -->|yes, locked| ErrLocked["ErrNoModelRoute"]
     IsGroup -->|yes| Group["resolveGroup:\npriority walk / sticky pin\n(see §5)"]
-    IsGroup -->|no, but locked (group-only)| ErrLocked
+    IsGroup -->|"no, but locked (group-only)"| ErrLocked
     IsGroup -->|no| Affinity{"token pinned via\nRouteAffinity and\nstill valid + provisioned?"}
     Affinity -->|hit| ReuseTarget["reuse pinned Target;\ntouch session reservation"]
     Affinity -->|miss| LoadCands["Store.ActiveMappingsForModel(model, flavor)"]

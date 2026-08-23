@@ -32,7 +32,7 @@ The five `/api/agent/v1/*` handlers are registered identically on **both** the p
 flowchart TD
     Req[Incoming request] --> Dispatch{"Which listener?"}
     Dispatch -->|main HTTP listener| PubMux["s.mux (public)\nserveWith(..., public=true)"]
-    Dispatch -->|dedicated agent listener\n(NetBird-only, if configured)| AgentMux["s.agentMux\nserveWith(..., public=false)\n+ withAgentListenerContext"]
+    Dispatch -->|"dedicated agent listener\n(NetBird-only, if configured)"| AgentMux["s.agentMux\nserveWith(..., public=false)\n+ withAgentListenerContext"]
     PubMux --> AgentAuth["authenticateAgent\n(agent-token bearer)"]
     AgentMux --> AgentAuth
     AgentAuth --> Handlers["telemetry / stream / system-report\ncertificate / ca / proxy-routes / download"]
