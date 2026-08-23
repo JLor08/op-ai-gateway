@@ -19,6 +19,7 @@ handle or remain unlisted.
 - The OnPrem AI Gateway contributors — initial project scaffold
 - [Andreas Andrusch](https://github.com/YXAndyYX) — project contribution
 - [Holger Ackurat](https://github.com/CrestofArkon) — project contribution
+- [Sascha Lorenz](https://github.com/mwg-fyzzo) — project contribution
 
 ## Attribution and licensing
 

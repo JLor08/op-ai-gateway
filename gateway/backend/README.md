@@ -16,3 +16,11 @@ The response contains a SHA-256 digest rather than the submitted payload. See
 go test ./...
 go run ./cmd/server
 ```
+
+## Architecture tests
+
+`internal/arch` enforces the module's dependency layering: public packages
+(`pkg/*`) may only depend on the standard library and other public packages,
+internal packages never depend on `cmd/*`, executable entry points live under
+`cmd/*`, and no import may cross into the `server-agent` module or pull in
+external dependencies. These rules run as part of `go test ./...`.

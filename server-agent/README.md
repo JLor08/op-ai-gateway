@@ -22,3 +22,12 @@ Configuration:
 - `REPORT_INTERVAL` — optional Go duration; defaults to `15s`
 
 See [DEPENDENCIES.md](DEPENDENCIES.md) for the AGPLv3 library/dependency record.
+
+## Architecture tests
+
+`internal/arch` enforces the module's dependency layering: the reporting
+collector (`pkg/reporting`) stays transport-agnostic (no `net/*` imports),
+public packages may only depend on the standard library and other public
+packages, executable entry points live under `cmd/*`, and no import may cross
+into the `gateway/backend` module or pull in external dependencies. These
+rules run as part of `go test ./...`.
