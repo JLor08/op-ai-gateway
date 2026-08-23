@@ -18,6 +18,7 @@ upstream HTTP request directly.
 |---|---|
 | `APIFlavor` | fine-grained source protocol: `openai_chat_completions`, `openai_responses`, `anthropic_messages` |
 | `Model` | the gateway model name (post model-override) |
+| `RequestedModel` | the client's original model name, pre-override; recorded on the usage event |
 | `Messages []Message` | role + `[]ContentPart` (text/image/tool_result) + optional `ToolCalls`/`ToolCallID`/`Reasoning` |
 | `Tools []Tool`, `ToolChoice any` | tool definitions; `ToolChoice` is forwarded upstream verbatim |
 | `Stream`, `IncludeUsage` | streaming flag; OpenAI `stream_options.include_usage` |

@@ -26,7 +26,7 @@ not route-based).
 |---|---|
 | `api_tokens` | Bearer API tokens. `user_id` is nullable (a *service* token has none instead); carries per-token model override / override map, log-communication and secret-capture flags, optional project attribution, and an optional per-token AI-server override. |
 | `route_affinity` | Sticky-routing memory: which application/server a given `(token, model, api_flavor, session)` was last routed to, with a TTL. |
-| `usage_events` | One row per completed/failed request: tokens in/out/cached/cache-write, latency, status, provider/model, session/service/project attribution, and P1 energy-attribution fields (`energy_wh`, `energy_marginal_wh`, `energy_source`). Deliberately carries **no foreign keys** on `user_id`/`token_id`/`host`/`service_id`/`project_id` — usage history must survive the deletion of the user, token, server, service, or project it references. |
+| `usage_events` | One row per completed/failed request: tokens in/out/cached/cache-write, latency, status, provider/model, the client's originally-requested model (`requested_model`, since migration 61; `''` on rows recorded before it), session/service/project attribution, and P1 energy-attribution fields (`energy_wh`, `energy_marginal_wh`, `energy_source`). Deliberately carries **no foreign keys** on `user_id`/`token_id`/`host`/`service_id`/`project_id` — usage history must survive the deletion of the user, token, server, service, or project it references. |
 | `captures` | Optional encrypted request/response payload capture, one row per `usage_events` row (FK cascade — a capture cannot outlive its usage event). |
 | `principal_limits` | Optional per-principal (`user` or `service`) rate/quota/budget limits, keyed by `(principal_type, principal_id)`. |
 
@@ -211,7 +211,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (60 migrations)
+## 4. Migration history (61 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -292,6 +292,7 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 | 6 | `usage_provider_path` | *(see above)* |
 | 38 | `usage_events_cache_write_tokens` | Adds `usage_events.cache_write_tokens` (prompt-cache write tokens, e.g. Anthropic cache creation). |
 | 39 | `usage_events_session_source_agent` | Adds `usage_events.session_source`/`agent_id` (protocol-aware session attribution). |
+| 61 | `usage_requested_model` | Adds `usage_events.requested_model` — the client's original model name, before any token model-override (`''` on rows recorded before this migration). |
 
 ### Service accounts, limits & affinity
 
