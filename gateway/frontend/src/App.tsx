@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react'
-import { Button } from 'twenty-ui/input'
+import RefreshIcon from '@mui/icons-material/Refresh'
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  Container,
+  Paper,
+  Stack,
+  Typography,
+} from '@mui/material'
 
 type Status = { service: string; upstreams: string[] }
 
@@ -23,18 +33,69 @@ export default function App() {
   }, [])
 
   return (
-    <main>
-      <p className="eyebrow">ON-PREMISES AI PLATFORM</p>
-      <h1>AI Gateway</h1>
-      <p>Control approved local model access from one internal endpoint.</p>
-      <Button title="Refresh gateway status" variant="secondary" onClick={() => void loadStatus()} />
-      {error && <p className="error">{error}</p>}
-      {status && (
-        <section aria-label="Gateway status">
-          <h2>{status.service}</h2>
-          <p>{status.upstreams.length} configured upstream(s)</p>
-        </section>
-      )}
-    </main>
+    <Container component="main" maxWidth="md" sx={{ py: { xs: 6, md: 10 } }}>
+      <Stack spacing={4}>
+        <Box>
+          <Typography
+            component="p"
+            variant="overline"
+            color="primary"
+            sx={{ fontWeight: 700 }}
+          >
+            ON-PREMISES AI PLATFORM
+          </Typography>
+          <Typography component="h1" variant="h2" sx={{ mt: 1, fontWeight: 800 }}>
+            AI Gateway
+          </Typography>
+          <Typography color="text.secondary" sx={{ mt: 2, maxWidth: 560 }}>
+            Control approved local model access from one internal endpoint.
+          </Typography>
+        </Box>
+
+        <Box>
+          <Button
+            aria-label="Refresh gateway status"
+            title="Refresh gateway status"
+            variant="contained"
+            startIcon={<RefreshIcon />}
+            onClick={() => void loadStatus()}
+          >
+            Refresh status
+          </Button>
+        </Box>
+
+        {error && <Alert severity="error">{error}</Alert>}
+
+        {status && (
+          <Paper
+            component="section"
+            aria-label="Gateway status"
+            variant="outlined"
+            sx={{ p: 3 }}
+          >
+            <Stack spacing={2}>
+              <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                spacing={2}
+                sx={{
+                  alignItems: { xs: 'flex-start', sm: 'center' },
+                  justifyContent: 'space-between',
+                }}
+              >
+                <Box>
+                  <Typography component="h2" variant="h5" sx={{ fontWeight: 700 }}>
+                    {status.service}
+                  </Typography>
+                  <Typography color="text.secondary">
+                    {status.upstreams.length} configured upstream(s)
+                  </Typography>
+                </Box>
+                <Chip color="primary" label="Reachable" />
+              </Stack>
+            </Stack>
+          </Paper>
+        )}
+      </Stack>
+    </Container>
   )
 }
