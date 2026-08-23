@@ -6,6 +6,7 @@ import type { MessageKey } from './shared/types';
 export type ColumnId =
   | 'created_at'
   | 'owner'
+  | 'requested_model'
   | 'model'
   | 'server_name'
   | 'token_name'
@@ -73,6 +74,13 @@ export const ACTIVITY_COLUMNS: ColumnDef[] = [
     labelKey: 'activityColService',
     defaultVisible: false,
     sortable: false,
+    numeric: false,
+  },
+  {
+    id: 'requested_model',
+    labelKey: 'tableRequestedModel',
+    defaultVisible: true,
+    sortable: true,
     numeric: false,
   },
   { id: 'model', labelKey: 'tableModel', defaultVisible: true, sortable: true, numeric: false },

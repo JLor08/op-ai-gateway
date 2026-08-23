@@ -42,6 +42,7 @@ function makeRow(overrides: Partial<UsageEvent> = {}): UsageEvent {
     content_type: 'application/json',
     req_path: '/v1/chat/completions',
     provider_model: 'qwen2.5',
+    requested_model: 'qwen-coder',
     stream: true,
     token_name: 'Dev Token',
     server_name: 'GPU 1',
@@ -99,11 +100,17 @@ afterEach(cleanup);
 
 describe('ActivityTable', () => {
   it('renders the default column headers and a data row', () => {
-    renderTable({ columns: columnsWithServer });
+    renderTable({
+      columns: columnsWithServer,
+      rows: [makeRow({ requested_model: 'gpt-oss-20b' })],
+    });
     const table = screen.getByRole('table');
     // Headers may contain an inline filter icon, so match on the label substring.
     expect(
       within(table).getByRole('columnheader', { name: new RegExp(t.tableModel) }),
+    ).toBeInTheDocument();
+    expect(
+      within(table).getByRole('columnheader', { name: new RegExp(t.tableRequestedModel) }),
     ).toBeInTheDocument();
     expect(
       within(table).getByRole('columnheader', { name: new RegExp(t.tableStatus) }),
@@ -113,8 +120,21 @@ describe('ActivityTable', () => {
       within(table).getByRole('columnheader', { name: new RegExp(t.activityColDuration) }),
     ).toBeInTheDocument();
     expect(within(table).getByRole('cell', { name: 'qwen-coder' })).toBeInTheDocument();
+    expect(within(table).getByRole('cell', { name: 'gpt-oss-20b' })).toBeInTheDocument();
     expect(within(table).getByRole('cell', { name: 'GPU 1' })).toBeInTheDocument();
     expect(within(table).getByRole('cell', { name: '14 ms' })).toBeInTheDocument();
+  });
+
+  it('renders an em dash for a legacy row with no recorded requested_model', () => {
+    renderTable({
+      columns: columnsWithServer,
+      rows: [makeRow({ requested_model: '' })],
+    });
+    const table = screen.getByRole('table');
+    expect(within(table).getByRole('cell', { name: '—' })).toBeInTheDocument();
+    // The empty requested_model must never fall back to displaying `model`: the
+    // model cell text ('qwen-coder') should appear exactly once (its own column).
+    expect(within(table).getAllByRole('cell', { name: 'qwen-coder' })).toHaveLength(1);
   });
 
   it('emits the column id from a sort-header click', () => {
