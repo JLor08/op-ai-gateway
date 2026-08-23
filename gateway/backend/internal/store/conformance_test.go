@@ -2633,7 +2633,7 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		evt := usage.Event{
 			ID: "evt1", UserID: "u1", TokenID: "tok1", SessionID: "sess_1",
 			SessionSource: "codex", AgentID: "agent_1",
-			APIFlavor: "openai", Model: "gpt-4o-mini", Provider: "ollama", Host: "srv1.local",
+			APIFlavor: "openai", Model: "gpt-4o-mini", RequestedModel: "gpt-oss-20b", Provider: "ollama", Host: "srv1.local",
 			InputTokens: 10, OutputTokens: 20, TotalTokens: 30, LatencyMS: 123,
 			HTTPStatus: 200, Status: "ok", CreatedAt: now,
 		}
@@ -2651,10 +2651,13 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		if page.Total != 1 || len(page.Data) != 1 || page.Data[0].ID != "evt1" {
 			t.Fatalf("query mismatch: %+v", page)
 		}
-		// session_id/session_source/agent_id must survive the round-trip on the
-		// Query (scanUsageRows) path.
+		// session_id/session_source/agent_id/requested_model must survive the
+		// round-trip on the Query (scanUsageRows) path.
 		if got := page.Data[0]; got.SessionID != "sess_1" || got.SessionSource != "codex" || got.AgentID != "agent_1" {
 			t.Fatalf("session provenance mismatch (query): session_id=%q session_source=%q agent_id=%q", got.SessionID, got.SessionSource, got.AgentID)
+		}
+		if got := page.Data[0].RequestedModel; got != "gpt-oss-20b" {
+			t.Fatalf("RequestedModel (query) = %q, want gpt-oss-20b", got)
 		}
 		// ... and on the All (scanUsageEvents) path.
 		all := s.All()
@@ -2663,6 +2666,9 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		}
 		if got := all[0]; got.SessionID != "sess_1" || got.SessionSource != "codex" || got.AgentID != "agent_1" {
 			t.Fatalf("session provenance mismatch (all): session_id=%q session_source=%q agent_id=%q", got.SessionID, got.SessionSource, got.AgentID)
+		}
+		if got := all[0].RequestedModel; got != "gpt-oss-20b" {
+			t.Fatalf("RequestedModel (all) = %q, want gpt-oss-20b", got)
 		}
 
 		// Substring filter on session_source: "codex" matches, "claude-code" does not.
@@ -2687,6 +2693,34 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		}
 		if stats.Totals.TotalRequests != 1 || stats.Totals.InputTokens != 10 || stats.Totals.OutputTokens != 20 {
 			t.Fatalf("stats mismatch: %+v", stats.Totals)
+		}
+
+		// requested_model is reachable by the free-text q search and is a
+		// whitelisted sort key (issue #7) -- mirrors
+		// usage.TestRequestedModelRoundTripSearchAndSort against the SQL driver.
+		evt2 := usage.Event{
+			ID: "evt2", UserID: "u1", Model: "gpt-4o-mini", RequestedModel: "claude-sonnet",
+			Provider: "ollama", Host: "srv1.local", HTTPStatus: 200, Status: "ok",
+			CreatedAt: now.Add(time.Minute),
+		}
+		if err := s.Record(evt2); err != nil {
+			t.Fatalf("record usage evt2: %v", err)
+		}
+
+		qPage, err := s.Query(usage.Query{UserID: "u1", Q: "gpt-oss", Page: 1, Limit: 25})
+		if err != nil {
+			t.Fatalf("Query(q=gpt-oss) returned err: %v", err)
+		}
+		if qPage.Total != 1 || len(qPage.Data) != 1 || qPage.Data[0].ID != "evt1" {
+			t.Fatalf("q=gpt-oss matched %+v, want exactly evt1", qPage)
+		}
+
+		sortPage, err := s.Query(usage.Query{UserID: "u1", Sort: "requested_model", Order: "asc", Page: 1, Limit: 25})
+		if err != nil {
+			t.Fatalf("Query(sort=requested_model) returned err: %v", err)
+		}
+		if len(sortPage.Data) != 2 || sortPage.Data[0].RequestedModel != "claude-sonnet" || sortPage.Data[1].RequestedModel != "gpt-oss-20b" {
+			t.Fatalf("sort order = %+v, want [claude-sonnet gpt-oss-20b]", sortPage.Data)
 		}
 	})
 }

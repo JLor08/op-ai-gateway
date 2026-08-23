@@ -91,6 +91,7 @@ var migrations = []migration{
 	{version: 58, name: "server_certificate_override", up: migration58Up},
 	{version: 59, name: "application_proxy_listen_port", up: migration59Up},
 	{version: 60, name: "server_https_switch_override", up: migration60Up},
+	{version: 61, name: "usage_requested_model", up: migration61Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2703,6 +2704,27 @@ func migration59Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // an existing DB.
 func migration60Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	stmt := "alter table ai_servers add column https_switch_override text not null default ''"
+	if dl.name() == "postgres" {
+		return execTx(ctx, tx, dl, strings.Replace(stmt, "add column ", "add column if not exists ", 1))
+	}
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// migration61Up adds usage_events.requested_model — the model name exactly as
+// the client sent it, BEFORE resolveModelOverride applied any token model
+// override (issue #7). TEXT NOT NULL DEFAULT ” so pre-existing rows read
+// back "" = "unknown" (whether an override fired historically is not
+// recorded), mirroring certificate_override/migration58Up's empty-default
+// convention. On a fresh DB the baseline already creates the column, so this
+// only does real work upgrading an existing DB.
+func migration61Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	stmt := "alter table usage_events add column requested_model text not null default ''"
 	if dl.name() == "postgres" {
 		return execTx(ctx, tx, dl, strings.Replace(stmt, "add column ", "add column if not exists ", 1))
 	}

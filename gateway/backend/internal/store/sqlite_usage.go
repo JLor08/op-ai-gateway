@@ -58,12 +58,12 @@ const energyMaxRequestWindow = 30 * time.Minute
 func (s *SQLiteStore) Record(event usage.Event) error {
 	_, err := s.exec(context.Background(), `
 		insert into usage_events (
-			id, request_id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model,
+			id, request_id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model,
 			route_id, provider, host, status, error_code, input_tokens, output_tokens,
 			total_tokens, latency_ms, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second,
 			http_status, content_type, req_path, provider_path, provider_model, stream, token_name,
 			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
 		event.ID,
 		event.UserID,
@@ -73,6 +73,7 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 		event.AgentID,
 		event.APIFlavor,
 		event.Model,
+		event.RequestedModel,
 		event.RouteID,
 		event.Provider,
 		event.Host,
@@ -200,7 +201,7 @@ func (s *SQLiteStore) UsageEventsForServerWindow(ctx context.Context, serverID s
 
 func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 	rows, err := s.query(context.Background(), `
-		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, provider,
+		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model, provider,
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
@@ -223,7 +224,7 @@ func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 
 func (s *SQLiteStore) All() []usage.Event {
 	rows, err := s.query(context.Background(), `
-		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, provider,
+		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model, provider,
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
@@ -345,6 +346,7 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 			&event.AgentID,
 			&event.APIFlavor,
 			&event.Model,
+			&event.RequestedModel,
 			&event.Provider,
 			&event.RouteID,
 			&event.Host,
@@ -388,7 +390,7 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 
 // usageEventColumns is the e.-aliased select list matching scanUsageRows order,
 // identical to the ByUser/All column order.
-const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_source, e.agent_id, e.api_flavor, e.model, e.provider,
+const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_source, e.agent_id, e.api_flavor, e.model, e.requested_model, e.provider,
 	e.route_id, e.host, e.input_tokens, e.output_tokens, e.total_tokens, e.latency_ms, e.status,
 	e.error_code, e.cached_tokens, e.cache_write_tokens, e.prompt_per_second, e.tokens_per_second, e.http_status,
 	e.content_type, e.req_path, e.provider_path, e.provider_model, e.stream, e.token_name, e.server_name,
@@ -402,6 +404,7 @@ var usageSortColumns = map[string]string{
 	"tokens_per_second": "e.tokens_per_second",
 	"http_status":       "e.http_status",
 	"model":             "e.model",
+	"requested_model":   "e.requested_model",
 	"server_name":       "e.server_name",
 	"token_name":        "e.token_name",
 }
@@ -492,8 +495,8 @@ func usageWhere(dl dialect, q usage.Query, ownerNameExpr string) (string, []any)
 	}
 	if q.Q != "" {
 		like := "%" + q.Q + "%"
-		conds = append(conds, "(e.id "+il+" ? or e.model "+il+" ? or e.host "+il+" ? or e.server_name "+il+" ? or e.token_name "+il+" ?)")
-		args = append(args, like, like, like, like, like)
+		conds = append(conds, "(e.id "+il+" ? or e.model "+il+" ? or e.requested_model "+il+" ? or e.host "+il+" ? or e.server_name "+il+" ? or e.token_name "+il+" ?)")
+		args = append(args, like, like, like, like, like, like)
 	}
 	if q.ReqPath != "" {
 		conds = append(conds, "e.req_path "+il+" ?")
@@ -674,6 +677,7 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 			&row.AgentID,
 			&row.APIFlavor,
 			&row.Model,
+			&row.RequestedModel,
 			&row.Provider,
 			&row.RouteID,
 			&row.Host,
