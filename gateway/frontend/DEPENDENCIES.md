@@ -1,18 +1,16 @@
 # Dependency and licensing record
 
-## Direct AGPLv3 dependency
+## Direct UI dependencies
 
 | Package | Version | Purpose | License | Upstream |
 |---|---:|---|---|---|
-| `twenty-ui` | `1.0.0-alpha.0` | React UI component library; the status refresh control uses its `Button` component and its theme provider/styles. | AGPL-3.0 (as declared in the npm package) | https://github.com/twentyhq/twenty/tree/main/packages/twenty-ui |
+| `@mui/material` | `^9.3.1` | React UI component library for the administration console. | MIT | https://github.com/mui/material-ui |
+| `@mui/icons-material` | `^9.3.1` | Material icon components for UI actions. | MIT | https://github.com/mui/material-ui |
+| `@emotion/react` | `^11.14.0` | Styling runtime required by Material UI. | MIT | https://github.com/emotion-js/emotion |
+| `@emotion/styled` | `^11.14.1` | Styled component API required by Material UI. | MIT | https://github.com/emotion-js/emotion |
 
-The package is pinned exactly in `package.json` and integrity-locked in
-`package-lock.json`. Its distributed `LICENSE` includes AGPLv3 and notes that
-upstream enterprise-marked files may have separate commercial terms. This
-project uses the published, non-enterprise `Button` component only; review the
-upstream license and this record before upgrading or using additional exports.
-
-The complete AGPLv3 text is provided in the repository-root `LICENSE`. The
-corresponding source for this project is made available under AGPL-3.0-only.
+The packages are versioned in `package.json` and integrity-locked in
+`package-lock.json`. Review upstream licenses and this record before upgrading
+or using additional exports.
 
 This is a compliance record, not legal advice.

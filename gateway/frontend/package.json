@@ -9,10 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.3.1",
+    "@mui/material": "^9.3.1",
     "@vitejs/plugin-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "twenty-ui": "1.0.0-alpha.0",
     "vite": "latest"
   },
   "devDependencies": {

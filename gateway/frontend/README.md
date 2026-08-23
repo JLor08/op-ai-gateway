@@ -2,9 +2,8 @@
 
 React and TypeScript administration console, built with Vite.
 
-The UI uses the AGPLv3 `twenty-ui` design-system package for its gateway status
-refresh control. Its exact version and licensing record are in
-[DEPENDENCIES.md](DEPENDENCIES.md).
+The UI uses the free Material UI component library. Its exact versions and
+licensing record are in [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ```bash
 npm install
