@@ -24,6 +24,7 @@ var sortWhitelist = map[string]bool{
 	"tokens_per_second": true,
 	"http_status":       true,
 	"model":             true,
+	"requested_model":   true,
 	"server_name":       true,
 	"token_name":        true,
 }
