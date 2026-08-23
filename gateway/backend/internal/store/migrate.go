@@ -174,8 +174,8 @@ func execTx(ctx context.Context, tx *sql.Tx, dl dialect, q string) error {
 // after "add column ", e.g. `https_switch_override text not null default` plus
 // an empty-string default clause (see migration60Up for the inlined version).
 //
-// This is not yet called by any shipped migration — every existing
-// migrationNUp keeps its own inlined copy of this block, and per the
+// migration61Up (usage_requested_model) is the first and only caller — every
+// migrationNUp up to v60 keeps its own inlined copy of this block, and per the
 // forward-only migration-ledger rule (see the `migrations` var doc comment,
 // "NEVER edit or reorder an already-shipped migration") none of them are
 // rewritten to call this helper retroactively; rewriting a shipped
@@ -2721,18 +2721,12 @@ func migration60Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // override (issue #7). TEXT NOT NULL DEFAULT ” so pre-existing rows read
 // back "" = "unknown" (whether an override fired historically is not
 // recorded), mirroring certificate_override/migration58Up's empty-default
-// convention. On a fresh DB the baseline already creates the column, so this
-// only does real work upgrading an existing DB.
+// convention. baselineCreateStatements is FROZEN as of v60 and deliberately
+// does NOT carry this column (see its doc comment: back-porting a new column
+// into the frozen baseline is exactly what that policy forbids) — a fresh DB
+// gets requested_model from THIS migration too, by replaying the v1 baseline
+// and then v2..vN in order. First migration to call addColumnIfMissing
+// instead of inlining the duplicate-tolerant add-column block.
 func migration61Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
-	stmt := "alter table usage_events add column requested_model text not null default ''"
-	if dl.name() == "postgres" {
-		return execTx(ctx, tx, dl, strings.Replace(stmt, "add column ", "add column if not exists ", 1))
-	}
-	if _, err := tx.ExecContext(ctx, stmt); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return addColumnIfMissing(ctx, tx, dl, "usage_events", "requested_model text not null default ''")
 }
