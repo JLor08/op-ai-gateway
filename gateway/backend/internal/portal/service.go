@@ -1211,7 +1211,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		CreatedAt:                      now,
 		UpdatedAt:                      now,
 		ModelOverride:                  override,
-		ModelOverrideMap:               store.EncodeModelOverrideMap(overrideMap),
+		ModelOverrideMap:               store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap)),
 		LogCommunication:               req.LogCommunication,
 		Secret:                         req.Secret,
 		ProjectID:                      projectID,
@@ -1281,7 +1281,7 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		if err != nil {
 			return TokenDTO{}, err
 		}
-		record.ModelOverrideMap = store.EncodeModelOverrideMap(overrideMap)
+		record.ModelOverrideMap = store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap))
 	}
 	if req.LogCommunication != nil {
 		record.LogCommunication = *req.LogCommunication
@@ -1431,6 +1431,38 @@ func (s *Service) validateModelOverrideMap(ctx context.Context, owner auth.Token
 		return nil, nil
 	}
 	return out, nil
+}
+
+// modelOverrideMapToRules mechanically lifts a validated requested->model DTO
+// map into the rules codec (Task 1's store.ModelOverrideRule), so it can be
+// persisted via store.EncodeModelOverrideRules: each entry becomes a rule with
+// only To set (Offer/HideTarget false) — the DTO wire format itself is
+// untouched by this task, a later task owns exposing the two listing switches
+// on it. nil in, nil out.
+func modelOverrideMapToRules(m map[string]string) map[string]store.ModelOverrideRule {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]store.ModelOverrideRule, len(m))
+	for k, v := range m {
+		out[k] = store.ModelOverrideRule{To: v}
+	}
+	return out
+}
+
+// modelOverrideRulesToMap mechanically projects decoded rules back down to the
+// DTO's requested->model map (rule.To only, dropping Offer/HideTarget) — the
+// inverse of modelOverrideMapToRules, used wherever a TokenDTO/ServiceTokenDTO
+// is rendered. nil in, nil out.
+func modelOverrideRulesToMap(rules map[string]store.ModelOverrideRule) map[string]string {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(rules))
+	for k, rule := range rules {
+		out[k] = rule.To
+	}
+	return out
 }
 
 func validateTokenScopes(owner auth.Token, requested []string) ([]string, error) {
@@ -3332,7 +3364,21 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		return auth.Token{}, ErrTokenForbidden
 	}
 	scopes := parseScopes(record.Scopes)
-	runAs := auth.Token{ID: record.ID, UserID: record.UserID, Name: record.Name, Active: true, Scopes: scopes, ModelOverride: record.ModelOverride, ModelOverrideMap: store.DecodeModelOverrideMap(record.ModelOverrideMap), LogCommunication: record.LogCommunication, Secret: record.Secret, ProjectID: record.ProjectID, ProjectName: s.resolveProjectName(ctx, record.ProjectID), ServerOverride: record.ServerOverride, ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable}
+	runAs := auth.Token{
+		ID: record.ID, UserID: record.UserID, Name: record.Name, Active: true, Scopes: scopes,
+		ModelOverride:                  record.ModelOverride,
+		ModelOverrideRules:             store.AuthModelOverrideRules(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
+		LogCommunication:               record.LogCommunication,
+		Secret:                         record.Secret,
+		ProjectID:                      record.ProjectID,
+		ProjectName:                    s.resolveProjectName(ctx, record.ProjectID),
+		ServerOverride:                 record.ServerOverride,
+		ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable,
+		LastUsedModel:                  record.LastUsedModel,
+		UnknownModelRedirect:           record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           record.UnknownModelFallback,
+	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
 	}
@@ -3353,7 +3399,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		LastUsedAt:                     record.LastUsedAt,
 		CreatedAt:                      record.CreatedAt,
 		ModelOverride:                  record.ModelOverride,
-		ModelOverrideMap:               store.DecodeModelOverrideMap(record.ModelOverrideMap),
+		ModelOverrideMap:               modelOverrideRulesToMap(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
 		LogCommunication:               record.LogCommunication,
 		Secret:                         record.Secret,
 		IsChatSession:                  false,

@@ -150,6 +150,22 @@ type TokenRecord struct {
 	// server (else an unhealthy override server is refused).
 	ServerOverride                 string
 	ServerOverrideForceUnreachable bool
+	// LastUsedModel is the gateway model or group name of this token's last
+	// SUCCESSFULLY ROUTED request ("" = none yet). Kept for every token, not
+	// only those using the redirect below, because the token list shows it.
+	LastUsedModel string
+	// UnknownModelRedirect turns on the unknown-model redirect: a requested
+	// model that does not apply falls back to LastUsedModel, then to
+	// UnknownModelFallback. An exact override row and the catch-all both win
+	// over it.
+	UnknownModelRedirect bool
+	// UnknownModelRedirectBlocked widens what counts as "does not apply": with
+	// it, a model that exists but this token may not use (allowlist, resource
+	// group visibility) is redirected too, instead of being refused.
+	UnknownModelRedirectBlocked bool
+	// UnknownModelFallback is the model or group used when LastUsedModel is
+	// empty or no longer offered ("" = none, the request then fails as before).
+	UnknownModelFallback string
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

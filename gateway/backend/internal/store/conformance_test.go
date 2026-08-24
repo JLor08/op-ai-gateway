@@ -325,6 +325,76 @@ func TestConformanceTokenRepoAndBearer(t *testing.T) {
 	})
 }
 
+// TestConformanceTokenRedirectSettingsRoundTrip proves the four new columns
+// (last_used_model, unknown_model_redirect, unknown_model_redirect_blocked,
+// unknown_model_fallback) round-trip through CreatePlainToken/TokenByID on
+// both dialects, alongside the existing ModelOverrideMap rules codec.
+func TestConformanceTokenRedirectSettingsRoundTrip(t *testing.T) {
+	forEachDialect(t, testTokenRedirectSettingsRoundTrip)
+}
+
+func testTokenRedirectSettingsRoundTrip(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_redirect", "redirect@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	rec := TokenRecord{
+		ID: "tok_redirect", UserID: "usr_redirect", Name: "redirect", CreatedAt: now, UpdatedAt: now,
+		ModelOverrideMap:            EncodeModelOverrideRules(map[string]ModelOverrideRule{"gpt-4o": {To: "qwen3-32b", Offer: true}}),
+		UnknownModelRedirect:        true,
+		UnknownModelRedirectBlocked: true,
+		UnknownModelFallback:        "fallback-model",
+		LastUsedModel:               "qwen3-32b",
+	}
+	if err := s.CreatePlainToken(ctx, rec, "redirect-secret-value"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	got, err := s.TokenByID(ctx, "tok_redirect")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if !got.UnknownModelRedirect || !got.UnknownModelRedirectBlocked {
+		t.Fatalf("switches lost: %+v", got)
+	}
+	if got.UnknownModelFallback != "fallback-model" || got.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("fallback/last-used lost: %+v", got)
+	}
+	rules := DecodeModelOverrideRules(got.ModelOverrideMap)
+	if !rules["gpt-4o"].Offer || rules["gpt-4o"].To != "qwen3-32b" {
+		t.Fatalf("rules lost: %#v", rules)
+	}
+}
+
+// TestConformanceTokenDefaultsUnchanged proves a token created without
+// touching any of the new fields reads back exactly as it did before this
+// feature: redirect off, no fallback, no last-used model.
+func TestConformanceTokenDefaultsUnchanged(t *testing.T) {
+	forEachDialect(t, testTokenDefaultsUnchanged)
+}
+
+func testTokenDefaultsUnchanged(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_plain", "plain@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	rec := TokenRecord{ID: "tok_plain", UserID: "usr_plain", Name: "plain", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, rec, "plain-secret-value"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	got, err := s.TokenByID(ctx, "tok_plain")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.UnknownModelRedirect || got.UnknownModelRedirectBlocked ||
+		got.UnknownModelFallback != "" || got.LastUsedModel != "" {
+		t.Fatalf("defaults changed: %+v", got)
+	}
+}
+
 // --- 4. Sessions + set-password tokens -------------------------------------
 
 func TestConformanceSessionsAndSetPasswordTokens(t *testing.T) {
@@ -5270,6 +5340,19 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		}
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column server_override_force_unreachable integer not null default 0`); err != nil {
 			t.Fatalf("reapply api_tokens.server_override_force_unreachable after migration40RawUp: %v", err)
+		}
+		// ...and v63's last-used-model marker + unknown-model redirect settings.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column last_used_model text not null default ''`); err != nil {
+			t.Fatalf("reapply api_tokens.last_used_model after migration40RawUp: %v", err)
+		}
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column unknown_model_redirect integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.unknown_model_redirect after migration40RawUp: %v", err)
+		}
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column unknown_model_redirect_blocked integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.unknown_model_redirect_blocked after migration40RawUp: %v", err)
+		}
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column unknown_model_fallback text not null default ''`); err != nil {
+			t.Fatalf("reapply api_tokens.unknown_model_fallback after migration40RawUp: %v", err)
 		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW

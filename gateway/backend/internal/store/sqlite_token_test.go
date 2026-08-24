@@ -442,10 +442,10 @@ func TestSQLiteTokenModelOverrideMapRoundTrip(t *testing.T) {
 		t.Fatalf("stored map = %q, want %q", got.ModelOverrideMap, rec.ModelOverrideMap)
 	}
 
-	// LookupBearer decodes the JSON column into auth.Token.ModelOverrideMap.
+	// LookupBearer decodes the JSON column into auth.Token.ModelOverrideRules.
 	tok, ok := st.LookupBearer("Bearer plain-secret")
-	if !ok || len(tok.ModelOverrideMap) != 2 || tok.ModelOverrideMap["gpt-4o"] != "qwen-coder" || tok.ModelOverride != "catch-all-model" {
-		t.Fatalf("LookupBearer map=%#v override=%q ok=%v", tok.ModelOverrideMap, tok.ModelOverride, ok)
+	if !ok || len(tok.ModelOverrideRules) != 2 || tok.ModelOverrideRules["gpt-4o"].To != "qwen-coder" || tok.ModelOverride != "catch-all-model" {
+		t.Fatalf("LookupBearer rules=%#v override=%q ok=%v", tok.ModelOverrideRules, tok.ModelOverride, ok)
 	}
 
 	// Clearing the map via update round-trips to the empty string.
@@ -458,8 +458,8 @@ func TestSQLiteTokenModelOverrideMapRoundTrip(t *testing.T) {
 		t.Fatalf("after clear: map=%q, want empty", after.ModelOverrideMap)
 	}
 	tok2, _ := st.LookupBearer("Bearer plain-secret")
-	if len(tok2.ModelOverrideMap) != 0 {
-		t.Fatalf("after clear LookupBearer map=%#v, want empty", tok2.ModelOverrideMap)
+	if len(tok2.ModelOverrideRules) != 0 {
+		t.Fatalf("after clear LookupBearer rules=%#v, want empty", tok2.ModelOverrideRules)
 	}
 }
 

@@ -49,8 +49,9 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 			id, user_id, name, secret_hash, secret_prefix, status, scopes,
 			expires_at, last_used_at, created_at, updated_at, model_override, model_override_map,
 			log_communication, secret, service_id, kind, project_id,
-			server_override, server_override_force_unreachable
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			server_override, server_override_force_unreachable,
+			last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		token.ID,
 		nullableTokenRef(token.UserID),
 		token.Name,
@@ -71,6 +72,10 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 		nullableTokenRef(token.ProjectID),
 		token.ServerOverride,
 		token.ServerOverrideForceUnreachable,
+		token.LastUsedModel,
+		token.UnknownModelRedirect,
+		token.UnknownModelRedirectBlocked,
+		token.UnknownModelFallback,
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -104,7 +109,8 @@ func nullableTokenRef(v string) sql.NullString {
 // token has no project).
 const tokenColumns = `id, coalesce(user_id,''), name, secret_hash, secret_prefix, status, scopes,
 		expires_at, last_used_at, created_at, updated_at, model_override, model_override_map, log_communication, secret,
-		coalesce(service_id,''), kind, coalesce(project_id,''), server_override, server_override_force_unreachable`
+		coalesce(service_id,''), kind, coalesce(project_id,''), server_override, server_override_force_unreachable,
+		last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback`
 
 func (s *SQLiteStore) TokenByID(ctx context.Context, id string) (TokenRecord, error) {
 	row := s.queryRow(ctx, `
@@ -204,10 +210,13 @@ func (s *SQLiteStore) UpdateTokenMetadata(ctx context.Context, token TokenRecord
 	res, err := s.exec(ctx, `
 		update api_tokens
 		set name = ?, scopes = ?, status = ?, updated_at = ?, model_override = ?, model_override_map = ?, log_communication = ?, secret = ?, project_id = ?,
-			server_override = ?, server_override_force_unreachable = ?
+			server_override = ?, server_override_force_unreachable = ?,
+			last_used_model = ?, unknown_model_redirect = ?, unknown_model_redirect_blocked = ?, unknown_model_fallback = ?
 		where id = ?`,
 		token.Name, token.Scopes, token.Status, token.UpdatedAt, token.ModelOverride, token.ModelOverrideMap, token.LogCommunication, token.Secret, nullableTokenRef(token.ProjectID),
-		token.ServerOverride, token.ServerOverrideForceUnreachable, token.ID)
+		token.ServerOverride, token.ServerOverrideForceUnreachable,
+		token.LastUsedModel, token.UnknownModelRedirect, token.UnknownModelRedirectBlocked, token.UnknownModelFallback,
+		token.ID)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict
@@ -314,7 +323,7 @@ func (s *SQLiteStore) LookupBearer(header string) (auth.Token, bool) {
 		Scopes:                         tokenScopes(record.Scopes),
 		ExpiresAt:                      record.ExpiresAt,
 		ModelOverride:                  record.ModelOverride,
-		ModelOverrideMap:               DecodeModelOverrideMap(record.ModelOverrideMap),
+		ModelOverrideRules:             AuthModelOverrideRules(DecodeModelOverrideRules(record.ModelOverrideMap)),
 		LogCommunication:               record.LogCommunication,
 		Secret:                         record.Secret,
 		ServiceID:                      record.ServiceID,
@@ -325,6 +334,10 @@ func (s *SQLiteStore) LookupBearer(header string) (auth.Token, bool) {
 		ProjectName:                    projectName,
 		ServerOverride:                 record.ServerOverride,
 		ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable,
+		LastUsedModel:                  record.LastUsedModel,
+		UnknownModelRedirect:           record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           record.UnknownModelFallback,
 	}, true
 }
 
@@ -343,6 +356,8 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	var logComm int64
 	var secret int64
 	var serverOverrideForceUnreachable int64
+	var unknownModelRedirect int64
+	var unknownModelRedirectBlocked int64
 	err := row.Scan(
 		&token.ID,
 		&token.UserID,
@@ -364,6 +379,10 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 		&token.ProjectID,
 		&token.ServerOverride,
 		&serverOverrideForceUnreachable,
+		&token.LastUsedModel,
+		&unknownModelRedirect,
+		&unknownModelRedirectBlocked,
+		&token.UnknownModelFallback,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TokenRecord{}, ErrNotFound
@@ -380,6 +399,8 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	token.LogCommunication = logComm != 0
 	token.Secret = secret != 0
 	token.ServerOverrideForceUnreachable = serverOverrideForceUnreachable != 0
+	token.UnknownModelRedirect = unknownModelRedirect != 0
+	token.UnknownModelRedirectBlocked = unknownModelRedirectBlocked != 0
 	return token, nil
 }
 

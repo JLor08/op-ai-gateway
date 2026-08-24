@@ -214,15 +214,15 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 }
 
 // resolveModelOverride returns the gateway model to use for a REQUESTED model given
-// the token's override configuration: an exact per-model map entry wins; otherwise
+// the token's override configuration: an exact per-model rule entry wins; otherwise
 // the catch-all (token.ModelOverride) applies; otherwise the requested model is
 // returned unchanged. It is the single source of truth for the one shared gate
 // (inferencePreflight) both the translate handlers and native passthrough
 // (tryProxyNative, via the preflight it consumes) resolve their effective model
 // through.
 func resolveModelOverride(token auth.Token, requested string) string {
-	if mapped, ok := token.ModelOverrideMap[requested]; ok && strings.TrimSpace(mapped) != "" {
-		return mapped
+	if rule, ok := token.ModelOverrideRules[requested]; ok && strings.TrimSpace(rule.To) != "" {
+		return rule.To
 	}
 	if token.ModelOverride != "" {
 		return token.ModelOverride

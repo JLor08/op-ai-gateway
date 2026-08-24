@@ -93,6 +93,7 @@ var migrations = []migration{
 	{version: 60, name: "server_https_switch_override", up: migration60Up},
 	{version: 61, name: "usage_requested_model", up: migration61Up},
 	{version: 62, name: "model_group_selection_settings", up: migration62Up},
+	{version: 63, name: "token_unknown_model_redirect", up: migration63Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2745,6 +2746,27 @@ func migration62Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	for _, col := range cols {
 		if err := addColumnIfMissing(ctx, tx, dl, "model_groups", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration63Up adds the per-token unknown-model redirect settings and the
+// last-used-model marker. Defaults reproduce the pre-feature behavior exactly:
+// the redirect is off, so resolution is unchanged for every existing token.
+// The model-override map needs NO migration — the column holds a JSON string
+// and DecodeModelOverrideRules reads the legacy shape as rules with both
+// listing switches false.
+func migration63Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	cols := []string{
+		"last_used_model text not null default ''",
+		"unknown_model_redirect integer not null default 0",
+		"unknown_model_redirect_blocked integer not null default 0",
+		"unknown_model_fallback text not null default ''",
+	}
+	for _, col := range cols {
+		if err := addColumnIfMissing(ctx, tx, dl, "api_tokens", col); err != nil {
 			return err
 		}
 	}

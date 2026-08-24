@@ -700,7 +700,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		ModelOverride:    override,
-		ModelOverrideMap: store.EncodeModelOverrideMap(overrideMap),
+		ModelOverrideMap: store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap)),
 		LogCommunication: req.LogCommunication,
 		Secret:           req.Secret,
 	}
@@ -977,7 +977,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		LastUsedAt:       record.LastUsedAt,
 		CreatedAt:        record.CreatedAt,
 		ModelOverride:    record.ModelOverride,
-		ModelOverrideMap: store.DecodeModelOverrideMap(record.ModelOverrideMap),
+		ModelOverrideMap: modelOverrideRulesToMap(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
 		LogCommunication: record.LogCommunication,
 		Secret:           record.Secret,
 	}

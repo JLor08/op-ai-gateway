@@ -5,37 +5,9 @@ package store
 
 import (
 	"encoding/json"
+	"op-ai-gateway/internal/auth"
 	"strings"
 )
-
-// DecodeModelOverrideMap parses the api_tokens.model_override_map JSON string into
-// a requested-model -> gateway-model map. An empty/blank/malformed value yields
-// nil (no per-model overrides) — malformed is treated as "none" rather than an
-// error so a bad row never breaks token resolution.
-func DecodeModelOverrideMap(s string) map[string]string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	var m map[string]string
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
-		return nil
-	}
-	return m
-}
-
-// EncodeModelOverrideMap serializes a requested-model -> gateway-model map into the
-// JSON string stored in api_tokens.model_override_map. An empty/nil map yields ""
-// (the column default) so "no entries" round-trips as the empty string, not "{}".
-func EncodeModelOverrideMap(m map[string]string) string {
-	if len(m) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
 
 // ModelOverrideRule is one row of a token's model-override map: the gateway
 // model a requested name resolves to, plus whether that requested name is
@@ -107,4 +79,23 @@ func EncodeModelOverrideRules(m map[string]ModelOverrideRule) string {
 		return ""
 	}
 	return string(b)
+}
+
+// AuthModelOverrideRules converts decoded store rules into auth.ModelOverrideRule,
+// the mirror type carried on auth.Token.ModelOverrideRules. The two types are
+// duplicated (identical shape, no shared definition) rather than auth.Token
+// referencing ModelOverrideRule directly, because this package (store) already
+// imports auth (for auth.Token itself, used by SQLStore.LookupBearer below) —
+// having auth import store the other way would be an import cycle. This is the
+// one place that bridges the two: every call site that builds an auth.Token
+// from a store.TokenRecord's decoded rules goes through here.
+func AuthModelOverrideRules(rules map[string]ModelOverrideRule) map[string]auth.ModelOverrideRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make(map[string]auth.ModelOverrideRule, len(rules))
+	for name, rule := range rules {
+		out[name] = auth.ModelOverrideRule{To: rule.To, Offer: rule.Offer, HideTarget: rule.HideTarget}
+	}
+	return out
 }
