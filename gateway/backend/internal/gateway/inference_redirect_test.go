@@ -26,12 +26,26 @@ func offering(offered, existing []string) portal.ModelOffering {
 	return portal.ModelOffering{Offered: nameSet(offered), Callable: nameSet(offered), Existing: nameSet(existing)}
 }
 
+// offeringWithLocked builds the model_settings "locked" shape: a GROUP-ONLY
+// name that exists but that a direct request cannot route to at all
+// (GroupRegistry.DirectAllowed → routing.ErrNoModelRoute). Unlike "hidden" this
+// is a real access boundary, so the name is absent from BOTH Offered and
+// Callable while staying in Existing — which is exactly the "exists but you
+// cannot call it" shape UnknownModelRedirectBlocked is for.
+func offeringWithLocked(callable, locked []string) portal.ModelOffering {
+	return portal.ModelOffering{
+		Offered:  nameSet(callable),
+		Callable: nameSet(callable),
+		Existing: nameSet(callable, locked),
+	}
+}
+
 // offeringWithSuppressed builds the case where the LISTING and the ACCESS set
 // disagree: `suppressed` names are dropped from the listing (model_settings
-// hidden/locked, or a rule's HideTarget) yet stay fully callable under their
-// own name — so they are absent from Offered but present in Callable and
-// Existing. This is the shape the redirect has to get right; asking Offered
-// here would reroute a request the token was entitled to serve.
+// "hidden", or a rule's HideTarget) yet stay fully callable under their own
+// name — so they are absent from Offered but present in Callable and Existing.
+// This is the shape the redirect has to get right; asking Offered here would
+// reroute a request the token was entitled to serve.
 func offeringWithSuppressed(offered, suppressed []string) portal.ModelOffering {
 	return portal.ModelOffering{
 		Offered:  nameSet(offered),
@@ -146,6 +160,40 @@ func TestRedirectAcceptsASuppressedButCallableCandidate(t *testing.T) {
 	tok := auth.Token{UnknownModelRedirect: true, LastUsedModel: "hidden-but-callable", UnknownModelFallback: "f"}
 	if got := redirectUnknownModel(tok, "nope", offeringWithSuppressed([]string{"f"}, []string{"hidden-but-callable"})); got != "hidden-but-callable" {
 		t.Fatalf("redirect = %q, want hidden-but-callable", got)
+	}
+}
+
+// TestRedirectWidenedRedirectsALockedModel: "locked" means group-only, so a
+// direct request for that name is refused with ErrNoModelRoute. That is
+// literally the "the model exists but you cannot call it" case
+// UnknownModelRedirectBlocked was added for, so widened mode must redirect it —
+// which only happens while Callable excludes locked names.
+func TestRedirectWidenedRedirectsALockedModel(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, LastUsedModel: "a"}
+	if got := redirectUnknownModel(tok, "locked-model", offeringWithLocked([]string{"a"}, []string{"locked-model"})); got != "a" {
+		t.Fatalf("redirect = %q, want a (a locked model cannot be called directly)", got)
+	}
+}
+
+// TestRedirectRejectsALockedFallback: the other consequence. A locked name is
+// not a usable TARGET either — redirecting onto it would swap the client's
+// model for one that then fails to route, under a name the client never sent.
+// Configured as the fallback, it must simply not be taken.
+func TestRedirectRejectsALockedFallback(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, LastUsedModel: "gone", UnknownModelFallback: "locked-model"}
+	if got := redirectUnknownModel(tok, "nope", offeringWithLocked([]string{"a"}, []string{"locked-model"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect onto a locked model", got)
+	}
+}
+
+// TestRedirectSkipsALockedLastUsedModel: same for the marker. A model can be
+// locked AFTER a token last used it successfully, so the last-used candidate is
+// exactly where a stale locked name shows up — the chain must step over it and
+// take the fallback rather than route to a dead end.
+func TestRedirectSkipsALockedLastUsedModel(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, LastUsedModel: "locked-model", UnknownModelFallback: "a"}
+	if got := redirectUnknownModel(tok, "nope", offeringWithLocked([]string{"a"}, []string{"locked-model"})); got != "a" {
+		t.Fatalf("redirect = %q, want the fallback a", got)
 	}
 }
 

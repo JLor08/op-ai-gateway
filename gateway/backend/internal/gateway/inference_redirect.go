@@ -26,13 +26,14 @@ import (
 //
 // Both questions this asks the offering — "does the request apply" and "is this
 // candidate usable" — are asked of Callable, NEVER of Offered. Offered is a
-// listing set: model_settings hidden/locked drops a name from it while leaving
-// the model fully callable under that same name. Reading Offered here would
-// make widened mode fire on a request the token was entitled to serve and
-// reroute it away from a working model — and, worse, defeat a catch-all whose
-// target happens to be suppressed, which must always win over this redirect.
-// Callable is the set that means "this token can actually route to it", so it
-// is the only correct answer to either question.
+// listing set: a model_settings "hidden" name drops out of it while the model
+// stays fully callable under that same name. Reading Offered here would make
+// widened mode fire on a request the token was entitled to serve and reroute it
+// away from a working model — and, worse, defeat a catch-all whose target
+// happens to be hidden, which must always win over this redirect. Callable
+// means "a direct request for this name can succeed", which is the only correct
+// answer to either question — including for a "locked" (group-only) name, which
+// Callable excludes precisely because a direct request for it cannot route.
 //
 // A failed offering lookup needs no special case here. ModelOfferingFor is
 // all-or-nothing and hands back WHOLLY EMPTY sets on any store error, and

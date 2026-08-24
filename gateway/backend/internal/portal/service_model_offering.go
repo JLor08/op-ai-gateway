@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"op-ai-gateway/internal/auth"
+	"strings"
 )
 
 // ModelOffering answers the questions the unknown-model redirect asks about a
@@ -18,15 +19,27 @@ import (
 // hide.
 //
 // Callable is the ACCESS set: what this token can actually route to under its
-// real name. It applies the same per-token reachability as Offered (the server
-// allowlist and resource-group provisioning of visibleMappingViews) but NOT the
-// model_settings hidden/locked suppression, and it carries every active group
-// regardless of the group's display visibility. Seeing and reaching are simply
-// not the same thing here: hidden/locked is a DISPLAY switch, and a suppressed
-// model stays fully callable under its own name (see visibleMappingViews's
-// visibility-surface matrix, and applyOverrideAliases below). The redirect must
-// ask this set, never Offered — asking Offered would fire on a request the
-// token was entitled to serve and reroute it away from a working model.
+// real name, i.e. exactly the names a direct request can succeed with. It
+// applies the same per-token reachability as Offered (the server allowlist and
+// resource-group provisioning of visibleMappingViews), and then splits the two
+// model_settings suppression values apart, because only one of them is about
+// access at all:
+//
+//   - "hidden" (and a rule's HideTarget) is DISPLAY ONLY — the name drops out
+//     of the listing and still routes perfectly. It stays in Callable, and an
+//     active group stays regardless of the group name's own display visibility.
+//     Asking Offered instead would fire the redirect on a request the token was
+//     entitled to serve and reroute it away from a working model.
+//   - "locked" is a real ACCESS boundary — the name is group-only, and a direct
+//     request for it is refused with routing.ErrNoModelRoute (see isLocked). It
+//     is therefore NOT callable and comes out. It is still Existing, which is
+//     what keeps it the "exists but you cannot call it" case that
+//     UnknownModelRedirectBlocked exists to redirect.
+//
+// A locked model reachable via a group does not sneak back in through the group
+// path: the group overlay contributes the GROUP's own name (with its members'
+// flavor union), never the member names, so a locked member's own name has only
+// the one entry — its own — and that entry is dropped here.
 //
 // Existing is every name that exists at all for that flavor, deliberately
 // WITHOUT the per-token visibility filter and WITHOUT the listing switches —
@@ -144,8 +157,10 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// same composition's OTHER half — the pre-suppression map it already builds
 	// for the alias overlay, which is precisely "token-filtered, but before the
 	// model_settings hidden/locked names were dropped, and with every active
-	// group regardless of its display visibility". No extra store read: it comes
-	// out of the one call below that was already being made.
+	// group regardless of its display visibility" — minus the locked names,
+	// re-dropped below. No extra store read: both come out of the one call below
+	// that was already being made, and the visibility map the locked filter
+	// needs is the overlay's own, already loaded.
 	sets, callable := flavorSetsFromViews(visible, &overlay, token)
 	out := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	for name, flavors := range sets {
@@ -154,9 +169,21 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 		}
 	}
 	for name, flavors := range callable {
-		if _, ok := flavors[flavor]; ok {
-			out.Callable[name] = struct{}{}
+		if _, ok := flavors[flavor]; !ok {
+			continue
 		}
+		// The one suppression value that must NOT survive into the access set.
+		// "locked" is group-only: a direct request for it is refused outright
+		// (DirectAllowed → ErrNoModelRoute), for a group name exactly as for a
+		// model name. Keeping it here would both stop widened mode redirecting
+		// the very "exists but you cannot call it" case it is for, AND make a
+		// locked name an eligible redirect TARGET — rerouting the request onto a
+		// name that then fails to route, under a model the client never sent.
+		// "hidden" stays: it is display-only and routes fine.
+		if isLocked(overlay.visByLower[strings.ToLower(strings.TrimSpace(name))]) {
+			continue
+		}
+		out.Callable[name] = struct{}{}
 	}
 	// Existing is built WITHOUT the token filter and without the visibility
 	// overlay: a model the token cannot see still exists, and conflating the two

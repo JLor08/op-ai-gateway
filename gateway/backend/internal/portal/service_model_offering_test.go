@@ -145,28 +145,94 @@ func TestOfferedAliasOfHiddenTargetIsListed(t *testing.T) {
 	}
 }
 
-// TestCallableKeepsAModelHiddenByModelSettings: hidden/locked is a DISPLAY
-// switch — the model drops out of the listing but stays fully routable under
-// its own name. Callable is the set that says so, and the Task-5 redirect reads
-// it precisely so that widened mode does not reroute a request the token was
-// entitled to serve.
-func TestCallableKeepsAModelHiddenByModelSettings(t *testing.T) {
+// TestCallableSplitsHiddenFromLocked is the whole point of Callable. Both
+// values suppress a model from every usage-facing LISTING, and there the two
+// are interchangeable — but only one of them is about access:
+//
+//   - "hidden" is display-only. The model routes fine under its own name, so it
+//     stays callable and the redirect must leave a request for it alone.
+//   - "locked" is group-only. GroupRegistry.DirectAllowed refuses it and
+//     routing.Resolver turns that into ErrNoModelRoute, so a direct request
+//     cannot succeed — it is not callable, and the redirect both may and must
+//     act on it.
+//
+// Either way the name still EXISTS: narrow mode keeps refusing rather than
+// redirecting.
+func TestCallableSplitsHiddenFromLocked(t *testing.T) {
 	ctx := context.Background()
-	for _, vis := range []string{"hidden", "locked"} {
-		t.Run(vis, func(t *testing.T) {
+	cases := []struct {
+		visibility   string
+		wantCallable bool
+	}{
+		{"hidden", true},
+		{"locked", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.visibility, func(t *testing.T) {
 			svc, rs := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
-			offerVisibility(t, rs, "qwen3-32b", vis)
+			offerVisibility(t, rs, "qwen3-32b", tc.visibility)
 			off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
 			if _, ok := off.Offered["qwen3-32b"]; ok {
-				t.Fatalf("%s model still listed", vis)
+				t.Fatalf("%s model still listed", tc.visibility)
 			}
-			if _, ok := off.Callable["qwen3-32b"]; !ok {
-				t.Fatalf("%s model dropped from Callable although it still routes", vis)
+			if _, ok := off.Callable["qwen3-32b"]; ok != tc.wantCallable {
+				t.Fatalf("Callable[%s model] = %v, want %v", tc.visibility, ok, tc.wantCallable)
 			}
 			if _, ok := off.Existing["qwen3-32b"]; !ok {
-				t.Fatalf("%s model dropped from Existing", vis)
+				t.Fatalf("%s model dropped from Existing", tc.visibility)
 			}
 		})
+	}
+}
+
+// TestCallableDropsALockedGroupName: "locked" is refused for a GROUP name too —
+// the resolver's group branch checks DirectAllowed before dispatching ("a
+// locked group: not directly requestable"), so the locked filter must apply to
+// group names, not only model names.
+func TestCallableDropsALockedGroupName(t *testing.T) {
+	ctx := context.Background()
+	svc, rs := newOfferingTestService(t,
+		offeringMapping{name: "m1", flavors: []string{routing.APIFlavorOpenAI}},
+		offeringMapping{name: "m2", flavors: []string{routing.APIFlavorOpenAI}},
+	)
+	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
+	offerVisibility(t, rs, "coder", "locked")
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if _, ok := off.Callable["coder"]; ok {
+		t.Fatal("locked group name is callable although a direct request for it is refused")
+	}
+	if _, ok := off.Existing["coder"]; !ok {
+		t.Fatal("locked group dropped from Existing")
+	}
+	// Its members keep their own, unlocked names.
+	if _, ok := off.Callable["m1"]; !ok {
+		t.Fatal("member of a locked group lost its own callable name")
+	}
+}
+
+// TestCallableDropsALockedMemberButKeepsItsGroup is the group-path question: a
+// locked model is reachable VIA a group, and the group name must stay callable
+// while the member's OWN name must not ride along on it. It does not: the group
+// overlay contributes only the group's name (carrying its members' FLAVOR
+// union, never their names), so the member has exactly one entry of its own and
+// the locked filter removes it.
+func TestCallableDropsALockedMemberButKeepsItsGroup(t *testing.T) {
+	ctx := context.Background()
+	svc, rs := newOfferingTestService(t,
+		offeringMapping{name: "m1", flavors: []string{routing.APIFlavorOpenAI}},
+		offeringMapping{name: "m2", flavors: []string{routing.APIFlavorOpenAI}},
+	)
+	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
+	offerVisibility(t, rs, "m1", "locked")
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if _, ok := off.Callable["m1"]; ok {
+		t.Fatal("locked member rode into Callable under its own name")
+	}
+	if _, ok := off.Callable["coder"]; !ok {
+		t.Fatal("the group itself must stay callable — that is how a locked member is reached")
+	}
+	if _, ok := off.Existing["m1"]; !ok {
+		t.Fatal("locked member dropped from Existing")
 	}
 }
 

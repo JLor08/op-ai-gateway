@@ -3309,12 +3309,22 @@ func (s *Service) modelVisibilityByLower(ctx context.Context) (map[string]string
 // of the two values a non-admin, usage-facing surface must suppress (a
 // missing/empty value, e.g. no settings row, is "shown" and never matches).
 func isHiddenOrLocked(visibility string) bool {
-	switch visibility {
-	case "hidden", "locked":
-		return true
-	default:
-		return false
-	}
+	return visibility == "hidden" || isLocked(visibility)
+}
+
+// isLocked reports whether a model_settings visibility makes a name GROUP-ONLY.
+// This is the ONE of the two suppression values that is a real ACCESS boundary
+// rather than a display switch: gateway.GroupRegistry.DirectAllowed returns
+// false for "locked", and routing.Resolver turns that into
+// routing.ErrNoModelRoute — for a group name exactly as for a model name (a
+// locked group is "not directly requestable"; a locked model is "group-only,
+// requested directly"). "hidden", by contrast, only removes a name from
+// listings and still routes perfectly under that same name.
+//
+// ModelOffering.Callable is the caller that needs the two kept apart: it keeps
+// hidden names and drops locked ones.
+func isLocked(visibility string) bool {
+	return visibility == "locked"
 }
 
 // groupOverlayEntry is one active model group's contribution to the offered
