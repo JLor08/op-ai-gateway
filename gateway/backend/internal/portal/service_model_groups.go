@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"time"
 )
 
 // Model-group + per-model-visibility management. Groups are named priority-failover
@@ -240,26 +241,9 @@ func (s *Service) CreateModelGroup(ctx context.Context, principal auth.Token, re
 	if err != nil {
 		return ModelGroupDTO{}, err
 	}
-	memberOrder, err := normalizeMemberOrderForWrite(req.MemberOrder)
+	selection, err := normalizeGroupSelectionForCreate(req)
 	if err != nil {
 		return ModelGroupDTO{}, err
-	}
-	minSpeedFallback, err := normalizeMinSpeedFallbackForWrite(req.MinSpeedFallback)
-	if err != nil {
-		return ModelGroupDTO{}, err
-	}
-	if req.MinTokensPerSecond < 0 {
-		return ModelGroupDTO{}, ErrModelGroupMinTokensPerSecondInvalid
-	}
-	// Omitted (nil) applies the shipped default; an explicit value -- including
-	// 0, "no margin required" -- is persisted exactly as given (see the type's
-	// doc comment on CreateModelGroupRequest.ClimbSpeedMarginPercent).
-	margin := routing.DefaultClimbSpeedMarginPercent
-	if req.ClimbSpeedMarginPercent != nil {
-		if *req.ClimbSpeedMarginPercent < 0 {
-			return ModelGroupDTO{}, ErrModelGroupClimbSpeedMarginInvalid
-		}
-		margin = *req.ClimbSpeedMarginPercent
 	}
 	members, err := s.validateGroupMembers(ctx, req.Members)
 	if err != nil {
@@ -288,34 +272,85 @@ func (s *Service) CreateModelGroup(ctx context.Context, principal auth.Token, re
 		CreatedAt:               now,
 		UpdatedAt:               now,
 		LoadedOnly:              req.LoadedOnly,
-		MemberOrder:             memberOrder,
-		ClimbSpeedMarginPercent: margin,
-		MinTokensPerSecond:      req.MinTokensPerSecond,
-		MinSpeedFallback:        minSpeedFallback,
+		MemberOrder:             selection.memberOrder,
+		ClimbSpeedMarginPercent: selection.climbSpeedMarginPercent,
+		MinTokensPerSecond:      selection.minTokensPerSecond,
+		MinSpeedFallback:        selection.minSpeedFallback,
 	}
 	if group.DisplayName == "" {
 		group.DisplayName = name
 	}
-	if err := s.routes.CreateModelGroup(ctx, group); err != nil {
+	if err := s.persistNewModelGroup(ctx, group, members, vis, visProvided, now); err != nil {
 		return ModelGroupDTO{}, err
-	}
-	if err := s.routes.SetGroupMembers(ctx, group.ID, members); err != nil {
-		return ModelGroupDTO{}, err
-	}
-	// Persist the group NAME's visibility (only when explicitly provided; the
-	// default "shown" needs no row). One save sets group + visibility.
-	if visProvided {
-		if err := s.routes.UpsertModelSetting(ctx, routing.ModelSetting{
-			GatewayModelName: name,
-			Visibility:       vis,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-		}); err != nil {
-			return ModelGroupDTO{}, err
-		}
 	}
 	s.refreshGroupCache(ctx)
 	return s.buildModelGroupDTO(ctx, group)
+}
+
+// groupSelection is the validated, normalised form of a create request's four
+// combinable selection settings.
+type groupSelection struct {
+	memberOrder             string
+	climbSpeedMarginPercent int
+	minTokensPerSecond      float64
+	minSpeedFallback        string
+}
+
+// normalizeGroupSelectionForCreate validates and normalises the selection settings of a
+// create request, rejecting the whole create before any mutation when one of them is
+// invalid. An omitted member_order / min_speed_fallback takes its default; an
+// unrecognized one is rejected (see normalizeMemberOrderForWrite).
+func normalizeGroupSelectionForCreate(req CreateModelGroupRequest) (groupSelection, error) {
+	memberOrder, err := normalizeMemberOrderForWrite(req.MemberOrder)
+	if err != nil {
+		return groupSelection{}, err
+	}
+	minSpeedFallback, err := normalizeMinSpeedFallbackForWrite(req.MinSpeedFallback)
+	if err != nil {
+		return groupSelection{}, err
+	}
+	if req.MinTokensPerSecond < 0 {
+		return groupSelection{}, ErrModelGroupMinTokensPerSecondInvalid
+	}
+	// Omitted (nil) applies the shipped default; an explicit value -- including
+	// 0, "no margin required" -- is persisted exactly as given (see the type's
+	// doc comment on CreateModelGroupRequest.ClimbSpeedMarginPercent).
+	margin := routing.DefaultClimbSpeedMarginPercent
+	if req.ClimbSpeedMarginPercent != nil {
+		if *req.ClimbSpeedMarginPercent < 0 {
+			return groupSelection{}, ErrModelGroupClimbSpeedMarginInvalid
+		}
+		margin = *req.ClimbSpeedMarginPercent
+	}
+	return groupSelection{
+		memberOrder:             memberOrder,
+		climbSpeedMarginPercent: margin,
+		minTokensPerSecond:      req.MinTokensPerSecond,
+		minSpeedFallback:        minSpeedFallback,
+	}, nil
+}
+
+// persistNewModelGroup writes a validated new group: the group row, its ordered members
+// and -- only when the create explicitly provided one, since the default "shown" needs no
+// row -- the group NAME's visibility. One save sets group + visibility.
+func (s *Service) persistNewModelGroup(ctx context.Context, group routing.ModelGroup, members []routing.GroupMember, visibility string, visibilityProvided bool, now time.Time) error {
+	if err := s.routes.CreateModelGroup(ctx, group); err != nil {
+		return err
+	}
+	if err := s.routes.SetGroupMembers(ctx, group.ID, members); err != nil {
+		return err
+	}
+	if visibilityProvided {
+		if err := s.routes.UpsertModelSetting(ctx, routing.ModelSetting{
+			GatewayModelName: group.GatewayModelName,
+			Visibility:       visibility,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateModelGroup partially updates a group; a non-nil Members replaces the whole
