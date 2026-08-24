@@ -2758,6 +2758,31 @@ func migration62Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // The model-override map needs NO migration — the column holds a JSON string
 // and DecodeModelOverrideRules reads the legacy shape as rules with both
 // listing switches false.
+//
+// ROLLBACK. Dropping back to a pre-v63 binary is safe for the four columns
+// added here: they are append-only, and an older binary simply never selects
+// them. api_tokens.model_override_map is the one place where a rollback can
+// still lose data, and exactly one case does:
+//
+//   - A token whose override rows use NEITHER new listing switch loses nothing.
+//     EncodeModelOverrideRules writes such rows in the legacy "name":"target"
+//     string form on purpose (see its doc comment), which is byte-identical to
+//     what the pre-branch encoder wrote, so the old decoder reads them back
+//     unchanged. A deployment that never touches the switches is fully
+//     downgradable.
+//   - A token with AT LEAST ONE row using `offer` or `hide_target` loses its
+//     ENTIRE override map. The pre-branch decoder unmarshals the column into
+//     map[string]string and returns nil on the first object-valued row — for
+//     the whole map, taking the untouched sibling rows with it — and the next
+//     save under the old binary then writes "" over the column, making the loss
+//     permanent. Nothing on this side can prevent that; the all-or-nothing
+//     decoder lives in the binary being rolled back to.
+//
+// So the residual is opt-in and per token: only tokens an operator explicitly
+// configured with the new switches are at risk, and the exposure is their
+// per-model override rows (never the catch-all, which has its own column).
+// Both cases are pinned by tests in token_override_test.go against a verbatim
+// copy of the pre-branch decoder.
 func migration63Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	cols := []string{
 		"last_used_model text not null default ''",

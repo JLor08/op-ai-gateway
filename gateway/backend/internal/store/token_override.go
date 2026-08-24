@@ -70,11 +70,42 @@ func decodeOverrideRule(value json.RawMessage) (ModelOverrideRule, bool) {
 // EncodeModelOverrideRules serializes the rules into the JSON string stored in
 // api_tokens.model_override_map. An empty/nil map yields "" (the column
 // default) so "no entries" round-trips as the empty string, not "{}".
+//
+// PER ROW it writes the NARROWEST shape that can carry the row: a row with both
+// listing switches false is written in the LEGACY string form ("name":"target"),
+// and only a row that actually uses a switch gets the object form.
+//
+// That is a rollback contract, not a cosmetic choice. The pre-branch decoder
+// (DecodeModelOverrideMap) unmarshals the column into map[string]string and
+// returns nil the moment ANY value is an object — not just for that row, for
+// the WHOLE map. Writing objects unconditionally would therefore turn a
+// downgrade into silent data loss: every token saved under the new binary would
+// lose ALL its per-model overrides, and the next save under the old binary would
+// write "" over the column, making the loss permanent. Emitting the legacy form
+// for rows that need nothing more keeps a deployment that never touches the new
+// switches fully rollback-compatible.
+//
+// The residual is deliberate and narrow: a token with at least ONE row using
+// `offer` or `hide_target` still loses its entire override map on a rollback,
+// because the old decoder's all-or-nothing rejection is in the old binary and
+// cannot be fixed from here. That case is opt-in — an operator who flipped a
+// switch this branch introduced — where the unswitched case is everybody.
+//
+// Both shapes decode here (decodeOverrideRule), so this is invisible on the
+// read side; only the bytes in the column change.
 func EncodeModelOverrideRules(m map[string]ModelOverrideRule) string {
 	if len(m) == 0 {
 		return ""
 	}
-	b, err := json.Marshal(m)
+	out := make(map[string]any, len(m))
+	for name, rule := range m {
+		if !rule.Offer && !rule.HideTarget {
+			out[name] = rule.To
+			continue
+		}
+		out[name] = rule
+	}
+	b, err := json.Marshal(out)
 	if err != nil {
 		return ""
 	}

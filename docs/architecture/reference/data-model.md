@@ -345,8 +345,23 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 
 | # | Migration | Purpose |
 |---|---|---|
-| 7 | `token_model_override_map` | *(see above)* — the column now holds `requested -> {to, offer, hide_target}` objects; the legacy `requested -> "target"` string map is still decoded, so the per-row switches needed no migration of their own. |
+| 7 | `token_model_override_map` | *(see above)* — the column can now hold `requested -> {to, offer, hide_target}` objects; the legacy `requested -> "target"` string map is still decoded, so the per-row switches needed no migration of their own. |
 | 63 | `token_unknown_model_redirect` | Adds `api_tokens.last_used_model` plus `unknown_model_redirect`/`unknown_model_redirect_blocked`/`unknown_model_fallback`. Defaults reproduce the pre-feature behavior exactly: the redirect is off, so resolution is unchanged for every existing token. |
+
+**Rollback and `model_override_map`.** The four columns migration 63 adds are
+append-only, so an older binary simply never selects them. The one place a
+rollback can still lose data is `model_override_map`, and exactly one case does:
+
+| Token's override rows | Read by a pre-v63 binary |
+|---|---|
+| neither `offer` nor `hide_target` used | **lossless** — `EncodeModelOverrideRules` writes those rows in the legacy `"requested":"target"` string form, byte-identical to what the old encoder wrote |
+| at least one row uses a switch | **the whole map is lost** — the old decoder unmarshals the column into `map[string]string` and returns `nil` on the first object-valued row, taking the untouched sibling rows with it; the next save under the old binary then writes `""` over the column |
+
+The encoder therefore picks the *narrowest* shape per row: legacy string when a
+row needs nothing more, object only when a switch is actually set. A deployment
+that never touches the new switches stays fully downgradable; the residual is
+opt-in and limited to the tokens an operator configured with them (never the
+catch-all `model_override`, which has its own column).
 
 ## See also
 
