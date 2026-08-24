@@ -454,6 +454,32 @@ func TestManageModelsNeverShowsAliases(t *testing.T) {
 	}
 }
 
+// TestOfferedAliasOntoAGroupReportsIsGroup: models and groups share one
+// namespace (TestOfferedAliasOntoAGroup already covers this as a legitimate
+// override target), so an alias whose rule.To names a GROUP really does fail
+// over across that group's members. The alias entry must report IsGroup:
+// true, or it understates what routing through it actually does -- it is not
+// an ordinary single-model alias.
+func TestOfferedAliasOntoAGroupReportsIsGroup(t *testing.T) {
+	ctx := context.Background()
+	svc, rs := newOfferingTestService(t,
+		offeringMapping{name: "m1", flavors: []string{routing.APIFlavorOpenAI}},
+		offeringMapping{name: "m2", flavors: []string{routing.APIFlavorOpenAI}},
+	)
+	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "coder", Offer: true},
+	})
+	byID := modelsByID(svc.Models(ctx, token))
+	dto, ok := byID["claude-x"]
+	if !ok {
+		t.Fatalf("alias onto a group missing from Models(): %#v", byID)
+	}
+	if !dto.IsGroup {
+		t.Fatal("alias onto a group must report is_group=true, understates that it fails over across members")
+	}
+}
+
 // TestOfferingReadsEachStoreTraversalOnce: Offered and Existing come from the
 // same two reads with different filters applied, so one call must walk the
 // mapping store once and load the group overlay once — Task 5 puts this on the

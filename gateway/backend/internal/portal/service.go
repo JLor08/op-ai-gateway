@@ -1981,13 +1981,19 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
 				// applyOverrideAliases only touches the flavor map; an alias name
 				// added there still needs the target's OTHER listing data (loaded
-				// state, offered-on count, context size, vision) copied over under
-				// the alias name -- the alias entry is meant to look exactly like
-				// its target's row, just filed under a different name (this is a
-				// display, not a leak: the alias really does route to this target).
-				// Checking flavors[name] reuses applyOverrideAliases's own decision
-				// of which aliases actually got added (Offer set AND the target
-				// existed in preSuppress) instead of re-deriving it here.
+				// state, offered-on count, context size, vision, and whether the
+				// target is itself a model GROUP) copied over under the alias name
+				// -- the alias entry is meant to look exactly like its target's
+				// row, just filed under a different name (this is a display, not a
+				// leak: the alias really does route to this target). Models and
+				// groups share one namespace, so rule.To naming a group is a
+				// legitimate, tested target (TestOfferedAliasOntoAGroup in Task 4);
+				// an alias onto one really does fail over across the group's
+				// members, so IsGroup must say so too, or the alias would
+				// understate what it does. Checking flavors[name] reuses
+				// applyOverrideAliases's own decision of which aliases actually got
+				// added (Offer set AND the target existed in preSuppress) instead
+				// of re-deriving it here.
 				for name, rule := range token.ModelOverrideRules {
 					if !rule.Offer {
 						continue
@@ -2006,6 +2012,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					if v, ok := visionOn[rule.To]; ok {
 						visionOn[name] = v
+					}
+					if _, ok := isGroup[rule.To]; ok {
+						isGroup[name] = struct{}{}
 					}
 				}
 			}
