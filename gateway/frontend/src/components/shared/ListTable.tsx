@@ -251,7 +251,19 @@ export function ListTable<Row>({
     return [...filtered].sort((a, b) => {
       const av = col.value(a);
       const bv = col.value(b);
-      if (col.numeric) return (Number(av) - Number(bv)) * dir;
+      if (col.numeric) {
+        const an = Number(av);
+        const bn = Number(bv);
+        // Cells without a magnitude have no place on the number line: keep them
+        // at the bottom in both directions instead of letting NaN comparisons
+        // freeze them wherever they happened to sit. Blank counts as missing
+        // too — Number('') is 0, which would rank a blank cell as the smallest
+        // real value.
+        const aMissing = av.trim() === '' || Number.isNaN(an);
+        const bMissing = bv.trim() === '' || Number.isNaN(bn);
+        if (aMissing || bMissing) return aMissing && bMissing ? 0 : aMissing ? 1 : -1;
+        return (an - bn) * dir;
+      }
       return av.localeCompare(bv) * dir;
     });
   }, [filtered, sort, columnById]);

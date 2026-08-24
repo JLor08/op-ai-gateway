@@ -26,7 +26,7 @@ import type {
   UpdateMappingRequest,
 } from '../api';
 import type { Translation, PortalApi } from './shared/types';
-import { formatPortalError } from './shared/format';
+import { formatMetric, formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { Panel } from './shared/Panel';
@@ -363,36 +363,43 @@ export function MappingSection({
     {
       id: 'context_size',
       label: t.mappingContextSize,
-      value: (m) => (m.context_size ? String(m.context_size) : '—'),
+      value: (m) => formatMetric(m.context_size, 0),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'energy_wh_per_token',
       label: t.mappingEnergyWhPerToken,
-      value: (m) => (m.energy_wh_per_token ? String(m.energy_wh_per_token) : '—'),
+      // Watt-hours per single token: the significant digits live far behind the
+      // decimal point, so this column needs a much longer tail than the others.
+      value: (m) => formatMetric(m.energy_wh_per_token, 10),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'gen_tps',
       label: t.mappingGenTokensPerSecond,
-      value: (m) => (m.gen_tokens_per_second ? String(m.gen_tokens_per_second) : '—'),
+      value: (m) => formatMetric(m.gen_tokens_per_second, 2),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'prompt_tps',
       label: t.mappingPromptTokensPerSecond,
-      value: (m) => (m.prompt_tokens_per_second ? String(m.prompt_tokens_per_second) : '—'),
+      value: (m) => formatMetric(m.prompt_tokens_per_second, 2),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'load_time_ms',
       label: t.mappingLoadTimeMs,
-      value: (m) => (m.load_time_ms ? String(m.load_time_ms) : '—'),
+      value: (m) => formatMetric(m.load_time_ms, 0),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
@@ -406,23 +413,25 @@ export function MappingSection({
     {
       id: 'max_concurrency',
       label: t.mappingMaxConcurrency,
-      value: (m) => (m.max_concurrency ? String(m.max_concurrency) : '—'),
+      value: (m) => formatMetric(m.max_concurrency, 0),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'recommended_concurrency',
       label: t.mappingRecommendedConcurrency,
-      value: (m) => (m.recommended_concurrency ? String(m.recommended_concurrency) : '—'),
+      value: (m) => formatMetric(m.recommended_concurrency, 0),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
     {
       id: 'gen_tps_at_capacity',
       label: t.mappingGenTpsAtCapacity,
-      value: (m) =>
-        m.gen_tokens_per_second_at_capacity ? String(m.gen_tokens_per_second_at_capacity) : '—',
+      value: (m) => formatMetric(m.gen_tokens_per_second_at_capacity, 2),
       filter: 'text',
+      numeric: true,
       defaultHidden: true,
     },
   ];
