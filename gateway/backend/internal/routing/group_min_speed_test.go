@@ -179,6 +179,82 @@ func TestResolverGroupMinSpeedUnreachableFloorIgnored(t *testing.T) {
 	}
 }
 
+// --- Pure floor exhaustion: no other gating at all ----------------------------
+
+// EVERY member has live, otherwise-perfectly-routable mappings that are simply too
+// slow — no reachability/capacity gating anywhere. This must classify as
+// ErrNoHealthyHost, not ErrNoModelRoute: the members are known and live, just gated by
+// speed. Distinguishes a too-slow member (memberUnavailable) from an unknown one
+// (memberNoMapping).
+func TestResolverGroupMinSpeedAllFilteredErrorsNoHealthyHost(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seedMinSpeedStore(t, now,
+		minSpeedFixture{serverID: "srv_a", appID: "app_a", mappingID: "map_a", gatewayName: "coder-a", genTPS: 10},
+		minSpeedFixture{serverID: "srv_b", appID: "app_b", mappingID: "map_b", gatewayName: "coder-b", genTPS: 15},
+	)
+	policy := GroupPolicy{FailoverMode: "sticky", MinTokensPerSecond: 20, MinSpeedFallback: MinSpeedFallbackError}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"coder-group": {policy: policy, members: []GroupMember{
+		{ID: "gm_a", GroupID: "grp1", MemberGatewayName: "coder-a", Priority: 0},
+		{ID: "gm_b", GroupID: "grp1", MemberGatewayName: "coder-b", Priority: 1},
+	}}}})
+
+	_, err := resolver.Resolve(ctx, auth.Token{}, groupReq(""))
+	if !errors.Is(err, ErrNoHealthyHost) {
+		t.Fatalf("err = %v, want ErrNoHealthyHost (both members are live, just too slow)", err)
+	}
+	if errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v also matches ErrNoModelRoute, want ONLY ErrNoHealthyHost", err)
+	}
+}
+
+// A member with NO live mapping at all (not merely a slow one) must still report
+// ErrNoModelRoute even with a floor configured — the floor must never turn a genuinely
+// unknown member into a "gated" one, pinning the memberNoMapping/memberUnavailable
+// distinction from the other side.
+func TestResolverGroupMinSpeedNoLiveMappingStillNoModelRoute(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seedMinSpeedStore(t, now) // no fixtures: "ghost" has no mapping anywhere
+	policy := GroupPolicy{FailoverMode: "sticky", MinTokensPerSecond: 20, MinSpeedFallback: MinSpeedFallbackError}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"ghost-group": {policy: policy, members: []GroupMember{
+		{ID: "gm_ghost", GroupID: "grp4", MemberGatewayName: "ghost", Priority: 0},
+	}}}})
+
+	_, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "ghost-group", APIFlavor: "openai_chat"})
+	if !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v, want ErrNoModelRoute (the member has no live mapping at all)", err)
+	}
+}
+
+// The pure all-filtered case still relaxes under MinSpeedFallbackIgnore: the first
+// attempt reports ErrNoHealthyHost (tolerated), the retry with the floor dropped serves
+// the top-priority member.
+func TestResolverGroupMinSpeedAllFilteredIgnoreServesRelaxed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seedMinSpeedStore(t, now,
+		minSpeedFixture{serverID: "srv_a", appID: "app_a", mappingID: "map_a", gatewayName: "coder-a", genTPS: 10},
+		minSpeedFixture{serverID: "srv_b", appID: "app_b", mappingID: "map_b", gatewayName: "coder-b", genTPS: 15},
+	)
+	policy := GroupPolicy{FailoverMode: "sticky", MinTokensPerSecond: 20, MinSpeedFallback: MinSpeedFallbackIgnore}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"coder-group": {policy: policy, members: []GroupMember{
+		{ID: "gm_a", GroupID: "grp1", MemberGatewayName: "coder-a", Priority: 0},
+		{ID: "gm_b", GroupID: "grp1", MemberGatewayName: "coder-b", Priority: 1},
+	}}}})
+
+	target, err := resolver.Resolve(ctx, auth.Token{}, groupReq(""))
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the top-priority member served under the ignore fallback", err)
+	}
+	if target.ServerID != "srv_a" || target.Model != "coder-a" {
+		t.Fatalf("target = {%q,%q}, want {srv_a, coder-a} (relaxed retry, priority order)", target.ServerID, target.Model)
+	}
+}
+
 // --- Unmeasured candidates never satisfy a floor ------------------------------
 
 // A candidate with no measured speed (GenTokensPerSecond == 0, i.e. effectiveGenTPS ==

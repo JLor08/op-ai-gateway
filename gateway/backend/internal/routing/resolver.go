@@ -923,12 +923,16 @@ const modeClimbUp = "climb_up"
 // "exists but forbidden" signal).
 //
 // minTPS is the group's speed floor (GroupPolicy.MinTokensPerSecond), applied CANDIDATE
-// by candidate right after filterProvisioned: a candidate whose effective generation
-// speed falls short is dropped from the pool before selectCandidate ever sees it, so a
-// member is never served on a too-slow candidate just because its fast one is busy. 0
-// disables the filter (the no-op invariant — no extra store read, cands is unchanged).
-// A set the floor empties out reports memberNoMapping, exactly like a member with no
-// mappings at all.
+// by candidate: a candidate whose effective generation speed falls short is dropped from
+// the pool before selectCandidate ever sees it, so a member is never served on a
+// too-slow candidate just because its fast one is busy. 0 disables the filter (the no-op
+// invariant — no extra store read, cands is unchanged).
+//
+// The floor runs AFTER the len(cands)==0 check, not before: a member with no live
+// mapping at all is memberNoMapping (unknown-model material), but a member that DOES
+// have live, otherwise-routable mappings which the floor rules out is memberUnavailable
+// — it is gated by speed, exactly like a down/busy/non-viable candidate, not "unknown".
+// Conflating the two would misreport a too-slow-but-real member as ErrNoModelRoute.
 func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, minTPS float64) (MappingCandidate, memberStatus, []string, int, error) {
 	cands, err := r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
@@ -937,6 +941,9 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 	cands, err = r.filterProvisioned(ctx, token, cands)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
+	}
+	if len(cands) == 0 {
+		return MappingCandidate{}, memberNoMapping, nil, 0, nil
 	}
 	if minTPS > 0 {
 		kept := make([]MappingCandidate, 0, len(cands))
@@ -950,9 +957,9 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 			}
 		}
 		cands = kept
-	}
-	if len(cands) == 0 {
-		return MappingCandidate{}, memberNoMapping, nil, 0, nil
+		if len(cands) == 0 {
+			return MappingCandidate{}, memberUnavailable, nil, 0, nil
+		}
 	}
 	selected, ok, serr := r.selectCandidate(ctx, cands, req, now)
 	if errors.Is(serr, errAllAtCapacity) {
