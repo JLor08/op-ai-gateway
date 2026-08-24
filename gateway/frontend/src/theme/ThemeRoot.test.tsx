@@ -271,12 +271,20 @@ describe('ThemeRoot (external theme data)', () => {
 
     // ThemeRoot must resolve the external image brand to the absolute backend
     // logo endpoint (not just apply the product name).
+    //
+    // The title is awaited rather than asserted straight after the brand mark:
+    // the mark is rendered output and is therefore already in the DOM at commit
+    // time, while the title is written by an effect, which React flushes after
+    // that commit. Asserting it synchronously here read the still-default title
+    // whenever the poll landed in that window (seen in CI). The sibling title
+    // assertions in this file wait on values that are themselves effect-written,
+    // so they are synchronised with the flush already.
     await waitFor(() => {
       expect(screen.getByTestId('brand-mark').textContent).toBe(
         'image:/api/system/themes/acme/logo',
       );
+      expect(document.title).toBe('Acme AI Gateway');
     });
-    expect(document.title).toBe('Acme AI Gateway');
   });
 
   it("resolves the external theme's own favicon endpoint when it has one", async () => {
