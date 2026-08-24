@@ -37,6 +37,13 @@ func newOfferingPortal(names ...string) *fakeOfferingPortal {
 	return &fakeOfferingPortal{off: offering(names, names)}
 }
 
+// serverWithSuppressedOffering builds a Server whose portal reports `offered`
+// as listed-and-callable and `suppressed` as callable-but-not-listed — the
+// model_settings hidden/locked shape (see offeringWithSuppressed).
+func serverWithSuppressedOffering(offered, suppressed []string) *Server {
+	return &Server{Portal: &fakeOfferingPortal{off: offeringWithSuppressed(offered, suppressed)}}
+}
+
 // serverWithOffering builds a Server whose Portal reports a ModelOffering with
 // exactly these names in both Offered and Existing. Everything else on the
 // Server stays zero: inferencePreflight only reaches the portal through the
@@ -86,6 +93,31 @@ func TestPreflightRedirectTargetStillFacesTheAllowlist(t *testing.T) {
 			inferenceShape{model: "unknown", apiFlavor: "openai"})
 	if !handled || rec.Code != http.StatusForbidden {
 		t.Fatalf("redirect reached a model outside the allowlist: handled=%v code=%d", handled, rec.Code)
+	}
+}
+
+// TestPreflightCatchAllWinsOverTheRedirectEvenWhenSuppressed is the case
+// TestPreflightCatchAllWinsOverTheRedirect cannot reach: there the catch-all
+// target is listed, so the redirect declines for the ordinary reason. Point the
+// catch-all at a model that model_settings hides while leaving it callable, and
+// a redirect that judged by the LISTING would find req.Model ∉ Offered and, in
+// widened mode, reroute away from the operator's explicit instruction. The
+// catch-all must always win, suppressed target or not.
+func TestPreflightCatchAllWinsOverTheRedirectEvenWhenSuppressed(t *testing.T) {
+	token := auth.Token{
+		ModelOverride:               "hidden-catchall",
+		UnknownModelRedirect:        true,
+		UnknownModelRedirectBlocked: true,
+		LastUsedModel:               "last-model",
+	}
+	pf, handled := serverWithSuppressedOffering([]string{"last-model"}, []string{"hidden-catchall"}).
+		inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil,
+			inferenceShape{model: "totally-unknown", apiFlavor: "openai"})
+	if handled {
+		t.Fatal("preflight refused the request")
+	}
+	if pf.Req.Model != "hidden-catchall" {
+		t.Fatalf("effective model = %q, want hidden-catchall (the catch-all must win)", pf.Req.Model)
 	}
 }
 

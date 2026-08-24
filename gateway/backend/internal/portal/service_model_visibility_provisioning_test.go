@@ -350,3 +350,36 @@ func TestModelVisibleViaEitherServerNoOverDenial(t *testing.T) {
 		t.Fatalf("ModelServers(usr_u2, model-both) = %+v, want 2 rows (provisioned -- sees both servers)", rowsU2)
 	}
 }
+
+// TestOfferingCallableAppliesTheProvisioningFilter is the safety half of
+// ModelOffering.Callable. Callable exists because model_settings visibility is
+// a DISPLAY switch that must not count as unusable — but resource-group
+// provisioning is the opposite, a genuine reachability boundary, and Callable
+// has to keep applying it. Were it not, the Task-5 redirect would treat a
+// restricted model as a legitimate target for a token that cannot route to it.
+// The name still EXISTS, though, which is what keeps narrow mode's "not yours"
+// refusal a refusal rather than a redirect.
+func TestOfferingCallableAppliesTheProvisioningFilter(t *testing.T) {
+	e := newGroupTestEnv(t)
+	f := setupVisibilityFixture(e)
+
+	offV := e.svc.ModelOfferingFor(e.ctx, token("usr_v"), routing.APIFlavorOpenAI)
+	if _, ok := offV.Callable[f.modelM]; ok {
+		t.Fatalf("Callable(usr_v) includes %s, want excluded (not provisioned into RG_VIS)", f.modelM)
+	}
+	if _, ok := offV.Existing[f.modelM]; !ok {
+		t.Fatalf("Existing(usr_v) missing %s: a restricted model still exists", f.modelM)
+	}
+	if _, ok := offV.Callable[f.modelN]; !ok {
+		t.Fatalf("Callable(usr_v) missing %s, want present (unrestricted)", f.modelN)
+	}
+
+	// The provisioned caller reaches both.
+	offU := e.svc.ModelOfferingFor(e.ctx, token("usr_u"), routing.APIFlavorOpenAI)
+	if _, ok := offU.Callable[f.modelM]; !ok {
+		t.Fatalf("Callable(usr_u) missing %s, want present (provisioned)", f.modelM)
+	}
+	if _, ok := offU.Callable[f.modelN]; !ok {
+		t.Fatalf("Callable(usr_u) missing %s, want present (unrestricted)", f.modelN)
+	}
+}

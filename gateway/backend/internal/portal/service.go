@@ -3203,9 +3203,13 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 // alias must still be able to inherit that target's flavors. See
 // applyOverrideAliases in service_model_offering.go.
 //
-// preSuppress is a listing-composition input only. It is never returned to a
-// caller as an offering: everything a principal may not see under
-// visibleMappingViews is already absent from it.
+// preSuppress is safe to hand out as a per-token ACCESS set, and
+// ModelOfferingFor does exactly that (ModelOffering.Callable): everything a
+// principal may not REACH is already absent from it — visibleMappingViews's
+// server allowlist and resource-group provisioning ran before it was built —
+// while the only thing it still carries that `sets` does not is what
+// model_settings merely hides from DISPLAY, which stays callable. It is not an
+// offering, though: never use it to answer "what does this principal see".
 func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {

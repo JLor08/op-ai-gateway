@@ -145,6 +145,90 @@ func TestOfferedAliasOfHiddenTargetIsListed(t *testing.T) {
 	}
 }
 
+// TestCallableKeepsAModelHiddenByModelSettings: hidden/locked is a DISPLAY
+// switch — the model drops out of the listing but stays fully routable under
+// its own name. Callable is the set that says so, and the Task-5 redirect reads
+// it precisely so that widened mode does not reroute a request the token was
+// entitled to serve.
+func TestCallableKeepsAModelHiddenByModelSettings(t *testing.T) {
+	ctx := context.Background()
+	for _, vis := range []string{"hidden", "locked"} {
+		t.Run(vis, func(t *testing.T) {
+			svc, rs := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+			offerVisibility(t, rs, "qwen3-32b", vis)
+			off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+			if _, ok := off.Offered["qwen3-32b"]; ok {
+				t.Fatalf("%s model still listed", vis)
+			}
+			if _, ok := off.Callable["qwen3-32b"]; !ok {
+				t.Fatalf("%s model dropped from Callable although it still routes", vis)
+			}
+			if _, ok := off.Existing["qwen3-32b"]; !ok {
+				t.Fatalf("%s model dropped from Existing", vis)
+			}
+		})
+	}
+}
+
+// TestCallableKeepsAHideTargetTarget: the same distinction from the per-token
+// side. A rule's HideTarget is explicitly documented as a listing overlay and
+// never an access control — the target stays callable under its real name.
+func TestCallableKeepsAHideTargetTarget(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"gpt-4o": {To: "qwen3-32b", Offer: true, HideTarget: true},
+	})
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	if _, ok := off.Offered["qwen3-32b"]; ok {
+		t.Fatal("hidden target still listed")
+	}
+	if _, ok := off.Callable["qwen3-32b"]; !ok {
+		t.Fatal("hidden target dropped from Callable although it still routes")
+	}
+}
+
+// TestCallableIncludesAHiddenGroup: a group name is callable like any model
+// name, and its own display visibility must not remove it from the access set
+// either.
+func TestCallableIncludesAHiddenGroup(t *testing.T) {
+	ctx := context.Background()
+	svc, rs := newOfferingTestService(t,
+		offeringMapping{name: "m1", flavors: []string{routing.APIFlavorOpenAI}},
+		offeringMapping{name: "m2", flavors: []string{routing.APIFlavorAnthropic}},
+	)
+	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
+	offerVisibility(t, rs, "coder", "hidden")
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if _, ok := off.Offered["coder"]; ok {
+		t.Fatal("hidden group still listed")
+	}
+	if _, ok := off.Callable["coder"]; !ok {
+		t.Fatalf("hidden group dropped from Callable: %#v", off.Callable)
+	}
+}
+
+// TestCallableExcludesAnAliasName: an alias is a listing name, not a routable
+// one — resolveModelOverride rewrites it to its target before anything else
+// sees it, so the target, and only the target, is what is callable.
+func TestCallableExcludesAnAliasName(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "qwen3-32b", Offer: true},
+	})
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	if _, ok := off.Offered["claude-x"]; !ok {
+		t.Fatal("alias missing from the listing")
+	}
+	if _, ok := off.Callable["claude-x"]; ok {
+		t.Fatal("alias leaked into Callable")
+	}
+	if _, ok := off.Callable["qwen3-32b"]; !ok {
+		t.Fatal("alias target missing from Callable")
+	}
+}
+
 // TestOfferingExistingIncludesGroups: a model GROUP shares the model namespace
 // and is therefore a name that exists. Guards against building Existing from a
 // group overlay computed over an empty model map (which yields no groups at
@@ -267,8 +351,18 @@ func TestOfferingIsWhollyEmptyOnMappingStoreError(t *testing.T) {
 
 	svc := offerSvc(gatewayAIServersErrStore{rs}, nil)
 	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
-	if len(off.Offered) != 0 || len(off.Existing) != 0 {
-		t.Fatalf("store error must yield two empty sets, got Offered=%#v Existing=%#v", off.Offered, off.Existing)
+	assertOfferingWhollyEmpty(t, off, "store error")
+}
+
+// assertOfferingWhollyEmpty checks the all-or-nothing contract across ALL
+// THREE sets. Callable matters most of the three: a populated Callable beside
+// an empty Existing would make the redirect treat every request as unknown and
+// then find a perfectly good candidate to send it to — the exact silent
+// rerouting the empty-on-error rule exists to prevent.
+func assertOfferingWhollyEmpty(t *testing.T, off ModelOffering, what string) {
+	t.Helper()
+	if len(off.Offered) != 0 || len(off.Callable) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("%s must yield empty sets, got Offered=%#v Callable=%#v Existing=%#v", what, off.Offered, off.Callable, off.Existing)
 	}
 }
 
@@ -285,9 +379,7 @@ func TestOfferingIsWhollyEmptyOnGroupOverlayError(t *testing.T) {
 
 	svc := offerSvc(groupErrStore{rs}, nil)
 	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
-	if len(off.Offered) != 0 || len(off.Existing) != 0 {
-		t.Fatalf("overlay error must yield two empty sets, got Offered=%#v Existing=%#v", off.Offered, off.Existing)
-	}
+	assertOfferingWhollyEmpty(t, off, "overlay error")
 	// The LISTING keeps its fail-open behaviour — this is a divergence of the
 	// offering lookup only, not a change to what /v1/models serves.
 	if !containsString(svc.ModelsForFlavor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI), "m1") {
@@ -335,6 +427,15 @@ func TestOfferingNeverReturnsAPartialResult(t *testing.T) {
 	for name := range off.Offered {
 		if _, ok := off.Existing[name]; !ok {
 			t.Fatalf("offered %q is missing from Existing (partial result): Offered=%#v Existing=%#v", name, off.Offered, off.Existing)
+		}
+	}
+	// Callable ⊆ Existing unconditionally: a name this token can route to
+	// exists by definition. A Callable name outside Existing is the partial
+	// result that makes the redirect judge the request unknown and then hand it
+	// that very name as a target.
+	for name := range off.Callable {
+		if _, ok := off.Existing[name]; !ok {
+			t.Fatalf("callable %q is missing from Existing (partial result): Callable=%#v Existing=%#v", name, off.Callable, off.Existing)
 		}
 	}
 }

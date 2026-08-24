@@ -8,18 +8,35 @@ import (
 	"op-ai-gateway/internal/auth"
 )
 
-// ModelOffering answers the two questions the unknown-model redirect asks about
-// a requested model name, for ONE API flavor.
+// ModelOffering answers the questions the unknown-model redirect asks about a
+// requested model name, for ONE API flavor. The three sets are deliberately
+// distinct, and confusing any two of them produces a wrong redirect.
 //
-// Offered is what this token sees and uses: the per-flavor discovery listing
+// Offered is the LISTING set: what this token sees in per-flavor discovery
 // (/v1/models et al.), including the token's own offered override aliases and
-// minus the targets it hides.
+// minus both the model_settings hidden/locked names and the targets its rules
+// hide.
+//
+// Callable is the ACCESS set: what this token can actually route to under its
+// real name. It applies the same per-token reachability as Offered (the server
+// allowlist and resource-group provisioning of visibleMappingViews) but NOT the
+// model_settings hidden/locked suppression, and it carries every active group
+// regardless of the group's display visibility. Seeing and reaching are simply
+// not the same thing here: hidden/locked is a DISPLAY switch, and a suppressed
+// model stays fully callable under its own name (see visibleMappingViews's
+// visibility-surface matrix, and applyOverrideAliases below). The redirect must
+// ask this set, never Offered — asking Offered would fire on a request the
+// token was entitled to serve and reroute it away from a working model.
 //
 // Existing is every name that exists at all for that flavor, deliberately
 // WITHOUT the per-token visibility filter and WITHOUT the listing switches —
 // only that separation lets the redirect tell "no such model" from "not yours".
+//
+// So Callable ⊆ Existing, while Offered is neither a subset nor a superset of
+// Callable: it loses the suppressed names and gains the override aliases.
 type ModelOffering struct {
-	Offered  map[string]struct{} // names this token sees/uses for one flavor
+	Offered  map[string]struct{} // names this token sees listed for one flavor
+	Callable map[string]struct{} // names this token can actually route to
 	Existing map[string]struct{} // names that exist at all for that flavor
 }
 
@@ -88,21 +105,22 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // both shared between the two sets — this sits on the per-request path in the
 // redirect and Service caches nothing.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string) ModelOffering {
-	empty := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
+	empty := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	if s.routes == nil {
 		if !isKnownAPIFlavor(flavor) {
 			return empty
 		}
-		out := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
+		out := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 		for _, name := range seedModelNames {
 			out.Offered[name] = struct{}{}
+			out.Callable[name] = struct{}{}
 			out.Existing[name] = struct{}{}
 		}
 		return out
 	}
-	// One traversal feeds both sets: Existing needs the unfiltered views,
-	// Offered the resource-group-filtered ones, and the filter is a pure
-	// post-step over the same slice (the identical one visibleMappingViews
+	// One traversal feeds all three sets: Existing needs the unfiltered views,
+	// Offered and Callable the resource-group-filtered ones, and the filter is a
+	// pure post-step over the same slice (the identical one visibleMappingViews
 	// applies — see filterVisibleMappingViews).
 	views, err := s.activeMappingViews(ctx)
 	if err != nil {
@@ -122,12 +140,22 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 		return empty
 	}
 	// Offered is composed exactly as the listing composes it (same function),
-	// so the two can never disagree about what this token sees.
-	sets, _ := flavorSetsFromViews(visible, &overlay, token)
-	out := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
+	// so the two can never disagree about what this token sees. Callable is that
+	// same composition's OTHER half — the pre-suppression map it already builds
+	// for the alias overlay, which is precisely "token-filtered, but before the
+	// model_settings hidden/locked names were dropped, and with every active
+	// group regardless of its display visibility". No extra store read: it comes
+	// out of the one call below that was already being made.
+	sets, callable := flavorSetsFromViews(visible, &overlay, token)
+	out := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	for name, flavors := range sets {
 		if _, ok := flavors[flavor]; ok {
 			out.Offered[name] = struct{}{}
+		}
+	}
+	for name, flavors := range callable {
+		if _, ok := flavors[flavor]; ok {
+			out.Callable[name] = struct{}{}
 		}
 	}
 	// Existing is built WITHOUT the token filter and without the visibility
