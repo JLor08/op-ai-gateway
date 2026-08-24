@@ -13,7 +13,7 @@ import (
 )
 
 // fakeGroups is a test GroupResolver. groups maps a group's gateway model name to its
-// ordered members + failover mode; locked marks model names whose direct (non-group)
+// ordered members + selection policy; locked marks model names whose direct (non-group)
 // request must be refused (visibility == "locked").
 type fakeGroups struct {
 	groups map[string]fakeGroup
@@ -22,15 +22,15 @@ type fakeGroups struct {
 
 type fakeGroup struct {
 	members []GroupMember
-	mode    string
+	policy  GroupPolicy
 }
 
-func (f *fakeGroups) Group(name string) ([]GroupMember, string, bool) {
+func (f *fakeGroups) Group(name string) ([]GroupMember, GroupPolicy, bool) {
 	g, ok := f.groups[name]
 	if !ok {
-		return nil, "", false
+		return nil, GroupPolicy{}, false
 	}
-	return g.members, g.mode, true
+	return g.members, g.policy, true
 }
 
 func (f *fakeGroups) DirectAllowed(name string) bool { return !f.locked[name] }
@@ -76,7 +76,7 @@ func seededGroupStore(t *testing.T, now time.Time) *MemoryStore {
 // twoMemberGroup builds a "coder-group" over coder-a (priority 0) then coder-b (priority 1).
 func twoMemberGroup(mode string) *fakeGroups {
 	return &fakeGroups{groups: map[string]fakeGroup{
-		"coder-group": {mode: mode, members: []GroupMember{
+		"coder-group": {policy: GroupPolicy{FailoverMode: mode}, members: []GroupMember{
 			{ID: "gm_a", GroupID: "grp1", MemberGatewayName: "coder-a", Priority: 0},
 			{ID: "gm_b", GroupID: "grp1", MemberGatewayName: "coder-b", Priority: 1},
 		}},
@@ -651,7 +651,7 @@ func TestResolverGroupEmptyMembersNoModelRoute(t *testing.T) {
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	store := seededGroupStore(t, now)
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
-	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"empty-group": {mode: "sticky"}}})
+	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"empty-group": {policy: GroupPolicy{FailoverMode: "sticky"}}}})
 
 	if _, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "empty-group", APIFlavor: "openai_chat"}); !errors.Is(err, ErrNoModelRoute) {
 		t.Fatalf("err = %v, want ErrNoModelRoute (zero-member group)", err)
@@ -668,7 +668,7 @@ func TestResolverGroupNoLiveMappingNoModelRoute(t *testing.T) {
 	store := seededGroupStore(t, now) // seeds coder-a / coder-b, NOT ghost-x / ghost-y
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
 	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{
-		"ghost-group": {mode: "sticky", members: []GroupMember{
+		"ghost-group": {policy: GroupPolicy{FailoverMode: "sticky"}, members: []GroupMember{
 			{ID: "gm_x", GroupID: "grpg", MemberGatewayName: "ghost-x", Priority: 0},
 			{ID: "gm_y", GroupID: "grpg", MemberGatewayName: "ghost-y", Priority: 1},
 		}},

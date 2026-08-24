@@ -122,13 +122,25 @@ type ProvisioningGate interface {
 	AllowedServerIDs(ctx context.Context, principal auth.Token, serverIDs []string) (map[string]bool, error)
 }
 
+// GroupPolicy is a group's selection policy: how members are ordered, which are
+// eligible, and how failover behaves. Passed as one value so the seam stays
+// readable and extensible.
+type GroupPolicy struct {
+	FailoverMode            string
+	MemberOrder             string
+	LoadedOnly              bool
+	ClimbSpeedMarginPercent int
+	MinTokensPerSecond      float64
+	MinSpeedFallback        string
+}
+
 // GroupResolver exposes the model-group config to the hot path. A nil resolver
 // means no groups exist (preserving the pre-feature single-model behavior — the
 // No-Op invariant). Satisfied by *gateway.GroupRegistry.
 type GroupResolver interface {
-	// Group returns a group's ordered members and its failover mode when name is
+	// Group returns a group's ordered members and its selection policy when name is
 	// an active group; ok=false when name is not a group.
-	Group(name string) (members []GroupMember, mode string, ok bool)
+	Group(name string) (members []GroupMember, policy GroupPolicy, ok bool)
 	// DirectAllowed reports whether a direct (non-group) request for modelName is
 	// permitted. false only when the model's ModelSetting.Visibility == "locked"
 	// (a group-only model, reachable solely via a group). Model-level, not membership.
@@ -344,11 +356,11 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	// for a plain model and DirectAllowed returns true (not locked), so the whole
 	// block is transparent.
 	if r.groups != nil {
-		if members, mode, ok := r.groups.Group(req.Model); ok {
+		if members, policy, ok := r.groups.Group(req.Model); ok {
 			if !r.groups.DirectAllowed(req.Model) {
 				return Target{}, ErrNoModelRoute // a locked group: not directly requestable
 			}
-			return r.resolveGroup(ctx, token, req, key, apiFlavor, members, mode, now)
+			return r.resolveGroup(ctx, token, req, key, apiFlavor, members, policy, now)
 		}
 		if !r.groups.DirectAllowed(req.Model) {
 			return Target{}, ErrNoModelRoute // a locked group-only model requested directly
@@ -877,8 +889,7 @@ const (
 	memberAtCapacity                      // every candidate is at its effective cap (queue material)
 )
 
-// modeClimbUp is the climb_up failover mode (Task 3 acts on it; Task 2 treats it
-// exactly like sticky). Declared here so both tasks share the literal.
+// modeClimbUp is the climb_up value of GroupPolicy.FailoverMode.
 const modeClimbUp = "climb_up"
 
 // selectMember resolves one group member's candidates and reports its status. For a
@@ -1022,7 +1033,7 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 // Errors map per §3g: zero members OR no member with any live mapping -> ErrNoModelRoute
 // (unknown model); members with live mappings but all gated (down/busy/non-viable/at-cap)
 // -> ErrNoHealthyHost.
-func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, mode string, now time.Time) (Target, error) {
+func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
 	if len(members) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
@@ -1044,7 +1055,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 			return Target{}, err
 		}
 		if pinStatus == memberOK {
-			if mode == modeClimbUp {
+			if policy.FailoverMode == modeClimbUp {
 				// Is a higher-priority member available? The pin is memberOK, so firstAvailable
 				// stops at-or-before it in the priority order → best index <= pin index (the
 				// memberIndex guard below is belt-and-suspenders for that invariant).

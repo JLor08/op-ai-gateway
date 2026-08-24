@@ -11,10 +11,10 @@ import (
 )
 
 // groupEntry is one active model group's resolved members (priority-ordered) and its
-// failover mode, held in the GroupRegistry snapshot.
+// selection policy, held in the GroupRegistry snapshot.
 type groupEntry struct {
 	members []routing.GroupMember
-	mode    string
+	policy  routing.GroupPolicy
 }
 
 // GroupRegistry is the hot-path, in-memory view of the model-group config the resolver
@@ -87,7 +87,30 @@ func (r *GroupRegistry) RefreshGroups(ctx context.Context) error {
 		for i, name := range flat {
 			members[i] = routing.GroupMember{MemberGatewayName: name, Priority: i}
 		}
-		nextGroups[strings.ToLower(g.GatewayModelName)] = groupEntry{members: members, mode: g.FailoverMode}
+		// MemberOrder/MinSpeedFallback are normalised here (empty OR unrecognized ->
+		// their default), matching how the resolver already fails an unknown
+		// FailoverMode open to "sticky" behavior via a plain equality check.
+		// ClimbSpeedMarginPercent is NOT defaulted: 0 is a legitimate "no margin
+		// required" policy, not an unset sentinel.
+		memberOrder := g.MemberOrder
+		if memberOrder != routing.MemberOrderPriority && memberOrder != routing.MemberOrderSpeed {
+			memberOrder = routing.MemberOrderPriority
+		}
+		minSpeedFallback := g.MinSpeedFallback
+		if minSpeedFallback != routing.MinSpeedFallbackError && minSpeedFallback != routing.MinSpeedFallbackIgnore {
+			minSpeedFallback = routing.MinSpeedFallbackError
+		}
+		nextGroups[strings.ToLower(g.GatewayModelName)] = groupEntry{
+			members: members,
+			policy: routing.GroupPolicy{
+				FailoverMode:            g.FailoverMode,
+				MemberOrder:             memberOrder,
+				LoadedOnly:              g.LoadedOnly,
+				ClimbSpeedMarginPercent: g.ClimbSpeedMarginPercent,
+				MinTokensPerSecond:      g.MinTokensPerSecond,
+				MinSpeedFallback:        minSpeedFallback,
+			},
+		}
 	}
 	settings, err := r.store.ModelSettings(ctx)
 	if err != nil {
@@ -106,19 +129,19 @@ func (r *GroupRegistry) RefreshGroups(ctx context.Context) error {
 	return nil
 }
 
-// Group returns a COPY of a group's priority-ordered members and its failover mode when
-// name is an active group (case-insensitive); ok=false otherwise. Nil-safe.
-func (r *GroupRegistry) Group(name string) ([]routing.GroupMember, string, bool) {
+// Group returns a COPY of a group's priority-ordered members and its selection policy
+// when name is an active group (case-insensitive); ok=false otherwise. Nil-safe.
+func (r *GroupRegistry) Group(name string) ([]routing.GroupMember, routing.GroupPolicy, bool) {
 	if r == nil {
-		return nil, "", false
+		return nil, routing.GroupPolicy{}, false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.groups[strings.ToLower(name)]
 	if !ok {
-		return nil, "", false
+		return nil, routing.GroupPolicy{}, false
 	}
-	return append([]routing.GroupMember(nil), e.members...), e.mode, true
+	return append([]routing.GroupMember(nil), e.members...), e.policy, true
 }
 
 // DirectAllowed reports whether a direct (non-group) request for a model is permitted. It
