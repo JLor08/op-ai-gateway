@@ -270,6 +270,34 @@ func TestUpdateTokenIgnoresLastUsedModelFromTheClient(t *testing.T) {
 	}
 }
 
+// TestCreateTokenCannotSetLastUsedModel is the create-side half of the
+// read-only guarantee (UpdateToken has its own). The request is built by
+// decoding a real body that tries to forge the marker, so a LastUsedModel field
+// added to CreateTokenRequest later — and assigned into the record — fails this
+// test instead of passing it unnoticed.
+func TestCreateTokenCannotSetLastUsedModel(t *testing.T) {
+	ctx := context.Background()
+	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
+	var req CreateTokenRequest
+	if err := json.Unmarshal([]byte(`{"name":"t","scopes":["gateway:use"],"last_used_model":"forged-model"}`), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	resp, err := f.svc.CreateToken(ctx, f.owner, req)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if resp.Token.LastUsedModel != "" {
+		t.Fatalf("dto last_used_model = %q, want empty", resp.Token.LastUsedModel)
+	}
+	record, err := f.dir.TokenByID(ctx, resp.Token.ID)
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if record.LastUsedModel != "" {
+		t.Fatalf("record last_used_model = %q, want empty", record.LastUsedModel)
+	}
+}
+
 func TestUpdateTokenKeepsRulesWhenFieldOmitted(t *testing.T) {
 	// A nil pointer means "unchanged" throughout this API; the switches must not
 	// silently reset when a client PATCHes an unrelated field.
