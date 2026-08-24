@@ -121,25 +121,56 @@ func TestPreflightCatchAllWinsOverTheRedirectEvenWhenSuppressed(t *testing.T) {
 	}
 }
 
-// TestPreflightRedirectTargetIsCheckedEvenWhenTheWishWasAllowed is the sharp
-// edge of the same invariant, and the one that actually pins the ORDER: here
-// the name the client asked for passes the allowlist (it is simply not offered
-// anywhere), so a redirect placed after modelAllowed would hand the request a
-// target no gate ever looked at. Running before it, the target itself is
-// refused.
-func TestPreflightRedirectTargetIsCheckedEvenWhenTheWishWasAllowed(t *testing.T) {
+// TestPreflightRedirectNeverPicksAnAllowlistBlockedTarget is the sharp edge of
+// the same invariant. Here the name the client asked for passes the allowlist
+// (it is simply not offered anywhere), so nothing downstream would ever look at
+// the redirect's target on this request's behalf: modelAllowed sees only the
+// EFFECTIVE model, and if the redirect swapped in a blocked one the 403 would
+// name a model the client never sent. The redirect must therefore refuse the
+// candidate itself (callableFor) and leave the request's model alone.
+func TestPreflightRedirectNeverPicksAnAllowlistBlockedTarget(t *testing.T) {
 	token := auth.Token{
 		Kind:                 "service",
 		AllowedModels:        []string{"ghost-model"},
 		UnknownModelRedirect: true,
 		LastUsedModel:        "forbidden-model",
 	}
-	rec := httptest.NewRecorder()
 	pf, handled := serverWithOffering("forbidden-model").
-		inferencePreflight(rec, newInferenceRequest(t), token, nil,
+		inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil,
 			inferenceShape{model: "ghost-model", apiFlavor: "openai"})
-	if !handled || rec.Code != http.StatusForbidden {
-		t.Fatalf("redirect target skipped the allowlist: handled=%v code=%d model=%q", handled, rec.Code, pf.Req.Model)
+	if handled {
+		t.Fatal("preflight refused a request whose own model the allowlist permits")
+	}
+	if pf.Req.Model != "ghost-model" {
+		t.Fatalf("effective model = %q, want ghost-model (the blocked candidate must not be taken)", pf.Req.Model)
+	}
+}
+
+// TestPreflightRedirectRunsBeforeTheAllowlist pins the ORDER, and is what makes
+// the service allowlist reachable by widened mode at all. The wish here is
+// blocked ONLY by the allowlist — the canonical "exists but you may not use it"
+// case UnknownModelRedirectBlocked is for. A redirect placed AFTER modelAllowed
+// would never see this request: the 403 would already have been written.
+func TestPreflightRedirectRunsBeforeTheAllowlist(t *testing.T) {
+	token := auth.Token{
+		Kind:                        "service",
+		AllowedModels:               []string{"allowed-model"},
+		UnknownModelRedirect:        true,
+		UnknownModelRedirectBlocked: true,
+		LastUsedModel:               "allowed-model",
+	}
+	rec := httptest.NewRecorder()
+	pf, handled := serverWithOffering("allowed-model", "forbidden-model").
+		inferencePreflight(rec, newInferenceRequest(t), token, nil,
+			inferenceShape{model: "forbidden-model", apiFlavor: "openai"})
+	if handled {
+		t.Fatalf("preflight refused the request instead of redirecting it: code=%d", rec.Code)
+	}
+	if pf.Req.Model != "allowed-model" {
+		t.Fatalf("effective model = %q, want allowed-model", pf.Req.Model)
+	}
+	if pf.Req.RequestedModel != "forbidden-model" {
+		t.Fatalf("requested model = %q, want the client's original wish", pf.Req.RequestedModel)
 	}
 }
 

@@ -34,6 +34,8 @@ import (
 // means "a direct request for this name can succeed", which is the only correct
 // answer to either question — including for a "locked" (group-only) name, which
 // Callable excludes precisely because a direct request for it cannot route.
+// Both questions go through callableFor, which is Callable narrowed by the one
+// admission gate the portal cannot see: the service-account model allowlist.
 //
 // A failed offering lookup needs no special case here. ModelOfferingFor is
 // all-or-nothing and hands back WHOLLY EMPTY sets on any store error, and
@@ -44,7 +46,7 @@ func redirectUnknownModel(token auth.Token, requested string, off portal.ModelOf
 	if !token.UnknownModelRedirect {
 		return ""
 	}
-	if _, callable := off.Callable[requested]; callable {
+	if callableFor(token, off, requested) {
 		return ""
 	}
 	if _, exists := off.Existing[requested]; exists && !token.UnknownModelRedirectBlocked {
@@ -54,9 +56,43 @@ func redirectUnknownModel(token auth.Token, requested string, off portal.ModelOf
 		if candidate == "" {
 			continue
 		}
-		if _, ok := off.Callable[candidate]; ok {
+		if callableFor(token, off, candidate) {
 			return candidate
 		}
 	}
 	return ""
+}
+
+// callableFor answers "can a direct request from THIS token for `name` succeed"
+// — the single question both halves of redirectUnknownModel ask.
+//
+// portal.ModelOffering.Callable answers it for everything the portal knows
+// about: the server-side existence of the name, resource-group provisioning,
+// and the "locked" (group-only) access boundary. It cannot answer it alone,
+// because one admission gate lives entirely on this side of the boundary and
+// the portal never sees it — the service-account model allowlist (modelAllowed,
+// inference_handlers.go). A name blocked ONLY by the allowlist is in Callable
+// and yet 403s at inference_handlers.go's modelAllowed gate a few lines later.
+//
+// Leaving it out broke the feature in both directions:
+//
+//   - The requested-model half: an allowlist-blocked name looked callable, so
+//     the redirect declined and the client got the 403 — even under
+//     UnknownModelRedirectBlocked, whose entire purpose is "also redirect the
+//     models this token may not use". The service allowlist is the canonical
+//     instance of that case (it is the only per-token allowlist there is), so
+//     widened mode covered every case except the one it was written for.
+//   - The candidate half: an allowlist-blocked LastUsedModel or fallback looked
+//     usable, so the redirect would swap the client's model for one that then
+//     fails the very next gate — turning a legible "unknown model" into a 403
+//     naming a model the client never sent.
+//
+// An empty allowlist on a service token, and any non-service token, mean "every
+// model allowed" — modelAllowed is a no-op there, so this stays exactly
+// off.Callable for every token that has no allowlist at all.
+func callableFor(token auth.Token, off portal.ModelOffering, name string) bool {
+	if _, ok := off.Callable[name]; !ok {
+		return false
+	}
+	return modelAllowed(token, name)
 }

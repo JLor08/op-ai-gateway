@@ -164,11 +164,11 @@ flowchart TD
     Catch -->|no| Eff
     Eff --> Opt{"UnknownModelRedirect\nopted in?"}
     Opt -->|no| Gates
-    Opt -->|yes| Applies{"does the effective name apply?\n(Callable; widened by\nUnknownModelRedirectBlocked)"}
+    Opt -->|yes| Applies{"does the effective name apply?\n(callableFor = Callable minus the\nservice allowlist; widened by\nUnknownModelRedirectBlocked)"}
     Applies -->|yes| Gates
-    Applies -->|no| Marker{"LastUsedModel\ncallable?"}
+    Applies -->|no| Marker{"LastUsedModel\ncallableFor?"}
     Marker -->|yes| UseMarker["redirect onto the marker"] --> Gates
-    Marker -->|no| Fallback{"UnknownModelFallback\ncallable?"}
+    Marker -->|no| Fallback{"UnknownModelFallback\ncallableFor?"}
     Fallback -->|yes| UseFB["redirect onto the fallback"] --> Gates
     Fallback -->|no| Keep["keep the requested model\n(today's error)"] --> Gates
     Gates["admission gates, unchanged:\nserver-override re-authorization,\nservice-token model allowlist,\nrate/quota/budget\n→ Resolver.Resolve (§2)"]
@@ -195,6 +195,19 @@ The narrow default is deliberate: a refusal on a model that *does* exist is a
 signal about a misconfiguration, and silently routing around it costs whoever
 debugs it later. The widened mode is the explicit opt-out from that.
 
+**"Callable" here is `ModelOffering.Callable` *plus* the service allowlist.**
+`callableFor` (`internal/gateway/inference_redirect.go`) is the predicate both
+questions actually go through: the offering set narrowed by `modelAllowed`, the
+service-account model allowlist. The portal cannot fold that gate into the
+offering itself — the allowlist is a property of the *service*, not of the model
+map — yet it is the only per-token allowlist the system has, and therefore the
+canonical instance of "exists but this token may not use it". Omitting it would
+make widened mode cover every case *except* the one it was written for, and
+would let the redirect pick a `LastUsedModel` or fallback that then 403s at the
+next gate under a model name the client never sent. An **empty** allowlist, and
+any non-service token, mean "every model allowed", so this narrows nothing for
+the tokens that have no allowlist.
+
 **Cost and failure direction.** A token with the redirect off pays one boolean
 test and no store work at all; only an opted-in token triggers the offering
 lookup (one mapping traversal plus one group-overlay load per request,
@@ -218,6 +231,16 @@ safe because the check is a usability guard, not the enforcement point:
 candidates are re-checked against the live offering on every request, and the
 result still faces the service's own allowlist, so a value that goes stale — or
 one the service may not use — is inert rather than dangerous.
+
+The **fallback** is the one exception, and only on the service-token path: it is
+validated against that principal's callable set **narrowed by the service's own
+allowlist**. An override target is a name the *client* asked for under another
+spelling, so an allowlist refusal reaches the client as the ordinary `403
+model.not_allowed` — a legible signal. The fallback is a name the *gateway*
+picks on its own, and `callableFor` will never pick one the allowlist blocks, so
+such a fallback is not refused anywhere: it is silently never taken. Rejecting
+it on write is the only moment an operator can still notice. An empty allowlist
+narrows nothing.
 
 **The last-used-model marker.** Every token records the gateway model or group
 name of its last **successfully routed** request (`api_tokens.last_used_model`).

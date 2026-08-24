@@ -197,6 +197,91 @@ func TestRedirectSkipsALockedLastUsedModel(t *testing.T) {
 	}
 }
 
+// serviceToken builds a service-account token with a model allowlist — the ONE
+// per-token access boundary portal.ModelOffering cannot know about, since it is
+// enforced by modelAllowed on this side of the portal boundary. A name blocked
+// only by the allowlist is therefore in Callable and still 403s, which is
+// exactly the "exists but you may not use it" case widened mode is for.
+func serviceToken(allowed ...string) auth.Token {
+	return auth.Token{Kind: "service", UnknownModelRedirect: true, AllowedModels: allowed}
+}
+
+// TestRedirectWidenedCoversAnAllowlistBlockedModel is the service allowlist as
+// the canonical widened-mode case: the model exists, this token is provisioned
+// for it, and only the allowlist refuses it. Judging by Callable alone leaves
+// it looking callable, the redirect declines, and the client gets the same 403
+// the switch was turned on to avoid.
+func TestRedirectWidenedCoversAnAllowlistBlockedModel(t *testing.T) {
+	tok := serviceToken("a")
+	tok.UnknownModelRedirectBlocked = true
+	tok.LastUsedModel = "a"
+	if got := redirectUnknownModel(tok, "b", offering([]string{"a", "b"}, []string{"a", "b"})); got != "a" {
+		t.Fatalf("redirect = %q, want a (b is blocked by the service allowlist)", got)
+	}
+}
+
+// TestRedirectNarrowLeavesAnAllowlistBlockedModelAlone: the switch is what makes
+// the difference, so the default must still refuse. "b" exists, so narrow mode
+// short-circuits on Existing and the 403 stays visible.
+func TestRedirectNarrowLeavesAnAllowlistBlockedModelAlone(t *testing.T) {
+	tok := serviceToken("a")
+	tok.LastUsedModel = "a"
+	if got := redirectUnknownModel(tok, "b", offering([]string{"a", "b"}, []string{"a", "b"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect in narrow mode", got)
+	}
+}
+
+// TestRedirectRejectsAnAllowlistBlockedFallback: the candidate half. Redirecting
+// onto a name the allowlist refuses would replace a legible "unknown model"
+// error with a 403 naming a model the client never sent.
+func TestRedirectRejectsAnAllowlistBlockedFallback(t *testing.T) {
+	tok := serviceToken("a")
+	tok.LastUsedModel = "gone"
+	tok.UnknownModelFallback = "f"
+	if got := redirectUnknownModel(tok, "nope", offering([]string{"a", "f"}, []string{"a", "f"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect onto an allowlist-blocked fallback", got)
+	}
+}
+
+// TestRedirectSkipsAnAllowlistBlockedLastUsedModel: a model can drop out of the
+// allowlist AFTER a token last used it, so the marker is exactly where a stale
+// blocked name shows up. The chain steps over it and takes the fallback.
+func TestRedirectSkipsAnAllowlistBlockedLastUsedModel(t *testing.T) {
+	tok := serviceToken("a")
+	tok.LastUsedModel = "dropped"
+	tok.UnknownModelFallback = "a"
+	if got := redirectUnknownModel(tok, "nope", offering([]string{"a", "dropped"}, []string{"a", "dropped"})); got != "a" {
+		t.Fatalf("redirect = %q, want the fallback a", got)
+	}
+}
+
+// TestRedirectEmptyAllowlistMeansEverything pins the allowlist's own default: on
+// a service token an EMPTY allowlist allows every model (it is opt-in, not
+// deny-by-default). Reading it as "nothing allowed" would make every name
+// uncallable, so widened mode would redirect every request and then find no
+// candidate to redirect it to.
+func TestRedirectEmptyAllowlistMeansEverything(t *testing.T) {
+	tok := serviceToken()
+	tok.UnknownModelRedirectBlocked = true
+	tok.LastUsedModel = "a"
+	if got := redirectUnknownModel(tok, "b", offering([]string{"a", "b"}, []string{"a", "b"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect: an empty allowlist allows everything", got)
+	}
+	if got := redirectUnknownModel(tok, "nope", offering([]string{"a"}, []string{"a"})); got != "a" {
+		t.Fatalf("redirect = %q, want a: an empty allowlist must not block the candidate either", got)
+	}
+}
+
+// TestRedirectAllowlistIgnoredForAUserToken: AllowedModels only ever means
+// anything on a service token (modelAllowed's own rule), and a user token never
+// carries one. A stray value must not narrow anything.
+func TestRedirectAllowlistIgnoredForAUserToken(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, LastUsedModel: "a", AllowedModels: []string{"a"}}
+	if got := redirectUnknownModel(tok, "b", offering([]string{"a", "b"}, []string{"a", "b"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect: a user token has no allowlist", got)
+	}
+}
+
 // TestRedirectDeclinesOnAnEmptyOffering pins the store-failure direction.
 // ModelOfferingFor returns two WHOLLY EMPTY sets on any store error (that is
 // deliberate — see its doc comment: the only safe partial result is none).

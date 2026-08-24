@@ -69,36 +69,93 @@ func TestCreateServiceTokenAcceptsGroupAsFallback(t *testing.T) {
 	}
 }
 
-// TestCreateServiceTokenFallbackIsCheckedAgainstThePrincipal pins the ruling
-// for this path: the fallback is validated against the CREATING PRINCIPAL's
-// callable set — exactly like the override target beside it — and NOT against
-// the service's own allowlist. A token that does not exist yet has no
-// reachability to compute. This is safe because the redirect's result passes
-// every admission gate at request time, the service allowlist included, so
-// save-time validation is a usability check and never the security boundary.
-func TestCreateServiceTokenFallbackIsCheckedAgainstThePrincipal(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now().UTC()
-	svc, _, _, _ := newServiceAccountsTestService(t, now)
+// narrowServiceWithAllowlist creates a service whose model allowlist is exactly
+// `allowed`, so the fallback validator has something to narrow by.
+func narrowServiceWithAllowlist(t *testing.T, ctx context.Context, svc *Service, allowed ...string) ServiceDTO {
+	t.Helper()
 	created, err := svc.CreateService(ctx, svcAdminToken(), CreateServiceRequest{
 		Name:          "Narrow Bot",
 		Delegates:     []ServiceDelegateInput{{UserID: "usr_full", CanManageSettings: true}},
-		AllowedModels: []string{"model-a"},
+		AllowedModels: allowed,
 		AdminGroupIDs: []string{testServiceAdminGroupID},
 	})
 	if err != nil {
 		t.Fatalf("CreateService: %v", err)
 	}
-	// model-b is outside the service's allowlist but callable by the principal:
-	// accepted at save time, and refused (not silently rerouted) per request.
+	return created
+}
+
+// TestCreateServiceTokenRejectsAFallbackOutsideTheAllowlist pins the ruling for
+// this path: the fallback is validated against the creating principal's callable
+// set NARROWED BY THIS SERVICE'S ALLOWLIST.
+//
+// The fallback is unlike every other model-valued token setting because the
+// GATEWAY, not the client, picks it — and the redirect only ever picks a
+// candidate that passes the allowlist too (callableFor, gateway package). A
+// fallback outside the allowlist is therefore not "refused per request with a
+// visible 403"; it is silently never taken, with nothing anywhere to say why.
+// Refusing to store it is the only moment an operator can still notice.
+func TestCreateServiceTokenRejectsAFallbackOutsideTheAllowlist(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := narrowServiceWithAllowlist(t, ctx, svc, "model-a")
+	// model-b is callable by the principal but outside the service's allowlist.
+	_, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
+		Name: "T1", UnknownModelRedirect: true, UnknownModelFallback: "model-b",
+	})
+	if !errors.Is(err, ErrTokenModelOverrideInvalid) {
+		t.Fatalf("err = %v, want ErrTokenModelOverrideInvalid for a fallback the allowlist blocks", err)
+	}
+	// The allowlisted one is still accepted, so the narrowing is a narrowing and
+	// not a blanket refusal.
+	resp, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
+		Name: "T2", UnknownModelRedirect: true, UnknownModelFallback: "model-a",
+	})
+	if err != nil {
+		t.Fatalf("allowlisted fallback rejected: %v", err)
+	}
+	if resp.Token.UnknownModelFallback != "model-a" {
+		t.Fatalf("fallback = %q, want model-a", resp.Token.UnknownModelFallback)
+	}
+}
+
+// TestCreateServiceTokenEmptyAllowlistAcceptsAnyCallableFallback is the other
+// half of that rule, and the one an implementation gets wrong: an EMPTY
+// allowlist means "every model allowed" (it is opt-in, and the default every
+// service starts with), never "no model allowed". Read the other way, this
+// validator would reject every fallback on every service that never configured
+// an allowlist — which is most of them.
+func TestCreateServiceTokenEmptyAllowlistAcceptsAnyCallableFallback(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := narrowServiceWithAllowlist(t, ctx, svc) // no allowlist at all
 	resp, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
 		Name: "T1", UnknownModelRedirect: true, UnknownModelFallback: "model-b",
 	})
 	if err != nil {
-		t.Fatalf("fallback outside the service allowlist rejected at save time: %v", err)
+		t.Fatalf("fallback rejected although the service has no allowlist: %v", err)
 	}
 	if resp.Token.UnknownModelFallback != "model-b" {
 		t.Fatalf("fallback = %q, want model-b", resp.Token.UnknownModelFallback)
+	}
+}
+
+// TestCreateServiceTokenOverrideTargetIgnoresTheAllowlist keeps the two kinds of
+// value apart. An override target is a name the CLIENT asked for under another
+// spelling, so an allowlist refusal surfaces as the ordinary 403 for that
+// target — a legible signal, not silence. Only the fallback is narrowed.
+func TestCreateServiceTokenOverrideTargetIgnoresTheAllowlist(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := narrowServiceWithAllowlist(t, ctx, svc, "model-a")
+	resp, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
+		Name: "T1", ModelOverride: "model-b",
+	})
+	if err != nil {
+		t.Fatalf("override target outside the allowlist rejected at save time: %v", err)
+	}
+	if resp.Token.ModelOverride != "model-b" {
+		t.Fatalf("override = %q, want model-b", resp.Token.ModelOverride)
 	}
 }
 

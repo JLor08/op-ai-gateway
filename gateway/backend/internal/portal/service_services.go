@@ -701,19 +701,33 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
-	// The redirect's fallback is checked against the CREATING PRINCIPAL's
-	// callable set, exactly like the override target above it — never against
-	// the service's own allowlist. A token that does not exist yet has no
-	// reachability of its own to compute, and the delegate picking the value is
-	// the one whose model list the UI shows.
+	// The redirect's fallback is checked against the creating principal's
+	// callable set NARROWED BY THIS SERVICE'S OWN ALLOWLIST — unlike the
+	// override target above it, which stays on the principal's set alone.
 	//
-	// That is safe because the check is a usability guard, not the security
-	// boundary: the redirect's RESULT passes every admission gate at request
-	// time — the service allowlist included — so a fallback the service may not
-	// use is refused there, exactly as a directly requested model would be. It
-	// can never widen what this token may reach.
+	// The two are different kinds of value, and that is why they are checked
+	// differently. An override target is a name the CLIENT asked for under
+	// another spelling: if the allowlist refuses it, the client gets the same
+	// 403 it would have got for the target's real name — a legible signal about
+	// a misconfiguration. The fallback is a name the GATEWAY picks on its own
+	// when the client's wish cannot be served, and the redirect only ever picks
+	// a candidate that passes every admission gate, the allowlist included (see
+	// callableFor in the gateway package). A fallback outside the allowlist is
+	// therefore not merely refused later; it is INERT — silently never taken,
+	// with nothing anywhere to say why. Refusing to store it is the only moment
+	// an operator can still notice.
+	//
+	// This narrows what may be SAVED, never what the token may reach: the
+	// redirect re-checks every candidate against the live offering and the live
+	// allowlist on each request, so an allowlist edited afterwards makes a stored
+	// fallback inert again — the same staleness every model-valued token setting
+	// already carries, and equally harmless.
+	allowlist, err := s.routes.ServiceAllowedModels(ctx, svc.ID)
+	if err != nil {
+		return CreateServiceTokenResponse{}, err
+	}
 	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
-		callable, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
+		intersectAllowedModels(callable, allowlist), req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
@@ -854,6 +868,29 @@ func (s *Service) validateServiceDelegates(ctx context.Context, raw []ServiceDel
 		out = append(out, routing.ServiceDelegate{UserID: userID, CanManageSettings: d.CanManageSettings})
 	}
 	return out, nil
+}
+
+// intersectAllowedModels narrows a callable-name set by a service's model
+// allowlist — the gateway-side admission gate (modelAllowed) that no offering
+// lookup can see, because it is a property of the service rather than of the
+// model map.
+//
+// An EMPTY allowlist means "every model allowed", not "no model allowed": the
+// allowlist is opt-in, and empty is the default every service starts with.
+// Reading it the other way would reject every fallback on every service that
+// never configured one. It therefore returns `callable` unchanged, and only an
+// allowlist with entries narrows anything.
+func intersectAllowedModels(callable map[string]struct{}, allowed []string) map[string]struct{} {
+	if len(allowed) == 0 {
+		return callable
+	}
+	out := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		if _, ok := callable[name]; ok {
+			out[name] = struct{}{}
+		}
+	}
+	return out
 }
 
 // validateServiceAllowedModels trims + validates a model allowlist: every
