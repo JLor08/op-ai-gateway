@@ -261,7 +261,9 @@ export function ListTable<Row>({
         // real value.
         const aMissing = av.trim() === '' || Number.isNaN(an);
         const bMissing = bv.trim() === '' || Number.isNaN(bn);
-        if (aMissing || bMissing) return aMissing && bMissing ? 0 : aMissing ? 1 : -1;
+        if (aMissing && bMissing) return 0;
+        if (aMissing) return 1;
+        if (bMissing) return -1;
         return (an - bn) * dir;
       }
       return av.localeCompare(bv) * dir;
