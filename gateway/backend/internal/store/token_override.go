@@ -89,13 +89,22 @@ func EncodeModelOverrideRules(m map[string]ModelOverrideRule) string {
 // having auth import store the other way would be an import cycle. This is the
 // one place that bridges the two: every call site that builds an auth.Token
 // from a store.TokenRecord's decoded rules goes through here.
+//
+// The conversion is a TYPE CONVERSION (auth.ModelOverrideRule(rule)), not a
+// field-by-field literal: the two types have an identical underlying
+// structure (same field names, types, and order — struct tags are ignored
+// for conversion purposes since Go 1.8), so the conversion is legal today.
+// If either struct later gains/loses/reorders a field without the other
+// following, the types stop being identical and this line fails to
+// COMPILE — turning drift between the two duplicated types into a build
+// error instead of a silently-dropped field.
 func AuthModelOverrideRules(rules map[string]ModelOverrideRule) map[string]auth.ModelOverrideRule {
 	if len(rules) == 0 {
 		return nil
 	}
 	out := make(map[string]auth.ModelOverrideRule, len(rules))
 	for name, rule := range rules {
-		out[name] = auth.ModelOverrideRule{To: rule.To, Offer: rule.Offer, HideTarget: rule.HideTarget}
+		out[name] = auth.ModelOverrideRule(rule)
 	}
 	return out
 }

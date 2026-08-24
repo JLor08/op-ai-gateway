@@ -463,6 +463,96 @@ func TestSQLiteTokenModelOverrideMapRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSQLiteTokenRedirectSettingsLookupBearerMapping proves LookupBearer's
+// returned auth.Token carries LastUsedModel/UnknownModelRedirect/
+// UnknownModelRedirectBlocked/UnknownModelFallback — a mapping distinct from
+// TokenByID's scanToken: TestConformanceTokenRedirectSettingsRoundTrip only
+// checks the TokenRecord path, never the auth.Token one LookupBearer builds.
+func TestSQLiteTokenRedirectSettingsLookupBearerMapping(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	rec := testTokenRecord(now)
+	rec.LastUsedModel = "qwen3-32b"
+	rec.UnknownModelRedirect = true
+	rec.UnknownModelRedirectBlocked = true
+	rec.UnknownModelFallback = "fallback-model"
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	tok, ok := st.LookupBearer("Bearer plain-secret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("LookupBearer LastUsedModel = %q, want %q", tok.LastUsedModel, "qwen3-32b")
+	}
+	if !tok.UnknownModelRedirect {
+		t.Fatalf("LookupBearer UnknownModelRedirect = false, want true")
+	}
+	if !tok.UnknownModelRedirectBlocked {
+		t.Fatalf("LookupBearer UnknownModelRedirectBlocked = false, want true")
+	}
+	if tok.UnknownModelFallback != "fallback-model" {
+		t.Fatalf("LookupBearer UnknownModelFallback = %q, want %q", tok.UnknownModelFallback, "fallback-model")
+	}
+}
+
+// TestSQLiteTokenRedirectSettingsUpdateRoundTrip proves UpdateTokenMetadata's
+// SQL actually writes the four new columns. The token is created with every
+// new field at its zero value (testTokenRecord's defaults), so the ONLY way
+// the post-update read can see the new values is if UpdateTokenMetadata's own
+// SET clause carries them — TestConformanceTokenRedirectSettingsRoundTrip
+// only exercises CreatePlainToken's insert, never this update path.
+func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	rec := testTokenRecord(now)
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+	before, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if before.UnknownModelRedirect || before.UnknownModelRedirectBlocked ||
+		before.UnknownModelFallback != "" || before.LastUsedModel != "" {
+		t.Fatalf("fixture must start at the zero defaults: %+v", before)
+	}
+
+	before.LastUsedModel = "qwen3-32b"
+	before.UnknownModelRedirect = true
+	before.UnknownModelRedirectBlocked = true
+	before.UnknownModelFallback = "fallback-model"
+	before.UpdatedAt = now.Add(time.Minute)
+	if err := st.UpdateTokenMetadata(ctx, before); err != nil {
+		t.Fatalf("UpdateTokenMetadata returned %v", err)
+	}
+
+	after, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if after.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("after update: LastUsedModel = %q, want %q", after.LastUsedModel, "qwen3-32b")
+	}
+	if !after.UnknownModelRedirect {
+		t.Fatalf("after update: UnknownModelRedirect = false, want true")
+	}
+	if !after.UnknownModelRedirectBlocked {
+		t.Fatalf("after update: UnknownModelRedirectBlocked = false, want true")
+	}
+	if after.UnknownModelFallback != "fallback-model" {
+		t.Fatalf("after update: UnknownModelFallback = %q, want %q", after.UnknownModelFallback, "fallback-model")
+	}
+}
+
 func TestSQLiteTokenSecretRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st := openTokenTestSQLite(t)
