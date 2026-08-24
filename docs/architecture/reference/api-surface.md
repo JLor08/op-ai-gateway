@@ -93,11 +93,25 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 
 #### Token model settings
 
-`/api/portal/tokens[/{id}]` and the service-token surface
-(`/api/portal/services/{id}/tokens`) carry the same per-token model settings on
-create, update, and read. Every model-valued one is validated on write against
-what the owner can route to **directly**, and an unroutable name is rejected
-with `400 portal.token_model_override_invalid`.
+User tokens and service tokens carry the same per-token model-settings **fields**,
+but not the same write surface:
+
+| Surface | Where the fields are writable | Where they are readable |
+|---|---|---|
+| User token | `POST /api/portal/tokens` (create) and `PATCH /api/portal/tokens/{id}` (update) | `GET /api/portal/tokens` |
+| Service token | `POST /api/portal/services/{id}/tokens` (create) **only** — there is no update endpoint; `{tid}` accepts `DELETE`, and `{tid}/rotate` accepts `POST`, which replaces the secret and nothing else | `GET /api/portal/services/{id}/tokens` |
+
+So a service token's model settings are **fixed at creation**: changing them
+means deleting the token and creating a new one.
+
+Every model-valued field is validated on write and an unroutable name is
+rejected with `400 portal.token_model_override_invalid`. The set it is validated
+against is the **writing principal's** callable models — the owner for a user
+token, and for a service token the principal issuing it (a service delegate or
+an authorized admin-group manager), never the service's own allowed-model list. That is a usability guard, not the security boundary: the
+service allowlist still refuses the request at inference time if the two
+disagree (see
+[Security, Authentication & Authorization](../cross-cutting/security-auth-rbac.md)).
 
 | Field | Shape | Meaning |
 |---|---|---|

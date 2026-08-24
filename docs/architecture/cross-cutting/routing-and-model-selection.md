@@ -206,13 +206,18 @@ listing's fail-open, which must never blank the list a user is looking at.
 
 **Configuration-time guard.** The catch-all, every rule's target, and the
 redirect's fallback are all validated on write against one set — what the
-owner can route to directly (`callableModelNames`,
+**writing principal** can route to directly (`callableModelNames`,
 `internal/portal/service.go`) — and an unroutable name is rejected with
-`400 portal.token_model_override_invalid` on every token-write path (user and
-service tokens, create and update). It is a usability guard, not the
-enforcement point: candidates are re-checked against the live offering on
-every request, so a value that goes stale later is inert rather than
-dangerous.
+`400 portal.token_model_override_invalid` on every token-write path there is:
+user-token create and update, and service-token create (a service token has no
+update path at all, so its model settings are fixed at creation). For a service
+token that principal is the one **issuing** it — a service delegate or an
+authorized admin-group manager — never the service itself: a token that does
+not exist yet has no reachability of its own to compute. That is
+safe because the check is a usability guard, not the enforcement point:
+candidates are re-checked against the live offering on every request, and the
+result still faces the service's own allowlist, so a value that goes stale — or
+one the service may not use — is inert rather than dangerous.
 
 **The last-used-model marker.** Every token records the gateway model or group
 name of its last **successfully routed** request (`api_tokens.last_used_model`).

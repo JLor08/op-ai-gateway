@@ -483,9 +483,11 @@ is the general invariant of
 [Routing & Model Selection §2.1](routing-and-model-selection.md): those
 settings change *which* name is requested, never *what* a token may reach.
 It is also why a service token's redirect fallback is validated against the
-creating delegate's callable models rather than the service's own allowlist —
-the write-time check is a usability guard, and the allowlist still refuses the
-request at inference time if the two disagree.
+callable models of the principal **issuing** it (a delegate or an authorized
+admin-group manager) rather than against the service's own allowlist — the
+write-time check is a usability guard, and the allowlist still refuses the
+request at inference time if the two disagree. A service token has no update
+endpoint, so those settings are fixed when it is created.
 
 **Projects** attribute usage, not access. A project has plain members
 (`project_members`), assigned groups (`project_groups` — any tier, and every
