@@ -126,14 +126,21 @@ func TestBuildGatewayServerDispatchesConfiguredProviderRoutes(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_DEV_TOKEN", "")
 	var upstreamModel string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Errorf, not Fatalf: this runs on the server's goroutine, where
+		// Fatalf's FailNow is not allowed to stop the test. Kept strict — with
+		// always_reachable on the application below, nothing but the dispatched
+		// completion may reach this upstream, so an unexpected request is a
+		// real finding rather than background noise to tolerate.
 		if r.URL.Path != "/v1/chat/completions" {
-			t.Fatalf("upstream path = %s", r.URL.Path)
+			t.Errorf("upstream path = %s", r.URL.Path)
+			return
 		}
 		var body struct {
 			Model string `json:"model"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("Decode upstream request returned %v", err)
+			t.Errorf("Decode upstream request returned %v", err)
+			return
 		}
 		upstreamModel = body.Model
 		w.Header().Set("Content-Type", "application/json")
@@ -167,7 +174,15 @@ func TestBuildGatewayServerDispatchesConfiguredProviderRoutes(t *testing.T) {
 	if err := srv.Routes.CreateAIServer(context.Background(), routing.AIServer{ID: "host_vllm", Name: "vLLM Host", Domain: upstreamHost, Provider: "vllm", Endpoint: upstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed AI server: %v", err)
 	}
-	if err := srv.Routes.CreateApplication(context.Background(), routing.Application{ID: "app_vllm", ServerID: "host_vllm", Type: routing.ProviderVLLM, Port: upstreamPort, Scheme: upstreamURL.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 100, Weight: 100, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	// always_reachable keeps the app-health loop from probing this upstream.
+	// buildGatewayServer's health loop runs one pass IMMEDIATELY at startup
+	// (runAppHealthLoop) and this application is seeded right after that call
+	// returns, so whether the pass observes it is pure scheduling — and when it
+	// did, the probe GET landed on the httptest handler below (path "/", the
+	// empty HealthCheckPath) and failed the test. This scenario is about route
+	// dispatch, not health probing; the same fixture flag is why the sibling
+	// native-passthrough e2e test never saw this.
+	if err := srv.Routes.CreateApplication(context.Background(), routing.Application{ID: "app_vllm", ServerID: "host_vllm", Type: routing.ProviderVLLM, Port: upstreamPort, Scheme: upstreamURL.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 100, Weight: 100, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: routing.ServerStatusActive, HealthCheckMode: routing.HealthCheckModeAlwaysReachable, AlwaysReachable: true, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed application: %v", err)
 	}
 	if err := srv.Routes.CreateMapping(context.Background(), routing.ModelMapping{ID: "map_vllm", ApplicationID: "app_vllm", GatewayModelName: "vllm-model", AppModelName: "actual-vllm", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
