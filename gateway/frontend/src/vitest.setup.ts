@@ -27,8 +27,12 @@ if (!window.localStorage) {
     },
     key: (i: number) => [...store.keys()][i] ?? null,
     getItem: (k: string) => (store.has(k) ? (store.get(k) as string) : null),
-    setItem: (k: string, v: string) => void store.set(k, String(v)),
-    removeItem: (k: string) => void store.delete(k),
+    setItem: (k: string, v: string) => {
+      store.set(k, String(v));
+    },
+    removeItem: (k: string) => {
+      store.delete(k);
+    },
     clear: () => store.clear(),
   };
   Object.defineProperty(window, 'localStorage', { value: polyfill, configurable: true });
@@ -43,5 +47,3 @@ if (!window.localStorage) {
 afterEach(() => {
   window.localStorage.clear();
 });
-
-export {};
