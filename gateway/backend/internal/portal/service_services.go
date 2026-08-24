@@ -128,31 +128,33 @@ type UpdateServiceRequest struct {
 // TokenDTO but carries ServiceID instead of a user id, and NEVER the secret
 // value (only SecretPrefix; guarded by TestServiceTokenDTOJSONNeverLeaksSecret).
 type ServiceTokenDTO struct {
-	ID               string            `json:"id"`
-	ServiceID        string            `json:"service_id"`
-	Name             string            `json:"name"`
-	SecretPrefix     string            `json:"secret_prefix"`
-	Status           string            `json:"status"`
-	Scopes           []string          `json:"scopes"`
-	ExpiresAt        *time.Time        `json:"expires_at"`
-	LastUsedAt       *time.Time        `json:"last_used_at"`
-	CreatedAt        time.Time         `json:"created_at"`
-	ModelOverride    string            `json:"model_override"`
-	ModelOverrideMap map[string]string `json:"model_override_map,omitempty"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
+	ID            string     `json:"id"`
+	ServiceID     string     `json:"service_id"`
+	Name          string     `json:"name"`
+	SecretPrefix  string     `json:"secret_prefix"`
+	Status        string     `json:"status"`
+	Scopes        []string   `json:"scopes"`
+	ExpiresAt     *time.Time `json:"expires_at"`
+	LastUsedAt    *time.Time `json:"last_used_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ModelOverride string     `json:"model_override"`
+	// ModelOverrideMap rows carry the same object shape as TokenDTO's — see
+	// there; a client that reads and writes a token back keeps both switches.
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
 }
 
 // CreateServiceTokenRequest is CreateServiceToken's body (§6.3): scopes are
 // NEVER accepted from the caller — they are always the fixed
 // [serviceLLMInvokeScope].
 type CreateServiceTokenRequest struct {
-	Name             string            `json:"name"`
-	ExpiresAt        *time.Time        `json:"expires_at"`
-	ModelOverride    string            `json:"model_override"`
-	ModelOverrideMap map[string]string `json:"model_override_map"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
+	Name             string                             `json:"name"`
+	ExpiresAt        *time.Time                         `json:"expires_at"`
+	ModelOverride    string                             `json:"model_override"`
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -672,11 +674,14 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if name == "" {
 		return CreateServiceTokenResponse{}, ErrServiceValidation
 	}
-	override, err := s.validateModelOverride(ctx, principal, req.ModelOverride)
+	// One offering lookup for the catch-all and every rule target (see
+	// callableModelNames).
+	callable := s.callableModelNames(ctx, principal)
+	override, err := validateModelOverride(callable, req.ModelOverride)
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
-	overrideMap, err := s.validateModelOverrideMap(ctx, principal, req.ModelOverrideMap)
+	overrideRules, err := validateModelOverrideRules(callable, req.ModelOverrideMap)
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
@@ -700,7 +705,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		ModelOverride:    override,
-		ModelOverrideMap: store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap)),
+		ModelOverrideMap: store.EncodeModelOverrideRules(overrideRules),
 		LogCommunication: req.LogCommunication,
 		Secret:           req.Secret,
 	}
@@ -815,8 +820,11 @@ func (s *Service) validateServiceDelegates(ctx context.Context, raw []ServiceDel
 }
 
 // validateServiceAllowedModels trims + validates a model allowlist: every
-// non-blank entry must be a currently-active gateway model (mirrors
-// validateModelOverrideMap's target check); blank entries are dropped,
+// non-blank entry must be a currently-active gateway model as the LISTING sees
+// it. This deliberately stays on Models() rather than following the override
+// targets onto callableModelNames: an allowlist is an admin picking from what
+// the management UI shows, not a name the gateway routes to on a client's
+// behalf. Blank entries are dropped,
 // duplicates de-duped. An empty/all-blank input returns nil (the "every model
 // allowed" default, unchanged).
 func (s *Service) validateServiceAllowedModels(ctx context.Context, principal auth.Token, raw []string) ([]string, error) {
@@ -977,7 +985,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		LastUsedAt:       record.LastUsedAt,
 		CreatedAt:        record.CreatedAt,
 		ModelOverride:    record.ModelOverride,
-		ModelOverrideMap: modelOverrideRulesToMap(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
+		ModelOverrideMap: store.DecodeModelOverrideRules(record.ModelOverrideMap),
 		LogCommunication: record.LogCommunication,
 		Secret:           record.Secret,
 	}

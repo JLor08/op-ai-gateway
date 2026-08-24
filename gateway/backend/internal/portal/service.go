@@ -752,13 +752,16 @@ type TokenDTO struct {
 	LastUsedAt    *time.Time `json:"last_used_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ModelOverride string     `json:"model_override"`
-	// ModelOverrideMap maps a requested model name -> the gateway model to use
-	// (takes precedence over ModelOverride, which is the catch-all). Empty = none.
-	ModelOverrideMap map[string]string `json:"model_override_map,omitempty"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
-	IsChatSession    bool              `json:"is_chat_session"`
-	Deletable        bool              `json:"deletable"`
+	// ModelOverrideMap maps a requested model name -> the rule for it (takes
+	// precedence over ModelOverride, which is the catch-all). Empty = none. The
+	// wire shape of a row is the object {"to","offer","hide_target"}: the two
+	// listing switches are part of the row, so a client that reads a token and
+	// writes it back preserves them instead of silently clearing them.
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
+	IsChatSession    bool                               `json:"is_chat_session"`
+	Deletable        bool                               `json:"deletable"`
 	// ProjectID/ProjectName is the project this token is attributed to for
 	// usage attribution ("" = none). ProjectName is resolved for display and
 	// is empty whenever ProjectID is empty or the project no longer exists.
@@ -774,6 +777,22 @@ type TokenDTO struct {
 	// server; it is always false whenever ServerOverride is "".
 	ServerOverride                 string `json:"server_override,omitempty"`
 	ServerOverrideForceUnreachable bool   `json:"server_override_force_unreachable,omitempty"`
+	// LastUsedModel is the gateway model or group name this token last routed a
+	// request to successfully. READ-ONLY over this API: it is written by the
+	// inference path alone and appears on no request type. It is the unknown-
+	// model redirect's first target, so a writable marker would hand a client
+	// control over where its own unknown requests go.
+	LastUsedModel string `json:"last_used_model,omitempty"`
+	// UnknownModelRedirect turns the unknown-model redirect on: a requested
+	// model this token cannot route to is served by LastUsedModel, or else by
+	// UnknownModelFallback, instead of failing. UnknownModelRedirectBlocked
+	// widens "unknown" from "does not exist at all" to "exists but this token
+	// cannot call it". UnknownModelFallback is the model or group used when the
+	// marker is empty or no longer routable. Both sub-settings are always
+	// off/empty whenever UnknownModelRedirect is false.
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
 }
 
 type TokenListResponse struct {
@@ -781,13 +800,13 @@ type TokenListResponse struct {
 }
 
 type CreateTokenRequest struct {
-	Name             string            `json:"name"`
-	Scopes           []string          `json:"scopes"`
-	ExpiresAt        *time.Time        `json:"expires_at"`
-	ModelOverride    string            `json:"model_override"`
-	ModelOverrideMap map[string]string `json:"model_override_map"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
+	Name             string                             `json:"name"`
+	Scopes           []string                           `json:"scopes"`
+	ExpiresAt        *time.Time                         `json:"expires_at"`
+	ModelOverride    string                             `json:"model_override"`
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
 	// ProjectID optionally attributes the token to a project the owner is a
 	// member of ("" = none). Enforced by CreateToken via isProjectMember.
 	ProjectID string `json:"project_id"`
@@ -797,6 +816,15 @@ type CreateTokenRequest struct {
 	// ignored (persisted as false) whenever the resulting override is "".
 	ServerOverride                 string `json:"server_override"`
 	ServerOverrideForceUnreachable bool   `json:"server_override_force_unreachable"`
+	// UnknownModelRedirect and its two sub-settings — see TokenDTO. There is
+	// deliberately NO last_used_model here: the marker is written by the
+	// inference path only. Both sub-settings are ignored (persisted off/empty)
+	// whenever UnknownModelRedirect is false, and a non-empty
+	// UnknownModelFallback must name a model or group this owner can route to
+	// directly, else ErrTokenModelOverrideInvalid.
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked"`
+	UnknownModelFallback        string `json:"unknown_model_fallback"`
 }
 
 type CreateTokenResponse struct {
@@ -805,13 +833,13 @@ type CreateTokenResponse struct {
 }
 
 type UpdateTokenRequest struct {
-	Name             *string            `json:"name,omitempty"`
-	Scopes           *[]string          `json:"scopes,omitempty"`
-	Status           *string            `json:"status,omitempty"`
-	ModelOverride    *string            `json:"model_override,omitempty"`
-	ModelOverrideMap *map[string]string `json:"model_override_map,omitempty"`
-	LogCommunication *bool              `json:"log_communication,omitempty"`
-	Secret           *bool              `json:"secret,omitempty"`
+	Name             *string                             `json:"name,omitempty"`
+	Scopes           *[]string                           `json:"scopes,omitempty"`
+	Status           *string                             `json:"status,omitempty"`
+	ModelOverride    *string                             `json:"model_override,omitempty"`
+	ModelOverrideMap *map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication *bool                               `json:"log_communication,omitempty"`
+	Secret           *bool                               `json:"secret,omitempty"`
 	// ProjectID: nil = keep the current project attribution, "" = clear it
 	// (always allowed), a non-empty id = re-attribute (membership-checked via
 	// isProjectMember, like CreateToken).
@@ -822,6 +850,15 @@ type UpdateTokenRequest struct {
 	// rejected). ServerOverrideForceUnreachable: nil = keep the current value.
 	ServerOverride                 *string `json:"server_override,omitempty"`
 	ServerOverrideForceUnreachable *bool   `json:"server_override_force_unreachable,omitempty"`
+	// The three unknown-model-redirect settings: nil = keep the current value.
+	// They are validated TOGETHER (see UpdateToken), because each one alone can
+	// invalidate the other two. There is deliberately no last_used_model field:
+	// the marker is the redirect's target, and a client able to set it would
+	// choose where its own unknown requests go — it is written by the inference
+	// path alone.
+	UnknownModelRedirect        *bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked *bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        *string `json:"unknown_model_fallback,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1178,11 +1215,18 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 	if taken {
 		return CreateTokenResponse{}, ErrTokenNameConflict
 	}
-	override, err := s.validateModelOverride(ctx, owner, req.ModelOverride)
+	// One offering lookup feeds all three model-valued settings below.
+	callable := s.callableModelNames(ctx, owner)
+	override, err := validateModelOverride(callable, req.ModelOverride)
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
-	overrideMap, err := s.validateModelOverrideMap(ctx, owner, req.ModelOverrideMap)
+	overrideRules, err := validateModelOverrideRules(callable, req.ModelOverrideMap)
+	if err != nil {
+		return CreateTokenResponse{}, err
+	}
+	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
+		callable, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
@@ -1211,12 +1255,17 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		CreatedAt:                      now,
 		UpdatedAt:                      now,
 		ModelOverride:                  override,
-		ModelOverrideMap:               store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap)),
+		ModelOverrideMap:               store.EncodeModelOverrideRules(overrideRules),
 		LogCommunication:               req.LogCommunication,
 		Secret:                         req.Secret,
 		ProjectID:                      projectID,
 		ServerOverride:                 serverOverride,
 		ServerOverrideForceUnreachable: serverOverrideForce,
+		// LastUsedModel is deliberately absent: a fresh token has never routed
+		// anything, and only the inference path ever writes the marker.
+		UnknownModelRedirect:        redirect,
+		UnknownModelRedirectBlocked: redirectBlocked,
+		UnknownModelFallback:        fallback,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1269,19 +1318,30 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		}
 		record.Status = status
 	}
+	// The callable-name set every model-valued setting below is checked against
+	// is built at most ONCE per update, and only when the request actually
+	// touches one of them — an update about something else costs no offering
+	// lookup at all.
+	var callableSet map[string]struct{}
+	callable := func() map[string]struct{} {
+		if callableSet == nil {
+			callableSet = s.callableModelNames(ctx, owner)
+		}
+		return callableSet
+	}
 	if req.ModelOverride != nil {
-		override, err := s.validateModelOverride(ctx, owner, *req.ModelOverride)
+		override, err := validateModelOverride(callable(), *req.ModelOverride)
 		if err != nil {
 			return TokenDTO{}, err
 		}
 		record.ModelOverride = override
 	}
 	if req.ModelOverrideMap != nil {
-		overrideMap, err := s.validateModelOverrideMap(ctx, owner, *req.ModelOverrideMap)
+		overrideRules, err := validateModelOverrideRules(callable(), *req.ModelOverrideMap)
 		if err != nil {
 			return TokenDTO{}, err
 		}
-		record.ModelOverrideMap = store.EncodeModelOverrideRules(modelOverrideMapToRules(overrideMap))
+		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
 	}
 	if req.LogCommunication != nil {
 		record.LogCommunication = *req.LogCommunication
@@ -1314,6 +1374,38 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	record.ServerOverride = s.validateServerOverride(ctx, owner, record.ServerOverride)
 	if record.ServerOverride == "" {
 		record.ServerOverrideForceUnreachable = false
+	}
+	// The three unknown-model-redirect settings are validated as ONE unit
+	// whenever the request touches ANY of them, against the values this update
+	// leaves them at: each one can invalidate the other two (switching the
+	// redirect off clears both sub-settings), so validating them individually
+	// would let an inconsistent combination through. Untouched, they are left
+	// exactly as stored — nil means unchanged here as everywhere else, and no
+	// re-validation is needed for them either, because an unroutable fallback
+	// is inert (the redirect re-checks every candidate per request) rather than
+	// dangerous the way a stale server override is.
+	//
+	// record.LastUsedModel is never assigned anywhere in this method: it is
+	// carried through from the record just read, so an update can neither set
+	// nor clear the redirect's own target.
+	if req.UnknownModelRedirect != nil || req.UnknownModelRedirectBlocked != nil || req.UnknownModelFallback != nil {
+		on, blocked, fallback := record.UnknownModelRedirect, record.UnknownModelRedirectBlocked, record.UnknownModelFallback
+		if req.UnknownModelRedirect != nil {
+			on = *req.UnknownModelRedirect
+		}
+		if req.UnknownModelRedirectBlocked != nil {
+			blocked = *req.UnknownModelRedirectBlocked
+		}
+		if req.UnknownModelFallback != nil {
+			fallback = *req.UnknownModelFallback
+		}
+		on, blocked, fallback, err := validateUnknownModelRedirect(callable(), on, blocked, fallback)
+		if err != nil {
+			return TokenDTO{}, err
+		}
+		record.UnknownModelRedirect = on
+		record.UnknownModelRedirectBlocked = blocked
+		record.UnknownModelFallback = fallback
 	}
 	record.UpdatedAt = s.clock().UTC()
 	if err := s.tokens.UpdateTokenMetadata(ctx, record); err != nil {
@@ -1382,50 +1474,85 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 	return false, nil
 }
 
+// callableModelNames is the set of names the owner can route to DIRECTLY,
+// unioned over every API flavor: every model-valued token setting (the
+// catch-all override, each rule's target, the redirect's fallback) is checked
+// against this one set, so the three can never drift apart.
+//
+// Callable, not Offered, and not Existing — the distinction is the whole point
+// (see ModelOffering):
+//
+//   - Offered is the LISTING set. It CONTAINS the token's own offered override
+//     ALIASES, which are not routable names at all: an override alias is
+//     rewritten before routing, so accepting one as a fallback would store a
+//     setting the redirect can never act on. It also LOSES the model_settings
+//     "hidden" names, which route perfectly well under their own name.
+//   - Existing ignores per-token reach entirely — it answers "does this name
+//     exist anywhere", not "can this owner use it".
+//   - Callable is exactly "a direct request for this name can succeed": the
+//     same per-token reachability as the listing, minus the "locked"
+//     (group-only) names, which a direct request cannot route to, plus the
+//     merely-hidden ones, which it can.
+//
+// Both flavors count: a name valid for only one of them is still a valid
+// setting, and every consumer re-checks the flavor per request. Groups share
+// the model namespace and are therefore included by the same lookup.
+//
+// The set is built ONCE per create/update and passed to each validator, rather
+// than rebuilt per entry: it costs one mapping traversal plus one group-overlay
+// load per flavor.
+func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, flavor := range knownAPIFlavors {
+		for name := range s.ModelOfferingFor(ctx, owner, flavor).Callable {
+			out[name] = struct{}{}
+		}
+	}
+	return out
+}
+
 // validateModelOverride trims the requested override and, when non-empty,
-// requires it to be a currently-active gateway model. Empty = override off.
-func (s *Service) validateModelOverride(ctx context.Context, owner auth.Token, model string) (string, error) {
+// requires it to be a name the owner can route to directly (callable). Empty =
+// override off.
+func validateModelOverride(callable map[string]struct{}, model string) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", nil
 	}
-	for _, m := range s.Models(ctx, owner).Data {
-		if m.ID == model {
-			return model, nil
-		}
+	if _, ok := callable[model]; !ok {
+		return "", ErrTokenModelOverrideInvalid
 	}
-	return "", ErrTokenModelOverrideInvalid
+	return model, nil
 }
 
-// validateModelOverrideMap trims and validates a per-requested-model override map:
-// each entry's requested-model KEY is free text (arbitrary client model name, only
-// required to be non-empty), and each VALUE must be a currently-active gateway
-// model (like the catch-all). Fully-empty rows are dropped; a row with only one
-// side filled, or a value that is not a known model, is rejected with
-// ErrTokenModelOverrideInvalid. Returns nil for an empty/all-dropped map. The
-// active-model set is fetched once (not per entry).
-func (s *Service) validateModelOverrideMap(ctx context.Context, owner auth.Token, raw map[string]string) (map[string]string, error) {
+// validateModelOverrideRules trims and validates a per-requested-model override
+// map: each entry's requested-model KEY is free text (arbitrary client model
+// name, only required to be non-empty), and each row's TARGET must be a name
+// the owner can route to directly (like the catch-all). The two listing
+// switches are carried through UNCHANGED — they are a display concern and
+// constrain nothing, so no row is ever complete or incomplete because of them.
+// Fully-empty rows are dropped; a row with only one side filled, or a target
+// that is not callable, is rejected with ErrTokenModelOverrideInvalid. Returns
+// nil for an empty/all-dropped map.
+func validateModelOverrideRules(callable map[string]struct{}, raw map[string]store.ModelOverrideRule) (map[string]store.ModelOverrideRule, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	known := make(map[string]struct{})
-	for _, m := range s.Models(ctx, owner).Data {
-		known[m.ID] = struct{}{}
-	}
-	out := make(map[string]string, len(raw))
-	for k, v := range raw {
+	out := make(map[string]store.ModelOverrideRule, len(raw))
+	for k, rule := range raw {
 		key := strings.TrimSpace(k)
-		val := strings.TrimSpace(v)
+		val := strings.TrimSpace(rule.To)
 		if key == "" && val == "" {
 			continue // fully-empty row: drop
 		}
 		if key == "" || val == "" {
 			return nil, ErrTokenModelOverrideInvalid // half-filled row
 		}
-		if _, ok := known[val]; !ok {
-			return nil, ErrTokenModelOverrideInvalid // target must be an active gateway model
+		if _, ok := callable[val]; !ok {
+			return nil, ErrTokenModelOverrideInvalid // target must be routable
 		}
-		out[key] = val
+		rule.To = val
+		out[key] = rule
 	}
 	if len(out) == 0 {
 		return nil, nil
@@ -1433,36 +1560,34 @@ func (s *Service) validateModelOverrideMap(ctx context.Context, owner auth.Token
 	return out, nil
 }
 
-// modelOverrideMapToRules mechanically lifts a validated requested->model DTO
-// map into the rules codec (Task 1's store.ModelOverrideRule), so it can be
-// persisted via store.EncodeModelOverrideRules: each entry becomes a rule with
-// only To set (Offer/HideTarget false) — the DTO wire format itself is
-// untouched by this task, a later task owns exposing the two listing switches
-// on it. nil in, nil out.
-func modelOverrideMapToRules(m map[string]string) map[string]store.ModelOverrideRule {
-	if len(m) == 0 {
-		return nil
+// validateUnknownModelRedirect normalizes the three redirect settings as ONE
+// unit, because each of them can invalidate the other two.
+//
+// The two sub-settings are cleared whenever the redirect itself is off: storing
+// a fallback that cannot apply invites the reading "it is configured, so it
+// works". Mirrors ServerOverrideForceUnreachable against ServerOverride.
+//
+// A non-empty fallback is trimmed and must be a model or group the owner can
+// actually route to — the same rule and the same error as an override target,
+// because it is the same kind of value: a name the gateway will route to on the
+// client's behalf. It is checked against the CALLABLE set specifically; see
+// callableModelNames for why neither of the other two sets would do.
+//
+// The check is a configuration-time guard, not an enforcement point: the
+// redirect re-checks its candidates against the live offering on every request,
+// so a fallback that goes stale later is inert rather than dangerous.
+func validateUnknownModelRedirect(callable map[string]struct{}, on, blocked bool, fallback string) (bool, bool, string, error) {
+	if !on {
+		return false, false, "", nil
 	}
-	out := make(map[string]store.ModelOverrideRule, len(m))
-	for k, v := range m {
-		out[k] = store.ModelOverrideRule{To: v}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return true, blocked, "", nil
 	}
-	return out
-}
-
-// modelOverrideRulesToMap mechanically projects decoded rules back down to the
-// DTO's requested->model map (rule.To only, dropping Offer/HideTarget) — the
-// inverse of modelOverrideMapToRules, used wherever a TokenDTO/ServiceTokenDTO
-// is rendered. nil in, nil out.
-func modelOverrideRulesToMap(rules map[string]store.ModelOverrideRule) map[string]string {
-	if len(rules) == 0 {
-		return nil
+	if _, ok := callable[fallback]; !ok {
+		return false, false, "", ErrTokenModelOverrideInvalid
 	}
-	out := make(map[string]string, len(rules))
-	for k, rule := range rules {
-		out[k] = rule.To
-	}
-	return out
+	return true, blocked, fallback, nil
 }
 
 func validateTokenScopes(owner auth.Token, requested []string) ([]string, error) {
@@ -3583,7 +3708,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		LastUsedAt:                     record.LastUsedAt,
 		CreatedAt:                      record.CreatedAt,
 		ModelOverride:                  record.ModelOverride,
-		ModelOverrideMap:               modelOverrideRulesToMap(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
+		ModelOverrideMap:               store.DecodeModelOverrideRules(record.ModelOverrideMap),
 		LogCommunication:               record.LogCommunication,
 		Secret:                         record.Secret,
 		IsChatSession:                  false,
@@ -3592,6 +3717,10 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ProjectName:                    s.resolveProjectName(ctx, record.ProjectID),
 		ServerOverride:                 record.ServerOverride,
 		ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable,
+		LastUsedModel:                  record.LastUsedModel,
+		UnknownModelRedirect:           record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           record.UnknownModelFallback,
 	}
 }
 
