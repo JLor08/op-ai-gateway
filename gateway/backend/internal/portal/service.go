@@ -3114,11 +3114,30 @@ func isKnownAPIFlavor(flavor string) bool {
 // per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the portal
 // Models() overview builds its own view via modelsResponse.
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
+	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
+	return sets, err
+}
+
+// modelFlavorSetsWithPreSuppress is modelFlavorSets plus the second map its
+// override-alias overlay needs: preSuppress, the same per-name flavor map taken
+// BEFORE the hidden/locked names were dropped (and carrying every active group
+// regardless of the group name's own visibility).
+//
+// The overlay reads flavors from preSuppress on purpose: a target suppressed by
+// model_settings is not listed under its own name but stays callable, and an
+// explicitly offered alias is a DIFFERENT name that does not reveal it — so the
+// alias must still be able to inherit that target's flavors. See
+// applyOverrideAliases in service_model_offering.go.
+//
+// preSuppress is a listing-composition input only. It is never returned to a
+// caller as an offering: everything a principal may not see under
+// visibleMappingViews is already absent from it.
+func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	sets := make(map[string]map[string]struct{})
+	sets = make(map[string]map[string]struct{})
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
 		if _, ok := sets[name]; !ok {
@@ -3130,6 +3149,10 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 			}
 		}
 	}
+	preSuppress = make(map[string]map[string]struct{}, len(sets))
+	for name, flavors := range sets {
+		preSuppress[name] = flavors
+	}
 	// Model-group offering overlay (spec §4a/§4b): add active groups (flavor
 	// union) and drop hidden/locked models, so /v1/models + per-flavor discovery
 	// include groups and hide non-shown models. This is ALWAYS the inference list,
@@ -3140,13 +3163,20 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 			delete(sets, name)
 		}
 		for _, e := range entries {
+			// A group name is an override target like any model name, so it
+			// belongs in preSuppress even when the group itself is not offered.
+			preSuppress[e.Name] = e.Flavors
 			if e.Visibility != "shown" {
 				continue
 			}
 			sets[e.Name] = e.Flavors
 		}
 	}
-	return sets, nil
+	// Per-token override aliases (offered requested names + hidden targets).
+	// Last, so it overlays the finished listing: a name the token explicitly
+	// offers survives the group/visibility suppression above.
+	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
+	return sets, preSuppress, nil
 }
 
 // modelVisibilityByLower returns every model_settings row's visibility keyed
