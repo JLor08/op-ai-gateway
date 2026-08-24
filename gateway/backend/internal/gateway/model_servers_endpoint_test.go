@@ -15,6 +15,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"sync"
 	"testing"
 	"time"
 )
@@ -33,6 +34,14 @@ const (
 // server's registry both fires the SSE change broker and is visible to the
 // recompute. It seeds one active server / application / mapping offering msModel.
 func newModelServersEndpointFixture(t *testing.T) (*Server, *LoadedModelRegistry) {
+	t.Helper()
+	return newModelServersEndpointFixtureWrapped(t, func(st routing.Store) routing.Store { return st })
+}
+
+// newModelServersEndpointFixtureWrapped is newModelServersEndpointFixture with a
+// hook around the routing store, so a test can gate a store read and thereby
+// control exactly when the SSE handler is inside its snapshot computation.
+func newModelServersEndpointFixtureWrapped(t *testing.T, wrapRoutes func(routing.Store) routing.Store) (*Server, *LoadedModelRegistry) {
 	t.Helper()
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -54,11 +63,12 @@ func newModelServersEndpointFixture(t *testing.T) (*Server, *LoadedModelRegistry
 	}
 	reg := NewLoadedModelRegistry()
 	recorder := usage.NewRecorder()
-	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, LoadedModels: reg})
+	routes := wrapRoutes(routeStore)
+	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routes, LoadedModels: reg})
 	s := New(ServerDeps{
 		Tokens:       tokens,
 		Usage:        recorder,
-		Routes:       routeStore,
+		Routes:       routes,
 		Portal:       svc,
 		LoadedModels: reg,
 	})
@@ -220,6 +230,106 @@ func TestModelServersEndpointEventsRequiresAuth(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct == "text/event-stream" {
 		t.Fatalf("auth gate must run before the SSE stream opens, got Content-Type %q", ct)
+	}
+}
+
+// gatedRoutes blocks the FIRST routing-store read until released, so a test can
+// hold the SSE handler inside its snapshot computation and act in that window.
+// Every later read passes straight through (release is closed, not drained).
+type gatedRoutes struct {
+	routing.Store
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedRoutes) AIServers(ctx context.Context) ([]routing.AIServer, error) {
+	g.once.Do(func() { close(g.entered) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+	}
+	return g.Store.AIServers(ctx)
+}
+
+// TestModelServersEndpointEventsChangeDuringSnapshotStillArrives pins the
+// subscribe/snapshot ORDER, which is what makes this endpoint's delivery
+// guarantee real rather than timing-dependent.
+//
+// The registry's Subscribe documents "no change is fully lost" — but that only
+// holds from the moment a subscription exists. If the handler computed and
+// flushed its snapshot BEFORE subscribing, any loaded-state change in that
+// window reached no subscriber at all and was dropped: the client then sat on a
+// stale row until some later change, or the 25s heartbeat. That is also what
+// made TestModelServersEndpointEventsSnapshotThenUpdate flaky on CI ("timed out
+// after 3s waiting for an SSE frame") — the same window, hit by chance under
+// load rather than on purpose.
+//
+// Here the window is made deterministic: the store read inside the snapshot
+// computation is gated, the change fires while the handler is parked in it, and
+// the update frame must still arrive afterwards.
+func TestModelServersEndpointEventsChangeDuringSnapshotStillArrives(t *testing.T) {
+	gate := &gatedRoutes{entered: make(chan struct{}), release: make(chan struct{})}
+	s, reg := newModelServersEndpointFixtureWrapped(t, func(st routing.Store) routing.Store {
+		gate.Store = st
+		return gate
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/portal/model-servers/events?name="+url.QueryEscape(msModel), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, rErr := http.DefaultClient.Do(req)
+		done <- result{resp, rErr}
+	}()
+
+	// The handler is now parked inside its snapshot computation: it has neither
+	// written the snapshot nor (with the ordering fixed) missed anything.
+	select {
+	case <-gate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler never reached the gated store read")
+	}
+	reg.SetGatewayProbe(msAppID, []string{msAppModel})
+	close(gate.release)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("Do: %v", got.err)
+	}
+	defer got.resp.Body.Close()
+	if got.resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", got.resp.StatusCode)
+	}
+	reader := bufio.NewReader(got.resp.Body)
+
+	if event, _ := readPerfSSEFrame(t, reader, 3*time.Second); event != "snapshot" {
+		t.Fatalf("first event = %q, want snapshot", event)
+	}
+	// The change fired before any subscription could exist under the old
+	// ordering; with subscribe-first it is buffered and delivered here.
+	event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+	if event != "update" {
+		t.Fatalf("second event = %q, want update (a change during the snapshot must not be dropped)", event)
+	}
+	var upd struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(data), &upd); err != nil {
+		t.Fatalf("unmarshal update: %v (%s)", err, data)
+	}
+	if len(upd.Data) != 1 || !upd.Data[0].Loaded {
+		t.Fatalf("update data = %+v, want one loaded row", upd.Data)
 	}
 }
 

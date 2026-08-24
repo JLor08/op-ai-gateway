@@ -129,12 +129,19 @@ func (s *Server) handlePortalModelServersEvents(w http.ResponseWriter, r *http.R
 		}
 		return rows
 	}
+	// Subscribe BEFORE the snapshot, not after. The registry's channel is
+	// buffered(1) and coalescing, so a change landing while the snapshot is
+	// being computed and flushed is retained and delivered as the first update
+	// (at worst a redundant one carrying the same data). Subscribing afterwards
+	// left a window in which a change reached no subscriber and was dropped
+	// entirely, leaving the client on a stale row until the next change or the
+	// 25s heartbeat.
+	changed, unsub := s.LoadedModels.Subscribe()
+	defer unsub()
+
 	if !writePerfEvent(w, flusher, "snapshot", map[string]any{"data": compute()}) {
 		return
 	}
-
-	changed, unsub := s.LoadedModels.Subscribe()
-	defer unsub()
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
 	ctx := r.Context()
