@@ -933,7 +933,12 @@ const modeClimbUp = "climb_up"
 // have live, otherwise-routable mappings which the floor rules out is memberUnavailable
 // — it is gated by speed, exactly like a down/busy/non-viable candidate, not "unknown".
 // Conflating the two would misreport a too-slow-but-real member as ErrNoModelRoute.
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, minTPS float64) (MappingCandidate, memberStatus, []string, int, error) {
+//
+// loadedOnly runs AFTER the floor, same reasoning: it never turns a genuinely unknown
+// member into memberNoMapping, only a live-but-gated one into memberUnavailable. It is a
+// no-op when r.loaded is nil (unknown loaded state excludes nothing, so a group without a
+// wired checker never becomes a dead end from this filter alone).
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, minTPS float64, loadedOnly bool) (MappingCandidate, memberStatus, []string, int, error) {
 	cands, err := r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, fmt.Errorf("resolve member mappings: %w", err)
@@ -953,6 +958,18 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 				return MappingCandidate{}, memberUnavailable, nil, 0, tErr
 			}
 			if tps >= minTPS {
+				kept = append(kept, c)
+			}
+		}
+		cands = kept
+		if len(cands) == 0 {
+			return MappingCandidate{}, memberUnavailable, nil, 0, nil
+		}
+	}
+	if loadedOnly && r.loaded != nil {
+		kept := make([]MappingCandidate, 0, len(cands))
+		for _, c := range cands {
+			if modelLoadedOn(r.loaded, c) {
 				kept = append(kept, c)
 			}
 		}
@@ -982,12 +999,12 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
 // store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, minTPS float64) (string, MappingCandidate, []string, int, bool, error) {
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, minTPS float64, loadedOnly bool) (string, MappingCandidate, []string, int, bool, error) {
 	var atCap []string
 	queueTimeoutSecs := 0
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, minTPS)
+		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, minTPS, loadedOnly)
 		if err != nil {
 			return "", MappingCandidate{}, nil, 0, false, err
 		}
@@ -1064,7 +1081,11 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 // caller still sees ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
 func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
 	attempts := []GroupPolicy{policy}
-	// (a later relaxation stage is inserted here, ahead of the speed-floor one below.)
+	if policy.LoadedOnly {
+		relaxed := policy
+		relaxed.LoadedOnly = false
+		attempts = append(attempts, relaxed) // keeps MinTokensPerSecond as-is
+	}
 	if policy.MinTokensPerSecond > 0 && policy.MinSpeedFallback == MinSpeedFallbackIgnore {
 		relaxed := policy
 		relaxed.MinTokensPerSecond = 0
@@ -1122,7 +1143,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 	// available. A pin that is down or at-capacity falls straight through to the walk (an
 	// immediate fall-DOWN, even to a cold member — the intended asymmetry, no warm).
 	if pinned := r.groupPin(ctx, key, members, now); pinned != "" {
-		pinSel, pinStatus, _, _, err := r.selectMember(ctx, token, pinned, apiFlavor, req, now, policy.MinTokensPerSecond)
+		pinSel, pinStatus, _, _, err := r.selectMember(ctx, token, pinned, apiFlavor, req, now, policy.MinTokensPerSecond, policy.LoadedOnly)
 		if err != nil {
 			return Target{}, err
 		}
@@ -1131,7 +1152,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 				// Is a higher-priority member available? The pin is memberOK, so firstAvailable
 				// stops at-or-before it in the priority order → best index <= pin index (the
 				// memberIndex guard below is belt-and-suspenders for that invariant).
-				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond)
+				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond, policy.LoadedOnly)
 				if ferr != nil {
 					return Target{}, ferr
 				}
@@ -1139,7 +1160,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 					if r.memberLoaded(bestSel) {
 						return serve(best, bestSel) // CLIMB: the better member is already loaded
 					}
-					if r.warmer != nil {
+					if r.warmer != nil && !policy.LoadedOnly {
 						r.warmer.Warm(ctx, best) // load-ahead (non-blocking); keep serving the pin this turn
 					}
 					// Fall through to serve the pin below; a later turn climbs once best is loaded.
@@ -1157,7 +1178,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond)
+		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond, policy.LoadedOnly)
 		if err != nil {
 			return Target{}, err
 		}
