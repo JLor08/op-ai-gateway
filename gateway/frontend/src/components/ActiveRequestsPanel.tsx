@@ -50,7 +50,8 @@ export function ActiveRequestsPanel({
   const now = Date.now();
   const activeShowOwner = effectiveScope === 'all';
   // Running-connections table columns (client-side ListTable; live from `active`).
-  // Default order: Benutzer, Token, Model, Pfad, Server, Stream, Laufzeit. Owner
+  // Default order: Benutzer, Token, Angefragt, Model, Pfad, Server, Stream,
+  // Laufzeit. Owner
   // is scope-gated via `available`. Laufzeit is derived (re-rendered each 1s tick).
   const activeColumns: ListColumn<ActiveRequest>[] = [
     {
@@ -76,6 +77,17 @@ export function ActiveRequestsPanel({
       value: (a) => a.service_name || '',
       filter: 'text',
       defaultHidden: true,
+    },
+    // The model the client asked for before a token override rewrote it.
+    // Visible by default, like its counterpart in the completed-requests table:
+    // seeing it without waiting for the request to finish is the whole point of
+    // carrying it here. Empty only on the paths that never resolved a model.
+    {
+      id: 'requested_model',
+      label: t.tableRequestedModel,
+      value: (a) => a.requested_model,
+      render: (a) => a.requested_model || '-',
+      filter: 'text',
     },
     { id: 'model', label: t.tableModel, value: (a) => a.model, filter: 'text' },
     { id: 'req_path', label: t.activityColPath, value: (a) => a.req_path, filter: 'text' },

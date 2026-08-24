@@ -204,7 +204,7 @@ func TestPortalUsageActiveScopeAndShape(t *testing.T) {
 	base := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	// Seed out of chronological order so the ascending sort is actually exercised.
 	srv.Active.Add(ActiveRequest{ID: "req_other", UserID: "usr_other", TokenID: "tok_o", TokenName: "Other", Model: "m2", APIFlavor: "openai", ReqPath: "/v1/chat/completions", Stream: true, StartedAt: base.Add(2 * time.Second)})
-	srv.Active.Add(ActiveRequest{ID: "req_owner", UserID: "usr_owner", TokenID: "tok_w", TokenName: "Mine", ServerName: "srv-mine", Model: "m1", APIFlavor: "anthropic", ReqPath: "/v1/messages", ProviderPath: "/v1/chat/completions", ProviderModel: "upstream-m1", Stream: false, StartedAt: base.Add(1 * time.Second)})
+	srv.Active.Add(ActiveRequest{ID: "req_owner", UserID: "usr_owner", TokenID: "tok_w", TokenName: "Mine", ServerName: "srv-mine", Model: "m1", RequestedModel: "client-m1", APIFlavor: "anthropic", ReqPath: "/v1/messages", ProviderPath: "/v1/chat/completions", ProviderModel: "upstream-m1", Stream: false, StartedAt: base.Add(1 * time.Second)})
 
 	ownerCookie := loginCookie(t, srv, "owner@example.test", "password-1")
 	admCookie := loginCookie(t, srv, "adm@example.test", "password-1")
@@ -238,7 +238,7 @@ func TestPortalUsageActiveScopeAndShape(t *testing.T) {
 	got := all[0]
 	want := activeRequestDTO{
 		ID: "req_owner", UserID: "usr_owner", UserName: "usr_owner", TokenID: "tok_w", TokenName: "Mine",
-		ServerName: "srv-mine", Model: "m1", APIFlavor: "anthropic", ReqPath: "/v1/messages",
+		ServerName: "srv-mine", Model: "m1", RequestedModel: "client-m1", APIFlavor: "anthropic", ReqPath: "/v1/messages",
 		ProviderPath: "/v1/chat/completions", ProviderModel: "upstream-m1", Stream: false,
 		StartedAt: base.Add(time.Second).Format(time.RFC3339),
 	}

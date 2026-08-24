@@ -31,8 +31,13 @@ type ActiveRequest struct {
 	ServerName  string
 	ServerID    string // resolved routing target server id (swap-protection key)
 	Model       string
-	APIFlavor   string
-	ReqPath     string
+	// RequestedModel is the model name as the client sent it, BEFORE a token
+	// model override rewrote Model; equal to Model when no override fired.
+	// Mirrors the usage event's requested_model so the live view and the
+	// persisted row show the same pair of names.
+	RequestedModel string
+	APIFlavor      string
+	ReqPath        string
 	// ProviderPath is the upstream endpoint path this request is calling (the
 	// built-in translation's chat-completions path, or the native passthrough path);
 	// it differs from ReqPath exactly when translation is happening.
@@ -165,24 +170,25 @@ func (a *activeRegistry) Snapshot() []ActiveRequest {
 
 // activeRequestDTO is the JSON shape returned by GET /api/portal/usage/active.
 type activeRequestDTO struct {
-	ID            string `json:"id"`
-	UserID        string `json:"user_id"`
-	UserName      string `json:"user_name"`
-	TokenID       string `json:"token_id"`
-	TokenName     string `json:"token_name"`
-	ServiceID     string `json:"service_id"`
-	ServiceName   string `json:"service_name"`
-	ServerName    string `json:"server_name"`
-	Model         string `json:"model"`
-	APIFlavor     string `json:"api_flavor"`
-	ReqPath       string `json:"req_path"`
-	ProviderPath  string `json:"provider_path"`
-	ProviderModel string `json:"provider_model"`
-	SessionID     string `json:"session_id"`
-	SessionSource string `json:"session_source"`
-	AgentID       string `json:"agent_id"`
-	Stream        bool   `json:"stream"`
-	StartedAt     string `json:"started_at"`
+	ID             string `json:"id"`
+	UserID         string `json:"user_id"`
+	UserName       string `json:"user_name"`
+	TokenID        string `json:"token_id"`
+	TokenName      string `json:"token_name"`
+	ServiceID      string `json:"service_id"`
+	ServiceName    string `json:"service_name"`
+	ServerName     string `json:"server_name"`
+	Model          string `json:"model"`
+	RequestedModel string `json:"requested_model"`
+	APIFlavor      string `json:"api_flavor"`
+	ReqPath        string `json:"req_path"`
+	ProviderPath   string `json:"provider_path"`
+	ProviderModel  string `json:"provider_model"`
+	SessionID      string `json:"session_id"`
+	SessionSource  string `json:"session_source"`
+	AgentID        string `json:"agent_id"`
+	Stream         bool   `json:"stream"`
+	StartedAt      string `json:"started_at"`
 }
 
 // handlePortalUsageActive returns the in-flight requests visible to the caller.
@@ -248,24 +254,25 @@ func (s *Server) handlePortalUsageActive(w http.ResponseWriter, r *http.Request)
 	dtos := make([]activeRequestDTO, 0, len(filtered))
 	for _, row := range filtered {
 		dtos = append(dtos, activeRequestDTO{
-			ID:            row.ID,
-			UserID:        row.UserID,
-			UserName:      names[row.UserID],
-			TokenID:       row.TokenID,
-			TokenName:     row.TokenName,
-			ServiceID:     row.ServiceID,
-			ServiceName:   row.ServiceName,
-			ServerName:    row.ServerName,
-			Model:         row.Model,
-			APIFlavor:     row.APIFlavor,
-			ReqPath:       row.ReqPath,
-			ProviderPath:  row.ProviderPath,
-			ProviderModel: row.ProviderModel,
-			SessionID:     row.SessionID,
-			SessionSource: row.SessionSource,
-			AgentID:       row.AgentID,
-			Stream:        row.Stream,
-			StartedAt:     row.StartedAt.UTC().Format(time.RFC3339),
+			ID:             row.ID,
+			UserID:         row.UserID,
+			UserName:       names[row.UserID],
+			TokenID:        row.TokenID,
+			TokenName:      row.TokenName,
+			ServiceID:      row.ServiceID,
+			ServiceName:    row.ServiceName,
+			ServerName:     row.ServerName,
+			Model:          row.Model,
+			RequestedModel: row.RequestedModel,
+			APIFlavor:      row.APIFlavor,
+			ReqPath:        row.ReqPath,
+			ProviderPath:   row.ProviderPath,
+			ProviderModel:  row.ProviderModel,
+			SessionID:      row.SessionID,
+			SessionSource:  row.SessionSource,
+			AgentID:        row.AgentID,
+			Stream:         row.Stream,
+			StartedAt:      row.StartedAt.UTC().Format(time.RFC3339),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": dtos})
