@@ -16,9 +16,12 @@ import (
 
 // CreateModelGroup inserts a new model group. A duplicate id classifies as
 // ErrConflict. An empty FailoverMode defaults to "sticky" (mirrors the column
-// default so a caller that omits it reads back the same value). MemberOrder,
-// ClimbSpeedMarginPercent and MinSpeedFallback are defaulted the same way
-// (their zero Go values do not all match the column defaults).
+// default so a caller that omits it reads back the same value). MemberOrder
+// and MinSpeedFallback are defaulted the same way (their zero Go values do
+// not match the column defaults). ClimbSpeedMarginPercent is NOT defaulted
+// here: 0 is a valid margin (no margin required, any faster candidate wins),
+// so it is never substituted here; the API layer supplies the default of 20
+// when a caller omits the field.
 func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelGroup) error {
 	failover := group.FailoverMode
 	if failover == "" {
@@ -31,10 +34,6 @@ func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelG
 	memberOrder := group.MemberOrder
 	if memberOrder == "" {
 		memberOrder = routing.MemberOrderPriority
-	}
-	climbMargin := group.ClimbSpeedMarginPercent
-	if climbMargin == 0 {
-		climbMargin = routing.DefaultClimbSpeedMarginPercent
 	}
 	minSpeedFallback := group.MinSpeedFallback
 	if minSpeedFallback == "" {
@@ -55,7 +54,7 @@ func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelG
 		traversal,
 		group.LoadedOnly,
 		memberOrder,
-		climbMargin,
+		group.ClimbSpeedMarginPercent,
 		group.MinTokensPerSecond,
 		minSpeedFallback,
 	)
@@ -83,10 +82,10 @@ func (s *SQLiteStore) UpdateModelGroup(ctx context.Context, group routing.ModelG
 	if memberOrder == "" {
 		memberOrder = routing.MemberOrderPriority
 	}
-	climbMargin := group.ClimbSpeedMarginPercent
-	if climbMargin == 0 {
-		climbMargin = routing.DefaultClimbSpeedMarginPercent
-	}
+	// ClimbSpeedMarginPercent is NOT defaulted here: 0 is a valid margin (no
+	// margin required, any faster candidate wins), so it is never substituted
+	// here; the API layer supplies the default of 20 when a caller omits the
+	// field.
 	minSpeedFallback := group.MinSpeedFallback
 	if minSpeedFallback == "" {
 		minSpeedFallback = routing.MinSpeedFallbackError
@@ -104,7 +103,7 @@ func (s *SQLiteStore) UpdateModelGroup(ctx context.Context, group routing.ModelG
 		traversal,
 		group.LoadedOnly,
 		memberOrder,
-		climbMargin,
+		group.ClimbSpeedMarginPercent,
 		group.MinTokensPerSecond,
 		minSpeedFallback,
 		group.ID,
