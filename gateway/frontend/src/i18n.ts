@@ -1069,6 +1069,12 @@ const de = {
   tokenOverrideCatchAllNote:
     'Überschreibt alle angefragten Modelle ohne eigene Zuordnung. Leer = keine Überschreibung für die übrigen Modelle.',
   tokenOverrideCatchAllShort: 'Rest',
+  tokenOverrideOffer: 'Als Modellname anbieten',
+  tokenOverrideOfferHint:
+    'Bietet das angefragte Modell selbst als Namen in der Modell-Liste an (erbt die API-Flavors des Zielmodells).',
+  tokenOverrideHideTarget: 'Zielmodell ausblenden',
+  tokenOverrideHideTargetHint:
+    'Entfernt den Namen des Zielmodells aus der Modell-Liste. Zeigen mehrere Zuordnungen auf dasselbe Ziel, genügt eine gesetzte Zeile, um es auszublenden.',
   serverOverrideLabel: 'Server-Override',
   serverOverrideNote:
     'Erzwingt jede Anfrage auf einen bestimmten Server, den Sie verwalten. Leer = kein Override.',
@@ -2694,6 +2700,12 @@ const en: PortalMessages = {
   tokenOverrideCatchAllNote:
     'Overrides every requested model without its own mapping. Empty = no override for the remaining models.',
   tokenOverrideCatchAllShort: 'Rest',
+  tokenOverrideOffer: 'Offer as a model name',
+  tokenOverrideOfferHint:
+    "Offers the requested model itself as a name in the model list (inherits the target model's API flavors).",
+  tokenOverrideHideTarget: 'Hide target model',
+  tokenOverrideHideTargetHint:
+    "Removes the target model's own name from the model list. When several mappings point to the same target, one checked row is enough to hide it.",
   serverOverrideLabel: 'Server override',
   serverOverrideNote:
     'Forces every request onto one specific server you manage. Empty = no override.',

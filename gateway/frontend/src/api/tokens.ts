@@ -3,6 +3,17 @@
 
 import { type Fetcher, request } from './transport';
 
+// One model_override_map entry on the wire: `to` is the gateway model the
+// requested-model key resolves to; `offer` lists the key itself as an
+// offered model name (inheriting `to`'s API flavors); `hide_target` removes
+// `to`'s own name from the offered list. The plain-string row form is no
+// longer accepted by the backend (400 portal.token_model_override_invalid).
+export type ModelOverrideEntry = {
+  to: string;
+  offer: boolean;
+  hide_target: boolean;
+};
+
 export type PortalToken = {
   id: string;
   name: string;
@@ -18,7 +29,7 @@ export type PortalToken = {
   // model_override_map maps a requested model name -> the gateway model to use
   // instead (takes precedence over the catch-all). Absent/empty = no per-model
   // overrides.
-  model_override_map?: Record<string, string>;
+  model_override_map?: Record<string, ModelOverrideEntry>;
   // server_override forces every request on this token onto one specific
   // AI-server the owner manages (absent/"" = no override, the common case —
   // the backend DTO field is `omitempty`); server_override_force_unreachable,
@@ -43,7 +54,7 @@ export type CreateTokenRequest = {
   name: string;
   scopes: string[];
   model_override?: string;
-  model_override_map?: Record<string, string>;
+  model_override_map?: Record<string, ModelOverrideEntry>;
   // Optional server override (see PortalToken.server_override); self-healed
   // server-side against the owner's current server-manage rights, never
   // rejected outright.
@@ -66,7 +77,7 @@ export type UpdateTokenRequest = {
   scopes?: string[];
   status?: 'active' | 'disabled';
   model_override?: string;
-  model_override_map?: Record<string, string>;
+  model_override_map?: Record<string, ModelOverrideEntry>;
   // Omitted = keep the current value (still re-validated server-side on every
   // update); "" clears the override; a server id replaces it.
   server_override?: string;

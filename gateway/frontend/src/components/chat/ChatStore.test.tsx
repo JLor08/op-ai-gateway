@@ -1197,7 +1197,7 @@ describe('ChatStoreProvider remembers an unavailable model', () => {
       last_used_at: null,
       created_at: T,
       model_override: '', // no catch-all
-      model_override_map: { 'model-b': 'model-a' }, // requesting model-b -> model-a
+      model_override_map: { 'model-b': { to: 'model-a', offer: false, hide_target: false } }, // requesting model-b -> model-a
       log_communication: false,
       secret: false,
       is_chat_session: false,

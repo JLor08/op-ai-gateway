@@ -53,6 +53,7 @@ import {
   buildOverrideMap,
   overrideRowsInvalid,
   overrideSummary,
+  type OverrideRow,
 } from './shared/ModelOverrideEditor';
 
 const allTokenScopes = ['gateway:use', 'admin'] as const;
@@ -119,7 +120,7 @@ export function TokenList({
   // Model override: a per-requested-model mapping (rows) + an optional catch-all.
   // A row maps a requested model name (free text) -> a gateway model; the catch-all
   // applies to any requested model with no row. Empty rows + empty catch-all = off.
-  const [overrideRows, setOverrideRows] = useState<{ from: string; to: string }[]>([]);
+  const [overrideRows, setOverrideRows] = useState<OverrideRow[]>([]);
   const [catchAll, setCatchAll] = useState('');
   // Server override: forces every request on this token onto one specific
   // server the caller manages. "" = no override. The whole control is hidden
@@ -208,7 +209,14 @@ export function TokenList({
     setScopes(row.scopes.filter((scope) => selectableScopes.includes(scope)));
     setScopesDirty(false);
     setOverrideRows(
-      Object.entries(row.model_override_map ?? {}).map(([from, to]) => ({ from, to })),
+      Object.entries(row.model_override_map ?? {}).map(([from, entry]) => ({
+        from,
+        to: entry.to,
+        // A missing switch (hand-written or older response) reads as false,
+        // never crashes the editor.
+        offer: entry.offer ?? false,
+        hideTarget: entry.hide_target ?? false,
+      })),
     );
     setCatchAll(row.model_override);
     setServerOverride(row.server_override ?? '');

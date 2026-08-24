@@ -220,12 +220,13 @@ describe('TokenList model override map + catch-all + log communication', () => {
     openCreate();
 
     fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'New Token' } });
-    // One mapping row: gpt-4o -> gpt-oss-20b.
+    // One mapping row: gpt-4o -> gpt-oss-20b, offered as its own model name.
     fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
     fireEvent.change(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 1` }), {
       target: { value: 'gpt-4o' },
     });
     await selectOption(`${t.tokenOverrideToLabel} 1`, 'gpt-oss-20b');
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenOverrideOffer }));
     // Catch-all + log communication.
     await selectOption(t.tokenOverrideCatchAllLabel, 'gpt-oss-20b');
     fireEvent.click(screen.getByLabelText(t.tokenLogCommunicationLabel));
@@ -235,7 +236,9 @@ describe('TokenList model override map + catch-all + log communication', () => {
     await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
     expect(created[0]).toMatchObject({
       model_override: 'gpt-oss-20b',
-      model_override_map: { 'gpt-4o': 'gpt-oss-20b' },
+      model_override_map: {
+        'gpt-4o': { to: 'gpt-oss-20b', offer: true, hide_target: false },
+      },
       log_communication: true,
     });
   });
@@ -259,7 +262,9 @@ describe('TokenList model override map + catch-all + log communication', () => {
           id: 'tok_a',
           name: 'A',
           model_override: 'gpt-oss-20b',
-          model_override_map: { 'gpt-4o': 'gpt-oss-20b' },
+          model_override_map: {
+            'gpt-4o': { to: 'gpt-oss-20b', offer: false, hide_target: false },
+          },
         }),
         makeToken({ id: 'tok_b', name: 'B', model_override: '', model_override_map: {} }),
       ],
@@ -318,14 +323,16 @@ describe('TokenList model override map + catch-all + log communication', () => {
     expect(body).toMatchObject({ secret: true });
   });
 
-  it('seeds existing map rows on edit and submits the updated map + catch-all', async () => {
+  it('seeds existing map rows (incl. both switches) on edit and submits the updated map + catch-all', async () => {
     const { fakeApi } = renderTokenList({
       tokens: [
         makeToken({
           id: 'tok_edit',
           name: 'Edit Me',
           model_override: '',
-          model_override_map: { claude: 'gpt-oss-20b' },
+          model_override_map: {
+            claude: { to: 'gpt-oss-20b', offer: false, hide_target: true },
+          },
           log_communication: false,
         }),
       ],
@@ -333,10 +340,14 @@ describe('TokenList model override map + catch-all + log communication', () => {
 
     openEdit();
 
-    // The existing map entry is seeded as row 1.
+    // The existing map entry is seeded as row 1, hide-target checked and
+    // offer unchecked per the seeded wire value.
     expect(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 1` })).toHaveValue(
       'claude',
     );
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideOffer })[0]).not.toBeChecked();
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideHideTarget })[0]).toBeChecked();
+
     // Add a second mapping + a catch-all + toggle log communication.
     fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
     fireEvent.change(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 2` }), {
@@ -353,8 +364,50 @@ describe('TokenList model override map + catch-all + log communication', () => {
       .calls[0];
     expect(body).toMatchObject({
       model_override: 'gpt-oss-20b',
-      model_override_map: { claude: 'gpt-oss-20b', 'gpt-4o': 'gpt-oss-20b' },
+      model_override_map: {
+        claude: { to: 'gpt-oss-20b', offer: false, hide_target: true },
+        'gpt-4o': { to: 'gpt-oss-20b', offer: false, hide_target: false },
+      },
       log_communication: true,
+    });
+  });
+
+  it('treats a missing switch on a seeded row as false, both on screen and on the next save', async () => {
+    // A hand-written or pre-migration response might carry only `to`. The
+    // editor must not crash, and re-saving the untouched row must resubmit
+    // explicit `false`s rather than silently dropping the keys (which is what
+    // would happen if the missing switches were passed through as `undefined`
+    // instead of being defaulted).
+    const legacyEntry = { to: 'gpt-oss-20b' } as unknown as {
+      to: string;
+      offer: boolean;
+      hide_target: boolean;
+    };
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_legacy',
+          name: 'Legacy',
+          model_override: '',
+          model_override_map: { claude: legacyEntry },
+        }),
+      ],
+    });
+
+    openEdit();
+
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideOffer })[0]).not.toBeChecked();
+    expect(
+      screen.getAllByRole('checkbox', { name: t.tokenOverrideHideTarget })[0],
+    ).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      model_override_map: { claude: { to: 'gpt-oss-20b', offer: false, hide_target: false } },
     });
   });
 });
@@ -668,7 +721,7 @@ describe('TokenList server override (Task 6)', () => {
     expect(created[0]).toMatchObject({
       server_override: 'srv_a',
       server_override_force_unreachable: true,
-      model_override_map: { req: 'server-only-model' },
+      model_override_map: { req: { to: 'server-only-model', offer: false, hide_target: false } },
     });
   });
 

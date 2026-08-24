@@ -40,7 +40,7 @@ export type RunMetricsPayload = { ttft_ms?: number; reasoning_ms?: number; tps?:
 export function resolveTokenOverride(token: PortalToken | undefined, requested: string): string {
   if (!token) return '';
   const mapped = token.model_override_map?.[requested];
-  if (mapped) return mapped;
+  if (mapped?.to) return mapped.to;
   return token.model_override ?? '';
 }
 
