@@ -450,6 +450,58 @@ describe('MappingSection optional metric columns', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: t.mappingLoadTimeMs }));
     fireEvent.click(screen.getByRole('checkbox', { name: t.mappingPromptTokensPerSecond }));
     expect(screen.getByText('1500')).toBeInTheDocument();
-    expect(screen.getByText('40.5')).toBeInTheDocument();
+    // Throughput is shown to two decimals (see the formatting test below).
+    expect(screen.getByText('40.50')).toBeInTheDocument();
+  });
+
+  it('shows throughput to two decimals and energy to ten', async () => {
+    renderSection({
+      mappings: [
+        makeMapping({
+          gen_tokens_per_second: 12.3456,
+          gen_tokens_per_second_at_capacity: 8.019,
+          energy_wh_per_token: 0.0000001234,
+        }),
+      ],
+    });
+    await screen.findByText('gw-model');
+
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingGenTokensPerSecond }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingGenTpsAtCapacity }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingEnergyWhPerToken }));
+
+    expect(screen.getByText('12.35')).toBeInTheDocument();
+    expect(screen.getByText('8.02')).toBeInTheDocument();
+    // Energy per token is a very small number; ten decimals keep it readable.
+    expect(screen.getByText('0.0000001234')).toBeInTheDocument();
+  });
+
+  it('sorts the numeric metric columns by magnitude, not lexically', async () => {
+    // 9 vs 100 is the pair that exposes text sorting: '100' precedes '9'.
+    renderSection({
+      mappings: [
+        makeMapping({ id: 'm1', gateway_model_name: 'gw-hundred', gen_tokens_per_second: 100 }),
+        makeMapping({ id: 'm2', gateway_model_name: 'gw-nine', gen_tokens_per_second: 9 }),
+        makeMapping({ id: 'm3', gateway_model_name: 'gw-twenty', gen_tokens_per_second: 20 }),
+      ],
+    });
+    await screen.findByText('gw-hundred');
+
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingGenTokensPerSecond }));
+    fireEvent.keyDown(screen.getByRole('checkbox', { name: t.mappingGenTokensPerSecond }), {
+      key: 'Escape',
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingGenTokensPerSecond }));
+
+    await waitFor(() => {
+      const shown = screen
+        .getAllByRole('row')
+        .slice(1)
+        .map((row) => row.querySelector('td')?.textContent ?? '');
+      expect(shown).toEqual(['gw-nine', 'gw-twenty', 'gw-hundred']);
+    });
   });
 });

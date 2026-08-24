@@ -95,6 +95,25 @@ export function formatPortalError(err: unknown, t: Translation): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Render a measured metric for a list cell: a fixed number of decimals so the
+ * column reads as one scale, and the em-dash placeholder when the metric was
+ * never measured (the backend reports that as 0).
+ *
+ * The fixed decimals also make the cell text sortable as a number — see
+ * `ListTable`'s `numeric` columns, which parse this string back.
+ */
+export function formatMetric(
+  value: number | null | undefined,
+  decimals: number,
+  placeholder = '—',
+): string {
+  if (!value) {
+    return placeholder;
+  }
+  return value.toFixed(decimals);
+}
+
 export function formatDate(value: string | null | undefined, fallback: string): string {
   if (!value) {
     return fallback;
