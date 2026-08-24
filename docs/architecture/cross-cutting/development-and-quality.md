@@ -149,6 +149,7 @@ Lifecycle (`scripts/sonar/sonar.sh`, wrapped by make targets):
 | `make sonar-scan` | Runs the scanner alone (missing coverage reports are tolerated with a WARN, but the gate's coverage condition then reads 0) |
 | `make sonar-gate` | Coverage + scan + waits for the computed **quality-gate verdict** — the meaningful pass/fail entry point |
 | `make sonar-findings` | Exports open issues + hotspots as JSON into `.sonar-local/` for headless triage |
+| `make sonar-branch-findings` | Filters that export down to the findings on lines **this branch** changed (see below); exits non-zero when the branch owns one |
 | `make sonar-down` | Stops the server (data volume kept) |
 | `sonar.sh purge` | Destroys the server **including** its database — resets credentials **and the new-code baseline** |
 
@@ -169,6 +170,42 @@ Semantics and policy:
   `sonar.javascript.lcov.reportPaths` (frontend lcov). The frontend report
   needs the `@vitest/coverage-v8` devDependency — run `npm ci` in any fresh
   checkout before `make sonar-gate`.
+
+### 7.1 "Did my branch introduce this?" — the branch filter
+
+Community Build cannot answer this with Sonar's own machinery: `sonar.branch.name`
+is refused ("Developer Edition or above is required"), so the server only ever
+knows a single branch, and a reference-branch new-code definition is unavailable.
+The remaining server-side definitions each have a hole for this purpose:
+`NUMBER_OF_DAYS` (max 90) stops counting a finding once the branch outlives the
+window — a **false green** — and after a rebase it counts other people's recent
+commits as yours; `PREVIOUS_VERSION` needs an analysis of the previous version in
+the local database, which a freshly bootstrapped server does not have. Neither is
+shareable either, because the reference lives in that server's database.
+
+`scripts/sonar/branch-findings.sh` (`make sonar-branch-findings`) therefore
+computes the comparison from **git**, which every developer has identically from
+the repository:
+
+- It diffs the **merge base** of `origin/main` and `HEAD` against the working
+  tree, so the result is independent of how long the branch has lived and immune
+  to a rebase (commits that landed on the base branch afterwards are not
+  attributed), and it covers all three ways a line reaches the scanner —
+  committed, uncommitted, and untracked (untracked files count whole).
+- It defaults to `origin/main`, not the local `main`: in a worktree the local ref
+  is often far behind, and a stale base makes the merge base ancient — which
+  attributes half the repository to the branch and still looks like a working
+  report.
+- It is post-processing only and never contacts the server: run
+  `make sonar-findings` first. Exit code 1 when the branch owns a finding, so it
+  works as a pre-PR check.
+- Its own cases (including the merge-base semantics and the stale-`main` default)
+  are pinned by `scripts/sonar/branch-findings.test.sh`, which runs offline
+  against a throwaway repository: `sh scripts/sonar/branch-findings.test.sh`.
+
+Deliberate limits: attribution is by **line**, so a finding your change causes
+elsewhere without touching that line is not attributed, and coverage is not
+considered — for those, read the quality gate itself.
 
 Operational notes (encoded in `sonar-project.properties` comments):
 
