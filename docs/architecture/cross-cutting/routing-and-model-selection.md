@@ -263,7 +263,7 @@ of resolving a single mapping.
     candidate. If nothing is loaded for the request, the restriction is
     dropped rather than dead-ending a request (see the relaxation ladder
     below).
-  - `member_order` (`priority` default | `speed`) — `speed` ranks each member
+  - `member_order` (`priority` (default) | `speed`) — `speed` ranks each member
     by its fastest *eligible* candidate's `effectiveGenTPS` (§3.1's load-aware
     speed), descending; an unmeasured member sorts last, and ties keep the
     manual order (`sort.SliceStable`), so a group with no measurements
@@ -275,7 +275,10 @@ of resolving a single mapping.
     `climb_up` climbs only to a member whose speed exceeds the pin's by more
     than this margin; `0` is a legitimate "no margin" value (any strictly
     faster candidate then wins), and only a negative value is clamped to 0.
-    A priority-ordered group ignores this setting entirely.
+    A priority-ordered group ignores this setting entirely. The write API
+    distinguishes the two: omitting the field on create applies the default
+    20, while an explicit `0` persists as `0` — an unset field and a
+    deliberate "no margin" policy are not the same thing.
   - `min_tokens_per_second` (0 = off) + `min_speed_fallback` (`error` |
     `ignore`) — a floor on the same load-aware `effectiveGenTPS`, applied per
     **candidate**, not per member, so a member with one fast and one slow

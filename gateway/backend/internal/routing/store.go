@@ -421,7 +421,8 @@ type ModelGroup struct {
 	// candidate (0) never satisfies a floor.
 	MinTokensPerSecond float64
 	// MinSpeedFallback is what happens when no candidate reaches the floor:
-	// MinSpeedFallbackError (503) or MinSpeedFallbackIgnore (retry without it).
+	// MinSpeedFallbackError (ErrNoHealthyHost, 502) or MinSpeedFallbackIgnore
+	// (retry without it).
 	MinSpeedFallback string
 }
 
