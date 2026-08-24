@@ -836,6 +836,22 @@ func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, m
 	return selected, found, nil
 }
 
+// candidateEffectiveGenTPS is a candidate's load-aware effective generation speed,
+// assembled exactly as argmaxByScore assembles its scoring route so the floor and
+// the ordering agree with the scorer. An unmeasured mapping yields 0.
+func (r *Resolver) candidateEffectiveGenTPS(ctx context.Context, c MappingCandidate, model string) (float64, error) {
+	telemetry, ok, err := r.store.TelemetryByServer(ctx, c.Server.ID)
+	if err != nil {
+		return 0, fmt.Errorf("load server telemetry: %w", err)
+	}
+	k := telemetry.ActiveRequests
+	if r.activity != nil {
+		inflight, _ := r.activity.ServerActivity(c.Server.ID)
+		k = inflight
+	}
+	return effectiveGenTPS(scoringRoute(c, telemetry, ok, k, model)), nil
+}
+
 func (r *Resolver) activeMappingForApplication(ctx context.Context, applicationID string, gatewayModel string) (ModelMapping, bool, error) {
 	mappings, err := r.store.MappingsByApplication(ctx, applicationID)
 	if err != nil {
@@ -905,7 +921,15 @@ const modeClimbUp = "climb_up"
 // servers the principal is not provisioned for reports memberNoMapping — the same
 // no-leak posture the codebase uses elsewhere (404 rather than a distinguishable
 // "exists but forbidden" signal).
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time) (MappingCandidate, memberStatus, []string, int, error) {
+//
+// minTPS is the group's speed floor (GroupPolicy.MinTokensPerSecond), applied CANDIDATE
+// by candidate right after filterProvisioned: a candidate whose effective generation
+// speed falls short is dropped from the pool before selectCandidate ever sees it, so a
+// member is never served on a too-slow candidate just because its fast one is busy. 0
+// disables the filter (the no-op invariant — no extra store read, cands is unchanged).
+// A set the floor empties out reports memberNoMapping, exactly like a member with no
+// mappings at all.
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, minTPS float64) (MappingCandidate, memberStatus, []string, int, error) {
 	cands, err := r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, fmt.Errorf("resolve member mappings: %w", err)
@@ -913,6 +937,19 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 	cands, err = r.filterProvisioned(ctx, token, cands)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
+	}
+	if minTPS > 0 {
+		kept := make([]MappingCandidate, 0, len(cands))
+		for _, c := range cands {
+			tps, tErr := r.candidateEffectiveGenTPS(ctx, c, name)
+			if tErr != nil {
+				return MappingCandidate{}, memberUnavailable, nil, 0, tErr
+			}
+			if tps >= minTPS {
+				kept = append(kept, c)
+			}
+		}
+		cands = kept
 	}
 	if len(cands) == 0 {
 		return MappingCandidate{}, memberNoMapping, nil, 0, nil
@@ -938,12 +975,12 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
 // store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time) (string, MappingCandidate, []string, int, bool, error) {
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, minTPS float64) (string, MappingCandidate, []string, int, bool, error) {
 	var atCap []string
 	queueTimeoutSecs := 0
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now)
+		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, minTPS)
 		if err != nil {
 			return "", MappingCandidate{}, nil, 0, false, err
 		}
@@ -1013,8 +1050,36 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 	return nil
 }
 
-// resolveGroup expands a group into its ordered members and serves the first available
-// one (failover), honoring a sticky pin. Two failover modes (§3f):
+// resolveGroup runs resolveGroupOnce under progressively relaxed eligibility filters.
+// The order encodes the spec's precedence: the loaded-only filter is dropped before the
+// speed floor is, and the floor is dropped only when min_speed_fallback says so. The
+// first attempt that resolves wins; the LAST attempt's error is the one returned, so the
+// caller still sees ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
+func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
+	attempts := []GroupPolicy{policy}
+	// (a later relaxation stage is inserted here, ahead of the speed-floor one below.)
+	if policy.MinTokensPerSecond > 0 && policy.MinSpeedFallback == MinSpeedFallbackIgnore {
+		relaxed := policy
+		relaxed.MinTokensPerSecond = 0
+		attempts = append(attempts, relaxed)
+	}
+	var lastErr error
+	for _, attempt := range attempts {
+		target, err := r.resolveGroupOnce(ctx, token, req, key, apiFlavor, members, attempt, now)
+		if err == nil {
+			return target, nil
+		}
+		if !errors.Is(err, ErrNoHealthyHost) && !errors.Is(err, ErrNoModelRoute) {
+			return Target{}, err // a real failure (store error, admission timeout) — never retried
+		}
+		lastErr = err
+	}
+	return Target{}, lastErr
+}
+
+// resolveGroupOnce expands a group into its ordered members and serves the first
+// available one (failover) under ONE fixed policy, honoring a sticky pin. Two failover
+// modes (§3f):
 //
 //   - sticky: the pin is preferred while it is available; if it is down or at-capacity the
 //     turn falls through walkPriority and re-pins, but never climbs back to a
@@ -1033,7 +1098,7 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 // Errors map per §3g: zero members OR no member with any live mapping -> ErrNoModelRoute
 // (unknown model); members with live mappings but all gated (down/busy/non-viable/at-cap)
 // -> ErrNoHealthyHost.
-func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
+func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
 	if len(members) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
@@ -1050,7 +1115,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 	// available. A pin that is down or at-capacity falls straight through to the walk (an
 	// immediate fall-DOWN, even to a cold member — the intended asymmetry, no warm).
 	if pinned := r.groupPin(ctx, key, members, now); pinned != "" {
-		pinSel, pinStatus, _, _, err := r.selectMember(ctx, token, pinned, apiFlavor, req, now)
+		pinSel, pinStatus, _, _, err := r.selectMember(ctx, token, pinned, apiFlavor, req, now, policy.MinTokensPerSecond)
 		if err != nil {
 			return Target{}, err
 		}
@@ -1059,7 +1124,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 				// Is a higher-priority member available? The pin is memberOK, so firstAvailable
 				// stops at-or-before it in the priority order → best index <= pin index (the
 				// memberIndex guard below is belt-and-suspenders for that invariant).
-				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now)
+				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond)
 				if ferr != nil {
 					return Target{}, ferr
 				}
@@ -1085,7 +1150,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, token, members, apiFlavor, req, now)
+		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy.MinTokensPerSecond)
 		if err != nil {
 			return Target{}, err
 		}
