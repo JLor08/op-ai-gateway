@@ -165,16 +165,20 @@ func TestResolveTargetDoesNotRecordOnFailure(t *testing.T) {
 }
 
 // TestChatCompletionsRecordsLastUsedModel is the end-to-end regression guard
-// for all three s.resolveTarget call sites (complete, tryProxyNative,
-// beginStream): it drives a real HTTP request through ServeHTTP instead of
-// calling resolveTarget directly, so a future revert of ANY of those three
-// call sites back to the bare s.Resolver.Resolve (which every other gateway
-// test would still pass, since LastUsedModelWriter is nil everywhere else)
-// fails here. Exercises the non-streaming /v1/chat/completions path
-// (inference_complete.go's complete) specifically because it reuses the
-// existing NewTestServer + seedGatewayTestRoutes fixture (routable model
-// "qwen-coder", token "tok_dev" / secret "dev-secret") verbatim — the
-// cheapest of the three paths to stand up.
+// for inference_complete.go's s.resolveTarget call site (the non-streaming
+// /v1/chat/completions path): it drives a real HTTP request through
+// ServeHTTP instead of calling resolveTarget directly, so a future revert of
+// THIS call site back to the bare s.Resolver.Resolve (which every other
+// gateway test would still pass, since LastUsedModelWriter is nil everywhere
+// else) fails here. It reuses the existing NewTestServer + seedGatewayTestRoutes
+// fixture (routable model "qwen-coder", token "tok_dev" / secret "dev-secret")
+// verbatim.
+//
+// The other two call sites — native_passthrough.go's tryProxyNative and
+// stream_session.go's beginStream — are NOT covered by this test (they are
+// different functions on a different code path); see
+// TestTryProxyNativeRecordsLastUsedModel and TestBeginStreamRecordsLastUsedModel
+// below for their own dedicated guards.
 func TestChatCompletionsRecordsLastUsedModel(t *testing.T) {
 	srv := NewTestServer()
 	var writes []string
@@ -192,5 +196,63 @@ func TestChatCompletionsRecordsLastUsedModel(t *testing.T) {
 	}
 	if len(writes) != 1 || writes[0] != "tok_dev=qwen-coder" {
 		t.Fatalf("writes = %v, want [tok_dev=qwen-coder]", writes)
+	}
+}
+
+// TestTryProxyNativeRecordsLastUsedModel is the regression guard for
+// native_passthrough.go's tryProxyNative — it drives that function directly
+// (rather than a full HTTP round-trip through ServeHTTP, which would need a
+// native-flagged application wired end to end) so a future revert of its
+// `s.resolveTarget(...)` call back to the bare `s.Resolver.Resolve(...)`
+// fails here. newTestServer's seeded application declares no native flags,
+// so tryProxyNative resolves successfully (writing the marker) and then
+// correctly falls through to "not enabled" and returns false — this test
+// only cares about the write, not the passthrough decision itself.
+func TestTryProxyNativeRecordsLastUsedModel(t *testing.T) {
+	s := newTestServer(t)
+	var writes []string
+	s.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+		writes = append(writes, tokenID+"="+model)
+		return nil
+	}
+	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
+	pf := preflight{Req: inference.Request{Model: "llama-70b"}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	w := httptest.NewRecorder()
+
+	if handled := s.tryProxyNative(w, r, token, []byte("{}"), "", pf); handled {
+		t.Fatalf("tryProxyNative returned true, want false (seeded application has no native flags)")
+	}
+	if len(writes) != 1 || writes[0] != "tok_1=llama-70b" {
+		t.Fatalf("writes = %v, want [tok_1=llama-70b]", writes)
+	}
+}
+
+// TestBeginStreamRecordsLastUsedModel is the regression guard for
+// stream_session.go's beginStream — driven directly (an httptest.ResponseRecorder
+// satisfies http.Flusher, and provider.Mock satisfies provider.StreamingClient,
+// so no full SSE round-trip is needed) so a future revert of its
+// `s.resolveTarget(...)` call back to the bare `s.Resolver.Resolve(...)`
+// fails here.
+func TestBeginStreamRecordsLastUsedModel(t *testing.T) {
+	s := newTestServer(t)
+	var writes []string
+	s.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+		writes = append(writes, tokenID+"="+model)
+		return nil
+	}
+	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
+	req := inference.Request{Model: "llama-70b"}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	ss, ok := s.beginStream(w, r, token, req, nil, "req_test", func(provider.Response) any { return nil })
+	if !ok {
+		t.Fatalf("beginStream returned ok=false, body=%s", w.Body.String())
+	}
+	defer ss.close()
+
+	if len(writes) != 1 || writes[0] != "tok_1=llama-70b" {
+		t.Fatalf("writes = %v, want [tok_1=llama-70b]", writes)
 	}
 }
