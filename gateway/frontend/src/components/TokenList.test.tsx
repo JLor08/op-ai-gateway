@@ -9,6 +9,7 @@ import { messages } from '../i18n';
 import {
   PortalApiError,
   type CreateTokenRequest,
+  type ModelOption,
   type PortalServer,
   type PortalToken,
   type ProjectRef,
@@ -96,6 +97,10 @@ function renderTokenList(opts: {
   myProjects?: ProjectRef[];
   servers?: PortalServer[];
   serverModelsByServer?: Record<string, ServerModelOption[]>;
+  // Override the default single-model list — used by the unknown-model
+  // redirect's fallback-picker test, which needs a group entry (is_group)
+  // alongside a plain model in the SAME list (Task 8).
+  models?: ModelOption[];
 }) {
   const created = opts.created ?? [];
   const tokens = opts.tokens ?? [];
@@ -149,7 +154,7 @@ function renderTokenList(opts: {
         tokens={tokens}
         setTokens={setTokens}
         role="admin"
-        models={models}
+        models={opts.models ?? models}
         servers={servers}
       />
     </ToastProvider>,
@@ -750,6 +755,123 @@ describe('TokenList server override (Task 6)', () => {
     expect(body).toMatchObject({
       server_override: 'srv_a',
       server_override_force_unreachable: true,
+    });
+  });
+});
+
+describe('TokenList unknown-model redirect (Task 8)', () => {
+  it('keeps the sub-settings disabled until the redirect is on', () => {
+    renderTokenList({});
+    openCreate();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeDisabled();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+
+    expect(
+      screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }),
+    ).not.toBeDisabled();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).not.toBeDisabled();
+  });
+
+  it('shows the last used model in the edit form', () => {
+    renderTokenList({ tokens: [makeToken({ last_used_model: 'qwen3-32b' })] });
+    openEdit();
+    expect(screen.getByText('qwen3-32b')).toBeInTheDocument();
+  });
+
+  it('shows a placeholder when the token has never been used', () => {
+    renderTokenList({ tokens: [makeToken({ last_used_model: '' })] });
+    openEdit();
+    expect(screen.getByText(t.tokenLastUsedModelNone)).toBeInTheDocument();
+  });
+
+  it('always shows the placeholder in the create form (no last-used value yet)', () => {
+    renderTokenList({});
+    openCreate();
+    expect(screen.getByText(t.tokenLastUsedModelNone)).toBeInTheDocument();
+  });
+
+  it('offers models and groups in one fallback picker', async () => {
+    renderTokenList({
+      models: [
+        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [] },
+        { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+      ],
+    });
+    openCreate();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.mouseDown(screen.getByLabelText(t.tokenUnknownFallback));
+    expect(await screen.findByRole('option', { name: 'qwen3-32b' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'fast-group' })).toBeInTheDocument();
+  });
+
+  it('sends the redirect settings on submit', async () => {
+    const { fakeApi, created } = renderTokenList({});
+    openCreate();
+    fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }));
+    await selectOption(t.tokenUnknownFallback, 'gpt-oss-20b');
+    fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+    expect(created[0]).toMatchObject({
+      unknown_model_redirect: true,
+      unknown_model_redirect_blocked: true,
+      unknown_model_fallback: 'gpt-oss-20b',
+    });
+  });
+
+  it('never sends last_used_model on create, even blank', async () => {
+    const { fakeApi, created } = renderTokenList({});
+    openCreate();
+    fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+    fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+    expect(created[0]).not.toHaveProperty('last_used_model');
+  });
+
+  it('never resends last_used_model when saving an edit', async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [makeToken({ id: 'tok_edit', last_used_model: 'qwen3-32b' })],
+    });
+    openEdit();
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).not.toHaveProperty('last_used_model');
+  });
+
+  it("seeds the redirect settings from the token's current values on edit", async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_edit',
+          unknown_model_redirect: true,
+          unknown_model_redirect_blocked: true,
+          unknown_model_fallback: 'gpt-oss-20b',
+        }),
+      ],
+    });
+
+    openEdit();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeChecked();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue('gpt-oss-20b');
+
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      unknown_model_redirect: true,
+      unknown_model_redirect_blocked: true,
+      unknown_model_fallback: 'gpt-oss-20b',
     });
   });
 });

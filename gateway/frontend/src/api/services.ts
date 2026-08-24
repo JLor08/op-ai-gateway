@@ -100,6 +100,13 @@ export type ServiceTokenDTO = {
   model_override_map?: Record<string, ModelOverrideEntry>;
   log_communication: boolean;
   secret: boolean;
+  // The unknown-model redirect, identical in meaning to PortalToken's — a
+  // service token is a token. last_used_model is READ-ONLY: it appears on no
+  // request type and must never be sent back in a create body.
+  last_used_model?: string;
+  unknown_model_redirect?: boolean;
+  unknown_model_redirect_blocked?: boolean;
+  unknown_model_fallback?: string;
 };
 
 export type CreateServiceTokenRequest = {
@@ -109,6 +116,12 @@ export type CreateServiceTokenRequest = {
   model_override_map?: Record<string, ModelOverrideEntry>;
   log_communication?: boolean;
   secret?: boolean;
+  // The unknown-model redirect (see ServiceTokenDTO). Deliberately NO
+  // last_used_model — a fresh token has never routed a request, and the
+  // marker is written by the inference path only, never by a client.
+  unknown_model_redirect?: boolean;
+  unknown_model_redirect_blocked?: boolean;
+  unknown_model_fallback?: string;
 };
 
 // The one-time reveal response for both create and rotate.

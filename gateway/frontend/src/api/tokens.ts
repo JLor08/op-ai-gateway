@@ -38,6 +38,19 @@ export type PortalToken = {
   // false/absent whenever server_override is absent/"".
   server_override?: string;
   server_override_force_unreachable?: boolean;
+  // last_used_model is the gateway model or group name this token last routed
+  // a request to. READ-ONLY: it appears on no request type and must never be
+  // sent back in a create/update body (the backend ignores it there anyway).
+  last_used_model?: string;
+  // The unknown-model redirect: a requested model this token cannot route to
+  // is served by last_used_model, or else by unknown_model_fallback, instead
+  // of failing. unknown_model_redirect_blocked widens "unknown" from "does
+  // not exist at all" to "exists but this token cannot call it". Both
+  // sub-settings are always off/empty whenever unknown_model_redirect is
+  // false.
+  unknown_model_redirect?: boolean;
+  unknown_model_redirect_blocked?: boolean;
+  unknown_model_fallback?: string;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -60,6 +73,12 @@ export type CreateTokenRequest = {
   // rejected outright.
   server_override?: string;
   server_override_force_unreachable?: boolean;
+  // The unknown-model redirect (see PortalToken). Deliberately NO
+  // last_used_model here: a fresh token has never routed a request, and the
+  // marker is written by the inference path only, never by a client.
+  unknown_model_redirect?: boolean;
+  unknown_model_redirect_blocked?: boolean;
+  unknown_model_fallback?: string;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -82,6 +101,11 @@ export type UpdateTokenRequest = {
   // update); "" clears the override; a server id replaces it.
   server_override?: string;
   server_override_force_unreachable?: boolean;
+  // The unknown-model redirect (see PortalToken). Omitted = keep the current
+  // value. Deliberately no last_used_model — it is read-only, see above.
+  unknown_model_redirect?: boolean;
+  unknown_model_redirect_blocked?: boolean;
+  unknown_model_fallback?: string;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;

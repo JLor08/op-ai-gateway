@@ -1089,6 +1089,15 @@ const de = {
     'Der Server-Override-Server ist deaktiviert oder nicht erreichbar.',
   errorServerOverrideModelUnavailable:
     'Der Server-Override-Server bietet das angeforderte Modell nicht an.',
+  tokenUnknownRedirect: 'Umleitung bei unbekanntem Modell',
+  tokenUnknownRedirectHint:
+    'Leitet eine Anfrage nach einem Modell, das dieser Token nicht direkt aufrufen kann, an das zuletzt genutzte Modell oder den Fallback um, statt fehlzuschlagen.',
+  tokenUnknownRedirectBlocked: 'Auch gesperrte Modelle umleiten',
+  tokenUnknownRedirectBlockedHint:
+    'Ohne diese Option greift die Umleitung nur bei einem völlig unbekannten Modellnamen. Aktiviert greift sie auch, wenn das Modell existiert, dieser Token es aber nicht aufrufen darf.',
+  tokenUnknownFallback: 'Fallback-Modell',
+  tokenLastUsedModel: 'Zuletzt genutztes Modell',
+  tokenLastUsedModelNone: 'Noch nicht verwendet',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -2719,6 +2728,15 @@ const en: PortalMessages = {
   errorServerOverrideServerUnavailable: 'The server-override target is disabled or unreachable.',
   errorServerOverrideModelUnavailable:
     'The server-override target does not offer the requested model.',
+  tokenUnknownRedirect: 'Redirect on unknown model',
+  tokenUnknownRedirectHint:
+    'Redirects a request for a model this token cannot call directly to the last-used model or the fallback, instead of failing.',
+  tokenUnknownRedirectBlocked: 'Also redirect blocked models',
+  tokenUnknownRedirectBlockedHint:
+    "Without this, the redirect only applies to a name that doesn't exist at all. Enabled, it also applies when the model exists but this token isn't allowed to call it.",
+  tokenUnknownFallback: 'Fallback model',
+  tokenLastUsedModel: 'Last used model',
+  tokenLastUsedModelNone: 'Not used yet',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',
