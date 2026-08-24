@@ -13,6 +13,11 @@ export type UsageEvent = {
   agent_id?: string;
   api_flavor: string;
   model: string;
+  // The model the client originally requested, before a token model override (if
+  // any) rewrote it to `model`. Equal to `model` when no override fired; "" for
+  // rows recorded before this field shipped (unknown — must NOT fall back to
+  // displaying `model`).
+  requested_model: string;
   provider: string;
   host: string;
   input_tokens: number;

@@ -4900,6 +4900,10 @@ func assertOverrideDroveRouting(t *testing.T, srv *Server, recorder *usage.Recor
 	if len(events) != 1 || events[0].Model != "qwen-coder" {
 		t.Fatalf("usage events = %#v (want one with Model qwen-coder)", events)
 	}
+	// Issue #7: the PRE-override name the client actually sent must be kept.
+	if events[0].RequestedModel != "gpt-oss-20b" {
+		t.Fatalf("RequestedModel = %q, want gpt-oss-20b (the client's original request)", events[0].RequestedModel)
+	}
 }
 
 // TestChatCompletionAppliesTokenModelOverride verifies that a token carrying a
@@ -4909,6 +4913,27 @@ func TestChatCompletionAppliesTokenModelOverride(t *testing.T) {
 	srv, recorder := newModelOverrideTestServer(t)
 	assertOverrideDroveRouting(t, srv, recorder, http.MethodPost, "/v1/chat/completions",
 		`{"model":"gpt-oss-20b","messages":[{"role":"user","content":"hi"}]}`)
+}
+
+// TestChatCompletionRecordsRequestedModelWithoutOverride: with no token
+// override, requested and effective model are identical on the event.
+func TestChatCompletionRecordsRequestedModelWithoutOverride(t *testing.T) {
+	srv := NewTestServer()
+	req := newJSONRequest(http.MethodPost, "/v1/chat/completions", `{"model":"qwen-coder","messages":[{"role":"user","content":"hi"}]}`)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].Model != "qwen-coder" || events[0].RequestedModel != "qwen-coder" {
+		t.Fatalf("Model = %q, RequestedModel = %q, want both qwen-coder", events[0].Model, events[0].RequestedModel)
+	}
 }
 
 // TestResponsesAppliesTokenModelOverride is the sibling of the chat-completions

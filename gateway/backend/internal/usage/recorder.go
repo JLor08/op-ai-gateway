@@ -27,12 +27,16 @@ type Event struct {
 	AgentID       string `json:"agent_id,omitempty"`
 	APIFlavor     string `json:"api_flavor"`
 	Model         string `json:"model"`
-	RouteID       string `json:"route_id,omitempty"`
-	Provider      string `json:"provider"`
-	Host          string `json:"host"`
-	InputTokens   int    `json:"input_tokens"`
-	OutputTokens  int    `json:"output_tokens"`
-	TotalTokens   int    `json:"total_tokens"`
+	// RequestedModel is the model name exactly as the client sent it, BEFORE
+	// resolveModelOverride applied any token model override. Equal to Model when
+	// no override fired. "" on rows recorded before migration 61 (unknown).
+	RequestedModel string `json:"requested_model"`
+	RouteID        string `json:"route_id,omitempty"`
+	Provider       string `json:"provider"`
+	Host           string `json:"host"`
+	InputTokens    int    `json:"input_tokens"`
+	OutputTokens   int    `json:"output_tokens"`
+	TotalTokens    int    `json:"total_tokens"`
 	// CachedTokens = prompt cache READ tokens; CacheWriteTokens = prompt cache WRITE
 	// (Anthropic cache_creation, 0 for OpenAI/Responses). Disjoint from InputTokens
 	// here (the accounting split happens in gateway.recordUsage), so
@@ -586,6 +590,7 @@ func matchUsage(q Query, e Event, resolveName func(string) string) bool {
 func usageMatchesText(e Event, needle string) bool {
 	return strings.Contains(strings.ToLower(e.ID), needle) ||
 		strings.Contains(strings.ToLower(e.Model), needle) ||
+		strings.Contains(strings.ToLower(e.RequestedModel), needle) ||
 		strings.Contains(strings.ToLower(e.Host), needle) ||
 		strings.Contains(strings.ToLower(e.ServerName), needle) ||
 		strings.Contains(strings.ToLower(e.TokenName), needle)
@@ -623,6 +628,8 @@ func compareUsage(sortKey string, a, b Event) int {
 		return cmp.Compare(a.HTTPStatus, b.HTTPStatus)
 	case "model":
 		return cmp.Compare(a.Model, b.Model)
+	case "requested_model":
+		return cmp.Compare(a.RequestedModel, b.RequestedModel)
 	case "server_name":
 		return cmp.Compare(a.ServerName, b.ServerName)
 	case "token_name":

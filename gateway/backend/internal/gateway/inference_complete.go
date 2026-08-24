@@ -669,6 +669,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		AgentID:          req.AgentID,
 		APIFlavor:        req.APIFlavor,
 		Model:            req.Model,
+		RequestedModel:   req.RequestedModel,
 		RouteID:          target.RouteID,
 		Provider:         target.Provider,
 		Host:             target.ServerID,

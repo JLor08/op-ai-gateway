@@ -481,6 +481,48 @@ func TestProxyNativeDefaultsContentTypeWhenUpstreamOmitsIt(t *testing.T) {
 	}
 }
 
+// TestProxyNativeRecordsPreOverrideRequestedModel proves the native-passthrough
+// path records the model the CLIENT sent (issue #7's requested_model), not only
+// the effective post-override one. Unlike the translate path — where the field
+// rides along through mergeInto — proxyNative builds its own inference.Request
+// literal by hand-copying fields off the preflight request (see
+// native_passthrough.go), so nothing structural keeps RequestedModel populated:
+// dropping that single line from the literal has to fail a test. A token whose
+// ModelOverride rewrites the client's "client-model" into the routable gateway
+// model "gw-model" makes requested and effective differ, so this pins the
+// PRE-override value rather than merely "some model name got recorded".
+func TestProxyNativeRecordsPreOverrideRequestedModel(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: `{"output_text":"hi"}`}
+	srv := newNativeProxyTestServer(prov, true, false)
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{
+		ID: "tok_ovr", UserID: "usr_dev", Name: "Override Token", Active: true,
+		Scopes: []string{"gateway:use", "admin"}, ModelOverride: "gw-model",
+	}, "ovr-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"client-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer ovr-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 {
+		t.Fatalf("ProxyNative calls = %d, want 1 (the request must take the native path, not translate)", prov.proxyCalls)
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].Model != "gw-model" {
+		t.Fatalf("Model = %q, want gw-model (the token override drove routing)", events[0].Model)
+	}
+	if events[0].RequestedModel != "client-model" {
+		t.Fatalf("RequestedModel = %q, want client-model (the pre-override name the client sent)", events[0].RequestedModel)
+	}
+}
+
 // newCapAdmissionTestServer builds a *Server with a single native-passthrough
 // application whose mapping caps concurrency at 1 (ModelMapping.MaxConcurrency)
 // and whose AdmissionQueueTimeoutSeconds is a short, real 1 second — enough for

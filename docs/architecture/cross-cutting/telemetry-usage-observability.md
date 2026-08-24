@@ -269,6 +269,11 @@ user/token/service/project id+name, session id/source/agent id, API flavor, mode
 (requested + effective provider model), route/provider/host, token counts, latency,
 HTTP status/error code, content type, and (additively) energy/cost.
 
+The model name is carried through three stages, each its own column: `requested_model`
+(the client's original name, before any token model-override) → `model` (the
+effective gateway model, after that override) → `provider_model` (the upstream
+application's own model name, after model-mapping).
+
 **Token accounting split**: `resp.Usage.InputTokens` is the OpenAI-canonical figure
 (includes both cache subsets), kept that way so client-facing responses stay
 wire-correct per protocol. `recordUsage` splits it into three **disjoint** stored

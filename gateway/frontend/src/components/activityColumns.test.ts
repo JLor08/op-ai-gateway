@@ -55,12 +55,13 @@ function installStorage() {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('activityColumns catalogue', () => {
-  it('has the seven default-visible columns and nineteen optional columns', () => {
+  it('has the eight default-visible columns and nineteen optional columns', () => {
     const visible = ACTIVITY_COLUMNS.filter((c) => c.defaultVisible).map((c) => c.id);
     expect(visible).toEqual([
       'created_at',
       'owner',
       'token_name',
+      'requested_model',
       'model',
       'http_status',
       'total_tokens',
@@ -120,6 +121,18 @@ describe('activityColumns catalogue', () => {
   it('uses the declaration order as the default column order', () => {
     expect(DEFAULT_COLUMN_ORDER).toEqual(ACTIVITY_COLUMNS.map((c) => c.id));
     expect(DEFAULT_COLUMN_ORDER[0]).toBe('created_at');
+  });
+
+  it('has requested_model as a default-visible, sortable column directly before model', () => {
+    const ids = ACTIVITY_COLUMNS.map((c) => c.id);
+    const reqIdx = ids.indexOf('requested_model');
+    const modelIdx = ids.indexOf('model');
+    expect(reqIdx).toBeGreaterThan(-1);
+    expect(reqIdx).toBe(modelIdx - 1);
+    const col = ACTIVITY_COLUMNS[reqIdx];
+    expect(col.defaultVisible).toBe(true);
+    expect(col.sortable).toBe(true);
+    expect(col.labelKey).toBe('tableRequestedModel');
   });
 });
 

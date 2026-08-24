@@ -67,6 +67,8 @@ function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
   switch (id) {
     case 'created_at':
       return new Date(row.created_at).toLocaleString();
+    case 'requested_model':
+      return row.requested_model || '—';
     case 'model':
       return row.model;
     case 'server_name':
