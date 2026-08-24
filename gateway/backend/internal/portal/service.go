@@ -3236,32 +3236,49 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // callers either.
 //
 // VISIBILITY-SURFACE MATRIX — every model/server-facing surface reachable by
-// a non-admin gateway:use principal, and which of the two independent
-// filters it applies: (a) the resource-group AllowedServerIDs filter this
-// function (or a sibling built on the same filterByAllowedServers core)
-// implements, and (b) the model_settings hidden/locked suppression —
+// a non-admin gateway:use principal, and which of the three independent
+// filters/overlays it applies: (a) the resource-group AllowedServerIDs filter
+// this function (or a sibling built on the same filterByAllowedServers core)
+// implements, (b) the model_settings hidden/locked suppression —
 // modelGroupOverlay's suppress set for Models()/ModelsForFlavor() (applies to
 // plain models AND groups alike), and the same underlying read
 // (modelVisibilityByLower) applied directly, principal-gated on
-// !isAdmin(...), by dashboardRouteData() and ModelServers():
+// !isAdmin(...), by dashboardRouteData() and ModelServers() — and (c) the
+// PER-TOKEN override-alias overlay (applyOverrideAliases: add each Offer
+// rule's requested name, drop each HideTarget rule's target), which unlike
+// (a)/(b) is not a filter at all but a per-principal RENAMING of the listing,
+// and is therefore applied LAST, over the finished result of (a) and (b):
 //
-//	Surface                                        (a) resource-group                          (b) hidden/locked
-//	Models()                                       yes — visibleMappingViews                   yes — modelsResponse(suppress=true)
-//	ModelsForFlavor() (/v1/models, per flavor)     yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)
-//	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass
-//	  (handlePortalModelServers /
-//	   handlePortalModelServersEvents)
-//	model-group-servers                             yes — per-member ModelServers, PLUS         yes — inherited: every row comes
+//	Surface                                        (a) resource-group                          (b) hidden/locked                           (c) per-token alias overlay
+//	Models()                                       yes — visibleMappingViews                   yes — modelsResponse(suppress=true)         yes — modelsResponse, suppress==true only
+//	                                                                                                                                       (plus the alias's loaded/offered/context/
+//	                                                                                                                                        vision/is-group row data, copied from
+//	                                                                                                                                        the target so the alias row looks like it)
+//	ModelsForFlavor() (/v1/models, per flavor)     yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass         no — keyed by a REAL model name; an alias
+//	  (handlePortalModelServers /                                                                                                              is not one, and the name it hides stays
+//	   handlePortalModelServersEvents)                                                                                                          fully callable (see below)
+//	model-group-servers                             yes — per-member ModelServers, PLUS         yes — inherited: every row comes            no — same reason
 //	  (handlePortalModelGroupServers)                    FilterAllowedGroupModelServerRows           from a per-member ModelServers call
 //	                                                     (defense-in-depth re-check)
-//	dashboardRouteData()                            yes — visibleMappingViews                   yes — principal-aware, admin bypass
+//	dashboardRouteData()                            yes — visibleMappingViews                   yes — principal-aware, admin bypass         no — same reason
 //	  (GET /api/portal/dashboard, "Live Model
 //	   Routes" table)
+//	ModelOfferingFor().Offered                      yes — filterVisibleMappingViews             yes — via flavorSetsFromViews               yes — via flavorSetsFromViews
+//	ModelOfferingFor().Callable                     yes — filterVisibleMappingViews             locked ONLY (hidden stays: display-only)    no — an alias is not a routable name
+//	ModelOfferingFor().Existing                     no  — deliberately unfiltered               no  — deliberately unsuppressed             no
 //
-// (ManageModels(), the admin-only management surface, applies NEITHER filter
-// by design: an admin managing visibility/groups must see every active
-// mapping regardless of resource-group provisioning or its own hidden/locked
-// state — see ManageModels's own doc-comment.)
+// (ManageModels(), the admin-only management surface, applies NONE of the
+// three by design: an admin managing visibility/groups must see every active
+// mapping regardless of resource-group provisioning, its own hidden/locked
+// state, or one particular token's aliases — see ManageModels's own
+// doc-comment.)
+//
+// (c) is a DISPLAY overlay and never an access control. HideTarget removes a
+// name from one token's listing; that same name keeps routing normally for
+// that same token, exactly as a model_settings "hidden" name does. The set
+// that answers "what can this principal actually reach" is
+// ModelOffering.Callable, never any listing above.
 //
 // CLOSED (security-policy — this row used to be a TODO here): ModelServers,
 // its SSE variant, and model-group-servers used to apply ONLY the
@@ -3307,11 +3324,22 @@ func isKnownAPIFlavor(flavor string) bool {
 	return false
 }
 
-// modelFlavorSets maps each active gateway model name to the set of known API
-// flavors that expose it (union of app.APIFlavors across its active mapping
-// views VISIBLE to the given principal — see visibleMappingViews). Drives
-// per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the portal
-// Models() overview builds its own view via modelsResponse.
+// modelFlavorSets maps each name this principal is OFFERED to the set of known
+// API flavors that expose it. That is three layers, in order: the union of
+// app.APIFlavors across the active mapping views VISIBLE to the principal (see
+// visibleMappingViews), then the model-group overlay (active groups added by
+// flavor union, hidden/locked names dropped), then the PER-TOKEN override-alias
+// overlay — each Offer rule's requested name added with its target's flavors,
+// each HideTarget rule's target removed (applyOverrideAliases).
+//
+// So the result is a LISTING, per principal AND per token, not a set of names
+// the principal may reach: an alias in it is rewritten before routing and is
+// not routable under that name, while a name the last two layers removed stays
+// fully callable. ModelOffering.Callable is the set that answers reach.
+//
+// Drives per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the
+// portal Models() overview builds its own view via modelsResponse, applying the
+// same three layers (see the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
 	return sets, err
