@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useState, type SubmitEvent } from 'react';
-import { Box, Button, Typography } from '@mui/material';
+import { Box, Button, Checkbox, FormControlLabel, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -12,6 +12,8 @@ import {
   PortalApiError,
   type ApplicationStatus,
   type CreateModelGroupRequest,
+  type ModelGroupMemberOrder,
+  type ModelGroupMinSpeedFallback,
   type ModelOption,
   type ModelVisibility,
   type PortalModelGroup,
@@ -37,6 +39,15 @@ type Mode = 'list' | 'create' | { edit: PortalModelGroup };
 
 const failoverModes = ['sticky', 'climb_up'] as const;
 const traversalModes = ['depth', 'breadth', 'round_robin'] as const;
+const memberOrders: ModelGroupMemberOrder[] = ['priority', 'speed'];
+const minSpeedFallbacks: ModelGroupMinSpeedFallback[] = ['error', 'ignore'];
+
+// Parse a free-text numeric input into a non-negative number; blank/invalid ->
+// 0 (min_tokens_per_second treats 0 as "off").
+function nonNegativeNumber(raw: string): number {
+  const n = Number(raw.trim());
+  return raw.trim() === '' || Number.isNaN(n) || n < 0 ? 0 : n;
+}
 
 export function ModelGroupSection({
   t,
@@ -75,6 +86,14 @@ export function ModelGroupSection({
   const [visibility, setVisibility] = useState<ModelVisibility>('shown');
   const [members, setMembers] = useState<string[]>([]);
   const [traversal, setTraversal] = useState<string>('round_robin');
+  const [loadedOnly, setLoadedOnly] = useState(false);
+  const [memberOrder, setMemberOrder] = useState<ModelGroupMemberOrder>('priority');
+  // Left blank means "not set" (omit from the request so the server's own
+  // default/unchanged-value handling applies); a typed "0" is an explicit
+  // margin of zero and IS sent.
+  const [climbSpeedMargin, setClimbSpeedMargin] = useState('');
+  const [minTokensPerSecond, setMinTokensPerSecond] = useState('');
+  const [minSpeedFallback, setMinSpeedFallback] = useState<ModelGroupMinSpeedFallback>('error');
 
   function openCreate() {
     setGatewayName('');
@@ -84,6 +103,11 @@ export function ModelGroupSection({
     setVisibility('shown');
     setMembers([]);
     setTraversal('round_robin');
+    setLoadedOnly(false);
+    setMemberOrder('priority');
+    setClimbSpeedMargin('');
+    setMinTokensPerSecond('');
+    setMinSpeedFallback('error');
     setMode('create');
   }
 
@@ -95,6 +119,11 @@ export function ModelGroupSection({
     setVisibility(row.visibility ?? 'shown');
     setMembers(row.members.map((m) => m.member_gateway_name));
     setTraversal(row.traversal || 'round_robin');
+    setLoadedOnly(row.loaded_only);
+    setMemberOrder(row.member_order === 'speed' ? 'speed' : 'priority');
+    setClimbSpeedMargin(String(row.climb_speed_margin_percent));
+    setMinTokensPerSecond(row.min_tokens_per_second ? String(row.min_tokens_per_second) : '');
+    setMinSpeedFallback(row.min_speed_fallback === 'ignore' ? 'ignore' : 'error');
     setMode({ edit: row });
   }
 
@@ -115,6 +144,22 @@ export function ModelGroupSection({
     setBusy(true);
     try {
       const memberInputs = members.map((name) => ({ member_gateway_name: name }));
+      const marginTrimmed = climbSpeedMargin.trim();
+      const marginParsed = Number(marginTrimmed);
+      // Only include the margin when the operator actually set it to a valid
+      // number, so leaving it blank never overrides the server's
+      // default/current value with 0.
+      const climbSpeedMarginPercent =
+        marginTrimmed === '' || Number.isNaN(marginParsed) ? undefined : Math.max(0, marginParsed);
+      const selectionFields = {
+        loaded_only: loadedOnly,
+        member_order: memberOrder,
+        min_tokens_per_second: nonNegativeNumber(minTokensPerSecond),
+        min_speed_fallback: minSpeedFallback,
+        ...(climbSpeedMarginPercent !== undefined
+          ? { climb_speed_margin_percent: climbSpeedMarginPercent }
+          : {}),
+      };
       if (mode === 'create') {
         const body: CreateModelGroupRequest = {
           gateway_model_name: gatewayName,
@@ -124,6 +169,7 @@ export function ModelGroupSection({
           visibility,
           members: memberInputs,
           traversal,
+          ...selectionFields,
         };
         const created = await api.createModelGroup(body);
         setData((current) => [created, ...(current ?? [])]);
@@ -136,6 +182,7 @@ export function ModelGroupSection({
           visibility,
           members: memberInputs,
           traversal,
+          ...selectionFields,
         };
         const updated = await api.updateModelGroup(mode.edit.id, body);
         setData((current) => (current ?? []).map((row) => (row.id === updated.id ? updated : row)));
@@ -343,6 +390,54 @@ export function ModelGroupSection({
                 {t.modelVisibilityHelp}
               </Typography>
             </Box>
+            <FormControlLabel
+              control={
+                <Checkbox checked={loadedOnly} onChange={(e) => setLoadedOnly(e.target.checked)} />
+              }
+              label={t.modelGroupLoadedOnly}
+            />
+            <SelectField
+              id="model-group-member-order"
+              label={t.modelGroupMemberOrder}
+              value={memberOrder}
+              onChange={(e) => setMemberOrder(e.target.value as ModelGroupMemberOrder)}
+            >
+              {memberOrders.map((v) => (
+                <option value={v} key={v}>
+                  {v === 'speed' ? t.modelGroupMemberOrderSpeed : t.modelGroupMemberOrderPriority}
+                </option>
+              ))}
+            </SelectField>
+            <Field
+              id="model-group-climb-speed-margin"
+              type="number"
+              label={t.modelGroupClimbSpeedMargin}
+              value={climbSpeedMargin}
+              onChange={(e) => setClimbSpeedMargin(e.target.value)}
+              inputProps={{ min: 0, step: 1 }}
+            />
+            <Field
+              id="model-group-min-tokens-per-second"
+              type="number"
+              label={t.modelGroupMinTokensPerSecond}
+              value={minTokensPerSecond}
+              onChange={(e) => setMinTokensPerSecond(e.target.value)}
+              inputProps={{ min: 0, step: 'any' }}
+            />
+            <SelectField
+              id="model-group-min-speed-fallback"
+              label={t.modelGroupMinSpeedFallback}
+              value={minSpeedFallback}
+              onChange={(e) => setMinSpeedFallback(e.target.value as ModelGroupMinSpeedFallback)}
+            >
+              {minSpeedFallbacks.map((v) => (
+                <option value={v} key={v}>
+                  {v === 'ignore'
+                    ? t.modelGroupMinSpeedFallbackIgnore
+                    : t.modelGroupMinSpeedFallbackError}
+                </option>
+              ))}
+            </SelectField>
             <OrderedMemberList
               members={members}
               onChange={setMembers}

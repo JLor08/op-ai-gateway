@@ -29,6 +29,11 @@ function makeGroup(overrides: Partial<PortalModelGroup> = {}): PortalModelGroup 
     visibility: 'shown',
     members: [{ member_gateway_name: 'm1' }, { member_gateway_name: 'm2' }],
     traversal: 'round_robin',
+    loaded_only: false,
+    member_order: 'priority',
+    climb_speed_margin_percent: 20,
+    min_tokens_per_second: 0,
+    min_speed_fallback: 'error',
     ...overrides,
   };
 }
@@ -164,6 +169,118 @@ describe('ModelGroupSection', () => {
     fireEvent.click(screen.getByRole('button', { name: t.modelGroupEdit }));
     const combo = await screen.findByRole('combobox', { name: t.modelVisibility });
     expect(combo).toHaveTextContent(t.modelVisibilityLocked);
+  });
+
+  it('renders the selection controls in the editor', async () => {
+    renderSection();
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupCreate }));
+
+    expect(screen.getByRole('checkbox', { name: t.modelGroupLoadedOnly })).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.modelGroupMemberOrder }));
+    expect(
+      await screen.findByRole('option', { name: t.modelGroupMemberOrderPriority }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: t.modelGroupMemberOrderSpeed })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('option', { name: t.modelGroupMemberOrderPriority }));
+
+    expect(screen.getByLabelText(t.modelGroupClimbSpeedMargin)).toBeInTheDocument();
+    expect(screen.getByLabelText(t.modelGroupMinTokensPerSecond)).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.modelGroupMinSpeedFallback }));
+    expect(
+      await screen.findByRole('option', { name: t.modelGroupMinSpeedFallbackError }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('option', { name: t.modelGroupMinSpeedFallbackIgnore }),
+    ).toBeInTheDocument();
+  });
+
+  it('sends the selection fields in the update payload, including an explicit zero margin', async () => {
+    const { fakeApi } = renderSection({
+      groups: [makeGroup({ id: 'grp_1', gateway_model_name: 'fast' })],
+    });
+    await screen.findByText('fast');
+
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupEdit }));
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: t.modelGroupLoadedOnly }));
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.modelGroupMemberOrder }));
+    fireEvent.click(await screen.findByRole('option', { name: t.modelGroupMemberOrderSpeed }));
+
+    fireEvent.change(screen.getByLabelText(t.modelGroupClimbSpeedMargin), {
+      target: { value: '0' },
+    });
+    fireEvent.change(screen.getByLabelText(t.modelGroupMinTokensPerSecond), {
+      target: { value: '5.5' },
+    });
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.modelGroupMinSpeedFallback }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.modelGroupMinSpeedFallbackIgnore }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupSave }));
+
+    await waitFor(() => expect(fakeApi.updateModelGroup).toHaveBeenCalled());
+    const [, body] = fakeApi.updateModelGroup.mock.calls[0];
+    expect(body).toMatchObject({
+      loaded_only: true,
+      member_order: 'speed',
+      climb_speed_margin_percent: 0,
+      min_tokens_per_second: 5.5,
+      min_speed_fallback: 'ignore',
+    });
+  });
+
+  it('omits the margin from the payload when the field is left blank', async () => {
+    const { created } = renderSection();
+
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupCreate }));
+    fireEvent.change(screen.getByLabelText(t.modelGroupGatewayName), {
+      target: { value: 'grp-1' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupCreate }));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0]).not.toHaveProperty('climb_speed_margin_percent');
+  });
+
+  it('shows the stored selection values for a group loaded from the API', async () => {
+    renderSection({
+      groups: [
+        makeGroup({
+          id: 'grp_1',
+          gateway_model_name: 'fast',
+          loaded_only: true,
+          member_order: 'speed',
+          climb_speed_margin_percent: 0,
+          min_tokens_per_second: 12.5,
+          min_speed_fallback: 'ignore',
+        }),
+      ],
+    });
+    await screen.findByText('fast');
+
+    fireEvent.click(screen.getByRole('button', { name: t.modelGroupEdit }));
+
+    expect(
+      (await screen.findByRole('checkbox', { name: t.modelGroupLoadedOnly })) as HTMLInputElement,
+    ).toBeChecked();
+    expect(screen.getByRole('combobox', { name: t.modelGroupMemberOrder })).toHaveTextContent(
+      t.modelGroupMemberOrderSpeed,
+    );
+    expect((screen.getByLabelText(t.modelGroupClimbSpeedMargin) as HTMLInputElement).value).toBe(
+      '0',
+    );
+    expect((screen.getByLabelText(t.modelGroupMinTokensPerSecond) as HTMLInputElement).value).toBe(
+      '12.5',
+    );
+    expect(screen.getByRole('combobox', { name: t.modelGroupMinSpeedFallback })).toHaveTextContent(
+      t.modelGroupMinSpeedFallbackIgnore,
+    );
   });
 
   it('deletes a group after confirmation', async () => {
