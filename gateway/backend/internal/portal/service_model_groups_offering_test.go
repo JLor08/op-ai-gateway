@@ -52,6 +52,23 @@ func offerGroup(t *testing.T, rs *routing.MemoryStore, id, name string, members 
 	}
 }
 
+// offerGroupLoadedOnly seeds an active, loaded_only model group with the given
+// members in priority order.
+func offerGroupLoadedOnly(t *testing.T, rs *routing.MemoryStore, id, name string, members ...string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := rs.CreateModelGroup(ctx, routing.ModelGroup{ID: id, GatewayModelName: name, DisplayName: name, Status: routing.ServerStatusActive, FailoverMode: "sticky", LoadedOnly: true, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateModelGroup %s: %v", name, err)
+	}
+	ms := make([]routing.GroupMember, 0, len(members))
+	for i, m := range members {
+		ms = append(ms, routing.GroupMember{ID: fmt.Sprintf("%s_m%d", id, i), GroupID: id, MemberGatewayName: m, Priority: i, CreatedAt: offeringTime})
+	}
+	if err := rs.SetGroupMembers(ctx, id, ms); err != nil {
+		t.Fatalf("SetGroupMembers %s: %v", id, err)
+	}
+}
+
 // offerVisibility upserts a model_settings visibility row.
 func offerVisibility(t *testing.T, rs *routing.MemoryStore, name, vis string) {
 	t.Helper()
@@ -157,6 +174,77 @@ func TestModelsOverlayGroupLoadedTopMember(t *testing.T) {
 		}
 		if len(grp.LoadedOn) != 0 {
 			t.Fatalf("group loaded_on = %#v, want empty", grp.LoadedOn)
+		}
+	})
+}
+
+// TestModelsOverlayGroupLoadedStateLoadedOnlyVsNormal proves the group
+// loaded-state rule differs for a loaded_only group versus a normal one, side
+// by side so the difference is visible: a loaded_only group is loaded when
+// ANY offerable member is loaded (LoadedOn is the union of those members'
+// servers), while a normal group keeps the existing highest-priority-member
+// rule (TestModelsOverlayGroupLoadedTopMember) unchanged.
+func TestModelsOverlayGroupLoadedStateLoadedOnlyVsNormal(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("loaded_only group: any loaded member makes the group loaded", func(t *testing.T) {
+		rs := routing.NewMemoryStore()
+		offerModel(t, rs, "srv_1", "Box1", "app_1", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+		offerModel(t, rs, "srv_2", "Box2", "app_2", []string{routing.APIFlavorOpenAI}, "m2", "m2-up", routing.ServerStatusActive)
+		offerGroupLoadedOnly(t, rs, "grp_lo", "coder-lo", "m1", "m2")
+		// Only the LOWER-priority member m2 is loaded -- a normal group would
+		// report NOT loaded here (see TestModelsOverlayGroupLoadedTopMember),
+		// but a loaded_only group must report loaded.
+		reader := fakeLoadedReader{byKey: map[string][]string{"app_2|srv_2": {"m2-up"}}}
+		svc := offerSvc(rs, reader)
+		byID := modelsByID(svc.Models(ctx, auth.Token{UserID: "usr_1"}))
+		grp, ok := byID["coder-lo"]
+		if !ok {
+			t.Fatalf("group missing from Models(): %#v", byID)
+		}
+		if !grp.Loaded {
+			t.Fatalf("loaded_only group should be loaded (lower-priority m2 loaded): %#v", grp)
+		}
+		if !reflect.DeepEqual(grp.LoadedOn, []string{"Box2"}) {
+			t.Fatalf("loaded_only group loaded_on = %#v, want [Box2]", grp.LoadedOn)
+		}
+	})
+
+	t.Run("loaded_only group: multiple loaded members union their servers", func(t *testing.T) {
+		rs := routing.NewMemoryStore()
+		offerModel(t, rs, "srv_1", "Box1", "app_1", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+		offerModel(t, rs, "srv_2", "Box2", "app_2", []string{routing.APIFlavorOpenAI}, "m2", "m2-up", routing.ServerStatusActive)
+		offerGroupLoadedOnly(t, rs, "grp_lo", "coder-lo", "m1", "m2")
+		reader := fakeLoadedReader{byKey: map[string][]string{
+			"app_1|srv_1": {"m1-up"},
+			"app_2|srv_2": {"m2-up"},
+		}}
+		svc := offerSvc(rs, reader)
+		byID := modelsByID(svc.Models(ctx, auth.Token{UserID: "usr_1"}))
+		grp := byID["coder-lo"]
+		if !grp.Loaded {
+			t.Fatalf("loaded_only group should be loaded (both members loaded): %#v", grp)
+		}
+		if !reflect.DeepEqual(grp.LoadedOn, []string{"Box1", "Box2"}) {
+			t.Fatalf("loaded_only group loaded_on = %#v, want union [Box1 Box2]", grp.LoadedOn)
+		}
+	})
+
+	t.Run("normal group: only the top-priority member's loaded state counts", func(t *testing.T) {
+		rs := routing.NewMemoryStore()
+		offerModel(t, rs, "srv_1", "Box1", "app_1", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+		offerModel(t, rs, "srv_2", "Box2", "app_2", []string{routing.APIFlavorOpenAI}, "m2", "m2-up", routing.ServerStatusActive)
+		offerGroup(t, rs, "grp_n", "coder-normal", "m1", "m2") // NOT loaded_only
+		// Only the LOWER-priority member m2 is loaded.
+		reader := fakeLoadedReader{byKey: map[string][]string{"app_2|srv_2": {"m2-up"}}}
+		svc := offerSvc(rs, reader)
+		byID := modelsByID(svc.Models(ctx, auth.Token{UserID: "usr_1"}))
+		grp := byID["coder-normal"]
+		if grp.Loaded {
+			t.Fatalf("normal group should NOT be loaded (only lower-priority m2 loaded): %#v", grp)
+		}
+		if len(grp.LoadedOn) != 0 {
+			t.Fatalf("normal group loaded_on = %#v, want empty", grp.LoadedOn)
 		}
 	})
 }
