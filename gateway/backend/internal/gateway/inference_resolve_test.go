@@ -5,7 +5,10 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -118,6 +121,29 @@ func TestResolveTargetRecordsLastUsedModelOnlyOnChange(t *testing.T) {
 	}
 }
 
+// TestResolveTargetSwallowsWriterErrorAndKeepsTarget covers the "a write
+// error is logged and swallowed" constraint from resolveTarget's doc comment
+// (inference_resolve.go): the marker is a convenience, never a reason to fail
+// a request that already has a live target. A writer that itself errors must
+// not surface that error to the caller, and the already-resolved target must
+// still come back intact.
+func TestResolveTargetSwallowsWriterErrorAndKeepsTarget(t *testing.T) {
+	s := newTestServer(t)
+	writerErr := errors.New("write failed")
+	s.LastUsedModelWriter = func(_ context.Context, _, _ string) error {
+		return writerErr
+	}
+	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
+
+	target, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "llama-70b"})
+	if err != nil {
+		t.Fatalf("resolveTarget returned %v, want nil (writer error must be swallowed)", err)
+	}
+	if target.ServerID == "" {
+		t.Fatalf("target = %#v, want the live target resolved before the writer ran", target)
+	}
+}
+
 func TestResolveTargetDoesNotRecordOnFailure(t *testing.T) {
 	// "Last used" means last SUCCESSFULLY routed — a typo or a dead model must
 	// never become the redirect target for every later request.
@@ -135,5 +161,36 @@ func TestResolveTargetDoesNotRecordOnFailure(t *testing.T) {
 	}
 	if len(writes) != 0 {
 		t.Fatalf("failed resolve wrote %v, want no write", writes)
+	}
+}
+
+// TestChatCompletionsRecordsLastUsedModel is the end-to-end regression guard
+// for all three s.resolveTarget call sites (complete, tryProxyNative,
+// beginStream): it drives a real HTTP request through ServeHTTP instead of
+// calling resolveTarget directly, so a future revert of ANY of those three
+// call sites back to the bare s.Resolver.Resolve (which every other gateway
+// test would still pass, since LastUsedModelWriter is nil everywhere else)
+// fails here. Exercises the non-streaming /v1/chat/completions path
+// (inference_complete.go's complete) specifically because it reuses the
+// existing NewTestServer + seedGatewayTestRoutes fixture (routable model
+// "qwen-coder", token "tok_dev" / secret "dev-secret") verbatim — the
+// cheapest of the three paths to stand up.
+func TestChatCompletionsRecordsLastUsedModel(t *testing.T) {
+	srv := NewTestServer()
+	var writes []string
+	srv.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+		writes = append(writes, tokenID+"="+model)
+		return nil
+	}
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, newJSONRequest(http.MethodPost, "/v1/chat/completions",
+		`{"model":"qwen-coder","messages":[{"role":"user","content":"hi"}]}`))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	if len(writes) != 1 || writes[0] != "tok_dev=qwen-coder" {
+		t.Fatalf("writes = %v, want [tok_dev=qwen-coder]", writes)
 	}
 }
