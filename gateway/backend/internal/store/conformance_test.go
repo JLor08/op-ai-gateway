@@ -4268,6 +4268,10 @@ func TestConformanceModelGroups(t *testing.T) {
 			ID: "grp1", GatewayModelName: "fast-coder", DisplayName: "Fast Coder",
 			Status: routing.ServerStatusActive, FailoverMode: "sticky", Traversal: "breadth",
 			CreatedAt: now, UpdatedAt: now,
+			// Non-default values must round-trip through every driver.
+			LoadedOnly: true, MemberOrder: routing.MemberOrderSpeed,
+			ClimbSpeedMarginPercent: 35, MinTokensPerSecond: 12.5,
+			MinSpeedFallback: routing.MinSpeedFallbackIgnore,
 		}
 		if err := s.CreateModelGroup(ctx, grp); err != nil {
 			t.Fatalf("create model group: %v", err)
@@ -4287,6 +4291,11 @@ func TestConformanceModelGroups(t *testing.T) {
 		}
 		if got.Traversal != "breadth" {
 			t.Fatalf("unexpected traversal on create: %+v", got)
+		}
+		if !got.LoadedOnly || got.MemberOrder != routing.MemberOrderSpeed ||
+			got.ClimbSpeedMarginPercent != 35 || got.MinTokensPerSecond != 12.5 ||
+			got.MinSpeedFallback != routing.MinSpeedFallbackIgnore {
+			t.Fatalf("group settings did not round-trip: %+v", got)
 		}
 
 		// Set members with out-of-order priorities [2,0,1]; read must be priority-ordered.
@@ -4377,6 +4386,13 @@ func TestConformanceModelGroups(t *testing.T) {
 		if len(all) != 2 || all[0].ID != "grp2" || all[1].ID != "grp1" {
 			// ordered by gateway_model_name: "aaa-first" < "fast-coder".
 			t.Fatalf("unexpected group list order: %+v", all)
+		}
+		// grp2 was created without the five settings; it must read back the
+		// documented defaults (reproducing pre-feature behavior exactly).
+		if all[0].LoadedOnly || all[0].MemberOrder != routing.MemberOrderPriority ||
+			all[0].ClimbSpeedMarginPercent != routing.DefaultClimbSpeedMarginPercent ||
+			all[0].MinTokensPerSecond != 0 || all[0].MinSpeedFallback != routing.MinSpeedFallbackError {
+			t.Fatalf("group settings defaults not applied: %+v", all[0])
 		}
 
 		// UpdateModelGroup on a missing id -> ErrNotFound.

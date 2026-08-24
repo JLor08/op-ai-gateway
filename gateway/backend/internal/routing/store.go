@@ -404,7 +404,37 @@ type ModelGroup struct {
 	Traversal        string // "depth" | "breadth" | "round_robin" — subgroup expansion order
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	// LoadedOnly restricts selection to members with an already-loaded candidate,
+	// so serving a request does not trigger a model load. When nothing is loaded
+	// the restriction is dropped for that request (never a dead end).
+	LoadedOnly bool
+	// MemberOrder is how the group's members are ordered for the walk:
+	// MemberOrderPriority (the manual order) or MemberOrderSpeed (fastest
+	// effective generation speed first). Unknown values fail open to priority.
+	MemberOrder string
+	// ClimbSpeedMarginPercent is how much faster a member must be before a
+	// SPEED-ordered climb_up leaves an available pin. Priority-ordered groups
+	// ignore it (no fluctuating measurement is involved).
+	ClimbSpeedMarginPercent int
+	// MinTokensPerSecond is the minimum effective generation speed a candidate
+	// must reach to count as available; 0 disables the floor. An unmeasured
+	// candidate (0) never satisfies a floor.
+	MinTokensPerSecond float64
+	// MinSpeedFallback is what happens when no candidate reaches the floor:
+	// MinSpeedFallbackError (503) or MinSpeedFallbackIgnore (retry without it).
+	MinSpeedFallback string
 }
+
+const (
+	MemberOrderPriority = "priority"
+	MemberOrderSpeed    = "speed"
+
+	MinSpeedFallbackError  = "error"
+	MinSpeedFallbackIgnore = "ignore"
+
+	// DefaultClimbSpeedMarginPercent is the shipped default margin.
+	DefaultClimbSpeedMarginPercent = 20
+)
 
 // GroupMember is one ordered member of a ModelGroup: a gateway model NAME (loose
 // reference, not a mapping id) and its priority (lower = higher priority / earlier
