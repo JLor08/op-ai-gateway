@@ -25,6 +25,41 @@ import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { useChatStore } from './ChatStore';
 
 /**
+ * Distance from the title's right edge to the first icon: the cluster covers
+ * 106px of the row (three `size="small"` icon buttons at 30px plus MUI's 16px
+ * inset), and the title's own box ends 20px short of the row (the button's
+ * gutter plus the row margin). Measured in the browser, not derived by faith.
+ */
+const ROW_ACTIONS_STRIP = 86;
+/**
+ * Runway the title fades out over, left of that strip. The fade has to be
+ * *finished* where the icons begin — spreading it across the icons instead
+ * leaves the name half-opaque underneath them.
+ */
+const TITLE_FADE_RUNWAY = 24;
+/** Class the fade rule targets on the title. */
+const ROW_TITLE_CLASS = 'op-chat-row-title';
+
+/**
+ * Fade applied to the title while the row's actions are visible. Masking the
+ * text, rather than putting a filled backdrop under the icons, keeps this free
+ * of any colour that would have to track the active theme: a backdrop built
+ * from `--sidebar` cannot be opaque in Matrix (that token is deliberately 90%
+ * translucent, so the title reads straight through it) and cannot match a
+ * hovered row either, because MUI paints its own hover tint underneath.
+ */
+const TITLE_FADE_MASK = `linear-gradient(to right, #000 calc(100% - ${
+  ROW_ACTIONS_STRIP + TITLE_FADE_RUNWAY
+}px), transparent calc(100% - ${ROW_ACTIONS_STRIP}px))`;
+
+const TITLE_FADE = {
+  maskImage: TITLE_FADE_MASK,
+  WebkitMaskImage: TITLE_FADE_MASK,
+} as const;
+/** Class the row's hover/focus rules target. */
+const ROW_ACTIONS_CLASS = 'op-chat-row-actions';
+
+/**
  * Collapsible left rail listing the user's persistent chats. Mirrors the
  * NavSidebar width-transition pattern (`var(--sidebar)` theming, icon-only when
  * collapsed). Reads the multi-chat surface directly from the store; the parent
@@ -140,8 +175,45 @@ export function ChatSidebar({
             <ListItem
               key={chat.id}
               disablePadding
+              sx={{
+                // MUI reserves 48px on the right for a single-icon
+                // secondaryAction. The actions here are hidden until hover and
+                // may sit above the title once shown, so that space is pure
+                // waste — give the name the full row and keep the button's
+                // normal gutter. MUI emits its 48px as a child rule of the list
+                // item, so the override has to be written the same way; setting
+                // paddingRight on the button itself loses to it.
+                '& > .MuiListItemButton-root': { paddingRight: 2 },
+                // Reveal on hover, and on focus-within so the actions stay
+                // reachable by keyboard. They are transparent rather than
+                // display:none for the same reason: a hidden element cannot be
+                // tabbed to in the first place.
+                [`&:hover .${ROW_ACTIONS_CLASS}, &:focus-within .${ROW_ACTIONS_CLASS}`]: {
+                  opacity: 1,
+                  pointerEvents: 'auto',
+                },
+                // The icons are allowed to sit above the title, so the title
+                // gives way underneath them for as long as they are shown.
+                [`&:hover .${ROW_TITLE_CLASS}, &:focus-within .${ROW_TITLE_CLASS}`]: TITLE_FADE,
+                // A touch device has no hover state to enter, which would leave
+                // the actions permanently unreachable — keep them visible there.
+                '@media (hover: none)': {
+                  [`& .${ROW_ACTIONS_CLASS}`]: { opacity: 1, pointerEvents: 'auto' },
+                  [`& .${ROW_TITLE_CLASS}`]: TITLE_FADE,
+                },
+              }}
               secondaryAction={
-                <Stack direction="row" sx={{ gap: 0 }}>
+                <Stack
+                  className={ROW_ACTIONS_CLASS}
+                  data-testid="chat-row-actions"
+                  direction="row"
+                  sx={{
+                    gap: 0,
+                    opacity: 0,
+                    pointerEvents: 'none',
+                    transition: 'opacity 120ms ease',
+                  }}
+                >
                   <IconAction
                     label={t.chatCopyId}
                     icon={<ContentCopyIcon fontSize="small" />}
@@ -171,7 +243,6 @@ export function ChatSidebar({
                 sx={{
                   borderRadius: '8px',
                   mx: 0.5,
-                  pr: 13,
                   gap: 1,
                   color: 'var(--nav-text)',
                   '&.Mui-selected, &.Mui-selected:hover': {
@@ -184,6 +255,7 @@ export function ChatSidebar({
                   primary={title}
                   slotProps={{
                     primary: {
+                      className: ROW_TITLE_CLASS,
                       sx: {
                         fontWeight: isActive ? 700 : 500,
                         whiteSpace: 'nowrap',
