@@ -1873,6 +1873,10 @@ type recordingProxyProvider struct {
 	gotPath    string
 	gotBody    []byte
 	gotModel   string
+	// onProxy, when set, runs at the head of ProxyNative — i.e. while the
+	// request is still in flight — so a test can inspect live state such as the
+	// active-request registry.
+	onProxy func()
 }
 
 func (p *recordingProxyProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
@@ -1887,6 +1891,12 @@ func (p *recordingProxyProvider) CompleteStream(ctx context.Context, _ routing.T
 }
 
 func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, path string, body []byte) (*provider.ProxyResponse, error) {
+	// Runs while the request is registered as in-flight (proxyNative adds it to
+	// the active registry before dispatching here), so a test can observe the
+	// live row from inside the call.
+	if p.onProxy != nil {
+		p.onProxy()
+	}
 	p.proxyCalls++
 	p.gotPath = path
 	p.gotBody = append([]byte(nil), body...)

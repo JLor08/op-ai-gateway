@@ -137,6 +137,10 @@ export type ActiveRequest = {
   service_id?: string;
   service_name?: string;
   model: string;
+  // The model the client asked for, before a token model override rewrote
+  // `model`; equal to `model` when no override fired. Mirrors the usage row's
+  // requested_model so the live view and the completed row agree.
+  requested_model: string;
   server_name: string;
   api_flavor: string;
   req_path: string;

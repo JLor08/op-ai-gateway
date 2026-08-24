@@ -61,6 +61,9 @@ function makeActive(overrides: Partial<ActiveRequest> = {}): ActiveRequest {
     token_id: 'tok_1',
     token_name: 'Live Token',
     model: 'live-model',
+    // Deliberately different from `model` (as if a token override were in play)
+    // so the two model columns stay individually addressable in these tests.
+    requested_model: 'client-model',
     server_name: 'live-server',
     api_flavor: 'openai',
     req_path: '/v1/chat/completions',
@@ -151,6 +154,33 @@ describe('Activity running-connections panel', () => {
     expect(
       screen.getByRole('heading', { level: 2, name: t.activityActiveTitle }),
     ).toBeInTheDocument();
+  });
+
+  it('shows the pre-override requested model of a running request by default', async () => {
+    // A token override is in play: the request routes to "live-model" while the
+    // client asked for "client-model". Seeing that second name without waiting
+    // for the request to finish is the reason this column exists, so it must be
+    // visible without touching the column menu.
+    renderActivity({ activeRequests: vi.fn(async () => ({ data: [makeActive()] })) });
+
+    const modelCell = await screen.findByRole('cell', { name: 'live-model' });
+    const row = modelCell.closest('tr')!;
+    expect(within(row).getByRole('cell', { name: 'client-model' })).toBeInTheDocument();
+    // Scoped to THIS table: the completed-requests table on the same page also
+    // carries a requested-model header.
+    const table = modelCell.closest('table')!;
+    expect(
+      within(table).getByRole('columnheader', { name: new RegExp(t.tableRequestedModel) }),
+    ).toBeInTheDocument();
+  });
+
+  it('renders a dash when a running request carries no requested model', async () => {
+    renderActivity({
+      activeRequests: vi.fn(async () => ({ data: [makeActive({ requested_model: '' })] })),
+    });
+
+    const row = (await screen.findByRole('cell', { name: 'live-model' })).closest('tr')!;
+    expect(within(row).getByRole('cell', { name: '-' })).toBeInTheDocument();
   });
 
   it('shows the session label when a running request has no token', async () => {

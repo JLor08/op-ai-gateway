@@ -341,6 +341,13 @@ Every `Add`/`Remove` pokes the same `usage.Broker`, so the Activity view's SSE
 stream refreshes on both request start and completion, without ever exposing a
 payload.
 
+An `ActiveRequest` mirrors the usage event's model-name fields, so the same
+three-stage trace described in §8.4.1 (`requested_model` → `model` →
+`provider_model`) is readable *while* a request is still running, not only after
+it completes. In the running-connections table `requested_model` and `model` are
+visible by default — matching the completed-requests table — and
+`provider_model` is an opt-in column.
+
 ### 8.4.4 Energy attribution
 
 Energy is **not** computed at request time — `recordUsage` always inserts

@@ -499,6 +499,12 @@ func TestProxyNativeRecordsPreOverrideRequestedModel(t *testing.T) {
 		Scopes: []string{"gateway:use", "admin"}, ModelOverride: "gw-model",
 	}, "ovr-secret")
 
+	// The native path builds its own ActiveRequest literal, so capture the live
+	// row while the request is in flight: the running-connections view must show
+	// the same pre-override name the finished usage event does.
+	var inFlight []ActiveRequest
+	prov.onProxy = func() { inFlight = srv.Active.Snapshot() }
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"client-model","input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer ovr-secret")
 	rec := httptest.NewRecorder()
@@ -507,6 +513,12 @@ func TestProxyNativeRecordsPreOverrideRequestedModel(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(inFlight) != 1 {
+		t.Fatalf("in-flight rows during ProxyNative = %d, want 1 (%#v)", len(inFlight), inFlight)
+	}
+	if inFlight[0].Model != "gw-model" || inFlight[0].RequestedModel != "client-model" {
+		t.Fatalf("in-flight model pair = (%q, %q), want (gw-model, client-model)", inFlight[0].Model, inFlight[0].RequestedModel)
 	}
 	if prov.proxyCalls != 1 {
 		t.Fatalf("ProxyNative calls = %d, want 1 (the request must take the native path, not translate)", prov.proxyCalls)
