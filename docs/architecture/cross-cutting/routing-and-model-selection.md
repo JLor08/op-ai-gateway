@@ -281,8 +281,8 @@ of resolving a single mapping.
     **candidate**, not per member, so a member with one fast and one slow
     candidate can never be served on the slow one. An unmeasured candidate
     (0 tok/s) never satisfies a nonzero floor. When no candidate anywhere
-    reaches it, `error` surfaces `ErrNoHealthyHost` (503); `ignore` re-resolves
-    the group without the floor.
+    reaches it, `error` surfaces `ErrNoHealthyHost` (502, §8); `ignore`
+    re-resolves the group without the floor.
 - **Evaluation order and relaxation.** `min_tokens_per_second` and
   `loaded_only` are both candidate-level filters inside `eligibleCandidates`
   (`internal/routing/resolver.go`, applied in that order — floor first, then
