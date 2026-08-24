@@ -65,26 +65,66 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // Existing deliberately ignores per-token visibility and the listing switches —
 // only then can the redirect tell "no such model" from "not yours".
 //
-// Fails open like the listing it shares its source with: a store error yields
-// empty sets, which makes the redirect decline rather than send a request
-// somewhere unintended. With no routing store configured it mirrors
-// ModelsForFlavor's seed fallback, so both answers stay consistent with what
-// /v1/models actually served.
+// ALL OR NOTHING. On any store error BOTH sets come back empty; the function
+// never returns a half-built answer. A populated Offered beside an empty
+// Existing would tell the redirect that every name this token can use is
+// simultaneously unknown, and it would redirect all of them. Because the caller
+// cannot distinguish a partial result from a real one, the only safe partial
+// result is none.
+//
+// This is deliberately NOT the fail-open that the listing does. ModelsForFlavor
+// falls back to seedModelNames on a store error and modelFlavorSets proceeds
+// without groups or suppression when the overlay read fails, because a glitch
+// must never blank the model list a user is looking at. Here the failure
+// direction is reversed: empty sets make the redirect DECLINE and the client
+// see today's ordinary error, instead of a request being sent somewhere
+// unintended. Same store, opposite safe direction, on purpose.
+//
+// The one shared fallback is the unconfigured routing store, where it mirrors
+// ModelsForFlavor's seed models so both answers agree with what /v1/models
+// actually served.
+//
+// Cost: one mapping traversal (activeMappingViews) and one group-overlay load,
+// both shared between the two sets — this sits on the per-request path in the
+// redirect and Service caches nothing.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string) ModelOffering {
-	out := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
+	empty := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	if s.routes == nil {
-		if isKnownAPIFlavor(flavor) {
-			for _, name := range seedModelNames {
-				out.Offered[name] = struct{}{}
-				out.Existing[name] = struct{}{}
-			}
+		if !isKnownAPIFlavor(flavor) {
+			return empty
+		}
+		out := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
+		for _, name := range seedModelNames {
+			out.Offered[name] = struct{}{}
+			out.Existing[name] = struct{}{}
 		}
 		return out
 	}
-	sets, err := s.modelFlavorSets(ctx, token)
+	// One traversal feeds both sets: Existing needs the unfiltered views,
+	// Offered the resource-group-filtered ones, and the filter is a pure
+	// post-step over the same slice (the identical one visibleMappingViews
+	// applies — see filterVisibleMappingViews).
+	views, err := s.activeMappingViews(ctx)
 	if err != nil {
-		return out
+		return empty
 	}
+	visible, err := s.filterVisibleMappingViews(ctx, token, views)
+	if err != nil {
+		return empty
+	}
+	// One overlay load feeds both sides too: its store reads do not depend on
+	// the flavor map it is built against, so it is loaded once and built twice.
+	// Unlike the listing, an overlay failure is FATAL here — the group NAMES
+	// come from it, and an Existing set missing every group would make a
+	// perfectly valid group name look unknown to the redirect.
+	overlay, err := s.loadGroupOverlayInputs(ctx)
+	if err != nil {
+		return empty
+	}
+	// Offered is composed exactly as the listing composes it (same function),
+	// so the two can never disagree about what this token sees.
+	sets, _ := flavorSetsFromViews(visible, &overlay, token)
+	out := ModelOffering{Offered: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	for name, flavors := range sets {
 		if _, ok := flavors[flavor]; ok {
 			out.Offered[name] = struct{}{}
@@ -92,40 +132,23 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	}
 	// Existing is built WITHOUT the token filter and without the visibility
 	// overlay: a model the token cannot see still exists, and conflating the two
-	// would make every invisible model look unknown. Hence activeMappingViews
-	// (token-less) rather than visibleMappingViews, and the group overlay's
-	// suppress set discarded.
-	views, err := s.activeMappingViews(ctx)
-	if err != nil {
-		return out
-	}
-	all := make(map[string]map[string]struct{})
-	for _, view := range views {
-		name := view.mapping.GatewayModelName
-		if _, ok := all[name]; !ok {
-			all[name] = make(map[string]struct{})
-		}
-		for _, f := range view.app.APIFlavors {
-			if isKnownAPIFlavor(f) {
-				all[name][f] = struct{}{}
-			}
-		}
-	}
+	// would make every invisible model look unknown. Hence the unfiltered views
+	// and the group overlay's suppress set discarded.
+	all := perNameFlavors(views)
 	for name, flavors := range all {
 		if _, ok := flavors[flavor]; ok {
 			out.Existing[name] = struct{}{}
 		}
 	}
 	// Groups share the model namespace, so a group name exists too. The overlay
-	// needs the full per-name flavor map to work from — a group is only offered
-	// once it has an offerable member, so passing anything less (an empty map,
-	// say) would silently yield no groups at all. Visibility is ignored on
-	// purpose here: a hidden group is still a name that exists.
-	if entries, _, gErr := s.modelGroupOverlay(ctx, all); gErr == nil {
-		for _, e := range entries {
-			if _, ok := e.Flavors[flavor]; ok {
-				out.Existing[e.Name] = struct{}{}
-			}
+	// is built against the full per-name flavor map — a group is only offered
+	// once it has an offerable member, so building it against anything less (an
+	// empty map, say) would silently yield no groups at all. Visibility is
+	// ignored on purpose: a hidden group is still a name that exists.
+	entries, _ := buildGroupOverlay(overlay, all)
+	for _, e := range entries {
+		if _, ok := e.Flavors[flavor]; ok {
+			out.Existing[e.Name] = struct{}{}
 		}
 	}
 	return out

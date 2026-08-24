@@ -3093,6 +3093,15 @@ func (s *Service) visibleMappingViews(ctx context.Context, token auth.Token) ([]
 	if err != nil {
 		return nil, err
 	}
+	return s.filterVisibleMappingViews(ctx, token, views)
+}
+
+// filterVisibleMappingViews is visibleMappingViews's filter half, applied to
+// views the caller has already fetched. It exists so ModelOfferingFor — which
+// needs BOTH the unfiltered and the filtered set from one traversal — applies
+// the identical filter rather than a copy of this call that could drift from
+// it.
+func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Token, views []mappingView) ([]mappingView, error) {
 	return filterByAllowedServers(ctx, s.AllowedServerIDs, token, views, func(v mappingView) string { return v.server.ID }, false)
 }
 
@@ -3137,7 +3146,23 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	if err != nil {
 		return nil, nil, err
 	}
-	sets = make(map[string]map[string]struct{})
+	// Fail open on an overlay store error, exactly as before: proceed WITHOUT
+	// groups and WITHOUT the hidden/locked suppression rather than blank the
+	// model list. ModelOfferingFor is the one caller that cannot fail open (a
+	// missing group name would read as "no such model"); it loads the inputs
+	// itself and treats the error as fatal.
+	var overlay *groupOverlayInputs
+	if loaded, gErr := s.loadGroupOverlayInputs(ctx); gErr == nil {
+		overlay = &loaded
+	}
+	sets, preSuppress = flavorSetsFromViews(views, overlay, token)
+	return sets, preSuppress, nil
+}
+
+// perNameFlavors maps each mapping view's gateway model name to the set of
+// KNOWN API flavors its application declares.
+func perNameFlavors(views []mappingView) map[string]map[string]struct{} {
+	sets := make(map[string]map[string]struct{})
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
 		if _, ok := sets[name]; !ok {
@@ -3149,6 +3174,19 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 			}
 		}
 	}
+	return sets
+}
+
+// flavorSetsFromViews is the store-free composition half of
+// modelFlavorSetsWithPreSuppress: it turns already-fetched mapping views and
+// already-loaded overlay inputs into the finished listing. A nil overlay means
+// the group/visibility inputs were unavailable — the fail-open path, which
+// yields the plain per-model sets with neither groups nor suppression.
+//
+// Factored out so ModelOfferingFor can compose the same listing from views it
+// has already read, instead of walking the mapping store a second time.
+func flavorSetsFromViews(views []mappingView, overlay *groupOverlayInputs, token auth.Token) (sets, preSuppress map[string]map[string]struct{}) {
+	sets = perNameFlavors(views)
 	preSuppress = make(map[string]map[string]struct{}, len(sets))
 	for name, flavors := range sets {
 		preSuppress[name] = flavors
@@ -3157,8 +3195,9 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	// union) and drop hidden/locked models, so /v1/models + per-flavor discovery
 	// include groups and hide non-shown models. This is ALWAYS the inference list,
 	// so a hidden/locked GROUP is skipped here too (mirrors the suppressed path in
-	// modelsResponse). Fails open on a store error.
-	if entries, suppress, gErr := s.modelGroupOverlay(ctx, sets); gErr == nil {
+	// modelsResponse).
+	if overlay != nil {
+		entries, suppress := buildGroupOverlay(*overlay, sets)
 		for name := range suppress {
 			delete(sets, name)
 		}
@@ -3176,7 +3215,7 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	// Last, so it overlays the finished listing: a name the token explicitly
 	// offers survives the group/visibility suppression above.
 	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
-	return sets, preSuppress, nil
+	return sets, preSuppress
 }
 
 // modelVisibilityByLower returns every model_settings row's visibility keyed
@@ -3248,10 +3287,40 @@ type groupOverlayEntry struct {
 // On any store read error it returns (nil, nil, err) so callers can fail open
 // (proceed WITHOUT groups/suppression); an offering glitch must never blank the
 // model list.
+//
+// It is the load-plus-build convenience wrapper over loadGroupOverlayInputs and
+// buildGroupOverlay. A caller that needs the overlay for TWO different
+// perNameFlavors maps (ModelOfferingFor: one token-filtered, one not) loads the
+// inputs once and builds twice instead — the store reads do not depend on
+// perNameFlavors at all.
 func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[string]map[string]struct{}) ([]groupOverlayEntry, map[string]struct{}, error) {
-	groups, err := s.routes.ModelGroups(ctx)
+	in, err := s.loadGroupOverlayInputs(ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	entries, suppress := buildGroupOverlay(in, perNameFlavors)
+	return entries, suppress, nil
+}
+
+// groupOverlayInputs is everything modelGroupOverlay reads from the store: the
+// groups themselves, the per-name visibility, and the flatten graph. None of it
+// depends on the perNameFlavors map the overlay is computed against, which is
+// why it can be loaded once and reused for several of them.
+type groupOverlayInputs struct {
+	groups     []routing.ModelGroup
+	visByLower map[string]string
+	// graph is keyed by lowercased, trimmed gateway_model_name, so a nested
+	// subgroup member is recognizable as a group and flattens via ITS OWN
+	// traversal strategy (routing.FlattenGroup).
+	graph map[string]routing.FlatGroup
+}
+
+// loadGroupOverlayInputs performs the overlay's store reads: ModelGroups, the
+// shared modelVisibilityByLower, and one GroupMembersByGroup per group.
+func (s *Service) loadGroupOverlayInputs(ctx context.Context) (groupOverlayInputs, error) {
+	groups, err := s.routes.ModelGroups(ctx)
+	if err != nil {
+		return groupOverlayInputs{}, err
 	}
 	// Per-model visibility keyed by lowercased name (case-insensitive lookup) —
 	// the shared read modelVisibilityByLower also backs the other
@@ -3260,30 +3329,36 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 	// visibleMappingViews).
 	visByLower, err := s.modelVisibilityByLower(ctx)
 	if err != nil {
-		return nil, nil, err
+		return groupOverlayInputs{}, err
 	}
+	// Build the flatten graph once from ALL groups (active flag preserved
+	// per-group) plus each group's ordered members.
+	graph := make(map[string]routing.FlatGroup, len(groups))
+	for _, g := range groups {
+		ms, err := s.routes.GroupMembersByGroup(ctx, g.ID)
+		if err != nil {
+			return groupOverlayInputs{}, err
+		}
+		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
+			Traversal: g.Traversal,
+			Members:   ms,
+			Active:    g.Status == routing.ServerStatusActive,
+		}
+	}
+	return groupOverlayInputs{groups: groups, visByLower: visByLower, graph: graph}, nil
+}
+
+// buildGroupOverlay is modelGroupOverlay's pure half: it touches no store and
+// derives the entries and the suppress set from already-loaded inputs and one
+// perNameFlavors map. See modelGroupOverlay for the contract.
+func buildGroupOverlay(in groupOverlayInputs, perNameFlavors map[string]map[string]struct{}) ([]groupOverlayEntry, map[string]struct{}) {
+	groups, visByLower, graph := in.groups, in.visByLower, in.graph
 	// suppress: offerable names whose visibility is hidden or locked. Keyed by
 	// the actual name as it appears in perNameFlavors so callers can delete it.
 	suppress := make(map[string]struct{})
 	for name := range perNameFlavors {
 		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
 			suppress[name] = struct{}{}
-		}
-	}
-	// Build the flatten graph once from ALL groups (active flag preserved
-	// per-group) plus each group's ordered members, keyed by lowercased
-	// gateway_model_name — so a nested subgroup member is recognizable as a
-	// group and flattens via ITS OWN traversal strategy (routing.FlattenGroup).
-	graph := make(map[string]routing.FlatGroup, len(groups))
-	for _, g := range groups {
-		ms, err := s.routes.GroupMembersByGroup(ctx, g.ID)
-		if err != nil {
-			return nil, nil, err
-		}
-		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
-			Traversal: g.Traversal,
-			Members:   ms,
-			Active:    g.Status == routing.ServerStatusActive,
 		}
 	}
 	entries := make([]groupOverlayEntry, 0)
@@ -3328,7 +3403,7 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 			LoadedOnly:              group.LoadedOnly,
 		})
 	}
-	return entries, suppress, nil
+	return entries, suppress
 }
 
 func sortedFlavorSet(set map[string]struct{}) []string {

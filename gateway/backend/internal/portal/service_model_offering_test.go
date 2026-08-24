@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
@@ -251,5 +252,142 @@ func TestOverrideAliasReachesModelsForFlavor(t *testing.T) {
 	got := svc.ModelsForFlavor(ctx, token, routing.APIFlavorOpenAI)
 	if len(got) != 1 || got[0] != "gpt-4o" {
 		t.Fatalf("ModelsForFlavor = %#v, want [gpt-4o]", got)
+	}
+}
+
+// TestOfferingIsWhollyEmptyOnMappingStoreError: a store failure yields BOTH
+// sets empty, never a half-built answer. A populated Offered next to an empty
+// Existing is indistinguishable, to the caller, from "these names exist but
+// none of them is real" — which is exactly the state that makes the Task-5
+// redirect fire on every offered name.
+func TestOfferingIsWhollyEmptyOnMappingStoreError(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	offerModel(t, rs, "srv_e", "BoxE", "app_e", []string{routing.APIFlavorOpenAI}, "qwen3-32b", "qwen-up", routing.ServerStatusActive)
+
+	svc := offerSvc(gatewayAIServersErrStore{rs}, nil)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if len(off.Offered) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("store error must yield two empty sets, got Offered=%#v Existing=%#v", off.Offered, off.Existing)
+	}
+}
+
+// TestOfferingIsWhollyEmptyOnGroupOverlayError: the group overlay is where the
+// group NAMES come from, so failing open there (as the LISTING does — see
+// TestModelsOverlayFailOpen) would hand the redirect an Existing set missing
+// every group, making a perfectly valid group name look unknown. This one
+// caller therefore treats the overlay error as fatal and returns nothing.
+func TestOfferingIsWhollyEmptyOnGroupOverlayError(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	offerModel(t, rs, "srv_e", "BoxE", "app_e", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+	offerGroup(t, rs, "grp_e", "coder", "m1")
+
+	svc := offerSvc(groupErrStore{rs}, nil)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if len(off.Offered) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("overlay error must yield two empty sets, got Offered=%#v Existing=%#v", off.Offered, off.Existing)
+	}
+	// The LISTING keeps its fail-open behaviour — this is a divergence of the
+	// offering lookup only, not a change to what /v1/models serves.
+	if !containsString(svc.ModelsForFlavor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI), "m1") {
+		t.Fatal("the listing must still fail open on an overlay error")
+	}
+}
+
+// lateFailAIServersStore serves the first AIServers call and fails every one
+// after it — a store that goes away mid-call, which is the only way a function
+// doing TWO mapping traversals can produce a half-built answer.
+type lateFailAIServersStore struct {
+	*routing.MemoryStore
+	calls int
+}
+
+func (l *lateFailAIServersStore) AIServers(ctx context.Context) ([]routing.AIServer, error) {
+	l.calls++
+	if l.calls > 1 {
+		return nil, errors.New("store: AI-server list went away mid-call")
+	}
+	return l.MemoryStore.AIServers(ctx)
+}
+
+// TestOfferingNeverReturnsAPartialResult: with the store failing from the
+// second traversal onwards, the answer must still be self-consistent — either
+// wholly empty, or an Existing that accounts for every Offered name. A second
+// traversal reintroduced into ModelOfferingFor fails here, because Offered
+// would survive it and Existing would not.
+func TestOfferingNeverReturnsAPartialResult(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	offerModel(t, rs, "srv_l", "BoxL", "app_l", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+	offerModel(t, rs, "srv_l2", "BoxL2", "app_l2", []string{routing.APIFlavorOpenAI}, "m2", "m2-up", routing.ServerStatusActive)
+
+	svc := offerSvc(&lateFailAIServersStore{MemoryStore: rs}, nil)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if len(off.Offered) == 0 {
+		if len(off.Existing) != 0 {
+			t.Fatalf("empty Offered beside a populated Existing: %#v", off.Existing)
+		}
+		return // wholly empty is the other acceptable answer
+	}
+	// This token has no override rules, so every offered name is a real model
+	// and MUST be accounted for by Existing.
+	for name := range off.Offered {
+		if _, ok := off.Existing[name]; !ok {
+			t.Fatalf("offered %q is missing from Existing (partial result): Offered=%#v Existing=%#v", name, off.Offered, off.Existing)
+		}
+	}
+}
+
+// countingRoutingStore counts the two store traversals ModelOfferingFor is at
+// risk of doing twice: the server/application/mapping walk behind
+// activeMappingViews, and the group overlay's own reads (ModelGroups plus one
+// GroupMembersByGroup per group).
+type countingRoutingStore struct {
+	*routing.MemoryStore
+	aiServers    int
+	modelGroups  int
+	groupMembers int
+}
+
+func (c *countingRoutingStore) AIServers(ctx context.Context) ([]routing.AIServer, error) {
+	c.aiServers++
+	return c.MemoryStore.AIServers(ctx)
+}
+
+func (c *countingRoutingStore) ModelGroups(ctx context.Context) ([]routing.ModelGroup, error) {
+	c.modelGroups++
+	return c.MemoryStore.ModelGroups(ctx)
+}
+
+func (c *countingRoutingStore) GroupMembersByGroup(ctx context.Context, id string) ([]routing.GroupMember, error) {
+	c.groupMembers++
+	return c.MemoryStore.GroupMembersByGroup(ctx, id)
+}
+
+// TestOfferingReadsEachStoreTraversalOnce: Offered and Existing come from the
+// same two reads with different filters applied, so one call must walk the
+// mapping store once and load the group overlay once — Task 5 puts this on the
+// per-inference-request path and Service caches nothing.
+func TestOfferingReadsEachStoreTraversalOnce(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	offerModel(t, rs, "srv_c", "BoxC", "app_c", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", routing.ServerStatusActive)
+	offerGroup(t, rs, "grp_c", "coder", "m1")
+
+	counted := &countingRoutingStore{MemoryStore: rs}
+	svc := offerSvc(counted, nil)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	if _, ok := off.Existing["coder"]; !ok {
+		t.Fatalf("precondition: group missing from Existing: %#v", off.Existing)
+	}
+	if counted.aiServers != 1 {
+		t.Fatalf("AIServers called %d times, want 1 (one mapping traversal)", counted.aiServers)
+	}
+	if counted.modelGroups != 1 {
+		t.Fatalf("ModelGroups called %d times, want 1 (one overlay load)", counted.modelGroups)
+	}
+	if counted.groupMembers != 1 {
+		t.Fatalf("GroupMembersByGroup called %d times, want 1 per group (one overlay load)", counted.groupMembers)
 	}
 }
