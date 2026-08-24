@@ -92,6 +92,7 @@ var migrations = []migration{
 	{version: 59, name: "application_proxy_listen_port", up: migration59Up},
 	{version: 60, name: "server_https_switch_override", up: migration60Up},
 	{version: 61, name: "usage_requested_model", up: migration61Up},
+	{version: 62, name: "model_group_selection_settings", up: migration62Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2729,4 +2730,23 @@ func migration60Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // instead of inlining the duplicate-tolerant add-column block.
 func migration61Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "usage_events", "requested_model text not null default ''")
+}
+
+// migration62Up adds the model-group selection settings: serve only loaded
+// members, order by measured speed, a minimum-speed floor with its fallback,
+// and the climb margin. Defaults reproduce the pre-feature behavior exactly.
+func migration62Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	cols := []string{
+		"loaded_only integer not null default 0",
+		"member_order text not null default 'priority'",
+		"climb_speed_margin_percent integer not null default 20",
+		"min_tokens_per_second real not null default 0",
+		"min_speed_fallback text not null default 'error'",
+	}
+	for _, col := range cols {
+		if err := addColumnIfMissing(ctx, tx, dl, "model_groups", col); err != nil {
+			return err
+		}
+	}
+	return nil
 }

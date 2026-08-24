@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"time"
 )
 
 // Model-group + per-model-visibility management. Groups are named priority-failover
@@ -32,6 +33,20 @@ var (
 	// make the group transitively contain itself, including a direct self-reference.
 	ErrModelGroupCycle        = errors.New("model_group.cycle")
 	ErrModelVisibilityInvalid = errors.New("model_setting.visibility_invalid")
+	// ErrModelGroupMemberOrderInvalid is an unrecognized member_order. Unlike
+	// Traversal (which fails open to a default), an unknown member_order is
+	// REJECTED on write so an operator learns of a typo instead of silently
+	// getting priority order.
+	ErrModelGroupMemberOrderInvalid = errors.New("model_group.member_order_invalid")
+	// ErrModelGroupMinSpeedFallbackInvalid is an unrecognized min_speed_fallback,
+	// rejected on write for the same reason as ErrModelGroupMemberOrderInvalid.
+	ErrModelGroupMinSpeedFallbackInvalid = errors.New("model_group.min_speed_fallback_invalid")
+	// ErrModelGroupMinTokensPerSecondInvalid is a negative min_tokens_per_second
+	// (0 is the valid, documented "no floor" off-state).
+	ErrModelGroupMinTokensPerSecondInvalid = errors.New("model_group.min_tokens_per_second_invalid")
+	// ErrModelGroupClimbSpeedMarginInvalid is a negative climb_speed_margin_percent
+	// (0 is a valid, meaningful "no margin required" policy).
+	ErrModelGroupClimbSpeedMarginInvalid = errors.New("model_group.climb_speed_margin_percent_invalid")
 )
 
 // ModelGroupDTO is the API shape of a model group. Members are ordered by priority
@@ -50,8 +65,22 @@ type ModelGroupDTO struct {
 	// Visibility is the group NAME's global visibility from model_settings
 	// ("shown" | "hidden" | "locked"; "shown" when no setting row exists). A group
 	// name lives in the same model_settings table as a model.
-	Visibility string           `json:"visibility"`
-	Members    []GroupMemberDTO `json:"members"`
+	Visibility string `json:"visibility"`
+	// LoadedOnly restricts selection to members with an already-loaded candidate
+	// (see routing.ModelGroup.LoadedOnly).
+	LoadedOnly bool `json:"loaded_only"`
+	// MemberOrder is how members are ordered for the walk: "priority" or "speed".
+	MemberOrder string `json:"member_order"`
+	// ClimbSpeedMarginPercent is how much faster a member must be before a
+	// SPEED-ordered climb_up leaves an available pin.
+	ClimbSpeedMarginPercent int `json:"climb_speed_margin_percent"`
+	// MinTokensPerSecond is the minimum effective generation speed a candidate
+	// must reach to count as available; 0 disables the floor.
+	MinTokensPerSecond float64 `json:"min_tokens_per_second"`
+	// MinSpeedFallback is what happens when no candidate reaches the floor:
+	// "error" or "ignore".
+	MinSpeedFallback string           `json:"min_speed_fallback"`
+	Members          []GroupMemberDTO `json:"members"`
 }
 
 // GroupMemberDTO is one ordered member of a group (a gateway model NAME). Order in
@@ -80,8 +109,29 @@ type CreateModelGroupRequest struct {
 	Traversal string `json:"traversal"`
 	// Visibility optionally sets the group NAME's visibility (shown | hidden |
 	// locked). Empty = "shown" (default, no setting row written).
-	Visibility string             `json:"visibility"`
-	Members    []GroupMemberInput `json:"members"`
+	Visibility string `json:"visibility"`
+	// LoadedOnly optionally restricts selection to already-loaded members.
+	// Empty (false) is itself the documented default, so no sentinel is needed.
+	LoadedOnly bool `json:"loaded_only"`
+	// MemberOrder optionally sets the walk order (priority | speed). Empty
+	// defaults to "priority"; an unrecognized value is REJECTED (not
+	// normalized) so an operator learns of a typo.
+	MemberOrder string `json:"member_order"`
+	// ClimbSpeedMarginPercent optionally sets the climb margin. nil (omitted)
+	// applies the shipped default (routing.DefaultClimbSpeedMarginPercent); an
+	// explicit value -- including 0, "no margin required" -- is persisted
+	// exactly as given. A pointer is required here because 0 is a legitimate,
+	// meaningful value, not an "unset" sentinel indistinguishable from omission.
+	ClimbSpeedMarginPercent *int `json:"climb_speed_margin_percent"`
+	// MinTokensPerSecond optionally sets the minimum-speed floor; 0 (the zero
+	// value, itself the documented off-state) disables it, so no sentinel is
+	// needed. Negative is rejected.
+	MinTokensPerSecond float64 `json:"min_tokens_per_second"`
+	// MinSpeedFallback optionally sets what happens when no candidate reaches
+	// the floor (error | ignore). Empty defaults to "error"; an unrecognized
+	// value is REJECTED (see MemberOrder).
+	MinSpeedFallback string             `json:"min_speed_fallback"`
+	Members          []GroupMemberInput `json:"members"`
 }
 
 // UpdateModelGroupRequest partially updates a group (nil pointer = leave unchanged).
@@ -96,8 +146,25 @@ type UpdateModelGroupRequest struct {
 	Traversal *string `json:"traversal"`
 	// Visibility, when non-nil, sets the group NAME's visibility (shown | hidden |
 	// locked). Nil = leave unchanged.
-	Visibility *string             `json:"visibility"`
-	Members    *[]GroupMemberInput `json:"members"`
+	Visibility *string `json:"visibility"`
+	// LoadedOnly, when non-nil, sets the loaded-only restriction. Nil = leave
+	// unchanged.
+	LoadedOnly *bool `json:"loaded_only"`
+	// MemberOrder, when non-nil, sets the walk order (priority | speed; empty
+	// normalizes to "priority", unrecognized is REJECTED). Nil = leave unchanged.
+	MemberOrder *string `json:"member_order"`
+	// ClimbSpeedMarginPercent, when non-nil, sets the climb margin -- including
+	// an explicit 0. Nil = leave unchanged (there is no "apply the shipped
+	// default" behavior on update, only on create).
+	ClimbSpeedMarginPercent *int `json:"climb_speed_margin_percent"`
+	// MinTokensPerSecond, when non-nil, sets the minimum-speed floor -- including
+	// an explicit 0 (disables it). Nil = leave unchanged. Negative is rejected.
+	MinTokensPerSecond *float64 `json:"min_tokens_per_second"`
+	// MinSpeedFallback, when non-nil, sets the floor fallback (error | ignore;
+	// empty normalizes to "error", unrecognized is REJECTED). Nil = leave
+	// unchanged.
+	MinSpeedFallback *string             `json:"min_speed_fallback"`
+	Members          *[]GroupMemberInput `json:"members"`
 }
 
 // SetModelVisibilityRequest sets a model's visibility (shown | hidden | locked).
@@ -174,6 +241,10 @@ func (s *Service) CreateModelGroup(ctx context.Context, principal auth.Token, re
 	if err != nil {
 		return ModelGroupDTO{}, err
 	}
+	selection, err := normalizeGroupSelectionForCreate(req)
+	if err != nil {
+		return ModelGroupDTO{}, err
+	}
 	members, err := s.validateGroupMembers(ctx, req.Members)
 	if err != nil {
 		return ModelGroupDTO{}, err
@@ -192,38 +263,94 @@ func (s *Service) CreateModelGroup(ctx context.Context, principal auth.Token, re
 	}
 	now := s.clock().UTC()
 	group := routing.ModelGroup{
-		ID:               "grp_" + compactRandomHex(16),
-		GatewayModelName: name,
-		DisplayName:      strings.TrimSpace(req.DisplayName),
-		Status:           status,
-		FailoverMode:     mode,
-		Traversal:        traversal,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		ID:                      "grp_" + compactRandomHex(16),
+		GatewayModelName:        name,
+		DisplayName:             strings.TrimSpace(req.DisplayName),
+		Status:                  status,
+		FailoverMode:            mode,
+		Traversal:               traversal,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		LoadedOnly:              req.LoadedOnly,
+		MemberOrder:             selection.memberOrder,
+		ClimbSpeedMarginPercent: selection.climbSpeedMarginPercent,
+		MinTokensPerSecond:      selection.minTokensPerSecond,
+		MinSpeedFallback:        selection.minSpeedFallback,
 	}
 	if group.DisplayName == "" {
 		group.DisplayName = name
 	}
-	if err := s.routes.CreateModelGroup(ctx, group); err != nil {
+	if err := s.persistNewModelGroup(ctx, group, members, vis, visProvided, now); err != nil {
 		return ModelGroupDTO{}, err
-	}
-	if err := s.routes.SetGroupMembers(ctx, group.ID, members); err != nil {
-		return ModelGroupDTO{}, err
-	}
-	// Persist the group NAME's visibility (only when explicitly provided; the
-	// default "shown" needs no row). One save sets group + visibility.
-	if visProvided {
-		if err := s.routes.UpsertModelSetting(ctx, routing.ModelSetting{
-			GatewayModelName: name,
-			Visibility:       vis,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-		}); err != nil {
-			return ModelGroupDTO{}, err
-		}
 	}
 	s.refreshGroupCache(ctx)
 	return s.buildModelGroupDTO(ctx, group)
+}
+
+// groupSelection is the validated, normalised form of a create request's four
+// combinable selection settings.
+type groupSelection struct {
+	memberOrder             string
+	climbSpeedMarginPercent int
+	minTokensPerSecond      float64
+	minSpeedFallback        string
+}
+
+// normalizeGroupSelectionForCreate validates and normalises the selection settings of a
+// create request, rejecting the whole create before any mutation when one of them is
+// invalid. An omitted member_order / min_speed_fallback takes its default; an
+// unrecognized one is rejected (see normalizeMemberOrderForWrite).
+func normalizeGroupSelectionForCreate(req CreateModelGroupRequest) (groupSelection, error) {
+	memberOrder, err := normalizeMemberOrderForWrite(req.MemberOrder)
+	if err != nil {
+		return groupSelection{}, err
+	}
+	minSpeedFallback, err := normalizeMinSpeedFallbackForWrite(req.MinSpeedFallback)
+	if err != nil {
+		return groupSelection{}, err
+	}
+	if req.MinTokensPerSecond < 0 {
+		return groupSelection{}, ErrModelGroupMinTokensPerSecondInvalid
+	}
+	// Omitted (nil) applies the shipped default; an explicit value -- including
+	// 0, "no margin required" -- is persisted exactly as given (see the type's
+	// doc comment on CreateModelGroupRequest.ClimbSpeedMarginPercent).
+	margin := routing.DefaultClimbSpeedMarginPercent
+	if req.ClimbSpeedMarginPercent != nil {
+		if *req.ClimbSpeedMarginPercent < 0 {
+			return groupSelection{}, ErrModelGroupClimbSpeedMarginInvalid
+		}
+		margin = *req.ClimbSpeedMarginPercent
+	}
+	return groupSelection{
+		memberOrder:             memberOrder,
+		climbSpeedMarginPercent: margin,
+		minTokensPerSecond:      req.MinTokensPerSecond,
+		minSpeedFallback:        minSpeedFallback,
+	}, nil
+}
+
+// persistNewModelGroup writes a validated new group: the group row, its ordered members
+// and -- only when the create explicitly provided one, since the default "shown" needs no
+// row -- the group NAME's visibility. One save sets group + visibility.
+func (s *Service) persistNewModelGroup(ctx context.Context, group routing.ModelGroup, members []routing.GroupMember, visibility string, visibilityProvided bool, now time.Time) error {
+	if err := s.routes.CreateModelGroup(ctx, group); err != nil {
+		return err
+	}
+	if err := s.routes.SetGroupMembers(ctx, group.ID, members); err != nil {
+		return err
+	}
+	if visibilityProvided {
+		if err := s.routes.UpsertModelSetting(ctx, routing.ModelSetting{
+			GatewayModelName: group.GatewayModelName,
+			Visibility:       visibility,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateModelGroup partially updates a group; a non-nil Members replaces the whole
@@ -276,6 +403,35 @@ func (s *Service) UpdateModelGroup(ctx context.Context, principal auth.Token, id
 		if err != nil {
 			return ModelGroupDTO{}, err
 		}
+	}
+	if req.LoadedOnly != nil {
+		group.LoadedOnly = *req.LoadedOnly
+	}
+	if req.MemberOrder != nil {
+		memberOrder, mErr := normalizeMemberOrderForWrite(*req.MemberOrder)
+		if mErr != nil {
+			return ModelGroupDTO{}, mErr
+		}
+		group.MemberOrder = memberOrder
+	}
+	if req.ClimbSpeedMarginPercent != nil {
+		if *req.ClimbSpeedMarginPercent < 0 {
+			return ModelGroupDTO{}, ErrModelGroupClimbSpeedMarginInvalid
+		}
+		group.ClimbSpeedMarginPercent = *req.ClimbSpeedMarginPercent
+	}
+	if req.MinTokensPerSecond != nil {
+		if *req.MinTokensPerSecond < 0 {
+			return ModelGroupDTO{}, ErrModelGroupMinTokensPerSecondInvalid
+		}
+		group.MinTokensPerSecond = *req.MinTokensPerSecond
+	}
+	if req.MinSpeedFallback != nil {
+		minSpeedFallback, fErr := normalizeMinSpeedFallbackForWrite(*req.MinSpeedFallback)
+		if fErr != nil {
+			return ModelGroupDTO{}, fErr
+		}
+		group.MinSpeedFallback = minSpeedFallback
 	}
 	var members []routing.GroupMember
 	membersChanged := false
@@ -407,14 +563,19 @@ func (s *Service) buildModelGroupDTO(ctx context.Context, group routing.ModelGro
 		visibility = setting.Visibility
 	}
 	return ModelGroupDTO{
-		ID:               group.ID,
-		GatewayModelName: group.GatewayModelName,
-		DisplayName:      group.DisplayName,
-		Status:           group.Status,
-		FailoverMode:     group.FailoverMode,
-		Traversal:        group.Traversal,
-		Visibility:       visibility,
-		Members:          memberDTOs,
+		ID:                      group.ID,
+		GatewayModelName:        group.GatewayModelName,
+		DisplayName:             group.DisplayName,
+		Status:                  group.Status,
+		FailoverMode:            group.FailoverMode,
+		Traversal:               group.Traversal,
+		Visibility:              visibility,
+		LoadedOnly:              group.LoadedOnly,
+		MemberOrder:             group.MemberOrder,
+		ClimbSpeedMarginPercent: group.ClimbSpeedMarginPercent,
+		MinTokensPerSecond:      group.MinTokensPerSecond,
+		MinSpeedFallback:        group.MinSpeedFallback,
+		Members:                 memberDTOs,
 	}, nil
 }
 
@@ -619,6 +780,38 @@ func normalizeTraversal(raw string) string {
 		return strings.TrimSpace(raw)
 	default:
 		return "round_robin"
+	}
+}
+
+// normalizeMemberOrderForWrite validates a group's member-ordering strategy on
+// write. Unlike normalizeTraversal (which fails open to a default for an
+// unknown value, matching the resolver's fail-open READ path), an
+// unrecognized member_order is REJECTED here so an operator learns of a typo
+// instead of silently getting priority order. Empty defaults to "priority".
+func normalizeMemberOrderForWrite(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	switch v {
+	case "":
+		return routing.MemberOrderPriority, nil
+	case routing.MemberOrderPriority, routing.MemberOrderSpeed:
+		return v, nil
+	default:
+		return "", ErrModelGroupMemberOrderInvalid
+	}
+}
+
+// normalizeMinSpeedFallbackForWrite validates the minimum-speed-floor
+// fallback on write; an unrecognized value is REJECTED (see
+// normalizeMemberOrderForWrite). Empty defaults to "error".
+func normalizeMinSpeedFallbackForWrite(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	switch v {
+	case "":
+		return routing.MinSpeedFallbackError, nil
+	case routing.MinSpeedFallbackError, routing.MinSpeedFallbackIgnore:
+		return v, nil
+	default:
+		return "", ErrModelGroupMinSpeedFallbackInvalid
 	}
 }
 

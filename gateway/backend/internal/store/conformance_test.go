@@ -4268,6 +4268,10 @@ func TestConformanceModelGroups(t *testing.T) {
 			ID: "grp1", GatewayModelName: "fast-coder", DisplayName: "Fast Coder",
 			Status: routing.ServerStatusActive, FailoverMode: "sticky", Traversal: "breadth",
 			CreatedAt: now, UpdatedAt: now,
+			// Non-default values must round-trip through every driver.
+			LoadedOnly: true, MemberOrder: routing.MemberOrderSpeed,
+			ClimbSpeedMarginPercent: 35, MinTokensPerSecond: 12.5,
+			MinSpeedFallback: routing.MinSpeedFallbackIgnore,
 		}
 		if err := s.CreateModelGroup(ctx, grp); err != nil {
 			t.Fatalf("create model group: %v", err)
@@ -4287,6 +4291,11 @@ func TestConformanceModelGroups(t *testing.T) {
 		}
 		if got.Traversal != "breadth" {
 			t.Fatalf("unexpected traversal on create: %+v", got)
+		}
+		if !got.LoadedOnly || got.MemberOrder != routing.MemberOrderSpeed ||
+			got.ClimbSpeedMarginPercent != 35 || got.MinTokensPerSecond != 12.5 ||
+			got.MinSpeedFallback != routing.MinSpeedFallbackIgnore {
+			t.Fatalf("group settings did not round-trip: %+v", got)
 		}
 
 		// Set members with out-of-order priorities [2,0,1]; read must be priority-ordered.
@@ -4362,11 +4371,44 @@ func TestConformanceModelGroups(t *testing.T) {
 		if reread.Traversal != "depth" {
 			t.Fatalf("update not applied to traversal: %+v", reread)
 		}
+		// UpdateModelGroup left the five settings fields untouched (updated was
+		// copied from got, which already carried the non-default values).
+		if !reread.LoadedOnly || reread.MemberOrder != routing.MemberOrderSpeed ||
+			reread.ClimbSpeedMarginPercent != 35 || reread.MinTokensPerSecond != 12.5 ||
+			reread.MinSpeedFallback != routing.MinSpeedFallbackIgnore {
+			t.Fatalf("group settings did not survive update round-trip: %+v", reread)
+		}
 
-		// A second group + ModelGroups list ordering.
+		// climb_speed_margin_percent is never store-defaulted (unlike the other
+		// four fields): 0 is a valid, meaningful margin ("no margin required, any
+		// faster candidate wins"), distinct from the documented default of 20
+		// that the API layer supplies when a caller omits the field. An explicit
+		// 0 must survive UpdateModelGroup, not get silently bumped to 20.
+		zeroMargin := reread
+		zeroMargin.ClimbSpeedMarginPercent = 0
+		zeroMargin.UpdatedAt = now.Add(2 * time.Hour)
+		if err := s.UpdateModelGroup(ctx, zeroMargin); err != nil {
+			t.Fatalf("update model group climb margin to zero: %v", err)
+		}
+		rereadZero, err := s.ModelGroupByID(ctx, "grp1")
+		if err != nil {
+			t.Fatalf("group by id after zero-margin update: %v", err)
+		}
+		if rereadZero.ClimbSpeedMarginPercent != 0 {
+			t.Fatalf("update did not preserve explicit zero climb margin: %+v", rereadZero)
+		}
+		if !rereadZero.LoadedOnly || rereadZero.MemberOrder != routing.MemberOrderSpeed ||
+			rereadZero.MinTokensPerSecond != 12.5 || rereadZero.MinSpeedFallback != routing.MinSpeedFallbackIgnore {
+			t.Fatalf("unrelated settings fields changed by zero-margin update: %+v", rereadZero)
+		}
+
+		// A second group + ModelGroups list ordering. ClimbSpeedMarginPercent is
+		// set explicitly to 0 (its Go zero value) to pin that Create persists it
+		// literally rather than store-defaulting it to 20.
 		if err := s.CreateModelGroup(ctx, routing.ModelGroup{
 			ID: "grp2", GatewayModelName: "aaa-first", DisplayName: "Alpha",
 			Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now,
+			ClimbSpeedMarginPercent: 0,
 		}); err != nil {
 			t.Fatalf("create group 2: %v", err)
 		}
@@ -4377,6 +4419,18 @@ func TestConformanceModelGroups(t *testing.T) {
 		if len(all) != 2 || all[0].ID != "grp2" || all[1].ID != "grp1" {
 			// ordered by gateway_model_name: "aaa-first" < "fast-coder".
 			t.Fatalf("unexpected group list order: %+v", all)
+		}
+		// grp2 was created without LoadedOnly/MemberOrder/MinTokensPerSecond/
+		// MinSpeedFallback; those four must read back the documented defaults
+		// (reproducing pre-feature behavior exactly). ClimbSpeedMarginPercent's
+		// explicit 0 must read back as 0, NOT the documented default of 20 —
+		// the store never substitutes it (0 is a valid margin in its own
+		// right; the API layer, not the store, supplies 20 for an omitted
+		// field).
+		if all[0].LoadedOnly || all[0].MemberOrder != routing.MemberOrderPriority ||
+			all[0].ClimbSpeedMarginPercent != 0 ||
+			all[0].MinTokensPerSecond != 0 || all[0].MinSpeedFallback != routing.MinSpeedFallbackError {
+			t.Fatalf("group settings defaults not applied: %+v", all[0])
 		}
 
 		// UpdateModelGroup on a missing id -> ErrNotFound.

@@ -170,10 +170,18 @@ Required sequence for substantial work:
    completion.
 8. Update the matching `docs/architecture/` documents with everything
    durable (design decisions, behavior, constraints) — in the same branch.
-9. **Final step before the pull request:** remove `docs/superpowers/` and
-   `docs/implementation-status.md` from the branch (their durable content
-   must already live in `docs/architecture/`).
-10. Push the branch and open a pull request. Do not merge it yourself.
+9. Run the local SonarQube quality gate whenever the environment allows it
+   (`make sonar-up` once, then `make sonar-gate`), and act on the result
+   before the cleanup below: the gate is new-code based, so what it reports
+   is this branch's own work. `make sonar-branch-findings` narrows the
+   export to the lines this branch changed. If Docker or the server is
+   unavailable, say so explicitly in the pull request rather than staying
+   silent about a skipped gate. See
+   [`development-and-quality.md` §7](docs/architecture/cross-cutting/development-and-quality.md).
+10. **Final step before the pull request:** remove `docs/superpowers/` and
+    `docs/implementation-status.md` from the branch (their durable content
+    must already live in `docs/architecture/`).
+11. Push the branch and open a pull request. Do not merge it yourself.
 
 Do not rely on chat history as the source of truth. Persist decisions in docs.
 

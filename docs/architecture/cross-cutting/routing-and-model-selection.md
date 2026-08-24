@@ -45,6 +45,13 @@ erDiagram
         float gen_tokens_per_second_at_capacity
         bool metrics_locked
     }
+    MODEL_GROUP {
+        bool loaded_only
+        string member_order "priority/speed"
+        int climb_speed_margin_percent
+        float min_tokens_per_second
+        string min_speed_fallback "error/ignore"
+    }
 ```
 
 A **`MappingCandidate`** (`internal/routing/store.go`) is the join of the three:
@@ -73,6 +80,11 @@ provider dispatch mapping (`cmd/gateway/main.go: providerClients`):
 | `mock` | `provider.NewMockWithDelay` (dev/test) |
 | `ollama` | `provider.NewOllamaClient` |
 | `vllm`, `llama_cpp`, `llama_swap`, `litellm` | `provider.NewOpenAICompatibleClient` (shared — all four speak the OpenAI HTTP dialect) |
+
+`ModelGroup` also carries five selection-setting columns, added append-only by
+migration `62`: `loaded_only`, `member_order`, `climb_speed_margin_percent`,
+`min_tokens_per_second`, `min_speed_fallback` — all defaulting to today's
+behavior. §5 documents what each one does and how they combine.
 
 ## 2. Resolution pipeline
 
@@ -188,6 +200,13 @@ in the portal (`GET /api/portal/model-servers`, its `/events` SSE sibling, and
 does not apply per-session swap-protection/reservation, since it represents the
 *general* live order, not one request's pinned outcome.
 
+The group variant additionally orders its rows by the group's **manual** member
+order. It does not model the group's selection settings — `member_order=speed`,
+`loaded_only` and the `min_tokens_per_second` floor all reorder or filter
+members inside the resolver — so such a group may be served in a different order
+than the portal shows. The ranking *within* one member is still the live
+scorer's.
+
 ## 4. Route affinity
 
 `RouteAffinity` (`internal/routing/store.go`) pins one `(APITokenID, Model,
@@ -241,11 +260,84 @@ of resolving a single mapping.
     (`internal/gateway/model_warmer.go`, 60s in-flight/cooldown dedup, 60s
     absolute call timeout) and keeps serving the pin this turn; a later turn
     climbs once the target is loaded. Falling **down** when the pin is
-    unavailable is always immediate, even to a cold member.
+    unavailable is always immediate, even to a cold member. Under `loaded_only`
+    the warm call is skipped entirely — warming a cold member is exactly what
+    the flag avoids. That suppression reads the group's **configured**
+    `loaded_only`, so it also holds on the relaxation ladder's later attempts,
+    whose loaded-only *filter* has already been dropped. Under
+    `member_order=speed` the free-climb rule gains one
+    more gate: see `climb_speed_margin_percent` below.
+- **Selection settings** (`ModelGroup`, migration `62`) — four independent,
+  combinable settings, all defaulting to today's behavior:
+  - `loaded_only` — restricts availability to members with an already-loaded
+    candidate. If nothing is loaded for the request, the restriction is
+    dropped rather than dead-ending a request (see the relaxation ladder
+    below).
+  - `member_order` (`priority` (default) | `speed`) — `speed` ranks each member
+    by its fastest *eligible* candidate's `effectiveGenTPS` (§3.1's load-aware
+    speed), descending; an unmeasured member sorts last, and ties keep the
+    manual order (`sort.SliceStable`), so a group with no measurements
+    anywhere behaves exactly as it did before speed ordering existed. Ranking
+    runs once per relaxation attempt, not once per request, because a
+    member's eligible candidates — and therefore its rank — depend on which
+    filters that attempt still has active.
+  - `climb_speed_margin_percent` (default 20) — for a speed-ordered group,
+    `climb_up` climbs only to a member whose speed exceeds the pin's by more
+    than this margin; `0` is a legitimate "no margin" value (any strictly
+    faster candidate then wins), and only a negative value is clamped to 0.
+    A priority-ordered group ignores this setting entirely. The write API
+    distinguishes the two: omitting the field on create applies the default
+    20, while an explicit `0` persists as `0` — an unset field and a
+    deliberate "no margin" policy are not the same thing.
+  - `min_tokens_per_second` (0 = off) + `min_speed_fallback` (`error` |
+    `ignore`) — a floor on the same load-aware `effectiveGenTPS`, applied per
+    **candidate**, not per member, so a member with one fast and one slow
+    candidate can never be served on the slow one. An unmeasured candidate
+    (0 tok/s) never satisfies a nonzero floor. When no candidate anywhere
+    reaches it, `error` surfaces `ErrNoHealthyHost` (502, §8); `ignore`
+    re-resolves the group without the floor.
+- **Evaluation order and relaxation.** `min_tokens_per_second` and
+  `loaded_only` are both candidate-level filters inside `eligibleCandidates`
+  (`internal/routing/resolver.go`, applied in that order — floor first, then
+  loaded-only), and both the pin check (`selectMember`) and the priority/speed
+  walk (`firstAvailable`) go through that same function — so a pinned
+  candidate that drops below the floor, or a pinned member that is no longer
+  loaded, simply stops counting as "available" and falls through to the walk,
+  exactly like a down or at-capacity pin already does. Within one attempt,
+  `resolveGroupOnce` first re-sorts the member list when `member_order=speed`
+  (so the pin check, the climb comparison, and the walk all read the same
+  "fastest first" order), then checks the pin — itself filtered by the floor
+  and loaded-only rules above — and only then falls through to the walk,
+  which applies the identical filters to every member it inspects.
+  `resolveGroup` re-attempts the whole thing (re-sort included) under a
+  **cumulative, monotone relaxation ladder** whenever an attempt finds nothing
+  eligible (never on a store error or an admission-queue timeout — those
+  propagate immediately):
+  1. floor and `loaded_only` both applied, as configured;
+  2. `loaded_only` dropped, floor still applied;
+  3. neither applied — reached only when `min_speed_fallback=ignore`.
+
+  The loaded-only filter is always dropped before the speed floor, and a
+  filter already dropped never reappears in a later attempt. Three
+  consequences follow directly from this design:
+  - The floor reads the *load-aware* effective speed, so a member can drop
+    below it purely because it is currently busy — nothing about the member
+    itself needs to change.
+  - A session loses its pin when its model is evicted under `loaded_only`,
+    and likewise when a pinned candidate falls below the floor — the honest
+    outcome in both cases, since continuing to serve the pin would mean
+    loading a cold model or serving below the configured floor.
+  - A speed-ordered group reads every member's mappings and telemetry on
+    every request (`orderMembersBySpeed`), additively to whatever the walk
+    itself reads, and the relaxation ladder can repeat that pass once per
+    attempt — where a priority-ordered walk stops at the first available
+    member. Only a group that opts into `member_order=speed` pays this cost.
 - **Error mapping** (§3g of the design): zero members, or no member with any
   live mapping → `ErrNoModelRoute` (unknown model); members exist but all are
-  gated (down/non-viable/at-capacity with no admission controller) →
-  `ErrNoHealthyHost`.
+  gated (down/non-viable/at-capacity with no admission controller, **or every
+  candidate removed by the speed floor or the loaded-only filter**) →
+  `ErrNoHealthyHost` — a member that is live but gated by policy is never
+  reported as an unknown model.
 - **Live priority.** `GroupRegistry` (`internal/gateway/group_registry.go`) is
   the resolver's `GroupResolver`: a pull-fed, in-memory snapshot rebuilt by
   `RefreshGroups` after every group/member/model-setting write (create, update,
@@ -253,7 +345,12 @@ of resolving a single mapping.
   or an added/removed member takes effect on the very next request — no
   restart, no cache TTL. A model's `ModelSetting.Visibility=="locked"` makes it
   reachable only via a group (`DirectAllowed` returns false for a direct
-  request).
+  request). The portal's "is this group loaded" rule (`internal/portal/service.go`)
+  differs for a `loaded_only` group: normally a group is loaded iff its
+  highest-priority *offerable* member is loaded, but for `loaded_only` **any**
+  offerable member being loaded makes the group loaded, and `LoadedOn` is the
+  union of those members' servers — because for such a group, any of them is
+  what would actually be served.
 
 ## 6. Concurrency capacity (CP1–CP4)
 

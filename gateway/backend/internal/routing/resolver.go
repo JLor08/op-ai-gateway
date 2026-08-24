@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/storeerr"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,13 +123,34 @@ type ProvisioningGate interface {
 	AllowedServerIDs(ctx context.Context, principal auth.Token, serverIDs []string) (map[string]bool, error)
 }
 
+// GroupPolicy is a group's selection policy: how members are ordered, which are
+// eligible, and how failover behaves. Passed as one value so the seam stays
+// readable and extensible.
+type GroupPolicy struct {
+	FailoverMode            string
+	MemberOrder             string
+	LoadedOnly              bool
+	ClimbSpeedMarginPercent int
+	MinTokensPerSecond      float64
+	MinSpeedFallback        string
+
+	// suppressWarm mirrors the group's CONFIGURED LoadedOnly and is derived internally
+	// (never supplied by a GroupResolver). It exists because LoadedOnly is a filter the
+	// relaxation ladder may drop, while "this group must never trigger a model load" is a
+	// property of the group itself and must hold on EVERY attempt: once the ladder has
+	// relaxed LoadedOnly to false, reading LoadedOnly for the climb_up warm decision would
+	// let the relaxed attempt start exactly the load the setting exists to avoid. The
+	// relaxation only ever clears LoadedOnly/MinTokensPerSecond, never this field.
+	suppressWarm bool
+}
+
 // GroupResolver exposes the model-group config to the hot path. A nil resolver
 // means no groups exist (preserving the pre-feature single-model behavior — the
 // No-Op invariant). Satisfied by *gateway.GroupRegistry.
 type GroupResolver interface {
-	// Group returns a group's ordered members and its failover mode when name is
+	// Group returns a group's ordered members and its selection policy when name is
 	// an active group; ok=false when name is not a group.
-	Group(name string) (members []GroupMember, mode string, ok bool)
+	Group(name string) (members []GroupMember, policy GroupPolicy, ok bool)
 	// DirectAllowed reports whether a direct (non-group) request for modelName is
 	// permitted. false only when the model's ModelSetting.Visibility == "locked"
 	// (a group-only model, reachable solely via a group). Model-level, not membership.
@@ -344,11 +366,19 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	// for a plain model and DirectAllowed returns true (not locked), so the whole
 	// block is transparent.
 	if r.groups != nil {
-		if members, mode, ok := r.groups.Group(req.Model); ok {
+		if members, policy, ok := r.groups.Group(req.Model); ok {
 			if !r.groups.DirectAllowed(req.Model) {
 				return Target{}, ErrNoModelRoute // a locked group: not directly requestable
 			}
-			return r.resolveGroup(ctx, token, req, key, apiFlavor, members, mode, now)
+			return r.resolveGroup(ctx, groupResolve{
+				token:     token,
+				req:       req,
+				key:       key,
+				apiFlavor: apiFlavor,
+				members:   members,
+				policy:    policy,
+				now:       now,
+			})
 		}
 		if !r.groups.DirectAllowed(req.Model) {
 			return Target{}, ErrNoModelRoute // a locked group-only model requested directly
@@ -824,6 +854,22 @@ func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, m
 	return selected, found, nil
 }
 
+// candidateEffectiveGenTPS is a candidate's load-aware effective generation speed,
+// assembled exactly as argmaxByScore assembles its scoring route so the floor and
+// the ordering agree with the scorer. An unmeasured mapping yields 0.
+func (r *Resolver) candidateEffectiveGenTPS(ctx context.Context, c MappingCandidate, model string) (float64, error) {
+	telemetry, ok, err := r.store.TelemetryByServer(ctx, c.Server.ID)
+	if err != nil {
+		return 0, fmt.Errorf("load server telemetry: %w", err)
+	}
+	k := telemetry.ActiveRequests
+	if r.activity != nil {
+		inflight, _ := r.activity.ServerActivity(c.Server.ID)
+		k = inflight
+	}
+	return effectiveGenTPS(scoringRoute(c, telemetry, ok, k, model)), nil
+}
+
 func (r *Resolver) activeMappingForApplication(ctx context.Context, applicationID string, gatewayModel string) (ModelMapping, bool, error) {
 	mappings, err := r.store.MappingsByApplication(ctx, applicationID)
 	if err != nil {
@@ -877,34 +923,117 @@ const (
 	memberAtCapacity                      // every candidate is at its effective cap (queue material)
 )
 
-// modeClimbUp is the climb_up failover mode (Task 3 acts on it; Task 2 treats it
-// exactly like sticky). Declared here so both tasks share the literal.
+// modeClimbUp is the climb_up value of GroupPolicy.FailoverMode.
 const modeClimbUp = "climb_up"
 
-// selectMember resolves one group member's candidates and reports its status. For a
-// memberAtCapacity result it also returns the member's distinct candidate server ids
-// and the MAX admission_queue_timeout_seconds across those candidates (queue material,
-// mirroring the main Resolve admission-param computation). memberAtCapacity is only
-// possible when an AdmissionController is wired (selectCandidate returns errAllAtCapacity
-// only then); otherwise an all-at-cap member fails open inside selectCandidate and comes
-// back memberOK, so a group without a wired admission controller never queues.
+// eligibleCandidates resolves one group member's candidates and applies every
+// eligibility filter the group's policy imposes: the store read, the provisioning gate,
+// the speed floor, then the loaded-only filter. Both the priority walk (selectMember)
+// and the speed ordering go through it, so they share ONE definition of eligibility
+// instead of two that can drift — the order can never rank a member the walk would
+// refuse.
 //
-// The candidates are filtered through filterProvisioned (mirroring the main Resolve
-// path) BEFORE the len(cands)==0 check: a member whose only live mappings are all on
-// servers the principal is not provisioned for reports memberNoMapping — the same
-// no-leak posture the codebase uses elsewhere (404 rather than a distinguishable
-// "exists but forbidden" signal).
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, err := r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
+// live reports whether the member had ANY live, provisioned mapping BEFORE the policy
+// filters ran. It is what keeps the two distinguishable "empty" outcomes apart:
+//
+//   - no candidates, live == false: the member has no live mapping at all — unknown-model
+//     material (memberNoMapping, mapping to ErrNoModelRoute).
+//   - no candidates, live == true: the member is real and otherwise routable, but every
+//     candidate is gated by the floor or the loaded-only filter (memberUnavailable,
+//     mapping to ErrNoHealthyHost) — gated by policy, exactly like a down/busy/non-viable
+//     candidate, not "unknown".
+//
+// Conflating the two would misreport a live-but-gated member as an unknown model. The
+// provisioning gate deliberately runs BEFORE live is taken (mirroring the main Resolve
+// path): a member whose only live mappings sit on servers the principal is not
+// provisioned for is live == false — the same no-leak posture the codebase uses elsewhere
+// (404 rather than a distinguishable "exists but forbidden" signal).
+//
+// The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
+// no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
+// before those settings existed.
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+	cands, err = r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
-		return MappingCandidate{}, memberUnavailable, nil, 0, fmt.Errorf("resolve member mappings: %w", err)
+		return nil, false, fmt.Errorf("resolve member mappings: %w", err)
 	}
 	cands, err = r.filterProvisioned(ctx, token, cands)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(cands) == 0 {
+		return nil, false, nil
+	}
+	cands, err = r.filterBySpeedFloor(ctx, cands, name, policy.MinTokensPerSecond)
+	if err != nil {
+		return nil, true, err
+	}
+	return r.filterLoaded(cands, policy.LoadedOnly), true, nil
+}
+
+// filterBySpeedFloor drops the candidates whose effective generation speed falls short of
+// the group's minimum-speed floor (GroupPolicy.MinTokensPerSecond). The floor is applied
+// CANDIDATE by candidate, before selectCandidate ever sees the slice, so a member is never
+// served on a too-slow candidate just because its fast one is busy. A floor of zero (or
+// below) disables the pass entirely — the no-op invariant: no extra store read, cands
+// returned unchanged. name is the member's gateway model name, used for the telemetry
+// lookup.
+func (r *Resolver) filterBySpeedFloor(ctx context.Context, cands []MappingCandidate, name string, minTokensPerSecond float64) ([]MappingCandidate, error) {
+	if minTokensPerSecond <= 0 {
+		return cands, nil
+	}
+	kept := make([]MappingCandidate, 0, len(cands))
+	for _, c := range cands {
+		tps, err := r.candidateEffectiveGenTPS(ctx, c, name)
+		if err != nil {
+			return nil, err
+		}
+		if tps >= minTokensPerSecond {
+			kept = append(kept, c)
+		}
+	}
+	return kept, nil
+}
+
+// filterLoaded drops the candidates whose upstream model is not currently loaded on its
+// server, for a group whose policy asks for loaded members only. It is a no-op when
+// loadedOnly is false, and equally when r.loaded is nil: unknown loaded state excludes
+// nothing, so a group without a wired checker never becomes a dead end from this filter
+// alone.
+func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []MappingCandidate {
+	if !loadedOnly || r.loaded == nil {
+		return cands
+	}
+	kept := make([]MappingCandidate, 0, len(cands))
+	for _, c := range cands {
+		if modelLoadedOn(r.loaded, c) {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
+// selectMember resolves one group member's eligible candidates and reports its status.
+// For a memberAtCapacity result it also returns the member's distinct candidate server
+// ids and the MAX admission_queue_timeout_seconds across those candidates (queue
+// material, mirroring the main Resolve admission-param computation). memberAtCapacity is
+// only possible when an AdmissionController is wired (selectCandidate returns
+// errAllAtCapacity only then); otherwise an all-at-cap member fails open inside
+// selectCandidate and comes back memberOK, so a group without a wired admission
+// controller never queues.
+//
+// Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
+// eligibleCandidates; this function only turns that outcome into a status and selects.
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, policy)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
 	if len(cands) == 0 {
-		return MappingCandidate{}, memberNoMapping, nil, 0, nil
+		if !live {
+			return MappingCandidate{}, memberNoMapping, nil, 0, nil // no live mapping at all
+		}
+		return MappingCandidate{}, memberUnavailable, nil, 0, nil // live, but every candidate gated
 	}
 	selected, ok, serr := r.selectCandidate(ctx, cands, req, now)
 	if errors.Is(serr, errAllAtCapacity) {
@@ -919,20 +1048,89 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 	return selected, memberOK, nil, 0, nil
 }
 
-// firstAvailable walks members top-down (priority order) and returns the first
-// memberOK member (its name + selection). If none is OK it returns the accumulated
-// at-capacity server ids across the skipped members and the MAX queue timeout over
-// those members (for queuing on the union), plus anyLive = whether ANY member had at
+// orderMembersBySpeed returns members re-sorted by their fastest ELIGIBLE candidate's
+// effective generation speed, descending. Eligibility is eligibleCandidates — the very
+// filters the walk applies — so the order can never rank a member the walk would refuse,
+// and a member scores on the candidate it would actually be served on rather than on one
+// the policy has already excluded. The metric is the load-aware effective speed, never the
+// raw stored gen_tokens_per_second, so it agrees with the scorer and the speed floor.
+//
+// A member with no measurement, and equally one whose candidates are all gated, scores 0
+// and therefore sorts LAST; SliceStable compares speed only, so ties keep the manual order
+// and a group with no measurements anywhere behaves exactly as it did before speed ordering
+// existed.
+//
+// Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
+// priority-ordered walk stops at the first available member. That is the price of the
+// ordering, and only groups that opt into it pay it.
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, policy GroupPolicy) ([]GroupMember, error) {
+	speed := make(map[string]float64, len(members))
+	for _, m := range members {
+		if _, done := speed[m.MemberGatewayName]; done {
+			continue // a duplicated member name is scored once
+		}
+		best := 0.0
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, policy)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cands {
+			tps, tErr := r.candidateEffectiveGenTPS(ctx, c, m.MemberGatewayName)
+			if tErr != nil {
+				return nil, tErr
+			}
+			if tps > best {
+				best = tps
+			}
+		}
+		speed[m.MemberGatewayName] = best
+	}
+	out := append([]GroupMember(nil), members...) // never reorder the caller's slice
+	sort.SliceStable(out, func(i, j int) bool {
+		return speed[out[i].MemberGatewayName] > speed[out[j].MemberGatewayName]
+	})
+	return out, nil
+}
+
+// speedMarginMet reports whether the candidate is enough faster than the pinned one to
+// justify moving a session: strictly MORE than the configured margin above it. A margin of
+// 0 is a legitimate value meaning "no margin required" — any strictly faster candidate then
+// wins; only a negative margin is clamped. An unmeasured pin (<= 0) always yields true —
+// anything measurable beats unknown.
+func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandidate, bestModel, pinnedModel string, policy GroupPolicy) (bool, error) {
+	pinnedTPS, err := r.candidateEffectiveGenTPS(ctx, pinned, pinnedModel)
+	if err != nil {
+		return false, err
+	}
+	if pinnedTPS <= 0 {
+		return true, nil
+	}
+	bestTPS, err := r.candidateEffectiveGenTPS(ctx, best, bestModel)
+	if err != nil {
+		return false, err
+	}
+	margin := policy.ClimbSpeedMarginPercent
+	if margin < 0 {
+		margin = 0
+	}
+	return bestTPS > pinnedTPS*(1+float64(margin)/100), nil
+}
+
+// firstAvailable walks members top-down — in whatever order the slice arrives in, which is
+// the manual priority order or the speed-sorted one — and returns the first memberOK member
+// (its name + selection). If none is OK it returns the accumulated at-capacity server ids
+// across the skipped members and the MAX queue timeout over those members (for queuing on
+// the union), plus anyLive = whether ANY member had at
 // least one live mapping (a member with live-but-gated candidates or at-capacity
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
 // store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time) (string, MappingCandidate, []string, int, bool, error) {
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (string, MappingCandidate, []string, int, bool, error) {
 	var atCap []string
 	queueTimeoutSecs := 0
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now)
+		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, policy)
 		if err != nil {
 			return "", MappingCandidate{}, nil, 0, false, err
 		}
@@ -1002,8 +1200,66 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 	return nil
 }
 
-// resolveGroup expands a group into its ordered members and serves the first available
-// one (failover), honoring a sticky pin. Two failover modes (§3f):
+// groupResolve bundles the per-request inputs of ONE group resolution: everything the
+// group path needs besides the context (which stays a separate first parameter, as Go
+// convention requires). It is passed BY VALUE, so a callee that adjusts a field — the
+// relaxation ladder swapping in this attempt's policy, resolveGroupOnce re-ordering
+// members by speed or advancing now across an admission wait — only ever changes its own
+// copy, never its caller's.
+type groupResolve struct {
+	token     auth.Token
+	req       inference.Request
+	key       AffinityKey
+	apiFlavor string
+	members   []GroupMember
+	policy    GroupPolicy
+	now       time.Time
+}
+
+// resolveGroup runs resolveGroupOnce under progressively relaxed eligibility filters.
+// The order encodes the spec's precedence: the loaded-only filter is dropped before the
+// speed floor is, and the floor is dropped only when min_speed_fallback says so. Each
+// relaxation is CUMULATIVE — built by mutating one carried-forward `relaxed` value, not by
+// rebuilding from the original `policy` — so the ladder is monotone: once a filter is
+// dropped it STAYS dropped in every later attempt. Rebuilding from `policy` each time would
+// let a later attempt resurrect an earlier-dropped filter (e.g. loaded_only reappearing once
+// the floor is also dropped), silently breaking both settings' documented promise that
+// nothing eligible => the restriction is dropped, never a dead end. The first attempt that
+// resolves wins; the LAST attempt's error is the one returned, so the caller still sees
+// ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
+func (r *Resolver) resolveGroup(ctx context.Context, g groupResolve) (Target, error) {
+	// Latch the configured loaded_only BEFORE any relaxation, so the climb_up warm gate
+	// keeps reading the group's own setting on every attempt (see GroupPolicy.suppressWarm).
+	g.policy.suppressWarm = g.policy.LoadedOnly
+	attempts := []GroupPolicy{g.policy}
+	relaxed := g.policy
+	if g.policy.LoadedOnly {
+		relaxed.LoadedOnly = false
+		attempts = append(attempts, relaxed)
+	}
+	if g.policy.MinTokensPerSecond > 0 && g.policy.MinSpeedFallback == MinSpeedFallbackIgnore {
+		relaxed.MinTokensPerSecond = 0
+		attempts = append(attempts, relaxed)
+	}
+	var lastErr error
+	for _, attempt := range attempts {
+		once := g
+		once.policy = attempt
+		target, err := r.resolveGroupOnce(ctx, once)
+		if err == nil {
+			return target, nil
+		}
+		if !errors.Is(err, ErrNoHealthyHost) && !errors.Is(err, ErrNoModelRoute) {
+			return Target{}, err // a real failure (store error, admission timeout) — never retried
+		}
+		lastErr = err
+	}
+	return Target{}, lastErr
+}
+
+// resolveGroupOnce expands a group into its ordered members and serves the first
+// available one (failover) under ONE fixed policy, honoring a sticky pin. Two failover
+// modes (§3f):
 //
 //   - sticky: the pin is preferred while it is available; if it is down or at-capacity the
 //     turn falls through walkPriority and re-pins, but never climbs back to a
@@ -1017,54 +1273,55 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 //     the pin is unavailable is immediate even to a cold member (you have no working model).
 //     So climb_up differs from sticky only when the pin is available AND a higher-priority
 //     member is available. A nil r.warmer makes climb_up purely passive (it only switches
-//     once a higher-priority member is loaded by other traffic).
+//     once a higher-priority member is loaded by other traffic), and so does a configured
+//     loaded_only (GroupPolicy.suppressWarm) — on every attempt of the relaxation ladder.
+//
+// Under member_order=speed the members are re-sorted by measured speed first, so
+// everything above reads "faster" wherever it says "higher-priority", and a climb_up climb
+// additionally has to clear the group's climb speed margin before it moves a session.
 //
 // Errors map per §3g: zero members OR no member with any live mapping -> ErrNoModelRoute
 // (unknown model); members with live mappings but all gated (down/busy/non-viable/at-cap)
 // -> ErrNoHealthyHost.
-func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, mode string, now time.Time) (Target, error) {
-	if len(members) == 0 {
+func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target, error) {
+	if len(g.members) == 0 {
 		return Target{}, ErrNoModelRoute
+	}
+
+	// Speed order: re-sort the member slice, because everything downstream reads order
+	// from it (firstAvailable walks it; memberIndex reads a member's rank from its
+	// position), so a re-sort here makes the whole rest of the function — the pin check,
+	// the climb comparison, the walk — mean "fastest" wherever it said "highest priority".
+	// The pass is skipped entirely for the default priority order, so that path costs
+	// exactly what it did before. Ordering happens per ATTEMPT, not once for the whole
+	// relaxation ladder, because eligibility (and therefore a member's score) depends on
+	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
+	// the candidates it can actually use.
+	if g.policy.MemberOrder == MemberOrderSpeed {
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.policy)
+		if err != nil {
+			return Target{}, err
+		}
+		g.members = ordered
 	}
 
 	// serve builds the target for a selected member and (re)pins the group affinity to it.
 	serve := func(name string, sel MappingCandidate) (Target, error) {
-		if err := r.upsertGroupPin(ctx, token, key, name, sel, now); err != nil {
+		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
 			return Target{}, err
 		}
-		return targetFrom(sel.Server, sel.Application, sel.Mapping, apiFlavor), nil
+		return targetFrom(sel.Server, sel.Application, sel.Mapping, g.apiFlavor), nil
 	}
 
-	// Check the pin's availability exactly once; the climb dance runs ONLY when the pin is
-	// available. A pin that is down or at-capacity falls straight through to the walk (an
-	// immediate fall-DOWN, even to a cold member — the intended asymmetry, no warm).
-	if pinned := r.groupPin(ctx, key, members, now); pinned != "" {
-		pinSel, pinStatus, _, _, err := r.selectMember(ctx, token, pinned, apiFlavor, req, now)
-		if err != nil {
-			return Target{}, err
-		}
-		if pinStatus == memberOK {
-			if mode == modeClimbUp {
-				// Is a higher-priority member available? The pin is memberOK, so firstAvailable
-				// stops at-or-before it in the priority order → best index <= pin index (the
-				// memberIndex guard below is belt-and-suspenders for that invariant).
-				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now)
-				if ferr != nil {
-					return Target{}, ferr
-				}
-				if best != "" && best != pinned && memberIndex(members, best) < memberIndex(members, pinned) {
-					if r.memberLoaded(bestSel) {
-						return serve(best, bestSel) // CLIMB: the better member is already loaded
-					}
-					if r.warmer != nil {
-						r.warmer.Warm(ctx, best) // load-ahead (non-blocking); keep serving the pin this turn
-					}
-					// Fall through to serve the pin below; a later turn climbs once best is loaded.
-				}
-			}
-			return serve(pinned, pinSel)
-		}
-		// Pin down OR at-capacity: fall through to walkPriority + re-pin (no warm).
+	// The pin (and, under climb_up, the climb dance) decides this turn's member; an empty
+	// name means there is nothing usable to serve from the pin and the walk below takes
+	// over.
+	pinned, pinSel, err := r.pinnedMember(ctx, g)
+	if err != nil {
+		return Target{}, err
+	}
+	if pinned != "" {
+		return serve(pinned, pinSel)
 	}
 
 	// Fresh request or a fallen-through pin: walk priorities; queue only if every member
@@ -1074,7 +1331,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, token, members, apiFlavor, req, now)
+		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
@@ -1084,7 +1341,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 		if len(atCap) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(queueTimeoutSecs) * time.Second
 			if queueTimeout > 0 && !deadlineSet {
-				deadline = now.Add(queueTimeout)
+				deadline = g.now.Add(queueTimeout)
 				deadlineSet = true
 			}
 			wait := time.Duration(0) // 0 => unbounded (ctx-only)
@@ -1100,7 +1357,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 			if werr := r.admission.WaitForSlot(ctx, distinctStrings(atCap), wait); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
-			now = r.clock()
+			g.now = r.clock()
 			continue
 		}
 		// No servable member and nothing to queue. §3g: if NO member has any live
@@ -1111,6 +1368,84 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 		}
 		return Target{}, ErrNoHealthyHost
 	}
+}
+
+// pinnedMember reports the member a pinned group session is to be served on THIS turn,
+// with its selection — the pin itself, or (under climb_up only) a better-ranked member the
+// session may climb to right now. The pin's availability is checked exactly once here, and
+// the climb dance runs ONLY when the pin is available.
+//
+// An empty name means "nothing to serve from the pin": there is no usable pin, or the pin
+// is down / at-capacity. The caller then falls straight through to the ordinary walk and
+// re-pins — an immediate fall-DOWN, even to a cold member, which is the intended asymmetry
+// (no warm). A store/selection error is propagated and never falls through.
+func (r *Resolver) pinnedMember(ctx context.Context, g groupResolve) (string, MappingCandidate, error) {
+	pinned := r.groupPin(ctx, g.key, g.members, g.now)
+	if pinned == "" {
+		return "", MappingCandidate{}, nil
+	}
+	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, g.policy)
+	if err != nil {
+		return "", MappingCandidate{}, err
+	}
+	if pinStatus != memberOK {
+		return "", MappingCandidate{}, nil // pin down OR at-capacity
+	}
+	if g.policy.FailoverMode == modeClimbUp {
+		best, bestSel, cErr := r.climbTarget(ctx, g, pinned, pinSel)
+		if cErr != nil {
+			return "", MappingCandidate{}, cErr
+		}
+		if best != "" {
+			return best, bestSel, nil // CLIMB
+		}
+	}
+	return pinned, pinSel, nil
+}
+
+// climbTarget runs the climb_up dance for an AVAILABLE pin: it reports the better-ranked
+// member the session should move to right now, or "" to keep serving the pin this turn.
+//
+// A climb happens only when a better-ranked member is available AND is already loaded — a
+// free climb, no cold-start stall. When it is not loaded the session stays on the pin and
+// a best-effort background warm is fired instead, so a later turn can climb once the
+// better member is loaded. Under speed ordering "better" means "faster", and a marginally
+// faster member is not worth moving a live session to: the configured climb margin has to
+// be cleared first. That gate sits ON TOP of the free-climb rule, never replacing it, and
+// is consulted only for a speed-ordered group, so a priority-ordered one climbs exactly as
+// it always did.
+func (r *Resolver) climbTarget(ctx context.Context, g groupResolve, pinned string, pinSel MappingCandidate) (string, MappingCandidate, error) {
+	// Is a better-ranked member available? The pin is memberOK, so firstAvailable stops
+	// at-or-before it in the effective order → best index <= pin index (the memberIndex
+	// guard below is belt-and-suspenders for that invariant).
+	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.policy)
+	if err != nil {
+		return "", MappingCandidate{}, err
+	}
+	if best == "" || best == pinned || memberIndex(g.members, best) >= memberIndex(g.members, pinned) {
+		return "", MappingCandidate{}, nil
+	}
+	if g.policy.MemberOrder == MemberOrderSpeed {
+		met, mErr := r.speedMarginMet(ctx, bestSel, pinSel, best, pinned, g.policy)
+		if mErr != nil {
+			return "", MappingCandidate{}, mErr
+		}
+		if !met {
+			// Not materially faster: keep the session where it is, and do not warm a member
+			// we would refuse to climb to anyway.
+			return "", MappingCandidate{}, nil
+		}
+	}
+	if r.memberLoaded(bestSel) {
+		return best, bestSel, nil // the better member is already loaded
+	}
+	// suppressWarm, not LoadedOnly: a loaded_only group must never trigger a load,
+	// including on an attempt whose loaded-only FILTER the relaxation ladder has already
+	// dropped.
+	if r.warmer != nil && !g.policy.suppressWarm {
+		r.warmer.Warm(ctx, best) // load-ahead (non-blocking); keep serving the pin this turn
+	}
+	return "", MappingCandidate{}, nil
 }
 
 // memberNameExists reports whether name is one of the group's member gateway names.

@@ -25,8 +25,21 @@ func groupSeedStore(t *testing.T) *routing.MemoryStore {
 			t.Fatalf("CreateModelGroup %s: %v", g.ID, err)
 		}
 	}
-	mustGroup(routing.ModelGroup{ID: "grp_1", GatewayModelName: "group-one", DisplayName: "Group One", Status: routing.ServerStatusActive, FailoverMode: "climb_up", CreatedAt: now, UpdatedAt: now})
-	mustGroup(routing.ModelGroup{ID: "grp_2", GatewayModelName: "Group-Two", DisplayName: "Group Two", Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now})
+	mustGroup(routing.ModelGroup{
+		ID: "grp_1", GatewayModelName: "group-one", DisplayName: "Group One",
+		Status: routing.ServerStatusActive, FailoverMode: "climb_up",
+		LoadedOnly: true, MemberOrder: routing.MemberOrderSpeed,
+		ClimbSpeedMarginPercent: 35, MinTokensPerSecond: 12.5,
+		MinSpeedFallback: routing.MinSpeedFallbackIgnore,
+		CreatedAt:        now, UpdatedAt: now,
+	})
+	mustGroup(routing.ModelGroup{
+		ID: "grp_2", GatewayModelName: "Group-Two", DisplayName: "Group Two",
+		Status: routing.ServerStatusActive, FailoverMode: "sticky",
+		// Garbage enum values: the registry must fail these open to the defaults.
+		MemberOrder: "bogus-order", MinSpeedFallback: "bogus-fallback",
+		CreatedAt: now, UpdatedAt: now,
+	})
 	mustGroup(routing.ModelGroup{ID: "grp_3", GatewayModelName: "group-disabled", DisplayName: "Disabled", Status: routing.ServerStatusDisabled, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now})
 	if err := mem.SetGroupMembers(ctx, "grp_1", []routing.GroupMember{
 		{MemberGatewayName: "m-a", Priority: 0},
@@ -56,12 +69,17 @@ func TestGroupRegistryRefreshBuildsSnapshot(t *testing.T) {
 		t.Fatalf("RefreshGroups: %v", err)
 	}
 
-	members, mode, ok := reg.Group("group-one")
+	members, policy, ok := reg.Group("group-one")
 	if !ok {
 		t.Fatal("Group(group-one) not found")
 	}
-	if mode != "climb_up" {
-		t.Fatalf("mode = %q, want climb_up", mode)
+	if policy.FailoverMode != "climb_up" {
+		t.Fatalf("FailoverMode = %q, want climb_up", policy.FailoverMode)
+	}
+	if !policy.LoadedOnly || policy.MemberOrder != routing.MemberOrderSpeed ||
+		policy.ClimbSpeedMarginPercent != 35 || policy.MinTokensPerSecond != 12.5 ||
+		policy.MinSpeedFallback != routing.MinSpeedFallbackIgnore {
+		t.Fatalf("policy = %+v, want all six non-default values carried through", policy)
 	}
 	if len(members) != 2 || members[0].MemberGatewayName != "m-a" || members[1].MemberGatewayName != "m-b" {
 		t.Fatalf("members = %+v, want [m-a, m-b] in priority order", members)
@@ -71,8 +89,16 @@ func TestGroupRegistryRefreshBuildsSnapshot(t *testing.T) {
 	if _, _, ok := reg.Group("GROUP-ONE"); !ok {
 		t.Fatal("case-insensitive Group(GROUP-ONE) failed")
 	}
-	if _, _, ok := reg.Group("group-two"); !ok {
+	twoMembers, twoPolicy, ok := reg.Group("group-two")
+	if !ok {
 		t.Fatal("Group(group-two) failed (stored as Group-Two)")
+	}
+	_ = twoMembers
+	if twoPolicy.MemberOrder != routing.MemberOrderPriority {
+		t.Fatalf("unknown MemberOrder should fail open to %q, got %q", routing.MemberOrderPriority, twoPolicy.MemberOrder)
+	}
+	if twoPolicy.MinSpeedFallback != routing.MinSpeedFallbackError {
+		t.Fatalf("unknown MinSpeedFallback should fail open to %q, got %q", routing.MinSpeedFallbackError, twoPolicy.MinSpeedFallback)
 	}
 
 	// A disabled group is not offered.
@@ -81,7 +107,7 @@ func TestGroupRegistryRefreshBuildsSnapshot(t *testing.T) {
 	}
 	// An unknown name.
 	if _, _, ok := reg.Group("nope"); ok {
-		t.Fatal("Group(nope) should be (nil, \"\", false)")
+		t.Fatal("Group(nope) should report ok == false for an unknown name")
 	}
 
 	// Group returns a COPY: mutating it must not leak into the registry.
@@ -215,12 +241,12 @@ func TestGroupRegistryFlattensNestedGroups(t *testing.T) {
 		t.Fatalf("RefreshGroups: %v", err)
 	}
 
-	members, mode, ok := reg.Group("G")
+	members, policy, ok := reg.Group("G")
 	if !ok {
 		t.Fatal("Group(G) not found")
 	}
-	if mode != "climb_up" {
-		t.Fatalf("mode = %q, want climb_up", mode)
+	if policy.FailoverMode != "climb_up" {
+		t.Fatalf("FailoverMode = %q, want climb_up", policy.FailoverMode)
 	}
 	want := []string{"A", "C", "B", "E", "D", "F", "J"}
 	got := make([]string, len(members))

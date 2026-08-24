@@ -487,6 +487,25 @@ const de = {
   modelGroupTraversalHelp:
     'Reihenfolge, in der die Modelle aus Untergruppen für den Failover durchsucht werden.',
   modelGroupCycleError: 'Zyklus: eine Gruppe kann sich nicht selbst enthalten.',
+  modelGroupLoadedOnly: 'Nur geladene Modelle',
+  modelGroupLoadedOnlyHelp:
+    'Bedient nur Mitglieder, die bereits geladen sind. Ist nirgends etwas geladen, wird doch geladen.',
+  modelGroupMemberOrder: 'Reihenfolge',
+  modelGroupMemberOrderPriority: 'Priorität',
+  modelGroupMemberOrderSpeed: 'Geschwindigkeit',
+  modelGroupMemberOrderHelp:
+    'Priorität: die manuelle Reihenfolge. Geschwindigkeit: das gemessen schnellste Mitglied zuerst.',
+  modelGroupClimbSpeedMargin: 'Wechsel-Schwelle (%)',
+  modelGroupClimbSpeedMarginHelp:
+    'Nur bei Reihenfolge „Geschwindigkeit“: So viel schneller muss ein Mitglied sein, damit eine laufende Sitzung wechselt. Leer übernimmt den Vorgabewert (20); eine eingetragene 0 bedeutet „keine Schwelle“.',
+  modelGroupMinTokensPerSecond: 'Mindestgeschwindigkeit (Tokens/s)',
+  modelGroupMinTokensPerSecondHelp:
+    'Langsamere Kandidaten werden übersprungen. 0 oder leer schaltet die Mindestgeschwindigkeit ab.',
+  modelGroupMinSpeedFallback: 'Wenn nichts erreicht wird',
+  modelGroupMinSpeedFallbackError: 'Fehler melden',
+  modelGroupMinSpeedFallbackIgnore: 'Ohne Mindestgeschwindigkeit fortfahren',
+  modelGroupMinSpeedFallbackHelp:
+    'Was passiert, wenn kein Kandidat die Mindestgeschwindigkeit erreicht: Anfrage mit Fehler ablehnen oder ohne die Mindestgeschwindigkeit bedienen.',
   modelVisibility: 'Sichtbarkeit',
   modelVisibilityShown: 'Sichtbar',
   modelVisibilityHidden: 'Ausgeblendet',
@@ -2107,6 +2126,25 @@ const en: PortalMessages = {
   modelGroupTraversalRoundRobin: 'Round-robin',
   modelGroupTraversalHelp: 'Order in which models from subgroups are searched for failover.',
   modelGroupCycleError: 'Cycle: a group cannot contain itself.',
+  modelGroupLoadedOnly: 'Loaded models only',
+  modelGroupLoadedOnlyHelp:
+    'Serve only members that are already loaded. If nothing is loaded anywhere, a model is loaded after all.',
+  modelGroupMemberOrder: 'Order',
+  modelGroupMemberOrderPriority: 'Priority',
+  modelGroupMemberOrderSpeed: 'Speed',
+  modelGroupMemberOrderHelp:
+    'Priority: the manual order. Speed: the fastest measured member first.',
+  modelGroupClimbSpeedMargin: 'Switch threshold (%)',
+  modelGroupClimbSpeedMarginHelp:
+    'Only with the “Speed” order: how much faster a member must be before a running session switches to it. Blank takes the default (20); an explicit 0 means “no threshold”.',
+  modelGroupMinTokensPerSecond: 'Minimum speed (tokens/s)',
+  modelGroupMinTokensPerSecondHelp:
+    'Slower candidates are skipped. 0 or blank turns the minimum off.',
+  modelGroupMinSpeedFallback: 'When nothing qualifies',
+  modelGroupMinSpeedFallbackError: 'Report an error',
+  modelGroupMinSpeedFallbackIgnore: 'Continue without the minimum',
+  modelGroupMinSpeedFallbackHelp:
+    'What happens when no candidate reaches the minimum speed: reject the request with an error, or serve it without the minimum.',
   modelVisibility: 'Visibility',
   modelVisibilityShown: 'Shown',
   modelVisibilityHidden: 'Hidden',

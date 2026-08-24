@@ -1816,14 +1816,30 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			isGroup := make(map[string]struct{})
 			if entries, suppressSet, gErr := s.modelGroupOverlay(ctx, flavors); gErr == nil {
 				// A group is "loaded" iff its highest-priority OFFERABLE member is
-				// loaded. Capture that BEFORE suppressing hidden/locked names — a
-				// hidden member is still a full group member.
+				// loaded -- except for a loaded_only group, where ANY loaded member
+				// is what will actually be served, so any of them makes it loaded
+				// (LoadedOn is then the union of those members' servers). Capture
+				// that BEFORE suppressing hidden/locked names — a hidden member is
+				// still a full group member.
 				groupLoaded := make(map[string]map[string]struct{}, len(entries))
 				for _, e := range entries {
-					if len(e.OrderedOfferableMembers) > 0 {
-						if servers := loadedOn[e.OrderedOfferableMembers[0]]; len(servers) > 0 {
-							groupLoaded[e.Name] = servers
+					if len(e.OrderedOfferableMembers) == 0 {
+						continue
+					}
+					if e.LoadedOnly {
+						union := make(map[string]struct{})
+						for _, member := range e.OrderedOfferableMembers {
+							for srv := range loadedOn[member] {
+								union[srv] = struct{}{}
+							}
 						}
+						if len(union) > 0 {
+							groupLoaded[e.Name] = union
+						}
+						continue
+					}
+					if servers := loadedOn[e.OrderedOfferableMembers[0]]; len(servers) > 0 {
+						groupLoaded[e.Name] = servers
 					}
 				}
 				// A group is "offered on" the UNION of its offerable members' servers.
@@ -3144,6 +3160,12 @@ type groupOverlayEntry struct {
 	Flavors                 map[string]struct{}
 	OrderedOfferableMembers []string
 	Visibility              string
+	// LoadedOnly carries the group's loaded_only selection setting so the
+	// group's reported loaded-state (see groupLoaded in modelsResponse) can
+	// use the union of ALL offerable members' loaded state, not just the
+	// highest-priority one -- because for a loaded_only group ANY of them is
+	// what will actually be served.
+	LoadedOnly bool
 }
 
 // modelGroupOverlay computes the model-group additions and the model-visibility
@@ -3241,6 +3263,7 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 			Flavors:                 flavors,
 			OrderedOfferableMembers: ordered,
 			Visibility:              vis,
+			LoadedOnly:              group.LoadedOnly,
 		})
 	}
 	return entries, suppress, nil

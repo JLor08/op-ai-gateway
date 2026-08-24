@@ -97,7 +97,7 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 |---|---|---|---|
 | `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller |
 | `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; SSE push on load-state change |
-| `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked as the resolver would try them |
+| `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
 | `/api/portal/model-settings/{name}` | PUT | **`admin`** | Set a model's visibility |
 | `/api/portal/servers`, `/servers/{id}[/...]` | GET/POST, GET/PATCH/DELETE + sub-paths (energy, admin-groups, applications, agent-token, resource-groups, models, certificate, https-switch-override, ping) | `gateway:use` + object-level ownership inside `portal.Service` | AI server CRUD and per-server management surface |

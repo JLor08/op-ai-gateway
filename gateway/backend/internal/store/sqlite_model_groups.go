@@ -16,7 +16,12 @@ import (
 
 // CreateModelGroup inserts a new model group. A duplicate id classifies as
 // ErrConflict. An empty FailoverMode defaults to "sticky" (mirrors the column
-// default so a caller that omits it reads back the same value).
+// default so a caller that omits it reads back the same value). MemberOrder
+// and MinSpeedFallback are defaulted the same way (their zero Go values do
+// not match the column defaults). ClimbSpeedMarginPercent is NOT defaulted
+// here: 0 is a valid margin (no margin required, any faster candidate wins),
+// so it is never substituted here; the API layer supplies the default of 20
+// when a caller omits the field.
 func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelGroup) error {
 	failover := group.FailoverMode
 	if failover == "" {
@@ -26,10 +31,19 @@ func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelG
 	if traversal == "" {
 		traversal = "round_robin"
 	}
+	memberOrder := group.MemberOrder
+	if memberOrder == "" {
+		memberOrder = routing.MemberOrderPriority
+	}
+	minSpeedFallback := group.MinSpeedFallback
+	if minSpeedFallback == "" {
+		minSpeedFallback = routing.MinSpeedFallbackError
+	}
 	_, err := s.exec(ctx, `
 		insert into model_groups (
-			id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal
-		) values (?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal,
+			loaded_only, member_order, climb_speed_margin_percent, min_tokens_per_second, min_speed_fallback
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		group.ID,
 		group.GatewayModelName,
 		group.DisplayName,
@@ -38,6 +52,11 @@ func (s *SQLiteStore) CreateModelGroup(ctx context.Context, group routing.ModelG
 		group.CreatedAt,
 		group.UpdatedAt,
 		traversal,
+		group.LoadedOnly,
+		memberOrder,
+		group.ClimbSpeedMarginPercent,
+		group.MinTokensPerSecond,
+		minSpeedFallback,
 	)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -59,9 +78,22 @@ func (s *SQLiteStore) UpdateModelGroup(ctx context.Context, group routing.ModelG
 	if traversal == "" {
 		traversal = "round_robin"
 	}
+	memberOrder := group.MemberOrder
+	if memberOrder == "" {
+		memberOrder = routing.MemberOrderPriority
+	}
+	// ClimbSpeedMarginPercent is NOT defaulted here: 0 is a valid margin (no
+	// margin required, any faster candidate wins), so it is never substituted
+	// here; the API layer supplies the default of 20 when a caller omits the
+	// field.
+	minSpeedFallback := group.MinSpeedFallback
+	if minSpeedFallback == "" {
+		minSpeedFallback = routing.MinSpeedFallbackError
+	}
 	result, err := s.exec(ctx, `
 		update model_groups set
-			gateway_model_name = ?, display_name = ?, status = ?, failover_mode = ?, updated_at = ?, traversal = ?
+			gateway_model_name = ?, display_name = ?, status = ?, failover_mode = ?, updated_at = ?, traversal = ?,
+			loaded_only = ?, member_order = ?, climb_speed_margin_percent = ?, min_tokens_per_second = ?, min_speed_fallback = ?
 		where id = ?`,
 		group.GatewayModelName,
 		group.DisplayName,
@@ -69,6 +101,11 @@ func (s *SQLiteStore) UpdateModelGroup(ctx context.Context, group routing.ModelG
 		failover,
 		group.UpdatedAt,
 		traversal,
+		group.LoadedOnly,
+		memberOrder,
+		group.ClimbSpeedMarginPercent,
+		group.MinTokensPerSecond,
+		minSpeedFallback,
 		group.ID,
 	)
 	if err != nil {
@@ -83,7 +120,8 @@ func (s *SQLiteStore) UpdateModelGroup(ctx context.Context, group routing.ModelG
 // ModelGroupByID returns one group. A missing id is ErrNotFound.
 func (s *SQLiteStore) ModelGroupByID(ctx context.Context, id string) (routing.ModelGroup, error) {
 	row := s.queryRow(ctx, `
-		select id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal
+		select id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal,
+			loaded_only, member_order, climb_speed_margin_percent, min_tokens_per_second, min_speed_fallback
 		from model_groups where id = ?`, id)
 	return scanModelGroup(row)
 }
@@ -91,7 +129,8 @@ func (s *SQLiteStore) ModelGroupByID(ctx context.Context, id string) (routing.Mo
 // ModelGroups returns all groups, ordered by gateway_model_name then id.
 func (s *SQLiteStore) ModelGroups(ctx context.Context) ([]routing.ModelGroup, error) {
 	rows, err := s.query(ctx, `
-		select id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal
+		select id, gateway_model_name, display_name, status, failover_mode, created_at, updated_at, traversal,
+			loaded_only, member_order, climb_speed_margin_percent, min_tokens_per_second, min_speed_fallback
 		from model_groups order by gateway_model_name, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list model groups: %w", err)
@@ -262,6 +301,7 @@ func (s *SQLiteStore) UpsertModelSetting(ctx context.Context, setting routing.Mo
 
 func scanModelGroup(row rowScanner) (routing.ModelGroup, error) {
 	var group routing.ModelGroup
+	var loadedOnly int64
 	err := row.Scan(
 		&group.ID,
 		&group.GatewayModelName,
@@ -271,6 +311,11 @@ func scanModelGroup(row rowScanner) (routing.ModelGroup, error) {
 		&group.CreatedAt,
 		&group.UpdatedAt,
 		&group.Traversal,
+		&loadedOnly,
+		&group.MemberOrder,
+		&group.ClimbSpeedMarginPercent,
+		&group.MinTokensPerSecond,
+		&group.MinSpeedFallback,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.ModelGroup{}, ErrNotFound
@@ -278,6 +323,7 @@ func scanModelGroup(row rowScanner) (routing.ModelGroup, error) {
 	if err != nil {
 		return routing.ModelGroup{}, fmt.Errorf("scan model group: %w", err)
 	}
+	group.LoadedOnly = loadedOnly != 0
 	return group, nil
 }
 

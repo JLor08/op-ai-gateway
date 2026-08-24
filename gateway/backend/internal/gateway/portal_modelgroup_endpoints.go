@@ -17,11 +17,17 @@ import (
 
 const msgModelGroupNotFound = "model group not found"
 
-// handlePortalModelGroupServers returns every (model, server) a model group can serve with a live
-// selection-order rank. gateway:use, GET. name=<group>. An unknown/inactive group (or a nil group
+// handlePortalModelGroupServers returns every (model, server) a model group can serve with a
+// display rank. gateway:use, GET. name=<group>. An unknown/inactive group (or a nil group
 // registry) yields empty data — never an error. The rank = available candidates first, then in
-// flattened traversal order (the order the group's own failover walk would try), then by
-// descending live score — what the resolver would try right now.
+// flattened MANUAL traversal order, then by descending live score.
+//
+// Scope of that rank: it models the group's manual member order and the live per-mapping
+// score, NOT the group's selection settings. member_order=speed, loaded_only and the
+// min_tokens_per_second floor all reorder or filter members inside the resolver, so such a
+// group may well be served in a different order than the one shown here. Within a member the
+// ranking IS the live scorer's, so the per-server ordering under one member is what the
+// resolver would pick from right now.
 func (s *Server) handlePortalModelGroupServers(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -31,7 +37,9 @@ func (s *Server) handlePortalModelGroupServers(w http.ResponseWriter, r *http.Re
 		return
 	}
 	name := r.URL.Query().Get("name")
-	members, _, ok := s.Groups.Group(name) // flattened leaf model names, in traversal order
+	// The policy is deliberately discarded: this ranking is the manual traversal order, not
+	// a second implementation of the group's selection settings (see the doc comment).
+	members, _, ok := s.Groups.Group(name) // flattened leaf model names, in manual traversal order
 	if !ok {
 		writeJSON(w, http.StatusOK, map[string]any{"data": []portal.GroupModelServerDTO{}})
 		return
@@ -226,6 +234,10 @@ var portalModelGroupErrRows = []errRow{
 	{err: portal.ErrModelGroupNameRequired, status: http.StatusBadRequest, code: "model_group.name_required", msg: "model group name is required"},
 	{err: portal.ErrModelGroupModeInvalid, status: http.StatusBadRequest, code: "model_group.mode_invalid", msg: "model group failover mode is invalid"},
 	{err: portal.ErrModelGroupMemberInvalid, status: http.StatusBadRequest, code: "model_group.member_invalid", msg: "model group member is invalid"},
+	{err: portal.ErrModelGroupMemberOrderInvalid, status: http.StatusBadRequest, code: "model_group.member_order_invalid", msg: "model group member order is invalid"},
+	{err: portal.ErrModelGroupMinSpeedFallbackInvalid, status: http.StatusBadRequest, code: "model_group.min_speed_fallback_invalid", msg: "model group minimum-speed fallback is invalid"},
+	{err: portal.ErrModelGroupMinTokensPerSecondInvalid, status: http.StatusBadRequest, code: "model_group.min_tokens_per_second_invalid", msg: "model group minimum tokens per second must not be negative"},
+	{err: portal.ErrModelGroupClimbSpeedMarginInvalid, status: http.StatusBadRequest, code: "model_group.climb_speed_margin_percent_invalid", msg: "model group climb speed margin must not be negative"},
 	{err: portal.ErrModelGroupCycle, status: http.StatusBadRequest, code: "model_group.cycle", msg: "model group member set would create a cycle"},
 	{err: portal.ErrModelVisibilityInvalid, status: http.StatusBadRequest, code: "model_setting.visibility_invalid", msg: "model visibility is invalid"},
 	{err: portal.ErrMappingStatusInvalid, status: http.StatusBadRequest, code: "model_group.status_invalid", msg: "model group status is invalid"},

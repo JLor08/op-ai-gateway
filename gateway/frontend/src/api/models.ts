@@ -192,6 +192,14 @@ export type SyncResult = {
 // "locked" is unlisted AND only reachable via a group.
 export type ModelVisibility = 'shown' | 'hidden' | 'locked';
 
+// How a group's members are walked: the manual priority order, or fastest
+// measured generation speed first.
+export type ModelGroupMemberOrder = 'priority' | 'speed';
+
+// What happens when no candidate reaches the group's min_tokens_per_second
+// floor: report an error, or continue without the minimum.
+export type ModelGroupMinSpeedFallback = 'error' | 'ignore';
+
 // One ordered member of a model group: a gateway model NAME (loose reference).
 // Array order in PortalModelGroup.members is the priority (index 0 = highest).
 export type ModelGroupMember = { member_gateway_name: string };
@@ -212,6 +220,18 @@ export type PortalModelGroup = {
   // "round_robin") governing the order in which a member subgroup's own models
   // are flattened into this group's failover candidate list.
   traversal: string;
+  // Restrict selection to members with an already-loaded candidate; if none is
+  // loaded the restriction is dropped for that request.
+  loaded_only: boolean;
+  member_order: ModelGroupMemberOrder;
+  // How much faster a member must be before a speed-ordered climb_up group
+  // leaves its pinned member. Always present on a read group (the server
+  // applies its own default of 20 when a create/update omits it).
+  climb_speed_margin_percent: number;
+  // Minimum measured generation speed a candidate must reach to count as
+  // available; 0 means the floor is off.
+  min_tokens_per_second: number;
+  min_speed_fallback: ModelGroupMinSpeedFallback;
 };
 
 export type PortalModelGroupListResponse = { data: PortalModelGroup[] };
@@ -224,6 +244,13 @@ export type CreateModelGroupRequest = {
   visibility?: ModelVisibility;
   members: ModelGroupMember[];
   traversal?: string;
+  loaded_only?: boolean;
+  member_order?: ModelGroupMemberOrder;
+  // Omit to apply the server's default margin (20); an explicit 0 means "no
+  // margin — any faster member wins". Never send 0 for an unset field.
+  climb_speed_margin_percent?: number;
+  min_tokens_per_second?: number;
+  min_speed_fallback?: ModelGroupMinSpeedFallback;
 };
 
 // Partial update (omitted fields left unchanged server-side; a present `members`
@@ -236,6 +263,13 @@ export type UpdateModelGroupRequest = {
   visibility?: ModelVisibility;
   members?: ModelGroupMember[];
   traversal?: string;
+  loaded_only?: boolean;
+  member_order?: ModelGroupMemberOrder;
+  // Omitted leaves the stored margin unchanged; an explicit 0 means "no
+  // margin — any faster member wins". Never send 0 for an unset field.
+  climb_speed_margin_percent?: number;
+  min_tokens_per_second?: number;
+  min_speed_fallback?: ModelGroupMinSpeedFallback;
 };
 
 export type PortalRoute = {

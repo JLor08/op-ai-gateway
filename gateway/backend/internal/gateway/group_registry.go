@@ -11,10 +11,10 @@ import (
 )
 
 // groupEntry is one active model group's resolved members (priority-ordered) and its
-// failover mode, held in the GroupRegistry snapshot.
+// selection policy, held in the GroupRegistry snapshot.
 type groupEntry struct {
 	members []routing.GroupMember
-	mode    string
+	policy  routing.GroupPolicy
 }
 
 // GroupRegistry is the hot-path, in-memory view of the model-group config the resolver
@@ -57,21 +57,9 @@ func (r *GroupRegistry) RefreshGroups(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Build the flattening graph from ALL groups (active status preserved per-group,
-	// not filtered here) so a subgroup member name is recognizable as a group in
-	// routing.FlattenGroup and an inactive subgroup correctly contributes nothing when
-	// expanded from an active parent.
-	graph := make(map[string]routing.FlatGroup, len(groups))
-	for _, g := range groups {
-		members, err := r.store.GroupMembersByGroup(ctx, g.ID)
-		if err != nil {
-			return err
-		}
-		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
-			Traversal: g.Traversal,
-			Members:   members,
-			Active:    g.Status == routing.ServerStatusActive,
-		}
+	graph, err := r.groupGraph(ctx, groups)
+	if err != nil {
+		return err
 	}
 	// Only ACTIVE groups are offered; each is flattened via ITS OWN traversal (and
 	// every nested subgroup's own traversal, recursively) into an ordered,
@@ -87,17 +75,14 @@ func (r *GroupRegistry) RefreshGroups(ctx context.Context) error {
 		for i, name := range flat {
 			members[i] = routing.GroupMember{MemberGatewayName: name, Priority: i}
 		}
-		nextGroups[strings.ToLower(g.GatewayModelName)] = groupEntry{members: members, mode: g.FailoverMode}
+		nextGroups[strings.ToLower(g.GatewayModelName)] = groupEntry{
+			members: members,
+			policy:  groupPolicyOf(g),
+		}
 	}
-	settings, err := r.store.ModelSettings(ctx)
+	nextLocked, err := r.lockedModelNames(ctx)
 	if err != nil {
 		return err
-	}
-	nextLocked := make(map[string]struct{})
-	for _, s := range settings {
-		if s.Visibility == "locked" {
-			nextLocked[strings.ToLower(s.GatewayModelName)] = struct{}{}
-		}
 	}
 	r.mu.Lock()
 	r.groups = nextGroups
@@ -106,19 +91,81 @@ func (r *GroupRegistry) RefreshGroups(ctx context.Context) error {
 	return nil
 }
 
-// Group returns a COPY of a group's priority-ordered members and its failover mode when
-// name is an active group (case-insensitive); ok=false otherwise. Nil-safe.
-func (r *GroupRegistry) Group(name string) ([]routing.GroupMember, string, bool) {
+// groupGraph builds the flattening graph from ALL groups (active status preserved
+// per-group, not filtered here) so a subgroup member name is recognizable as a group in
+// routing.FlattenGroup and an inactive subgroup correctly contributes nothing when
+// expanded from an active parent. A store error on any group's members aborts the whole
+// build, leaving the caller's current snapshot untouched.
+func (r *GroupRegistry) groupGraph(ctx context.Context, groups []routing.ModelGroup) (map[string]routing.FlatGroup, error) {
+	graph := make(map[string]routing.FlatGroup, len(groups))
+	for _, g := range groups {
+		members, err := r.store.GroupMembersByGroup(ctx, g.ID)
+		if err != nil {
+			return nil, err
+		}
+		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
+			Traversal: g.Traversal,
+			Members:   members,
+			Active:    g.Status == routing.ServerStatusActive,
+		}
+	}
+	return graph, nil
+}
+
+// lockedModelNames returns the lowercased set of gateway model names whose
+// ModelSetting.Visibility is "locked" (a group-only model a direct request must be
+// refused).
+func (r *GroupRegistry) lockedModelNames(ctx context.Context) (map[string]struct{}, error) {
+	settings, err := r.store.ModelSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	locked := make(map[string]struct{})
+	for _, s := range settings {
+		if s.Visibility == "locked" {
+			locked[strings.ToLower(s.GatewayModelName)] = struct{}{}
+		}
+	}
+	return locked, nil
+}
+
+// groupPolicyOf builds the resolver-facing selection policy of one stored group.
+// MemberOrder/MinSpeedFallback are normalised here (empty OR unrecognized -> their
+// default), matching how the resolver already fails an unknown FailoverMode open to
+// "sticky" behavior via a plain equality check. ClimbSpeedMarginPercent is NOT defaulted:
+// 0 is a legitimate "no margin required" policy, not an unset sentinel.
+func groupPolicyOf(g routing.ModelGroup) routing.GroupPolicy {
+	memberOrder := g.MemberOrder
+	if memberOrder != routing.MemberOrderPriority && memberOrder != routing.MemberOrderSpeed {
+		memberOrder = routing.MemberOrderPriority
+	}
+	minSpeedFallback := g.MinSpeedFallback
+	if minSpeedFallback != routing.MinSpeedFallbackError && minSpeedFallback != routing.MinSpeedFallbackIgnore {
+		minSpeedFallback = routing.MinSpeedFallbackError
+	}
+	return routing.GroupPolicy{
+		FailoverMode:            g.FailoverMode,
+		MemberOrder:             memberOrder,
+		LoadedOnly:              g.LoadedOnly,
+		ClimbSpeedMarginPercent: g.ClimbSpeedMarginPercent,
+		MinTokensPerSecond:      g.MinTokensPerSecond,
+		MinSpeedFallback:        minSpeedFallback,
+	}
+}
+
+// Group returns a COPY of a group's priority-ordered members and its selection policy
+// when name is an active group (case-insensitive); ok=false otherwise. Nil-safe.
+func (r *GroupRegistry) Group(name string) ([]routing.GroupMember, routing.GroupPolicy, bool) {
 	if r == nil {
-		return nil, "", false
+		return nil, routing.GroupPolicy{}, false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.groups[strings.ToLower(name)]
 	if !ok {
-		return nil, "", false
+		return nil, routing.GroupPolicy{}, false
 	}
-	return append([]routing.GroupMember(nil), e.members...), e.mode, true
+	return append([]routing.GroupMember(nil), e.members...), e.policy, true
 }
 
 // DirectAllowed reports whether a direct (non-group) request for a model is permitted. It

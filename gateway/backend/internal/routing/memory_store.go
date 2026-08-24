@@ -1079,6 +1079,12 @@ func (m *MemoryStore) CreateModelGroup(_ context.Context, group ModelGroup) erro
 	if group.Traversal == "" {
 		group.Traversal = "round_robin"
 	}
+	if group.MemberOrder == "" {
+		group.MemberOrder = MemberOrderPriority
+	}
+	if group.MinSpeedFallback == "" {
+		group.MinSpeedFallback = MinSpeedFallbackError
+	}
 	m.groups[group.ID] = group
 	return nil
 }
@@ -1095,6 +1101,12 @@ func (m *MemoryStore) UpdateModelGroup(_ context.Context, group ModelGroup) erro
 	}
 	if group.Traversal == "" {
 		group.Traversal = "round_robin"
+	}
+	if group.MemberOrder == "" {
+		group.MemberOrder = MemberOrderPriority
+	}
+	if group.MinSpeedFallback == "" {
+		group.MinSpeedFallback = MinSpeedFallbackError
 	}
 	// Mirror the SQL UPDATE which does not touch created_at.
 	group.CreatedAt = existing.CreatedAt

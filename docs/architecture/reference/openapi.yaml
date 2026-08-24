@@ -507,7 +507,7 @@ paths:
   /api/portal/model-group-servers:
     get:
       tags: [portal]
-      summary: Candidate servers for a model group, resolver-ranked
+      summary: Candidate servers for a model group, ranked by manual traversal order + live score
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
