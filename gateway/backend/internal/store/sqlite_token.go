@@ -207,15 +207,24 @@ func (s *SQLiteStore) UpdateTokenMetadata(ctx context.Context, token TokenRecord
 	if token.UpdatedAt.IsZero() {
 		token.UpdatedAt = time.Now().UTC()
 	}
+	// last_used_model is NOT in this SET clause, for the same reason
+	// last_used_at is not: both are written by the REQUEST path
+	// (SetTokenLastUsedModel and the LookupBearer touch), while a caller here
+	// carries a record it read moments earlier. Including either would let an
+	// unrelated metadata edit racing an inference request roll the value back.
+	// For the marker that matters more than for the timestamp: it is the
+	// unknown-model redirect's own first target, so a silent rollback sends the
+	// next unknown request to the fallback instead of the model the token
+	// actually used last.
 	res, err := s.exec(ctx, `
 		update api_tokens
 		set name = ?, scopes = ?, status = ?, updated_at = ?, model_override = ?, model_override_map = ?, log_communication = ?, secret = ?, project_id = ?,
 			server_override = ?, server_override_force_unreachable = ?,
-			last_used_model = ?, unknown_model_redirect = ?, unknown_model_redirect_blocked = ?, unknown_model_fallback = ?
+			unknown_model_redirect = ?, unknown_model_redirect_blocked = ?, unknown_model_fallback = ?
 		where id = ?`,
 		token.Name, token.Scopes, token.Status, token.UpdatedAt, token.ModelOverride, token.ModelOverrideMap, token.LogCommunication, token.Secret, nullableTokenRef(token.ProjectID),
 		token.ServerOverride, token.ServerOverrideForceUnreachable,
-		token.LastUsedModel, token.UnknownModelRedirect, token.UnknownModelRedirectBlocked, token.UnknownModelFallback,
+		token.UnknownModelRedirect, token.UnknownModelRedirectBlocked, token.UnknownModelFallback,
 		token.ID)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {

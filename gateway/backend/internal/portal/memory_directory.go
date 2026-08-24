@@ -285,7 +285,14 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.ProjectID = token.ProjectID
 	existing.ServerOverride = token.ServerOverride
 	existing.ServerOverrideForceUnreachable = token.ServerOverrideForceUnreachable
-	existing.LastUsedModel = token.LastUsedModel
+	// LastUsedModel is deliberately NOT copied from the incoming record, exactly
+	// as LastUsedAt is not (and as the SQL driver's SET clause omits both): the
+	// marker belongs to the request path (SetTokenLastUsedModel), while a caller
+	// here carries a record it read moments earlier. Copying it would let an
+	// unrelated metadata edit racing an inference request roll back the
+	// unknown-model redirect's own first target. The stored value survives
+	// untouched in `existing`, and the bearer mirror below is rebuilt from
+	// `existing`, so both copies keep it.
 	existing.UnknownModelRedirect = token.UnknownModelRedirect
 	existing.UnknownModelRedirectBlocked = token.UnknownModelRedirectBlocked
 	existing.UnknownModelFallback = token.UnknownModelFallback

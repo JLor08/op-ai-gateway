@@ -545,11 +545,15 @@ func TestSQLiteTokenRedirectSettingsLookupBearerMapping(t *testing.T) {
 }
 
 // TestSQLiteTokenRedirectSettingsUpdateRoundTrip proves UpdateTokenMetadata's
-// SQL actually writes the four new columns. The token is created with every
-// new field at its zero value (testTokenRecord's defaults), so the ONLY way
-// the post-update read can see the new values is if UpdateTokenMetadata's own
-// SET clause carries them — TestConformanceTokenRedirectSettingsRoundTrip
+// SQL actually writes the three SETTINGS columns. The token is created with
+// every new field at its zero value (testTokenRecord's defaults), so the ONLY
+// way the post-update read can see the new values is if UpdateTokenMetadata's
+// own SET clause carries them — TestConformanceTokenRedirectSettingsRoundTrip
 // only exercises CreatePlainToken's insert, never this update path.
+//
+// The fourth column, last_used_model, is deliberately absent from that SET
+// clause and therefore from this test; TestSQLiteUpdateTokenMetadataLeavesLastUsedModel
+// pins that separation from the other side.
 func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st := openTokenTestSQLite(t)
@@ -569,7 +573,9 @@ func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
 		t.Fatalf("fixture must start at the zero defaults: %+v", before)
 	}
 
-	before.LastUsedModel = "qwen3-32b"
+	// LastUsedModel is deliberately NOT flipped here: it is not part of the
+	// metadata write at all (see TestSQLiteUpdateTokenMetadataLeavesLastUsedModel
+	// for the invariant, and SetTokenLastUsedModel for its one writer).
 	before.UnknownModelRedirect = true
 	before.UnknownModelRedirectBlocked = true
 	before.UnknownModelFallback = "fallback-model"
@@ -582,9 +588,6 @@ func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TokenByID returned %v", err)
 	}
-	if after.LastUsedModel != "qwen3-32b" {
-		t.Fatalf("after update: LastUsedModel = %q, want %q", after.LastUsedModel, "qwen3-32b")
-	}
 	if !after.UnknownModelRedirect {
 		t.Fatalf("after update: UnknownModelRedirect = false, want true")
 	}
@@ -593,6 +596,47 @@ func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
 	}
 	if after.UnknownModelFallback != "fallback-model" {
 		t.Fatalf("after update: UnknownModelFallback = %q, want %q", after.UnknownModelFallback, "fallback-model")
+	}
+}
+
+// TestSQLiteUpdateTokenMetadataLeavesLastUsedModel pins that the marker is NOT
+// part of the metadata write, exactly as last_used_at is not: both are written
+// by the request path (SetTokenLastUsedModel / the LookupBearer touch), and a
+// portal PATCH carries a record read moments earlier. If last_used_model went
+// back into that SET clause, an unrelated token edit racing an inference
+// request would silently roll the marker back — and the marker is the
+// redirect's own target, so the next unknown request would go to the fallback
+// instead of the model the token really used last.
+func TestSQLiteUpdateTokenMetadataLeavesLastUsedModel(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	rec := testTokenRecord(now)
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+	// The inference path writes the marker through its own narrow statement.
+	if err := st.SetTokenLastUsedModel(ctx, rec.ID, "qwen3-32b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+	// A metadata update built from a record read BEFORE that write (hence the
+	// stale empty marker) must not undo it.
+	stale := rec
+	stale.Name = "renamed"
+	stale.UpdatedAt = now.Add(time.Minute)
+	if err := st.UpdateTokenMetadata(ctx, stale); err != nil {
+		t.Fatalf("UpdateTokenMetadata returned %v", err)
+	}
+	got, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if got.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("LastUsedModel = %q, want %q (metadata update reverted the marker)", got.LastUsedModel, "qwen3-32b")
+	}
+	if got.Name != "renamed" {
+		t.Fatalf("Name = %q, want renamed (the update itself must still apply)", got.Name)
 	}
 }
 
