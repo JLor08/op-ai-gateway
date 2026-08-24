@@ -470,23 +470,41 @@ type inferenceShape struct {
 //     model (an unparseable/malformed body, or one with no usable "model"
 //     field at all) -- that case must bail out before ANY gate runs (see the
 //     callers below), so a parse failure never consumes admission budget.
-//  2. applyServerOverride (re-authorizes a token/header server pin) --
+//  2. redirectUnknownModel (per-token unknown-model redirect) -- OPT-IN, and
+//     for every other token a single boolean test with no store work at all.
+//     It runs here, BEFORE the gates below, on purpose: it changes WHICH model
+//     name is requested, never WHAT the token may reach, so its result then
+//     faces the allowlist (and every other gate) exactly as if the client had
+//     named it. Never terminal: with nothing usable to redirect to, the
+//     request keeps its model and fails exactly as it does today.
+//  3. applyServerOverride (re-authorizes a token/header server pin) --
 //     TERMINAL on failure (403).
-//  3. modelAllowed (service-account model allowlist) -- TERMINAL on failure
-//     (403), checked against the EFFECTIVE (post-override) model.
-//  4. admitPrincipal (rate/quota/budget) -- TERMINAL on failure (429/402).
-//  5. extractClientSession -- pure, never fails.
+//  4. modelAllowed (service-account model allowlist) -- TERMINAL on failure
+//     (403), checked against the EFFECTIVE (post-override, post-redirect)
+//     model.
+//  5. admitPrincipal (rate/quota/budget) -- TERMINAL on failure (429/402).
+//  6. extractClientSession -- pure, never fails.
 //
 // Called EXACTLY ONCE per client request: the three translate handlers below
 // call it before their own parse (chat) or before attempting native
 // passthrough (responses, messages), and tryProxyNative -- which used to run
-// its own copy of steps 1-5, in a different order, on every native attempt --
+// its own copy of these steps, in a different order, on every native attempt --
 // now takes the preflight this produced and never re-runs any of it. This is
 // what makes admitPrincipal single-execution without the mutable per-request
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
 	req := inference.Request{Model: resolveModelOverride(token, shape.model), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream}
+	// Only tokens that opted in pay for the offering lookup; for every other
+	// token this is a single boolean test. req.RequestedModel keeps the client's
+	// original wish either way — the usage events already carry it, so a
+	// redirect stays traceable afterwards.
+	if token.UnknownModelRedirect && s.Portal != nil {
+		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor))
+		if to := redirectUnknownModel(token, req.Model, off); to != "" {
+			req.Model = to
+		}
+	}
 	req, sErr := s.applyServerOverride(r.Context(), r, token, req)
 	if sErr != nil {
 		writeServerOverrideForbidden(w)
