@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/storeerr"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1010,10 +1011,79 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 	return selected, memberOK, nil, 0, nil
 }
 
-// firstAvailable walks members top-down (priority order) and returns the first
-// memberOK member (its name + selection). If none is OK it returns the accumulated
-// at-capacity server ids across the skipped members and the MAX queue timeout over
-// those members (for queuing on the union), plus anyLive = whether ANY member had at
+// orderMembersBySpeed returns members re-sorted by their fastest ELIGIBLE candidate's
+// effective generation speed, descending. Eligibility is eligibleCandidates — the very
+// filters the walk applies — so the order can never rank a member the walk would refuse,
+// and a member scores on the candidate it would actually be served on rather than on one
+// the policy has already excluded. The metric is the load-aware effective speed, never the
+// raw stored gen_tokens_per_second, so it agrees with the scorer and the speed floor.
+//
+// A member with no measurement, and equally one whose candidates are all gated, scores 0
+// and therefore sorts LAST; SliceStable compares speed only, so ties keep the manual order
+// and a group with no measurements anywhere behaves exactly as it did before speed ordering
+// existed.
+//
+// Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
+// priority-ordered walk stops at the first available member. That is the price of the
+// ordering, and only groups that opt into it pay it.
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, policy GroupPolicy) ([]GroupMember, error) {
+	speed := make(map[string]float64, len(members))
+	for _, m := range members {
+		if _, done := speed[m.MemberGatewayName]; done {
+			continue // a duplicated member name is scored once
+		}
+		best := 0.0
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, policy)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cands {
+			tps, tErr := r.candidateEffectiveGenTPS(ctx, c, m.MemberGatewayName)
+			if tErr != nil {
+				return nil, tErr
+			}
+			if tps > best {
+				best = tps
+			}
+		}
+		speed[m.MemberGatewayName] = best
+	}
+	out := append([]GroupMember(nil), members...) // never reorder the caller's slice
+	sort.SliceStable(out, func(i, j int) bool {
+		return speed[out[i].MemberGatewayName] > speed[out[j].MemberGatewayName]
+	})
+	return out, nil
+}
+
+// speedMarginMet reports whether the candidate is enough faster than the pinned one to
+// justify moving a session: strictly MORE than the configured margin above it. A margin of
+// 0 is a legitimate value meaning "no margin required" — any strictly faster candidate then
+// wins; only a negative margin is clamped. An unmeasured pin (<= 0) always yields true —
+// anything measurable beats unknown.
+func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandidate, bestModel, pinnedModel string, policy GroupPolicy) (bool, error) {
+	pinnedTPS, err := r.candidateEffectiveGenTPS(ctx, pinned, pinnedModel)
+	if err != nil {
+		return false, err
+	}
+	if pinnedTPS <= 0 {
+		return true, nil
+	}
+	bestTPS, err := r.candidateEffectiveGenTPS(ctx, best, bestModel)
+	if err != nil {
+		return false, err
+	}
+	margin := policy.ClimbSpeedMarginPercent
+	if margin < 0 {
+		margin = 0
+	}
+	return bestTPS > pinnedTPS*(1+float64(margin)/100), nil
+}
+
+// firstAvailable walks members top-down — in whatever order the slice arrives in, which is
+// the manual priority order or the speed-sorted one — and returns the first memberOK member
+// (its name + selection). If none is OK it returns the accumulated at-capacity server ids
+// across the skipped members and the MAX queue timeout over those members (for queuing on
+// the union), plus anyLive = whether ANY member had at
 // least one live mapping (a member with live-but-gated candidates or at-capacity
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
@@ -1147,12 +1217,33 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 //     member is available. A nil r.warmer makes climb_up purely passive (it only switches
 //     once a higher-priority member is loaded by other traffic).
 //
+// Under member_order=speed the members are re-sorted by measured speed first, so
+// everything above reads "faster" wherever it says "higher-priority", and a climb_up climb
+// additionally has to clear the group's climb speed margin before it moves a session.
+//
 // Errors map per §3g: zero members OR no member with any live mapping -> ErrNoModelRoute
 // (unknown model); members with live mappings but all gated (down/busy/non-viable/at-cap)
 // -> ErrNoHealthyHost.
 func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
 	if len(members) == 0 {
 		return Target{}, ErrNoModelRoute
+	}
+
+	// Speed order: re-sort the member slice, because everything downstream reads order
+	// from it (firstAvailable walks it; memberIndex reads a member's rank from its
+	// position), so a re-sort here makes the whole rest of the function — the pin check,
+	// the climb comparison, the walk — mean "fastest" wherever it said "highest priority".
+	// The pass is skipped entirely for the default priority order, so that path costs
+	// exactly what it did before. Ordering happens per ATTEMPT, not once for the whole
+	// relaxation ladder, because eligibility (and therefore a member's score) depends on
+	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
+	// the candidates it can actually use.
+	if policy.MemberOrder == MemberOrderSpeed {
+		ordered, err := r.orderMembersBySpeed(ctx, token, members, apiFlavor, policy)
+		if err != nil {
+			return Target{}, err
+		}
+		members = ordered
 	}
 
 	// serve builds the target for a selected member and (re)pins the group affinity to it.
@@ -1173,14 +1264,30 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 		}
 		if pinStatus == memberOK {
 			if policy.FailoverMode == modeClimbUp {
-				// Is a higher-priority member available? The pin is memberOK, so firstAvailable
-				// stops at-or-before it in the priority order → best index <= pin index (the
+				// Is a better-ranked member available? The pin is memberOK, so firstAvailable
+				// stops at-or-before it in the effective order → best index <= pin index (the
 				// memberIndex guard below is belt-and-suspenders for that invariant).
 				best, bestSel, _, _, _, ferr := r.firstAvailable(ctx, token, members, apiFlavor, req, now, policy)
 				if ferr != nil {
 					return Target{}, ferr
 				}
 				if best != "" && best != pinned && memberIndex(members, best) < memberIndex(members, pinned) {
+					// Under speed ordering "better" means "faster", and a marginally faster
+					// member is not worth moving a live session to: require the configured
+					// margin first. This gate sits ON TOP of the free-climb rule below, never
+					// replacing it — and it is consulted only for a speed-ordered group, so a
+					// priority-ordered one climbs exactly as it always did.
+					if policy.MemberOrder == MemberOrderSpeed {
+						met, mErr := r.speedMarginMet(ctx, bestSel, pinSel, best, pinned, policy)
+						if mErr != nil {
+							return Target{}, mErr
+						}
+						if !met {
+							// Not materially faster: keep the session where it is, and do not warm
+							// a member we would refuse to climb to anyway.
+							return serve(pinned, pinSel)
+						}
+					}
 					if r.memberLoaded(bestSel) {
 						return serve(best, bestSel) // CLIMB: the better member is already loaded
 					}
