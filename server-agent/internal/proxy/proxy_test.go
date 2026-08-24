@@ -239,6 +239,15 @@ func TestManagerStreamsWithoutBuffering(t *testing.T) {
 
 	firstWritten := make(chan struct{})
 	release := make(chan struct{})
+	// The upstream handler parks on <-release, and the deferred
+	// httptest.Server.Close waits for that connection to finish. Releasing it
+	// from a defer -- once, from whichever path gets there first -- keeps a
+	// t.Fatalf between here and the release below from leaving Close waiting on
+	// a handler nobody would ever wake: that turned a one-line assertion
+	// failure into a 10-minute package timeout in CI.
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseUpstream()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fl, ok := w.(http.Flusher)
 		if !ok {
@@ -291,18 +300,22 @@ func TestManagerStreamsWithoutBuffering(t *testing.T) {
 			t.Fatalf("want first chunk %q, got %q", "first\n", string(rr.buf))
 		}
 	case <-time.After(3 * time.Second):
-		close(release)
 		t.Fatalf("first chunk not received before second write (response buffered; FlushInterval not -1)")
 	}
 
 	// Confirm upstream actually flushed the first chunk before we released it.
+	// This WAITS rather than polling with a default branch: the handler closes
+	// firstWritten only after its flush returns, so the flushed bytes can reach
+	// this goroutine before that close executes. Whenever the handler was
+	// descheduled in exactly that window -- a contended CI runner -- the
+	// non-blocking check reported a violation that had not happened.
 	select {
 	case <-firstWritten:
-	default:
-		t.Fatalf("received data before upstream flushed first chunk (unexpected)")
+	case <-time.After(3 * time.Second):
+		t.Fatalf("upstream never flushed the first chunk")
 	}
 
-	close(release)
+	releaseUpstream()
 	rest, _ := io.ReadAll(resp.Body)
 	if string(rest) != "second\n" {
 		t.Fatalf("want second chunk %q, got %q", "second\n", string(rest))
@@ -593,6 +606,14 @@ func TestManagerStopDrainsOffLock(t *testing.T) {
 	release := make(chan struct{})
 	reached := make(chan struct{})
 	var reachedOnce sync.Once
+	// Same reason as in TestManagerStreamsWithoutBuffering: several t.Fatalf
+	// calls sit between the blocked handler below and the release at the end of
+	// this test, and the deferred Close waits for that handler. Release from a
+	// defer so a failing assertion fails fast instead of hanging until the
+	// package timeout and hiding its own message.
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseUpstream()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reachedOnce.Do(func() { close(reached) })
 		<-release
@@ -652,6 +673,6 @@ func TestManagerStopDrainsOffLock(t *testing.T) {
 
 	// Release the first (drained) request so it completes and the deferred Close
 	// drains cleanly without waiting out the grace.
-	close(release)
+	releaseUpstream()
 	clientDone.Wait()
 }
