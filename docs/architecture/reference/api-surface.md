@@ -91,6 +91,30 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 | `/api/portal/benchmarks/active` | GET | Currently running benchmark jobs, visibility-filtered like server ownership |
 | `/api/portal/dashboard` | GET | Aggregated dashboard payload |
 
+#### Token model settings
+
+`/api/portal/tokens[/{id}]` and the service-token surface
+(`/api/portal/services/{id}/tokens`) carry the same per-token model settings on
+create, update, and read. Every model-valued one is validated on write against
+what the owner can route to **directly**, and an unroutable name is rejected
+with `400 portal.token_model_override_invalid`.
+
+| Field | Shape | Meaning |
+|---|---|---|
+| `model_override` | string | catch-all: rewrites any requested model that has no rule of its own (`""` = off) |
+| `model_override_map` | object, `requested -> {"to","offer","hide_target"}` | per-requested-name rules. `to` is the gateway model or group to route to; `offer` advertises the requested name in this token's model listing, inheriting the target's flavors; `hide_target` drops the target's own name from that listing. Both switches are listing-only |
+| `unknown_model_redirect` | bool | opt into the unknown-model redirect |
+| `unknown_model_redirect_blocked` | bool | widen "unknown" from "no such model" to "also models this token may not use"; ignored (stored `false`) while the redirect is off |
+| `unknown_model_fallback` | string | model or group used when the marker below is empty or no longer routable; cleared while the redirect is off |
+| `last_used_model` | string, **read-only** | the gateway model or group of this token's last successfully routed request. Present on token DTOs, accepted on no request body — a writable marker would let a client choose where its own unknown requests go |
+
+The rule object is the only accepted wire shape; the legacy
+`requested -> "target"` string map is tolerated when *reading* the stored
+column, which is why the feature needed no data migration. Semantics — the
+resolution order, the three model sets, and the invariant that a redirected
+request still passes every admission gate — are in
+[Routing & Model Selection §2.1–2.2](../cross-cutting/routing-and-model-selection.md).
+
 ### Models, servers, applications, mappings
 
 | Path | Methods | Auth notes | Purpose |

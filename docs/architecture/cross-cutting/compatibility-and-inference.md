@@ -17,8 +17,8 @@ upstream HTTP request directly.
 | Field | Purpose |
 |---|---|
 | `APIFlavor` | fine-grained source protocol: `openai_chat_completions`, `openai_responses`, `anthropic_messages` |
-| `Model` | the gateway model name (post model-override) |
-| `RequestedModel` | the client's original model name, pre-override; recorded on the usage event |
+| `Model` | the gateway model name the request is actually routed under — after the token's model-override rules, catch-all, and unknown-model redirect (see [Routing & Model Selection §2.1](routing-and-model-selection.md)) |
+| `RequestedModel` | the client's original model name, before any of that; recorded on the usage event |
 | `Messages []Message` | role + `[]ContentPart` (text/image/tool_result) + optional `ToolCalls`/`ToolCallID`/`Reasoning` |
 | `Tools []Tool`, `ToolChoice any` | tool definitions; `ToolChoice` is forwarded upstream verbatim |
 | `Stream`, `IncludeUsage` | streaming flag; OpenAI `stream_options.include_usage` |
@@ -259,9 +259,14 @@ native endpoint and streams the raw response back unmodified.
 
 1. Peek `model`/`stream` from the raw body (tolerant of a malformed body — falls
    through to the translate path, which produces the proper parse error).
-2. Apply the token's model override, the service-account allowlist gate, and
-   the principal admission gate — at the **same** pre-`Resolve` point the
-   translate path applies them, so a rejected request never resolves twice.
+2. Consume the **shared preflight** (`inferencePreflight`) the caller already
+   ran: the token's model-override chain and unknown-model redirect
+   ([Routing & Model Selection §2.1](routing-and-model-selection.md)), the
+   server-override re-authorization, the service-account allowlist gate, and
+   the principal admission gate. It is computed exactly once per client
+   request — this path used to run its own copy of the same steps in a
+   different order — so a rejected request never resolves twice and admission
+   budget is never consumed twice.
 3. `Resolver.Resolve` the model. An admission-queue rejection here is
    **terminal** (surfaced immediately, never falls through — otherwise the
    translate path would re-queue and wait a second time).
@@ -397,6 +402,34 @@ filtered by a service token's model allowlist (discovery is unrestricted;
 invocation is gated separately, §3/§6). With no routing store configured, all
 three fall back to two fixed seed model names so a fresh/dev instance always
 answers something.
+
+**Per-token override aliases.** A token's model-override rules
+(`requested -> {to, offer, hide_target}`) are also a listing overlay
+(`applyOverrideAliases`, `internal/portal/service_model_offering.go`), applied
+last, over the finished listing:
+
+- `offer` adds the **requested** name to this token's listing, inheriting its
+  target's API flavors — and, in the richer portal/LM-Studio shape, the
+  target's loaded state, offering servers, context size, vision flag, and
+  whether the target is a model *group*, so the alias row looks exactly like
+  its target's row filed under a different name. Flavors are read from the
+  pre-suppression set, so an alias onto a hidden or locked target is still
+  listed: the alias is a different name and does not reveal the target.
+- `hide_target` drops the **target's** own name from this token's listing.
+  With several rows onto one target, `hide_target` set on any of them hides
+  it — a set switch is an instruction, an unset one merely its absence.
+
+A rule whose target does not exist adds nothing (an alias would be a dead
+name), and the catch-all `model_override` has no requested name of its own and
+therefore no switches. The overlay reaches all three inference listings above
+and the portal's own Models view; it is never applied to the admin management
+surface (`ManageModels`), which shows the system's real models rather than one
+token's aliases.
+
+**This is a display, never an access control.** A target hidden by
+`hide_target` stays fully callable under its real name — the three sets that
+keep listing and reach apart are
+[Routing & Model Selection §2.2](routing-and-model-selection.md).
 
 The portal's own **Models** view (`ModelList.tsx`) is the cross-flavor
 counterpart: each row's "APIs" column lists every flavor (`openai`,

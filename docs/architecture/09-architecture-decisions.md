@@ -159,3 +159,18 @@ that read it as an authorization flag.
 the mutation (keep current), and only a definitive empty result tears a resource
 down. Per-tick errors are logged at Debug, not Warn. **Consequence:** a transient
 dependency error never tears down a healthy certificate, route, or peer.
+
+## ADR-023 — A model listing is a display; reach is a separate set
+**Context:** per-token settings shape both what a client *sees* in the model
+listing (offered override aliases, hidden targets, `model_settings`
+hidden/locked) and what a request may be *rewritten* to (override rules,
+catch-all, unknown-model redirect). **Decision:** keep the two strictly apart in
+three sets — *offered* (the listing, alias overlay applied), *callable* (what a
+direct request can actually route to: excludes `locked`, includes merely
+`hidden`), and *existing* (what exists at all, ignoring per-token reach) — and
+let every rewrite decision read *callable*, never *offered*. A rewritten name
+then passes every admission gate exactly as if the client had sent it.
+**Consequence:** suppressing a name from a listing is never an access control,
+and a rewrite can never widen what a token may reach; conversely, judging a
+request by the listing would reroute requests the token was entitled to serve.
+See [Routing & Model Selection §2.1–2.2](cross-cutting/routing-and-model-selection.md).
