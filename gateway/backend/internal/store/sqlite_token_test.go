@@ -285,6 +285,49 @@ func TestSQLiteUpdateTokenMetadataUnknownIDReturnsNotFound(t *testing.T) {
 	}
 }
 
+// TestSQLiteSetTokenLastUsedModelPersistsUnconditionally proves the write is
+// unconditional at the store layer (any caller-side "only on change" gating
+// lives in gateway.Server.resolveTarget, not here) and that it does not
+// disturb any other column.
+func TestSQLiteSetTokenLastUsedModelPersistsUnconditionally(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	rec := testTokenRecord(now)
+	rec.LastUsedModel = "qwen3-32b"
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	if err := st.SetTokenLastUsedModel(ctx, "tok_1", "llama-70b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+
+	got, err := st.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if got.LastUsedModel != "llama-70b" {
+		t.Fatalf("LastUsedModel = %q, want %q", got.LastUsedModel, "llama-70b")
+	}
+	if got.Name != rec.Name || got.Status != rec.Status {
+		t.Fatalf("SetTokenLastUsedModel disturbed unrelated columns: %#v", got)
+	}
+}
+
+func TestSQLiteSetTokenLastUsedModelUnknownIDReturnsNotFound(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+
+	err := st.SetTokenLastUsedModel(ctx, "tok_missing", "llama-70b")
+
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetTokenLastUsedModel error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSQLiteRotateTokenSecretReplacesSecretAndPrefix(t *testing.T) {
 	ctx := context.Background()
 	st := openTokenTestSQLite(t)

@@ -180,6 +180,23 @@ func (s *TokenStore) RekeyToken(id, newSecretHash string) {
 	}
 }
 
+// SetLastUsedModel updates the stored token that matches id's LastUsedModel
+// field in place, keeping every other field untouched — mirroring
+// RekeyToken's narrow-mutation shape rather than UpdateToken's full replace,
+// since only this one scalar field changes. It is a no-op if no token with
+// that id is present.
+func (s *TokenStore) SetLastUsedModel(id, model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, existing := range s.tokens {
+		if existing.ID == id {
+			existing.LastUsedModel = model
+			s.tokens[hash] = existing
+			return
+		}
+	}
+}
+
 func (s *TokenStore) LookupBearer(header string) (Token, bool) {
 	secret, ok := ExtractBearerSecret(header)
 	if !ok {

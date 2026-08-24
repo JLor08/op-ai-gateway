@@ -320,6 +320,25 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	return nil
 }
 
+// SetTokenLastUsedModel records the gateway model or group name of a token's
+// last successfully routed request, mirroring the write into both the
+// TokenRecord map and the bearer store's mirrored auth.Token (a narrow,
+// single-field update — unlike UpdateTokenMetadata's full rebuild — since
+// auth.TokenStore.SetLastUsedModel mutates only that one field in place).
+func (m *MemoryDirectory) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.tokens[tokenID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	existing.LastUsedModel = model
+	existing.UpdatedAt = time.Now().UTC()
+	m.tokens[tokenID] = existing
+	m.auth.SetLastUsedModel(tokenID, model)
+	return nil
+}
+
 func (m *MemoryDirectory) RotateTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, updatedAt time.Time) error {
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()

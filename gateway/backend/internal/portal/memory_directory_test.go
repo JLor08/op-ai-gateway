@@ -198,6 +198,52 @@ func TestMemoryDirectoryUpdateTokenMetadataUnknownIDReturnsNotFound(t *testing.T
 	}
 }
 
+// TestMemoryDirectorySetTokenLastUsedModelSyncsBearerStore proves the memory
+// driver's narrow LastUsedModel write reaches BOTH of its copies: the
+// TokenRecord map (read via TokenByID) and the mirrored auth.Token the bearer
+// store hands back on lookup (read via LookupBearer) — mirroring
+// UpdateTokenMetadata's own carry-through, but for this single field.
+func TestMemoryDirectorySetTokenLastUsedModelSyncsBearerStore(t *testing.T) {
+	ctx := context.Background()
+	authStore := auth.NewTokenStore()
+	dir := NewMemoryDirectory(authStore)
+	now := time.Now().UTC()
+	if err := dir.CreatePlainToken(ctx, store.TokenRecord{
+		ID: "tok_1", UserID: "usr_1", Name: "T", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`,
+		CreatedAt: now, UpdatedAt: now, LastUsedModel: "qwen3-32b",
+	}, "secret-1"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	if err := dir.SetTokenLastUsedModel(ctx, "tok_1", "llama-70b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+
+	record, err := dir.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if record.LastUsedModel != "llama-70b" {
+		t.Fatalf("TokenRecord.LastUsedModel = %q, want %q", record.LastUsedModel, "llama-70b")
+	}
+
+	tok, ok := authStore.LookupBearer("Bearer secret-1")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "llama-70b" {
+		t.Fatalf("bearer LastUsedModel = %q, want %q", tok.LastUsedModel, "llama-70b")
+	}
+}
+
+func TestMemoryDirectorySetTokenLastUsedModelUnknownIDReturnsNotFound(t *testing.T) {
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	err := dir.SetTokenLastUsedModel(context.Background(), "tok_missing", "llama-70b")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("SetTokenLastUsedModel error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestMemoryDirectoryTokenModelOverride(t *testing.T) {
 	ctx := context.Background()
 	tokens := auth.NewTokenStore()

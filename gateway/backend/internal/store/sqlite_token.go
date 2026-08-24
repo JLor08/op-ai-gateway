@@ -226,6 +226,22 @@ func (s *SQLiteStore) UpdateTokenMetadata(ctx context.Context, token TokenRecord
 	return requireAffected(res)
 }
 
+// SetTokenLastUsedModel records the gateway model or group name of a token's
+// last successfully routed request. It is unconditional — callers write only
+// when the value actually changes (see gateway.Server.resolveTarget); this
+// method itself always writes.
+func (s *SQLiteStore) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
+	res, err := s.exec(ctx, `
+		update api_tokens
+		set last_used_model = ?, updated_at = ?
+		where id = ?`,
+		model, time.Now().UTC(), tokenID)
+	if err != nil {
+		return fmt.Errorf("set token last used model: %w", err)
+	}
+	return requireAffected(res)
+}
+
 func (s *SQLiteStore) RotateTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, updatedAt time.Time) error {
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
