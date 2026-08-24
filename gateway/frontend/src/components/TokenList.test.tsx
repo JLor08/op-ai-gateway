@@ -874,4 +874,37 @@ describe('TokenList unknown-model redirect (Task 8)', () => {
       unknown_model_fallback: 'gpt-oss-20b',
     });
   });
+
+  it('clears the sub-settings when the redirect is switched off before saving', async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_edit',
+          unknown_model_redirect: true,
+          unknown_model_redirect_blocked: true,
+          unknown_model_fallback: 'gpt-oss-20b',
+        }),
+      ],
+    });
+
+    openEdit();
+    // Seeded on: both sub-settings visible/enabled and set.
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeChecked();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue('gpt-oss-20b');
+
+    // Turn the redirect itself off — the sub-settings must not just render
+    // disabled, they must be cleared, so the saved request matches what the
+    // form now shows.
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      unknown_model_redirect: false,
+      unknown_model_redirect_blocked: false,
+      unknown_model_fallback: '',
+    });
+  });
 });

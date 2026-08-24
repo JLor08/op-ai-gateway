@@ -534,7 +534,22 @@ export function TokenList({
                 control={
                   <Checkbox
                     checked={unknownRedirect}
-                    onChange={(e) => setUnknownRedirect(e.target.checked)}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setUnknownRedirect(checked);
+                      // Switching the redirect off also clears both
+                      // sub-settings in STATE, not just their disabled
+                      // rendering: submitCreate/submitEdit send them
+                      // unconditionally, and a saved fallback the UI shows
+                      // as disabled/invisible would mislead the next reader
+                      // of the request into thinking it is in effect (the
+                      // backend clears them too, but the form must show
+                      // exactly what it sends).
+                      if (!checked) {
+                        setUnknownRedirectBlocked(false);
+                        setUnknownFallback('');
+                      }
+                    }}
                   />
                 }
                 label={t.tokenUnknownRedirect}

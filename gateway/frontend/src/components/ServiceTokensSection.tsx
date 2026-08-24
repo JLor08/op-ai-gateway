@@ -360,7 +360,18 @@ export function ServiceTokensSection({
                 control={
                   <Checkbox
                     checked={tokenUnknownRedirect}
-                    onChange={(e) => setTokenUnknownRedirect(e.target.checked)}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setTokenUnknownRedirect(checked);
+                      // See TokenList's identical handler: the redirect being
+                      // off must clear both sub-settings in STATE, not just
+                      // their disabled rendering — submitCreateToken sends
+                      // them unconditionally.
+                      if (!checked) {
+                        setTokenUnknownRedirectBlocked(false);
+                        setTokenUnknownFallback('');
+                      }
+                    }}
                   />
                 }
                 label={t.tokenUnknownRedirect}

@@ -12,6 +12,7 @@ import type {
   CreateServiceRequest,
   ModelOption,
   PortalService,
+  ServiceTokenDTO,
   UpdateServiceRequest,
 } from '../api';
 import type { PortalApi } from './shared/types';
@@ -80,12 +81,34 @@ function makeService(overrides: Partial<PortalService> = {}): PortalService {
   };
 }
 
+function makeServiceToken(overrides: Partial<ServiceTokenDTO> = {}): ServiceTokenDTO {
+  return {
+    id: 'tok_new',
+    service_id: 'svc_1',
+    name: 'New Token',
+    secret_prefix: 'svctok_new',
+    status: 'active',
+    scopes: ['llm:invoke'],
+    expires_at: null,
+    last_used_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    model_override: '',
+    log_communication: false,
+    secret: false,
+    ...overrides,
+  };
+}
+
 function renderServicesView(
   opts: {
     services?: PortalService[];
     role?: string;
     userId?: string;
     overrides?: Partial<PortalApi>;
+    // Override the default two-model list — used by the unknown-model
+    // redirect's fallback-picker test, which needs a group entry (is_group)
+    // alongside a plain model in the SAME list (Task 8).
+    models?: ModelOption[];
   } = {},
 ) {
   const services = opts.services ?? [makeService()];
@@ -126,7 +149,7 @@ function renderServicesView(
       <ServicesView
         t={t}
         api={fakeApi}
-        models={models}
+        models={opts.models ?? models}
         role={opts.role ?? 'admin'}
         userId={opts.userId ?? 'usr_admin'}
       />
@@ -769,6 +792,98 @@ describe('ServicesView token management', () => {
 
     await waitFor(() =>
       expect(fakeApi.deleteServiceToken).toHaveBeenCalledWith('svc_del_tok', 'tok_del'),
+    );
+  });
+});
+
+describe('ServiceTokensSection unknown-model redirect (Task 8)', () => {
+  it('sends the redirect settings when creating a service token', async () => {
+    const svc = makeService({ id: 'svc_redirect' });
+    const { fakeApi } = renderServicesView({
+      services: [svc],
+      overrides: {
+        createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
+      },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+    fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+    const createDialog = within(screen.getByRole('dialog'));
+    fireEvent.change(createDialog.getByLabelText(t.tokenNameLabel), {
+      target: { value: 'Batch Token' },
+    });
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }));
+    fireEvent.mouseDown(createDialog.getByLabelText(t.tokenUnknownFallback));
+    fireEvent.click(await screen.findByRole('option', { name: 'gpt-oss-20b' }));
+    fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+    expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+      'svc_redirect',
+      expect.objectContaining({
+        unknown_model_redirect: true,
+        unknown_model_redirect_blocked: true,
+        unknown_model_fallback: 'gpt-oss-20b',
+      }),
+    );
+  });
+
+  it('offers models and groups in one fallback picker', async () => {
+    const svc = makeService({ id: 'svc_groups' });
+    renderServicesView({
+      services: [svc],
+      models: [
+        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [] },
+        { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+      ],
+      overrides: {
+        createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
+      },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+    fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+    const createDialog = within(screen.getByRole('dialog'));
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.mouseDown(createDialog.getByLabelText(t.tokenUnknownFallback));
+
+    expect(await screen.findByRole('option', { name: 'qwen3-32b' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'fast-group' })).toBeInTheDocument();
+  });
+
+  it('clears the sub-settings when the redirect is switched off before creating a token', async () => {
+    const svc = makeService({ id: 'svc_clear' });
+    const { fakeApi } = renderServicesView({
+      services: [svc],
+      overrides: {
+        createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
+      },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+    fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+    const createDialog = within(screen.getByRole('dialog'));
+    fireEvent.change(createDialog.getByLabelText(t.tokenNameLabel), {
+      target: { value: 'Batch Token' },
+    });
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }));
+    fireEvent.mouseDown(createDialog.getByLabelText(t.tokenUnknownFallback));
+    fireEvent.click(await screen.findByRole('option', { name: 'gpt-oss-20b' }));
+    // Turn the redirect back off before submitting — the sub-settings must
+    // be cleared, not merely rendered disabled.
+    fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+    expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+      'svc_clear',
+      expect.objectContaining({
+        unknown_model_redirect: false,
+        unknown_model_redirect_blocked: false,
+        unknown_model_fallback: '',
+      }),
     );
   });
 });
