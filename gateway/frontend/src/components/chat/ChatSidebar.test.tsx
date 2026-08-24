@@ -167,6 +167,87 @@ describe('ChatSidebar', () => {
     expect(deleteButtons[1]).not.toBeDisabled();
   });
 
+  // The three row actions sit in an absolutely-positioned overlay above the row,
+  // where they used to cover the chat title. They stay transparent (and
+  // click-through) until the row is hovered or something inside it takes focus.
+  //
+  // jsdom never matches :hover, so the reveal itself is not assertable here —
+  // this pins the resting state, which is the half that was broken.
+  it('keeps the row actions transparent while the row is at rest', () => {
+    renderSidebar(makeStore());
+    const actions = screen.getAllByTestId('chat-row-actions')[0];
+    expect(getComputedStyle(actions).opacity).toBe('0');
+    expect(getComputedStyle(actions).pointerEvents).toBe('none');
+  });
+
+  // jsdom cannot enter :hover, so the assertion above would still pass if the
+  // reveal selector were misspelled — leaving the actions invisible forever with
+  // a green suite. This checks the emitted rules exist and turn the actions back
+  // on, for the pointer case and the keyboard case.
+  it('emits reveal rules for hover and focus-within', () => {
+    renderSidebar(makeStore());
+    const actionsClass = screen
+      .getAllByTestId('chat-row-actions')[0]
+      .className.split(' ')
+      .find((name) => name.startsWith('op-chat-row-actions'));
+    expect(actionsClass).toBeDefined();
+
+    // Two traps to avoid. A substring check would also accept
+    // `.op-chat-row-actions-typo`, which selects nothing — so match the class as
+    // a whole token. And a comma-joined rule must be split into its individual
+    // selectors, or one intact half vouches for a broken other half.
+    const targetsActions = new RegExp(`\\.${actionsClass}(?![\\w-])`);
+    const revealing = [...document.styleSheets]
+      .flatMap((sheet) => [...sheet.cssRules])
+      .filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      .filter((rule) => rule.style.opacity === '1')
+      .flatMap((rule) => (rule.selectorText ?? '').split(','))
+      .map((selector) => selector.trim())
+      .filter((selector) => targetsActions.test(selector));
+
+    expect(revealing.some((selector) => selector.includes(':hover'))).toBe(true);
+    expect(revealing.some((selector) => selector.includes(':focus-within'))).toBe(true);
+
+    // A pointer-less device never enters :hover, so the actions must be on
+    // unconditionally there or they are unreachable.
+    const touchFallback = [...document.styleSheets]
+      .flatMap((sheet) => [...sheet.cssRules])
+      .filter((rule): rule is CSSMediaRule => rule instanceof CSSMediaRule)
+      .filter((rule) => rule.conditionText.replace(/\s/g, '').includes('hover:none'))
+      .flatMap((rule) => [...rule.cssRules])
+      .filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      .filter((rule) => rule.style.opacity === '1')
+      .flatMap((rule) => (rule.selectorText ?? '').split(','))
+      .map((selector) => selector.trim())
+      .filter((selector) => targetsActions.test(selector));
+
+    expect(touchFallback).not.toHaveLength(0);
+  });
+
+  // The icons are allowed to sit above the title, so the title fades out
+  // underneath them. Same reasoning as the test above: jsdom cannot hover, but a
+  // selector that stopped matching would silently bring the tangle back.
+  it('emits a fade rule for the title under the revealed actions', () => {
+    renderSidebar(makeStore());
+    const titleClass = screen
+      .getByText('First chat')
+      .className.split(' ')
+      .find((name) => name.startsWith('op-chat-row-title'));
+    expect(titleClass).toBeDefined();
+
+    const targetsTitle = new RegExp(`\\.${titleClass}(?![\\w-])`);
+    const masking = [...document.styleSheets]
+      .flatMap((sheet) => [...sheet.cssRules])
+      .filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      .filter((rule) => rule.style.getPropertyValue('mask-image').includes('linear-gradient'))
+      .flatMap((rule) => (rule.selectorText ?? '').split(','))
+      .map((selector) => selector.trim())
+      .filter((selector) => targetsTitle.test(selector));
+
+    expect(masking.some((selector) => selector.includes(':hover'))).toBe(true);
+    expect(masking.some((selector) => selector.includes(':focus-within'))).toBe(true);
+  });
+
   it('collapses to a rail: hides the list and exposes an expand button', () => {
     const store = makeStore();
     renderSidebar(store, true);
