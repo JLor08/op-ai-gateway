@@ -45,7 +45,7 @@ not route-based).
 
 | Table | Purpose |
 |---|---|
-| `model_groups` | A named priority-failover group offered to clients as a single synthetic gateway model (failover mode, subgroup traversal order). |
+| `model_groups` | A named priority-failover group offered to clients as a single synthetic gateway model (failover mode, subgroup traversal order, and the four combinable selection settings: `loaded_only`, `member_order`, `climb_speed_margin_percent`, `min_tokens_per_second` + `min_speed_fallback`). |
 | `model_group_members` | Ordered members of a model group (a gateway model name + priority). |
 
 ### Telemetry, availability & hardware
@@ -266,6 +266,7 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 | 26 | `model_group_traversal` | Adds `model_groups.traversal` (subgroup expansion order: depth/breadth/round-robin). |
 | 32 | `model_mappings_vision_capable` | Adds `model_mappings.vision_capable`. |
 | 33 | `model_mapping_benchmarks_vision_capable` | Adds the definitive measured `vision_capable` flag to benchmark runs. |
+| 62 | `model_group_selection_settings` | Adds the five model-group selection-setting columns: `loaded_only`, `member_order`, `climb_speed_margin_percent`, `min_tokens_per_second`, `min_speed_fallback`. |
 
 ### Hardware & power telemetry
 

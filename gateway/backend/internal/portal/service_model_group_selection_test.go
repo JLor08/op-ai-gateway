@@ -120,7 +120,7 @@ func TestModelGroupSelectionSettingsRoundTrip(t *testing.T) {
 // DefaultClimbSpeedMarginPercent=20 is applied nowhere except this write
 // path, so omitting the field on create must persist 20 and an EXPLICIT 0
 // must persist as 0 (0 is a legitimate "no margin required" policy, not an
-// unset sentinel -- Task 1 deliberately removed store-level substitution for
+// unset sentinel -- the store deliberately does not substitute a default for
 // exactly this reason).
 func TestModelGroupClimbMarginOmittedVsExplicitZero(t *testing.T) {
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
