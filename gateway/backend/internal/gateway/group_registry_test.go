@@ -107,7 +107,7 @@ func TestGroupRegistryRefreshBuildsSnapshot(t *testing.T) {
 	}
 	// An unknown name.
 	if _, _, ok := reg.Group("nope"); ok {
-		t.Fatal("Group(nope) should be (nil, \"\", false)")
+		t.Fatal("Group(nope) should report ok == false for an unknown name")
 	}
 
 	// Group returns a COPY: mutating it must not leak into the registry.

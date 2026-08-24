@@ -200,6 +200,13 @@ in the portal (`GET /api/portal/model-servers`, its `/events` SSE sibling, and
 does not apply per-session swap-protection/reservation, since it represents the
 *general* live order, not one request's pinned outcome.
 
+The group variant additionally orders its rows by the group's **manual** member
+order. It does not model the group's selection settings — `member_order=speed`,
+`loaded_only` and the `min_tokens_per_second` floor all reorder or filter
+members inside the resolver — so such a group may be served in a different order
+than the portal shows. The ranking *within* one member is still the live
+scorer's.
+
 ## 4. Route affinity
 
 `RouteAffinity` (`internal/routing/store.go`) pins one `(APITokenID, Model,
@@ -255,7 +262,10 @@ of resolving a single mapping.
     climbs once the target is loaded. Falling **down** when the pin is
     unavailable is always immediate, even to a cold member. Under `loaded_only`
     the warm call is skipped entirely — warming a cold member is exactly what
-    the flag avoids. Under `member_order=speed` the free-climb rule gains one
+    the flag avoids. That suppression reads the group's **configured**
+    `loaded_only`, so it also holds on the relaxation ladder's later attempts,
+    whose loaded-only *filter* has already been dropped. Under
+    `member_order=speed` the free-climb rule gains one
     more gate: see `climb_speed_margin_percent` below.
 - **Selection settings** (`ModelGroup`, migration `62`) — four independent,
   combinable settings, all defaulting to today's behavior:

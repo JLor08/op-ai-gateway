@@ -133,6 +133,15 @@ type GroupPolicy struct {
 	ClimbSpeedMarginPercent int
 	MinTokensPerSecond      float64
 	MinSpeedFallback        string
+
+	// suppressWarm mirrors the group's CONFIGURED LoadedOnly and is derived internally
+	// (never supplied by a GroupResolver). It exists because LoadedOnly is a filter the
+	// relaxation ladder may drop, while "this group must never trigger a model load" is a
+	// property of the group itself and must hold on EVERY attempt: once the ladder has
+	// relaxed LoadedOnly to false, reading LoadedOnly for the climb_up warm decision would
+	// let the relaxed attempt start exactly the load the setting exists to avoid. The
+	// relaxation only ever clears LoadedOnly/MinTokensPerSecond, never this field.
+	suppressWarm bool
 }
 
 // GroupResolver exposes the model-group config to the hot path. A nil resolver
@@ -1175,6 +1184,9 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 // resolves wins; the LAST attempt's error is the one returned, so the caller still sees
 // ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
 func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
+	// Latch the configured loaded_only BEFORE any relaxation, so the climb_up warm gate
+	// keeps reading the group's own setting on every attempt (see GroupPolicy.suppressWarm).
+	policy.suppressWarm = policy.LoadedOnly
 	attempts := []GroupPolicy{policy}
 	relaxed := policy
 	if policy.LoadedOnly {
@@ -1215,7 +1227,8 @@ func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req infer
 //     the pin is unavailable is immediate even to a cold member (you have no working model).
 //     So climb_up differs from sticky only when the pin is available AND a higher-priority
 //     member is available. A nil r.warmer makes climb_up purely passive (it only switches
-//     once a higher-priority member is loaded by other traffic).
+//     once a higher-priority member is loaded by other traffic), and so does a configured
+//     loaded_only (GroupPolicy.suppressWarm) — on every attempt of the relaxation ladder.
 //
 // Under member_order=speed the members are re-sorted by measured speed first, so
 // everything above reads "faster" wherever it says "higher-priority", and a climb_up climb
@@ -1291,7 +1304,10 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, token auth.Token, req i
 					if r.memberLoaded(bestSel) {
 						return serve(best, bestSel) // CLIMB: the better member is already loaded
 					}
-					if r.warmer != nil && !policy.LoadedOnly {
+					// suppressWarm, not LoadedOnly: a loaded_only group must never trigger a
+					// load, including on an attempt whose loaded-only FILTER the relaxation
+					// ladder has already dropped.
+					if r.warmer != nil && !policy.suppressWarm {
 						r.warmer.Warm(ctx, best) // load-ahead (non-blocking); keep serving the pin this turn
 					}
 					// Fall through to serve the pin below; a later turn climbs once best is loaded.

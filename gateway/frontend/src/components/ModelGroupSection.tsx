@@ -390,54 +390,82 @@ export function ModelGroupSection({
                 {t.modelVisibilityHelp}
               </Typography>
             </Box>
-            <FormControlLabel
-              control={
-                <Checkbox checked={loadedOnly} onChange={(e) => setLoadedOnly(e.target.checked)} />
-              }
-              label={t.modelGroupLoadedOnly}
-            />
-            <SelectField
-              id="model-group-member-order"
-              label={t.modelGroupMemberOrder}
-              value={memberOrder}
-              onChange={(e) => setMemberOrder(e.target.value as ModelGroupMemberOrder)}
-            >
-              {memberOrders.map((v) => (
-                <option value={v} key={v}>
-                  {v === 'speed' ? t.modelGroupMemberOrderSpeed : t.modelGroupMemberOrderPriority}
-                </option>
-              ))}
-            </SelectField>
-            <Field
-              id="model-group-climb-speed-margin"
-              type="number"
-              label={t.modelGroupClimbSpeedMargin}
-              value={climbSpeedMargin}
-              onChange={(e) => setClimbSpeedMargin(e.target.value)}
-              inputProps={{ min: 0, step: 1 }}
-            />
-            <Field
-              id="model-group-min-tokens-per-second"
-              type="number"
-              label={t.modelGroupMinTokensPerSecond}
-              value={minTokensPerSecond}
-              onChange={(e) => setMinTokensPerSecond(e.target.value)}
-              inputProps={{ min: 0, step: 'any' }}
-            />
-            <SelectField
-              id="model-group-min-speed-fallback"
-              label={t.modelGroupMinSpeedFallback}
-              value={minSpeedFallback}
-              onChange={(e) => setMinSpeedFallback(e.target.value as ModelGroupMinSpeedFallback)}
-            >
-              {minSpeedFallbacks.map((v) => (
-                <option value={v} key={v}>
-                  {v === 'ignore'
-                    ? t.modelGroupMinSpeedFallbackIgnore
-                    : t.modelGroupMinSpeedFallbackError}
-                </option>
-              ))}
-            </SelectField>
+            <Box sx={{ display: 'grid', gap: 0.5 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={loadedOnly}
+                    onChange={(e) => setLoadedOnly(e.target.checked)}
+                  />
+                }
+                label={t.modelGroupLoadedOnly}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.modelGroupLoadedOnlyHelp}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 0.5 }}>
+              <SelectField
+                id="model-group-member-order"
+                label={t.modelGroupMemberOrder}
+                value={memberOrder}
+                onChange={(e) => setMemberOrder(e.target.value as ModelGroupMemberOrder)}
+              >
+                {memberOrders.map((v) => (
+                  <option value={v} key={v}>
+                    {v === 'speed' ? t.modelGroupMemberOrderSpeed : t.modelGroupMemberOrderPriority}
+                  </option>
+                ))}
+              </SelectField>
+              <Typography variant="caption" color="text.secondary">
+                {t.modelGroupMemberOrderHelp}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 0.5 }}>
+              <Field
+                id="model-group-climb-speed-margin"
+                type="number"
+                label={t.modelGroupClimbSpeedMargin}
+                value={climbSpeedMargin}
+                onChange={(e) => setClimbSpeedMargin(e.target.value)}
+                inputProps={{ min: 0, step: 1 }}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.modelGroupClimbSpeedMarginHelp}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 0.5 }}>
+              <Field
+                id="model-group-min-tokens-per-second"
+                type="number"
+                label={t.modelGroupMinTokensPerSecond}
+                value={minTokensPerSecond}
+                onChange={(e) => setMinTokensPerSecond(e.target.value)}
+                inputProps={{ min: 0, step: 'any' }}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.modelGroupMinTokensPerSecondHelp}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 0.5 }}>
+              <SelectField
+                id="model-group-min-speed-fallback"
+                label={t.modelGroupMinSpeedFallback}
+                value={minSpeedFallback}
+                onChange={(e) => setMinSpeedFallback(e.target.value as ModelGroupMinSpeedFallback)}
+              >
+                {minSpeedFallbacks.map((v) => (
+                  <option value={v} key={v}>
+                    {v === 'ignore'
+                      ? t.modelGroupMinSpeedFallbackIgnore
+                      : t.modelGroupMinSpeedFallbackError}
+                  </option>
+                ))}
+              </SelectField>
+              <Typography variant="caption" color="text.secondary">
+                {t.modelGroupMinSpeedFallbackHelp}
+              </Typography>
+            </Box>
             <OrderedMemberList
               members={members}
               onChange={setMembers}

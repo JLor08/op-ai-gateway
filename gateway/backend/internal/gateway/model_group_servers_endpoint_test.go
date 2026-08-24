@@ -89,8 +89,9 @@ func newModelGroupServersFixture(t *testing.T) *Server {
 
 // TestModelGroupServersEndpointList: GET /api/portal/model-group-servers?name=<group> returns
 // 200 and one row per (model, server) the group's flattened members offer — carrying the leaf
-// model name, a live 1-based priority with no gaps/dupes, and traversal order (member 1's row
-// before member 2's row, since both are equally available single-server offerings).
+// model name, a 1-based display priority with no gaps/dupes, and MANUAL traversal order
+// (member 1's row before member 2's row, since both are equally available single-server
+// offerings). The rank does not model the group's selection settings.
 func TestModelGroupServersEndpointList(t *testing.T) {
 	s := newModelGroupServersFixture(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-group-servers?name="+url.QueryEscape(mgsGroupName), nil)
@@ -144,9 +145,10 @@ func TestModelGroupServersEndpointList(t *testing.T) {
 		t.Fatalf("mgs-model-b row identity = (%q, %q), want (srv_mgs_b, map_mgs_b)", rowB.ServerID, rowB.MappingID)
 	}
 	// Both candidates are single-offering and equally healthy/available, so the tie-break
-	// falls to flattened traversal order: member 1 (mgs-model-a) must rank before member 2.
+	// falls to the flattened MANUAL traversal order: member 1 (mgs-model-a) must rank
+	// before member 2.
 	if rowA.Priority != 1 || rowB.Priority != 2 {
-		t.Fatalf("traversal order not honored: mgs-model-a priority=%d, mgs-model-b priority=%d, want 1 and 2", rowA.Priority, rowB.Priority)
+		t.Fatalf("manual traversal order not honored: mgs-model-a priority=%d, mgs-model-b priority=%d, want 1 and 2", rowA.Priority, rowB.Priority)
 	}
 }
 

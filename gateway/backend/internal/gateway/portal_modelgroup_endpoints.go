@@ -17,11 +17,17 @@ import (
 
 const msgModelGroupNotFound = "model group not found"
 
-// handlePortalModelGroupServers returns every (model, server) a model group can serve with a live
-// selection-order rank. gateway:use, GET. name=<group>. An unknown/inactive group (or a nil group
+// handlePortalModelGroupServers returns every (model, server) a model group can serve with a
+// display rank. gateway:use, GET. name=<group>. An unknown/inactive group (or a nil group
 // registry) yields empty data — never an error. The rank = available candidates first, then in
-// flattened traversal order (the order the group's own failover walk would try), then by
-// descending live score — what the resolver would try right now.
+// flattened MANUAL traversal order, then by descending live score.
+//
+// Scope of that rank: it models the group's manual member order and the live per-mapping
+// score, NOT the group's selection settings. member_order=speed, loaded_only and the
+// min_tokens_per_second floor all reorder or filter members inside the resolver, so such a
+// group may well be served in a different order than the one shown here. Within a member the
+// ranking IS the live scorer's, so the per-server ordering under one member is what the
+// resolver would pick from right now.
 func (s *Server) handlePortalModelGroupServers(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -31,7 +37,9 @@ func (s *Server) handlePortalModelGroupServers(w http.ResponseWriter, r *http.Re
 		return
 	}
 	name := r.URL.Query().Get("name")
-	members, _, ok := s.Groups.Group(name) // flattened leaf model names, in traversal order
+	// The policy is deliberately discarded: this ranking is the manual traversal order, not
+	// a second implementation of the group's selection settings (see the doc comment).
+	members, _, ok := s.Groups.Group(name) // flattened leaf model names, in manual traversal order
 	if !ok {
 		writeJSON(w, http.StatusOK, map[string]any{"data": []portal.GroupModelServerDTO{}})
 		return

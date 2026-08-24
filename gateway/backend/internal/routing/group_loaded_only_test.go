@@ -104,6 +104,42 @@ func TestResolverGroupLoadedOnlyClimbUpNeverWarms(t *testing.T) {
 	}
 }
 
+// The suppression must survive the RELAXATION LADDER. With a real loaded checker and
+// nothing loaded anywhere, the first attempt (loaded_only on) finds no eligible candidate
+// and fails, so the second attempt runs with loaded_only relaxed to false — and it is that
+// attempt which reaches the climb_up dance with an available, cold, higher-priority member.
+// Warming there would start exactly the model load the group exists to avoid, so the gate
+// has to read the group's CONFIGURED setting, not the attempt's relaxed copy.
+func TestResolverGroupLoadedOnlyClimbUpNeverWarmsOnRelaxedAttempt(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seededGroupStore(t, now)
+	unreach := map[string]bool{"app_a": true} // member-1 down at pin time
+	warmer := &fakeWarmer{}
+	resolver := NewResolver(store, func() time.Time { return now }, fakeReachability{unreachable: unreach})
+	resolver.SetGroupResolver(twoMemberLoadedOnlyGroup(GroupPolicy{FailoverMode: modeClimbUp, LoadedOnly: true}))
+	resolver.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{}}) // nothing loaded anywhere
+	resolver.SetModelWarmer(warmer)
+	token := auth.Token{ID: "tok1", UserID: "u1", Active: true}
+	req := groupReq("s1")
+
+	if _, err := resolver.Resolve(ctx, token, req); err != nil { // relaxed attempt pins member-2
+		t.Fatalf("Resolve #1: %v", err)
+	}
+
+	delete(unreach, "app_a") // member-1 (coder-a) recovers, still cold
+	t2, err := resolver.Resolve(ctx, token, req)
+	if err != nil {
+		t.Fatalf("Resolve #2: %v", err)
+	}
+	if t2.ServerID != "srv_b" || t2.Model != "coder-b" {
+		t.Fatalf("#2 target = {%q,%q}, want {srv_b, coder-b} (no warm, keep serving the pin)", t2.ServerID, t2.Model)
+	}
+	if len(warmer.warmed) != 0 {
+		t.Fatalf("warmer.warmed = %v, want none — the relaxed attempt of a loaded_only group must not warm either", warmer.warmed)
+	}
+}
+
 // --- Case 4: pin gating -------------------------------------------------------
 
 // A pinned member that is no longer loaded must be abandoned in favour of a member that

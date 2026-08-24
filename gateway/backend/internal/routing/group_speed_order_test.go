@@ -214,6 +214,49 @@ func TestResolverGroupSpeedOrderZeroMarginClimbsOnAnyGain(t *testing.T) {
 	}
 }
 
+// A PRIORITY-ordered group must never consult the margin at all — the margin is a
+// speed-ordering concept, and the default of 20 would otherwise silently freeze every
+// existing climb_up group whose members happen to be measured. Here the higher-priority
+// coder-a is measurably SLOWER than the pinned coder-b (80 vs 100 tok/s), so no margin
+// could ever be cleared; the session must still climb, because priority order does not
+// care about speed. Deleting the `policy.MemberOrder == MemberOrderSpeed` guard around
+// the margin check turns this into a kept pin and fails the test.
+func TestResolverGroupPriorityOrderIgnoresClimbMargin(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seedMinSpeedStore(t, now,
+		minSpeedFixture{serverID: "srv_a", appID: "app_a", mappingID: "map_a", gatewayName: "coder-a", genTPS: 80},
+		minSpeedFixture{serverID: "srv_b", appID: "app_b", mappingID: "map_b", gatewayName: "coder-b", genTPS: 100},
+	)
+	unreach := map[string]bool{"app_a": true} // the top-priority coder-a is down at pin time
+	loaded := &fakeLoaded{byServer: map[string][]string{}}
+	resolver := NewResolver(store, func() time.Time { return now }, fakeReachability{unreachable: unreach})
+	resolver.SetGroupResolver(speedGroup(GroupPolicy{
+		FailoverMode: modeClimbUp, MemberOrder: MemberOrderPriority, ClimbSpeedMarginPercent: 20,
+	}, "coder-a", "coder-b"))
+	resolver.SetLoadedModelChecker(loaded)
+	token := auth.Token{ID: "tok1", UserID: "u1", Active: true}
+
+	t1, err := resolver.Resolve(ctx, token, groupReq("s1"))
+	if err != nil {
+		t.Fatalf("Resolve #1 (pin the lower-priority member): %v", err)
+	}
+	if t1.Model != "coder-b" {
+		t.Fatalf("#1 target model = %q, want coder-b (coder-a is down at pin time)", t1.Model)
+	}
+
+	delete(unreach, "app_a")                          // coder-a recovers...
+	loaded.byServer["srv_a"] = []string{"coder-a-up"} // ...and is already loaded, so the free climb applies
+
+	target, err := resolver.Resolve(ctx, token, groupReq("s1"))
+	if err != nil {
+		t.Fatalf("Resolve #2: %v", err)
+	}
+	if target.ServerID != "srv_a" || target.Model != "coder-a" {
+		t.Fatalf("target = {%q,%q}, want {srv_a, coder-a} (a priority-ordered climb must not consult the speed margin)", target.ServerID, target.Model)
+	}
+}
+
 // --- Case 5: speed order + loaded_only --------------------------------------
 
 // coder-a offers a FAST candidate that is cold and a SLOW one that is loaded; coder-b's
