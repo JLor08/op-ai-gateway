@@ -45,7 +45,7 @@ func serverWithSuppressedOffering(offered, suppressed []string) *Server {
 }
 
 // serverWithOffering builds a Server whose Portal reports a ModelOffering with
-// exactly these names in both Offered and Existing. Everything else on the
+// exactly these names in both Callable and Existing. Everything else on the
 // Server stays zero: inferencePreflight only reaches the portal through the
 // override re-authorization (skipped when no server override is configured)
 // and the redirect, and s.Limiter.Admit is nil-safe.
@@ -100,7 +100,7 @@ func TestPreflightRedirectTargetStillFacesTheAllowlist(t *testing.T) {
 // TestPreflightCatchAllWinsOverTheRedirect cannot reach: there the catch-all
 // target is listed, so the redirect declines for the ordinary reason. Point the
 // catch-all at a model that model_settings hides while leaving it callable, and
-// a redirect that judged by the LISTING would find req.Model ∉ Offered and, in
+// a redirect that judged by the LISTING would find req.Model unlisted and, in
 // widened mode, reroute away from the operator's explicit instruction. The
 // catch-all must always win, suppressed target or not.
 func TestPreflightCatchAllWinsOverTheRedirectEvenWhenSuppressed(t *testing.T) {

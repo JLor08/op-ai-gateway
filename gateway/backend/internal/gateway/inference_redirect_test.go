@@ -20,21 +20,20 @@ func nameSet(lists ...[]string) map[string]struct{} {
 }
 
 // offering builds the ORDINARY portal.ModelOffering, where nothing is
-// suppressed and everything listed is therefore also callable — so each test
-// below reads as "these names are offered, these exist".
-func offering(offered, existing []string) portal.ModelOffering {
-	return portal.ModelOffering{Offered: nameSet(offered), Callable: nameSet(offered), Existing: nameSet(existing)}
+// suppressed — so each test below reads as "these names are callable, these
+// exist".
+func offering(callable, existing []string) portal.ModelOffering {
+	return portal.ModelOffering{Callable: nameSet(callable), Existing: nameSet(existing)}
 }
 
 // offeringWithLocked builds the model_settings "locked" shape: a GROUP-ONLY
 // name that exists but that a direct request cannot route to at all
 // (GroupRegistry.DirectAllowed → routing.ErrNoModelRoute). Unlike "hidden" this
-// is a real access boundary, so the name is absent from BOTH Offered and
-// Callable while staying in Existing — which is exactly the "exists but you
-// cannot call it" shape UnknownModelRedirectBlocked is for.
+// is a real access boundary, so the name is absent from Callable while staying
+// in Existing — which is exactly the "exists but you cannot call it" shape
+// UnknownModelRedirectBlocked is for.
 func offeringWithLocked(callable, locked []string) portal.ModelOffering {
 	return portal.ModelOffering{
-		Offered:  nameSet(callable),
 		Callable: nameSet(callable),
 		Existing: nameSet(callable, locked),
 	}
@@ -43,14 +42,15 @@ func offeringWithLocked(callable, locked []string) portal.ModelOffering {
 // offeringWithSuppressed builds the case where the LISTING and the ACCESS set
 // disagree: `suppressed` names are dropped from the listing (model_settings
 // "hidden", or a rule's HideTarget) yet stay fully callable under their own
-// name — so they are absent from Offered but present in Callable and Existing.
-// This is the shape the redirect has to get right; asking Offered here would
-// reroute a request the token was entitled to serve.
-func offeringWithSuppressed(offered, suppressed []string) portal.ModelOffering {
+// name — so they are absent from what /v1/models shows this token, and present
+// in both Callable and Existing. This is the shape the redirect has to get
+// right; judging by the listing here would reroute a request the token was
+// entitled to serve. The distinction is only visible because ModelOffering
+// carries no listing set for the redirect to reach for by mistake.
+func offeringWithSuppressed(listed, suppressed []string) portal.ModelOffering {
 	return portal.ModelOffering{
-		Offered:  nameSet(offered),
-		Callable: nameSet(offered, suppressed),
-		Existing: nameSet(offered, suppressed),
+		Callable: nameSet(listed, suppressed),
+		Existing: nameSet(listed, suppressed),
 	}
 }
 
@@ -114,12 +114,12 @@ func TestRedirectLeavesKnownModelsAlone(t *testing.T) {
 	}
 }
 
-// TestRedirectWidenedStillLeavesOfferedModelsAlone proves the widening switch
-// only ever adds blocked names to the redirect's reach. A model this token IS
-// offered stays untouched under UnknownModelRedirectBlocked too — the switch
+// TestRedirectWidenedStillLeavesCallableModelsAlone proves the widening switch
+// only ever adds blocked names to the redirect's reach. A model this token CAN
+// call stays untouched under UnknownModelRedirectBlocked too — the switch
 // widens what counts as "does not apply", it does not turn the redirect on for
 // working requests.
-func TestRedirectWidenedStillLeavesOfferedModelsAlone(t *testing.T) {
+func TestRedirectWidenedStillLeavesCallableModelsAlone(t *testing.T) {
 	tok := auth.Token{UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, LastUsedModel: "a"}
 	if got := redirectUnknownModel(tok, "b", offering([]string{"a", "b"}, []string{"a", "b"})); got != "" {
 		t.Fatalf("redirect = %q, want no redirect for an offered model", got)
@@ -129,10 +129,10 @@ func TestRedirectWidenedStillLeavesOfferedModelsAlone(t *testing.T) {
 // TestRedirectWidenedLeavesASuppressedButCallableModelAlone is the case that
 // separates the listing set from the access set. A model suppressed by
 // model_settings (hidden/locked) — or by a rule's HideTarget — is dropped from
-// Offered but stays fully callable under its own name. It is therefore ∈Existing
-// and ∉Offered, exactly the shape widened mode acts on, so a redirect that asked
-// Offered would fire here and reroute a request this token was entitled to
-// serve. Asking Callable, it declines.
+// the listing but stays fully callable under its own name. It is therefore
+// ∈Existing and unlisted, exactly the shape widened mode acts on, so a redirect
+// that asked the listing would fire here and reroute a request this token was
+// entitled to serve. Asking Callable, it declines.
 func TestRedirectWidenedLeavesASuppressedButCallableModelAlone(t *testing.T) {
 	tok := auth.Token{UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, LastUsedModel: "a"}
 	if got := redirectUnknownModel(tok, "hidden-but-callable", offeringWithSuppressed([]string{"a"}, []string{"hidden-but-callable"})); got != "" {

@@ -1479,14 +1479,16 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 // catch-all override, each rule's target, the redirect's fallback) is checked
 // against this one set, so the three can never drift apart.
 //
-// Callable, not Offered, and not Existing — the distinction is the whole point
-// (see ModelOffering):
+// Callable, not the LISTING, and not Existing — the distinction is the whole
+// point (see ModelOffering):
 //
-//   - Offered is the LISTING set. It CONTAINS the token's own offered override
-//     ALIASES, which are not routable names at all: an override alias is
-//     rewritten before routing, so accepting one as a fallback would store a
-//     setting the redirect can never act on. It also LOSES the model_settings
-//     "hidden" names, which route perfectly well under their own name.
+//   - The LISTING (ModelsForFlavor / Models(), what a token sees advertised)
+//     CONTAINS the token's own offered override ALIASES, which are not routable
+//     names at all: an override alias is rewritten before routing, so accepting
+//     one as a fallback would store a setting the redirect can never act on. It
+//     also LOSES the model_settings "hidden" names, which route perfectly well
+//     under their own name. ModelOffering carries no listing set for exactly
+//     that reason.
 //   - Existing ignores per-token reach entirely — it answers "does this name
 //     exist anywhere", not "can this owner use it".
 //   - Callable is exactly "a direct request for this name can succeed": the
@@ -3264,9 +3266,15 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 //	dashboardRouteData()                            yes — visibleMappingViews                   yes — principal-aware, admin bypass         no — same reason
 //	  (GET /api/portal/dashboard, "Live Model
 //	   Routes" table)
-//	ModelOfferingFor().Offered                      yes — filterVisibleMappingViews             yes — via flavorSetsFromViews               yes — via flavorSetsFromViews
 //	ModelOfferingFor().Callable                     yes — filterVisibleMappingViews             locked ONLY (hidden stays: display-only)    no — an alias is not a routable name
 //	ModelOfferingFor().Existing                     no  — deliberately unfiltered               no  — deliberately unsuppressed             no
+//
+// (ModelOfferingFor has NO listing set, deliberately. It used to carry an
+// `Offered` field that applied all three columns exactly as
+// ModelsForFlavor()'s row above does — a second copy of that row's answer,
+// with no reader. The listing surfaces in this table ARE the listing; the
+// offering answers only "can this token route to this name" (Callable) and
+// "does this name exist at all" (Existing), which no row above answers.)
 //
 // (ManageModels(), the admin-only management surface, applies NONE of the
 // three by design: an admin managing visibility/groups must see every active

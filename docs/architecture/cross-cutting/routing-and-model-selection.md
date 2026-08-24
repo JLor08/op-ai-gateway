@@ -256,21 +256,27 @@ already has a live target. Over the portal API the marker is **read-only**: it
 appears on token DTOs and on no request body, because a writable marker would
 hand a client control over where its own unknown requests go.
 
-### 2.2 Offered, callable, existing
+### 2.2 Callable, existing — and why the listing is neither
 
 `portal.ModelOffering` (`internal/portal/service_model_offering.go`) answers
-the redirect's questions with three deliberately distinct per-flavor sets.
-Confusing any two of them produces a wrong redirect:
+the redirect's questions with two deliberately distinct per-flavor sets.
+Confusing them produces a wrong redirect. The **listing** is in the table for
+contrast only — it is not part of `ModelOffering`:
 
 | Set | Question it answers | Per-token reach | `hidden` names | `locked` names | override aliases |
 |---|---|---|---|---|---|
-| `Offered` | what a listing shows this token | applied | dropped | dropped | overlaid |
 | `Callable` | what this token can route to directly | applied | **kept** | dropped | not applied |
 | `Existing` | what exists at all | ignored | kept | kept | not applied |
+| *(the listing — `ModelsForFlavor`/`Models`, not on `ModelOffering`)* | what a listing shows this token | applied | dropped | dropped | overlaid |
 
-`Callable ⊆ Existing`. `Offered` is neither a subset nor a superset of
+`Callable ⊆ Existing`. The listing is neither a subset nor a superset of
 `Callable`: it loses the suppressed names and gains the token's own aliases,
-which are rewritten before routing and are therefore not routable names.
+which are rewritten before routing and are therefore not routable names — so it
+answers no question the redirect asks. `ModelOffering` carried an `Offered`
+field mirroring it until that field was found to have no reader in production;
+it was removed rather than kept as a second, cost-bearing copy of an answer the
+discovery endpoints already give. The visibility matrix on `Service.Models`
+(`internal/portal/service.go`) is where the listing's own filters are recorded.
 
 The split between the two `model_settings` suppression values is the
 load-bearing part:
@@ -288,8 +294,8 @@ a token's listing — by `model_settings`, or by an override row's `hide_target`
 (§2.1, and [API Compatibility & Inference §9](compatibility-and-inference.md))
 — stays callable under its real name, exactly as before these switches existed.
 
-The redirect therefore asks **both** its questions of `Callable`, never of
-`Offered`: reading `Offered` would make widened mode fire on a request the
+The redirect therefore asks **both** its questions of `Callable`, never of a
+listing: reading the listing would make widened mode fire on a request the
 token was entitled to serve and reroute it away from a working model, and
 would defeat a catch-all whose target happens to be hidden. `Existing` is
 built without the per-token filter and without the listing switches, because

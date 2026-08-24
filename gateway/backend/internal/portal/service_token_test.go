@@ -128,18 +128,18 @@ func TestCreateTokenAcceptsGroupAsFallback(t *testing.T) {
 
 // TestCreateTokenAcceptsHiddenModelAsFallback and
 // TestCreateTokenRejectsLockedModelAsFallback are the two halves of the SET the
-// fallback is validated against. Callable, not Offered: "hidden" only takes a
-// name out of the listing while it keeps routing perfectly, whereas "locked"
-// makes it group-only, so a direct request for it — which is exactly what the
-// redirect issues — cannot route at all.
+// fallback is validated against. Callable, never the LISTING: "hidden" only
+// takes a name out of the listing while it keeps routing perfectly, whereas
+// "locked" makes it group-only, so a direct request for it — which is exactly
+// what the redirect issues — cannot route at all.
 func TestCreateTokenAcceptsHiddenModelAsFallback(t *testing.T) {
 	ctx := context.Background()
 	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
 	offerVisibility(t, f.rs, "qwen3-32b", "hidden")
 	// Guard against the test passing for the wrong reason: the model really is
 	// out of the listing set here.
-	if _, ok := f.svc.ModelOfferingFor(ctx, f.owner, routing.APIFlavorOpenAI).Offered["qwen3-32b"]; ok {
-		t.Fatal("fixture broken: the hidden model is still in Offered")
+	if containsString(f.svc.ModelsForFlavor(ctx, f.owner, routing.APIFlavorOpenAI), "qwen3-32b") {
+		t.Fatal("fixture broken: the hidden model is still in the listing")
 	}
 	resp, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
 		Name: "t", Scopes: []string{"gateway:use"},
@@ -171,9 +171,10 @@ func TestCreateTokenRejectsLockedModelAsFallback(t *testing.T) {
 }
 
 // TestCreateTokenRejectsOfferedAliasAsFallback pins the other half of the same
-// choice. An offered override alias IS in Offered, and validating against that
-// set would let an operator save a fallback that can never route: the redirect
-// runs AFTER the override rewrite, so an alias reaching it is a dead name.
+// choice. An offered override alias IS in the LISTING, and validating against
+// the listing would let an operator save a fallback that can never route: the
+// redirect runs AFTER the override rewrite, so an alias reaching it is a dead
+// name.
 func TestCreateTokenRejectsOfferedAliasAsFallback(t *testing.T) {
 	ctx := context.Background()
 	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
@@ -181,8 +182,8 @@ func TestCreateTokenRejectsOfferedAliasAsFallback(t *testing.T) {
 	owner.ModelOverrideRules = store.AuthModelOverrideRules(map[string]store.ModelOverrideRule{
 		"claude-x": {To: "qwen3-32b", Offer: true},
 	})
-	if _, ok := f.svc.ModelOfferingFor(ctx, owner, routing.APIFlavorOpenAI).Offered["claude-x"]; !ok {
-		t.Fatal("fixture broken: the alias is not in Offered, so this proves nothing")
+	if !containsString(f.svc.ModelsForFlavor(ctx, owner, routing.APIFlavorOpenAI), "claude-x") {
+		t.Fatal("fixture broken: the alias is not listed, so this proves nothing")
 	}
 	_, err := f.svc.CreateToken(ctx, owner, CreateTokenRequest{
 		Name: "t", Scopes: []string{"gateway:use"},

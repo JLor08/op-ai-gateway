@@ -25,12 +25,14 @@ import (
 // the RESULT, so the redirect can never reach further than the token may.
 //
 // Both questions this asks the offering — "does the request apply" and "is this
-// candidate usable" — are asked of Callable, NEVER of Offered. Offered is a
-// listing set: a model_settings "hidden" name drops out of it while the model
-// stays fully callable under that same name. Reading Offered here would make
-// widened mode fire on a request the token was entitled to serve and reroute it
-// away from a working model — and, worse, defeat a catch-all whose target
-// happens to be hidden, which must always win over this redirect. Callable
+// candidate usable" — are asked of Callable, NEVER of a LISTING. A listing set
+// is a display: a model_settings "hidden" name drops out of it while the model
+// stays fully callable under that same name. Judging by one would make widened
+// mode fire on a request the token was entitled to serve and reroute it away
+// from a working model — and, worse, defeat a catch-all whose target happens to
+// be hidden, which must always win over this redirect. (portal.ModelOffering
+// deliberately carries no listing set at all, so there is nothing here to reach
+// for by mistake.) Callable
 // means "a direct request for this name can succeed", which is the only correct
 // answer to either question — including for a "locked" (group-only) name, which
 // Callable excludes precisely because a direct request for it cannot route.

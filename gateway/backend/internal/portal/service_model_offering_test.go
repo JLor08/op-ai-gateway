@@ -36,6 +36,15 @@ func newOfferingTestService(t *testing.T, mappings ...offeringMapping) (*Service
 	return offerSvc(rs, nil), rs
 }
 
+// listed reports whether the per-flavor discovery listing (/v1/models et al.)
+// shows `name` to this token. The listing is what the removed
+// ModelOffering.Offered field used to mirror; asking ModelsForFlavor asks the
+// real thing instead of a copy of it, which is the whole reason the copy went.
+func listed(t *testing.T, svc *Service, token auth.Token, flavor, name string) bool {
+	t.Helper()
+	return containsString(svc.ModelsForFlavor(context.Background(), token, flavor), name)
+}
+
 // tokenWithRules returns a token carrying the given model-override rules. The
 // rules are written in the store shape (the shape the token editor persists)
 // and converted through the one bridge that exists for it.
@@ -51,21 +60,23 @@ func TestOfferedAliasAppearsWithTargetFlavors(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"claude-x": {To: "qwen3-32b", Offer: true},
 	})
-	if _, ok := svc.ModelOfferingFor(ctx, token, routing.APIFlavorAnthropic).Offered["claude-x"]; !ok {
+	if !listed(t, svc, token, routing.APIFlavorAnthropic, "claude-x") {
 		t.Fatal("alias missing from the anthropic listing")
 	}
-	if _, ok := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI).Offered["claude-x"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "claude-x") {
 		t.Fatal("alias leaked into the openai listing")
 	}
+	_ = ctx
 }
 
 func TestUnofferedAliasStaysOut(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
 	token := tokenWithRules(map[string]store.ModelOverrideRule{"gpt-4o": {To: "qwen3-32b"}})
-	if _, ok := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI).Offered["gpt-4o"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "gpt-4o") {
 		t.Fatal("alias offered although Offer is false")
 	}
+	_ = ctx
 }
 
 func TestHideTargetDropsTargetName(t *testing.T) {
@@ -74,17 +85,17 @@ func TestHideTargetDropsTargetName(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"gpt-4o": {To: "qwen3-32b", Offer: true, HideTarget: true},
 	})
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["qwen3-32b"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("hidden target still listed")
 	}
 	// Hiding is a listing concern only: the target still EXISTS, so the redirect
 	// in Task 5 must not treat it as unknown.
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
 	if _, ok := off.Existing["qwen3-32b"]; !ok {
 		t.Fatal("hidden target dropped from Existing")
 	}
 	// The alias itself is still offered.
-	if _, ok := off.Offered["gpt-4o"]; !ok {
+	if !listed(t, svc, token, routing.APIFlavorOpenAI, "gpt-4o") {
 		t.Fatal("alias missing although Offer is set")
 	}
 }
@@ -98,9 +109,10 @@ func TestHideTargetWinsOverASecondRow(t *testing.T) {
 		"a": {To: "qwen3-32b", Offer: true, HideTarget: true},
 		"b": {To: "qwen3-32b", Offer: true},
 	})
-	if _, ok := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI).Offered["qwen3-32b"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("target visible although one row hides it")
 	}
+	_ = ctx
 }
 
 // TestAliasToUnknownTargetIsNotOffered: a rule pointing at a model that does
@@ -112,13 +124,13 @@ func TestAliasToUnknownTargetIsNotOffered(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"ghost": {To: "does-not-exist", Offer: true, HideTarget: true},
 	})
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["ghost"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "ghost") {
 		t.Fatal("alias onto a non-existent target was offered")
 	}
-	if _, ok := off.Offered["qwen3-32b"]; !ok {
+	if !listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("the real model disappeared from the listing")
 	}
+	_ = ctx
 }
 
 // TestOfferedAliasOfHiddenTargetIsListed: the alias is a DIFFERENT name that
@@ -132,14 +144,14 @@ func TestOfferedAliasOfHiddenTargetIsListed(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"gpt-4o": {To: "qwen3-32b", Offer: true},
 	})
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["gpt-4o"]; !ok {
+	if !listed(t, svc, token, routing.APIFlavorOpenAI, "gpt-4o") {
 		t.Fatal("alias of a hidden target missing from the listing")
 	}
-	if _, ok := off.Offered["qwen3-32b"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("hidden target listed under its own name")
 	}
 	// Existing ignores visibility: the hidden model still exists.
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
 	if _, ok := off.Existing["qwen3-32b"]; !ok {
 		t.Fatal("hidden model missing from Existing")
 	}
@@ -171,8 +183,9 @@ func TestCallableSplitsHiddenFromLocked(t *testing.T) {
 		t.Run(tc.visibility, func(t *testing.T) {
 			svc, rs := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
 			offerVisibility(t, rs, "qwen3-32b", tc.visibility)
-			off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
-			if _, ok := off.Offered["qwen3-32b"]; ok {
+			token := auth.Token{UserID: "usr_off"}
+			off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+			if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 				t.Fatalf("%s model still listed", tc.visibility)
 			}
 			if _, ok := off.Callable["qwen3-32b"]; ok != tc.wantCallable {
@@ -245,10 +258,10 @@ func TestCallableKeepsAHideTargetTarget(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"gpt-4o": {To: "qwen3-32b", Offer: true, HideTarget: true},
 	})
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["qwen3-32b"]; ok {
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("hidden target still listed")
 	}
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
 	if _, ok := off.Callable["qwen3-32b"]; !ok {
 		t.Fatal("hidden target dropped from Callable although it still routes")
 	}
@@ -265,8 +278,9 @@ func TestCallableIncludesAHiddenGroup(t *testing.T) {
 	)
 	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
 	offerVisibility(t, rs, "coder", "hidden")
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["coder"]; ok {
+	token := auth.Token{UserID: "usr_off"}
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	if listed(t, svc, token, routing.APIFlavorOpenAI, "coder") {
 		t.Fatal("hidden group still listed")
 	}
 	if _, ok := off.Callable["coder"]; !ok {
@@ -283,10 +297,10 @@ func TestCallableExcludesAnAliasName(t *testing.T) {
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
 		"claude-x": {To: "qwen3-32b", Offer: true},
 	})
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
-	if _, ok := off.Offered["claude-x"]; !ok {
+	if !listed(t, svc, token, routing.APIFlavorOpenAI, "claude-x") {
 		t.Fatal("alias missing from the listing")
 	}
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
 	if _, ok := off.Callable["claude-x"]; ok {
 		t.Fatal("alias leaked into Callable")
 	}
@@ -321,7 +335,7 @@ func TestOfferingExistingIncludesGroups(t *testing.T) {
 	if _, ok := off.Existing["coder"]; !ok {
 		t.Fatal("hidden group dropped from Existing")
 	}
-	if _, ok := off.Offered["coder"]; ok {
+	if listed(t, svc, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, "coder") {
 		t.Fatal("hidden group still offered")
 	}
 }
@@ -339,19 +353,21 @@ func TestOfferedAliasOntoAGroup(t *testing.T) {
 		"gpt-4o": {To: "coder", Offer: true, HideTarget: true},
 	})
 	for _, flavor := range []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic} {
-		off := svc.ModelOfferingFor(ctx, token, flavor)
-		if _, ok := off.Offered["gpt-4o"]; !ok {
+		if !listed(t, svc, token, flavor, "gpt-4o") {
 			t.Fatalf("alias onto a group missing from the %s listing", flavor)
 		}
-		if _, ok := off.Offered["coder"]; ok {
+		if listed(t, svc, token, flavor, "coder") {
 			t.Fatalf("hidden group target still listed in the %s listing", flavor)
 		}
 	}
+	_ = ctx
 }
 
 // TestOfferingWithoutRulesIsUnchanged: a token WITHOUT override rules gets
-// exactly the listing it got before this change — ModelsForFlavor and
-// ModelOfferingFor.Offered agree, and neither gained nor lost a name.
+// exactly the listing it got before this change — neither gained nor lost a
+// name. It also pins listing ⊆ Callable for such a token: the listing may drop
+// a merely-hidden name (m4 here), but it can never show one the token cannot
+// route to, since without rules there are no aliases to add.
 func TestOfferingWithoutRulesIsUnchanged(t *testing.T) {
 	ctx := context.Background()
 	svc, rs := newOfferingTestService(t,
@@ -378,14 +394,16 @@ func TestOfferingWithoutRulesIsUnchanged(t *testing.T) {
 				t.Fatalf("ModelsForFlavor(%s) = %#v, want %#v", flavor, got, expected)
 			}
 		}
-		offered := svc.ModelOfferingFor(ctx, token, flavor).Offered
-		if len(offered) != len(expected) {
-			t.Fatalf("Offered(%s) = %#v, want %#v", flavor, offered, expected)
-		}
+		callable := svc.ModelOfferingFor(ctx, token, flavor).Callable
 		for _, name := range expected {
-			if _, ok := offered[name]; !ok {
-				t.Fatalf("Offered(%s) = %#v, want %#v", flavor, offered, expected)
+			if _, ok := callable[name]; !ok {
+				t.Fatalf("listed %q is not callable for %s: Callable = %#v", name, flavor, callable)
 			}
+		}
+		// The hidden model is the other half of the same point: dropped from the
+		// listing, still callable. Only the openai flavor serves it.
+		if _, ok := callable["m4"]; ok != (flavor == routing.APIFlavorOpenAI) {
+			t.Fatalf("Callable(%s)[m4] = %v: a hidden model must stay callable where it is served", flavor, ok)
 		}
 	}
 }
@@ -406,10 +424,10 @@ func TestOverrideAliasReachesModelsForFlavor(t *testing.T) {
 }
 
 // TestOfferingIsWhollyEmptyOnMappingStoreError: a store failure yields BOTH
-// sets empty, never a half-built answer. A populated Offered next to an empty
+// sets empty, never a half-built answer. A populated Callable next to an empty
 // Existing is indistinguishable, to the caller, from "these names exist but
-// none of them is real" — which is exactly the state that makes the Task-5
-// redirect fire on every offered name.
+// none of them is real" — which is exactly the state that makes the redirect
+// fire on every request and then find a candidate to send it to.
 func TestOfferingIsWhollyEmptyOnMappingStoreError(t *testing.T) {
 	ctx := context.Background()
 	rs := routing.NewMemoryStore()
@@ -420,15 +438,15 @@ func TestOfferingIsWhollyEmptyOnMappingStoreError(t *testing.T) {
 	assertOfferingWhollyEmpty(t, off, "store error")
 }
 
-// assertOfferingWhollyEmpty checks the all-or-nothing contract across ALL
-// THREE sets. Callable matters most of the three: a populated Callable beside
-// an empty Existing would make the redirect treat every request as unknown and
-// then find a perfectly good candidate to send it to — the exact silent
-// rerouting the empty-on-error rule exists to prevent.
+// assertOfferingWhollyEmpty checks the all-or-nothing contract across BOTH
+// sets. Callable matters most: a populated Callable beside an empty Existing
+// would make the redirect treat every request as unknown and then find a
+// perfectly good candidate to send it to — the exact silent rerouting the
+// empty-on-error rule exists to prevent.
 func assertOfferingWhollyEmpty(t *testing.T, off ModelOffering, what string) {
 	t.Helper()
-	if len(off.Offered) != 0 || len(off.Callable) != 0 || len(off.Existing) != 0 {
-		t.Fatalf("%s must yield empty sets, got Offered=%#v Callable=%#v Existing=%#v", what, off.Offered, off.Callable, off.Existing)
+	if len(off.Callable) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("%s must yield empty sets, got Callable=%#v Existing=%#v", what, off.Callable, off.Existing)
 	}
 }
 
@@ -471,8 +489,8 @@ func (l *lateFailAIServersStore) AIServers(ctx context.Context) ([]routing.AISer
 
 // TestOfferingNeverReturnsAPartialResult: with the store failing from the
 // second traversal onwards, the answer must still be self-consistent — either
-// wholly empty, or an Existing that accounts for every Offered name. A second
-// traversal reintroduced into ModelOfferingFor fails here, because Offered
+// wholly empty, or an Existing that accounts for every Callable name. A second
+// traversal reintroduced into ModelOfferingFor fails here, because Callable
 // would survive it and Existing would not.
 func TestOfferingNeverReturnsAPartialResult(t *testing.T) {
 	ctx := context.Background()
@@ -482,18 +500,11 @@ func TestOfferingNeverReturnsAPartialResult(t *testing.T) {
 
 	svc := offerSvc(&lateFailAIServersStore{MemoryStore: rs}, nil)
 	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
-	if len(off.Offered) == 0 {
+	if len(off.Callable) == 0 {
 		if len(off.Existing) != 0 {
-			t.Fatalf("empty Offered beside a populated Existing: %#v", off.Existing)
+			t.Fatalf("empty Callable beside a populated Existing: %#v", off.Existing)
 		}
 		return // wholly empty is the other acceptable answer
-	}
-	// This token has no override rules, so every offered name is a real model
-	// and MUST be accounted for by Existing.
-	for name := range off.Offered {
-		if _, ok := off.Existing[name]; !ok {
-			t.Fatalf("offered %q is missing from Existing (partial result): Offered=%#v Existing=%#v", name, off.Offered, off.Existing)
-		}
 	}
 	// Callable ⊆ Existing unconditionally: a name this token can route to
 	// exists by definition. A Callable name outside Existing is the partial
@@ -647,9 +658,9 @@ func TestOfferedAliasOntoAGroupReportsIsGroup(t *testing.T) {
 	}
 }
 
-// TestOfferingReadsEachStoreTraversalOnce: Offered and Existing come from the
+// TestOfferingReadsEachStoreTraversalOnce: Callable and Existing come from the
 // same two reads with different filters applied, so one call must walk the
-// mapping store once and load the group overlay once — Task 5 puts this on the
+// mapping store once and load the group overlay once — this sits on the
 // per-inference-request path and Service caches nothing.
 func TestOfferingReadsEachStoreTraversalOnce(t *testing.T) {
 	ctx := context.Background()

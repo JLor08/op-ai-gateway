@@ -10,26 +10,21 @@ import (
 )
 
 // ModelOffering answers the questions the unknown-model redirect asks about a
-// requested model name, for ONE API flavor. The three sets are deliberately
-// distinct, and confusing any two of them produces a wrong redirect.
-//
-// Offered is the LISTING set: what this token sees in per-flavor discovery
-// (/v1/models et al.), including the token's own offered override aliases and
-// minus both the model_settings hidden/locked names and the targets its rules
-// hide.
+// requested model name, for ONE API flavor. The two sets are deliberately
+// distinct, and confusing them produces a wrong redirect.
 //
 // Callable is the ACCESS set: what this token can actually route to under its
 // real name, i.e. exactly the names a direct request can succeed with. It
-// applies the same per-token reachability as Offered (the server allowlist and
-// resource-group provisioning of visibleMappingViews), and then splits the two
-// model_settings suppression values apart, because only one of them is about
-// access at all:
+// applies the same per-token reachability the LISTING does (the server
+// allowlist and resource-group provisioning of visibleMappingViews), and then
+// splits the two model_settings suppression values apart, because only one of
+// them is about access at all:
 //
 //   - "hidden" (and a rule's HideTarget) is DISPLAY ONLY — the name drops out
 //     of the listing and still routes perfectly. It stays in Callable, and an
 //     active group stays regardless of the group name's own display visibility.
-//     Asking Offered instead would fire the redirect on a request the token was
-//     entitled to serve and reroute it away from a working model.
+//     Asking the listing instead would fire the redirect on a request the token
+//     was entitled to serve and reroute it away from a working model.
 //   - "locked" is a real ACCESS boundary — the name is group-only, and a direct
 //     request for it is refused with routing.ErrNoModelRoute (see isLocked). It
 //     is therefore NOT callable and comes out. It is still Existing, which is
@@ -44,11 +39,23 @@ import (
 // Existing is every name that exists at all for that flavor, deliberately
 // WITHOUT the per-token visibility filter and WITHOUT the listing switches —
 // only that separation lets the redirect tell "no such model" from "not yours".
+// So Callable ⊆ Existing.
 //
-// So Callable ⊆ Existing, while Offered is neither a subset nor a superset of
-// Callable: it loses the suppressed names and gains the override aliases.
+// THE LISTING SET IS NOT HERE, on purpose. What a token sees advertised —
+// ModelsForFlavor / Models(), which drop the suppressed names and add the
+// token's own offered override aliases — is neither a subset nor a superset of
+// Callable, and it answers no question the redirect asks: an alias is rewritten
+// before routing, so it is not a routable name, and a suppressed name routes
+// fine. This type carried an `Offered` field mirroring that listing until it
+// was found to have no production reader at all, only per-request cost. The
+// listing has one composition (flavorSetsFromViews) and one set of consumers
+// (the discovery endpoints), and asking THOSE is how you ask about the listing;
+// see the visibility matrix on Service.Models in service.go.
+//
+// One caller outside the redirect uses Callable: callableModelNames, the
+// configuration-time guard for every model-valued token setting — same
+// question ("can this name be routed to directly"), same answer.
 type ModelOffering struct {
-	Offered  map[string]struct{} // names this token sees listed for one flavor
 	Callable map[string]struct{} // names this token can actually route to
 	Existing map[string]struct{} // names that exist at all for that flavor
 }
@@ -91,16 +98,17 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 }
 
 // ModelOfferingFor answers the two questions the unknown-model redirect asks
-// about a requested name: does this token see it, and does it exist at all.
+// about a requested name: can this token route to it, and does it exist at all.
 // Existing deliberately ignores per-token visibility and the listing switches —
 // only then can the redirect tell "no such model" from "not yours".
 //
 // ALL OR NOTHING. On any store error BOTH sets come back empty; the function
-// never returns a half-built answer. A populated Offered beside an empty
+// never returns a half-built answer. A populated Callable beside an empty
 // Existing would tell the redirect that every name this token can use is
-// simultaneously unknown, and it would redirect all of them. Because the caller
-// cannot distinguish a partial result from a real one, the only safe partial
-// result is none.
+// simultaneously unknown, and it would redirect all of them — then hand each
+// one a perfectly good candidate to go to. Because the caller cannot
+// distinguish a partial result from a real one, the only safe partial result
+// is none.
 //
 // This is deliberately NOT the fail-open that the listing does. ModelsForFlavor
 // falls back to seedModelNames on a store error and modelFlavorSets proceeds
@@ -118,22 +126,21 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // both shared between the two sets — this sits on the per-request path in the
 // redirect and Service caches nothing.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string) ModelOffering {
-	empty := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
+	empty := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	if s.routes == nil {
 		if !isKnownAPIFlavor(flavor) {
 			return empty
 		}
-		out := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
+		out := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 		for _, name := range seedModelNames {
-			out.Offered[name] = struct{}{}
 			out.Callable[name] = struct{}{}
 			out.Existing[name] = struct{}{}
 		}
 		return out
 	}
-	// One traversal feeds all three sets: Existing needs the unfiltered views,
-	// Offered and Callable the resource-group-filtered ones, and the filter is a
-	// pure post-step over the same slice (the identical one visibleMappingViews
+	// One traversal feeds both sets: Existing needs the unfiltered views,
+	// Callable the resource-group-filtered ones, and the filter is a pure
+	// post-step over the same slice (the identical one visibleMappingViews
 	// applies — see filterVisibleMappingViews).
 	views, err := s.activeMappingViews(ctx)
 	if err != nil {
@@ -152,22 +159,24 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	if err != nil {
 		return empty
 	}
-	// Offered is composed exactly as the listing composes it (same function),
-	// so the two can never disagree about what this token sees. Callable is that
-	// same composition's OTHER half — the pre-suppression map it already builds
-	// for the alias overlay, which is precisely "token-filtered, but before the
+	// Callable comes out of the LISTING's own composition (same function), so the
+	// two can never disagree about what this token reaches. It is that
+	// composition's OTHER half — the pre-suppression map it already builds for
+	// the alias overlay, which is precisely "token-filtered, but before the
 	// model_settings hidden/locked names were dropped, and with every active
 	// group regardless of its display visibility" — minus the locked names,
-	// re-dropped below. No extra store read: both come out of the one call below
+	// re-dropped below. No extra store read: it comes out of the one call below
 	// that was already being made, and the visibility map the locked filter
 	// needs is the overlay's own, already loaded.
-	sets, callable := flavorSetsFromViews(visible, &overlay, token)
-	out := ModelOffering{Offered: map[string]struct{}{}, Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
-	for name, flavors := range sets {
-		if _, ok := flavors[flavor]; ok {
-			out.Offered[name] = struct{}{}
-		}
-	}
+	//
+	// The finished LISTING that same call also produces is discarded here (`_`):
+	// no question this type answers is about the listing, and composing it is
+	// how the pre-suppression map comes to exist at all — it is a by-product of
+	// one call, not a second computation. Reusing the listing's own composition
+	// is what keeps Callable from drifting away from what the token really
+	// reaches.
+	_, callable := flavorSetsFromViews(visible, &overlay, token)
+	out := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	for name, flavors := range callable {
 		if _, ok := flavors[flavor]; !ok {
 			continue
