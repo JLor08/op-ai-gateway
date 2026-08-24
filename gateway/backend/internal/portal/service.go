@@ -1846,6 +1846,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// synthetic models, and drop hidden/locked models from the standalone
 			// listing. Fails open (proceed without the overlay) on a store error.
 			isGroup := make(map[string]struct{})
+			// preSuppress mirrors flavorSetsFromViews's own preSuppress: the
+			// per-name flavor set BEFORE any suppression, so the override-alias
+			// overlay below can have an alias inherit a hidden/locked target's
+			// flavors (see applyOverrideAliases's doc comment). Snapshotted here,
+			// before the hidden/locked deletion and the group entries just below;
+			// each group's flavors are folded in unconditionally as it is built,
+			// exactly like flavorSetsFromViews does.
+			preSuppress := make(map[string]map[string]struct{}, len(flavors))
+			for name, f := range flavors {
+				preSuppress[name] = f
+			}
 			if entries, suppressSet, gErr := s.modelGroupOverlay(ctx, flavors); gErr == nil {
 				// A group is "loaded" iff its highest-priority OFFERABLE member is
 				// loaded -- except for a loaded_only group, where ANY loaded member
@@ -1936,6 +1947,10 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// retains it so a hidden/locked group stays visible + revertible. Its
 				// per-name Visibility on the DTO is filled below from the settings map.
 				for _, e := range entries {
+					// A group name is an override target like any model name, so it
+					// belongs in preSuppress even when the group itself is not offered
+					// (mirrors flavorSetsFromViews's identical unconditional add).
+					preSuppress[e.Name] = e.Flavors
 					if suppress && e.Visibility != "shown" {
 						continue
 					}
@@ -1951,6 +1966,47 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					visionOn[e.Name] = groupVision[e.Name]
 					isGroup[e.Name] = struct{}{}
+				}
+			}
+			// Per-token override aliases (Task 4b): the same overlay
+			// flavorSetsFromViews applies for /v1/models and the Anthropic
+			// listing, reused here rather than reimplemented so the rules cannot
+			// drift between the two paths. USAGE PATH ONLY -- suppress==true is
+			// Models(), the listing a token's override rules are meant to shape;
+			// suppress==false is ManageModels(), the admin surface showing the
+			// system's real models, which must never be filled with one token's
+			// aliases. A token without override rules is unaffected either way:
+			// applyOverrideAliases is a no-op on an empty rule set.
+			if suppress {
+				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
+				// applyOverrideAliases only touches the flavor map; an alias name
+				// added there still needs the target's OTHER listing data (loaded
+				// state, offered-on count, context size, vision) copied over under
+				// the alias name -- the alias entry is meant to look exactly like
+				// its target's row, just filed under a different name (this is a
+				// display, not a leak: the alias really does route to this target).
+				// Checking flavors[name] reuses applyOverrideAliases's own decision
+				// of which aliases actually got added (Offer set AND the target
+				// existed in preSuppress) instead of re-deriving it here.
+				for name, rule := range token.ModelOverrideRules {
+					if !rule.Offer {
+						continue
+					}
+					if _, ok := flavors[name]; !ok {
+						continue
+					}
+					if servers, ok := loadedOn[rule.To]; ok {
+						loadedOn[name] = servers
+					}
+					if servers, ok := offeredOn[rule.To]; ok {
+						offeredOn[name] = servers
+					}
+					if cs, ok := contextSizeOn[rule.To]; ok {
+						contextSizeOn[name] = cs
+					}
+					if v, ok := visionOn[rule.To]; ok {
+						visionOn[name] = v
+					}
 				}
 			}
 			ids := make([]string, 0, len(flavors))

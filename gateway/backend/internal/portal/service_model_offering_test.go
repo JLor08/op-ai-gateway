@@ -365,6 +365,95 @@ func (c *countingRoutingStore) GroupMembersByGroup(ctx context.Context, id strin
 	return c.MemoryStore.GroupMembersByGroup(ctx, id)
 }
 
+// --- Task 4b: the same override-alias overlay applied to Models() / modelsResponse ---
+//
+// ModelOfferingFor (above) drives the per-flavor discovery listing
+// (/v1/models, the Anthropic listing) via modelFlavorSets. Models() -- the
+// LM Studio / chat-picker listing -- goes through modelsResponse instead,
+// which builds its own flavor map from activeMappingViews rather than
+// reusing modelFlavorSets, so it never picked up the override-alias overlay
+// Task 4 built. These tests close that gap; see also
+// TestManageModelsNeverShowsAliases below, which guards the one place the
+// overlay must NOT apply.
+
+// TestOfferedAliasAppearsInModelsListing: a token's Offer rule surfaces the
+// alias name in Models(), the usage-facing listing that also feeds the
+// portal's chat model picker.
+func TestOfferedAliasAppearsInModelsListing(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "qwen3-32b", Offer: true},
+	})
+	byID := modelsByID(svc.Models(ctx, token))
+	if _, ok := byID["claude-x"]; !ok {
+		t.Fatalf("offered alias missing from Models(): %#v", byID)
+	}
+}
+
+// TestOfferedAliasCarriesTargetContextSize: the alias entry is not a bare
+// name -- it carries its target's DTO data (context size here), same as the
+// target's own row would, just filed under the alias name. This is correct,
+// not a leak: the alias really does route to this target, and the listing is
+// a display, never an access control.
+func TestOfferedAliasCarriesTargetContextSize(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	if err := rs.CreateAIServer(ctx, routing.AIServer{ID: "srv_alias_ctx", Name: "AliasCtxBox", Domain: "srv_alias_ctx.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := rs.CreateApplication(ctx, routing.Application{ID: "app_alias_ctx", ServerID: "srv_alias_ctx", Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: "map_alias_ctx", ApplicationID: "app_alias_ctx", GatewayModelName: "qwen3-32b", AppModelName: "qwen3-32b-up", Status: routing.ServerStatusActive, ContextSize: 32768, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	svc := offerSvc(rs, nil)
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "qwen3-32b", Offer: true},
+	})
+	byID := modelsByID(svc.Models(ctx, token))
+	if byID["claude-x"].ContextSize != 32768 {
+		t.Fatalf("claude-x context_size = %d, want 32768 (the target's)", byID["claude-x"].ContextSize)
+	}
+}
+
+// TestHideTargetDropsFromModelsListing: HideTarget removes the target's own
+// entry from Models(), mirroring the per-flavor listing's behaviour.
+func TestHideTargetDropsFromModelsListing(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "qwen3-32b", Offer: true, HideTarget: true},
+	})
+	byID := modelsByID(svc.Models(ctx, token))
+	if _, ok := byID["qwen3-32b"]; ok {
+		t.Fatal("hidden target still listed in Models()")
+	}
+	if _, ok := byID["claude-x"]; !ok {
+		t.Fatal("alias missing from Models() although Offer is set")
+	}
+}
+
+// TestManageModelsNeverShowsAliases: ManageModels() is the admin management
+// surface (modelsResponse(suppress=false)) and must show the system's real
+// models only -- filling it with one token's aliases would be wrong, since it
+// is not scoped to any one token's perspective.
+func TestManageModelsNeverShowsAliases(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
+	token := tokenWithRules(map[string]store.ModelOverrideRule{
+		"claude-x": {To: "qwen3-32b", Offer: true},
+	})
+	byID := modelsByID(svc.ManageModels(ctx, token))
+	if _, ok := byID["claude-x"]; ok {
+		t.Fatal("ManageModels() must never show a token's override aliases")
+	}
+	if _, ok := byID["qwen3-32b"]; !ok {
+		t.Fatal("real model missing from ManageModels()")
+	}
+}
+
 // TestOfferingReadsEachStoreTraversalOnce: Offered and Existing come from the
 // same two reads with different filters applied, so one call must walk the
 // mapping store once and load the group overlay once — Task 5 puts this on the
