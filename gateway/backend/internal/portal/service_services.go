@@ -143,6 +143,15 @@ type ServiceTokenDTO struct {
 	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
 	LogCommunication bool                               `json:"log_communication"`
 	Secret           bool                               `json:"secret"`
+	// The unknown-model redirect, identical in meaning to TokenDTO's — the
+	// setting belongs to the token, and a service token is a token. See there.
+	// LastUsedModel is READ-ONLY here too: written by the inference path alone
+	// (LookupBearer already carries all four onto a service token's auth.Token,
+	// so the runtime half needs nothing from this DTO).
+	LastUsedModel               string `json:"last_used_model,omitempty"`
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
 }
 
 // CreateServiceTokenRequest is CreateServiceToken's body (§6.3): scopes are
@@ -155,6 +164,13 @@ type CreateServiceTokenRequest struct {
 	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map"`
 	LogCommunication bool                               `json:"log_communication"`
 	Secret           bool                               `json:"secret"`
+	// The unknown-model redirect settings — see ServiceTokenDTO. There is
+	// deliberately no last_used_model: the marker is written by the inference
+	// path only. Both sub-settings are ignored whenever UnknownModelRedirect is
+	// false, and a non-empty fallback is validated in CreateServiceToken.
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked"`
+	UnknownModelFallback        string `json:"unknown_model_fallback"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -685,6 +701,22 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
+	// The redirect's fallback is checked against the CREATING PRINCIPAL's
+	// callable set, exactly like the override target above it — never against
+	// the service's own allowlist. A token that does not exist yet has no
+	// reachability of its own to compute, and the delegate picking the value is
+	// the one whose model list the UI shows.
+	//
+	// That is safe because the check is a usability guard, not the security
+	// boundary: the redirect's RESULT passes every admission gate at request
+	// time — the service allowlist included — so a fallback the service may not
+	// use is refused there, exactly as a directly requested model would be. It
+	// can never widen what this token may reach.
+	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
+		callable, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
+	if err != nil {
+		return CreateServiceTokenResponse{}, err
+	}
 	now := s.clock().UTC()
 	secret, err := s.secretGenerator()
 	if err != nil {
@@ -708,6 +740,11 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		ModelOverrideMap: store.EncodeModelOverrideRules(overrideRules),
 		LogCommunication: req.LogCommunication,
 		Secret:           req.Secret,
+		// LastUsedModel is deliberately absent: a fresh token has never routed
+		// anything, and only the inference path ever writes the marker.
+		UnknownModelRedirect:        redirect,
+		UnknownModelRedirectBlocked: redirectBlocked,
+		UnknownModelFallback:        fallback,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateServiceTokenResponse{}, err
@@ -975,19 +1012,23 @@ func (s *Service) serviceDTO(ctx context.Context, svc routing.Service) (ServiceD
 // NEVER carries the secret value, only SecretPrefix.
 func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 	return ServiceTokenDTO{
-		ID:               record.ID,
-		ServiceID:        record.ServiceID,
-		Name:             record.Name,
-		SecretPrefix:     record.SecretPrefix,
-		Status:           record.Status,
-		Scopes:           parseScopes(record.Scopes),
-		ExpiresAt:        record.ExpiresAt,
-		LastUsedAt:       record.LastUsedAt,
-		CreatedAt:        record.CreatedAt,
-		ModelOverride:    record.ModelOverride,
-		ModelOverrideMap: store.DecodeModelOverrideRules(record.ModelOverrideMap),
-		LogCommunication: record.LogCommunication,
-		Secret:           record.Secret,
+		ID:                          record.ID,
+		ServiceID:                   record.ServiceID,
+		Name:                        record.Name,
+		SecretPrefix:                record.SecretPrefix,
+		Status:                      record.Status,
+		Scopes:                      parseScopes(record.Scopes),
+		ExpiresAt:                   record.ExpiresAt,
+		LastUsedAt:                  record.LastUsedAt,
+		CreatedAt:                   record.CreatedAt,
+		ModelOverride:               record.ModelOverride,
+		ModelOverrideMap:            store.DecodeModelOverrideRules(record.ModelOverrideMap),
+		LogCommunication:            record.LogCommunication,
+		Secret:                      record.Secret,
+		LastUsedModel:               record.LastUsedModel,
+		UnknownModelRedirect:        record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked: record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:        record.UnknownModelFallback,
 	}
 }
 
