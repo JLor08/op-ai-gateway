@@ -2,7 +2,7 @@
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
 .PHONY: test test-go test-ui test-e2e dev run-gateway fmt lint lint-fix lint-install hooks \
-	sonar-up sonar-coverage sonar-scan sonar-gate sonar-findings sonar-down
+	sonar-up sonar-coverage sonar-scan sonar-gate sonar-findings sonar-branch-findings sonar-down
 
 test: test-go test-ui
 
@@ -62,6 +62,12 @@ sonar-gate:
 
 sonar-findings:
 	./scripts/sonar/sonar.sh findings
+
+# Which of the exported findings sit on lines THIS branch changed (vs origin/main).
+# Post-processing only: run sonar-findings first. Exits non-zero when the branch
+# owns a finding, so it works as a pre-PR check.
+sonar-branch-findings:
+	./scripts/sonar/branch-findings.sh
 
 sonar-down:
 	./scripts/sonar/sonar.sh down
