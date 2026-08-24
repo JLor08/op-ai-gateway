@@ -285,16 +285,21 @@ of resolving a single mapping.
     the group without the floor.
 - **Evaluation order and relaxation.** `min_tokens_per_second` and
   `loaded_only` are both candidate-level filters inside `eligibleCandidates`
-  (`internal/routing/resolver.go`), and both the pin check (`selectMember`)
-  and the priority/speed walk (`firstAvailable`) go through that same
-  function — so a pinned candidate that drops below the floor, or a pinned
-  member that is no longer loaded, simply stops counting as "available" and
-  falls through to the walk, exactly like a down or at-capacity pin already
-  does. Per attempt the order is **pin check → speed floor → loaded-only →
-  member ordering → walk** (`resolveGroupOnce`); `resolveGroup` re-attempts
-  the whole thing under a **cumulative, monotone relaxation ladder** whenever
-  an attempt finds nothing eligible (never on a store error or an
-  admission-queue timeout — those propagate immediately):
+  (`internal/routing/resolver.go`, applied in that order — floor first, then
+  loaded-only), and both the pin check (`selectMember`) and the priority/speed
+  walk (`firstAvailable`) go through that same function — so a pinned
+  candidate that drops below the floor, or a pinned member that is no longer
+  loaded, simply stops counting as "available" and falls through to the walk,
+  exactly like a down or at-capacity pin already does. Within one attempt,
+  `resolveGroupOnce` first re-sorts the member list when `member_order=speed`
+  (so the pin check, the climb comparison, and the walk all read the same
+  "fastest first" order), then checks the pin — itself filtered by the floor
+  and loaded-only rules above — and only then falls through to the walk,
+  which applies the identical filters to every member it inspects.
+  `resolveGroup` re-attempts the whole thing (re-sort included) under a
+  **cumulative, monotone relaxation ladder** whenever an attempt finds nothing
+  eligible (never on a store error or an admission-queue timeout — those
+  propagate immediately):
   1. floor and `loaded_only` both applied, as configured;
   2. `loaded_only` dropped, floor still applied;
   3. neither applied — reached only when `min_speed_fallback=ignore`.
