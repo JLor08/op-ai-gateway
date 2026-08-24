@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ServicesView } from './ServicesView';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages } from '../i18n';
@@ -885,5 +885,61 @@ describe('ServiceTokensSection unknown-model redirect (Task 8)', () => {
         unknown_model_fallback: '',
       }),
     );
+  });
+});
+
+describe('ServiceTokensSection last-used-model column (Task 9)', () => {
+  // The column-visibility toggle persists to localStorage (usePreference), so
+  // clear it between cases to keep each test starting from the hidden-by-default
+  // state (see ServerList.test.tsx's Server-ID column tests for the same pattern).
+  beforeEach(() => {
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom/private-mode guard */
+    }
+  });
+
+  it('hides the last-used-model column by default and shows it from the column menu', async () => {
+    const svc = makeService({ id: 'svc_last_used' });
+    const existingToken = makeServiceToken({
+      id: 'tok_last_used',
+      service_id: 'svc_last_used',
+      name: 'Batch Token',
+      last_used_model: 'qwen3-32b',
+    });
+    renderServicesView({
+      services: [svc],
+      overrides: { serviceTokens: vi.fn(async () => ({ data: [existingToken] })) },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+    await screen.findByText('Batch Token');
+    expect(screen.queryByText('qwen3-32b')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenLastUsedModel }));
+    expect(screen.getByText('qwen3-32b')).toBeInTheDocument();
+  });
+
+  it('renders the placeholder for a token that has never been used', async () => {
+    const svc = makeService({ id: 'svc_never_used' });
+    const existingToken = makeServiceToken({
+      id: 'tok_never_used',
+      service_id: 'svc_never_used',
+      name: 'Fresh Token',
+      last_used_model: '',
+    });
+    renderServicesView({
+      services: [svc],
+      overrides: { serviceTokens: vi.fn(async () => ({ data: [existingToken] })) },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+    await screen.findByText('Fresh Token');
+
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenLastUsedModel }));
+    expect(screen.getByText('—')).toBeInTheDocument();
   });
 });

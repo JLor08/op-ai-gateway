@@ -227,6 +227,14 @@ export function ServiceTokensSection({
       value: (r) => r.last_used_at ?? '',
       render: (r) => formatDate(r.last_used_at, t.agentTokenNever),
     },
+    {
+      id: 'last_used_model',
+      label: t.tokenLastUsedModel,
+      value: (r) => r.last_used_model || '',
+      filter: 'text',
+      defaultHidden: true,
+      render: (r) => r.last_used_model || '—',
+    },
   ];
 
   // The unknown-model redirect's fallback picker offers the SAME

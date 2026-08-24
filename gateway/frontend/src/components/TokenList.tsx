@@ -372,6 +372,14 @@ export function TokenList({
       render: (r) => r.project_name || '-',
     },
     {
+      id: 'last_used_model',
+      label: t.tokenLastUsedModel,
+      value: (r) => r.last_used_model || '',
+      filter: 'text',
+      defaultHidden: true,
+      render: (r) => r.last_used_model || '—',
+    },
+    {
       id: 'status',
       label: t.tableStatus,
       value: (r) => r.status,
