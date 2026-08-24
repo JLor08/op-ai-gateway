@@ -119,3 +119,25 @@ func TestHandlePortalTokenRotateEmptyIDReturns404(t *testing.T) {
 		t.Fatalf("error code = %q, want portal.token_not_found", code)
 	}
 }
+
+// TestHandlePortalTokensCreateInvalidModelSettingReturns400 pins that a
+// rejected model-valued setting reaches the client as the SAME 400 +
+// portal.token_model_override_invalid the PATCH path already returns. The
+// collection handler maps its errors inline instead of through
+// writePortalTokenError, and this case was missing from that list — so a
+// typo'd override target (and now a typo'd redirect fallback, which shares the
+// error deliberately) surfaced as a 500 "token could not be created" on create
+// only, telling the operator the gateway broke rather than that the name is
+// wrong.
+func TestHandlePortalTokensCreateInvalidModelSettingReturns400(t *testing.T) {
+	srv := NewTestServer()
+	rec := httptest.NewRecorder()
+	body := `{"name":"redirect-token","unknown_model_redirect":true,"unknown_model_fallback":"no-such-model"}`
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/tokens", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "portal.token_model_override_invalid" {
+		t.Fatalf("error code = %q, want portal.token_model_override_invalid", code)
+	}
+}
