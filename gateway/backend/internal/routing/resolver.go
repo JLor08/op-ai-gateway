@@ -1076,18 +1076,23 @@ func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key Aff
 
 // resolveGroup runs resolveGroupOnce under progressively relaxed eligibility filters.
 // The order encodes the spec's precedence: the loaded-only filter is dropped before the
-// speed floor is, and the floor is dropped only when min_speed_fallback says so. The
-// first attempt that resolves wins; the LAST attempt's error is the one returned, so the
-// caller still sees ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
+// speed floor is, and the floor is dropped only when min_speed_fallback says so. Each
+// relaxation is CUMULATIVE — built by mutating one carried-forward `relaxed` value, not by
+// rebuilding from the original `policy` — so the ladder is monotone: once a filter is
+// dropped it STAYS dropped in every later attempt. Rebuilding from `policy` each time would
+// let a later attempt resurrect an earlier-dropped filter (e.g. loaded_only reappearing once
+// the floor is also dropped), silently breaking both settings' documented promise that
+// nothing eligible => the restriction is dropped, never a dead end. The first attempt that
+// resolves wins; the LAST attempt's error is the one returned, so the caller still sees
+// ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
 func (r *Resolver) resolveGroup(ctx context.Context, token auth.Token, req inference.Request, key AffinityKey, apiFlavor string, members []GroupMember, policy GroupPolicy, now time.Time) (Target, error) {
 	attempts := []GroupPolicy{policy}
+	relaxed := policy
 	if policy.LoadedOnly {
-		relaxed := policy
 		relaxed.LoadedOnly = false
-		attempts = append(attempts, relaxed) // keeps MinTokensPerSecond as-is
+		attempts = append(attempts, relaxed)
 	}
 	if policy.MinTokensPerSecond > 0 && policy.MinSpeedFallback == MinSpeedFallbackIgnore {
-		relaxed := policy
 		relaxed.MinTokensPerSecond = 0
 		attempts = append(attempts, relaxed)
 	}

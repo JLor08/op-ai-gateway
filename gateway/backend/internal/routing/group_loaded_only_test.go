@@ -245,3 +245,33 @@ func TestResolverGroupLoadedOnlyAndFloorBothWithErrorNeverDropsFloor(t *testing.
 		t.Fatalf("err = %v also matches ErrNoModelRoute, want ONLY ErrNoHealthyHost", err)
 	}
 }
+
+// --- Case 7: both settings + min_speed_fallback=ignore must reach fully relaxed ---
+
+// The relaxation ladder must be MONOTONE: once loaded_only is dropped (attempt 2), it must
+// STAY dropped in attempt 3 (the floor-dropped attempt), never come back. The sole candidate
+// is both below the floor AND not loaded, so only the fully-relaxed attempt (neither filter)
+// can serve it. A ladder that rebuilds each relaxation from the original policy would
+// resurrect loaded_only in attempt 3 and this would incorrectly report ErrNoHealthyHost
+// instead of serving the member — exactly the bug this test guards against.
+func TestResolverGroupLoadedOnlyAndFloorBothWithIgnoreReachesFullyRelaxed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seedMinSpeedStore(t, now,
+		minSpeedFixture{serverID: "srv_solo", appID: "app_solo", mappingID: "map_solo", gatewayName: "coder-solo", genTPS: 10}, // below the floor of 20
+	)
+	policy := GroupPolicy{FailoverMode: "sticky", LoadedOnly: true, MinTokensPerSecond: 20, MinSpeedFallback: MinSpeedFallbackIgnore}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{"solo-group": {policy: policy, members: []GroupMember{
+		{ID: "gm_solo", GroupID: "grp2", MemberGatewayName: "coder-solo", Priority: 0},
+	}}}})
+	resolver.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{}}) // nothing loaded anywhere
+
+	target, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "solo-group", APIFlavor: "openai_chat"})
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the fully-relaxed attempt (neither loaded_only nor the floor) to serve coder-solo", err)
+	}
+	if target.ServerID != "srv_solo" || target.Model != "coder-solo" {
+		t.Fatalf("target = {%q,%q}, want {srv_solo, coder-solo}", target.ServerID, target.Model)
+	}
+}
