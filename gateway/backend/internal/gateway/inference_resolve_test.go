@@ -9,13 +9,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"testing"
-	"time"
-
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"testing"
+	"time"
 )
 
 // newTestServer builds a working *Server whose resolver can successfully

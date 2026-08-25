@@ -6,7 +6,6 @@ package gateway
 import (
 	"context"
 	"log/slog"
-
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
