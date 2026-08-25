@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -364,6 +365,75 @@ func testTokenRedirectSettingsRoundTrip(t *testing.T, s *SQLStore) {
 	rules := DecodeModelOverrideRules(got.ModelOverrideMap)
 	if !rules["gpt-4o"].Offer || rules["gpt-4o"].To != "qwen3-32b" {
 		t.Fatalf("rules lost: %#v", rules)
+	}
+}
+
+// TestConformanceLegacyOverrideMapReadsThroughBothTokenPaths is the store-level
+// half of the design's trickiest promise: a row written by the PRE-BRANCH
+// binary, read back after migration 63, yields rules with both listing switches
+// false and loses nothing.
+//
+// The decoder's own unit test proves the codec. This proves the COLUMN: the
+// legacy JSON goes into api_tokens.model_override_map directly — the way an
+// upgraded database really holds it, never through this branch's encoder — and
+// comes back out through both real read paths, on every dialect. TokenByID and
+// LookupBearer decode independently (one into a TokenRecord, one straight onto
+// an auth.Token via AuthModelOverrideRules), so a decode wired into only one of
+// them would pass every test that asks just one.
+func TestConformanceLegacyOverrideMapReadsThroughBothTokenPaths(t *testing.T) {
+	forEachDialect(t, testLegacyOverrideMapReadsThroughBothTokenPaths)
+}
+
+func testLegacyOverrideMapReadsThroughBothTokenPaths(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_legacy", "legacy@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	rec := TokenRecord{ID: "tok_legacy", UserID: "usr_legacy", Name: "legacy", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, rec, "legacy-secret-value"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	// Exactly what a pre-branch binary left in the column: a plain
+	// requested->model string map, written past this branch's encoder on purpose.
+	const legacy = `{"gpt-4o":"qwen3-32b","o3":"coder"}`
+	if _, err := s.exec(ctx, `update api_tokens set model_override_map = ? where id = ?`, legacy, "tok_legacy"); err != nil {
+		t.Fatalf("seed legacy column: %v", err)
+	}
+	want := map[string]ModelOverrideRule{"gpt-4o": {To: "qwen3-32b"}, "o3": {To: "coder"}}
+
+	got, err := s.TokenByID(ctx, "tok_legacy")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.ModelOverrideMap != legacy {
+		t.Fatalf("TokenByID column = %q, want the untouched legacy value %q", got.ModelOverrideMap, legacy)
+	}
+	if rules := DecodeModelOverrideRules(got.ModelOverrideMap); !reflect.DeepEqual(rules, want) {
+		t.Fatalf("TokenByID rules = %#v, want %#v", rules, want)
+	}
+
+	token, ok := s.LookupBearer("Bearer legacy-secret-value")
+	if !ok {
+		t.Fatal("LookupBearer failed for the legacy token")
+	}
+	if len(token.ModelOverrideRules) != len(want) {
+		t.Fatalf("LookupBearer rules = %#v, want %#v", token.ModelOverrideRules, want)
+	}
+	for name, w := range want {
+		rule, ok := token.ModelOverrideRules[name]
+		if !ok {
+			t.Fatalf("LookupBearer lost rule %q: %#v", name, token.ModelOverrideRules)
+		}
+		if rule.To != w.To {
+			t.Fatalf("LookupBearer rule %q target = %q, want %q", name, rule.To, w.To)
+		}
+		// The load-bearing part: a legacy row must default BOTH switches to
+		// false, so no pre-existing token's listing changes under the new binary.
+		if rule.Offer || rule.HideTarget {
+			t.Fatalf("legacy rule %q gained a listing switch: %#v", name, rule)
+		}
 	}
 }
 

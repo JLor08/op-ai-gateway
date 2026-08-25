@@ -7,6 +7,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -381,5 +382,21 @@ func TestOfferingCallableAppliesTheProvisioningFilter(t *testing.T) {
 	}
 	if _, ok := offU.Callable[f.modelN]; !ok {
 		t.Fatalf("Callable(usr_u) missing %s, want present (unrestricted)", f.modelN)
+	}
+
+	// Existing is IDENTICAL for both callers — that is the property the whole
+	// "not yours" vs "no such model" split rests on. Callable differs by
+	// provisioning above; if Existing narrowed with it, the two sets would move
+	// together, the redirect could no longer tell the two cases apart, and narrow
+	// mode would start redirecting restricted models it is meant to keep
+	// refusing. Compared as whole sets, so a name added to one and not the other
+	// fails here rather than at the next reader.
+	if !reflect.DeepEqual(offU.Existing, offV.Existing) {
+		t.Fatalf("Existing differs by caller: usr_u=%v usr_v=%v — it must ignore per-token reach entirely", offU.Existing, offV.Existing)
+	}
+	for _, name := range []string{f.modelM, f.modelN} {
+		if _, ok := offU.Existing[name]; !ok {
+			t.Fatalf("Existing missing %s: precondition — both models must exist for this comparison to mean anything", name)
+		}
 	}
 }
