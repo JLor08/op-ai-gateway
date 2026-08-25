@@ -147,17 +147,8 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // both shared between the two sets — this sits on the per-request path in the
 // redirect and Service caches nothing.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string) ModelOffering {
-	empty := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 	if s.routes == nil {
-		if !isKnownAPIFlavor(flavor) {
-			return empty
-		}
-		out := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
-		for _, name := range seedModelNames {
-			out.Callable[name] = struct{}{}
-			out.Existing[name] = struct{}{}
-		}
-		return out
+		return seedModelOffering(flavor)
 	}
 	// One traversal feeds both sets: Existing needs the unfiltered views,
 	// Callable the resource-group-filtered ones, and the filter is a pure
@@ -165,11 +156,11 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// applies — see filterVisibleMappingViews).
 	views, err := s.activeMappingViews(ctx)
 	if err != nil {
-		return empty
+		return emptyModelOffering()
 	}
 	visible, err := s.filterVisibleMappingViews(ctx, token, views)
 	if err != nil {
-		return empty
+		return emptyModelOffering()
 	}
 	// One overlay load feeds both sides too: its store reads do not depend on
 	// the flavor map it is built against, so it is loaded once and built twice.
@@ -178,7 +169,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// perfectly valid group name look unknown to the redirect.
 	overlay, err := s.loadGroupOverlayInputs(ctx)
 	if err != nil {
-		return empty
+		return emptyModelOffering()
 	}
 	// Callable comes out of the LISTING's own composition (same function), so the
 	// two can never disagree about what this token reaches. It is that
@@ -186,9 +177,9 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// the alias overlay, which is precisely "token-filtered, but before the
 	// model_settings hidden/locked names were dropped, and with every active
 	// group regardless of its display visibility" — minus the locked names,
-	// re-dropped below. No extra store read: it comes out of the one call below
-	// that was already being made, and the visibility map the locked filter
-	// needs is the overlay's own, already loaded.
+	// re-dropped by callableNamesForFlavor. No extra store read: it comes out of
+	// the one call below that was already being made, and the visibility map the
+	// locked filter needs is the overlay's own, already loaded.
 	//
 	// The finished LISTING that same call also produces is discarded here (`_`):
 	// no question this type answers is about the listing, and composing it is
@@ -196,9 +187,44 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// one call, not a second computation. Reusing the listing's own composition
 	// is what keeps Callable from drifting away from what the token really
 	// reaches.
-	_, callable := flavorSetsFromViews(visible, &overlay, token)
-	out := ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
-	for name, flavors := range callable {
+	_, preSuppress := flavorSetsFromViews(visible, &overlay, token)
+	return ModelOffering{
+		Callable: callableNamesForFlavor(preSuppress, flavor, overlay.visByLower),
+		Existing: existingNamesForFlavor(views, overlay, flavor),
+	}
+}
+
+// emptyModelOffering is the ALL-OR-NOTHING store-error result: both sets empty,
+// never a half-built answer. See ModelOfferingFor for why the failure direction
+// is the opposite of the listing's fail-open.
+func emptyModelOffering() ModelOffering {
+	return ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
+}
+
+// seedModelOffering is the unconfigured-routing-store fallback, the one place
+// where both sets agree with the listing by construction: it mirrors
+// ModelsForFlavor's seed models so both answers match what /v1/models actually
+// served. The seeds expose every known flavor, so each is both callable and
+// existing; an unknown flavor offers nothing at all.
+func seedModelOffering(flavor string) ModelOffering {
+	out := emptyModelOffering()
+	if !isKnownAPIFlavor(flavor) {
+		return out
+	}
+	for _, name := range seedModelNames {
+		out.Callable[name] = struct{}{}
+		out.Existing[name] = struct{}{}
+	}
+	return out
+}
+
+// callableNamesForFlavor narrows the listing composition's pre-suppression map
+// — "token-filtered, but before the model_settings hidden/locked names were
+// dropped, and with every active group regardless of its display visibility" —
+// to the ACCESS set for one flavor. See ModelOffering.Callable.
+func callableNamesForFlavor(preSuppress map[string]map[string]struct{}, flavor string, visByLower map[string]string) map[string]struct{} {
+	out := make(map[string]struct{})
+	for name, flavors := range preSuppress {
 		if _, ok := flavors[flavor]; !ok {
 			continue
 		}
@@ -210,19 +236,27 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 		// locked name an eligible redirect TARGET — rerouting the request onto a
 		// name that then fails to route, under a model the client never sent.
 		// "hidden" stays: it is display-only and routes fine.
-		if isLocked(overlay.visByLower[strings.ToLower(strings.TrimSpace(name))]) {
+		if isLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
 			continue
 		}
-		out.Callable[name] = struct{}{}
+		out[name] = struct{}{}
 	}
-	// Existing is built WITHOUT the token filter and without the visibility
-	// overlay: a model the token cannot see still exists, and conflating the two
-	// would make every invisible model look unknown. Hence the unfiltered views
-	// and the group overlay's suppress set discarded.
+	return out
+}
+
+// existingNamesForFlavor is every name that exists at all for one flavor: the
+// models plus the group names.
+//
+// It is built WITHOUT the token filter and without the visibility overlay: a
+// model the token cannot see still exists, and conflating the two would make
+// every invisible model look unknown. Hence the caller's UNFILTERED views and
+// the group overlay's suppress set discarded.
+func existingNamesForFlavor(views []mappingView, overlay groupOverlayInputs, flavor string) map[string]struct{} {
+	out := make(map[string]struct{})
 	all := perNameFlavors(views)
 	for name, flavors := range all {
 		if _, ok := flavors[flavor]; ok {
-			out.Existing[name] = struct{}{}
+			out[name] = struct{}{}
 		}
 	}
 	// Groups share the model namespace, so a group name exists too. The overlay
@@ -233,7 +267,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	entries, _ := buildGroupOverlay(overlay, all)
 	for _, e := range entries {
 		if _, ok := e.Flavors[flavor]; ok {
-			out.Existing[e.Name] = struct{}{}
+			out[e.Name] = struct{}{}
 		}
 	}
 	return out

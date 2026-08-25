@@ -3599,17 +3599,9 @@ func (s *Service) loadGroupOverlayInputs(ctx context.Context) (groupOverlayInput
 // derives the entries and the suppress set from already-loaded inputs and one
 // perNameFlavors map. See modelGroupOverlay for the contract.
 func buildGroupOverlay(in groupOverlayInputs, perNameFlavors map[string]map[string]struct{}) ([]groupOverlayEntry, map[string]struct{}) {
-	groups, visByLower, graph := in.groups, in.visByLower, in.graph
-	// suppress: offerable names whose visibility is hidden or locked. Keyed by
-	// the actual name as it appears in perNameFlavors so callers can delete it.
-	suppress := make(map[string]struct{})
-	for name := range perNameFlavors {
-		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
-			suppress[name] = struct{}{}
-		}
-	}
+	suppress := suppressedOfferableNames(perNameFlavors, in.visByLower)
 	entries := make([]groupOverlayEntry, 0)
-	for _, group := range groups {
+	for _, group := range in.groups {
 		if group.Status != routing.ServerStatusActive {
 			continue
 		}
@@ -3620,37 +3612,66 @@ func buildGroupOverlay(in groupOverlayInputs, perNameFlavors map[string]map[stri
 		}
 		// Flatten the group's (possibly nested) subgroups into the ordered,
 		// de-duplicated leaf-MODEL member names reachable from it.
-		flat := routing.FlattenGroup(group.GatewayModelName, graph)
-		flavors := make(map[string]struct{})
-		ordered := make([]string, 0, len(flat))
-		for _, memberName := range flat {
-			memberFlavors, ok := perNameFlavors[memberName]
-			if !ok {
-				continue // leaf member is not currently offerable
-			}
-			ordered = append(ordered, memberName)
-			for f := range memberFlavors {
-				flavors[f] = struct{}{}
-			}
-		}
+		flat := routing.FlattenGroup(group.GatewayModelName, in.graph)
+		ordered, flavors := offerableGroupMembers(flat, perNameFlavors)
 		if len(ordered) == 0 {
 			continue // no offerable member → the group is not offered
-		}
-		// The group NAME's own visibility (a group name lives in model_settings just
-		// like a model). Default "shown" when no setting row exists.
-		vis := "shown"
-		if v := visByLower[strings.ToLower(strings.TrimSpace(group.GatewayModelName))]; v != "" {
-			vis = v
 		}
 		entries = append(entries, groupOverlayEntry{
 			Name:                    group.GatewayModelName,
 			Flavors:                 flavors,
 			OrderedOfferableMembers: ordered,
-			Visibility:              vis,
+			Visibility:              visibilityOrShown(in.visByLower, group.GatewayModelName),
 			LoadedOnly:              group.LoadedOnly,
 		})
 	}
 	return entries, suppress
+}
+
+// suppressedOfferableNames returns the offerable names whose model_settings
+// visibility is hidden or locked — buildGroupOverlay's suppress set. Keyed by
+// the actual name as it appears in perNameFlavors so callers can delete it.
+func suppressedOfferableNames(perNameFlavors map[string]map[string]struct{}, visByLower map[string]string) map[string]struct{} {
+	suppress := make(map[string]struct{})
+	for name := range perNameFlavors {
+		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
+			suppress[name] = struct{}{}
+		}
+	}
+	return suppress
+}
+
+// offerableGroupMembers reduces a group's flattened leaf-member names to the
+// ones that are currently offerable — in the same priority order — and returns
+// the UNION of their API flavors alongside. A member's own visibility does NOT
+// come into it: a hidden/locked model is still a full member (see
+// modelGroupOverlay). An empty ordered slice means the group has no offerable
+// member at all, which is what makes it not offered.
+func offerableGroupMembers(flat []string, perNameFlavors map[string]map[string]struct{}) ([]string, map[string]struct{}) {
+	flavors := make(map[string]struct{})
+	ordered := make([]string, 0, len(flat))
+	for _, memberName := range flat {
+		memberFlavors, ok := perNameFlavors[memberName]
+		if !ok {
+			continue // leaf member is not currently offerable
+		}
+		ordered = append(ordered, memberName)
+		for f := range memberFlavors {
+			flavors[f] = struct{}{}
+		}
+	}
+	return ordered, flavors
+}
+
+// visibilityOrShown looks a name's own model_settings visibility up
+// case-insensitively, defaulting to "shown" when no setting row exists. It is
+// used for a GROUP name too, because a group name lives in model_settings just
+// like a model name.
+func visibilityOrShown(visByLower map[string]string, name string) string {
+	if v := visByLower[strings.ToLower(strings.TrimSpace(name))]; v != "" {
+		return v
+	}
+	return "shown"
 }
 
 func sortedFlavorSet(set map[string]struct{}) []string {
