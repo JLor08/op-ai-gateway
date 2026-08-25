@@ -63,6 +63,14 @@ describe('OrderedMemberList', () => {
     expect(within(rows[1]).getByText('m2')).toBeInTheDocument();
   });
 
+  // NOTE: the "leftover query after adding" bug (the picker is an ACTION that
+  // keeps value="", so MUI's value prop goes null -> null and its internal input
+  // reset never fires) has NO test here on purpose. jsdom clears the input on
+  // selection whether or not the fix is present, so any test written for it
+  // passes either way — a guard with no power, which reads as coverage while
+  // protecting nothing. It reproduces and is verified in a real browser; the
+  // reasoning lives on SearchableSelect's `query` state.
+
   it('removes a member', () => {
     render(<Harness initial={['m1', 'm2']} />);
     fireEvent.click(screen.getByRole('button', { name: `${t.modelGroupRemoveMember}: m1` }));
