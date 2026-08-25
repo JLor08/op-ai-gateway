@@ -17,6 +17,27 @@ jobs:
   go:
     name: Go (backend + agent)
     runs-on: ubuntu-latest
+    # The store conformance suite runs against every driver, but its PostgreSQL
+    # leg SKIPS itself unless OP_AI_GATEWAY_TEST_POSTGRES_DSN is set. Without
+    # this service that leg never ran here, and the gaps it exists to catch --
+    # narrow column types (ADR-005), dialect-specific SQL -- reached main
+    # unnoticed. The image tracks the deployment view's postgres:17-alpine so CI
+    # tests the version operators actually run.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: op_test
+        ports:
+          - 5432:5432
+        # Steps start as soon as the container does, which is well before the
+        # server accepts connections; without this the first test would race it.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d op_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -26,6 +47,13 @@ jobs:
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
       - name: Format check + lint + test (backend)
         working-directory: gateway/backend
+        # Only the backend reads this: the server-agent has no store. The suite
+        # gives itself a clean slate per PostgreSQL subtest (drop schema public
+        # cascade), which is safe because internal/store is the single package
+        # that touches the database -- its tests are serialized within the
+        # package, so no two of them share the schema at once.
+        env:
+          OP_AI_GATEWAY_TEST_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/op_test?sslmode=disable
         run: |
           golangci-lint fmt --diff
           golangci-lint run
