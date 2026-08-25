@@ -127,7 +127,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 	// resolve on the /v1/responses + /v1/messages non-native path only (chat
 	// completions is untouched). We accept that over threading a pre-resolved target
 	// through the battle-tested complete/completeStream* functions.
-	target, err := s.Resolver.Resolve(r.Context(), token, req)
+	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
 		// An admission-queue rejection (CP4: timeout or full) is TERMINAL for the request —
 		// surface the 503 here rather than returning false, otherwise the translate path

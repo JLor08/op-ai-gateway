@@ -38,7 +38,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	start := time.Now()
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
-	target, err := s.Resolver.Resolve(r.Context(), token, req)
+	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
 		slog.Warn("inference resolve failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", completionErrorCode(err), "status", completionHTTPStatus(err), "err", err)
 		body := writeCompletionErrorCaptured(w, err)

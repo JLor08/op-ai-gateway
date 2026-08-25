@@ -1007,6 +1007,12 @@ func (_d *APIWithTracing) MeshTLSPendingServers(ctx context.Context) (ca1 []Cert
 	return _d.API.MeshTLSPendingServers(ctx)
 }
 
+func (_d *APIWithTracing) ModelOfferingFor(ctx context.Context, t1 auth.Token, s1 string) (m1 ModelOffering) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ModelOfferingFor")
+	defer span.End()
+	return _d.API.ModelOfferingFor(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) ModelServers(ctx context.Context, t1 auth.Token, s1 string) (ma1 []ModelServerDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ModelServers")
 	defer span.End()

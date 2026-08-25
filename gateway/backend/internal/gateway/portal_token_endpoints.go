@@ -56,6 +56,17 @@ func (s *Server) handlePortalTokens(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusConflict, apierror.Response("portal.token_name_conflict", "token name already exists", ""))
 				return
 			}
+			// Every model-valued token setting (the catch-all override, each
+			// override rule's target, the unknown-model redirect's fallback)
+			// rejects an unroutable name with this one error. The PATCH path
+			// below maps it through writePortalTokenError; this handler's
+			// hand-inlined list had no row for it, so on CREATE the same
+			// mistake came back as a 500 "the gateway broke" instead of a 400
+			// "that name is wrong".
+			if errors.Is(err, portal.ErrTokenModelOverrideInvalid) {
+				writeJSON(w, http.StatusBadRequest, apierror.Response("portal.token_model_override_invalid", "token model override is invalid", ""))
+				return
+			}
 			// Project attribution (spec: 2026-08-08-projects-design.md §6/§9):
 			// CreateToken's assignTokenProject enforces membership; this handler
 			// predates that (its error mapping was hand-inlined rather than routed

@@ -90,7 +90,8 @@ behavior. §5 documents what each one does and how they combine.
 
 `Resolver.Resolve` (`internal/routing/resolver.go`) is the single entry point,
 invoked once per inference request with the caller's `auth.Token` and the
-translated `inference.Request`.
+translated `inference.Request` — whose `Model` field the edge has already
+derived from the client's requested name, per token (§2.1).
 
 ```mermaid
 flowchart TD
@@ -131,6 +132,175 @@ the default, is a no-op — every candidate passes). This is the only place
 authorization intersects routing; see
 [Security, Authentication & Authorization](security-auth-rbac.md) for the gate
 itself.
+
+### 2.1 Per-token model resolution
+
+Before the resolver sees anything, the edge decides **which name to resolve**.
+`inferencePreflight` (`internal/gateway/inference_handlers.go`) is the single
+place that happens — once per client request, for the translate handlers and
+for native passthrough alike — and it walks a four-step chain:
+
+| # | Step | Source | Applies when |
+|---|---|---|---|
+| 1 | Exact override row | `token.ModelOverrideRules[requested].To` | the token has a row for exactly this requested name |
+| 2 | Catch-all override | `token.ModelOverride` | no row matched and the catch-all is set |
+| 3 | Unknown-model redirect | `token.LastUsedModel`, then `token.UnknownModelFallback` | the token opted in **and** the name steps 1–2 produced does not apply (below) |
+| 4 | — | — | nothing claimed the name: the request keeps it and fails exactly as it would without the redirect |
+
+Steps 1–2 are `resolveModelOverride`; step 3 is `redirectUnknownModel`
+(`internal/gateway/inference_redirect.go`). Step 3 judges the **effective**
+name steps 1–2 produced, so an override that already resolves to a usable
+model ends the chain there. The catch-all has no requested name of its own —
+it is a single string, not a row — and therefore carries none of the per-row
+listing switches (`offer`/`hide_target`, see
+[API Compatibility & Inference §9](compatibility-and-inference.md)).
+
+```mermaid
+flowchart TD
+    Req["client's requested model\n(inferencePreflight)"] --> Row{"exact override row\nfor this name?"}
+    Row -->|yes| Eff["effective model"]
+    Row -->|no| Catch{"catch-all\nModelOverride set?"}
+    Catch -->|yes| Eff
+    Catch -->|no| Eff
+    Eff --> Opt{"UnknownModelRedirect\nopted in?"}
+    Opt -->|no| Gates
+    Opt -->|yes| Applies{"does the effective name apply?\n(callableFor = Callable minus the\nservice allowlist; widened by\nUnknownModelRedirectBlocked)"}
+    Applies -->|yes| Gates
+    Applies -->|no| Marker{"LastUsedModel\ncallableFor?"}
+    Marker -->|yes| UseMarker["redirect onto the marker"] --> Gates
+    Marker -->|no| Fallback{"UnknownModelFallback\ncallableFor?"}
+    Fallback -->|yes| UseFB["redirect onto the fallback"] --> Gates
+    Fallback -->|no| Keep["keep the requested model\n(today's error)"] --> Gates
+    Gates["admission gates, unchanged:\nserver-override re-authorization,\nservice-token model allowlist,\nrate/quota/budget\n→ Resolver.Resolve (§2)"]
+```
+
+**The invariant.** The redirect target passes every admission gate exactly as
+if the client had named it. The redirect changes *which* name is requested,
+never *what* a token may reach. That is why step 3 sits where it does — before
+`applyServerOverride`, `modelAllowed`, and `admitPrincipal`, not after them —
+and why it is never terminal: with nothing usable to redirect onto, the
+request keeps its model and produces the same error it always did.
+`RequestedModel` still carries the client's original wish, so the usage event
+records both names (see
+[Telemetry, Usage Analytics & Observability](telemetry-usage-observability.md)).
+
+**What "does not apply" means** has two widths, chosen per token:
+
+| `UnknownModelRedirectBlocked` | The effective name is redirected when it is… |
+|---|---|
+| `false` (default) | not callable **and** not in `Existing` — i.e. there is no such model at all |
+| `true` | not callable, full stop — including a model that exists but this token may not use |
+
+The narrow default is deliberate: a refusal on a model that *does* exist is a
+signal about a misconfiguration, and silently routing around it costs whoever
+debugs it later. The widened mode is the explicit opt-out from that.
+
+**"Callable" here is `ModelOffering.Callable` *plus* the service allowlist.**
+`callableFor` (`internal/gateway/inference_redirect.go`) is the predicate both
+questions actually go through: the offering set narrowed by `modelAllowed`, the
+service-account model allowlist. The portal cannot fold that gate into the
+offering itself — the allowlist is a property of the *service*, not of the model
+map — yet it is the only per-token allowlist the system has, and therefore the
+canonical instance of "exists but this token may not use it". Omitting it would
+make widened mode cover every case *except* the one it was written for, and
+would let the redirect pick a `LastUsedModel` or fallback that then 403s at the
+next gate under a model name the client never sent. An **empty** allowlist, and
+any non-service token, mean "every model allowed", so this narrows nothing for
+the tokens that have no allowlist.
+
+**Cost and failure direction.** A token with the redirect off pays one boolean
+test and no store work at all; only an opted-in token triggers the offering
+lookup (one mapping traversal plus one group-overlay load per request,
+uncached). `ModelOfferingFor` is **all-or-nothing**: on any store error every
+set comes back empty, every candidate then reads as uncallable, the chain
+declines, and the client sees today's ordinary error rather than a request
+sent somewhere unintended. This is deliberately the opposite of the model
+listing's fail-open, which must never blank the list a user is looking at.
+
+**Configuration-time guard.** The catch-all, every rule's target, and the
+redirect's fallback are all validated on write against one set — what the
+**writing principal** can route to directly (`callableModelNames`,
+`internal/portal/service.go`) — and an unroutable name is rejected with
+`400 portal.token_model_override_invalid` on every token-write path there is:
+user-token create and update, and service-token create (a service token has no
+update path at all, so its model settings are fixed at creation). For a service
+token that principal is the one **issuing** it — a service delegate or an
+authorized admin-group manager — never the service itself: a token that does
+not exist yet has no reachability of its own to compute. That is
+safe because the check is a usability guard, not the enforcement point:
+candidates are re-checked against the live offering on every request, and the
+result still faces the service's own allowlist, so a value that goes stale — or
+one the service may not use — is inert rather than dangerous.
+
+The **fallback** is the one exception, and only on the service-token path: it is
+validated against that principal's callable set **narrowed by the service's own
+allowlist**. An override target is a name the *client* asked for under another
+spelling, so an allowlist refusal reaches the client as the ordinary `403
+model.not_allowed` — a legible signal. The fallback is a name the *gateway*
+picks on its own, and `callableFor` will never pick one the allowlist blocks, so
+such a fallback is not refused anywhere: it is silently never taken. Rejecting
+it on write is the only moment an operator can still notice. An empty allowlist
+narrows nothing.
+
+**The last-used-model marker.** Every token records the gateway model or group
+name of its last **successfully routed** request (`api_tokens.last_used_model`).
+`Server.resolveTarget` (`internal/gateway/inference_resolve.go`) is the single
+seam all three inference paths (`complete`, `tryProxyNative`, `beginStream`)
+resolve through, so the marker is written in exactly one place. It is written
+**only when the value changes** (the token row is already written on every
+authentication; a second unconditional write per request would double that
+load for no gain), **never on a failed resolve** (a typo or a dead model must
+not become a token's redirect target), and a write error is logged and
+swallowed — the marker is a convenience, never a reason to fail a request that
+already has a live target. Over the portal API the marker is **read-only**: it
+appears on token DTOs and on no request body, because a writable marker would
+hand a client control over where its own unknown requests go.
+
+### 2.2 Callable, existing — and why the listing is neither
+
+`portal.ModelOffering` (`internal/portal/service_model_offering.go`) answers
+the redirect's questions with two deliberately distinct per-flavor sets.
+Confusing them produces a wrong redirect. The **listing** is in the table for
+contrast only — it is not part of `ModelOffering`:
+
+| Set | Question it answers | Per-token reach | `hidden` names | `locked` names | override aliases |
+|---|---|---|---|---|---|
+| `Callable` | what this token can route to directly | applied | **kept** | dropped | not applied |
+| `Existing` | what exists at all | ignored | kept | kept | not applied |
+| *(the listing — `ModelsForFlavor`/`Models`, not on `ModelOffering`)* | what a listing shows this token | applied | dropped | dropped | overlaid |
+
+`Callable ⊆ Existing`. The listing is neither a subset nor a superset of
+`Callable`: it loses the suppressed names and gains the token's own aliases,
+which are rewritten before routing and are therefore not routable names — so it
+answers no question the redirect asks. `ModelOffering` carried an `Offered`
+field mirroring it until that field was found to have no reader in production;
+it was removed rather than kept as a second, cost-bearing copy of an answer the
+discovery endpoints already give. The visibility matrix on `Service.Models`
+(`internal/portal/service.go`) is where the listing's own filters are recorded.
+
+The split between the two `model_settings` suppression values is the
+load-bearing part:
+
+- **`hidden` is display suppression only.** The name drops out of listings and
+  still routes perfectly under that same name, so it stays in `Callable`.
+- **`locked` is a real access boundary.** The name is group-only
+  (`GroupRegistry.DirectAllowed` is false, and the resolver turns that into
+  `ErrNoModelRoute`, §8) — for a group name exactly as for a model name — so it
+  is not callable. It stays in `Existing`, which is precisely what makes it the
+  "exists but you cannot call it" case widened mode is for.
+
+**The listing is a display, never an access control.** A name suppressed from
+a token's listing — by `model_settings`, or by an override row's `hide_target`
+(§2.1, and [API Compatibility & Inference §9](compatibility-and-inference.md))
+— stays callable under its real name, exactly as before these switches existed.
+
+The redirect therefore asks **both** its questions of `Callable`, never of a
+listing: reading the listing would make widened mode fire on a request the
+token was entitled to serve and reroute it away from a working model, and
+would defeat a catch-all whose target happens to be hidden. `Existing` is
+built without the per-token filter and without the listing switches, because
+only that separation lets the redirect tell "no such model" from "not yours";
+groups share the model namespace, so an active group's own name is in it too.
 
 ## 3. Candidate scoring
 

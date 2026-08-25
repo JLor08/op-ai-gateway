@@ -1069,6 +1069,12 @@ const de = {
   tokenOverrideCatchAllNote:
     'Überschreibt alle angefragten Modelle ohne eigene Zuordnung. Leer = keine Überschreibung für die übrigen Modelle.',
   tokenOverrideCatchAllShort: 'Rest',
+  tokenOverrideOffer: 'Als Modellname anbieten',
+  tokenOverrideOfferHint:
+    'Bietet das angefragte Modell selbst als Namen in der Modell-Liste an (erbt die API-Flavors des Zielmodells).',
+  tokenOverrideHideTarget: 'Zielmodell ausblenden',
+  tokenOverrideHideTargetHint:
+    'Entfernt den Namen des Zielmodells aus der Modell-Liste. Zeigen mehrere Zuordnungen auf dasselbe Ziel, genügt eine gesetzte Zeile, um es auszublenden.',
   serverOverrideLabel: 'Server-Override',
   serverOverrideNote:
     'Erzwingt jede Anfrage auf einen bestimmten Server, den Sie verwalten. Leer = kein Override.',
@@ -1083,6 +1089,15 @@ const de = {
     'Der Server-Override-Server ist deaktiviert oder nicht erreichbar.',
   errorServerOverrideModelUnavailable:
     'Der Server-Override-Server bietet das angeforderte Modell nicht an.',
+  tokenUnknownRedirect: 'Umleitung bei unbekanntem Modell',
+  tokenUnknownRedirectHint:
+    'Leitet eine Anfrage nach einem Modellnamen, den es nicht gibt, an das zuletzt genutzte Modell oder den Fallback um, statt fehlzuschlagen. Modelle, die es gibt, dieser Token aber nicht aufrufen darf, werden weiterhin abgelehnt – dafür ist die folgende Option da.',
+  tokenUnknownRedirectBlocked: 'Auch gesperrte Modelle umleiten',
+  tokenUnknownRedirectBlockedHint:
+    'Ohne diese Option greift die Umleitung nur bei einem völlig unbekannten Modellnamen. Aktiviert greift sie auch, wenn das Modell existiert, dieser Token es aber nicht aufrufen darf.',
+  tokenUnknownFallback: 'Fallback-Modell',
+  tokenLastUsedModel: 'Zuletzt genutztes Modell',
+  tokenLastUsedModelNone: 'Noch nicht verwendet',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -2694,6 +2709,12 @@ const en: PortalMessages = {
   tokenOverrideCatchAllNote:
     'Overrides every requested model without its own mapping. Empty = no override for the remaining models.',
   tokenOverrideCatchAllShort: 'Rest',
+  tokenOverrideOffer: 'Offer as a model name',
+  tokenOverrideOfferHint:
+    "Offers the requested model itself as a name in the model list (inherits the target model's API flavors).",
+  tokenOverrideHideTarget: 'Hide target model',
+  tokenOverrideHideTargetHint:
+    "Removes the target model's own name from the model list. When several mappings point to the same target, one checked row is enough to hide it.",
   serverOverrideLabel: 'Server override',
   serverOverrideNote:
     'Forces every request onto one specific server you manage. Empty = no override.',
@@ -2707,6 +2728,15 @@ const en: PortalMessages = {
   errorServerOverrideServerUnavailable: 'The server-override target is disabled or unreachable.',
   errorServerOverrideModelUnavailable:
     'The server-override target does not offer the requested model.',
+  tokenUnknownRedirect: 'Redirect on unknown model',
+  tokenUnknownRedirectHint:
+    'Redirects a request for a model name that does not exist to the last-used model or the fallback, instead of failing. A model that does exist but this token may not call is still refused — that is what the option below is for.',
+  tokenUnknownRedirectBlocked: 'Also redirect blocked models',
+  tokenUnknownRedirectBlockedHint:
+    "Without this, the redirect only applies to a name that doesn't exist at all. Enabled, it also applies when the model exists but this token isn't allowed to call it.",
+  tokenUnknownFallback: 'Fallback model',
+  tokenLastUsedModel: 'Last used model',
+  tokenLastUsedModelNone: 'Not used yet',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',

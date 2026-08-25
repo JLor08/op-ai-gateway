@@ -65,19 +65,25 @@ type userLookup interface {
 }
 
 type ServerDeps struct {
-	Tokens            auth.BearerStore
-	Usage             usage.Store
-	UsageEvents       *usage.Broker
-	Captures          CaptureStore
-	Provider          provider.Client
-	Routes            routing.Store
-	Resolver          *routing.Resolver
-	Portal            portal.API
-	Account           account.API
-	CookieSecure      bool
-	SessionMaxAge     time.Duration
-	PublicURL         string
-	StreamIdleTimeout time.Duration
+	Tokens      auth.BearerStore
+	Usage       usage.Store
+	UsageEvents *usage.Broker
+	Captures    CaptureStore
+	Provider    provider.Client
+	Routes      routing.Store
+	Resolver    *routing.Resolver
+	// LastUsedModelWriter persists the effective model of a token's last
+	// SUCCESSFULLY routed request (see Server.resolveTarget, the single seam
+	// that calls it). Wired in cmd/gateway/main.go to the driver's
+	// SetTokenLastUsedModel (store.SQLStore or portal.MemoryDirectory). Nil
+	// disables the marker entirely — resolveTarget is nil-safe.
+	LastUsedModelWriter func(ctx context.Context, tokenID, model string) error
+	Portal              portal.API
+	Account             account.API
+	CookieSecure        bool
+	SessionMaxAge       time.Duration
+	PublicURL           string
+	StreamIdleTimeout   time.Duration
 	// SwapProtectWindow is the recency window for routing swap-protection: a
 	// server that served a request within this window is protected from eviction
 	// by a request for a different model. <= 0 defaults to 30s in New.
@@ -256,27 +262,29 @@ type ServerDeps struct {
 }
 
 type Server struct {
-	Tokens            auth.BearerStore
-	Usage             usage.Store
-	UsageEvents       *usage.Broker
-	Captures          CaptureStore
-	Provider          provider.Client
-	Routes            routing.Store
-	Resolver          *routing.Resolver
-	Portal            portal.API
-	agentBinaryDir    string
-	Account           account.API
-	CookieSecure      bool
-	SessionMaxAge     time.Duration
-	PublicURL         string
-	streamIdleTimeout time.Duration
-	selfBaseURL       string
-	Cipher            *capture.Cipher
-	captureMaxBytes   int
-	CaptureEnabled    func() bool
-	CaptureOverride   func() bool
-	Active            *activeRegistry
-	AppHealth         *AppHealthRegistry
+	Tokens      auth.BearerStore
+	Usage       usage.Store
+	UsageEvents *usage.Broker
+	Captures    CaptureStore
+	Provider    provider.Client
+	Routes      routing.Store
+	Resolver    *routing.Resolver
+	// LastUsedModelWriter mirrors ServerDeps.LastUsedModelWriter — see its doc.
+	LastUsedModelWriter func(ctx context.Context, tokenID, model string) error
+	Portal              portal.API
+	agentBinaryDir      string
+	Account             account.API
+	CookieSecure        bool
+	SessionMaxAge       time.Duration
+	PublicURL           string
+	streamIdleTimeout   time.Duration
+	selfBaseURL         string
+	Cipher              *capture.Cipher
+	captureMaxBytes     int
+	CaptureEnabled      func() bool
+	CaptureOverride     func() bool
+	Active              *activeRegistry
+	AppHealth           *AppHealthRegistry
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -647,6 +655,7 @@ func New(deps ServerDeps) *Server {
 		Provider:                    providerClient,
 		Routes:                      deps.Routes,
 		Resolver:                    resolver,
+		LastUsedModelWriter:         deps.LastUsedModelWriter,
 		Portal:                      deps.Portal,
 		agentBinaryDir:              deps.AgentBinaryDir,
 		Account:                     deps.Account,

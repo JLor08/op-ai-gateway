@@ -127,16 +127,16 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 	}
 	m.tokens[token.ID] = token
 	m.auth.AddPlainToken(auth.Token{
-		ID:               token.ID,
-		UserID:           token.UserID,
-		Name:             token.Name,
-		Active:           token.Status == store.TokenStatusActive,
-		Scopes:           recordScopes(token.Scopes),
-		ExpiresAt:        token.ExpiresAt,
-		ModelOverride:    token.ModelOverride,
-		ModelOverrideMap: store.DecodeModelOverrideMap(token.ModelOverrideMap),
-		LogCommunication: token.LogCommunication,
-		Secret:           token.Secret,
+		ID:                 token.ID,
+		UserID:             token.UserID,
+		Name:               token.Name,
+		Active:             token.Status == store.TokenStatusActive,
+		Scopes:             recordScopes(token.Scopes),
+		ExpiresAt:          token.ExpiresAt,
+		ModelOverride:      token.ModelOverride,
+		ModelOverrideRules: store.AuthModelOverrideRules(store.DecodeModelOverrideRules(token.ModelOverrideMap)),
+		LogCommunication:   token.LogCommunication,
+		Secret:             token.Secret,
 		// ServiceID/Kind mint a Service Account token (Phase 1) as such under
 		// the memory driver so token.IsService() works; AllowedModels starts
 		// empty (unrestricted) here and is best-effort backfilled right after
@@ -150,6 +150,10 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		ProjectName:                    m.projectName(token.ProjectID),
 		ServerOverride:                 token.ServerOverride,
 		ServerOverrideForceUnreachable: token.ServerOverrideForceUnreachable,
+		LastUsedModel:                  token.LastUsedModel,
+		UnknownModelRedirect:           token.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    token.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           token.UnknownModelFallback,
 	}, secret)
 	return nil
 }
@@ -192,7 +196,7 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			Scopes:                         recordScopes(token.Scopes),
 			ExpiresAt:                      token.ExpiresAt,
 			ModelOverride:                  token.ModelOverride,
-			ModelOverrideMap:               store.DecodeModelOverrideMap(token.ModelOverrideMap),
+			ModelOverrideRules:             store.AuthModelOverrideRules(store.DecodeModelOverrideRules(token.ModelOverrideMap)),
 			LogCommunication:               token.LogCommunication,
 			Secret:                         token.Secret,
 			ServiceID:                      token.ServiceID,
@@ -202,6 +206,10 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			ProjectName:                    m.projectName(token.ProjectID),
 			ServerOverride:                 token.ServerOverride,
 			ServerOverrideForceUnreachable: token.ServerOverrideForceUnreachable,
+			LastUsedModel:                  token.LastUsedModel,
+			UnknownModelRedirect:           token.UnknownModelRedirect,
+			UnknownModelRedirectBlocked:    token.UnknownModelRedirectBlocked,
+			UnknownModelFallback:           token.UnknownModelFallback,
 		})
 	}
 	return nil
@@ -277,18 +285,29 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.ProjectID = token.ProjectID
 	existing.ServerOverride = token.ServerOverride
 	existing.ServerOverrideForceUnreachable = token.ServerOverrideForceUnreachable
+	// LastUsedModel is deliberately NOT copied from the incoming record, exactly
+	// as LastUsedAt is not (and as the SQL driver's SET clause omits both): the
+	// marker belongs to the request path (SetTokenLastUsedModel), while a caller
+	// here carries a record it read moments earlier. Copying it would let an
+	// unrelated metadata edit racing an inference request roll back the
+	// unknown-model redirect's own first target. The stored value survives
+	// untouched in `existing`, and the bearer mirror below is rebuilt from
+	// `existing`, so both copies keep it.
+	existing.UnknownModelRedirect = token.UnknownModelRedirect
+	existing.UnknownModelRedirectBlocked = token.UnknownModelRedirectBlocked
+	existing.UnknownModelFallback = token.UnknownModelFallback
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
-		ID:               existing.ID,
-		UserID:           existing.UserID,
-		Name:             existing.Name,
-		Active:           existing.Status == store.TokenStatusActive,
-		Scopes:           recordScopes(existing.Scopes),
-		ExpiresAt:        existing.ExpiresAt,
-		ModelOverride:    existing.ModelOverride,
-		ModelOverrideMap: store.DecodeModelOverrideMap(existing.ModelOverrideMap),
-		LogCommunication: existing.LogCommunication,
-		Secret:           existing.Secret,
+		ID:                 existing.ID,
+		UserID:             existing.UserID,
+		Name:               existing.Name,
+		Active:             existing.Status == store.TokenStatusActive,
+		Scopes:             recordScopes(existing.Scopes),
+		ExpiresAt:          existing.ExpiresAt,
+		ModelOverride:      existing.ModelOverride,
+		ModelOverrideRules: store.AuthModelOverrideRules(store.DecodeModelOverrideRules(existing.ModelOverrideMap)),
+		LogCommunication:   existing.LogCommunication,
+		Secret:             existing.Secret,
 		// ServiceID/Kind never change after creation (see store.TokenRecord's
 		// doc comment) but must be carried forward here regardless: UpdateToken
 		// REPLACES the cached auth.Token wholesale, so omitting them would
@@ -300,7 +319,30 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		ProjectName:                    m.projectName(existing.ProjectID),
 		ServerOverride:                 existing.ServerOverride,
 		ServerOverrideForceUnreachable: existing.ServerOverrideForceUnreachable,
+		LastUsedModel:                  existing.LastUsedModel,
+		UnknownModelRedirect:           existing.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    existing.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           existing.UnknownModelFallback,
 	})
+	return nil
+}
+
+// SetTokenLastUsedModel records the gateway model or group name of a token's
+// last successfully routed request, mirroring the write into both the
+// TokenRecord map and the bearer store's mirrored auth.Token (a narrow,
+// single-field update — unlike UpdateTokenMetadata's full rebuild — since
+// auth.TokenStore.SetLastUsedModel mutates only that one field in place).
+func (m *MemoryDirectory) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.tokens[tokenID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	existing.LastUsedModel = model
+	existing.UpdatedAt = time.Now().UTC()
+	m.tokens[tokenID] = existing
+	m.auth.SetLastUsedModel(tokenID, model)
 	return nil
 }
 

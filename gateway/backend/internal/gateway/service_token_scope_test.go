@@ -238,8 +238,8 @@ func TestModelAllowlistGateTranslatePath(t *testing.T) {
 		// EFFECTIVE model "qwen-coder" (not the requested name) -> must be allowed.
 		addServiceToken(tokens, "svc-secret", auth.Token{
 			ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Svc",
-			ModelOverrideMap: map[string]string{"requested-name": "qwen-coder"},
-			AllowedModels:    []string{"qwen-coder"},
+			ModelOverrideRules: map[string]auth.ModelOverrideRule{"requested-name": {To: "qwen-coder"}},
+			AllowedModels:      []string{"qwen-coder"},
 		})
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/chat/completions", `{"model":"requested-name","messages":[{"role":"user","content":"hi"}]}`, "svc-secret"))
@@ -254,8 +254,8 @@ func TestModelAllowlistGateTranslatePath(t *testing.T) {
 		// override maps it to "qwen-coder", so the EFFECTIVE model is not listed.
 		addServiceToken(tokens, "svc-secret-2", auth.Token{
 			ID: "tok_svc2", ServiceID: "svc_2", ServiceName: "Svc2",
-			ModelOverrideMap: map[string]string{"requested-name": "qwen-coder"},
-			AllowedModels:    []string{"requested-name"},
+			ModelOverrideRules: map[string]auth.ModelOverrideRule{"requested-name": {To: "qwen-coder"}},
+			AllowedModels:      []string{"requested-name"},
 		})
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/chat/completions", `{"model":"requested-name","messages":[{"role":"user","content":"hi"}]}`, "svc-secret-2"))

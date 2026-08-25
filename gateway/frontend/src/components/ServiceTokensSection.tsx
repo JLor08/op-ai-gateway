@@ -26,6 +26,7 @@ import { Field } from './shared/Field';
 import { StatusChip } from './shared/StatusChip';
 import { SecretReveal } from './shared/SecretReveal';
 import { ConfirmDialog } from './shared/ConfirmDialog';
+import { SearchableSelect } from './shared/SearchableSelect';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import {
@@ -111,6 +112,13 @@ export function ServiceTokensSection({
   const [tokenName, setTokenName] = useState('');
   const [tokenOverrideRows, setTokenOverrideRows] = useState<OverrideRow[]>([]);
   const [tokenCatchAll, setTokenCatchAll] = useState('');
+  // The unknown-model redirect (Task 8) — see TokenList for the field
+  // meanings. This form is create-only (no update endpoint for a service
+  // token), so there is never a last-used value to show; the display always
+  // reads the placeholder.
+  const [tokenUnknownRedirect, setTokenUnknownRedirect] = useState(false);
+  const [tokenUnknownRedirectBlocked, setTokenUnknownRedirectBlocked] = useState(false);
+  const [tokenUnknownFallback, setTokenUnknownFallback] = useState('');
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -125,6 +133,9 @@ export function ServiceTokensSection({
     setTokenName('');
     setTokenOverrideRows([]);
     setTokenCatchAll('');
+    setTokenUnknownRedirect(false);
+    setTokenUnknownRedirectBlocked(false);
+    setTokenUnknownFallback('');
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
     setTokenFormOpen(true);
@@ -138,6 +149,12 @@ export function ServiceTokensSection({
         name: tokenName,
         model_override: tokenCatchAll,
         model_override_map: buildOverrideMap(tokenOverrideRows),
+        // last_used_model is deliberately never sent: it is read-only and
+        // not part of CreateServiceTokenRequest at all — a fresh token has
+        // never routed a request.
+        unknown_model_redirect: tokenUnknownRedirect,
+        unknown_model_redirect_blocked: tokenUnknownRedirectBlocked,
+        unknown_model_fallback: tokenUnknownFallback,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
       });
@@ -210,6 +227,22 @@ export function ServiceTokensSection({
       value: (r) => r.last_used_at ?? '',
       render: (r) => formatDate(r.last_used_at, t.agentTokenNever),
     },
+    {
+      id: 'last_used_model',
+      label: t.tokenLastUsedModel,
+      value: (r) => r.last_used_model || '',
+      filter: 'text',
+      defaultHidden: true,
+      render: (r) => r.last_used_model || '—',
+    },
+  ];
+
+  // The unknown-model redirect's fallback picker offers the SAME
+  // model-plus-group list `models` already carries (portal model listing,
+  // groups marked `is_group`) — no separate fetch (Task 8).
+  const unknownFallbackOptions = [
+    { value: '', label: '-' },
+    ...models.map((m) => ({ value: m.id, label: m.display_name })),
   ];
 
   const tokenRowActions = (r: ServiceTokenDTO): RowAction[] => [
@@ -330,6 +363,57 @@ export function ServiceTokensSection({
               idPrefix="service-token"
               catchAllId="service-token-catchall"
             />
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenUnknownRedirect}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setTokenUnknownRedirect(checked);
+                      // See TokenList's identical handler: the redirect being
+                      // off must clear both sub-settings in STATE, not just
+                      // their disabled rendering — submitCreateToken sends
+                      // them unconditionally.
+                      if (!checked) {
+                        setTokenUnknownRedirectBlocked(false);
+                        setTokenUnknownFallback('');
+                      }
+                    }}
+                  />
+                }
+                label={t.tokenUnknownRedirect}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenUnknownRedirectHint}
+              </Typography>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenUnknownRedirectBlocked}
+                    disabled={!tokenUnknownRedirect}
+                    onChange={(e) => setTokenUnknownRedirectBlocked(e.target.checked)}
+                  />
+                }
+                label={t.tokenUnknownRedirectBlocked}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenUnknownRedirectBlockedHint}
+              </Typography>
+              <SearchableSelect
+                id="service-token-unknown-fallback"
+                label={t.tokenUnknownFallback}
+                value={tokenUnknownFallback}
+                onChange={setTokenUnknownFallback}
+                disabled={!tokenUnknownRedirect}
+                options={unknownFallbackOptions}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenLastUsedModel}
+              </Typography>
+              {/* Create-only form: there is never a last-used value yet. */}
+              <Typography variant="body2">{t.tokenLastUsedModelNone}</Typography>
+            </Box>
             <FormControlLabel
               control={
                 <Checkbox

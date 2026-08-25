@@ -91,6 +91,44 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 | `/api/portal/benchmarks/active` | GET | Currently running benchmark jobs, visibility-filtered like server ownership |
 | `/api/portal/dashboard` | GET | Aggregated dashboard payload |
 
+#### Token model settings
+
+User tokens and service tokens carry the same per-token model-settings **fields**,
+but not the same write surface:
+
+| Surface | Where the fields are writable | Where they are readable |
+|---|---|---|
+| User token | `POST /api/portal/tokens` (create) and `PATCH /api/portal/tokens/{id}` (update) | `GET /api/portal/tokens` |
+| Service token | `POST /api/portal/services/{id}/tokens` (create) **only** — there is no update endpoint; `{tid}` accepts `DELETE`, and `{tid}/rotate` accepts `POST`, which replaces the secret and nothing else | `GET /api/portal/services/{id}/tokens` |
+
+So a service token's model settings are **fixed at creation**: changing them
+means deleting the token and creating a new one.
+
+Every model-valued field is validated on write and an unroutable name is
+rejected with `400 portal.token_model_override_invalid`. The set it is validated
+against is the **writing principal's** callable models — the owner for a user
+token, and for a service token the principal issuing it (a service delegate or
+an authorized admin-group manager), never the service's own allowed-model list. That is a usability guard, not the security boundary: the
+service allowlist still refuses the request at inference time if the two
+disagree (see
+[Security, Authentication & Authorization](../cross-cutting/security-auth-rbac.md)).
+
+| Field | Shape | Meaning |
+|---|---|---|
+| `model_override` | string | catch-all: rewrites any requested model that has no rule of its own (`""` = off) |
+| `model_override_map` | object, `requested -> {"to","offer","hide_target"}` | per-requested-name rules. `to` is the gateway model or group to route to; `offer` advertises the requested name in this token's model listing, inheriting the target's flavors; `hide_target` drops the target's own name from that listing. Both switches are listing-only |
+| `unknown_model_redirect` | bool | opt into the unknown-model redirect |
+| `unknown_model_redirect_blocked` | bool | widen "unknown" from "no such model" to "also models this token may not use"; ignored (stored `false`) while the redirect is off |
+| `unknown_model_fallback` | string | model or group used when the marker below is empty or no longer routable; cleared while the redirect is off |
+| `last_used_model` | string, **read-only** | the gateway model or group of this token's last successfully routed request. Present on token DTOs, accepted on no request body — a writable marker would let a client choose where its own unknown requests go |
+
+The rule object is the only accepted wire shape; the legacy
+`requested -> "target"` string map is tolerated when *reading* the stored
+column, which is why the feature needed no data migration. Semantics — the
+resolution order, the three model sets, and the invariant that a redirected
+request still passes every admission gate — are in
+[Routing & Model Selection §2.1–2.2](../cross-cutting/routing-and-model-selection.md).
+
 ### Models, servers, applications, mappings
 
 | Path | Methods | Auth notes | Purpose |

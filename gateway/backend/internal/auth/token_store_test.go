@@ -40,6 +40,30 @@ func TestTokenStoreRekeyTokenMovesToNewHash(t *testing.T) {
 	s.RekeyToken("tok_missing", HashSecret("z"))
 }
 
+// TestTokenStoreSetLastUsedModelUpdatesLookupWithoutTouchingOtherFields
+// mirrors TestTokenStoreRekeyTokenMovesToNewHash's shape but for the narrow
+// single-field mutator: the field changes, everything else (here: Name) is
+// left as-is, and an unknown id is a documented no-op rather than a panic.
+func TestTokenStoreSetLastUsedModelUpdatesLookupWithoutTouchingOtherFields(t *testing.T) {
+	s := NewTokenStore()
+	s.AddPlainToken(Token{ID: "tok_1", Name: "dev token", Active: true, LastUsedModel: "qwen3-32b"}, "secret")
+
+	s.SetLastUsedModel("tok_1", "llama-70b")
+
+	tok, ok := s.LookupBearer("Bearer secret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "llama-70b" {
+		t.Fatalf("LastUsedModel = %q, want %q", tok.LastUsedModel, "llama-70b")
+	}
+	if tok.Name != "dev token" {
+		t.Fatalf("SetLastUsedModel disturbed Name: %q", tok.Name)
+	}
+	// Unknown id is a no-op.
+	s.SetLastUsedModel("tok_missing", "z")
+}
+
 func TestTokenHasScope(t *testing.T) {
 	token := Token{ID: "tok_dev", UserID: "usr_dev", Active: true, Scopes: []string{"gateway:use", "admin"}}
 

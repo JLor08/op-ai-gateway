@@ -20,8 +20,11 @@ import (
 
 func TestResolveModelOverride(t *testing.T) {
 	tok := auth.Token{
-		ModelOverride:    "catch-all",
-		ModelOverrideMap: map[string]string{"gpt-4o": "qwen-coder", "empty-target": ""},
+		ModelOverride: "catch-all",
+		ModelOverrideRules: map[string]auth.ModelOverrideRule{
+			"gpt-4o":       {To: "qwen-coder"},
+			"empty-target": {To: ""},
+		},
 	}
 	tests := []struct {
 		name      string
@@ -33,7 +36,7 @@ func TestResolveModelOverride(t *testing.T) {
 		{"unmapped requested falls back to catch-all", tok, "claude-sonnet", "catch-all"},
 		{"empty map target is ignored -> catch-all", tok, "empty-target", "catch-all"},
 		{"no map + no catch-all leaves requested unchanged", auth.Token{}, "gpt-4o", "gpt-4o"},
-		{"map miss + no catch-all leaves requested unchanged", auth.Token{ModelOverrideMap: map[string]string{"x": "y"}}, "gpt-4o", "gpt-4o"},
+		{"map miss + no catch-all leaves requested unchanged", auth.Token{ModelOverrideRules: map[string]auth.ModelOverrideRule{"x": {To: "y"}}}, "gpt-4o", "gpt-4o"},
 		{"catch-all only forces every requested model", auth.Token{ModelOverride: "forced"}, "anything", "forced"},
 	}
 	for _, tt := range tests {

@@ -82,7 +82,7 @@ type streamSession struct {
 func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, id string, fallback func(provider.Response) any) (*streamSession, bool) {
 	start := time.Now()
 	capturing := s.capturingEnabled(token)
-	target, err := s.Resolver.Resolve(r.Context(), token, req)
+	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
 		// pre-stream failure: the client has no stream yet, so return a normal JSON error
 		slog.Warn("inference stream resolve failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", completionErrorCode(err), "status", completionHTTPStatus(err), "err", err)

@@ -7,6 +7,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -348,5 +349,54 @@ func TestModelVisibleViaEitherServerNoOverDenial(t *testing.T) {
 	}
 	if len(rowsU2) != 2 {
 		t.Fatalf("ModelServers(usr_u2, model-both) = %+v, want 2 rows (provisioned -- sees both servers)", rowsU2)
+	}
+}
+
+// TestOfferingCallableAppliesTheProvisioningFilter is the safety half of
+// ModelOffering.Callable. Callable exists because model_settings visibility is
+// a DISPLAY switch that must not count as unusable — but resource-group
+// provisioning is the opposite, a genuine reachability boundary, and Callable
+// has to keep applying it. Were it not, the Task-5 redirect would treat a
+// restricted model as a legitimate target for a token that cannot route to it.
+// The name still EXISTS, though, which is what keeps narrow mode's "not yours"
+// refusal a refusal rather than a redirect.
+func TestOfferingCallableAppliesTheProvisioningFilter(t *testing.T) {
+	e := newGroupTestEnv(t)
+	f := setupVisibilityFixture(e)
+
+	offV := e.svc.ModelOfferingFor(e.ctx, token("usr_v"), routing.APIFlavorOpenAI)
+	if _, ok := offV.Callable[f.modelM]; ok {
+		t.Fatalf("Callable(usr_v) includes %s, want excluded (not provisioned into RG_VIS)", f.modelM)
+	}
+	if _, ok := offV.Existing[f.modelM]; !ok {
+		t.Fatalf("Existing(usr_v) missing %s: a restricted model still exists", f.modelM)
+	}
+	if _, ok := offV.Callable[f.modelN]; !ok {
+		t.Fatalf("Callable(usr_v) missing %s, want present (unrestricted)", f.modelN)
+	}
+
+	// The provisioned caller reaches both.
+	offU := e.svc.ModelOfferingFor(e.ctx, token("usr_u"), routing.APIFlavorOpenAI)
+	if _, ok := offU.Callable[f.modelM]; !ok {
+		t.Fatalf("Callable(usr_u) missing %s, want present (provisioned)", f.modelM)
+	}
+	if _, ok := offU.Callable[f.modelN]; !ok {
+		t.Fatalf("Callable(usr_u) missing %s, want present (unrestricted)", f.modelN)
+	}
+
+	// Existing is IDENTICAL for both callers — that is the property the whole
+	// "not yours" vs "no such model" split rests on. Callable differs by
+	// provisioning above; if Existing narrowed with it, the two sets would move
+	// together, the redirect could no longer tell the two cases apart, and narrow
+	// mode would start redirecting restricted models it is meant to keep
+	// refusing. Compared as whole sets, so a name added to one and not the other
+	// fails here rather than at the next reader.
+	if !reflect.DeepEqual(offU.Existing, offV.Existing) {
+		t.Fatalf("Existing differs by caller: usr_u=%v usr_v=%v — it must ignore per-token reach entirely", offU.Existing, offV.Existing)
+	}
+	for _, name := range []string{f.modelM, f.modelN} {
+		if _, ok := offU.Existing[name]; !ok {
+			t.Fatalf("Existing missing %s: precondition — both models must exist for this comparison to mean anything", name)
+		}
 	}
 }

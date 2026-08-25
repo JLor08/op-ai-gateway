@@ -99,7 +99,8 @@ principal, or the internal loopback all eventually resolve into. Key fields:
 |---|---|
 | `Scopes` | see [§10](#10-role-based-access-control) |
 | `Kind` | `""`/`"user"` for a normal token, `"service"` for a service-account token (see [§12](#12-delegated--resource-scoped-authorization)) |
-| `ModelOverride` / `ModelOverrideMap` | catch-all / per-model rewrite applied before routing |
+| `ModelOverride` / `ModelOverrideRules` | catch-all / per-requested-name rewrite applied before routing; a rule is `{to, offer, hide_target}`, the two switches shaping only this token's model *listing* |
+| `UnknownModelRedirect` / `UnknownModelRedirectBlocked` / `UnknownModelFallback` / `LastUsedModel` | the opt-in unknown-model redirect and the marker it aims at — see [Routing & Model Selection §2.1](routing-and-model-selection.md) |
 | `AllowedModels` | non-empty only on a service token; a per-model allowlist (empty = every model) |
 | `LogCommunication`, `Secret` | this principal's opt-in/secret-visibility flags for [payload capture](#14-capture-redaction-of-sensitive-headers) |
 | `ProjectID` | usage-attribution project, user tokens only |
@@ -144,8 +145,8 @@ authorization point:
 3. The resulting principal must itself carry `gateway:use`.
 
 On success, the request proceeds as that token's `auth.Token` — its scopes,
-`ModelOverride`/`ModelOverrideMap`, capture flags, project, and server
-override, not the session's. This is the mechanism the gateway's own
+`ModelOverride`/`ModelOverrideRules` and redirect settings, capture flags,
+project, and server override, not the session's. This is the mechanism the gateway's own
 background chat-run executor uses when it calls back into itself over the
 internal trusted-loopback path (`X-OP-Internal-Auth`): it optionally attaches
 `X-OP-Run-As-Token` to run the executed chat step under a specific token's
@@ -475,8 +476,18 @@ status, delegate list, model allowlist, and admin-group links.
 `modelAllowed`) is real, not just documentary: an empty allowlist means every
 model is permitted (the default, and the only state a *user* token is ever
 in — the check is skipped entirely for `Kind != "service"`), while a
-non-empty allowlist is checked **after** model-override resolution, so an
-override can never be used to route around it.
+non-empty allowlist is checked **after** the whole per-token model-name
+resolution — override rules, catch-all, and unknown-model redirect alike — so
+neither an override nor a redirect can ever be used to route around it. That
+is the general invariant of
+[Routing & Model Selection §2.1](routing-and-model-selection.md): those
+settings change *which* name is requested, never *what* a token may reach.
+It is also why a service token's redirect fallback is validated against the
+callable models of the principal **issuing** it (a delegate or an authorized
+admin-group manager) rather than against the service's own allowlist — the
+write-time check is a usability guard, and the allowlist still refuses the
+request at inference time if the two disagree. A service token has no update
+endpoint, so those settings are fixed when it is created.
 
 **Projects** attribute usage, not access. A project has plain members
 (`project_members`), assigned groups (`project_groups` — any tier, and every

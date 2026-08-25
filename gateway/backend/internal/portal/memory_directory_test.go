@@ -198,6 +198,52 @@ func TestMemoryDirectoryUpdateTokenMetadataUnknownIDReturnsNotFound(t *testing.T
 	}
 }
 
+// TestMemoryDirectorySetTokenLastUsedModelSyncsBearerStore proves the memory
+// driver's narrow LastUsedModel write reaches BOTH of its copies: the
+// TokenRecord map (read via TokenByID) and the mirrored auth.Token the bearer
+// store hands back on lookup (read via LookupBearer) — mirroring
+// UpdateTokenMetadata's own carry-through, but for this single field.
+func TestMemoryDirectorySetTokenLastUsedModelSyncsBearerStore(t *testing.T) {
+	ctx := context.Background()
+	authStore := auth.NewTokenStore()
+	dir := NewMemoryDirectory(authStore)
+	now := time.Now().UTC()
+	if err := dir.CreatePlainToken(ctx, store.TokenRecord{
+		ID: "tok_1", UserID: "usr_1", Name: "T", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`,
+		CreatedAt: now, UpdatedAt: now, LastUsedModel: "qwen3-32b",
+	}, "secret-1"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	if err := dir.SetTokenLastUsedModel(ctx, "tok_1", "llama-70b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+
+	record, err := dir.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if record.LastUsedModel != "llama-70b" {
+		t.Fatalf("TokenRecord.LastUsedModel = %q, want %q", record.LastUsedModel, "llama-70b")
+	}
+
+	tok, ok := authStore.LookupBearer("Bearer secret-1")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "llama-70b" {
+		t.Fatalf("bearer LastUsedModel = %q, want %q", tok.LastUsedModel, "llama-70b")
+	}
+}
+
+func TestMemoryDirectorySetTokenLastUsedModelUnknownIDReturnsNotFound(t *testing.T) {
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	err := dir.SetTokenLastUsedModel(context.Background(), "tok_missing", "llama-70b")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("SetTokenLastUsedModel error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestMemoryDirectoryTokenModelOverride(t *testing.T) {
 	ctx := context.Background()
 	tokens := auth.NewTokenStore()
@@ -226,6 +272,129 @@ func TestMemoryDirectoryTokenModelOverride(t *testing.T) {
 	tok, ok = tokens.LookupBearer("Bearer sekret")
 	if !ok || tok.ModelOverride != "qwen-coder" || !tok.LogCommunication {
 		t.Fatalf("after update bearer ModelOverride=%q LogCommunication=%v ok=%v", tok.ModelOverride, tok.LogCommunication, ok)
+	}
+}
+
+// TestMemoryDirectoryTokenRedirectSettingsCarryThrough proves the memory
+// driver carries LastUsedModel/UnknownModelRedirect/UnknownModelRedirectBlocked/
+// UnknownModelFallback into the mirrored auth.Token the bearer store hands back
+// on lookup:
+//   - CreatePlainToken's initial mirror carries all FOUR (checked via the FIRST
+//     LookupBearer)
+//   - UpdateTokenMetadata's selective field-copy + rebuilt mirror carries the
+//     three SETTINGS (checked via the SECOND LookupBearer, after flipping each
+//     of them). LastUsedModel is deliberately not among them — it has exactly
+//     one writer, SetTokenLastUsedModel; see
+//     TestMemoryDirectoryUpdateTokenMetadataLeavesLastUsedModel
+//
+// Unlike TestMemoryDirectoryTokenModelOverride (which only exercises
+// ModelOverride/LogCommunication), this test's bearer-store assertions would
+// keep passing at their PRE-update values even if the corresponding
+// existing.X = token.X lines were deleted from UpdateTokenMetadata, UNLESS
+// the create and update fixtures use DIFFERENT values for every field, which
+// they do here on purpose.
+func TestMemoryDirectoryTokenRedirectSettingsCarryThrough(t *testing.T) {
+	ctx := context.Background()
+	tokens := auth.NewTokenStore()
+	dir := NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	dir.AddUser(store.User{ID: "usr_1", Email: "a@b.test", DisplayName: "A", Role: "user", Status: store.UserStatusActive, CreatedAt: now, UpdatedAt: now})
+
+	rec := store.TokenRecord{
+		ID: "tok_1", UserID: "usr_1", Name: "T", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		LastUsedModel: "qwen3-32b", UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, UnknownModelFallback: "fallback-model",
+	}
+	if err := dir.CreatePlainToken(ctx, rec, "sekret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+
+	// CreatePlainToken's mirror carries the four fields onto the bearer entry.
+	tok, ok := tokens.LookupBearer("Bearer sekret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "qwen3-32b" || !tok.UnknownModelRedirect || !tok.UnknownModelRedirectBlocked || tok.UnknownModelFallback != "fallback-model" {
+		t.Fatalf("after create, bearer token = %#v", tok)
+	}
+
+	// UpdateTokenMetadata flips every one of the four fields to a DIFFERENT
+	// value than the create fixture used, so a missing copy/rebuild line
+	// would leave the stale create-time value behind rather than accidentally
+	// matching by coincidence.
+	rec.UnknownModelRedirect = false
+	rec.UnknownModelRedirectBlocked = false
+	rec.UnknownModelFallback = "other-fallback"
+	rec.UpdatedAt = now.Add(time.Minute)
+	if err := dir.UpdateTokenMetadata(ctx, rec); err != nil {
+		t.Fatalf("UpdateTokenMetadata: %v", err)
+	}
+
+	// The TokenRecord side (existing.X = token.X field copy).
+	got, err := dir.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.UnknownModelRedirect || got.UnknownModelRedirectBlocked || got.UnknownModelFallback != "other-fallback" {
+		t.Fatalf("after update, TokenRecord = %#v", got)
+	}
+
+	// The mirrored auth.Token side (UpdateTokenMetadata's rebuilt bearer entry).
+	tok2, ok := tokens.LookupBearer("Bearer sekret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false after update")
+	}
+	if tok2.UnknownModelRedirect {
+		t.Fatalf("after update, bearer UnknownModelRedirect = true, want false")
+	}
+	if tok2.UnknownModelRedirectBlocked {
+		t.Fatalf("after update, bearer UnknownModelRedirectBlocked = true, want false")
+	}
+	if tok2.UnknownModelFallback != "other-fallback" {
+		t.Fatalf("after update, bearer UnknownModelFallback = %q, want %q", tok2.UnknownModelFallback, "other-fallback")
+	}
+}
+
+// TestMemoryDirectoryUpdateTokenMetadataLeavesLastUsedModel is the memory
+// driver's half of the same invariant the SQL driver carries (see
+// TestSQLiteUpdateTokenMetadataLeavesLastUsedModel): the marker is written by
+// SetTokenLastUsedModel alone, so a metadata update built from a stale record
+// must not roll it back — in the stored record OR in the mirrored bearer entry
+// the update rebuilds.
+func TestMemoryDirectoryUpdateTokenMetadataLeavesLastUsedModel(t *testing.T) {
+	ctx := context.Background()
+	tokens := auth.NewTokenStore()
+	dir := NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	dir.AddUser(store.User{ID: "usr_1", Email: "a@b.test", DisplayName: "A", Role: "user", Status: store.UserStatusActive, CreatedAt: now, UpdatedAt: now})
+	rec := store.TokenRecord{ID: "tok_1", UserID: "usr_1", Name: "T", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}
+	if err := dir.CreatePlainToken(ctx, rec, "sekret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	if err := dir.SetTokenLastUsedModel(ctx, "tok_1", "qwen3-32b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel: %v", err)
+	}
+	stale := rec // read before the marker write: LastUsedModel is still ""
+	stale.Name = "renamed"
+	stale.UpdatedAt = now.Add(time.Minute)
+	if err := dir.UpdateTokenMetadata(ctx, stale); err != nil {
+		t.Fatalf("UpdateTokenMetadata: %v", err)
+	}
+	got, err := dir.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("TokenRecord LastUsedModel = %q, want qwen3-32b (metadata update reverted the marker)", got.LastUsedModel)
+	}
+	if got.Name != "renamed" {
+		t.Fatalf("Name = %q, want renamed (the update itself must still apply)", got.Name)
+	}
+	tok, ok := tokens.LookupBearer("Bearer sekret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("bearer LastUsedModel = %q, want qwen3-32b", tok.LastUsedModel)
 	}
 }
 

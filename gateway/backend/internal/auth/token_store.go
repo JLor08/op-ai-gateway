@@ -11,6 +11,19 @@ import (
 	"time"
 )
 
+// ModelOverrideRule is auth's copy of store.ModelOverrideRule (the target
+// model plus the two listing switches, Offer/HideTarget). It is duplicated
+// here — not imported — because op-ai-gateway/internal/store already imports
+// this package (for auth.Token, used by SQLStore.LookupBearer); importing
+// store from here would be an import cycle. store.AuthModelOverrideRules
+// converts a decoded map[string]store.ModelOverrideRule into this type at
+// every call site that builds an auth.Token from a store.TokenRecord.
+type ModelOverrideRule struct {
+	To         string
+	Offer      bool
+	HideTarget bool
+}
+
 type Token struct {
 	ID        string
 	UserID    string
@@ -19,14 +32,14 @@ type Token struct {
 	Scopes    []string
 	ExpiresAt *time.Time
 	// ModelOverride is the CATCH-ALL model override: applied to a requested model
-	// that has no entry in ModelOverrideMap. Empty = no catch-all.
+	// that has no entry in ModelOverrideRules. Empty = no catch-all.
 	ModelOverride string
-	// ModelOverrideMap maps a REQUESTED model name -> the gateway model to use
-	// instead (takes precedence over ModelOverride). Empty/nil = no per-model
-	// overrides.
-	ModelOverrideMap map[string]string
-	LogCommunication bool
-	Secret           bool
+	// ModelOverrideRules maps a REQUESTED model name -> the rule for it (target
+	// plus the two listing switches). Takes precedence over ModelOverride, the
+	// catch-all. Empty/nil = no per-model overrides.
+	ModelOverrideRules map[string]ModelOverrideRule
+	LogCommunication   bool
+	Secret             bool
 	// ServiceID / ServiceName / Kind identify a SERVICE token (Kind=="service"):
 	// it belongs to a routing.Service, not a user (UserID is then empty).
 	// ServiceName is resolved at lookup time for display only (never persisted
@@ -51,6 +64,12 @@ type Token struct {
 	// to route even to an unhealthy/unreachable server.
 	ServerOverride                 string
 	ServerOverrideForceUnreachable bool
+	// LastUsedModel / UnknownModelRedirect / UnknownModelRedirectBlocked /
+	// UnknownModelFallback mirror the token record — see store.TokenRecord.
+	LastUsedModel               string
+	UnknownModelRedirect        bool
+	UnknownModelRedirectBlocked bool
+	UnknownModelFallback        string
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the
@@ -59,13 +78,16 @@ func (t Token) IsService() bool {
 	return t.Kind == "service"
 }
 
-// cloneOverrideMap returns a shallow copy of m (nil stays nil), so a stored Token's
-// map is never shared by reference with a caller who might mutate it.
-func cloneOverrideMap(m map[string]string) map[string]string {
+// cloneOverrideMap returns a copy of m (nil stays nil), so a stored Token's
+// map is never shared by reference with a caller who might mutate it. Each
+// ModelOverrideRule value is a plain struct of scalar fields (no nested slice
+// or map), so copying the map entries is already a full deep copy — there is
+// no further nested structure a caller could reach through to mutate.
+func cloneOverrideMap(m map[string]ModelOverrideRule) map[string]ModelOverrideRule {
 	if m == nil {
 		return nil
 	}
-	out := make(map[string]string, len(m))
+	out := make(map[string]ModelOverrideRule, len(m))
 	for k, v := range m {
 		out[k] = v
 	}
@@ -108,7 +130,7 @@ func (s *TokenStore) AddPlainToken(token Token, secret string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	token.Scopes = append([]string(nil), token.Scopes...)
-	token.ModelOverrideMap = cloneOverrideMap(token.ModelOverrideMap)
+	token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 	token.AllowedModels = cloneStrings(token.AllowedModels)
 	s.tokens[HashSecret(secret)] = token
 }
@@ -121,7 +143,7 @@ func (s *TokenStore) UpdateToken(token Token) {
 	for hash, existing := range s.tokens {
 		if existing.ID == token.ID {
 			token.Scopes = append([]string(nil), token.Scopes...)
-			token.ModelOverrideMap = cloneOverrideMap(token.ModelOverrideMap)
+			token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 			token.AllowedModels = cloneStrings(token.AllowedModels)
 			s.tokens[hash] = token
 			return
@@ -158,6 +180,23 @@ func (s *TokenStore) RekeyToken(id, newSecretHash string) {
 	}
 }
 
+// SetLastUsedModel updates the stored token that matches id's LastUsedModel
+// field in place, keeping every other field untouched — mirroring
+// RekeyToken's narrow-mutation shape rather than UpdateToken's full replace,
+// since only this one scalar field changes. It is a no-op if no token with
+// that id is present.
+func (s *TokenStore) SetLastUsedModel(id, model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, existing := range s.tokens {
+		if existing.ID == id {
+			existing.LastUsedModel = model
+			s.tokens[hash] = existing
+			return
+		}
+	}
+}
+
 func (s *TokenStore) LookupBearer(header string) (Token, bool) {
 	secret, ok := ExtractBearerSecret(header)
 	if !ok {
@@ -174,7 +213,7 @@ func (s *TokenStore) LookupBearer(header string) (Token, bool) {
 		return Token{}, false
 	}
 	token.Scopes = append([]string(nil), token.Scopes...)
-	token.ModelOverrideMap = cloneOverrideMap(token.ModelOverrideMap)
+	token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 	token.AllowedModels = cloneStrings(token.AllowedModels)
 	return token, true
 }

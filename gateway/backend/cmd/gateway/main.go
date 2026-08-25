@@ -690,20 +690,21 @@ func memoryDeps(cfg config.Config) (gateway.ServerDeps, func() error, error) {
 	chats := store.NewMemoryChatStore(cfg.CaptureMemoryMaxBytes)
 
 	return buildRuntime(cfg, depsBackend{
-		Users:            directory,
-		Tokens:           directory,
-		Groups:           directory,
-		Projects:         directory,
-		ServerTokens:     tokens,
-		Usage:            recorder,
-		Routes:           routeStore,
-		SystemSettings:   systemSettings,
-		UIPrefs:          uiPreferences,
-		Captures:         captures,
-		Chats:            chats,
-		SettingsVolatile: true,
-		Account:          account.NewAPIWithTracing(acct),
-		Cleanup:          func() error { return nil },
+		Users:                 directory,
+		Tokens:                directory,
+		Groups:                directory,
+		Projects:              directory,
+		ServerTokens:          tokens,
+		SetTokenLastUsedModel: directory.SetTokenLastUsedModel,
+		Usage:                 recorder,
+		Routes:                routeStore,
+		SystemSettings:        systemSettings,
+		UIPrefs:               uiPreferences,
+		Captures:              captures,
+		Chats:                 chats,
+		SettingsVolatile:      true,
+		Account:               account.NewAPIWithTracing(acct),
+		Cleanup:               func() error { return nil },
 	})
 }
 
@@ -741,6 +742,13 @@ type depsBackend struct {
 	// (*portal.MemoryDirectory itself does not implement LookupBearer); the
 	// sqlite/postgres driver reuses the same *store.SQLStore as Tokens above.
 	ServerTokens auth.BearerStore
+	// SetTokenLastUsedModel is gateway.ServerDeps.LastUsedModelWriter's driver
+	// seam: the memory driver's *portal.MemoryDirectory keeps its own
+	// TokenRecord map AND the ServerTokens mirror in sync (its
+	// SetTokenLastUsedModel), while the sqlite/postgres driver's
+	// *store.SQLStore writes the row directly. Both satisfy the same
+	// signature, so this field just carries the bound method through.
+	SetTokenLastUsedModel func(ctx context.Context, tokenID, model string) error
 
 	// Captures/Chats are the ONE shared instance for this process handed to
 	// both the portal read side and the gateway write side; each driver has
@@ -984,6 +992,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	captureFlagsHook := newCaptureFlagsHook(b.SystemSettings, time.Now)
 	return gateway.ServerDeps{
 		Tokens:                          b.ServerTokens,
+		LastUsedModelWriter:             b.SetTokenLastUsedModel,
 		Usage:                           b.Usage,
 		UsageEvents:                     usageBroker,
 		Provider:                        mux,
@@ -1128,23 +1137,24 @@ func sqlDeps(cfg config.Config, sqlStore *store.SQLStore, driverCleanup func() e
 	}
 
 	return buildRuntime(cfg, depsBackend{
-		Users:            sqlStore,
-		Tokens:           sqlStore,
-		Groups:           sqlStore,
-		Projects:         sqlStore,
-		ServerTokens:     sqlStore,
-		Usage:            sqlStore,
-		Routes:           sqlStore,
-		SystemSettings:   sqlStore,
-		UIPrefs:          sqlStore,
-		Captures:         captures,
-		Chats:            chats,
-		Cipher:           captureCipher,
-		CertCipher:       certCipher,
-		CaptureMaxBytes:  cfg.CaptureMaxBytes,
-		SettingsVolatile: false,
-		Account:          account.NewAPIWithTracing(acct),
-		Cleanup:          cleanup,
+		Users:                 sqlStore,
+		Tokens:                sqlStore,
+		Groups:                sqlStore,
+		Projects:              sqlStore,
+		ServerTokens:          sqlStore,
+		SetTokenLastUsedModel: sqlStore.SetTokenLastUsedModel,
+		Usage:                 sqlStore,
+		Routes:                sqlStore,
+		SystemSettings:        sqlStore,
+		UIPrefs:               sqlStore,
+		Captures:              captures,
+		Chats:                 chats,
+		Cipher:                captureCipher,
+		CertCipher:            certCipher,
+		CaptureMaxBytes:       cfg.CaptureMaxBytes,
+		SettingsVolatile:      false,
+		Account:               account.NewAPIWithTracing(acct),
+		Cleanup:               cleanup,
 	})
 }
 

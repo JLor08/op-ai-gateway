@@ -15,6 +15,9 @@ Domain and technical terms used throughout this documentation.
 | **Resolver** | The routing component that turns a model name + API flavor into candidate `(server, application, mapping)` tuples. |
 | **Candidate scoring** | Ranking candidates by telemetry (load, latency, error rate, availability), priority/weight, and capacity. |
 | **Route affinity** | Sticky routing keyed on application/server (per token/user, with a TTL). |
+| **Model override rule** | A per-token row `requested name -> {to, offer, hide_target}`: rewrite this requested name to `to`, optionally advertise the requested name in this token's listing (`offer`) and drop the target's own name from it (`hide_target`). |
+| **Unknown-model redirect** | A per-token opt-in: a requested model that does not apply is served by the token's last successfully routed model, then by a configured fallback, instead of failing. |
+| **Offered / callable / existing** | The three model sets kept apart per token: what a listing shows, what a direct request can actually route to, and what exists at all. |
 | **API flavor** | The client dialect: OpenAI-compatible, Anthropic-compatible, Codex (`/v1/responses`), or Claude Code (`/v1/messages`). |
 | **Provider** | A backend client adapter (Ollama, OpenAI-compatible for vLLM/llama.cpp, or the mock). |
 | **Agent token** | A per-server bearer token authenticating the Server-Agent's telemetry/cert calls. |

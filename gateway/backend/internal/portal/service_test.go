@@ -1389,12 +1389,12 @@ func TestCreateTokenModelOverrideMap(t *testing.T) {
 	resp, err := svc.CreateToken(ctx, owner, CreateTokenRequest{
 		Name:             "M1",
 		ModelOverride:    seedModel, // catch-all
-		ModelOverrideMap: map[string]string{"gpt-4o": seedModel, "claude": seedModel, "": ""},
+		ModelOverrideMap: map[string]store.ModelOverrideRule{"gpt-4o": {To: seedModel}, "claude": {To: seedModel}, "": {}},
 	})
 	if err != nil {
 		t.Fatalf("CreateToken with map: %v", err)
 	}
-	if len(resp.Token.ModelOverrideMap) != 2 || resp.Token.ModelOverrideMap["gpt-4o"] != seedModel || resp.Token.ModelOverrideMap["claude"] != seedModel {
+	if len(resp.Token.ModelOverrideMap) != 2 || resp.Token.ModelOverrideMap["gpt-4o"].To != seedModel || resp.Token.ModelOverrideMap["claude"].To != seedModel {
 		t.Fatalf("dto map = %#v, want 2 entries mapping to %q (empty row dropped)", resp.Token.ModelOverrideMap, seedModel)
 	}
 	if resp.Token.ModelOverride != seedModel {
@@ -1419,11 +1419,11 @@ func TestCreateTokenModelOverrideMap(t *testing.T) {
 	}
 
 	// A map value that is not a known model is rejected.
-	if _, err := svc.CreateToken(ctx, owner, CreateTokenRequest{Name: "M2", ModelOverrideMap: map[string]string{"x": "does-not-exist"}}); !errors.Is(err, ErrTokenModelOverrideInvalid) {
+	if _, err := svc.CreateToken(ctx, owner, CreateTokenRequest{Name: "M2", ModelOverrideMap: map[string]store.ModelOverrideRule{"x": {To: "does-not-exist"}}}); !errors.Is(err, ErrTokenModelOverrideInvalid) {
 		t.Fatalf("unknown map target: want ErrTokenModelOverrideInvalid, got %v", err)
 	}
 	// A half-filled row (key without a value) is rejected.
-	if _, err := svc.CreateToken(ctx, owner, CreateTokenRequest{Name: "M3", ModelOverrideMap: map[string]string{"x": ""}}); !errors.Is(err, ErrTokenModelOverrideInvalid) {
+	if _, err := svc.CreateToken(ctx, owner, CreateTokenRequest{Name: "M3", ModelOverrideMap: map[string]store.ModelOverrideRule{"x": {}}}); !errors.Is(err, ErrTokenModelOverrideInvalid) {
 		t.Fatalf("half-filled row: want ErrTokenModelOverrideInvalid, got %v", err)
 	}
 }
@@ -1444,16 +1444,16 @@ func TestUpdateTokenModelOverrideMap(t *testing.T) {
 		t.Fatalf("CreateToken: %v", err)
 	}
 	// Patch in a map.
-	m := map[string]string{"alias": seedModel}
+	m := map[string]store.ModelOverrideRule{"alias": {To: seedModel}}
 	dto, err := svc.UpdateToken(ctx, owner, created.Token.ID, UpdateTokenRequest{ModelOverrideMap: &m})
 	if err != nil {
 		t.Fatalf("UpdateToken map: %v", err)
 	}
-	if len(dto.ModelOverrideMap) != 1 || dto.ModelOverrideMap["alias"] != seedModel {
+	if len(dto.ModelOverrideMap) != 1 || dto.ModelOverrideMap["alias"].To != seedModel {
 		t.Fatalf("patched map = %#v", dto.ModelOverrideMap)
 	}
 	// Clearing it (empty map) removes all entries.
-	empty := map[string]string{}
+	empty := map[string]store.ModelOverrideRule{}
 	dto, err = svc.UpdateToken(ctx, owner, created.Token.ID, UpdateTokenRequest{ModelOverrideMap: &empty})
 	if err != nil {
 		t.Fatalf("UpdateToken clear map: %v", err)
@@ -1462,7 +1462,7 @@ func TestUpdateTokenModelOverrideMap(t *testing.T) {
 		t.Fatalf("cleared map = %#v, want empty", dto.ModelOverrideMap)
 	}
 	// An invalid target rejects the patch.
-	bad := map[string]string{"x": "nope"}
+	bad := map[string]store.ModelOverrideRule{"x": {To: "nope"}}
 	if _, err := svc.UpdateToken(ctx, owner, created.Token.ID, UpdateTokenRequest{ModelOverrideMap: &bad}); !errors.Is(err, ErrTokenModelOverrideInvalid) {
 		t.Fatalf("want ErrTokenModelOverrideInvalid, got %v", err)
 	}

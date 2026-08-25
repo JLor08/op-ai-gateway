@@ -51,8 +51,10 @@ import { useToast } from './shared/ToastProvider';
 import {
   ModelOverrideEditor,
   buildOverrideMap,
+  newOverrideRow,
   overrideRowsInvalid,
   overrideSummary,
+  type OverrideRow,
 } from './shared/ModelOverrideEditor';
 
 const allTokenScopes = ['gateway:use', 'admin'] as const;
@@ -119,7 +121,7 @@ export function TokenList({
   // Model override: a per-requested-model mapping (rows) + an optional catch-all.
   // A row maps a requested model name (free text) -> a gateway model; the catch-all
   // applies to any requested model with no row. Empty rows + empty catch-all = off.
-  const [overrideRows, setOverrideRows] = useState<{ from: string; to: string }[]>([]);
+  const [overrideRows, setOverrideRows] = useState<OverrideRow[]>([]);
   const [catchAll, setCatchAll] = useState('');
   // Server override: forces every request on this token onto one specific
   // server the caller manages. "" = no override. The whole control is hidden
@@ -130,6 +132,15 @@ export function TokenList({
   // api.serverModels), narrowing the model-override map's "to" dropdown once a
   // server override is picked. Empty while no override is set.
   const [serverOverrideModels, setServerOverrideModels] = useState<ServerModelOption[]>([]);
+  // The unknown-model redirect (Task 8): a requested model this token cannot
+  // route to is served by the token's last_used_model (read-only, display
+  // only — see below), or else by unknownFallback, instead of failing.
+  // unknownRedirectBlocked widens "unknown" to also cover a model that exists
+  // but this token cannot call. Both sub-settings are disabled in the UI (and
+  // ignored server-side) while unknownRedirect is off.
+  const [unknownRedirect, setUnknownRedirect] = useState(false);
+  const [unknownRedirectBlocked, setUnknownRedirectBlocked] = useState(false);
+  const [unknownFallback, setUnknownFallback] = useState('');
   const [logCommunication, setLogCommunication] = useState(false);
   const [secret, setSecret] = useState(false);
   // Project attribution (spec: 2026-08-08-projects-design.md §6): "" = no project.
@@ -197,6 +208,9 @@ export function TokenList({
     setCatchAll('');
     setServerOverride('');
     setServerOverrideForce(false);
+    setUnknownRedirect(false);
+    setUnknownRedirectBlocked(false);
+    setUnknownFallback('');
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
@@ -208,11 +222,25 @@ export function TokenList({
     setScopes(row.scopes.filter((scope) => selectableScopes.includes(scope)));
     setScopesDirty(false);
     setOverrideRows(
-      Object.entries(row.model_override_map ?? {}).map(([from, to]) => ({ from, to })),
+      Object.entries(row.model_override_map ?? {}).map(([from, entry]) =>
+        // newOverrideRow, not a bare object literal: every row needs the stable
+        // id the editor keys it by (see OverrideRow).
+        newOverrideRow({
+          from,
+          to: entry.to,
+          // A missing switch (hand-written or older response) reads as false,
+          // never crashes the editor.
+          offer: entry.offer ?? false,
+          hideTarget: entry.hide_target ?? false,
+        }),
+      ),
     );
     setCatchAll(row.model_override);
     setServerOverride(row.server_override ?? '');
     setServerOverrideForce(row.server_override_force_unreachable ?? false);
+    setUnknownRedirect(row.unknown_model_redirect ?? false);
+    setUnknownRedirectBlocked(row.unknown_model_redirect_blocked ?? false);
+    setUnknownFallback(row.unknown_model_fallback ?? '');
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
@@ -230,6 +258,11 @@ export function TokenList({
         model_override_map: buildOverrideMap(overrideRows),
         server_override: serverOverride,
         server_override_force_unreachable: serverOverrideForce,
+        // last_used_model is deliberately never sent: it is read-only (see
+        // PortalToken) and not part of CreateTokenRequest at all.
+        unknown_model_redirect: unknownRedirect,
+        unknown_model_redirect_blocked: unknownRedirectBlocked,
+        unknown_model_fallback: unknownFallback,
         log_communication: logCommunication,
         secret,
         project_id: projectId,
@@ -256,6 +289,11 @@ export function TokenList({
       body.model_override_map = buildOverrideMap(overrideRows);
       body.server_override = serverOverride;
       body.server_override_force_unreachable = serverOverrideForce;
+      // last_used_model is deliberately never sent: it is read-only (see
+      // PortalToken) and not part of UpdateTokenRequest at all.
+      body.unknown_model_redirect = unknownRedirect;
+      body.unknown_model_redirect_blocked = unknownRedirectBlocked;
+      body.unknown_model_fallback = unknownFallback;
       body.log_communication = logCommunication;
       body.secret = secret;
       body.project_id = projectId;
@@ -339,6 +377,14 @@ export function TokenList({
       render: (r) => r.project_name || '-',
     },
     {
+      id: 'last_used_model',
+      label: t.tokenLastUsedModel,
+      value: (r) => r.last_used_model || '',
+      filter: 'text',
+      defaultHidden: true,
+      render: (r) => r.last_used_model || '—',
+    },
+    {
       id: 'status',
       label: t.tableStatus,
       value: (r) => r.status,
@@ -402,6 +448,16 @@ export function TokenList({
     // dropdown (both per-row and the catch-all) narrows to that server's OWN
     // offered models (api.serverModels) instead of the full model list.
     const overrideModelOptions = serverOverride !== '' ? serverOverrideModels : models;
+    // The unknown-model redirect's fallback picker offers the SAME
+    // model-plus-group list the caller loads for everything else (the
+    // portal model listing already carries groups, marked `is_group`) —
+    // no separate fetch, and deliberately NOT server-override-narrowed
+    // (unlike overrideModelOptions above): the redirect is unrelated to a
+    // server override.
+    const unknownFallbackOptions = [
+      { value: '', label: '-' },
+      ...models.map((m) => ({ value: m.id, label: m.display_name })),
+    ];
     return (
       <>
         <Breadcrumbs
@@ -486,6 +542,64 @@ export function TokenList({
               idPrefix="token"
               catchAllId="token-model-catchall"
             />
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={unknownRedirect}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setUnknownRedirect(checked);
+                      // Switching the redirect off also clears both
+                      // sub-settings in STATE, not just their disabled
+                      // rendering: submitCreate/submitEdit send them
+                      // unconditionally, and a saved fallback the UI shows
+                      // as disabled/invisible would mislead the next reader
+                      // of the request into thinking it is in effect (the
+                      // backend clears them too, but the form must show
+                      // exactly what it sends).
+                      if (!checked) {
+                        setUnknownRedirectBlocked(false);
+                        setUnknownFallback('');
+                      }
+                    }}
+                  />
+                }
+                label={t.tokenUnknownRedirect}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenUnknownRedirectHint}
+              </Typography>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={unknownRedirectBlocked}
+                    disabled={!unknownRedirect}
+                    onChange={(e) => setUnknownRedirectBlocked(e.target.checked)}
+                  />
+                }
+                label={t.tokenUnknownRedirectBlocked}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenUnknownRedirectBlockedHint}
+              </Typography>
+              <SearchableSelect
+                id="token-unknown-fallback"
+                label={t.tokenUnknownFallback}
+                value={unknownFallback}
+                onChange={setUnknownFallback}
+                disabled={!unknownRedirect}
+                options={unknownFallbackOptions}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenLastUsedModel}
+              </Typography>
+              <Typography variant="body2">
+                {editing
+                  ? mode.edit.last_used_model || t.tokenLastUsedModelNone
+                  : t.tokenLastUsedModelNone}
+              </Typography>
+            </Box>
             <SearchableSelect
               id="token-project"
               label={t.tokenProjectLabel}

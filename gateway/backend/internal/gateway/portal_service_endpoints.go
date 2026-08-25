@@ -258,6 +258,13 @@ var portalServiceErrRows = []errRow{
 	{err: portal.ErrServiceAdminGroupRequired, status: http.StatusBadRequest, code: "service.admin_group_required", msg: "at least one admin group is required"},
 	{err: portal.ErrServiceAdminGroupInvalid, status: http.StatusBadRequest, code: "service.admin_group_invalid", msg: "admin group is invalid"},
 	{err: portal.ErrServiceAdminGroupParentMismatch, status: http.StatusBadRequest, code: "service.admin_group_parent_mismatch", msg: "admin groups must share one parent system group"},
+	// Every model-valued token setting (the catch-all override, an override
+	// rule's target, the unknown-model redirect's fallback) rejects an
+	// unroutable name with this one error, on the service-token create path
+	// exactly as on the user-token one. Same code as writePortalTokenError uses
+	// on purpose: it is the same mistake, and it names the setting instead of
+	// letting a mistyped model read as a 500 "the gateway broke".
+	{err: portal.ErrTokenModelOverrideInvalid, status: http.StatusBadRequest, code: "portal.token_model_override_invalid", msg: "token model override is invalid"},
 	{err: portal.ErrServiceNotFound, status: http.StatusNotFound, code: portal.CodeServiceNotFound, msg: msgServiceNotFound},
 	{err: portal.ErrTokenNotFound, status: http.StatusNotFound, code: "service.token_not_found", msg: "service token not found"},
 }

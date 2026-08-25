@@ -285,6 +285,49 @@ func TestSQLiteUpdateTokenMetadataUnknownIDReturnsNotFound(t *testing.T) {
 	}
 }
 
+// TestSQLiteSetTokenLastUsedModelPersistsUnconditionally proves the write is
+// unconditional at the store layer (any caller-side "only on change" gating
+// lives in gateway.Server.resolveTarget, not here) and that it does not
+// disturb any other column.
+func TestSQLiteSetTokenLastUsedModelPersistsUnconditionally(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	rec := testTokenRecord(now)
+	rec.LastUsedModel = "qwen3-32b"
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	if err := st.SetTokenLastUsedModel(ctx, "tok_1", "llama-70b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+
+	got, err := st.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if got.LastUsedModel != "llama-70b" {
+		t.Fatalf("LastUsedModel = %q, want %q", got.LastUsedModel, "llama-70b")
+	}
+	if got.Name != rec.Name || got.Status != rec.Status {
+		t.Fatalf("SetTokenLastUsedModel disturbed unrelated columns: %#v", got)
+	}
+}
+
+func TestSQLiteSetTokenLastUsedModelUnknownIDReturnsNotFound(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+
+	err := st.SetTokenLastUsedModel(ctx, "tok_missing", "llama-70b")
+
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetTokenLastUsedModel error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSQLiteRotateTokenSecretReplacesSecretAndPrefix(t *testing.T) {
 	ctx := context.Background()
 	st := openTokenTestSQLite(t)
@@ -442,10 +485,10 @@ func TestSQLiteTokenModelOverrideMapRoundTrip(t *testing.T) {
 		t.Fatalf("stored map = %q, want %q", got.ModelOverrideMap, rec.ModelOverrideMap)
 	}
 
-	// LookupBearer decodes the JSON column into auth.Token.ModelOverrideMap.
+	// LookupBearer decodes the JSON column into auth.Token.ModelOverrideRules.
 	tok, ok := st.LookupBearer("Bearer plain-secret")
-	if !ok || len(tok.ModelOverrideMap) != 2 || tok.ModelOverrideMap["gpt-4o"] != "qwen-coder" || tok.ModelOverride != "catch-all-model" {
-		t.Fatalf("LookupBearer map=%#v override=%q ok=%v", tok.ModelOverrideMap, tok.ModelOverride, ok)
+	if !ok || len(tok.ModelOverrideRules) != 2 || tok.ModelOverrideRules["gpt-4o"].To != "qwen-coder" || tok.ModelOverride != "catch-all-model" {
+		t.Fatalf("LookupBearer rules=%#v override=%q ok=%v", tok.ModelOverrideRules, tok.ModelOverride, ok)
 	}
 
 	// Clearing the map via update round-trips to the empty string.
@@ -458,8 +501,142 @@ func TestSQLiteTokenModelOverrideMapRoundTrip(t *testing.T) {
 		t.Fatalf("after clear: map=%q, want empty", after.ModelOverrideMap)
 	}
 	tok2, _ := st.LookupBearer("Bearer plain-secret")
-	if len(tok2.ModelOverrideMap) != 0 {
-		t.Fatalf("after clear LookupBearer map=%#v, want empty", tok2.ModelOverrideMap)
+	if len(tok2.ModelOverrideRules) != 0 {
+		t.Fatalf("after clear LookupBearer rules=%#v, want empty", tok2.ModelOverrideRules)
+	}
+}
+
+// TestSQLiteTokenRedirectSettingsLookupBearerMapping proves LookupBearer's
+// returned auth.Token carries LastUsedModel/UnknownModelRedirect/
+// UnknownModelRedirectBlocked/UnknownModelFallback — a mapping distinct from
+// TokenByID's scanToken: TestConformanceTokenRedirectSettingsRoundTrip only
+// checks the TokenRecord path, never the auth.Token one LookupBearer builds.
+func TestSQLiteTokenRedirectSettingsLookupBearerMapping(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	rec := testTokenRecord(now)
+	rec.LastUsedModel = "qwen3-32b"
+	rec.UnknownModelRedirect = true
+	rec.UnknownModelRedirectBlocked = true
+	rec.UnknownModelFallback = "fallback-model"
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+
+	tok, ok := st.LookupBearer("Bearer plain-secret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if tok.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("LookupBearer LastUsedModel = %q, want %q", tok.LastUsedModel, "qwen3-32b")
+	}
+	if !tok.UnknownModelRedirect {
+		t.Fatalf("LookupBearer UnknownModelRedirect = false, want true")
+	}
+	if !tok.UnknownModelRedirectBlocked {
+		t.Fatalf("LookupBearer UnknownModelRedirectBlocked = false, want true")
+	}
+	if tok.UnknownModelFallback != "fallback-model" {
+		t.Fatalf("LookupBearer UnknownModelFallback = %q, want %q", tok.UnknownModelFallback, "fallback-model")
+	}
+}
+
+// TestSQLiteTokenRedirectSettingsUpdateRoundTrip proves UpdateTokenMetadata's
+// SQL actually writes the three SETTINGS columns. The token is created with
+// every new field at its zero value (testTokenRecord's defaults), so the ONLY
+// way the post-update read can see the new values is if UpdateTokenMetadata's
+// own SET clause carries them — TestConformanceTokenRedirectSettingsRoundTrip
+// only exercises CreatePlainToken's insert, never this update path.
+//
+// The fourth column, last_used_model, is deliberately absent from that SET
+// clause and therefore from this test; TestSQLiteUpdateTokenMetadataLeavesLastUsedModel
+// pins that separation from the other side.
+func TestSQLiteTokenRedirectSettingsUpdateRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	rec := testTokenRecord(now)
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+	before, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if before.UnknownModelRedirect || before.UnknownModelRedirectBlocked ||
+		before.UnknownModelFallback != "" || before.LastUsedModel != "" {
+		t.Fatalf("fixture must start at the zero defaults: %+v", before)
+	}
+
+	// LastUsedModel is deliberately NOT flipped here: it is not part of the
+	// metadata write at all (see TestSQLiteUpdateTokenMetadataLeavesLastUsedModel
+	// for the invariant, and SetTokenLastUsedModel for its one writer).
+	before.UnknownModelRedirect = true
+	before.UnknownModelRedirectBlocked = true
+	before.UnknownModelFallback = "fallback-model"
+	before.UpdatedAt = now.Add(time.Minute)
+	if err := st.UpdateTokenMetadata(ctx, before); err != nil {
+		t.Fatalf("UpdateTokenMetadata returned %v", err)
+	}
+
+	after, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if !after.UnknownModelRedirect {
+		t.Fatalf("after update: UnknownModelRedirect = false, want true")
+	}
+	if !after.UnknownModelRedirectBlocked {
+		t.Fatalf("after update: UnknownModelRedirectBlocked = false, want true")
+	}
+	if after.UnknownModelFallback != "fallback-model" {
+		t.Fatalf("after update: UnknownModelFallback = %q, want %q", after.UnknownModelFallback, "fallback-model")
+	}
+}
+
+// TestSQLiteUpdateTokenMetadataLeavesLastUsedModel pins that the marker is NOT
+// part of the metadata write, exactly as last_used_at is not: both are written
+// by the request path (SetTokenLastUsedModel / the LookupBearer touch), and a
+// portal PATCH carries a record read moments earlier. If last_used_model went
+// back into that SET clause, an unrelated token edit racing an inference
+// request would silently roll the marker back — and the marker is the
+// redirect's own target, so the next unknown request would go to the fallback
+// instead of the model the token really used last.
+func TestSQLiteUpdateTokenMetadataLeavesLastUsedModel(t *testing.T) {
+	ctx := context.Background()
+	st := openTokenTestSQLite(t)
+	defer st.Close()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	rec := testTokenRecord(now)
+	if err := st.CreatePlainToken(ctx, rec, "plain-secret"); err != nil {
+		t.Fatalf("CreatePlainToken returned %v", err)
+	}
+	// The inference path writes the marker through its own narrow statement.
+	if err := st.SetTokenLastUsedModel(ctx, rec.ID, "qwen3-32b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel returned %v", err)
+	}
+	// A metadata update built from a record read BEFORE that write (hence the
+	// stale empty marker) must not undo it.
+	stale := rec
+	stale.Name = "renamed"
+	stale.UpdatedAt = now.Add(time.Minute)
+	if err := st.UpdateTokenMetadata(ctx, stale); err != nil {
+		t.Fatalf("UpdateTokenMetadata returned %v", err)
+	}
+	got, err := st.TokenByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("TokenByID returned %v", err)
+	}
+	if got.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("LastUsedModel = %q, want %q (metadata update reverted the marker)", got.LastUsedModel, "qwen3-32b")
+	}
+	if got.Name != "renamed" {
+		t.Fatalf("Name = %q, want renamed (the update itself must still apply)", got.Name)
 	}
 }
 

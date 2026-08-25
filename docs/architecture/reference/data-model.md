@@ -24,7 +24,7 @@ not route-based).
 
 | Table | Purpose |
 |---|---|
-| `api_tokens` | Bearer API tokens. `user_id` is nullable (a *service* token has none instead); carries per-token model override / override map, log-communication and secret-capture flags, optional project attribution, and an optional per-token AI-server override. |
+| `api_tokens` | Bearer API tokens. `user_id` is nullable (a *service* token has none instead); carries the per-token model catch-all override and override-rule map (`model_override_map`, a JSON string of `requested -> {to, offer, hide_target}`), the unknown-model redirect settings and the `last_used_model` marker it aims at, log-communication and secret-capture flags, optional project attribution, and an optional per-token AI-server override. |
 | `route_affinity` | Sticky-routing memory: which application/server a given `(token, model, api_flavor, session)` was last routed to, with a TTL. |
 | `usage_events` | One row per completed/failed request: tokens in/out/cached/cache-write, latency, status, provider/model, the client's originally-requested model (`requested_model`, since migration 61; `''` on rows recorded before it), session/service/project attribution, and P1 energy-attribution fields (`energy_wh`, `energy_marginal_wh`, `energy_source`). Deliberately carries **no foreign keys** on `user_id`/`token_id`/`host`/`service_id`/`project_id` — usage history must survive the deletion of the user, token, server, service, or project it references. |
 | `captures` | Optional encrypted request/response payload capture, one row per `usage_events` row (FK cascade — a capture cannot outlive its usage event). |
@@ -211,7 +211,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (61 migrations)
+## 4. Migration history (63 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -340,6 +340,28 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 | 58 | `server_certificate_override` | Adds `ai_servers.certificate_override` (per-server ACME include/exclude). |
 | 59 | `application_proxy_listen_port` | Adds `applications.proxy_listen_port` (gateway-assigned TLS proxy port, P4 HTTPS switch). |
 | 60 | `server_https_switch_override` | Adds `ai_servers.https_switch_override` (per-server HTTPS-auto-switch include/exclude). |
+
+### Per-token model settings
+
+| # | Migration | Purpose |
+|---|---|---|
+| 7 | `token_model_override_map` | *(see above)* — the column can now hold `requested -> {to, offer, hide_target}` objects; the legacy `requested -> "target"` string map is still decoded, so the per-row switches needed no migration of their own. |
+| 63 | `token_unknown_model_redirect` | Adds `api_tokens.last_used_model` plus `unknown_model_redirect`/`unknown_model_redirect_blocked`/`unknown_model_fallback`. Defaults reproduce the pre-feature behavior exactly: the redirect is off, so resolution is unchanged for every existing token. |
+
+**Rollback and `model_override_map`.** The four columns migration 63 adds are
+append-only, so an older binary simply never selects them. The one place a
+rollback can still lose data is `model_override_map`, and exactly one case does:
+
+| Token's override rows | Read by a pre-v63 binary |
+|---|---|
+| neither `offer` nor `hide_target` used | **lossless** — `EncodeModelOverrideRules` writes those rows in the legacy `"requested":"target"` string form, byte-identical to what the old encoder wrote |
+| at least one row uses a switch | **the whole map is lost** — the old decoder unmarshals the column into `map[string]string` and returns `nil` on the first object-valued row, taking the untouched sibling rows with it; the next save under the old binary then writes `""` over the column |
+
+The encoder therefore picks the *narrowest* shape per row: legacy string when a
+row needs nothing more, object only when a switch is actually set. A deployment
+that never touches the new switches stays fully downgradable; the residual is
+opt-in and limited to the tokens an operator configured with them (never the
+catch-all `model_override`, which has its own column).
 
 ## See also
 

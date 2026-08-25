@@ -62,6 +62,24 @@ func TestHandlePortalServiceTokensPostInvalidJSONReturns400(t *testing.T) {
 	assertErrorCode(t, rec, "request.invalid_json")
 }
 
+// TestHandlePortalServiceTokensPostInvalidModelSettingReturns400 is the
+// service-token twin of the user-token create case: a model-valued setting the
+// principal cannot route to (an override target, or the unknown-model
+// redirect's fallback) is a 400 naming the setting, not a 500 claiming the
+// gateway broke. portalServiceErrRows had no row for the error, so it fell
+// through to the generic service.token_create_failed.
+func TestHandlePortalServiceTokensPostInvalidModelSettingReturns400(t *testing.T) {
+	s := newServicesTestFixture(t)
+	id := createServiceWithDelegates(t, s)
+	rec := httptest.NewRecorder()
+	body := `{"name":"t","unknown_model_redirect":true,"unknown_model_fallback":"no-such-model"}`
+	s.ServeHTTP(rec, svcAuthedRequest(http.MethodPost, "/api/portal/services/"+id+"/tokens", body, svcAdminSecret))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "portal.token_model_override_invalid")
+}
+
 func TestHandlePortalServiceAdminGroupsInvalidJSONReturns400(t *testing.T) {
 	s := newServicesTestFixture(t)
 	id := createServiceWithDelegates(t, s)

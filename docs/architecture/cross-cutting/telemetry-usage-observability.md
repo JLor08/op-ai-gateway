@@ -270,9 +270,14 @@ user/token/service/project id+name, session id/source/agent id, API flavor, mode
 HTTP status/error code, content type, and (additively) energy/cost.
 
 The model name is carried through three stages, each its own column: `requested_model`
-(the client's original name, before any token model-override) → `model` (the
-effective gateway model, after that override) → `provider_model` (the upstream
-application's own model name, after model-mapping).
+(the client's original name, before any per-token resolution) → `model` (the
+effective gateway model, after the token's override rules, catch-all, and
+unknown-model redirect — see
+[Routing & Model Selection §2.1](routing-and-model-selection.md)) →
+`provider_model` (the upstream application's own model name, after
+model-mapping). Keeping the first column is what makes a redirected request
+traceable: the pair says both what the client asked for and what it actually
+got.
 
 **Token accounting split**: `resp.Usage.InputTokens` is the OpenAI-canonical figure
 (includes both cache subsets), kept that way so client-facing responses stay

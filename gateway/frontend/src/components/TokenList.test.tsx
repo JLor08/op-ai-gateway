@@ -2,13 +2,14 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TokenList } from './TokenList';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages } from '../i18n';
 import {
   PortalApiError,
   type CreateTokenRequest,
+  type ModelOption,
   type PortalServer,
   type PortalToken,
   type ProjectRef,
@@ -96,6 +97,10 @@ function renderTokenList(opts: {
   myProjects?: ProjectRef[];
   servers?: PortalServer[];
   serverModelsByServer?: Record<string, ServerModelOption[]>;
+  // Override the default single-model list — used by the unknown-model
+  // redirect's fallback-picker test, which needs a group entry (is_group)
+  // alongside a plain model in the SAME list (Task 8).
+  models?: ModelOption[];
 }) {
   const created = opts.created ?? [];
   const tokens = opts.tokens ?? [];
@@ -149,7 +154,7 @@ function renderTokenList(opts: {
         tokens={tokens}
         setTokens={setTokens}
         role="admin"
-        models={models}
+        models={opts.models ?? models}
         servers={servers}
       />
     </ToastProvider>,
@@ -220,12 +225,13 @@ describe('TokenList model override map + catch-all + log communication', () => {
     openCreate();
 
     fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'New Token' } });
-    // One mapping row: gpt-4o -> gpt-oss-20b.
+    // One mapping row: gpt-4o -> gpt-oss-20b, offered as its own model name.
     fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
     fireEvent.change(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 1` }), {
       target: { value: 'gpt-4o' },
     });
     await selectOption(`${t.tokenOverrideToLabel} 1`, 'gpt-oss-20b');
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenOverrideOffer }));
     // Catch-all + log communication.
     await selectOption(t.tokenOverrideCatchAllLabel, 'gpt-oss-20b');
     fireEvent.click(screen.getByLabelText(t.tokenLogCommunicationLabel));
@@ -235,7 +241,9 @@ describe('TokenList model override map + catch-all + log communication', () => {
     await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
     expect(created[0]).toMatchObject({
       model_override: 'gpt-oss-20b',
-      model_override_map: { 'gpt-4o': 'gpt-oss-20b' },
+      model_override_map: {
+        'gpt-4o': { to: 'gpt-oss-20b', offer: true, hide_target: false },
+      },
       log_communication: true,
     });
   });
@@ -259,7 +267,9 @@ describe('TokenList model override map + catch-all + log communication', () => {
           id: 'tok_a',
           name: 'A',
           model_override: 'gpt-oss-20b',
-          model_override_map: { 'gpt-4o': 'gpt-oss-20b' },
+          model_override_map: {
+            'gpt-4o': { to: 'gpt-oss-20b', offer: false, hide_target: false },
+          },
         }),
         makeToken({ id: 'tok_b', name: 'B', model_override: '', model_override_map: {} }),
       ],
@@ -318,14 +328,16 @@ describe('TokenList model override map + catch-all + log communication', () => {
     expect(body).toMatchObject({ secret: true });
   });
 
-  it('seeds existing map rows on edit and submits the updated map + catch-all', async () => {
+  it('seeds existing map rows (incl. both switches) on edit and submits the updated map + catch-all', async () => {
     const { fakeApi } = renderTokenList({
       tokens: [
         makeToken({
           id: 'tok_edit',
           name: 'Edit Me',
           model_override: '',
-          model_override_map: { claude: 'gpt-oss-20b' },
+          model_override_map: {
+            claude: { to: 'gpt-oss-20b', offer: false, hide_target: true },
+          },
           log_communication: false,
         }),
       ],
@@ -333,10 +345,14 @@ describe('TokenList model override map + catch-all + log communication', () => {
 
     openEdit();
 
-    // The existing map entry is seeded as row 1.
+    // The existing map entry is seeded as row 1, hide-target checked and
+    // offer unchecked per the seeded wire value.
     expect(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 1` })).toHaveValue(
       'claude',
     );
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideOffer })[0]).not.toBeChecked();
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideHideTarget })[0]).toBeChecked();
+
     // Add a second mapping + a catch-all + toggle log communication.
     fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
     fireEvent.change(screen.getByRole('textbox', { name: `${t.tokenOverrideFromLabel} 2` }), {
@@ -353,8 +369,50 @@ describe('TokenList model override map + catch-all + log communication', () => {
       .calls[0];
     expect(body).toMatchObject({
       model_override: 'gpt-oss-20b',
-      model_override_map: { claude: 'gpt-oss-20b', 'gpt-4o': 'gpt-oss-20b' },
+      model_override_map: {
+        claude: { to: 'gpt-oss-20b', offer: false, hide_target: true },
+        'gpt-4o': { to: 'gpt-oss-20b', offer: false, hide_target: false },
+      },
       log_communication: true,
+    });
+  });
+
+  it('treats a missing switch on a seeded row as false, both on screen and on the next save', async () => {
+    // A hand-written or pre-migration response might carry only `to`. The
+    // editor must not crash, and re-saving the untouched row must resubmit
+    // explicit `false`s rather than silently dropping the keys (which is what
+    // would happen if the missing switches were passed through as `undefined`
+    // instead of being defaulted).
+    const legacyEntry = { to: 'gpt-oss-20b' } as unknown as {
+      to: string;
+      offer: boolean;
+      hide_target: boolean;
+    };
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_legacy',
+          name: 'Legacy',
+          model_override: '',
+          model_override_map: { claude: legacyEntry },
+        }),
+      ],
+    });
+
+    openEdit();
+
+    expect(screen.getAllByRole('checkbox', { name: t.tokenOverrideOffer })[0]).not.toBeChecked();
+    expect(
+      screen.getAllByRole('checkbox', { name: t.tokenOverrideHideTarget })[0],
+    ).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      model_override_map: { claude: { to: 'gpt-oss-20b', offer: false, hide_target: false } },
     });
   });
 });
@@ -668,7 +726,7 @@ describe('TokenList server override (Task 6)', () => {
     expect(created[0]).toMatchObject({
       server_override: 'srv_a',
       server_override_force_unreachable: true,
-      model_override_map: { req: 'server-only-model' },
+      model_override_map: { req: { to: 'server-only-model', offer: false, hide_target: false } },
     });
   });
 
@@ -698,5 +756,186 @@ describe('TokenList server override (Task 6)', () => {
       server_override: 'srv_a',
       server_override_force_unreachable: true,
     });
+  });
+});
+
+describe('TokenList unknown-model redirect (Task 8)', () => {
+  it('keeps the sub-settings disabled until the redirect is on', () => {
+    renderTokenList({});
+    openCreate();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeDisabled();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+
+    expect(
+      screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }),
+    ).not.toBeDisabled();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).not.toBeDisabled();
+  });
+
+  it('shows the last used model in the edit form', () => {
+    renderTokenList({ tokens: [makeToken({ last_used_model: 'qwen3-32b' })] });
+    openEdit();
+    expect(screen.getByText('qwen3-32b')).toBeInTheDocument();
+  });
+
+  it('shows a placeholder when the token has never been used', () => {
+    renderTokenList({ tokens: [makeToken({ last_used_model: '' })] });
+    openEdit();
+    expect(screen.getByText(t.tokenLastUsedModelNone)).toBeInTheDocument();
+  });
+
+  it('always shows the placeholder in the create form (no last-used value yet)', () => {
+    renderTokenList({});
+    openCreate();
+    expect(screen.getByText(t.tokenLastUsedModelNone)).toBeInTheDocument();
+  });
+
+  it('offers models and groups in one fallback picker', async () => {
+    renderTokenList({
+      models: [
+        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [] },
+        { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+      ],
+    });
+    openCreate();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.mouseDown(screen.getByLabelText(t.tokenUnknownFallback));
+    expect(await screen.findByRole('option', { name: 'qwen3-32b' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'fast-group' })).toBeInTheDocument();
+  });
+
+  it('sends the redirect settings on submit', async () => {
+    const { fakeApi, created } = renderTokenList({});
+    openCreate();
+    fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }));
+    await selectOption(t.tokenUnknownFallback, 'gpt-oss-20b');
+    fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+    expect(created[0]).toMatchObject({
+      unknown_model_redirect: true,
+      unknown_model_redirect_blocked: true,
+      unknown_model_fallback: 'gpt-oss-20b',
+    });
+  });
+
+  it('never sends last_used_model on create, even blank', async () => {
+    const { fakeApi, created } = renderTokenList({});
+    openCreate();
+    fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+    fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+    await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+    expect(created[0]).not.toHaveProperty('last_used_model');
+  });
+
+  it('never resends last_used_model when saving an edit', async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [makeToken({ id: 'tok_edit', last_used_model: 'qwen3-32b' })],
+    });
+    openEdit();
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).not.toHaveProperty('last_used_model');
+  });
+
+  it("seeds the redirect settings from the token's current values on edit", async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_edit',
+          unknown_model_redirect: true,
+          unknown_model_redirect_blocked: true,
+          unknown_model_fallback: 'gpt-oss-20b',
+        }),
+      ],
+    });
+
+    openEdit();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeChecked();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue('gpt-oss-20b');
+
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      unknown_model_redirect: true,
+      unknown_model_redirect_blocked: true,
+      unknown_model_fallback: 'gpt-oss-20b',
+    });
+  });
+
+  it('clears the sub-settings when the redirect is switched off before saving', async () => {
+    const { fakeApi } = renderTokenList({
+      tokens: [
+        makeToken({
+          id: 'tok_edit',
+          unknown_model_redirect: true,
+          unknown_model_redirect_blocked: true,
+          unknown_model_fallback: 'gpt-oss-20b',
+        }),
+      ],
+    });
+
+    openEdit();
+    // Seeded on: both sub-settings visible/enabled and set.
+    expect(screen.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked })).toBeChecked();
+    expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue('gpt-oss-20b');
+
+    // Turn the redirect itself off — the sub-settings must not just render
+    // disabled, they must be cleared, so the saved request matches what the
+    // form now shows.
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+    fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+    await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+    const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0];
+    expect(body).toMatchObject({
+      unknown_model_redirect: false,
+      unknown_model_redirect_blocked: false,
+      unknown_model_fallback: '',
+    });
+  });
+});
+
+describe('TokenList last-used-model column (Task 9)', () => {
+  // The column-visibility toggle persists to localStorage (usePreference), so
+  // clear it between cases to keep each test starting from the hidden-by-default
+  // state (see ServerList.test.tsx's Server-ID column tests for the same pattern).
+  beforeEach(() => {
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom/private-mode guard */
+    }
+  });
+
+  it('hides the last-used-model column by default and shows it from the column menu', async () => {
+    renderTokenList({ tokens: [makeToken({ last_used_model: 'qwen3-32b' })] });
+    await screen.findByText('Dev Token');
+    expect(screen.queryByText('qwen3-32b')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenLastUsedModel }));
+    expect(screen.getByText('qwen3-32b')).toBeInTheDocument();
+  });
+
+  it('renders the placeholder for a token that has never been used', async () => {
+    renderTokenList({ tokens: [makeToken({ name: 'token-a', last_used_model: '' })] });
+    await screen.findByText('token-a');
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.tokenLastUsedModel }));
+    expect(screen.getByText('—')).toBeInTheDocument();
   });
 });

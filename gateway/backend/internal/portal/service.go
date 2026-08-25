@@ -752,13 +752,16 @@ type TokenDTO struct {
 	LastUsedAt    *time.Time `json:"last_used_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ModelOverride string     `json:"model_override"`
-	// ModelOverrideMap maps a requested model name -> the gateway model to use
-	// (takes precedence over ModelOverride, which is the catch-all). Empty = none.
-	ModelOverrideMap map[string]string `json:"model_override_map,omitempty"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
-	IsChatSession    bool              `json:"is_chat_session"`
-	Deletable        bool              `json:"deletable"`
+	// ModelOverrideMap maps a requested model name -> the rule for it (takes
+	// precedence over ModelOverride, which is the catch-all). Empty = none. The
+	// wire shape of a row is the object {"to","offer","hide_target"}: the two
+	// listing switches are part of the row, so a client that reads a token and
+	// writes it back preserves them instead of silently clearing them.
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
+	IsChatSession    bool                               `json:"is_chat_session"`
+	Deletable        bool                               `json:"deletable"`
 	// ProjectID/ProjectName is the project this token is attributed to for
 	// usage attribution ("" = none). ProjectName is resolved for display and
 	// is empty whenever ProjectID is empty or the project no longer exists.
@@ -774,6 +777,22 @@ type TokenDTO struct {
 	// server; it is always false whenever ServerOverride is "".
 	ServerOverride                 string `json:"server_override,omitempty"`
 	ServerOverrideForceUnreachable bool   `json:"server_override_force_unreachable,omitempty"`
+	// LastUsedModel is the gateway model or group name this token last routed a
+	// request to successfully. READ-ONLY over this API: it is written by the
+	// inference path alone and appears on no request type. It is the unknown-
+	// model redirect's first target, so a writable marker would hand a client
+	// control over where its own unknown requests go.
+	LastUsedModel string `json:"last_used_model,omitempty"`
+	// UnknownModelRedirect turns the unknown-model redirect on: a requested
+	// model this token cannot route to is served by LastUsedModel, or else by
+	// UnknownModelFallback, instead of failing. UnknownModelRedirectBlocked
+	// widens "unknown" from "does not exist at all" to "exists but this token
+	// cannot call it". UnknownModelFallback is the model or group used when the
+	// marker is empty or no longer routable. Both sub-settings are always
+	// off/empty whenever UnknownModelRedirect is false.
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
 }
 
 type TokenListResponse struct {
@@ -781,13 +800,13 @@ type TokenListResponse struct {
 }
 
 type CreateTokenRequest struct {
-	Name             string            `json:"name"`
-	Scopes           []string          `json:"scopes"`
-	ExpiresAt        *time.Time        `json:"expires_at"`
-	ModelOverride    string            `json:"model_override"`
-	ModelOverrideMap map[string]string `json:"model_override_map"`
-	LogCommunication bool              `json:"log_communication"`
-	Secret           bool              `json:"secret"`
+	Name             string                             `json:"name"`
+	Scopes           []string                           `json:"scopes"`
+	ExpiresAt        *time.Time                         `json:"expires_at"`
+	ModelOverride    string                             `json:"model_override"`
+	ModelOverrideMap map[string]store.ModelOverrideRule `json:"model_override_map"`
+	LogCommunication bool                               `json:"log_communication"`
+	Secret           bool                               `json:"secret"`
 	// ProjectID optionally attributes the token to a project the owner is a
 	// member of ("" = none). Enforced by CreateToken via isProjectMember.
 	ProjectID string `json:"project_id"`
@@ -797,6 +816,15 @@ type CreateTokenRequest struct {
 	// ignored (persisted as false) whenever the resulting override is "".
 	ServerOverride                 string `json:"server_override"`
 	ServerOverrideForceUnreachable bool   `json:"server_override_force_unreachable"`
+	// UnknownModelRedirect and its two sub-settings — see TokenDTO. There is
+	// deliberately NO last_used_model here: the marker is written by the
+	// inference path only. Both sub-settings are ignored (persisted off/empty)
+	// whenever UnknownModelRedirect is false, and a non-empty
+	// UnknownModelFallback must name a model or group this owner can route to
+	// directly, else ErrTokenModelOverrideInvalid.
+	UnknownModelRedirect        bool   `json:"unknown_model_redirect"`
+	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked"`
+	UnknownModelFallback        string `json:"unknown_model_fallback"`
 }
 
 type CreateTokenResponse struct {
@@ -805,13 +833,13 @@ type CreateTokenResponse struct {
 }
 
 type UpdateTokenRequest struct {
-	Name             *string            `json:"name,omitempty"`
-	Scopes           *[]string          `json:"scopes,omitempty"`
-	Status           *string            `json:"status,omitempty"`
-	ModelOverride    *string            `json:"model_override,omitempty"`
-	ModelOverrideMap *map[string]string `json:"model_override_map,omitempty"`
-	LogCommunication *bool              `json:"log_communication,omitempty"`
-	Secret           *bool              `json:"secret,omitempty"`
+	Name             *string                             `json:"name,omitempty"`
+	Scopes           *[]string                           `json:"scopes,omitempty"`
+	Status           *string                             `json:"status,omitempty"`
+	ModelOverride    *string                             `json:"model_override,omitempty"`
+	ModelOverrideMap *map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication *bool                               `json:"log_communication,omitempty"`
+	Secret           *bool                               `json:"secret,omitempty"`
 	// ProjectID: nil = keep the current project attribution, "" = clear it
 	// (always allowed), a non-empty id = re-attribute (membership-checked via
 	// isProjectMember, like CreateToken).
@@ -822,6 +850,15 @@ type UpdateTokenRequest struct {
 	// rejected). ServerOverrideForceUnreachable: nil = keep the current value.
 	ServerOverride                 *string `json:"server_override,omitempty"`
 	ServerOverrideForceUnreachable *bool   `json:"server_override_force_unreachable,omitempty"`
+	// The three unknown-model-redirect settings: nil = keep the current value.
+	// They are validated TOGETHER (see UpdateToken), because each one alone can
+	// invalidate the other two. There is deliberately no last_used_model field:
+	// the marker is the redirect's target, and a client able to set it would
+	// choose where its own unknown requests go — it is written by the inference
+	// path alone.
+	UnknownModelRedirect        *bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked *bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        *string `json:"unknown_model_fallback,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1178,11 +1215,18 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 	if taken {
 		return CreateTokenResponse{}, ErrTokenNameConflict
 	}
-	override, err := s.validateModelOverride(ctx, owner, req.ModelOverride)
+	// One offering lookup feeds all three model-valued settings below.
+	callable := s.callableModelNames(ctx, owner)
+	override, err := validateModelOverride(callable, req.ModelOverride)
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
-	overrideMap, err := s.validateModelOverrideMap(ctx, owner, req.ModelOverrideMap)
+	overrideRules, err := validateModelOverrideRules(callable, req.ModelOverrideMap)
+	if err != nil {
+		return CreateTokenResponse{}, err
+	}
+	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
+		func() map[string]struct{} { return callable }, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
@@ -1211,12 +1255,17 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		CreatedAt:                      now,
 		UpdatedAt:                      now,
 		ModelOverride:                  override,
-		ModelOverrideMap:               store.EncodeModelOverrideMap(overrideMap),
+		ModelOverrideMap:               store.EncodeModelOverrideRules(overrideRules),
 		LogCommunication:               req.LogCommunication,
 		Secret:                         req.Secret,
 		ProjectID:                      projectID,
 		ServerOverride:                 serverOverride,
 		ServerOverrideForceUnreachable: serverOverrideForce,
+		// LastUsedModel is deliberately absent: a fresh token has never routed
+		// anything, and only the inference path ever writes the marker.
+		UnknownModelRedirect:        redirect,
+		UnknownModelRedirectBlocked: redirectBlocked,
+		UnknownModelFallback:        fallback,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1269,19 +1318,30 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		}
 		record.Status = status
 	}
+	// The callable-name set every model-valued setting below is checked against
+	// is built at most ONCE per update, and only when the request actually
+	// touches one of them — an update about something else costs no offering
+	// lookup at all.
+	var callableSet map[string]struct{}
+	callable := func() map[string]struct{} {
+		if callableSet == nil {
+			callableSet = s.callableModelNames(ctx, owner)
+		}
+		return callableSet
+	}
 	if req.ModelOverride != nil {
-		override, err := s.validateModelOverride(ctx, owner, *req.ModelOverride)
+		override, err := validateModelOverride(callable(), *req.ModelOverride)
 		if err != nil {
 			return TokenDTO{}, err
 		}
 		record.ModelOverride = override
 	}
 	if req.ModelOverrideMap != nil {
-		overrideMap, err := s.validateModelOverrideMap(ctx, owner, *req.ModelOverrideMap)
+		overrideRules, err := validateModelOverrideRules(callable(), *req.ModelOverrideMap)
 		if err != nil {
 			return TokenDTO{}, err
 		}
-		record.ModelOverrideMap = store.EncodeModelOverrideMap(overrideMap)
+		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
 	}
 	if req.LogCommunication != nil {
 		record.LogCommunication = *req.LogCommunication
@@ -1314,6 +1374,38 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	record.ServerOverride = s.validateServerOverride(ctx, owner, record.ServerOverride)
 	if record.ServerOverride == "" {
 		record.ServerOverrideForceUnreachable = false
+	}
+	// The three unknown-model-redirect settings are validated as ONE unit
+	// whenever the request touches ANY of them, against the values this update
+	// leaves them at: each one can invalidate the other two (switching the
+	// redirect off clears both sub-settings), so validating them individually
+	// would let an inconsistent combination through. Untouched, they are left
+	// exactly as stored — nil means unchanged here as everywhere else, and no
+	// re-validation is needed for them either, because an unroutable fallback
+	// is inert (the redirect re-checks every candidate per request) rather than
+	// dangerous the way a stale server override is.
+	//
+	// record.LastUsedModel is never assigned anywhere in this method: it is
+	// carried through from the record just read, so an update can neither set
+	// nor clear the redirect's own target.
+	if req.UnknownModelRedirect != nil || req.UnknownModelRedirectBlocked != nil || req.UnknownModelFallback != nil {
+		on, blocked, fallback := record.UnknownModelRedirect, record.UnknownModelRedirectBlocked, record.UnknownModelFallback
+		if req.UnknownModelRedirect != nil {
+			on = *req.UnknownModelRedirect
+		}
+		if req.UnknownModelRedirectBlocked != nil {
+			blocked = *req.UnknownModelRedirectBlocked
+		}
+		if req.UnknownModelFallback != nil {
+			fallback = *req.UnknownModelFallback
+		}
+		on, blocked, fallback, err := validateUnknownModelRedirect(callable, on, blocked, fallback)
+		if err != nil {
+			return TokenDTO{}, err
+		}
+		record.UnknownModelRedirect = on
+		record.UnknownModelRedirectBlocked = blocked
+		record.UnknownModelFallback = fallback
 	}
 	record.UpdatedAt = s.clock().UTC()
 	if err := s.tokens.UpdateTokenMetadata(ctx, record); err != nil {
@@ -1382,55 +1474,129 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 	return false, nil
 }
 
+// callableModelNames is the set of names the owner can route to DIRECTLY,
+// unioned over every API flavor: every model-valued token setting (the
+// catch-all override, each rule's target, the redirect's fallback) is checked
+// against this one set, so the three can never drift apart.
+//
+// Callable, not the LISTING, and not Existing — the distinction is the whole
+// point (see ModelOffering):
+//
+//   - The LISTING (ModelsForFlavor / Models(), what a token sees advertised)
+//     CONTAINS the token's own offered override ALIASES, which are not routable
+//     names at all: an override alias is rewritten before routing, so accepting
+//     one as a fallback would store a setting the redirect can never act on. It
+//     also LOSES the model_settings "hidden" names, which route perfectly well
+//     under their own name. ModelOffering carries no listing set for exactly
+//     that reason.
+//   - Existing ignores per-token reach entirely — it answers "does this name
+//     exist anywhere", not "can this owner use it".
+//   - Callable is exactly "a direct request for this name can succeed": the
+//     same per-token reachability as the listing, minus the "locked"
+//     (group-only) names, which a direct request cannot route to, plus the
+//     merely-hidden ones, which it can.
+//
+// Both flavors count: a name valid for only one of them is still a valid
+// setting, and every consumer re-checks the flavor per request. Groups share
+// the model namespace and are therefore included by the same lookup.
+//
+// The set is built ONCE per create/update and passed to each validator, rather
+// than rebuilt per entry: it costs one mapping traversal plus one group-overlay
+// load per flavor.
+func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, flavor := range knownAPIFlavors {
+		for name := range s.ModelOfferingFor(ctx, owner, flavor).Callable {
+			out[name] = struct{}{}
+		}
+	}
+	return out
+}
+
 // validateModelOverride trims the requested override and, when non-empty,
-// requires it to be a currently-active gateway model. Empty = override off.
-func (s *Service) validateModelOverride(ctx context.Context, owner auth.Token, model string) (string, error) {
+// requires it to be a name the owner can route to directly (callable). Empty =
+// override off.
+func validateModelOverride(callable map[string]struct{}, model string) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", nil
 	}
-	for _, m := range s.Models(ctx, owner).Data {
-		if m.ID == model {
-			return model, nil
-		}
+	if _, ok := callable[model]; !ok {
+		return "", ErrTokenModelOverrideInvalid
 	}
-	return "", ErrTokenModelOverrideInvalid
+	return model, nil
 }
 
-// validateModelOverrideMap trims and validates a per-requested-model override map:
-// each entry's requested-model KEY is free text (arbitrary client model name, only
-// required to be non-empty), and each VALUE must be a currently-active gateway
-// model (like the catch-all). Fully-empty rows are dropped; a row with only one
-// side filled, or a value that is not a known model, is rejected with
-// ErrTokenModelOverrideInvalid. Returns nil for an empty/all-dropped map. The
-// active-model set is fetched once (not per entry).
-func (s *Service) validateModelOverrideMap(ctx context.Context, owner auth.Token, raw map[string]string) (map[string]string, error) {
+// validateModelOverrideRules trims and validates a per-requested-model override
+// map: each entry's requested-model KEY is free text (arbitrary client model
+// name, only required to be non-empty), and each row's TARGET must be a name
+// the owner can route to directly (like the catch-all). The two listing
+// switches are carried through UNCHANGED — they are a display concern and
+// constrain nothing, so no row is ever complete or incomplete because of them.
+// Fully-empty rows are dropped; a row with only one side filled, or a target
+// that is not callable, is rejected with ErrTokenModelOverrideInvalid. Returns
+// nil for an empty/all-dropped map.
+func validateModelOverrideRules(callable map[string]struct{}, raw map[string]store.ModelOverrideRule) (map[string]store.ModelOverrideRule, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	known := make(map[string]struct{})
-	for _, m := range s.Models(ctx, owner).Data {
-		known[m.ID] = struct{}{}
-	}
-	out := make(map[string]string, len(raw))
-	for k, v := range raw {
+	out := make(map[string]store.ModelOverrideRule, len(raw))
+	for k, rule := range raw {
 		key := strings.TrimSpace(k)
-		val := strings.TrimSpace(v)
+		val := strings.TrimSpace(rule.To)
 		if key == "" && val == "" {
 			continue // fully-empty row: drop
 		}
 		if key == "" || val == "" {
 			return nil, ErrTokenModelOverrideInvalid // half-filled row
 		}
-		if _, ok := known[val]; !ok {
-			return nil, ErrTokenModelOverrideInvalid // target must be an active gateway model
+		if _, ok := callable[val]; !ok {
+			return nil, ErrTokenModelOverrideInvalid // target must be routable
 		}
-		out[key] = val
+		rule.To = val
+		out[key] = rule
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// validateUnknownModelRedirect normalizes the three redirect settings as ONE
+// unit, because each of them can invalidate the other two.
+//
+// The two sub-settings are cleared whenever the redirect itself is off: storing
+// a fallback that cannot apply invites the reading "it is configured, so it
+// works". Mirrors ServerOverrideForceUnreachable against ServerOverride.
+//
+// A non-empty fallback is trimmed and must be a model or group the owner can
+// actually route to — the same rule and the same error as an override target,
+// because it is the same kind of value: a name the gateway will route to on the
+// client's behalf. It is checked against the CALLABLE set specifically; see
+// callableModelNames for why neither of the other two sets would do.
+//
+// The check is a configuration-time guard, not an enforcement point: the
+// redirect re-checks its candidates against the live offering on every request,
+// so a fallback that goes stale later is inert rather than dangerous.
+//
+// `callable` is a FUNCTION, not a set, because the two early returns above the
+// only use of it are the common cases: an update that switches the redirect
+// off, or leaves the fallback empty, needs no callable set at all — and
+// building one costs a mapping traversal plus a group-overlay load PER API
+// FLAVOR (callableModelNames). Taking the set eagerly meant paying for it to
+// reach a `return` that never looked at it.
+func validateUnknownModelRedirect(callable func() map[string]struct{}, on, blocked bool, fallback string) (bool, bool, string, error) {
+	if !on {
+		return false, false, "", nil
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return true, blocked, "", nil
+	}
+	if _, ok := callable()[fallback]; !ok {
+		return false, false, "", ErrTokenModelOverrideInvalid
+	}
+	return true, blocked, fallback, nil
 }
 
 func validateTokenScopes(owner auth.Token, requested []string) ([]string, error) {
@@ -1814,6 +1980,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// synthetic models, and drop hidden/locked models from the standalone
 			// listing. Fails open (proceed without the overlay) on a store error.
 			isGroup := make(map[string]struct{})
+			// preSuppress mirrors flavorSetsFromViews's own preSuppress: the
+			// per-name flavor set BEFORE any suppression, so the override-alias
+			// overlay below can have an alias inherit a hidden/locked target's
+			// flavors (see applyOverrideAliases's doc comment). Snapshotted here,
+			// before the hidden/locked deletion and the group entries just below;
+			// each group's flavors are folded in unconditionally as it is built,
+			// exactly like flavorSetsFromViews does.
+			preSuppress := make(map[string]map[string]struct{}, len(flavors))
+			for name, f := range flavors {
+				preSuppress[name] = f
+			}
 			if entries, suppressSet, gErr := s.modelGroupOverlay(ctx, flavors); gErr == nil {
 				// A group is "loaded" iff its highest-priority OFFERABLE member is
 				// loaded -- except for a loaded_only group, where ANY loaded member
@@ -1904,6 +2081,10 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// retains it so a hidden/locked group stays visible + revertible. Its
 				// per-name Visibility on the DTO is filled below from the settings map.
 				for _, e := range entries {
+					// A group name is an override target like any model name, so it
+					// belongs in preSuppress even when the group itself is not offered
+					// (mirrors flavorSetsFromViews's identical unconditional add).
+					preSuppress[e.Name] = e.Flavors
 					if suppress && e.Visibility != "shown" {
 						continue
 					}
@@ -1919,6 +2100,56 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					visionOn[e.Name] = groupVision[e.Name]
 					isGroup[e.Name] = struct{}{}
+				}
+			}
+			// Per-token override aliases (Task 4b): the same overlay
+			// flavorSetsFromViews applies for /v1/models and the Anthropic
+			// listing, reused here rather than reimplemented so the rules cannot
+			// drift between the two paths. USAGE PATH ONLY -- suppress==true is
+			// Models(), the listing a token's override rules are meant to shape;
+			// suppress==false is ManageModels(), the admin surface showing the
+			// system's real models, which must never be filled with one token's
+			// aliases. A token without override rules is unaffected either way:
+			// applyOverrideAliases is a no-op on an empty rule set.
+			if suppress {
+				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
+				// applyOverrideAliases only touches the flavor map; an alias name
+				// added there still needs the target's OTHER listing data (loaded
+				// state, offered-on count, context size, vision, and whether the
+				// target is itself a model GROUP) copied over under the alias name
+				// -- the alias entry is meant to look exactly like its target's
+				// row, just filed under a different name (this is a display, not a
+				// leak: the alias really does route to this target). Models and
+				// groups share one namespace, so rule.To naming a group is a
+				// legitimate, tested target (TestOfferedAliasOntoAGroup in Task 4);
+				// an alias onto one really does fail over across the group's
+				// members, so IsGroup must say so too, or the alias would
+				// understate what it does. Checking flavors[name] reuses
+				// applyOverrideAliases's own decision of which aliases actually got
+				// added (Offer set AND the target existed in preSuppress) instead
+				// of re-deriving it here.
+				for name, rule := range token.ModelOverrideRules {
+					if !rule.Offer {
+						continue
+					}
+					if _, ok := flavors[name]; !ok {
+						continue
+					}
+					if servers, ok := loadedOn[rule.To]; ok {
+						loadedOn[name] = servers
+					}
+					if servers, ok := offeredOn[rule.To]; ok {
+						offeredOn[name] = servers
+					}
+					if cs, ok := contextSizeOn[rule.To]; ok {
+						contextSizeOn[name] = cs
+					}
+					if v, ok := visionOn[rule.To]; ok {
+						visionOn[name] = v
+					}
+					if _, ok := isGroup[rule.To]; ok {
+						isGroup[name] = struct{}{}
+					}
 				}
 			}
 			ids := make([]string, 0, len(flavors))
@@ -3014,32 +3245,55 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // callers either.
 //
 // VISIBILITY-SURFACE MATRIX — every model/server-facing surface reachable by
-// a non-admin gateway:use principal, and which of the two independent
-// filters it applies: (a) the resource-group AllowedServerIDs filter this
-// function (or a sibling built on the same filterByAllowedServers core)
-// implements, and (b) the model_settings hidden/locked suppression —
+// a non-admin gateway:use principal, and which of the three independent
+// filters/overlays it applies: (a) the resource-group AllowedServerIDs filter
+// this function (or a sibling built on the same filterByAllowedServers core)
+// implements, (b) the model_settings hidden/locked suppression —
 // modelGroupOverlay's suppress set for Models()/ModelsForFlavor() (applies to
 // plain models AND groups alike), and the same underlying read
 // (modelVisibilityByLower) applied directly, principal-gated on
-// !isAdmin(...), by dashboardRouteData() and ModelServers():
+// !isAdmin(...), by dashboardRouteData() and ModelServers() — and (c) the
+// PER-TOKEN override-alias overlay (applyOverrideAliases: add each Offer
+// rule's requested name, drop each HideTarget rule's target), which unlike
+// (a)/(b) is not a filter at all but a per-principal RENAMING of the listing,
+// and is therefore applied LAST, over the finished result of (a) and (b):
 //
-//	Surface                                        (a) resource-group                          (b) hidden/locked
-//	Models()                                       yes — visibleMappingViews                   yes — modelsResponse(suppress=true)
-//	ModelsForFlavor() (/v1/models, per flavor)     yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)
-//	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass
-//	  (handlePortalModelServers /
-//	   handlePortalModelServersEvents)
-//	model-group-servers                             yes — per-member ModelServers, PLUS         yes — inherited: every row comes
+//	Surface                                        (a) resource-group                          (b) hidden/locked                           (c) per-token alias overlay
+//	Models()                                       yes — visibleMappingViews                   yes — modelsResponse(suppress=true)         yes — modelsResponse, suppress==true only
+//	                                                                                                                                       (plus the alias's loaded/offered/context/
+//	                                                                                                                                        vision/is-group row data, copied from
+//	                                                                                                                                        the target so the alias row looks like it)
+//	ModelsForFlavor() (/v1/models, per flavor)     yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass         no — keyed by a REAL model name; an alias
+//	  (handlePortalModelServers /                                                                                                              is not one, and the name it hides stays
+//	   handlePortalModelServersEvents)                                                                                                          fully callable (see below)
+//	model-group-servers                             yes — per-member ModelServers, PLUS         yes — inherited: every row comes            no — same reason
 //	  (handlePortalModelGroupServers)                    FilterAllowedGroupModelServerRows           from a per-member ModelServers call
 //	                                                     (defense-in-depth re-check)
-//	dashboardRouteData()                            yes — visibleMappingViews                   yes — principal-aware, admin bypass
+//	dashboardRouteData()                            yes — visibleMappingViews                   yes — principal-aware, admin bypass         no — same reason
 //	  (GET /api/portal/dashboard, "Live Model
 //	   Routes" table)
+//	ModelOfferingFor().Callable                     yes — filterVisibleMappingViews             locked ONLY (hidden stays: display-only)    no — an alias is not a routable name
+//	ModelOfferingFor().Existing                     no  — deliberately unfiltered               no  — deliberately unsuppressed             no
 //
-// (ManageModels(), the admin-only management surface, applies NEITHER filter
-// by design: an admin managing visibility/groups must see every active
-// mapping regardless of resource-group provisioning or its own hidden/locked
-// state — see ManageModels's own doc-comment.)
+// (ModelOfferingFor has NO listing set, deliberately. It used to carry an
+// `Offered` field that applied all three columns exactly as
+// ModelsForFlavor()'s row above does — a second copy of that row's answer,
+// with no reader. The listing surfaces in this table ARE the listing; the
+// offering answers only "can this token route to this name" (Callable) and
+// "does this name exist at all" (Existing), which no row above answers.)
+//
+// (ManageModels(), the admin-only management surface, applies NONE of the
+// three by design: an admin managing visibility/groups must see every active
+// mapping regardless of resource-group provisioning, its own hidden/locked
+// state, or one particular token's aliases — see ManageModels's own
+// doc-comment.)
+//
+// (c) is a DISPLAY overlay and never an access control. HideTarget removes a
+// name from one token's listing; that same name keeps routing normally for
+// that same token, exactly as a model_settings "hidden" name does. The set
+// that answers "what can this principal actually reach" is
+// ModelOffering.Callable, never any listing above.
 //
 // CLOSED (security-policy — this row used to be a TODO here): ModelServers,
 // its SSE variant, and model-group-servers used to apply ONLY the
@@ -3061,6 +3315,15 @@ func (s *Service) visibleMappingViews(ctx context.Context, token auth.Token) ([]
 	if err != nil {
 		return nil, err
 	}
+	return s.filterVisibleMappingViews(ctx, token, views)
+}
+
+// filterVisibleMappingViews is visibleMappingViews's filter half, applied to
+// views the caller has already fetched. It exists so ModelOfferingFor — which
+// needs BOTH the unfiltered and the filtered set from one traversal — applies
+// the identical filter rather than a copy of this call that could drift from
+// it.
+func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Token, views []mappingView) ([]mappingView, error) {
 	return filterByAllowedServers(ctx, s.AllowedServerIDs, token, views, func(v mappingView) string { return v.server.ID }, false)
 }
 
@@ -3076,16 +3339,66 @@ func isKnownAPIFlavor(flavor string) bool {
 	return false
 }
 
-// modelFlavorSets maps each active gateway model name to the set of known API
-// flavors that expose it (union of app.APIFlavors across its active mapping
-// views VISIBLE to the given principal — see visibleMappingViews). Drives
-// per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the portal
-// Models() overview builds its own view via modelsResponse.
+// modelFlavorSets maps each name this principal is OFFERED to the set of known
+// API flavors that expose it. That is three layers, in order: the union of
+// app.APIFlavors across the active mapping views VISIBLE to the principal (see
+// visibleMappingViews), then the model-group overlay (active groups added by
+// flavor union, hidden/locked names dropped), then the PER-TOKEN override-alias
+// overlay — each Offer rule's requested name added with its target's flavors,
+// each HideTarget rule's target removed (applyOverrideAliases).
+//
+// So the result is a LISTING, per principal AND per token, not a set of names
+// the principal may reach: an alias in it is rewritten before routing and is
+// not routable under that name, while a name the last two layers removed stays
+// fully callable. ModelOffering.Callable is the set that answers reach.
+//
+// Drives per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the
+// portal Models() overview builds its own view via modelsResponse, applying the
+// same three layers (see the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
+	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
+	return sets, err
+}
+
+// modelFlavorSetsWithPreSuppress is modelFlavorSets plus the second map its
+// override-alias overlay needs: preSuppress, the same per-name flavor map taken
+// BEFORE the hidden/locked names were dropped (and carrying every active group
+// regardless of the group name's own visibility).
+//
+// The overlay reads flavors from preSuppress on purpose: a target suppressed by
+// model_settings is not listed under its own name but stays callable, and an
+// explicitly offered alias is a DIFFERENT name that does not reveal it — so the
+// alias must still be able to inherit that target's flavors. See
+// applyOverrideAliases in service_model_offering.go.
+//
+// preSuppress is safe to hand out as a per-token ACCESS set, and
+// ModelOfferingFor does exactly that (ModelOffering.Callable): everything a
+// principal may not REACH is already absent from it — visibleMappingViews's
+// server allowlist and resource-group provisioning ran before it was built —
+// while the only thing it still carries that `sets` does not is what
+// model_settings merely hides from DISPLAY, which stays callable. It is not an
+// offering, though: never use it to answer "what does this principal see".
+func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	// Fail open on an overlay store error, exactly as before: proceed WITHOUT
+	// groups and WITHOUT the hidden/locked suppression rather than blank the
+	// model list. ModelOfferingFor is the one caller that cannot fail open (a
+	// missing group name would read as "no such model"); it loads the inputs
+	// itself and treats the error as fatal.
+	var overlay *groupOverlayInputs
+	if loaded, gErr := s.loadGroupOverlayInputs(ctx); gErr == nil {
+		overlay = &loaded
+	}
+	sets, preSuppress = flavorSetsFromViews(views, overlay, token)
+	return sets, preSuppress, nil
+}
+
+// perNameFlavors maps each mapping view's gateway model name to the set of
+// KNOWN API flavors its application declares.
+func perNameFlavors(views []mappingView) map[string]map[string]struct{} {
 	sets := make(map[string]map[string]struct{})
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
@@ -3098,23 +3411,48 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 			}
 		}
 	}
+	return sets
+}
+
+// flavorSetsFromViews is the store-free composition half of
+// modelFlavorSetsWithPreSuppress: it turns already-fetched mapping views and
+// already-loaded overlay inputs into the finished listing. A nil overlay means
+// the group/visibility inputs were unavailable — the fail-open path, which
+// yields the plain per-model sets with neither groups nor suppression.
+//
+// Factored out so ModelOfferingFor can compose the same listing from views it
+// has already read, instead of walking the mapping store a second time.
+func flavorSetsFromViews(views []mappingView, overlay *groupOverlayInputs, token auth.Token) (sets, preSuppress map[string]map[string]struct{}) {
+	sets = perNameFlavors(views)
+	preSuppress = make(map[string]map[string]struct{}, len(sets))
+	for name, flavors := range sets {
+		preSuppress[name] = flavors
+	}
 	// Model-group offering overlay (spec §4a/§4b): add active groups (flavor
 	// union) and drop hidden/locked models, so /v1/models + per-flavor discovery
 	// include groups and hide non-shown models. This is ALWAYS the inference list,
 	// so a hidden/locked GROUP is skipped here too (mirrors the suppressed path in
-	// modelsResponse). Fails open on a store error.
-	if entries, suppress, gErr := s.modelGroupOverlay(ctx, sets); gErr == nil {
+	// modelsResponse).
+	if overlay != nil {
+		entries, suppress := buildGroupOverlay(*overlay, sets)
 		for name := range suppress {
 			delete(sets, name)
 		}
 		for _, e := range entries {
+			// A group name is an override target like any model name, so it
+			// belongs in preSuppress even when the group itself is not offered.
+			preSuppress[e.Name] = e.Flavors
 			if e.Visibility != "shown" {
 				continue
 			}
 			sets[e.Name] = e.Flavors
 		}
 	}
-	return sets, nil
+	// Per-token override aliases (offered requested names + hidden targets).
+	// Last, so it overlays the finished listing: a name the token explicitly
+	// offers survives the group/visibility suppression above.
+	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
+	return sets, preSuppress
 }
 
 // modelVisibilityByLower returns every model_settings row's visibility keyed
@@ -3139,12 +3477,22 @@ func (s *Service) modelVisibilityByLower(ctx context.Context) (map[string]string
 // of the two values a non-admin, usage-facing surface must suppress (a
 // missing/empty value, e.g. no settings row, is "shown" and never matches).
 func isHiddenOrLocked(visibility string) bool {
-	switch visibility {
-	case "hidden", "locked":
-		return true
-	default:
-		return false
-	}
+	return visibility == "hidden" || isLocked(visibility)
+}
+
+// isLocked reports whether a model_settings visibility makes a name GROUP-ONLY.
+// This is the ONE of the two suppression values that is a real ACCESS boundary
+// rather than a display switch: gateway.GroupRegistry.DirectAllowed returns
+// false for "locked", and routing.Resolver turns that into
+// routing.ErrNoModelRoute — for a group name exactly as for a model name (a
+// locked group is "not directly requestable"; a locked model is "group-only,
+// requested directly"). "hidden", by contrast, only removes a name from
+// listings and still routes perfectly under that same name.
+//
+// ModelOffering.Callable is the caller that needs the two kept apart: it keeps
+// hidden names and drops locked ones.
+func isLocked(visibility string) bool {
+	return visibility == "locked"
 }
 
 // groupOverlayEntry is one active model group's contribution to the offered
@@ -3186,10 +3534,40 @@ type groupOverlayEntry struct {
 // On any store read error it returns (nil, nil, err) so callers can fail open
 // (proceed WITHOUT groups/suppression); an offering glitch must never blank the
 // model list.
+//
+// It is the load-plus-build convenience wrapper over loadGroupOverlayInputs and
+// buildGroupOverlay. A caller that needs the overlay for TWO different
+// perNameFlavors maps (ModelOfferingFor: one token-filtered, one not) loads the
+// inputs once and builds twice instead — the store reads do not depend on
+// perNameFlavors at all.
 func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[string]map[string]struct{}) ([]groupOverlayEntry, map[string]struct{}, error) {
-	groups, err := s.routes.ModelGroups(ctx)
+	in, err := s.loadGroupOverlayInputs(ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	entries, suppress := buildGroupOverlay(in, perNameFlavors)
+	return entries, suppress, nil
+}
+
+// groupOverlayInputs is everything modelGroupOverlay reads from the store: the
+// groups themselves, the per-name visibility, and the flatten graph. None of it
+// depends on the perNameFlavors map the overlay is computed against, which is
+// why it can be loaded once and reused for several of them.
+type groupOverlayInputs struct {
+	groups     []routing.ModelGroup
+	visByLower map[string]string
+	// graph is keyed by lowercased, trimmed gateway_model_name, so a nested
+	// subgroup member is recognizable as a group and flattens via ITS OWN
+	// traversal strategy (routing.FlattenGroup).
+	graph map[string]routing.FlatGroup
+}
+
+// loadGroupOverlayInputs performs the overlay's store reads: ModelGroups, the
+// shared modelVisibilityByLower, and one GroupMembersByGroup per group.
+func (s *Service) loadGroupOverlayInputs(ctx context.Context) (groupOverlayInputs, error) {
+	groups, err := s.routes.ModelGroups(ctx)
+	if err != nil {
+		return groupOverlayInputs{}, err
 	}
 	// Per-model visibility keyed by lowercased name (case-insensitive lookup) —
 	// the shared read modelVisibilityByLower also backs the other
@@ -3198,25 +3576,15 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 	// visibleMappingViews).
 	visByLower, err := s.modelVisibilityByLower(ctx)
 	if err != nil {
-		return nil, nil, err
-	}
-	// suppress: offerable names whose visibility is hidden or locked. Keyed by
-	// the actual name as it appears in perNameFlavors so callers can delete it.
-	suppress := make(map[string]struct{})
-	for name := range perNameFlavors {
-		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
-			suppress[name] = struct{}{}
-		}
+		return groupOverlayInputs{}, err
 	}
 	// Build the flatten graph once from ALL groups (active flag preserved
-	// per-group) plus each group's ordered members, keyed by lowercased
-	// gateway_model_name — so a nested subgroup member is recognizable as a
-	// group and flattens via ITS OWN traversal strategy (routing.FlattenGroup).
+	// per-group) plus each group's ordered members.
 	graph := make(map[string]routing.FlatGroup, len(groups))
 	for _, g := range groups {
 		ms, err := s.routes.GroupMembersByGroup(ctx, g.ID)
 		if err != nil {
-			return nil, nil, err
+			return groupOverlayInputs{}, err
 		}
 		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
 			Traversal: g.Traversal,
@@ -3224,8 +3592,16 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 			Active:    g.Status == routing.ServerStatusActive,
 		}
 	}
+	return groupOverlayInputs{groups: groups, visByLower: visByLower, graph: graph}, nil
+}
+
+// buildGroupOverlay is modelGroupOverlay's pure half: it touches no store and
+// derives the entries and the suppress set from already-loaded inputs and one
+// perNameFlavors map. See modelGroupOverlay for the contract.
+func buildGroupOverlay(in groupOverlayInputs, perNameFlavors map[string]map[string]struct{}) ([]groupOverlayEntry, map[string]struct{}) {
+	suppress := suppressedOfferableNames(perNameFlavors, in.visByLower)
 	entries := make([]groupOverlayEntry, 0)
-	for _, group := range groups {
+	for _, group := range in.groups {
 		if group.Status != routing.ServerStatusActive {
 			continue
 		}
@@ -3236,37 +3612,66 @@ func (s *Service) modelGroupOverlay(ctx context.Context, perNameFlavors map[stri
 		}
 		// Flatten the group's (possibly nested) subgroups into the ordered,
 		// de-duplicated leaf-MODEL member names reachable from it.
-		flat := routing.FlattenGroup(group.GatewayModelName, graph)
-		flavors := make(map[string]struct{})
-		ordered := make([]string, 0, len(flat))
-		for _, memberName := range flat {
-			memberFlavors, ok := perNameFlavors[memberName]
-			if !ok {
-				continue // leaf member is not currently offerable
-			}
-			ordered = append(ordered, memberName)
-			for f := range memberFlavors {
-				flavors[f] = struct{}{}
-			}
-		}
+		flat := routing.FlattenGroup(group.GatewayModelName, in.graph)
+		ordered, flavors := offerableGroupMembers(flat, perNameFlavors)
 		if len(ordered) == 0 {
 			continue // no offerable member → the group is not offered
-		}
-		// The group NAME's own visibility (a group name lives in model_settings just
-		// like a model). Default "shown" when no setting row exists.
-		vis := "shown"
-		if v := visByLower[strings.ToLower(strings.TrimSpace(group.GatewayModelName))]; v != "" {
-			vis = v
 		}
 		entries = append(entries, groupOverlayEntry{
 			Name:                    group.GatewayModelName,
 			Flavors:                 flavors,
 			OrderedOfferableMembers: ordered,
-			Visibility:              vis,
+			Visibility:              visibilityOrShown(in.visByLower, group.GatewayModelName),
 			LoadedOnly:              group.LoadedOnly,
 		})
 	}
-	return entries, suppress, nil
+	return entries, suppress
+}
+
+// suppressedOfferableNames returns the offerable names whose model_settings
+// visibility is hidden or locked — buildGroupOverlay's suppress set. Keyed by
+// the actual name as it appears in perNameFlavors so callers can delete it.
+func suppressedOfferableNames(perNameFlavors map[string]map[string]struct{}, visByLower map[string]string) map[string]struct{} {
+	suppress := make(map[string]struct{})
+	for name := range perNameFlavors {
+		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(name))]) {
+			suppress[name] = struct{}{}
+		}
+	}
+	return suppress
+}
+
+// offerableGroupMembers reduces a group's flattened leaf-member names to the
+// ones that are currently offerable — in the same priority order — and returns
+// the UNION of their API flavors alongside. A member's own visibility does NOT
+// come into it: a hidden/locked model is still a full member (see
+// modelGroupOverlay). An empty ordered slice means the group has no offerable
+// member at all, which is what makes it not offered.
+func offerableGroupMembers(flat []string, perNameFlavors map[string]map[string]struct{}) ([]string, map[string]struct{}) {
+	flavors := make(map[string]struct{})
+	ordered := make([]string, 0, len(flat))
+	for _, memberName := range flat {
+		memberFlavors, ok := perNameFlavors[memberName]
+		if !ok {
+			continue // leaf member is not currently offerable
+		}
+		ordered = append(ordered, memberName)
+		for f := range memberFlavors {
+			flavors[f] = struct{}{}
+		}
+	}
+	return ordered, flavors
+}
+
+// visibilityOrShown looks a name's own model_settings visibility up
+// case-insensitively, defaulting to "shown" when no setting row exists. It is
+// used for a GROUP name too, because a group name lives in model_settings just
+// like a model name.
+func visibilityOrShown(visByLower map[string]string, name string) string {
+	if v := visByLower[strings.ToLower(strings.TrimSpace(name))]; v != "" {
+		return v
+	}
+	return "shown"
 }
 
 func sortedFlavorSet(set map[string]struct{}) []string {
@@ -3332,7 +3737,21 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		return auth.Token{}, ErrTokenForbidden
 	}
 	scopes := parseScopes(record.Scopes)
-	runAs := auth.Token{ID: record.ID, UserID: record.UserID, Name: record.Name, Active: true, Scopes: scopes, ModelOverride: record.ModelOverride, ModelOverrideMap: store.DecodeModelOverrideMap(record.ModelOverrideMap), LogCommunication: record.LogCommunication, Secret: record.Secret, ProjectID: record.ProjectID, ProjectName: s.resolveProjectName(ctx, record.ProjectID), ServerOverride: record.ServerOverride, ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable}
+	runAs := auth.Token{
+		ID: record.ID, UserID: record.UserID, Name: record.Name, Active: true, Scopes: scopes,
+		ModelOverride:                  record.ModelOverride,
+		ModelOverrideRules:             store.AuthModelOverrideRules(store.DecodeModelOverrideRules(record.ModelOverrideMap)),
+		LogCommunication:               record.LogCommunication,
+		Secret:                         record.Secret,
+		ProjectID:                      record.ProjectID,
+		ProjectName:                    s.resolveProjectName(ctx, record.ProjectID),
+		ServerOverride:                 record.ServerOverride,
+		ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable,
+		LastUsedModel:                  record.LastUsedModel,
+		UnknownModelRedirect:           record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           record.UnknownModelFallback,
+	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
 	}
@@ -3353,7 +3772,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		LastUsedAt:                     record.LastUsedAt,
 		CreatedAt:                      record.CreatedAt,
 		ModelOverride:                  record.ModelOverride,
-		ModelOverrideMap:               store.DecodeModelOverrideMap(record.ModelOverrideMap),
+		ModelOverrideMap:               store.DecodeModelOverrideRules(record.ModelOverrideMap),
 		LogCommunication:               record.LogCommunication,
 		Secret:                         record.Secret,
 		IsChatSession:                  false,
@@ -3362,6 +3781,10 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ProjectName:                    s.resolveProjectName(ctx, record.ProjectID),
 		ServerOverride:                 record.ServerOverride,
 		ServerOverrideForceUnreachable: record.ServerOverrideForceUnreachable,
+		LastUsedModel:                  record.LastUsedModel,
+		UnknownModelRedirect:           record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:           record.UnknownModelFallback,
 	}
 }
 
