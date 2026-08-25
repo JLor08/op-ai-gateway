@@ -2126,8 +2126,17 @@ func TestMigration43WidensRealToDoublePrecision(t *testing.T) {
 			t.Fatalf("fresh double precision round-trip: got %.17g, want %.17g", got, want)
 		}
 
-		// --- Simulate a fully pre-v43 deployment: revert EVERY float column to real. ---
-		floats := columnsOfType("double precision")
+		// --- Simulate a pre-v43 deployment: revert the columns v43 owns to real. ---
+		//
+		// Deliberately migration43FloatColumns and not every float column in the
+		// live schema. v43 can only widen columns that exist when it runs, and a
+		// fresh install replays the chain in order — so demanding that it also
+		// widen a column added by a LATER migration is a requirement no correct
+		// migration could satisfy. Each later migration owns its own column type;
+		// that no `real` column survives a full migration is asserted above, on
+		// the untouched baseline, which is the check that actually catches a new
+		// migration getting the type wrong.
+		floats := migration43FloatColumns
 		if len(floats) == 0 {
 			t.Fatal("expected double precision columns in the corrected baseline, found none")
 		}

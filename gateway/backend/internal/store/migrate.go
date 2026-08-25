@@ -94,6 +94,7 @@ var migrations = []migration{
 	{version: 61, name: "usage_requested_model", up: migration61Up},
 	{version: 62, name: "model_group_selection_settings", up: migration62Up},
 	{version: 63, name: "token_unknown_model_redirect", up: migration63Up},
+	{version: 64, name: "model_group_min_tps_double_precision", up: migration64Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -1989,39 +1990,50 @@ func migration42Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // already-`double precision` column (e.g. after a fresh baseline created it that
 // way) is a harmless no-op, so this runs unconditionally on postgres regardless of
 // which historical migration first created each column.
+// migration43FloatColumns is the set of float64-backed columns that existed
+// when migration43Up ran. It is a package-level var only so the conformance
+// test can revert exactly these columns and prove v43 widens all of them —
+// deriving that list from the live schema instead would demand that v43 also
+// widen columns added by LATER migrations, which it cannot: a fresh install
+// replays the chain in order, so v43 runs before those columns exist.
+//
+// A later migration that adds a float column is responsible for its own type
+// (see migration64Up); the invariant that no `real` column survives a full
+// migration is asserted separately.
+var migration43FloatColumns = [][2]string{
+	{"usage_events", "prompt_per_second"},
+	{"usage_events", "tokens_per_second"},
+	{"usage_events", "energy_wh"},
+	{"usage_events", "energy_marginal_wh"},
+	{"ai_servers", "estimated_watts"},
+	{"ai_servers", "idle_watts"},
+	{"ai_servers", "price_per_kwh"},
+	{"ai_servers", "pue"},
+	{"server_telemetry", "cpu_load"},
+	{"server_telemetry", "error_rate"},
+	{"server_telemetry_samples", "cpu_util_pct"},
+	{"server_telemetry_samples", "load1"},
+	{"server_telemetry_samples", "load5"},
+	{"server_telemetry_samples", "load15"},
+	{"server_telemetry_samples", "cpu_power_w"},
+	{"server_telemetry_samples", "system_power_w"},
+	{"server_telemetry_samples", "cpu_temp_c"},
+	{"model_mappings", "gen_tokens_per_second"},
+	{"model_mappings", "prompt_tokens_per_second"},
+	{"model_mappings", "energy_wh_per_token"},
+	{"model_mappings", "gen_tokens_per_second_at_capacity"},
+	{"model_mapping_benchmarks", "gen_tokens_per_second"},
+	{"model_mapping_benchmarks", "prompt_tokens_per_second"},
+	{"principal_limits", "cost_budget_amount"},
+}
+
 func migration43Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	if dl.name() != "postgres" {
 		return nil
 	}
-	// {table, column} for every float64-backed column. Grouped by table for
-	// readability; the order does not matter (each ALTER is independent).
-	cols := [][2]string{
-		{"usage_events", "prompt_per_second"},
-		{"usage_events", "tokens_per_second"},
-		{"usage_events", "energy_wh"},
-		{"usage_events", "energy_marginal_wh"},
-		{"ai_servers", "estimated_watts"},
-		{"ai_servers", "idle_watts"},
-		{"ai_servers", "price_per_kwh"},
-		{"ai_servers", "pue"},
-		{"server_telemetry", "cpu_load"},
-		{"server_telemetry", "error_rate"},
-		{"server_telemetry_samples", "cpu_util_pct"},
-		{"server_telemetry_samples", "load1"},
-		{"server_telemetry_samples", "load5"},
-		{"server_telemetry_samples", "load15"},
-		{"server_telemetry_samples", "cpu_power_w"},
-		{"server_telemetry_samples", "system_power_w"},
-		{"server_telemetry_samples", "cpu_temp_c"},
-		{"model_mappings", "gen_tokens_per_second"},
-		{"model_mappings", "prompt_tokens_per_second"},
-		{"model_mappings", "energy_wh_per_token"},
-		{"model_mappings", "gen_tokens_per_second_at_capacity"},
-		{"model_mapping_benchmarks", "gen_tokens_per_second"},
-		{"model_mapping_benchmarks", "prompt_tokens_per_second"},
-		{"principal_limits", "cost_budget_amount"},
-	}
-	for _, c := range cols {
+	// The column set lives in migration43FloatColumns; the order does not matter
+	// (each ALTER is independent).
+	for _, c := range migration43FloatColumns {
 		stmt := "alter table " + c[0] + " alter column " + c[1] + " type double precision"
 		if err := execTx(ctx, tx, dl, stmt); err != nil {
 			return err
@@ -2736,6 +2748,11 @@ func migration61Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // migration62Up adds the model-group selection settings: serve only loaded
 // members, order by measured speed, a minimum-speed floor with its fallback,
 // and the climb margin. Defaults reproduce the pre-feature behavior exactly.
+//
+// NOTE: `min_tokens_per_second real` is too narrow on PostgreSQL, where `real`
+// is 4-byte float32 (see ADR-005 and migration43Up). It is left as written
+// because migrations are append-only — migration64Up widens it instead, which
+// also repairs a database that already ran this one. Do not "fix" it here.
 func migration62Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	cols := []string{
 		"loaded_only integer not null default 0",
@@ -2796,4 +2813,26 @@ func migration63Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration64Up widens model_groups.min_tokens_per_second from `real` to
+// `double precision` on PostgreSQL. migration62Up added it with the literal
+// `real`, which on PostgreSQL is a 4-byte float32 and silently rounds the
+// float64 the application stores — the narrow-type hazard ADR-005 exists for,
+// and the one migration43Up already swept every other float column for.
+//
+// A forward migration rather than a correction of migration62Up: migrations are
+// append-only, and editing v62 in place would fix only databases created after
+// the edit, leaving any database that already ran v62 with a `real` column and
+// the same schema_version — exactly the divergence the append-only rule
+// prevents. This way a fresh install and an already-migrated one end up
+// identical.
+//
+// SQLite needs nothing: its REAL is 8-byte, and it has no ALTER COLUMN TYPE.
+func migration64Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if dl.name() != "postgres" {
+		return nil
+	}
+	return execTx(ctx, tx, dl,
+		"alter table model_groups alter column min_tokens_per_second type double precision")
 }
