@@ -52,6 +52,82 @@ func tokenWithRules(rules map[string]store.ModelOverrideRule) auth.Token {
 	return auth.Token{UserID: "usr_off", ModelOverrideRules: store.AuthModelOverrideRules(rules)}
 }
 
+// aliasRules is the auth-side rule map applyOverrideAliases takes, written in
+// the store shape the token editor persists and converted through the one
+// bridge that exists for it.
+func aliasRules(rules map[string]store.ModelOverrideRule) map[string]auth.ModelOverrideRule {
+	return store.AuthModelOverrideRules(rules)
+}
+
+// flavorSet is one entry of the per-name flavor map the overlay works on.
+func flavorSet(flavors ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(flavors))
+	for _, f := range flavors {
+		out[f] = struct{}{}
+	}
+	return out
+}
+
+// TestOverrideAliasFlavorsAreCopiedNotShared: an offered alias must get its OWN
+// flavor set, never a reference to its target's. Sharing one map object between
+// an alias, its target, and every other alias onto that target means a single
+// later per-name flavor edit silently reaches names it was never applied to —
+// the kind of aliasing bug that only surfaces once someone adds the first
+// mutator, far from here.
+func TestOverrideAliasFlavorsAreCopiedNotShared(t *testing.T) {
+	preSuppress := map[string]map[string]struct{}{"target": flavorSet(routing.APIFlavorOpenAI)}
+	sets := map[string]map[string]struct{}{"target": preSuppress["target"]}
+	applyOverrideAliases(sets, preSuppress, aliasRules(map[string]store.ModelOverrideRule{
+		"alias-a": {To: "target", Offer: true},
+		"alias-b": {To: "target", Offer: true},
+	}))
+	// Mutating one alias's flavors must reach nothing else.
+	sets["alias-a"][routing.APIFlavorAnthropic] = struct{}{}
+	for _, name := range []string{"alias-b", "target"} {
+		if _, leaked := sets[name][routing.APIFlavorAnthropic]; leaked {
+			t.Fatalf("%q shares its flavor map with alias-a: %#v", name, sets[name])
+		}
+	}
+	if _, leaked := preSuppress["target"][routing.APIFlavorAnthropic]; leaked {
+		t.Fatalf("the pre-suppression map was mutated through an alias: %#v", preSuppress["target"])
+	}
+}
+
+// TestHideTargetRemovesAnAliasOfTheSameName documents the one surprising
+// consequence of applying every HideTarget AFTER all the adding: hiding is by
+// NAME, and an alias name shares the model namespace. A rule that offers the
+// alias "shadow" and another rule that names "shadow" as its hide target both
+// hit the same key, so the alias is added and then removed — the token sees
+// neither the real model nor the alias.
+//
+// That is the intended reading of "a set switch is an instruction", and it is
+// DETERMINISTIC: the deferred hide pass is exactly what stops Go's randomized
+// map iteration from deciding the outcome. Repeated so a version that
+// interleaved adding and hiding would fail here rather than flake in
+// production.
+func TestHideTargetRemovesAnAliasOfTheSameName(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		preSuppress := map[string]map[string]struct{}{
+			"shadow": flavorSet(routing.APIFlavorOpenAI),
+			"real":   flavorSet(routing.APIFlavorOpenAI),
+		}
+		sets := map[string]map[string]struct{}{
+			"shadow": preSuppress["shadow"],
+			"real":   preSuppress["real"],
+		}
+		applyOverrideAliases(sets, preSuppress, aliasRules(map[string]store.ModelOverrideRule{
+			"shadow": {To: "real", Offer: true},        // offers an alias named "shadow"
+			"other":  {To: "shadow", HideTarget: true}, // hides the name "shadow"
+		}))
+		if _, ok := sets["shadow"]; ok {
+			t.Fatalf("run %d: %q survived a rule that hides that name: %#v", i, "shadow", sets)
+		}
+		if _, ok := sets["real"]; !ok {
+			t.Fatalf("run %d: the hide pass removed an unrelated name: %#v", i, sets)
+		}
+	}
+}
+
 func TestOfferedAliasAppearsWithTargetFlavors(t *testing.T) {
 	// An alias inherits its target's flavors: an Anthropic-only target must not
 	// surface the alias in the OpenAI listing.

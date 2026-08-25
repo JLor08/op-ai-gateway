@@ -1091,7 +1091,7 @@ const de = {
     'Der Server-Override-Server bietet das angeforderte Modell nicht an.',
   tokenUnknownRedirect: 'Umleitung bei unbekanntem Modell',
   tokenUnknownRedirectHint:
-    'Leitet eine Anfrage nach einem Modell, das dieser Token nicht direkt aufrufen kann, an das zuletzt genutzte Modell oder den Fallback um, statt fehlzuschlagen.',
+    'Leitet eine Anfrage nach einem Modellnamen, den es nicht gibt, an das zuletzt genutzte Modell oder den Fallback um, statt fehlzuschlagen. Modelle, die es gibt, dieser Token aber nicht aufrufen darf, werden weiterhin abgelehnt – dafür ist die folgende Option da.',
   tokenUnknownRedirectBlocked: 'Auch gesperrte Modelle umleiten',
   tokenUnknownRedirectBlockedHint:
     'Ohne diese Option greift die Umleitung nur bei einem völlig unbekannten Modellnamen. Aktiviert greift sie auch, wenn das Modell existiert, dieser Token es aber nicht aufrufen darf.',
@@ -2730,7 +2730,7 @@ const en: PortalMessages = {
     'The server-override target does not offer the requested model.',
   tokenUnknownRedirect: 'Redirect on unknown model',
   tokenUnknownRedirectHint:
-    'Redirects a request for a model this token cannot call directly to the last-used model or the fallback, instead of failing.',
+    'Redirects a request for a model name that does not exist to the last-used model or the fallback, instead of failing. A model that does exist but this token may not call is still refused — that is what the option below is for.',
   tokenUnknownRedirectBlocked: 'Also redirect blocked models',
   tokenUnknownRedirectBlockedHint:
     "Without this, the redirect only applies to a name that doesn't exist at all. Enabled, it also applies when the model exists but this token isn't allowed to call it.",

@@ -373,6 +373,61 @@ func TestOverrideRuleWireShapeIsAnObject(t *testing.T) {
 	}
 }
 
+// TestUpdateTokenRedirectOffCostsNoOfferingLookup: switching the redirect OFF
+// needs no callable-name set at all — validateUnknownModelRedirect returns
+// before it looks at one. Building that set costs a mapping traversal plus a
+// group-overlay load PER API FLAVOR, so taking it eagerly meant paying for an
+// answer the validator threw away. The counters below are the only way to see
+// that, since the outcome is identical either way.
+func TestUpdateTokenRedirectOffCostsNoOfferingLookup(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	offerModel(t, rs, "srv_lazy", "LazyBox", "app_lazy", []string{routing.APIFlavorOpenAI}, "qwen3-32b", "qwen3-32b-up", routing.ServerStatusActive)
+	counted := &countingRoutingStore{MemoryStore: rs}
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	if err := dir.CreateUser(ctx, store.User{
+		ID: "usr_lazy", Email: "lazy@example.test", DisplayName: "Lazy", Role: "user",
+		Status: store.UserStatusActive, PreferredLanguage: "de",
+		CreatedAt: offeringTime, UpdatedAt: offeringTime,
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	svc := NewService(ServiceDeps{Users: dir, Tokens: dir, Routes: counted, Clock: func() time.Time { return offeringTime }})
+	owner := auth.Token{UserID: "usr_lazy", Scopes: []string{"gateway:use"}}
+	resp, err := svc.CreateToken(ctx, owner, CreateTokenRequest{
+		Name: "t", Scopes: []string{"gateway:use"},
+		UnknownModelRedirect: true, UnknownModelFallback: "qwen3-32b",
+	})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	counted.aiServers, counted.modelGroups, counted.groupMembers = 0, 0, 0
+	dto, err := svc.UpdateToken(ctx, owner, resp.Token.ID, UpdateTokenRequest{UnknownModelRedirect: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("UpdateToken: %v", err)
+	}
+	if dto.UnknownModelRedirect || dto.UnknownModelFallback != "" {
+		t.Fatalf("dto after switching the redirect off = %+v", dto)
+	}
+	if counted.aiServers != 0 || counted.modelGroups != 0 {
+		t.Fatalf("switching the redirect off cost %d mapping traversals and %d overlay loads, want 0 of each",
+			counted.aiServers, counted.modelGroups)
+	}
+
+	// The set is still built when it is actually needed — otherwise this test
+	// would also pass against a validator that never checks the fallback at all.
+	counted.aiServers = 0
+	if _, err := svc.UpdateToken(ctx, owner, resp.Token.ID, UpdateTokenRequest{
+		UnknownModelRedirect: boolPtr(true), UnknownModelFallback: strPtr("qwen3-32b"),
+	}); err != nil {
+		t.Fatalf("UpdateToken (turning it back on): %v", err)
+	}
+	if counted.aiServers == 0 {
+		t.Fatal("a non-empty fallback was accepted without consulting the callable set")
+	}
+}
+
 func TestUpdateTokenRedirectSettings(t *testing.T) {
 	// The three settings are patchable, and switching the redirect off clears
 	// both sub-settings on the stored record, not just in the response.

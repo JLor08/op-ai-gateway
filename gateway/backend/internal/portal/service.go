@@ -1226,7 +1226,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		return CreateTokenResponse{}, err
 	}
 	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
-		callable, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
+		func() map[string]struct{} { return callable }, req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
@@ -1399,7 +1399,7 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		if req.UnknownModelFallback != nil {
 			fallback = *req.UnknownModelFallback
 		}
-		on, blocked, fallback, err := validateUnknownModelRedirect(callable(), on, blocked, fallback)
+		on, blocked, fallback, err := validateUnknownModelRedirect(callable, on, blocked, fallback)
 		if err != nil {
 			return TokenDTO{}, err
 		}
@@ -1578,7 +1578,14 @@ func validateModelOverrideRules(callable map[string]struct{}, raw map[string]sto
 // The check is a configuration-time guard, not an enforcement point: the
 // redirect re-checks its candidates against the live offering on every request,
 // so a fallback that goes stale later is inert rather than dangerous.
-func validateUnknownModelRedirect(callable map[string]struct{}, on, blocked bool, fallback string) (bool, bool, string, error) {
+//
+// `callable` is a FUNCTION, not a set, because the two early returns above the
+// only use of it are the common cases: an update that switches the redirect
+// off, or leaves the fallback empty, needs no callable set at all — and
+// building one costs a mapping traversal plus a group-overlay load PER API
+// FLAVOR (callableModelNames). Taking the set eagerly meant paying for it to
+// reach a `return` that never looked at it.
+func validateUnknownModelRedirect(callable func() map[string]struct{}, on, blocked bool, fallback string) (bool, bool, string, error) {
 	if !on {
 		return false, false, "", nil
 	}
@@ -1586,7 +1593,7 @@ func validateUnknownModelRedirect(callable map[string]struct{}, on, blocked bool
 	if fallback == "" {
 		return true, blocked, "", nil
 	}
-	if _, ok := callable[fallback]; !ok {
+	if _, ok := callable()[fallback]; !ok {
 		return false, false, "", ErrTokenModelOverrideInvalid
 	}
 	return true, blocked, fallback, nil

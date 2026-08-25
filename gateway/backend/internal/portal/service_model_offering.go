@@ -73,6 +73,16 @@ type ModelOffering struct {
 // set switch is an instruction, an unset one merely its absence. Hiding is
 // therefore applied after all the adding, never interleaved with it.
 //
+// CONSEQUENCE of that deferred hide pass, worth naming because it looks like a
+// bug until you see it: hiding is by NAME, and an alias name lives in the same
+// namespace as a model name. So if one rule OFFERS the alias "A" and another
+// rule names "A" as its target with HideTarget set, the second rule wins — "A"
+// is added by the first pass and removed by the second, and the token sees
+// neither. This is deterministic (map iteration order cannot affect it, which
+// is exactly why the hide pass is deferred), it matches "a set switch is an
+// instruction", and it is the same outcome an operator would get by hiding a
+// real model of that name. It is not silently reordered or half-applied.
+//
 // This is a LISTING overlay, never an access control: a hidden target stays
 // callable under its real name, exactly as before this feature.
 func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rules map[string]auth.ModelOverrideRule) {
@@ -86,7 +96,18 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 			continue // target does not exist (or is not visible here): an alias would be a dead name
 		}
 		if rule.Offer {
-			sets[name] = flavors
+			// COPIED, not aliased. Assigning preSuppress[rule.To] by reference
+			// would make the alias entry and its target the SAME map object —
+			// and two aliases onto one target the same object as each other —
+			// so any later per-name flavor edit would silently reach names it
+			// was never applied to. Nothing mutates these today; a copy costs a
+			// few entries per offered alias and removes the hazard instead of
+			// leaving a note about it.
+			copied := make(map[string]struct{}, len(flavors))
+			for flavor := range flavors {
+				copied[flavor] = struct{}{}
+			}
+			sets[name] = copied
 		}
 		if rule.HideTarget {
 			hidden[rule.To] = struct{}{}

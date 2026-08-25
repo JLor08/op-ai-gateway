@@ -727,7 +727,8 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		return CreateServiceTokenResponse{}, err
 	}
 	redirect, redirectBlocked, fallback, err := validateUnknownModelRedirect(
-		intersectAllowedModels(callable, allowlist), req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
+		func() map[string]struct{} { return intersectAllowedModels(callable, allowlist) },
+		req.UnknownModelRedirect, req.UnknownModelRedirectBlocked, req.UnknownModelFallback)
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
