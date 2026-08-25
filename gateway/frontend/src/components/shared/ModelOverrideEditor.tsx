@@ -9,16 +9,49 @@ import type { Translation } from './types';
 import { Field } from './Field';
 import { SearchableSelect } from './SearchableSelect';
 
-// A row in the model-override editor: a requested-model free-text key -> a
-// gateway model id, plus the two listing switches (see ModelOverrideEntry).
-// `offer` lists `from` itself as an offered model name (inheriting `to`'s API
-// flavors); `hideTarget` removes `to`'s own name from the offered list.
-// Neither switch affects row completeness (see overrideRowsInvalid below).
-// The catch-all (carried separately, see ModelOverrideEditor below) applies to
-// any requested model with no row. Shared by TokenList (personal/chat tokens)
-// and ServicesView (service tokens) — both build the same wire shape
-// (buildOverrideMap) and render the same row editor.
-export type OverrideRow = { from: string; to: string; offer: boolean; hideTarget: boolean };
+// The DATA half of a row in the model-override editor: a requested-model
+// free-text key -> a gateway model id, plus the two listing switches (see
+// ModelOverrideEntry). `offer` lists `from` itself as an offered model name
+// (inheriting `to`'s API flavors); `hideTarget` removes `to`'s own name from
+// the offered list. Neither switch affects row completeness (see
+// overrideRowsInvalid below). The catch-all (carried separately, see
+// ModelOverrideEditor below) applies to any requested model with no row.
+// Shared by TokenList (personal/chat tokens) and ServicesView (service tokens)
+// — both build the same wire shape (buildOverrideMap) and render the same row
+// editor.
+//
+// Everything that is serialized or validated lives here, and NOT the row's
+// identity: buildOverrideMap and overrideRowsInvalid take this type so they
+// stay independent of the editor's rendering concern.
+export type OverrideRowValues = {
+  from: string;
+  to: string;
+  offer: boolean;
+  hideTarget: boolean;
+};
+
+// A row as the editor renders it: its values plus a stable `id`.
+//
+// `id` is the row's React key, and it MUST NOT be the array index. React keeps
+// a row's mounted component instances per key, so with an index key removing a
+// row re-points every later row at its predecessor's instances and destroys
+// the last one — the surviving rows keep their (controlled) values but not
+// their instances, so anything React holds ON the instance moves one row up or
+// is thrown away: the caret/focus the user was in, and the uncontrolled
+// internal state of the row's SearchableSelect (MUI Autocomplete's typed
+// filter text). A stable id makes a removal remove exactly the one row.
+export type OverrideRow = OverrideRowValues & { id: string };
+
+// Row ids only have to be unique among the rows mounted in one editor: they
+// are never persisted (not part of the wire shape — see buildOverrideMap),
+// never rendered, and never sent anywhere, so a module-level counter is
+// enough and keeps them stable and readable in test failures. Every row is
+// created through here, so no row can ever be missing one.
+let overrideRowSeq = 0;
+export function newOverrideRow(values: OverrideRowValues): OverrideRow {
+  overrideRowSeq += 1;
+  return { ...values, id: `override-row-${overrideRowSeq}` };
+}
 
 // The "to" dropdown only ever needs id + display_name — both ModelOption
 // (the full model list) and ServerModelOption (a server-override-narrowed
@@ -27,7 +60,7 @@ export type OverrideModelOption = { id: string; display_name: string };
 
 // A row is incomplete when exactly one side is filled; such a row blocks
 // submit.
-export function overrideRowsInvalid(rows: OverrideRow[]): boolean {
+export function overrideRowsInvalid(rows: readonly OverrideRowValues[]): boolean {
   return rows.some((r) => (r.from.trim() !== '') !== (r.to.trim() !== ''));
 }
 
@@ -35,7 +68,9 @@ export function overrideRowsInvalid(rows: OverrideRow[]): boolean {
 // only complete rows (both sides non-empty, trimmed); a duplicate
 // requested-model key resolves to the last row. Both switches always ride
 // along, defaulting to their current (possibly false) row value.
-export function buildOverrideMap(rows: OverrideRow[]): Record<string, ModelOverrideEntry> {
+export function buildOverrideMap(
+  rows: readonly OverrideRowValues[],
+): Record<string, ModelOverrideEntry> {
   const map: Record<string, ModelOverrideEntry> = {};
   for (const row of rows) {
     const from = row.from.trim();
@@ -64,6 +99,10 @@ export function overrideSummary(
  * create/edit form and ServicesView's service-token create dialog. Fully
  * controlled: no internal row/catch-all state — `onRowsChange`/
  * `onCatchAllChange` drive it, add/update/remove-row handlers live only here.
+ *
+ * Callers must build their rows with `newOverrideRow` so every row carries the
+ * stable `id` this renders as its React key (see OverrideRow for why an index
+ * key is wrong here).
  *
  * `idPrefix` derives each row's Field/SearchableSelect ids as
  * `${idPrefix}-override-from-${i}` / `${idPrefix}-override-to-${i}`, matching
@@ -96,7 +135,7 @@ export function ModelOverrideEditor({
     onRowsChange(rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   }
   function addRow() {
-    onRowsChange([...rows, { from: '', to: '', offer: false, hideTarget: false }]);
+    onRowsChange([...rows, newOverrideRow({ from: '', to: '', offer: false, hideTarget: false })]);
   }
   function removeRow(index: number) {
     onRowsChange(rows.filter((_, i) => i !== index));
@@ -115,7 +154,11 @@ export function ModelOverrideEditor({
         {t.tokenOverrideHideTargetHint}
       </Typography>
       {rows.map((row, i) => (
-        <Box key={i} sx={{ display: 'grid', gap: 0.5 }}>
+        // Keyed by the row's own id, never by `i` — see OverrideRow. The
+        // index is still what the ids/aria-labels below are derived from:
+        // those describe the row's POSITION ("… 2"), which is exactly what
+        // should shift when a row above is removed.
+        <Box key={row.id} sx={{ display: 'grid', gap: 0.5 }}>
           <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
             <Box sx={{ flex: 1 }}>
               <Field

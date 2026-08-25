@@ -51,6 +51,7 @@ import { useToast } from './shared/ToastProvider';
 import {
   ModelOverrideEditor,
   buildOverrideMap,
+  newOverrideRow,
   overrideRowsInvalid,
   overrideSummary,
   type OverrideRow,
@@ -221,14 +222,18 @@ export function TokenList({
     setScopes(row.scopes.filter((scope) => selectableScopes.includes(scope)));
     setScopesDirty(false);
     setOverrideRows(
-      Object.entries(row.model_override_map ?? {}).map(([from, entry]) => ({
-        from,
-        to: entry.to,
-        // A missing switch (hand-written or older response) reads as false,
-        // never crashes the editor.
-        offer: entry.offer ?? false,
-        hideTarget: entry.hide_target ?? false,
-      })),
+      Object.entries(row.model_override_map ?? {}).map(([from, entry]) =>
+        // newOverrideRow, not a bare object literal: every row needs the stable
+        // id the editor keys it by (see OverrideRow).
+        newOverrideRow({
+          from,
+          to: entry.to,
+          // A missing switch (hand-written or older response) reads as false,
+          // never crashes the editor.
+          offer: entry.offer ?? false,
+          hideTarget: entry.hide_target ?? false,
+        }),
+      ),
     );
     setCatchAll(row.model_override);
     setServerOverride(row.server_override ?? '');
