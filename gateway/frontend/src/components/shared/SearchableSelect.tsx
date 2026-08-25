@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Autocomplete, Box, InputAdornment, TextField } from '@mui/material';
 import PriorityHighIcon from '@mui/icons-material/PriorityHigh';
 
@@ -63,11 +63,26 @@ export function SearchableSelect({
   unavailableTitle?: string;
 }>) {
   const selected = options.find((o) => o.value === value) ?? null;
+  // The typed query, or null while the field simply shows `value`. Deriving the
+  // input text from the controlled value — instead of letting MUI keep its own —
+  // is what makes the field follow whatever the PARENT decides the value is.
+  //
+  // That matters for a picker used as an ACTION: OrderedMemberList hands each
+  // pick to a list and keeps `value=""`, so MUI's `value` prop goes null -> null
+  // and its internal reset, which fires on a value CHANGE, never runs. The
+  // picked label stayed in the box and kept filtering the options, so the next
+  // model could not be picked until the user deleted the text by hand.
+  const [query, setQuery] = useState<string | null>(null);
   return (
     <Autocomplete
       id={id}
       options={options}
       value={selected}
+      inputValue={query ?? (selected ? selected.label : '')}
+      // Only real typing is a query. Every other reason MUI reports (blur,
+      // clear, selecting an option) means "show the value again", which is
+      // exactly what dropping the query does.
+      onInputChange={(_event, next, reason) => setQuery(reason === 'input' ? next : null)}
       disabled={disabled}
       fullWidth
       size="small"
@@ -78,7 +93,10 @@ export function SearchableSelect({
       filterOptions={(opts, state) =>
         matchOptions(opts, state.inputValue, selected ? selected.label : null)
       }
-      onChange={(_event, next) => onChange(next ? next.value : '')}
+      onChange={(_event, next) => {
+        setQuery(null);
+        onChange(next ? next.value : '');
+      }}
       // Let the dropdown popup grow to fit its widest option (so long model names
       // show in FULL, never clipped/ellipsised). MUI sizes the popper to the input
       // width via an inline `style.width`; overriding that style here wins per-key
