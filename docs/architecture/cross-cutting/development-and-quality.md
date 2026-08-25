@@ -102,9 +102,13 @@ screenshots in the same branch.
 - **Store conformance suite**
   (`gateway/backend/internal/store/conformance_test.go`): the store contract
   runs against the in-memory store and SQLite always, and against PostgreSQL
-  when `OP_AI_GATEWAY_TEST_POSTGRES_DSN` is set. Run it Postgres-backed
-  before merging store changes — SQLite masks narrow-column truncation (see
-  [Persistence](persistence.md) and ADR-005). Note that memory mode enforces
+  when `OP_AI_GATEWAY_TEST_POSTGRES_DSN` is set. CI sets it: the Go job runs a
+  `postgres:17-alpine` service (matching the [deployment
+  view](../07-deployment-view.md)) so the PostgreSQL leg runs on every push.
+  It has not always — while that leg was skipped, a `real` column reached
+  `main` and stayed there, which is what SQLite masks and ADR-005 warns about
+  (see [Persistence](persistence.md)). Run it Postgres-backed locally too when
+  you change the store, rather than discovering it in CI. Note that memory mode enforces
   no foreign keys and keeps no persistent usage store, so FK- and
   usage-aggregation behavior must be tested SQLite-backed or via the
   conformance suite, not via memory-mode e2e.
