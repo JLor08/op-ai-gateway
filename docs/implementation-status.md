@@ -10,8 +10,12 @@
   (self-reviewed; heartbeat mechanics, admission wait timeout, server_agent
   timeout default, and a test-table artifact fixed inline).
 - Go test baseline in this worktree: green (`make test-go`, exit 0).
-- Awaiting: user review of the written spec, then the implementation plan
-  (writing-plans skill) under `docs/superpowers/plans/`.
+- Spec approved by the user (2026-08-25).
+- Implementation plan written and self-reviewed:
+  `docs/superpowers/plans/2026-08-25-agent-runtime-manager.md` — 24 tasks in
+  five phases (store 1-4, gateway 5-10, agent 11-18, frontend 19-22,
+  e2e+docs 23-24), grounded in five code-pattern briefs (exact signatures,
+  registration points, test conventions).
 
 ## Context worth keeping on this branch
 
@@ -25,5 +29,5 @@
 
 ## Next planned step
 
-1. User reviews the spec file.
-2. Write the implementation plan (writing-plans) on this branch.
+1. User picks the execution mode (subagent-driven vs. inline).
+2. Execute the plan task-by-task; update this file after each task.
