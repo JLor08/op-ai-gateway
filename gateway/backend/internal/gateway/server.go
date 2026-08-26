@@ -193,6 +193,25 @@ type ServerDeps struct {
 	// snapshot+subscribe status stream. gateway.New defaults a nil value to
 	// a fresh registry.
 	RuntimeStatus *runtimeStatusRegistry
+	// SetRuntimeConfigChangedHook, when non-nil, is called ONCE by
+	// cmd/gateway's buildGatewayServer immediately after gateway.New returns,
+	// with the just-built Server's PushRuntimeConfig bound as the argument --
+	// i.e. it is portal.Service.SetRuntimeConfigChangedHook itself, handed
+	// forward through ServerDeps by cmd/gateway's buildRuntime (which already
+	// holds the concrete *portal.Service in scope where it builds the Portal
+	// field above, before it is wrapped for the ServerDeps.Portal interface
+	// value). This field exists ONLY to carry that setter across the
+	// construction-order gap: the portal Service must exist before
+	// ServerDeps.Portal can be built, but the callback it needs
+	// (Server.PushRuntimeConfig) is a method on the Server, which does not
+	// exist until gateway.New(deps) returns -- so neither side can wire the
+	// other in directly at its own construction time. Server itself never
+	// stores or reads this field, and it plays no role in New's construction
+	// of *Server; it is read directly off the ServerDeps value still in
+	// scope in buildGatewayServer, purely as a wiring conduit. nil is the
+	// correct default for any Server built without cmd/gateway (e.g. a bare
+	// test Server) -- there is nothing to wire in that case.
+	SetRuntimeConfigChangedHook func(func(serverID string))
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.

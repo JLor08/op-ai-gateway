@@ -405,16 +405,16 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 
 	srv := gateway.New(deps)
 	// Task 8 (agent-runtime-manager): wire the runtime-config WS push in now
-	// that srv exists. portalService was constructed BEFORE srv (and wrapped
-	// into deps.Portal by the OTel tracing decorator above), so this cannot
-	// be a ServiceDeps field for the production path -- see
-	// portal.Service.SetRuntimeConfigChangedHook's doc. portal.UnwrapService
-	// recovers the concrete *portal.Service from srv.Portal so the exported
-	// setter can be called; a nil result (only possible if srv.Portal is
-	// neither a *portal.Service nor a decorator wrapping one) leaves the
-	// hook unset, matching a bare test Server's behaviour.
-	if portalSvc := portal.UnwrapService(srv.Portal); portalSvc != nil {
-		portalSvc.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)
+	// that srv exists. deps.SetRuntimeConfigChangedHook is portalService's
+	// OWN exported setter (Service.SetRuntimeConfigChangedHook), handed
+	// forward through ServerDeps by buildRuntime -- which still has
+	// portalService in scope where it builds deps.Portal -- because the
+	// setter cannot be called any earlier: it takes srv.PushRuntimeConfig,
+	// a method on the gateway Server, which does not exist until the
+	// gateway.New call directly above returns. The Server itself never
+	// sees *portal.Service; deps stays in scope here as an ordinary local.
+	if deps.SetRuntimeConfigChangedHook != nil {
+		deps.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)
 	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
@@ -1003,13 +1003,20 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	}
 	captureFlagsHook := newCaptureFlagsHook(b.SystemSettings, time.Now)
 	return gateway.ServerDeps{
-		Tokens:                          b.ServerTokens,
-		LastUsedModelWriter:             b.SetTokenLastUsedModel,
-		Usage:                           b.Usage,
-		UsageEvents:                     usageBroker,
-		Provider:                        mux,
-		Routes:                          tracedRoutes,
-		Portal:                          portal.NewAPIWithTracing(portalService),
+		Tokens:              b.ServerTokens,
+		LastUsedModelWriter: b.SetTokenLastUsedModel,
+		Usage:               b.Usage,
+		UsageEvents:         usageBroker,
+		Provider:            mux,
+		Routes:              tracedRoutes,
+		Portal:              portal.NewAPIWithTracing(portalService),
+		// SetRuntimeConfigChangedHook hands portalService's OWN exported
+		// setter forward -- portalService is in scope right here, alongside
+		// where it is wrapped for Portal above -- so buildGatewayServer can
+		// call it once srv (and srv.PushRuntimeConfig) exists. See that
+		// setter's doc and ServerDeps.SetRuntimeConfigChangedHook's doc for
+		// why this indirection exists instead of a direct field value.
+		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,
