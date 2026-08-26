@@ -12,6 +12,14 @@ import (
 	"strings"
 )
 
+// agentOwnEnvPrefix marks the agent's own configuration/credential
+// namespace. ${AGENT_ENV:NAME} refuses any NAME starting with this prefix --
+// the agent's own environment holds OP_AGENT_TOKEN (its gateway bearer
+// credential, which authenticates the certificate, CA, and runtime-config
+// endpoints), so without this refusal a gateway-supplied spec could read it
+// straight back out and impersonate the agent.
+const agentOwnEnvPrefix = "OP_AGENT_"
+
 // LocalPolicy is the agent-operator-controlled counterweight to the
 // gateway-supplied Spec. The gateway decides WHEN and HOW a process runs
 // (binary, args, env, work_dir); LocalPolicy, populated from the agent's OWN
@@ -115,6 +123,10 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 				return strconv.Itoa(port)
 			}
 			name := strings.TrimPrefix(inner, "AGENT_ENV:")
+			if strings.HasPrefix(name, agentOwnEnvPrefix) {
+				firstErr = fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
+				return match
+			}
 			val := getenv(name)
 			if val == "" {
 				firstErr = fmt.Errorf("runtime: required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)

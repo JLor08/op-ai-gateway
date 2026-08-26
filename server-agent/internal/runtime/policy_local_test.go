@@ -153,6 +153,55 @@ func TestExpandPlaceholdersAgentEnvResolves(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersAgentEnvRefusesOwnNamespace pins the Critical fix: a
+// gateway-supplied spec must never be able to read the agent's OWN
+// environment variables (its gateway bearer token, or any other
+// agent-internal setting) via ${AGENT_ENV:...} -- that would hand a portal
+// administrator the exact credential this whole boundary exists to protect.
+// Any name in the agent's own OP_AGENT_* namespace is refused outright,
+// regardless of whether getenv would have actually returned a value for it.
+func TestExpandPlaceholdersAgentEnvRefusesOwnNamespace(t *testing.T) {
+	spec := Spec{Args: []string{"--token", "${AGENT_ENV:OP_AGENT_TOKEN}"}}
+	getenv := func(k string) string {
+		if k == "OP_AGENT_TOKEN" {
+			return "gateway-bearer-secret"
+		}
+		return ""
+	}
+
+	_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err == nil {
+		t.Fatal("ExpandPlaceholders with ${AGENT_ENV:OP_AGENT_TOKEN} should refuse, not resolve the agent's own token")
+	}
+	if !strings.Contains(err.Error(), "OP_AGENT_TOKEN") {
+		t.Errorf("error = %q, want it to name the refused variable OP_AGENT_TOKEN", err.Error())
+	}
+	if strings.Contains(err.Error(), "gateway-bearer-secret") {
+		t.Fatalf("error leaked the secret value: %q", err.Error())
+	}
+}
+
+// TestExpandPlaceholdersAgentEnvOrdinaryNameStillResolves proves the
+// namespace refusal is scoped to OP_AGENT_* -- an ordinary secret name
+// unrelated to the agent's own settings still resolves normally.
+func TestExpandPlaceholdersAgentEnvOrdinaryNameStillResolves(t *testing.T) {
+	spec := Spec{Args: []string{"--hf-token", "${AGENT_ENV:HF_TOKEN}"}}
+	getenv := func(k string) string {
+		if k == "HF_TOKEN" {
+			return "hf-secret-value"
+		}
+		return ""
+	}
+
+	args, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	if want := []string{"--hf-token", "hf-secret-value"}; !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %#v, want %#v", args, want)
+	}
+}
+
 // TestExpandPlaceholdersMissingAgentEnvErrors proves a missing agent
 // environment variable is a hard error naming the variable, never an empty
 // substitution -- launching a model with an empty HF_TOKEN produces a
