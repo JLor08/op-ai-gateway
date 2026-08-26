@@ -738,6 +738,13 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 	// path releases exactly once too -- not only the post-commit paths the
 	// other three subtests cover. Shrinking the interval here would risk a
 	// heartbeat racing in first and silently testing the wrong thing.
+	//
+	// C1: nothing was committed yet (a fast non-2xx from an
+	// already-admitted child, e.g. the model server rejecting the request
+	// with its own diagnostics), so the child's own status and body must
+	// be forwarded verbatim -- exactly like the non-streaming path would
+	// for the identical child response -- not rewritten to a generic 502
+	// with the diagnostics thrown away.
 	t.Run("upstream_non2xx", func(t *testing.T) {
 		shrinkTimings(t)
 		m := newTestManager(t, allowlistPolicy())
@@ -752,13 +759,16 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Post: %v", err)
 		}
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Errorf("status = %d, want 502 -- nothing was committed yet (a fast non-2xx from an already-admitted child), so this must be a real HTTP status via sentinelCode, not a 200-committed terminal SSE frame", resp.StatusCode)
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("status = %d, want %d -- the child's own status, forwarded verbatim (nothing was committed to SSE yet)", resp.StatusCode, http.StatusInternalServerError)
 		}
-		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("Content-Type = %q, want application/json (nothing committed to SSE)", ct)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
 		}
-		io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining only
+		if string(respBody) != "stubchild: scripted failure" {
+			t.Errorf("body = %q, want the child's own diagnostic body forwarded verbatim, not deleted", respBody)
+		}
 		resp.Body.Close()
 
 		waitUntil(t, 3*time.Second, "release called exactly once on a fast, uncommitted non-2xx upstream status", func() bool {

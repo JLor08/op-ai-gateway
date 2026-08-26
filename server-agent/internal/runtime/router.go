@@ -56,14 +56,25 @@
 // doc §8.3, §15): once 200 HAS been committed for a streaming request (a
 // heartbeat fired, or real data started flowing, before the eventual
 // outcome was known), no later failure -- EnsureRunning erroring, the
-// child returning a non-2xx status, the child dying mid-response -- can be
-// reported as an HTTP status any more. Each is instead reported as a
-// terminal SSE frame (`data: {"error":{"code":"...","message":"..."}}\n\n`)
-// carrying the exact same stable code the non-streaming path would have
-// used for that failure (§6.5's sentinel table, reproduced in
-// sentinelCode below). The lazy commit means this trade-off is now paid
-// only when it is actually earned by a genuinely slow phase, not on every
-// streaming request regardless of how fast it resolves.
+// child dying mid-response -- can be reported as an HTTP status any more.
+// Each is instead reported as a terminal SSE frame
+// (`data: {"error":{"code":"...","message":"..."}}\n\n`) carrying the exact
+// same stable code the non-streaming path would have used for that
+// failure (§6.5's sentinel table, reproduced in sentinelCode below). The
+// lazy commit means this trade-off is now paid only when it is actually
+// earned by a genuinely slow phase, not on every streaming request
+// regardless of how fast it resolves.
+//
+// A non-2xx from an already-admitted child is deliberately NOT part of
+// this trade-off (C1): it is the model server's own legitimate response
+// (a 400 "context length exceeded", a 422 for a bad tool schema, ...), not
+// a router-level failure, and the brief only prescribes the error-frame
+// treatment for a non-2xx AFTER heartbeats began. So a non-2xx arriving
+// before anything is committed is forwarded verbatim -- status, headers,
+// body -- exactly like the non-streaming path would for the identical
+// response (forwardUpstreamResponse); only a non-2xx arriving AFTER 200 is
+// already committed falls into the terminal-frame trade-off above, since
+// by then there is genuinely no HTTP status left to give it.
 package runtime
 
 import (
@@ -388,6 +399,22 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 	resp := rres.resp
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// C1: an already-admitted child answering with its own non-2xx
+		// (e.g. 400 "context length exceeded") is a legitimate response,
+		// not a router-level failure. If nothing has been committed to
+		// SSE yet, forward it exactly as the plain (non-streaming) path
+		// would for the identical response -- status, headers, and body
+		// verbatim -- so a streaming caller sees the same diagnostics a
+		// non-streaming caller gets. Only once 200 is ALREADY committed
+		// (a heartbeat fired, or real data already flowed) does a non-2xx
+		// become the ACCEPTED TRADE-OFF terminal frame instead: the
+		// brief prescribes that treatment for a non-2xx "after heartbeats
+		// began", not unconditionally, which the lazy commit exists to
+		// distinguish.
+		if !committed {
+			forwardUpstreamResponse(w, flusher, resp)
+			return
+		}
 		failStream(fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
 		return
 	}
@@ -566,8 +593,56 @@ func (rt *router) buildUpstreamRequest(r *http.Request, endpoint string, body []
 		req.Header.Del(h)
 	}
 	req.Header.Del("Content-Length") // req.ContentLength (set below) is authoritative for the buffered body
+	// I2: forwarding the caller's own Accept-Encoding lets a compressing
+	// child return a gzipped body that http.Transport does NOT
+	// transparently decompress (it only does that for a request where IT
+	// added the header itself). A 2xx response then gets spliced straight
+	// through as compressed bytes under the router's own fixed
+	// Content-Type: text/event-stream, with no matching Content-Encoding
+	// of its own to explain them -- silently corrupt SSE output. Deleting
+	// it lets the Transport request and decompress on our behalf, the same
+	// way every other stdlib HTTP call in this codebase already works by
+	// never setting it itself.
+	req.Header.Del("Accept-Encoding")
 	req.ContentLength = int64(len(body))
 	return req, nil
+}
+
+// forwardUpstreamResponse copies resp's status, headers (minus hop-by-hop),
+// and body verbatim to w -- used when nothing has been committed to SSE
+// yet and the upstream response should be forwarded exactly as the plain
+// (non-streaming) path's httputil.ReverseProxy would for the identical
+// response (C1): a non-2xx status from an already-admitted child is the
+// model server's own legitimate answer (e.g. 400 "context length
+// exceeded"), not a router-level failure, and a streaming caller must see
+// the same status/headers/body a non-streaming caller would. Never called
+// once committed is true -- headers are already sent by then, and a
+// non-2xx from that point on is the ACCEPTED TRADE-OFF terminal frame
+// instead (see package doc).
+func forwardUpstreamResponse(w http.ResponseWriter, flusher http.Flusher, resp *http.Response) {
+	dst := w.Header()
+	for k, vv := range resp.Header {
+		if isHopByHopHeader(k) {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	fw := flushWriter{w: w, f: flusher}
+	if _, err := io.Copy(fw, resp.Body); err != nil {
+		slog.Warn("runtime: router failed to forward upstream body", "status", resp.StatusCode, "error", err)
+	}
+}
+
+func isHopByHopHeader(key string) bool {
+	for _, h := range hopByHopHeaders {
+		if key == h {
+			return true
+		}
+	}
+	return false
 }
 
 // flushWriter flushes the underlying ResponseWriter after every Write, so
