@@ -248,7 +248,7 @@ func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endp
 		defer m.wg.Done()
 		select {
 		case <-ctx.Done():
-			m.postCmd(cmdCancelEnsure{reply: reply})
+			m.postCmd(cmdCancelEnsure{reply: reply, err: ctx.Err()})
 		case <-cancelDone:
 		}
 	}()
@@ -393,6 +393,7 @@ func (cmdEnsure) isCommand() {}
 
 type cmdCancelEnsure struct {
 	reply chan ensureOutcome
+	err   error // the caller's ctx.Err(); what the waiter is resolved with
 }
 
 func (cmdCancelEnsure) isCommand() {}
@@ -593,7 +594,7 @@ func (o *owner) handle(cmd command) {
 	case cmdEnsure:
 		o.handleEnsure(c)
 	case cmdCancelEnsure:
-		o.handleCancelEnsure(c.reply)
+		o.handleCancelEnsure(c)
 	case cmdWaiterTimeout:
 		o.handleWaiterTimeout(c)
 	case cmdRelease:
@@ -659,6 +660,11 @@ func (o *owner) applyConfig(cfg Config) {
 			st.removed = true
 			o.beginDrain(id)
 		} else {
+			// C2 fix: resolve any queued waiter before dropping the spec --
+			// otherwise it (and even its own admission_wait_timeout, since
+			// handleWaiterTimeout is itself a no-op once the spec is gone)
+			// would never be resolved at all.
+			o.failPending(st, ErrModelNotManaged)
 			delete(o.specs, id)
 		}
 	}
@@ -734,12 +740,23 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	o.admitAndStart(specID)
 }
 
-func (o *owner) handleCancelEnsure(reply chan ensureOutcome) {
+// handleCancelEnsure resolves and removes the queued waiter matching
+// c.reply -- fixes C1: previously this removed the waiter WITHOUT ever
+// sending to its reply channel, so a caller whose context was cancelled
+// while queued (the routine case of a client disconnecting during a cold
+// start) hung forever. c.reply is buffered(1), so this send is always
+// safe and can never block the owner.
+func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 	for _, st := range o.specs {
 		for i, w := range st.pending {
-			if w.reply == reply {
+			if w.reply == c.reply {
 				cancelTimer(o.m, &w.timer)
 				st.pending = append(st.pending[:i:i], st.pending[i+1:]...)
+				err := c.err
+				if err == nil {
+					err = context.Canceled
+				}
+				c.reply <- ensureOutcome{err: err}
 				return
 			}
 		}
@@ -1125,6 +1142,12 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	cancelTimer(o.m, &proc.drainTimer)
 	cancelTimer(o.m, &proc.stableTimer)
 	st.proc = nil
+	// C3 fix: the generation's requests are dead by definition. Without
+	// this, a request in flight when the child crashed left InFlight stuck
+	// above zero forever, and Admit's isEvictable (which requires
+	// InFlight==0) then treated this spec as permanently busy, as if
+	// pinned -- never evictable again, and never idle-unloadable.
+	st.inFlight = 0
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
@@ -1135,6 +1158,11 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	if wasIntentional {
 		if removed {
+			// C2 fix: resolve any queued waiter before dropping the spec --
+			// otherwise it (and even its own admission_wait_timeout, since
+			// handleWaiterTimeout is itself a no-op once the spec is gone)
+			// would never be resolved at all.
+			o.failPending(st, ErrModelNotManaged)
 			delete(o.specs, st.spec.ID)
 			o.wakeAllPendingWaiters()
 			return

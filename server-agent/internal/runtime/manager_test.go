@@ -681,3 +681,136 @@ func TestManagerTransitionsCoalesce(t *testing.T) {
 	default:
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (task-14-fix-round-1.md), Criticals only: C1, C2, C3 below are
+// each written to FAIL against the pre-fix code -- confirmed by running them
+// before applying the corresponding manager.go change; see
+// task-14-report.md's fix-round-1 appendix for the captured "red" output.
+// ---------------------------------------------------------------------------
+
+// TestManagerEnsureRunningReturnsOnContextCancelWhileQueued is C1: a queued
+// EnsureRunning call whose context is cancelled must return promptly, not
+// hang forever. Before the fix, handleCancelEnsure removed the waiter from
+// st.pending WITHOUT ever sending to its reply channel, so the caller never
+// unblocked (only Manager.Close, at test cleanup, would have ended it).
+func TestManagerEnsureRunningReturnsOnContextCancelWhileQueued(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Pinned = true
+	specB := baseSpec("spec-b", "model-b")
+	specB.AdmissionWaitTimeoutSeconds = 0 // wait until ctx is done -- only cancellation can end this wait
+	m.Apply(Config{Specs: []Spec{specA, specB}})
+
+	waitUntil(t, 3*time.Second, "pinned spec-a running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := m.EnsureRunning(ctx, "model-b")
+		errCh <- err
+	}()
+
+	// Let model-b actually reach st.pending (past the first select in
+	// EnsureRunning) before cancelling -- otherwise cancelling might only
+	// exercise the already-correct "cancelled before the send" path instead
+	// of the queued-waiter path this test targets.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("EnsureRunning returned a nil error after its context was cancelled while queued")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureRunning did not return within 2s of its context being cancelled while queued -- BUG C1: handleCancelEnsure removes the waiter without ever resolving its reply channel")
+	}
+}
+
+// TestManagerEnsureRunningResolvesWhenSpecRemovedByApply is C2: a waiter
+// queued on a spec that Apply then removes must be resolved, not dropped.
+// Before the fix, applyConfig's delete(o.specs, id) (and onProcExited's,
+// for a removed spec that was still draining) discarded st.pending
+// entirely, and handleWaiterTimeout returned silently once st was nil --
+// so even a configured AdmissionWaitTimeoutSeconds could not rescue the
+// caller.
+func TestManagerEnsureRunningResolvesWhenSpecRemovedByApply(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Pinned = true
+	specB := baseSpec("spec-b", "model-b")
+	specB.AdmissionWaitTimeoutSeconds = 1
+	m.Apply(Config{Specs: []Spec{specA, specB}})
+
+	waitUntil(t, 3*time.Second, "pinned spec-a running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		_, _, err := m.EnsureRunning(ctx, "model-b")
+		errCh <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let model-b actually queue before removing its spec
+	m.Apply(Config{Specs: []Spec{specA}})
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrModelNotManaged) {
+			t.Errorf("EnsureRunning(model-b) after its spec was removed = %v, want ErrModelNotManaged", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureRunning(model-b) did not resolve within 3s of its spec being removed by Apply -- BUG C2: a waiter on a removed spec is dropped without being resolved, and even its own admission_wait_timeout cannot rescue it because handleWaiterTimeout returns silently once the spec is gone")
+	}
+}
+
+// TestManagerInFlightResetAfterCrash is C3: InFlight must return to zero
+// once the process that was serving a request is gone, even if release()
+// is never called (exactly what happens in production when the connection
+// dies along with the crash). Before the fix, onProcExited never touched
+// st.inFlight, so a spec that crashed once under load became permanently
+// un-evictable: Admit's isEvictable requires InFlight==0, so the stuck
+// counter made this spec block every incompatible model as though it were
+// pinned, and it could never idle-unload either.
+func TestManagerInFlightResetAfterCrash(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 100*time.Millisecond, 3, "")
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	// Deliberately never call release(): the request was in flight when the
+	// child crashed.
+
+	waitUntil(t, 3*time.Second, "spec-a reaches backoff after the scripted crash", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateBackoff
+	})
+
+	st := statusFor(m, "spec-a")
+	if st.InFlight != 0 {
+		t.Fatalf("InFlight = %d after a crash with no release() call, want 0 -- BUG C3: onProcExited never resets InFlight, so this spec becomes permanently un-evictable/never idle-unloadable, as if pinned", st.InFlight)
+	}
+}
