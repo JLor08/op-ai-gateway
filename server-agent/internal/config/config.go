@@ -177,7 +177,10 @@ type Config struct {
 	// locally). An empty value resolves to RuntimeSourceGateway.
 	RuntimeSource string
 	// RuntimeConfigPath is the local runtime-config JSON file path. Required
-	// when RuntimeSource is RuntimeSourceFile; ignored otherwise.
+	// when RuntimeSource is RuntimeSourceFile; ignored otherwise. A relative
+	// value is anchored beside the selected config file (the CAFile/
+	// CACacheFile precedent), since it names a file whose path is typically
+	// written relative to that same config file.
 	RuntimeConfigPath string
 	// RuntimeAllowedBinaries lists the absolute binary paths the agent's
 	// OWN local policy permits launching, regardless of what the gateway
@@ -193,7 +196,10 @@ type Config struct {
 	// RuntimeAllowedBinaries. Nil (unset) means any work_dir is permitted.
 	RuntimeAllowedDirs []string
 	// RuntimeCachePath is where the runtime process-state cache is
-	// persisted. Defaults to defaultRuntimeCacheName next to the binary.
+	// persisted. Defaults to defaultRuntimeCacheName next to the binary. A
+	// relative value from the config file is anchored beside that config
+	// file (the CAFile/CACacheFile precedent) rather than the agent's
+	// process working directory, which for a service is typically "/".
 	RuntimeCachePath string
 }
 
@@ -359,6 +365,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	}
 	cfg.CAFile = resolvePathAgainstConfig(cfg.CAFile, path)
 	cfg.CACacheFile = resolvePathAgainstConfig(cfg.CACacheFile, path)
+	cfg.RuntimeConfigPath = resolvePathAgainstConfig(cfg.RuntimeConfigPath, path)
+	cfg.RuntimeCachePath = resolvePathAgainstConfig(cfg.RuntimeCachePath, path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}

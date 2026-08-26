@@ -548,6 +548,44 @@ func TestLoadResolvesRelativeCAPathsAgainstSelectedConfig(t *testing.T) {
 	}
 }
 
+// TestLoadResolvesRelativeRuntimePathsAgainstSelectedConfig mirrors
+// TestLoadResolvesRelativeCAPathsAgainstSelectedConfig: RuntimeConfigPath and
+// RuntimeCachePath are files the agent reads/writes whose names typically
+// come from the config file (RuntimeConfigPath is the closest analogue to
+// CAFile/CACacheFile in this whole struct), so a relative value must be
+// anchored beside the selected config file rather than left relative to the
+// agent's process working directory (which, for a service, is typically
+// "/" -- a relative runtime_cache would write into "/", and a relative
+// runtime_config would simply never be found).
+func TestLoadResolvesRelativeRuntimePathsAgainstSelectedConfig(t *testing.T) {
+	dir := t.TempDir()
+	absRuntimeConfig := filepath.Join(t.TempDir(), "absolute-runtime.json")
+	path := filepath.Join(dir, "selected-agent.json")
+	body := `{"gateway_url":"https://gw.example","token":"x","runtime_source":"file","runtime_config":"runtime.json","runtime_cache":"cache/runtime.cache.json"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := filepath.Join(dir, "runtime.json"); cfg.RuntimeConfigPath != want {
+		t.Errorf("RuntimeConfigPath = %q, want %q", cfg.RuntimeConfigPath, want)
+	}
+	if want := filepath.Join(dir, "cache", "runtime.cache.json"); cfg.RuntimeCachePath != want {
+		t.Errorf("RuntimeCachePath = %q, want %q", cfg.RuntimeCachePath, want)
+	}
+
+	cfg, err = Load([]string{"-config", path, "-runtime-config", absRuntimeConfig}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load absolute runtime-config path: %v", err)
+	}
+	if cfg.RuntimeConfigPath != absRuntimeConfig {
+		t.Errorf("absolute RuntimeConfigPath = %q, want unchanged %q", cfg.RuntimeConfigPath, absRuntimeConfig)
+	}
+}
+
 func TestLoadCAFieldsRespectFlagEnvFilePrecedence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "precedence.json")
