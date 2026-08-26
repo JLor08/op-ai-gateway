@@ -47,8 +47,19 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	if len(p.AllowedBinaries) == 0 {
 		return fmt.Errorf("runtime: binary allowlist is empty, refusing to start %q (configure the agent's runtime_allowed_binaries / OP_AGENT_RUNTIME_ALLOWED_BINARIES)", spec.Binary)
 	}
+	// Absolute paths only -- this also closes the concrete bypass where a
+	// config file's runtime_allowed_binaries contains an empty string (e.g.
+	// [""]): resolveStringList only drops empty entries on the env path, so
+	// a file-sourced [""] survives as a non-empty allowlist that would
+	// otherwise match a spec with Binary: "" verbatim.
+	if !filepath.IsAbs(spec.Binary) {
+		return fmt.Errorf("runtime: binary %q must be an absolute path", spec.Binary)
+	}
 	binaryAllowed := false
 	for _, b := range p.AllowedBinaries {
+		if !filepath.IsAbs(b) {
+			continue // a non-absolute allowlist entry can never permit anything
+		}
 		if spec.Binary == b {
 			binaryAllowed = true
 			break

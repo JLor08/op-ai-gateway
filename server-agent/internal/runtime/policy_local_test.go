@@ -53,6 +53,46 @@ func TestPermitUnlistedBinaryRejects(t *testing.T) {
 	}
 }
 
+// TestPermitEmptyBinaryRejected proves an empty spec.Binary is refused even
+// against a non-empty allowlist -- Permit never reached the point of
+// checking absoluteness, so an empty string (zero value, or a spec that
+// simply omitted Binary) must not slip through.
+func TestPermitEmptyBinaryRejected(t *testing.T) {
+	p := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}}
+	spec := Spec{ID: "s1", Binary: ""}
+
+	if err := p.Permit(spec); err == nil {
+		t.Fatal("Permit with an empty Binary should refuse, not match the allowlist")
+	}
+}
+
+// TestPermitAllowlistWithEmptyStringDoesNotPermitEmptyBinary pins the
+// concrete bypass: resolveStringList's env-only empty-entry drop means a
+// config FILE value of runtime_allowed_binaries: [""] survives verbatim as
+// []string{""}, which has len != 0 and thus passes the empty-allowlist gate.
+// Without an absoluteness check, that entry would then exactly match a spec
+// with Binary: "".
+func TestPermitAllowlistWithEmptyStringDoesNotPermitEmptyBinary(t *testing.T) {
+	p := LocalPolicy{AllowedBinaries: []string{""}}
+	spec := Spec{ID: "s1", Binary: ""}
+
+	if err := p.Permit(spec); err == nil {
+		t.Fatal("Permit must not treat an empty allowlist entry as matching an empty Binary")
+	}
+}
+
+// TestPermitRelativeBinaryRejected proves a relative Binary is refused even
+// when it happens to match an allowlist entry's text -- absolute paths only,
+// per the AllowedBinaries doc comment.
+func TestPermitRelativeBinaryRejected(t *testing.T) {
+	p := LocalPolicy{AllowedBinaries: []string{"ollama"}}
+	spec := Spec{ID: "s1", Binary: "ollama"}
+
+	if err := p.Permit(spec); err == nil {
+		t.Fatal("Permit with a relative Binary should refuse even if it matches a (relative) allowlist entry")
+	}
+}
+
 // TestPermitWorkDirContainment pins the exact containment rule: filepath.Clean
 // both sides, then require the candidate to equal the allowed dir or sit
 // strictly beneath it (a path-segment boundary), never a bare string-prefix
