@@ -122,6 +122,14 @@ var placeholderPattern = regexp.MustCompile(`\$\{(PORT|AGENT_ENV:[^}]+)\}`)
 // ${AGENT_ENV:...} secret configured for OTHER models. spec.Env entries are
 // emitted in sorted-key order so the result is deterministic across calls
 // (spec.Env is a Go map with randomized iteration order).
+//
+// A spec.Env key of PATH or HOME is refused outright rather than allowed to
+// override the agent-provided base: these two are agent-owned, not
+// spec-negotiable. A gateway-supplied PATH would let a spec choose where the
+// child resolves shared libraries and helper subprocesses -- the same class
+// of risk Permit's absolute-binary-path requirement exists to close -- so
+// this treats "minimal base" as agent-controlled rather than
+// spec-overridable.
 func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args []string, env []string, err error) {
 	expand := func(s string) (string, error) {
 		var firstErr error
@@ -165,6 +173,18 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 		envKeys = append(envKeys, k)
 	}
 	sort.Strings(envKeys)
+
+	// PATH and HOME are agent-owned, not spec-negotiable: refuse outright
+	// rather than let a spec silently override them (see the PATH/HOME
+	// decision in the Task 13 fix-round-1 report). This is checked
+	// unconditionally, even when the agent's own environment has neither,
+	// because the rule is about which party controls these keys, not about
+	// detecting an actual collision.
+	for _, k := range envKeys {
+		if k == "PATH" || k == "HOME" {
+			return nil, nil, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
+		}
+	}
 
 	// Minimal base: PATH/HOME from the agent's OWN environment, only if
 	// present. Never the agent's full environment -- see doc comment above.

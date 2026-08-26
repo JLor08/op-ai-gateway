@@ -323,6 +323,53 @@ func TestExpandPlaceholdersChildEnvExactSet(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersSpecEnvCannotOverridePathOrHome pins the decision
+// recorded in the Task 13 fix-round-1 report: a spec.Env key of PATH or HOME
+// is refused outright rather than silently overriding the agent-provided
+// base (which previously produced two PATH= entries in the child env, with
+// os/exec resolving last-occurrence-wins -- letting a gateway-supplied PATH
+// win in the child).
+func TestExpandPlaceholdersSpecEnvCannotOverridePathOrHome(t *testing.T) {
+	getenv := func(k string) string {
+		switch k {
+		case "PATH":
+			return "/usr/local/bin:/usr/bin:/bin"
+		case "HOME":
+			return "/home/agent"
+		default:
+			return ""
+		}
+	}
+
+	for _, key := range []string{"PATH", "HOME"} {
+		t.Run(key, func(t *testing.T) {
+			spec := Spec{Env: map[string]string{key: "/attacker-controlled"}}
+			_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+			if err == nil {
+				t.Fatalf("ExpandPlaceholders with spec.Env[%q] set should refuse, not override the agent-provided base", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error = %q, want it to name %q", err.Error(), key)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersSpecEnvCannotOverridePathOrHomeEvenWhenBaseAbsent
+// proves the refusal is unconditional -- it applies even when the agent's
+// own environment has no PATH/HOME to collide with, because the rule is
+// about which party may ever set these keys, not about detecting an actual
+// duplicate.
+func TestExpandPlaceholdersSpecEnvCannotOverridePathOrHomeEvenWhenBaseAbsent(t *testing.T) {
+	spec := Spec{Env: map[string]string{"PATH": "/attacker-controlled"}}
+	getenv := func(string) string { return "" }
+
+	_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err == nil {
+		t.Fatal("ExpandPlaceholders with spec.Env[PATH] set should refuse even when the agent has no PATH of its own")
+	}
+}
+
 // TestExpandPlaceholdersOmitsAbsentBase proves PATH/HOME are included only
 // when the agent's own environment actually defines them -- ExpandPlaceholders
 // never invents a value.
