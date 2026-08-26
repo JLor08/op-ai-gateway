@@ -34,6 +34,36 @@ type wireSample struct {
 	// ProxyRoutes mirrors the gateway's agentTelemetryRequest ProxyRoutes tag
 	// (Certificates P4 Task 9 ingest, Task 4 agent side).
 	ProxyRoutes []wireProxyRoute `json:"proxy_routes,omitempty"`
+	// Runtimes mirrors the gateway's agentRuntimeSample tag
+	// (gateway/backend/internal/gateway/agent_ingest.go) exactly, field for
+	// field (agent-runtime-manager Task 9/18).
+	Runtimes []wireRuntimeSample `json:"runtimes,omitempty"`
+}
+
+type wireRuntimeGPU struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
+type wireRuntimeError struct {
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+	ExitCode   int       `json:"exit_code"`
+	Failures   int       `json:"failures"`
+	StderrTail string    `json:"stderr_tail,omitempty"`
+}
+
+type wireRuntimeSample struct {
+	SpecID    string            `json:"spec_id"`
+	Model     string            `json:"model"`
+	State     string            `json:"state"`
+	Since     time.Time         `json:"since"`
+	PID       int               `json:"pid,omitempty"`
+	Port      int               `json:"port,omitempty"`
+	InFlight  int               `json:"in_flight"`
+	Restarts  int               `json:"restarts"`
+	GPUs      []wireRuntimeGPU  `json:"gpus,omitempty"`
+	LastError *wireRuntimeError `json:"last_error,omitempty"`
 }
 
 type wireProxyRoute struct {
@@ -260,6 +290,85 @@ func TestSampleCarriesProxyRoutes(t *testing.T) {
 	}
 	if bytes.Contains(rawZero, []byte(`proxy_routes`)) {
 		t.Errorf("raw JSON should omit proxy_routes when unset; got %s", rawZero)
+	}
+}
+
+// TestSampleCarriesRuntimes is the sample half of Task 18's agent-managed
+// runtime status wire contract: a populated Runtimes entry (including a
+// measured GPU and a last_error) marshals into the gateway's exact tags,
+// and a Sample with no Runtimes at all (every pre-Task-18 agent, and a
+// Task-18 agent that never negotiated runtime_manager) OMITS the key
+// entirely -- never a null or an empty array.
+func TestSampleCarriesRuntimes(t *testing.T) {
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	failedAt := time.Date(2026, 8, 20, 9, 59, 0, 0, time.UTC)
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{
+				SpecID:   "rspec_a",
+				Model:    "qwen-coder",
+				State:    "running",
+				Since:    since,
+				PID:      4242,
+				Port:     9001,
+				InFlight: 2,
+				Restarts: 1,
+				GPUs:     []RuntimeGPUSample{{Index: 0, VRAMMeasuredMB: 21234}},
+				LastError: &RuntimeErrorSample{
+					Message:    "runtime: process exited unexpectedly (exit code 1)",
+					At:         failedAt,
+					ExitCode:   1,
+					Failures:   3,
+					StderrTail: "CUDA error: out of memory",
+				},
+			},
+		},
+	}
+	s.Normalize()
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got wireSample
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into wire struct: %v", err)
+	}
+	if len(got.Runtimes) != 1 {
+		t.Fatalf("runtimes len = %d, want 1", len(got.Runtimes))
+	}
+	rt := got.Runtimes[0]
+	if rt.SpecID != "rspec_a" || rt.Model != "qwen-coder" || rt.State != "running" {
+		t.Errorf("runtimes[0] identity fields = %+v", rt)
+	}
+	if !rt.Since.Equal(since) {
+		t.Errorf("runtimes[0].since = %v, want %v", rt.Since, since)
+	}
+	if rt.PID != 4242 || rt.Port != 9001 || rt.InFlight != 2 || rt.Restarts != 1 {
+		t.Errorf("runtimes[0] counters = %+v", rt)
+	}
+	if len(rt.GPUs) != 1 || rt.GPUs[0].Index != 0 || rt.GPUs[0].VRAMMeasuredMB != 21234 {
+		t.Errorf("runtimes[0].gpus = %+v", rt.GPUs)
+	}
+	if rt.LastError == nil {
+		t.Fatal("runtimes[0].last_error round-tripped as nil")
+	}
+	if rt.LastError.ExitCode != 1 || rt.LastError.Failures != 3 || rt.LastError.StderrTail != "CUDA error: out of memory" {
+		t.Errorf("runtimes[0].last_error = %+v", rt.LastError)
+	}
+
+	// A Sample with no Runtimes at all -- the byte-neutrality case a nil
+	// RuntimeDriver must produce -- must OMIT the "runtimes" key entirely,
+	// not marshal a null or an empty array.
+	var zero Sample
+	zero.Normalize()
+	rawZero, err := json.Marshal(&zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	if bytes.Contains(rawZero, []byte(`runtimes`)) {
+		t.Errorf("raw JSON should omit runtimes entirely when unset; got %s", rawZero)
 	}
 }
 

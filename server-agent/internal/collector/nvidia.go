@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // nvidiaQueryFields is the ordered --query-gpu field list the collector requests
@@ -99,4 +100,174 @@ func parseNvidiaCSV(data []byte) ([]sample.GPU, error) {
 		gpus = append(gpus, gpu)
 	}
 	return gpus, nil
+}
+
+// nvidiaComputeAppsFields is the ordered --query-compute-apps field list
+// (design doc §5): the per-process, per-GPU memory usage nvidia-smi can
+// report because it knows every CUDA context's owning PID -- an exact
+// measurement, not an estimate, for any PID the agent recognizes as one of
+// its own managed children.
+const nvidiaComputeAppsFields = "pid,gpu_uuid,used_memory"
+
+// nvidiaGPUIndexFields is the minimal --query-gpu field list needed to map
+// a GPU's UUID (compute-apps rows only carry the UUID) back to the index
+// number spec.GPUs/GPUBudget use. Deliberately independent of
+// nvidiaQueryFields above: the measurer runs on the runtime Manager's own
+// serialized owner goroutine (buildSnapshot), not on this collector's
+// regular telemetry cadence, so it cannot reuse a cached Collect() result
+// from a different invocation -- it fetches its own tiny, cheap mapping
+// every time it is called.
+const nvidiaGPUIndexFields = "index,uuid"
+
+// nvidiaMeasureTimeout bounds EACH nvidia-smi invocation the measurer
+// makes. Two calls (index/uuid mapping, then compute-apps) run per
+// measurement, so a worst case blocks for up to 2x this -- still small
+// next to collectTimeout (2s, the same order of magnitude), and load-
+// bearing: buildSnapshot runs on the Manager's single serialized owner
+// goroutine (manager.go), so a wedged nvidia-smi here would stall every
+// other admission decision, not just this one measurement. A package-level
+// var (not a const), matching this module's other external-command timing
+// knobs, so a test can shrink it if it ever needs to exercise the timeout
+// path without actually waiting it out.
+var nvidiaMeasureTimeout = 2 * time.Second
+
+// NewNvidiaComputeApps returns a per-process, per-GPU VRAM usage measurer
+// backed by `nvidia-smi --query-compute-apps`, for wiring into
+// runtime.Manager.SetMeasurer. It returns nil when nvidia-smi is not on
+// PATH: measurement is a HARDWARE capability, not a negotiated protocol
+// feature (design doc §5) -- a host without nvidia-smi (no NVIDIA GPUs, AMD,
+// or Apple unified memory, which has no per-process split to report at
+// all) simply has no measurer installed, and the manager falls back to each
+// spec's operator-entered VRAM estimate exactly as it already does today.
+func NewNvidiaComputeApps() func(pids []int) map[int]map[int]int {
+	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+		return nil
+	}
+	return measureNvidiaComputeApps
+}
+
+// measureNvidiaComputeApps is the func(pids []int) map[int]map[int]int
+// shape runtime.Manager.SetMeasurer expects. pids is the manager's own live
+// managed-process PID set; the returned map is restricted to exactly those
+// PIDs (never a bystander process' usage, even though nvidia-smi itself has
+// no notion of "whose child is this" -- the manager is the one that knows).
+// nil pids, or either nvidia-smi invocation failing, returns nil: the
+// caller (buildSnapshot) already treats a nil measurement map as "nothing
+// measured this cycle", falling back to static estimates for every spec,
+// exactly like having no measurer installed at all -- a transient
+// nvidia-smi hiccup must never look like a hard VRAM-budget violation.
+func measureNvidiaComputeApps(pids []int) map[int]map[int]int {
+	if len(pids) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
+	defer cancel()
+	idxOut, err := exec.CommandContext(ctx, "nvidia-smi",
+		"--query-gpu="+nvidiaGPUIndexFields,
+		"--format=csv,noheader,nounits",
+	).Output()
+	if err != nil {
+		return nil
+	}
+	uuidToIndex := parseNvidiaGPUIndexCSV(idxOut)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
+	defer cancel2()
+	appsOut, err := exec.CommandContext(ctx2, "nvidia-smi",
+		"--query-compute-apps="+nvidiaComputeAppsFields,
+		"--format=csv,noheader,nounits",
+	).Output()
+	if err != nil {
+		return nil
+	}
+	rows := parseNvidiaComputeAppsCSV(appsOut)
+
+	wanted := make(map[int]bool, len(pids))
+	for _, p := range pids {
+		wanted[p] = true
+	}
+
+	var out map[int]map[int]int
+	for _, row := range rows {
+		if !wanted[row.PID] {
+			continue // not one of the manager's own managed children
+		}
+		idx, ok := uuidToIndex[row.GPUUUID]
+		if !ok {
+			continue // a GPU nvidia-smi did not also report in --query-gpu; skip rather than guess
+		}
+		if out == nil {
+			out = make(map[int]map[int]int)
+		}
+		if out[row.PID] == nil {
+			out[row.PID] = make(map[int]int)
+		}
+		out[row.PID][idx] = row.UsedMemoryMB
+	}
+	return out
+}
+
+// parseNvidiaGPUIndexCSV parses `nvidia-smi --query-gpu=index,uuid
+// --format=csv,noheader,nounits` output into a uuid->index map. A row with
+// fewer than 2 fields is skipped, matching parseNvidiaCSV's own tolerance
+// for a malformed line.
+func parseNvidiaGPUIndexCSV(data []byte) map[string]int {
+	out := make(map[string]int)
+	for _, row := range splitNvidiaCSVRows(data) {
+		if len(row) < 2 {
+			continue
+		}
+		out[row[1]] = naInt(row[0])
+	}
+	return out
+}
+
+// nvidiaComputeAppRow is one row of `nvidia-smi --query-compute-apps`
+// output: which process, on which GPU (by UUID -- compute-apps does not
+// report a GPU index directly), using how much memory.
+type nvidiaComputeAppRow struct {
+	PID          int
+	GPUUUID      string
+	UsedMemoryMB int
+}
+
+// parseNvidiaComputeAppsCSV parses `nvidia-smi
+// --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,
+// nounits` output. A row with fewer than 3 fields is skipped. A pure
+// function (no I/O), unit-tested with canned CSV per the design doc's own
+// requirement that the parser be independently verifiable of a real GPU.
+func parseNvidiaComputeAppsCSV(data []byte) []nvidiaComputeAppRow {
+	var out []nvidiaComputeAppRow
+	for _, row := range splitNvidiaCSVRows(data) {
+		if len(row) < 3 {
+			continue
+		}
+		out = append(out, nvidiaComputeAppRow{
+			PID:          naInt(row[0]),
+			GPUUUID:      row[1],
+			UsedMemoryMB: naInt(row[2]),
+		})
+	}
+	return out
+}
+
+// splitNvidiaCSVRows splits raw nvidia-smi CSV output into trimmed fields
+// per non-empty line, shared by parseNvidiaGPUIndexCSV and
+// parseNvidiaComputeAppsCSV (the same line-splitting/trimming parseNvidiaCSV
+// above already does inline for the --query-gpu telemetry shape).
+func splitNvidiaCSVRows(data []byte) [][]string {
+	var rows [][]string
+	for _, raw := range bytes.Split(data, []byte("\n")) {
+		line := strings.TrimSpace(string(raw))
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		rows = append(rows, parts)
+	}
+	return rows
 }

@@ -5,6 +5,7 @@ package collector
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -101,5 +102,114 @@ func TestParseNvidiaCSVBackCompatNineFields(t *testing.T) {
 	gpus, err := parseNvidiaCSV(data)
 	if err != nil || len(gpus) != 1 || gpus[0].DriverVersion != "" {
 		t.Fatalf("parse = %v err=%v", gpus, err)
+	}
+}
+
+// canned nvidia-smi output fixtures for the compute-apps measurer (design
+// doc §5): two GPUs, three compute-app rows (two processes on GPU 0, one on
+// GPU 1), including sentinel/whitespace noise parseNvidiaCSV already
+// tolerates for the telemetry query.
+const (
+	canned2GPUIndexCSV   = "0, GPU-aaaa-0\n1, GPU-bbbb-1\n"
+	cannedComputeAppsCSV = "12345, GPU-aaaa-0, 21234\n" +
+		"12345, GPU-bbbb-1, 8000\n" +
+		"99999, GPU-aaaa-0, 5000\n"
+)
+
+func TestParseNvidiaGPUIndexCSV(t *testing.T) {
+	got := parseNvidiaGPUIndexCSV([]byte(canned2GPUIndexCSV))
+	want := map[string]int{"GPU-aaaa-0": 0, "GPU-bbbb-1": 1}
+	if len(got) != len(want) {
+		t.Fatalf("got = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%q] = %d, want %d", k, got[k], v)
+		}
+	}
+}
+
+func TestParseNvidiaGPUIndexCSVSkipsShortRows(t *testing.T) {
+	got := parseNvidiaGPUIndexCSV([]byte("just-one-field\n\n0, GPU-aaaa-0\n"))
+	if len(got) != 1 || got["GPU-aaaa-0"] != 0 {
+		t.Fatalf("got = %v, want {GPU-aaaa-0:0}", got)
+	}
+}
+
+func TestParseNvidiaComputeAppsCSV(t *testing.T) {
+	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
+	if len(rows) != 3 {
+		t.Fatalf("len(rows) = %d, want 3", len(rows))
+	}
+	if rows[0] != (nvidiaComputeAppRow{PID: 12345, GPUUUID: "GPU-aaaa-0", UsedMemoryMB: 21234}) {
+		t.Errorf("rows[0] = %+v", rows[0])
+	}
+	if rows[1] != (nvidiaComputeAppRow{PID: 12345, GPUUUID: "GPU-bbbb-1", UsedMemoryMB: 8000}) {
+		t.Errorf("rows[1] = %+v", rows[1])
+	}
+	if rows[2] != (nvidiaComputeAppRow{PID: 99999, GPUUUID: "GPU-aaaa-0", UsedMemoryMB: 5000}) {
+		t.Errorf("rows[2] = %+v", rows[2])
+	}
+}
+
+func TestParseNvidiaComputeAppsCSVEmptyAndShortRows(t *testing.T) {
+	rows := parseNvidiaComputeAppsCSV(nil)
+	if len(rows) != 0 {
+		t.Fatalf("nil input: want 0 rows, got %d", len(rows))
+	}
+	rows = parseNvidiaComputeAppsCSV([]byte("12345, GPU-aaaa-0\n"))
+	if len(rows) != 0 {
+		t.Fatalf("short row: want 0 rows, got %d", len(rows))
+	}
+}
+
+// TestMeasureNvidiaComputeAppsAttributesByPIDAndMapsUUIDToIndex proves the
+// end-to-end shape SetMeasurer needs: only the requested PIDs are reported,
+// and each row's GPU UUID resolves to the matching index -- exercised via
+// the pure parse functions rather than a real nvidia-smi (which the test
+// host does not have), matching how the manager's buildSnapshot actually
+// consumes this measurer's return value.
+func TestMeasureNvidiaComputeAppsAttributesByPIDAndMapsUUIDToIndex(t *testing.T) {
+	uuidToIndex := parseNvidiaGPUIndexCSV([]byte(canned2GPUIndexCSV))
+	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
+
+	wanted := map[int]bool{12345: true} // the manager only cares about ITS OWN child, not pid 99999
+	out := make(map[int]map[int]int)
+	for _, row := range rows {
+		if !wanted[row.PID] {
+			continue
+		}
+		idx, ok := uuidToIndex[row.GPUUUID]
+		if !ok {
+			continue
+		}
+		if out[row.PID] == nil {
+			out[row.PID] = map[int]int{}
+		}
+		out[row.PID][idx] = row.UsedMemoryMB
+	}
+
+	if len(out) != 1 {
+		t.Fatalf("out = %v, want exactly pid 12345", out)
+	}
+	if out[12345][0] != 21234 || out[12345][1] != 8000 {
+		t.Errorf("out[12345] = %v, want {0:21234 1:8000}", out[12345])
+	}
+	if _, ok := out[99999]; ok {
+		t.Errorf("out contains pid 99999, which was not in the requested pid set")
+	}
+}
+
+func TestNewNvidiaComputeAppsNilWithoutBinary(t *testing.T) {
+	// This test host is not guaranteed to have nvidia-smi installed (in
+	// fact almost certainly does not, in CI); NewNvidiaComputeApps must
+	// degrade to nil rather than returning a measurer that will fail every
+	// call -- the design doc's own "measurement is a hardware capability,
+	// not a negotiated feature" contract (§5).
+	if _, err := exec.LookPath("nvidia-smi"); err == nil {
+		t.Skip("nvidia-smi is present on this host; nothing to prove here")
+	}
+	if f := NewNvidiaComputeApps(); f != nil {
+		t.Fatal("NewNvidiaComputeApps() = non-nil without nvidia-smi on PATH, want nil")
 	}
 }

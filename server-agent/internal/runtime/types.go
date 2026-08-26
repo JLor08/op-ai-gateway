@@ -177,25 +177,54 @@ const (
 // cleared only by the NEXT SUCCESSFUL start, never merely by a state change
 // (design doc §7): a spec can be StateStopped and still show "last load
 // attempt failed, yesterday 14:32, exit code 1".
+//
+// JSON tags mirror sample.RuntimeErrorSample field-for-field (Task 18 is the
+// first caller to put this on the wire, via Driver.Status ->
+// internal/agent.collectOnce -> sample.RuntimeSample.LastError).
 type LastError struct {
-	Message    string
-	At         time.Time
-	ExitCode   int
-	Failures   int
-	StderrTail string // bounded, ~2 KiB
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+	ExitCode   int       `json:"exit_code"`
+	Failures   int       `json:"failures"`
+	StderrTail string    `json:"stderr_tail,omitempty"` // bounded, ~2 KiB
 }
 
 // Status is one spec's current runtime status, as tracked by the process
-// manager (a later task) and reported upward.
+// manager and reported upward. JSON tags mirror sample.RuntimeSample
+// field-for-field, EXCEPT MeasuredVRAM: the sample maps it to
+// RuntimeSample.GPUs ([]RuntimeGPUSample), so "measured_vram" here is not
+// itself part of that wire contract -- the tag exists so Status marshals
+// sensibly wherever it IS put on the wire directly (a status
+// stderr/debugging dump, a future endpoint), consistent with the rest of
+// this type.
 type Status struct {
-	SpecID       string
-	Model        string // upstream model name
-	State        State
-	Since        time.Time
-	PID          int
-	Port         int
-	InFlight     int
-	Restarts     int
-	MeasuredVRAM map[int]int // gpu index -> MB, when measured
-	LastError    *LastError
+	SpecID       string      `json:"spec_id"`
+	Model        string      `json:"model"` // upstream model name
+	State        State       `json:"state"`
+	Since        time.Time   `json:"since"`
+	PID          int         `json:"pid,omitempty"`
+	Port         int         `json:"port,omitempty"`
+	InFlight     int         `json:"in_flight"`
+	Restarts     int         `json:"restarts"`
+	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
+	LastError    *LastError  `json:"last_error,omitempty"`
+}
+
+// statusAlias is Status under a different name, used only to marshal
+// through Status's own MarshalJSON below without recursing into it.
+type statusAlias Status
+
+// MarshalJSON normalizes a nil MeasuredVRAM to an empty JSON object ("{}")
+// instead of Go's default "null" for a nil map. A nil-versus-null defect on
+// a field the gateway parses has already been caught six times elsewhere on
+// this branch (task-18-brief.md); Status.MeasuredVRAM is nil on every spec
+// that has never been measured (no measurer installed, or not yet running),
+// which is the common case, so this is not a corner this type can leave
+// unguarded.
+func (s Status) MarshalJSON() ([]byte, error) {
+	a := statusAlias(s)
+	if a.MeasuredVRAM == nil {
+		a.MeasuredVRAM = map[int]int{}
+	}
+	return json.Marshal(a)
 }

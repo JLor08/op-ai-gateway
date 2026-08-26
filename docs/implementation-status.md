@@ -254,8 +254,69 @@ Agent phase in progress:
   allowlist entry was already `{}`. Report:
   `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-13-report.md`.
 
+- Task 14 — `server-agent/internal/runtime/manager.go`: the serialized-owner
+  process supervisor (`NewManager`, `Apply`, `EnsureRunning`, `Status`,
+  `LoadedModels`, `Transitions`, `SetMeasurer`, `Close`), consuming Tasks
+  12-13's `Spec`/`Admit`/`LocalPolicy` verbatim. Core commit `9debc91`, three
+  review-fix rounds `3cd107d`/`dd80c8e`/`28d4b00`. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-14-report.md`.
+- Task 15 — `server-agent/internal/runtime/router.go`: `NewRouter(m
+  *Manager) http.Handler`, the router port (health/`/running`/`/v1/models`
+  plus the model-routed proxy with lazily-committed streaming heartbeats).
+  Core commit `1b86c7e`, review fixes `dc4ed52`/`c23b82a`/`22f0e3a`. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-15-report.md`.
+- Task 16 — `server-agent/internal/runtime/config_client.go`: `Source`
+  interface, `GatewaySource` (ETag-conditional GET + disk cache +
+  `ApplyPushed`), `FileSource` (mtime poll + `LastParseError`). Commit
+  `a4f5f31`. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-16-report.md`.
+- Task 17 — `server-agent/internal/runtime/features_client.go`/`report.go`,
+  `internal/client/ws.go`'s `RuntimeUpdates()`/`PostRuntimeReport`: the
+  gateway feature list client, the file-mode upward report builder
+  (env-redacted), and the WS/POST sender plumbing. Commit `8cf4a4d`, atomic
+  drain-then-send fix `68d46d6`. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-17-report.md`.
+
+Agent phase COMPLETE (Tasks 11-18):
+- Task 18 — `server-agent/internal/runtime/driver.go` (new): `Driver`, the
+  top-level object wiring everything from Tasks 11-17 into the agent's main
+  loop. `Sync` re-checks feature negotiation on every call (own local
+  `runtimeManagerFeature` constant — `internal/runtime` cannot import
+  `internal/agent`'s registry without an import cycle), loads the desired
+  config (`GatewaySource.ApplyPushed` for a WS-pushed payload,
+  `FileSource`/anything else via `Load`, `*FileSource` always ignoring a
+  pushed payload per spec §10.2), and on change applies it to the manager,
+  (re)binds the router listener (`StartRouter`, all-interfaces bind, torn
+  down via `net/http.Server.Close`, idempotent on an unchanged port), and
+  (file mode only) posts the redacted report. `internal/agent/agent.go`
+  gained the symmetric `runtimeDriver`/`runtimeWaker`/
+  `runtimeTransitionsWaker` seams (mirroring `certProxyDriver` exactly): a
+  nil `Deps.RuntimeDriver` is a complete no-op (no ticker, no wake, no
+  `runtimes` sample key) — pinned by
+  `TestCollectOnceRuntimeNilOmitsRuntimesKey`, which asserts the marshaled
+  JSON never contains the substring `"runtimes"`. `collectOnce` maps
+  `driver.Status()` to the new `sample.RuntimeSample`/`RuntimeGPUSample`/
+  `RuntimeErrorSample` types and sets `LoadedModels` authoritatively from
+  the manager (`StateRunning` only), overriding the generic model-status
+  lister. `collector/nvidia.go` gained `NewNvidiaComputeApps()` (nil
+  without `nvidia-smi` on PATH — a hardware capability, not a negotiated
+  feature), wired into the manager via `SetMeasurer` in `main.go`.
+  `main.go` fetches gateway features once at startup (via the same
+  `*FeaturesClient` the driver reuses), computes `runtimeActive` through
+  `agent.ActiveFeatures`, and constructs the manager/source/driver only
+  inside that branch. Two pre-existing debts paid off while in these files
+  (both flagged by earlier reviews specifically for this task):
+  `sample.EmptyCapabilities` is now a function (fresh `json.RawMessage`
+  per call) instead of a shared package-level `var`; `runtime.Status`/
+  `LastError` gained JSON tags plus a `Status.MarshalJSON` that normalizes
+  a nil `MeasuredVRAM` to `{}` instead of Go's default `null`. `archtest`
+  gained `internal/agent += internal/runtime` and `mainPkgKey +=
+  internal/runtime`. Full test/verification detail, the exact `runtimes`
+  sample JSON shape, and deviations:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-18-report.md`.
+
 ## Next planned step
 
-1. Continue the plan at Task 14.
-2. Remaining: 14-18 (agent), 19-22 (portal UI),
-   23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
+1. Continue the plan at Task 19 (frontend: api module, type union, i18n).
+2. Remaining: 19-22 (portal UI), 23 (e2e),
+   24 (docs + Sonar gate + working-file cleanup before the PR).

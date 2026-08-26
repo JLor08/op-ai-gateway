@@ -86,7 +86,7 @@ func capabilitiesJSON() json.RawMessage {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("capabilities marshal failed", "err", err)
-		return sample.EmptyCapabilities
+		return sample.EmptyCapabilities()
 	}
 	return raw
 }

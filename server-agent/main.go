@@ -21,9 +21,17 @@ import (
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/proxy"
+
+	// runtimectl is internal/runtime. main.go itself imports no stdlib
+	// "runtime" package, so there is no LOCAL collision here -- the alias
+	// is used anyway for consistency with every other import site in this
+	// module (internal/agent/agent.go DOES need it, since that file uses
+	// the stdlib runtime.GOOS/runtime.GOARCH).
+	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/trust"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -125,6 +133,50 @@ func main() {
 	default:
 		deps.Poster = client.New(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(10*time.Second))
 	}
+
+	// Agent-managed model runtime (Task 18, design spec §9): active only
+	// when BOTH this agent binary and the connected gateway declare
+	// runtime_manager. featuresClient is constructed unconditionally (it is
+	// the very thing this check needs) and, when the feature IS active,
+	// handed to the driver so its own Sync re-checks negotiation on every
+	// call with the SAME cached/conditional-GET state -- no duplicate
+	// startup fetch. cfg.RuntimeSource/RuntimeConfigPath pairing is already
+	// guaranteed valid at this point: config.Load already ran cfg.Validate
+	// and this process would have exited at startup otherwise.
+	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
+	fctx, fcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	gatewayFeatures, err := featuresClient.Fetch(fctx)
+	fcancel()
+	if err != nil {
+		slog.Debug("runtime: startup gateway features fetch failed", "err", err)
+	}
+	runtimeActive := slices.Contains(agent.ActiveFeatures(gatewayFeatures), "runtime_manager")
+	if runtimeActive {
+		localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
+		mgr := runtimectl.NewManager(runtimectl.ManagerOptions{Policy: localPolicy, Getenv: os.Getenv})
+		defer mgr.Close()
+		// nvidia-smi is a HARDWARE capability, not a negotiated feature
+		// (design spec §5): NewNvidiaComputeApps returns nil on hosts
+		// without it (AMD, Apple unified memory, no GPU at all), and
+		// SetMeasurer(nil) is exactly NewManager's own default -- operator
+		// VRAM estimates stand.
+		mgr.SetMeasurer(collector.NewNvidiaComputeApps())
+
+		var src runtimectl.Source
+		if cfg.RuntimeSource == config.RuntimeSourceFile {
+			src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
+		} else {
+			src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
+		}
+		var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
+		if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
+			reporter = r // typed-nil discipline: assign only inside the ok branch
+		}
+		drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter)
+		defer drv.Close()
+		deps.RuntimeDriver = drv
+	}
+
 	a := agent.NewFromDeps(cfg, deps)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -141,7 +193,9 @@ func main() {
 		"temp_sources", collector.TempSources(temp),
 		"verbose", cfg.Verbose,
 		"transport", cfg.Transport,
-		"cert_mode", cfg.CertMode)
+		"cert_mode", cfg.CertMode,
+		"runtime_manager_active", runtimeActive,
+		"runtime_source", cfg.RuntimeSource)
 	// Detailed resolved config for debugging. The token is NEVER logged, even
 	// here. cert_reload_command IS included at Debug (unlike the Info line
 	// above) — Debug is opt-in via -v/--verbose for local troubleshooting, and
@@ -162,7 +216,11 @@ func main() {
 		"ca_pem_set", cfg.CAPEM != "",
 		"tls_insecure", cfg.TLSInsecure,
 		"interval", cfg.Interval.String(),
-		"system_report_interval", cfg.SystemReportInterval.String())
+		"system_report_interval", cfg.SystemReportInterval.String(),
+		"runtime_config_path", cfg.RuntimeConfigPath,
+		"runtime_cache_path", cfg.RuntimeCachePath,
+		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
+		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs))
 
 	if err := a.Run(ctx); err != nil {
 		slog.Error("server-agent run failed", "err", err)

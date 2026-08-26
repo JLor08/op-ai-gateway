@@ -5,7 +5,9 @@ package runtime
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 // capturedRuntimeConfigJSON is the exact wire document captured from a live
@@ -285,5 +287,92 @@ func TestConfigAllowedPairsCanonicalizesReversedInput(t *testing.T) {
 	}
 	if !allowed[PairKey("b", "a")] {
 		t.Error("PairKey itself must be order-independent on lookup too")
+	}
+}
+
+// TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM pins the Task 18 debt
+// paydown: a Status with a nil MeasuredVRAM (the common case -- no
+// measurer, or not yet running) must marshal that field as "{}", never as
+// Go's default "null" for a nil map. A populated map must still round-trip
+// its entries untouched.
+func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
+	nilCase := Status{SpecID: "s1", State: StateRunning}
+	raw, err := json.Marshal(nilCase)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"measured_vram":{}`) {
+		t.Errorf("raw = %s, want measured_vram:{} for a nil map", raw)
+	}
+	if strings.Contains(string(raw), "null") {
+		t.Errorf("raw = %s, must never contain null", raw)
+	}
+
+	populated := Status{SpecID: "s2", State: StateRunning, MeasuredVRAM: map[int]int{0: 21234, 1: 8000}}
+	raw2, err := json.Marshal(populated)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw2, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var vram map[string]int
+	if err := json.Unmarshal(decoded["measured_vram"], &vram); err != nil {
+		t.Fatalf("unmarshal measured_vram: %v", err)
+	}
+	if vram["0"] != 21234 || vram["1"] != 8000 || len(vram) != 2 {
+		t.Errorf("measured_vram = %v, want {0:21234 1:8000}", vram)
+	}
+}
+
+// TestStatusAndLastErrorJSONTags pins the exact wire tags Status/LastError
+// carry now that Task 18 puts them on the wire (via
+// sample.RuntimeSample/RuntimeErrorSample, built field-by-field from these
+// types in internal/agent.collectOnce).
+func TestStatusAndLastErrorJSONTags(t *testing.T) {
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	failedAt := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
+	st := Status{
+		SpecID:   "rspec_a",
+		Model:    "qwen-coder",
+		State:    StateCrashed,
+		Since:    since,
+		PID:      111,
+		Port:     9001,
+		InFlight: 2,
+		Restarts: 1,
+		LastError: &LastError{
+			Message:    "boom",
+			At:         failedAt,
+			ExitCode:   1,
+			Failures:   3,
+			StderrTail: "oom",
+		},
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"spec_id":"rspec_a"`, `"model":"qwen-coder"`, `"state":"crashed"`,
+		`"pid":111`, `"port":9001`, `"in_flight":2`, `"restarts":1`,
+	} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("raw = %s, missing %s", raw, key)
+		}
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var le map[string]json.RawMessage
+	if err := json.Unmarshal(decoded["last_error"], &le); err != nil {
+		t.Fatalf("unmarshal last_error: %v", err)
+	}
+	for _, key := range []string{"message", "at", "exit_code", "failures", "stderr_tail"} {
+		if _, ok := le[key]; !ok {
+			t.Errorf("last_error missing key %q in %s", key, decoded["last_error"])
+		}
 	}
 }
