@@ -81,6 +81,12 @@ type WSSender struct {
 	// successful (re)connect, mirroring how it already wakes certUpdates/
 	// trustUpdates on connect.
 	runtimeUpdates chan json.RawMessage
+	// runtimeWakeMu makes wakeRuntimeConfig's drain-then-send pair a single
+	// atomic critical section -- see that function's doc for why this is
+	// required (readLoop and maybeDial's connect hook can call it
+	// concurrently) and why it is a DEDICATED lock rather than a reuse of
+	// mu below.
+	runtimeWakeMu sync.Mutex
 
 	mu          sync.Mutex
 	conn        *websocket.Conn
@@ -152,6 +158,15 @@ func (s *WSSender) TrustUpdates() <-chan struct{} { return s.trustUpdates }
 // with or without a reader ever draining in between, coalesces into exactly
 // the newest document -- reading this channel is never required to keep the
 // connection alive, and the producer (readLoop) never blocks on it.
+//
+// NOTE for the consumer: a nil value is NOT proof this came from a
+// reconnect. readLoop decodes f.Data straight from the wire, so a
+// well-formed-but-contract-violating frame that omits "data" entirely
+// (`{"type":"runtime_config"}` -- valid JSON, invalid per the runtime_config
+// contract) also decodes to a Go-nil json.RawMessage and is indistinguishable
+// from the connect hook's intentional nil. This is harmless either way:
+// treat every nil, whatever its origin, as "resync over HTTP" -- which is
+// exactly the safe, idempotent fallback both cases want.
 func (s *WSSender) RuntimeUpdates() <-chan json.RawMessage { return s.runtimeUpdates }
 
 // wakeCertUpdates is the shared non-blocking send both wake sources (readLoop's
@@ -178,13 +193,41 @@ func (s *WSSender) wakeTrustUpdates() {
 // before sending the new one, so a consumer that has not yet read the
 // previous value never observes it once a newer one has arrived. Called
 // from readLoop (a genuine "runtime_config" frame, data = f.Data) and from
-// maybeDial's connect hook (data = nil, meaning "resync over HTTP") -- both
-// non-blocking, by construction: neither select here can ever block, since
-// the channel is buffered(1) and the drain immediately preceding the send
-// guarantees room for exactly one value. This is the load-bearing property
-// for readLoop's caller: readLoop must NEVER block on this send, because it
-// is also the goroutine that detects a dead peer (see readLoop's own doc).
+// maybeDial's connect hook (data = nil, meaning "resync over HTTP").
+//
+// The drain and the send are two INDEPENDENT atomic channel operations, not
+// one atomic transaction -- and this function has two call sites that run
+// on DIFFERENT goroutines with no other ordering between them: maybeDial
+// spawns readLoop on a new goroutine and then, still in the CALLING
+// goroutine, calls wakeRuntimeConfig(nil) itself after further work (two
+// network writes). If the gateway pushes a real document in that window,
+// readLoop's wakeRuntimeConfig(f.Data) call races the connect hook's
+// wakeRuntimeConfig(nil) call. Without synchronization, their drain/send
+// pairs can interleave so that an earlier call's send lands AFTER a later
+// call's drain already found the channel empty -- the later call's own
+// send then silently loses to the earlier one (a real pushed document can
+// be replaced by a stale nil, or the reverse). The channel is never left
+// empty and nothing hangs either way (each call's own send always has room
+// by the time it runs, since its own immediately-preceding drain guarantees
+// that), but WHICH document survives is only well-defined when the two
+// steps are atomic -- hence runtimeWakeMu.
+//
+// runtimeWakeMu is a DEDICATED lock, not a reuse of s.mu: s.mu guards
+// connection state (conn/connDone/backoff bookkeeping), and readLoop never
+// touches s.mu at all today -- coupling this doorbell to that lock would
+// risk a deadlock the moment either call site's path to here ever grows to
+// (re)acquire s.mu first, for zero benefit (s.mu's own invariants don't
+// need to protect this channel). Holding runtimeWakeMu is still safe for
+// readLoop to do unconditionally: both selects inside the critical section
+// are non-blocking (each has a `default`), so the section's duration is
+// bounded by two trivial channel operations, never by whether -- or when
+// -- a consumer drains RuntimeUpdates(). That is the property that matters
+// for readLoop's caller: readLoop must never block WAITING ON A CONSUMER,
+// because it is also the goroutine that detects a dead peer (see readLoop's
+// own doc); brief mutex contention between the two producers is not that.
 func (s *WSSender) wakeRuntimeConfig(data json.RawMessage) {
+	s.runtimeWakeMu.Lock()
+	defer s.runtimeWakeMu.Unlock()
 	select {
 	case <-s.runtimeUpdates: // drop the stale pending document, if any
 	default:

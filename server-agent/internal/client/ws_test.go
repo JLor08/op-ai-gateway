@@ -1034,11 +1034,21 @@ func TestRuntimeUpdatesLatestWins(t *testing.T) {
 // RuntimeUpdates() send, even under a sustained burst with NO reader ever
 // draining the channel -- because readLoop is also what detects a dead
 // peer, and a wedged readLoop would silently stall connection health
-// detection. It never drains RuntimeUpdates() at all (not even the initial
-// connect wake), pushes a burst of frames, then proves the connection is
-// still alive two independent ways: a further application-level Post
-// succeeds, and a raw WebSocket ping/pong round-trip on the SAME connection
-// still completes.
+// detection. It drains the initial connect wake ONCE up front -- leaving the
+// channel genuinely EMPTY -- and then never drains it again for the rest of
+// the test. That "genuinely empty before the burst starts" detail is
+// load-bearing: without it, the channel would already hold the connect
+// wake's pending nil when the burst's first push runs, so that push's own
+// drain step would always find something to remove and its `select`'s
+// `default` branch would never be exercised -- a regression that replaced
+// the drain step with a plain BLOCKING channel receive (no `default`) would
+// still happen to succeed in that setup, hiding exactly the bug this test
+// exists to catch. Draining first ensures the very first burst push's drain
+// step hits a truly empty channel, so only a correctly non-blocking
+// `select` (with `default`) can get past it. The test then proves the
+// connection is still alive two independent ways: a further
+// application-level Post succeeds, and a raw WebSocket ping/pong round-trip
+// on the SAME connection still completes.
 func TestRuntimeUpdatesReadLoopNeverBlocksWithoutAReader(t *testing.T) {
 	g, up := newServerPusher()
 	ts := httptest.NewServer(g.handler(up))
@@ -1054,9 +1064,11 @@ func TestRuntimeUpdatesReadLoopNeverBlocksWithoutAReader(t *testing.T) {
 	if conn == nil {
 		t.Fatal("expected an active connection")
 	}
+	// Drain the connect wake ONCE, up front, so the channel is genuinely
+	// empty going into the burst below -- see the function doc for why this
+	// is load-bearing. Never drained again after this point.
+	drainInitialRuntimeConfigWake(t, s)
 
-	// Deliberately never drain RuntimeUpdates() -- not the connect wake, not
-	// any of the pushes below.
 	for i := 0; i < 20; i++ {
 		g.push(t, []byte(`{"type":"runtime_config","data":{"n":`+strconv.Itoa(i)+`}}`))
 	}
@@ -1104,5 +1116,74 @@ func TestReconnectWakesRuntimeNil(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected the reconnect to wake RuntimeUpdates() with a nil payload")
+	}
+}
+
+// TestWakeRuntimeConfigConcurrentCallersNeverDeadlockOrLoseAllValues is the
+// direct regression test for the review finding that wakeRuntimeConfig's
+// drain-then-send pair was not atomic: readLoop's per-connection goroutine
+// and the goroutine that calls maybeDial (which, after spawning readLoop,
+// keeps running unguarded and eventually calls wakeRuntimeConfig(nil)
+// itself) can call wakeRuntimeConfig CONCURRENTLY. Two independent,
+// non-atomic channel operations (a drain, then a send) racing across two
+// callers can interleave so that an earlier call's send lands after a
+// later call's drain already found the channel empty -- the later call's
+// send is then silently dropped, and a genuine pushed document can lose to
+// a stale nil (or the reverse).
+//
+// This does NOT manifest as data loss or a hang -- the channel is never
+// left empty, since each call's own drain-then-send always leaves room for
+// its own send by the time that send runs -- so there is no deterministic
+// way to assert "the temporally later call wins" under genuine concurrency
+// (the two callers' relative timing is itself a race, not just the
+// channel's). Faking that with sleeps would not be a real test. Instead
+// this asserts exactly the properties that ARE guaranteed regardless of
+// scheduling: the operation never deadlocks, the channel always ends up
+// holding a value (never empty), and that value is one of the two actually
+// sent (never a corrupted/torn third value) -- calling wakeRuntimeConfig
+// directly, on both goroutines, with two distinct payloads racing to
+// exercise exactly this interleaving.
+func TestWakeRuntimeConfigConcurrentCallersNeverDeadlockOrLoseAllValues(t *testing.T) {
+	s, err := NewWSSender("https://gw.example", "tok", nil)
+	if err != nil {
+		t.Fatalf("NewWSSender: %v", err)
+	}
+
+	payloadA := json.RawMessage(`{"v":"a"}`)
+	payloadB := json.RawMessage(`{"v":"b"}`)
+
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	for _, p := range []json.RawMessage{payloadA, payloadB} {
+		p := p
+		go func() {
+			<-start // maximize the chance both calls genuinely overlap
+			s.wakeRuntimeConfig(p)
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+
+	deadline := time.After(3 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-deadline:
+			t.Fatal("wakeRuntimeConfig deadlocked under concurrent callers")
+		}
+	}
+
+	select {
+	case got := <-s.RuntimeUpdates():
+		if string(got) != string(payloadA) && string(got) != string(payloadB) {
+			t.Fatalf("surviving payload %s is neither of the two sent values -- torn/corrupted state", got)
+		}
+	default:
+		t.Fatal("channel is empty after two concurrent wakes -- a document must never be lost entirely")
+	}
+	select {
+	case extra := <-s.RuntimeUpdates():
+		t.Fatalf("channel held a second value after two concurrent wakes, want exactly one (buffered(1), latest-wins): %s", extra)
+	default:
 	}
 }
