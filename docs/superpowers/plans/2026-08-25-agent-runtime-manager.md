@@ -1011,17 +1011,27 @@ Handler: same skeleton, ETag over the marshaled body, agent-token auth, register
 func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.RawMessage)
 // frame on the wire: {"type":"runtime_config","data":<full AgentRuntimeConfigDTO JSON>}
 
-// runtime_registry.go
+// runtime_registry.go — created by THIS task. Both registries are nil-safe on
+// every method (the package-wide convention: a bare *Server built in a test
+// must keep working).
 type agentFeaturesRegistry struct{ mu sync.RWMutex; features map[string][]string }
 func (r *agentFeaturesRegistry) Set(serverID string, features []string) // nil-safe
 func (r *agentFeaturesRegistry) Has(serverID, feature string) bool      // nil-safe
+
+// runtimeStatusRegistry is introduced here holding ONLY the file-mode flag that
+// PushRuntimeConfig consults; Task 9 extends this SAME type with the
+// snapshot+subscribe status stream. Creating the type here avoids a forward
+// dependency on Task 9.
+type runtimeStatusRegistry struct{ mu sync.RWMutex; fileMode map[string]bool }
+func (r *runtimeStatusRegistry) SetFileMode(serverID string, on bool) // nil-safe
+func (r *runtimeStatusRegistry) IsFileMode(serverID string) bool      // nil-safe, false by default
 // Server method — the push path (called from the portal hook via main.go):
 func (s *Server) PushRuntimeConfig(serverID string) // goroutine-safe, best-effort
 ```
 
 - `PushRuntimeConfig`: `go func(){ if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) { return }; dto, err := s.Portal.AgentRuntimeConfig(context.Background(), serverID); if err != nil { slog.Debug(...); return }; b, _ := json.Marshal(dto); s.AgentStreams.NotifyRuntimeConfig(serverID, b) }()` — asynchronous because the portal hook contract is "synchronous but guaranteed fast" (it is called under certMu-like write paths).
 - Capabilities parse in `ingestTelemetrySample` AFTER store writes succeed (the registry-update convention): parse `req.Capabilities` as `{"features":[...],"agent_version":"..."}` tolerantly (bad JSON → empty), `s.AgentFeatures.Set(serverID, features)`.
-- main.go wiring: `OnRuntimeConfigChanged: srv.PushRuntimeConfig` cannot work (portal service is built before the gateway Server) — follow the cert pattern instead: wire a small indirection `var runtimePush func(string)` closure… NO. Copy the EXACT cert pattern: `OnCertificateIssued: agentStreams.NotifyCertUpdate` is registry-direct. Here assembly needs the portal itself, so: create the portal service first (hook left nil), build the gateway Server, then set the hook via a portal setter `portalService.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)` added in Task 5 (exported setter, one line, called in all three driver wirings in main.go). Check how `cmd/gateway` builds per-driver deps (`sqlDeps`/`memoryDeps`) and place the setter after `gateway.New`.
+- main.go wiring: the hook cannot be a `ServiceDeps` field value here, because `PushRuntimeConfig` needs the gateway `Server` and the portal service is constructed BEFORE it. The cert precedent (`OnCertificateIssued: agentStreams.NotifyCertUpdate`) works only because it points at a registry, not at the Server. So: construct the portal service with the hook left nil, build the gateway `Server`, then wire it late via the exported setter Task 5 already added — `portalService.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)` — placed after `gateway.New` in each of the three driver wirings. Check how `cmd/gateway` builds its per-driver deps (`sqlDeps`/`memoryDeps`) and follow that structure.
 
 **Steps:**
 
@@ -1073,9 +1083,10 @@ type agentRuntimeSample struct {
 }
 // on agentTelemetryRequest: Runtimes []agentRuntimeSample `json:"runtimes"`
 
-// runtime_registry.go — the serverPerfRegistry shape (atomic snapshot+subscribe,
-// non-blocking delivery, nil-safe):
-type runtimeStatusRegistry struct{ ... }
+// runtime_registry.go — EXTEND the runtimeStatusRegistry type Task 8 created
+// (it already holds the file-mode flag) with the serverPerfRegistry shape:
+// atomic snapshot+subscribe, non-blocking delivery, nil-safe throughout.
+type runtimeStatusRegistry struct{ /* + ring, subscribers */ }
 func (r *runtimeStatusRegistry) publish(serverID string, statuses []RuntimeStatusDTO)
 func (r *runtimeStatusRegistry) subscribe(serverID string) ([]RuntimeStatusDTO, <-chan []RuntimeStatusDTO, func())
 type RuntimeStatusDTO struct { // mirrors agentRuntimeSample, json tags identical
