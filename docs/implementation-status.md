@@ -103,6 +103,32 @@ Gateway phase in progress:
   "OTHER HOUSE PATTERNS" note about per-server registry leaks turned out to
   have a small, worthwhile fix once traced through, see the task report's
   deviation #2 for the full rationale and the reviewer note.
+  **Review round 1 fixes (separate commits):** a CRITICAL cross-server
+  authorization gap in the VRAM write-back — `spec_id` is agent-supplied
+  and nothing checked it belonged to the reporting server's own
+  application, so server A's agent could overwrite server B's
+  `vram_measured_mb` (which feeds B's OWN admission arithmetic via
+  `agentRuntimeSpecDTO`). Fixed by resolving spec → mapping → application →
+  `ServerID` and rejecting a mismatch; regression-tested by confirming the
+  new test fails against the pre-fix code. Also fixed in the same round:
+  the write-back loop is now length-capped
+  (`maxRuntimeSamplesPerSample`/`maxRuntimeGPUsPerSample`) and memoizes
+  EVERY resolution outcome including misses/errors (previously only a
+  successful resolution was cached, so a repeated bad `spec_id` re-read
+  every time — up to ~19k reads from one 1 MiB POST); and a file-mode
+  report's `parse_error` is now redacted to its classification (text before
+  the first `:`), not just length-clamped — a config-loader error routinely
+  quotes the offending line, so an unparsed secret-bearing line could
+  otherwise reach `server_runtime_reports` through this field instead of
+  `env`. See the task report's "Review round 1" section for full detail,
+  including two corrections agent-task authors should read before coding
+  against the earlier JSON samples: the `runtime-report` example there
+  omitted `work_dir`/`gpus`/`etag` (all three round-trip; a corrected full
+  example is in that section), and — more importantly — **omitting
+  `runtimes` from a telemetry sample is additive at the schema level but
+  REPLACES the live status snapshot with empty at the behavior level**; an
+  agent that only sends `runtimes` on a subset of its ~1s samples will make
+  the portal's live runtime table visibly flicker empty between them.
 
 Durable corrections discovered during execution (fold into docs/architecture in
 Task 24):
