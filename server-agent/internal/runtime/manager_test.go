@@ -1110,9 +1110,19 @@ func TestManagerRejectsAgentOwnEnvNamespaceReference(t *testing.T) {
 // EnsureRunning call once the operator sets that variable on the agent
 // host -- WITHOUT requiring an unrelated Apply/ETag change to clear the
 // stuck state. See task-14-report.md's I6 section for the full reasoning.
+// TestManagerNotPermittedRetriesOnNextRequestNotOnApply is I6's property,
+// updated for fix round 2 (R2-1) to account for notPermittedRetryInterval:
+// a request INSIDE the interval must still get the cached verdict (the
+// rate limit's whole point), but a request AFTER the interval elapses
+// must re-evaluate fully and succeed once the underlying problem is
+// fixed -- with no Apply/config change. This must not regress: R2-1 added
+// a bound, not a return to I6's original stickiness.
 func TestManagerNotPermittedRetriesOnNextRequestNotOnApply(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
+	origInterval := notPermittedRetryInterval
+	notPermittedRetryInterval = 200 * time.Millisecond
+	defer func() { notPermittedRetryInterval = origInterval }()
 
 	var tokenSet atomic.Bool
 	getenv := func(name string) string {
@@ -1136,18 +1146,124 @@ func TestManagerNotPermittedRetriesOnNextRequestNotOnApply(t *testing.T) {
 	}
 
 	// The operator fixes it on the AGENT HOST -- no gateway config change,
-	// no Apply call, no ETag change.
+	// no Apply call, no ETag change. A request made immediately (still
+	// inside the interval) must still get the CACHED verdict: that is the
+	// rate limit's whole point, not a regression back to stickiness.
 	tokenSet.Store(true)
+	ctxImmediate, cancelImmediate := context.WithTimeout(context.Background(), 2*time.Second)
+	_, _, errImmediate := m.EnsureRunning(ctxImmediate, "model-a")
+	cancelImmediate()
+	if !errors.Is(errImmediate, ErrNotPermitted) {
+		t.Fatalf("EnsureRunning immediately after the fix (still inside notPermittedRetryInterval) = %v, want the cached ErrNotPermitted -- a request inside the interval must not re-evaluate yet", errImmediate)
+	}
+
+	time.Sleep(notPermittedRetryInterval + 100*time.Millisecond)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	endpoint, release, err := m.EnsureRunning(ctx2, "model-a")
 	if err != nil {
-		t.Fatalf("EnsureRunning after the operator fixed the missing env var = %v, want success -- BUG I6: StateNotPermitted must not be sticky across requests when nothing about the SPEC itself needs to change", err)
+		t.Fatalf("EnsureRunning after the operator fixed the missing env var and the retry interval elapsed = %v, want success -- I6 must not regress: recovery needs no Apply/config change", err)
 	}
 	defer release()
 	if endpoint == "" {
 		t.Fatal("expected a non-empty endpoint")
+	}
+}
+
+// TestManagerNotPermittedRateLimitsReEvaluation is R2-1: N rapid requests
+// against a NotPermitted spec must perform only ONE full evaluation, not
+// one per request. Counted from the FAKE's side (the injected Getenv
+// closure's own call count), not from manager bookkeeping -- a missing
+// (non-agent-owned) ${AGENT_ENV:NAME} is used as the failure cause because
+// it is the one ExpandPlaceholders rejection that still calls getenv
+// before erroring (the PATH/HOME and ${AGENT_ENV:OP_AGENT_*} causes
+// deliberately never call getenv at all, by design -- see
+// policy_local.go), giving a real external side effect to count.
+func TestManagerNotPermittedRateLimitsReEvaluation(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origInterval := notPermittedRetryInterval
+	notPermittedRetryInterval = 2 * time.Second
+	defer func() { notPermittedRetryInterval = origInterval }()
+
+	var getenvCalls atomic.Int64
+	getenv := func(name string) string {
+		if name == "MISSING_TOKEN" {
+			getenvCalls.Add(1)
+		}
+		return ""
+	}
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: getenv})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Env = map[string]string{"HF_TOKEN": "${AGENT_ENV:MISSING_TOKEN}"}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _, err := m.EnsureRunning(ctx, "model-a")
+		cancel()
+		if !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("attempt %d: EnsureRunning error = %v, want ErrNotPermitted", i, err)
+		}
+	}
+
+	if got := getenvCalls.Load(); got != 1 {
+		t.Fatalf("getenv(MISSING_TOKEN) called %d times across %d rapid requests within the retry interval, want exactly 1 -- BUG: NotPermitted must be rate-limited, not re-evaluated (ExpandPlaceholders re-run) on every request", got, n)
+	}
+}
+
+// TestManagerPendingVRAMUnknownRateLimitsReEvaluation is R2-1's other
+// half: N rapid requests against a PendingVRAMUnknown spec must invoke
+// the installed measurer only ONCE, not once per request -- otherwise,
+// once a later task wires a real nvidia-smi-backed measurer, a client
+// retrying against a VRAM-blocked spec would drive an external process
+// call at request rate on the single serialized owner goroutine.
+func TestManagerPendingVRAMUnknownRateLimitsReEvaluation(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origInterval := notPermittedRetryInterval
+	notPermittedRetryInterval = 2 * time.Second
+	defer func() { notPermittedRetryInterval = origInterval }()
+
+	m := newTestManager(t, allowlistPolicy())
+
+	var measurerCalls atomic.Int64
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		measurerCalls.Add(1)
+		return nil
+	})
+
+	pinned := baseSpec("spec-pinned", "model-pinned")
+	pinned.Pinned = true
+	pinned.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+
+	unknown := baseSpec("spec-unknown", "model-unknown")
+	unknown.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}} // unknown demand, touches the pinned spec's GPU
+
+	m.Apply(Config{Specs: []Spec{pinned, unknown}})
+
+	waitUntil(t, 3*time.Second, "pinned spec-pinned running", func() bool {
+		st := statusFor(m, "spec-pinned")
+		return st != nil && st.State == StateRunning
+	})
+	measurerCalls.Store(0) // the pinned spec's own start also builds a snapshot; isolate the count to what follows
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _, err := m.EnsureRunning(ctx, "model-unknown")
+		cancel()
+		if !errors.Is(err, ErrAdmissionBlocked) {
+			t.Fatalf("attempt %d: EnsureRunning error = %v, want ErrAdmissionBlocked", i, err)
+		}
+	}
+
+	if got := measurerCalls.Load(); got != 1 {
+		t.Fatalf("measurer invoked %d times across %d rapid requests within the retry interval, want exactly 1 -- BUG: PendingVRAMUnknown must be rate-limited, not re-evaluated (and re-measured) on every request", got, n)
 	}
 }
 

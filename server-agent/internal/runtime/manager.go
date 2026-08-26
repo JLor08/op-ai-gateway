@@ -74,6 +74,20 @@ var (
 	// idleTickInterval is how often the owner scans for idle-timeout
 	// unloads.
 	idleTickInterval = 15 * time.Second
+	// notPermittedRetryInterval bounds how often StateNotPermitted /
+	// StatePendingVRAMUnknown are re-evaluated (fix round 2 / R2-1). A
+	// request arriving within this interval of the state's own onset gets
+	// the cached verdict immediately, with no Permit/Admit/port-grab; once
+	// it elapses, the next request re-evaluates fully and self-clears if
+	// the underlying problem is fixed -- a rate limiter, not the
+	// permanent stickiness I6 removed. 5s bounds retry-driven syscall
+	// (grabEphemeralPort, for the PATH/HOME and ${AGENT_ENV:...} causes)
+	// and measurer-invocation (for PendingVRAMUnknown, once a later task
+	// wires a real one) cost to at most once per 5s per spec even under a
+	// request storm, while keeping an operator's config-fix recovery time
+	// short enough to need no gateway-side action -- the same order of
+	// magnitude as backoffBase's own default.
+	notPermittedRetryInterval = 5 * time.Second
 )
 
 // Typed errors the router maps to HTTP (design doc §6.5). Stable identity
@@ -552,6 +566,15 @@ type specState struct {
 	// back to nil (never measured) when no measurer is installed.
 	measuredVRAM map[int]int
 
+	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
+	// StateNotPermitted or StatePendingVRAMUnknown -- deliberately NOT the
+	// same as `since`, because setState is a no-op (and so never touches
+	// `since`) when re-entering a state the spec is already in, but a
+	// rate-limit window needs to restart on every re-confirmation, not just
+	// the first one. handleEnsure compares this against
+	// notPermittedRetryInterval (fix round 2 / R2-1).
+	notPermittedAt time.Time
+
 	pending []*ensureWaiter
 }
 
@@ -729,21 +752,30 @@ func (o *owner) rebuildUpstreamIndex() {
 }
 
 // handleEnsure resolves an EnsureRunning request immediately when possible
-// (already Running), otherwise queues it and (re)attempts admission.
+// (already Running, or a still-rate-limited terminal state), otherwise
+// queues it and (re)attempts admission.
 //
-// I6 fix: earlier code short-circuited StateNotPermitted /
+// I6 fix (round 1): earlier code short-circuited StateNotPermitted /
 // StatePendingVRAMUnknown here, answering every subsequent request with
 // the SAME cached verdict forever -- the only way to clear it was an
 // unrelated Apply/ETag change (applyConfig's terminal-state reset). That
 // made a transient cause (e.g. a missing ${AGENT_ENV:...} variable) look
-// like a permanent one: an operator who fixed it on the agent host found
-// the model still dead until some unconnected gateway-side edit happened
-// to touch this spec too. Permit and Admit are cheap, pure, in-memory
-// checks, so simply re-running them on every request (via the normal
-// queue+admitAndStart path below, which resolves synchronously within
-// this same call when the answer is still "no") is both correct and
-// negligible in cost. See task-14-report.md's I6 section for the full
-// reasoning and the alternative considered.
+// like a permanent one.
+//
+// R2-1 fix (round 2): removing that short-circuit outright made
+// re-evaluation UNBOUNDED instead of merely un-sticky -- Permit is cheap,
+// but the ExpandPlaceholders/env path (moved ahead of grabEphemeralPort in
+// startProcess, see its own comment) and the PendingVRAMUnknown path
+// (buildSnapshot invokes the installed measurer on every call) are not
+// free once a spec is genuinely broken and something keeps retrying it.
+// The two rate-limit checks below restore a bound: within
+// notPermittedRetryInterval of the state's own onset (specState.notPermittedAt),
+// a request gets the cached verdict with no re-evaluation at all; once
+// the interval elapses, the next request falls through to the normal
+// queue+admitAndStart path and re-evaluates fully, self-clearing if the
+// underlying problem is fixed -- a rate limiter, not a return to
+// stickiness. See task-14-report.md's I6/R2-1 sections for the full
+// reasoning.
 func (o *owner) handleEnsure(c cmdEnsure) {
 	if o.closing {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
@@ -763,6 +795,14 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		st.inFlight++
 		st.lastUsed = time.Now()
 		c.reply <- ensureOutcome{endpoint: endpointFor(st.proc.port), specID: specID, proc: st.proc}
+		return
+	}
+	if st.state == StateNotPermitted && time.Since(st.notPermittedAt) < notPermittedRetryInterval {
+		c.reply <- ensureOutcome{err: ErrNotPermitted}
+		return
+	}
+	if st.state == StatePendingVRAMUnknown && time.Since(st.notPermittedAt) < notPermittedRetryInterval {
+		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
 	}
 
@@ -868,6 +908,7 @@ func (o *owner) setState(st *specState, s State) {
 
 func (o *owner) setNotPermitted(st *specState, message string) {
 	o.setState(st, StateNotPermitted)
+	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
 	st.lastError = &LastError{Message: message, At: time.Now()}
 	o.failPending(st, ErrNotPermitted)
 }
@@ -921,6 +962,7 @@ func (o *owner) admitAndStart(specID string) {
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
 		o.setState(st, StatePendingVRAMUnknown)
+		st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
 		o.failPending(st, ErrAdmissionBlocked)
 	case dec.Wait:
 		// Leave st queued; a future completion event elsewhere re-triggers
@@ -999,6 +1041,21 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 func (o *owner) startProcess(st *specState) {
 	spec := st.spec
 
+	// R2-1 fix, part 1: validate placeholder expansion and env BEFORE
+	// acquiring any resource. A spec that can never launch (a spec.Env key
+	// of PATH/HOME, ${AGENT_ENV:OP_AGENT_*}, a missing ${AGENT_ENV:NAME},
+	// or a malformed placeholder) should fail before grabEphemeralPort's
+	// real net.Listen/Close pair, not after -- previously EVERY retry of a
+	// spec broken this way paid that syscall cost first. The port value
+	// itself never affects whether ExpandPlaceholders errors (it only
+	// substitutes a decimal string for ${PORT}), so this dry run with a
+	// placeholder port is a faithful pre-check; the real port is
+	// substituted in the second call below once one is available.
+	if _, _, err := ExpandPlaceholders(spec, 0, o.getenv); err != nil {
+		o.setNotPermitted(st, err.Error())
+		return
+	}
+
 	port := spec.ListenPort
 	if port == 0 {
 		p, err := grabEphemeralPort()
@@ -1014,6 +1071,9 @@ func (o *owner) startProcess(st *specState) {
 
 	args, env, err := ExpandPlaceholders(spec, port, o.getenv)
 	if err != nil {
+		// Already validated above (that dry run used port 0); reaching
+		// here would mean ExpandPlaceholders' result depends on the port
+		// value, which it does not. Defensive only.
 		o.setNotPermitted(st, err.Error())
 		return
 	}
