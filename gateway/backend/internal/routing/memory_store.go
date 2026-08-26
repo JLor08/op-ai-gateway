@@ -2172,8 +2172,7 @@ func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus 
 	if _, ok := m.runtimeSpecs[specID]; !ok {
 		return storeerr.ErrNotFound
 	}
-	stored := make([]RuntimeSpecGPU, len(gpus))
-	copy(stored, gpus)
+	stored := copyRuntimeSpecGPUs(gpus)
 	for i := range stored {
 		stored[i].SpecID = specID
 	}
@@ -2208,6 +2207,16 @@ func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID str
 	return storeerr.ErrNotFound
 }
 
+// copyRuntimeSpecGPUs returns an ALWAYS-non-nil copy of gpus: RuntimeSpecGPUs'
+// documented contract (store.go) is "always non-nil, empty when none", which
+// the SQL side satisfies via `make([]routing.RuntimeSpecGPU, 0)`. Building
+// this with `append([]RuntimeSpecGPU(nil), gpus...)` would silently return a
+// bare nil for a nil OR an already-empty gpus (append onto a nil slice
+// literal with zero elements to append always yields nil in Go), diverging
+// from the SQL store and surfacing downstream as a JSON `null` vs `[]`
+// difference. `make` + `copy` always allocates, even for length 0.
 func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
-	return append([]RuntimeSpecGPU(nil), gpus...)
+	out := make([]RuntimeSpecGPU, len(gpus))
+	copy(out, gpus)
+	return out
 }

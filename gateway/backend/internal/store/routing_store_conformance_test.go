@@ -544,6 +544,16 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("by application: %v %d", err, len(specs))
 		}
 
+		// A spec that has never had SetRuntimeSpecGPUs called for it must read
+		// back a non-nil, empty slice (the documented RuntimeStore contract:
+		// "Always non-nil, empty when none" — store.go). A bare nil here would
+		// marshal as JSON `null` instead of `[]` in the agent-facing config
+		// payload (Task 7), a memory-vs-SQL divergence not caught by a
+		// length-only assertion.
+		if gpus, err := s.RuntimeSpecGPUs(ctx, "rspec_rt2"); err != nil || gpus == nil || len(gpus) != 0 {
+			t.Fatalf("gpus for a spec with no rows yet must be non-nil and empty: err=%v gpus=%#v", err, gpus)
+		}
+
 		gpus := []routing.RuntimeSpecGPU{
 			{SpecID: "rspec_rt2", GPUIndex: 1, VRAMEstimateMB: 21500},
 			{SpecID: "rspec_rt2", GPUIndex: 0, VRAMEstimateMB: 22000},
@@ -565,6 +575,18 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		}
 		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 7, 1); err != ErrNotFound {
 			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
+		}
+
+		// Explicitly clearing the GPU rows (an empty, non-nil slice in) must
+		// still read back non-nil, empty (not a bare nil) — the same contract
+		// as the never-set case above, exercised via the other code path
+		// (SetRuntimeSpecGPUs's delete-then-insert-nothing) that could
+		// plausibly diverge from it.
+		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_rt2", []routing.RuntimeSpecGPU{}); err != nil {
+			t.Fatalf("clear gpus: %v", err)
+		}
+		if gpus, err := s.RuntimeSpecGPUs(ctx, "rspec_rt2"); err != nil || gpus == nil || len(gpus) != 0 {
+			t.Fatalf("gpus after clearing via empty slice must be non-nil and empty: err=%v gpus=%#v", err, gpus)
 		}
 
 		orphan := spec
