@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -500,6 +501,14 @@ type runningProc struct {
 	// full healthPollInterval tick).
 	exited chan struct{}
 
+	// everHealthy is set true (by handleStartResult's success branch) the
+	// first and only time this generation ever passes a health probe.
+	// onProcExited (I4 fix) uses this -- not the spec's CURRENT display
+	// state, which may already be Draining -- to classify an unexpected
+	// exit as a crash (was genuinely healthy) vs. a start failure (never
+	// became healthy at all).
+	everHealthy bool
+
 	drainTimer  *time.Timer // pending "drain grace exceeded, terminate anyway" callback
 	killTimer   *time.Timer // pending "kill grace exceeded, SIGKILL" callback
 	stableTimer *time.Timer // pending "this run has been stable long enough" callback
@@ -640,10 +649,24 @@ func (o *owner) applyConfig(cfg Config) {
 			o.specs[spec.ID] = &specState{spec: spec, state: StateStopped, since: time.Now()}
 			continue
 		}
+		// M1 fix: only reset a resting terminal/backoff state when THIS
+		// spec's own definition actually changed, not merely because the
+		// overall Config's ETag changed (which happens on ANY edit,
+		// including one to a completely different spec). Before this, an
+		// operator editing spec B could let spec A's active crash-backoff
+		// skip its remaining wait for no reason connected to A at all.
+		//
+		// StateNotPermitted/StatePendingVRAMUnknown are deliberately NOT
+		// reset here any more (I6): handleEnsure no longer short-circuits
+		// them, so every fresh request already re-evaluates Permit/Admit
+		// on its own; forcing them back to Stopped here without a request
+		// to actually re-check would just be a cosmetic, potentially
+		// misleading flip.
+		changed := !reflect.DeepEqual(st.spec, spec)
 		st.spec = spec
-		if st.proc == nil {
+		if changed && st.proc == nil {
 			switch st.state {
-			case StateNotPermitted, StatePendingVRAMUnknown, StateStartFailed, StateCrashed:
+			case StateStartFailed, StateCrashed:
 				o.setState(st, StateStopped)
 			case StateBackoff:
 				cancelTimer(o.m, &st.backoffTimer)
@@ -691,13 +714,36 @@ func (o *owner) applyConfig(cfg Config) {
 func (o *owner) rebuildUpstreamIndex() {
 	o.byUpstream = make(map[string]string, len(o.specs))
 	for id, st := range o.specs {
+		// M4 fix: this used to collapse silently, with map iteration order
+		// (unspecified, and different on every run) deciding which spec
+		// wins EnsureRunning's upstream_model lookup -- an undiagnosable
+		// config error without this log line. Still a collapse (the data
+		// model's own invariant, one spec per mapping, means this
+		// shouldn't happen from a well-formed config in the first place),
+		// but now at least visible.
+		if existing, dup := o.byUpstream[st.spec.UpstreamModel]; dup {
+			slog.Warn("runtime: multiple specs share upstream_model; only one is reachable via EnsureRunning", "upstream_model", st.spec.UpstreamModel, "spec_a", existing, "spec_b", id)
+		}
 		o.byUpstream[st.spec.UpstreamModel] = id
 	}
 }
 
 // handleEnsure resolves an EnsureRunning request immediately when possible
-// (already Running, or a terminal not-retryable state), otherwise queues it
-// and (re)attempts admission.
+// (already Running), otherwise queues it and (re)attempts admission.
+//
+// I6 fix: earlier code short-circuited StateNotPermitted /
+// StatePendingVRAMUnknown here, answering every subsequent request with
+// the SAME cached verdict forever -- the only way to clear it was an
+// unrelated Apply/ETag change (applyConfig's terminal-state reset). That
+// made a transient cause (e.g. a missing ${AGENT_ENV:...} variable) look
+// like a permanent one: an operator who fixed it on the agent host found
+// the model still dead until some unconnected gateway-side edit happened
+// to touch this spec too. Permit and Admit are cheap, pure, in-memory
+// checks, so simply re-running them on every request (via the normal
+// queue+admitAndStart path below, which resolves synchronously within
+// this same call when the answer is still "no") is both correct and
+// negligible in cost. See task-14-report.md's I6 section for the full
+// reasoning and the alternative considered.
 func (o *owner) handleEnsure(c cmdEnsure) {
 	if o.closing {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
@@ -717,14 +763,6 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		st.inFlight++
 		st.lastUsed = time.Now()
 		c.reply <- ensureOutcome{endpoint: endpointFor(st.proc.port), specID: specID, proc: st.proc}
-		return
-	}
-	if st.state == StateNotPermitted {
-		c.reply <- ensureOutcome{err: ErrNotPermitted}
-		return
-	}
-	if st.state == StatePendingVRAMUnknown {
-		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
 	}
 
@@ -968,6 +1006,7 @@ func (o *owner) startProcess(st *specState) {
 			o.setState(st, StateStartFailed)
 			o.recordFailure(st, "runtime: grab ephemeral port: "+err.Error(), 0, "")
 			o.failPending(st, ErrStartFailed)
+			o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
 			return
 		}
 		port = p
@@ -993,6 +1032,7 @@ func (o *owner) startProcess(st *specState) {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, fmt.Sprintf("runtime: exec %s: %s", spec.Binary, err.Error()), 0, "")
 		o.failPending(st, ErrStartFailed)
+		o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
 		return
 	}
 
@@ -1007,6 +1047,17 @@ func (o *owner) startProcess(st *specState) {
 	}
 	st.proc = proc
 	o.setState(st, StateStarting)
+	// I3 fix: an admission-wait timer exists to bound how long a request
+	// waits for a SLOT to free up; once the target has actually started,
+	// the request is no longer waiting on admission at all -- it is
+	// waiting on startup, which has its own bound
+	// (spec.StartupTimeoutSeconds, enforced by pollHealth). Without this,
+	// the admission-wait timer kept running through startup and could fire
+	// a misleading ErrAdmissionBlocked for a model that was seconds away
+	// from becoming healthy.
+	for _, w := range st.pending {
+		cancelTimer(o.m, &w.timer)
+	}
 	slog.Info("runtime: process starting", "spec", spec.ID, "binary", spec.Binary, "port", port, "pid", proc.pid)
 
 	o.m.wg.Add(1)
@@ -1050,7 +1101,13 @@ func (o *owner) pollHealth(specID string, proc *runningProc, spec Spec) {
 		probeTimeout = 2 * time.Second
 	}
 	url := endpointFor(proc.port) + healthPath
-	client := &http.Client{}
+	// M5 fix: a private transport with keep-alives disabled, instead of
+	// http.DefaultTransport's global connection pool -- the loopback port
+	// this dials is a recyclable OS-assigned ephemeral port, so an idle
+	// keep-alive connection left in the global pool after this generation
+	// is killed could otherwise be reused against a completely different
+	// process that is later assigned the same port number.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 
 	ticker := time.NewTicker(healthPollInterval)
 	defer ticker.Stop()
@@ -1100,8 +1157,16 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		st.hasRunBefore = true
 		o.setState(st, StateRunning)
 		st.lastError = nil
-		st.failures = 0
+		// I1 fix: do NOT reset st.failures here. Resetting it on every
+		// successful start meant the NEXT crash always recomputed
+		// backoffDelayFor(1) -- the base delay -- so backoff never
+		// escalated, and handleStableRun's stable-run reset (which already
+		// implements the reset the brief actually asked for) was
+		// unreachable dead code. failures now resets ONLY via
+		// handleStableRun, after a run has been stable for
+		// stableRunThreshold.
 		proc := c.proc
+		proc.everHealthy = true
 		proc.stableTimer = o.m.scheduleAfter(stableRunThreshold, func() {
 			o.m.postCmd(cmdStableRun{specID: c.specID, proc: proc})
 		})
@@ -1115,6 +1180,11 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	o.recordFailure(st, "runtime: startup timed out waiting for health", 0, tail)
 	o.failPending(st, ErrStartTimeout)
 	o.terminateNow(st, c.proc)
+	// I2 fix: rate-limit retries of a spec that never becomes healthy
+	// (non-pinned) and give a PINNED spec whose start always fails a
+	// retry at all (handleBackoffFire already restarts pinned specs
+	// correctly once the backoff elapses).
+	o.enterBackoff(st)
 }
 
 func (o *owner) handleStableRun(c cmdStableRun) {
@@ -1152,7 +1222,13 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
 	removed := st.removed
-	wasRunning := st.state == StateRunning
+	// I4 fix: classify by whether THIS GENERATION ever passed a health
+	// probe, not by the current display state. A healthy, serving process
+	// that happens to exit on its own (for an unrelated reason) while
+	// State is already Draining -- e.g. mid the in-flight drain wait,
+	// before the owner ever signalled it -- must still be reported as a
+	// crash, not "start_failed / never became healthy".
+	wasHealthy := proc.everHealthy
 
 	slog.Info("runtime: process exited", "spec", st.spec.ID, "intentional", wasIntentional, "exit_code", extractExitCode(exitErr))
 
@@ -1179,14 +1255,20 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	exitCode := extractExitCode(exitErr)
 	tail := proc.ring.Tail(2048)
-	if wasRunning {
+	if wasHealthy {
 		o.setState(st, StateCrashed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited unexpectedly (exit code %d)", exitCode), exitCode, tail)
 		o.enterBackoff(st)
 	} else {
+		// I2 fix: route a failed START through backoff too, exactly like a
+		// crash -- otherwise a non-pinned spec whose start always fails
+		// re-execs once per incoming request with no rate limit, and a
+		// PINNED spec whose start always fails never retries at all (stuck
+		// in start_failed until an unrelated config edit).
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited before becoming healthy (exit code %d)", exitCode), exitCode, tail)
 		o.failPending(st, ErrStartFailed)
+		o.enterBackoff(st)
 	}
 	o.wakeAllPendingWaiters()
 }
@@ -1271,6 +1353,24 @@ func (o *owner) handleKillGraceExpired(c cmdKillGraceExpired) {
 // st.intentionalStop so the eventual exit report is classified as a clean
 // stop, not a crash.
 func (o *owner) terminateNow(st *specState, proc *runningProc) {
+	// M2 fix, part 1: if this generation has already exited, do nothing --
+	// proc.cmd.Process.Pid could since have been recycled by the OS to an
+	// unrelated process, and signaling it would be a hazard, not a no-op.
+	select {
+	case <-proc.exited:
+		return
+	default:
+	}
+	// M2 fix, part 2: if termination is already in progress (killTimer
+	// already scheduled), don't re-signal or schedule a second escalation
+	// timer -- this can otherwise be reached twice for the same
+	// generation (e.g. the drain-grace timer expiring at the same moment
+	// a release() brings InFlight to zero), producing a redundant
+	// SIGTERM/SIGKILL and an orphaned killTimer whose wg accounting would
+	// only be reclaimed when it eventually fires on its own.
+	if proc.killTimer != nil {
+		return
+	}
 	st.intentionalStop = true
 	cancelTimer(o.m, &proc.drainTimer)
 	if err := terminateGroup(proc.cmd); err != nil {
@@ -1320,14 +1420,24 @@ func (o *owner) snapshotStatus() []Status {
 	out := make([]Status, 0, len(o.specs))
 	for id, st := range o.specs {
 		s := Status{
-			SpecID:       id,
-			Model:        st.spec.UpstreamModel,
-			State:        st.state,
-			Since:        st.since,
-			InFlight:     st.inFlight,
-			Restarts:     st.restarts,
-			LastError:    st.lastError,
-			MeasuredVRAM: st.measuredVRAM,
+			SpecID:    id,
+			Model:     st.spec.UpstreamModel,
+			State:     st.state,
+			Since:     st.since,
+			InFlight:  st.inFlight,
+			Restarts:  st.restarts,
+			LastError: st.lastError,
+		}
+		if st.measuredVRAM != nil {
+			// M3 fix: hand out a COPY, not the same map the measurer
+			// returned -- that map is shared with every Status() caller
+			// and, once a real measurer exists (Task 18), may be reused
+			// by its next call.
+			cp := make(map[int]int, len(st.measuredVRAM))
+			for k, v := range st.measuredVRAM {
+				cp[k] = v
+			}
+			s.MeasuredVRAM = cp
 		}
 		if st.proc != nil {
 			s.PID = st.proc.pid

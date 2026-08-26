@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -293,9 +294,15 @@ func TestManagerStartTimeout(t *testing.T) {
 		t.Fatalf("EnsureRunning error = %v, want ErrStartTimeout", err)
 	}
 
+	// Fix round 1 / I2: a failed start now enters backoff exactly like a
+	// crash (rate-limits a non-pinned spec's retries and gives a pinned
+	// one a retry at all), so start_failed is transient -- by the time
+	// Status() is polled it has almost always already advanced to backoff
+	// in the same synchronous transition, the same way a crash's
+	// momentary "crashed" is never observable either.
 	st := statusFor(m, "spec-a")
-	if st == nil || st.State != StateStartFailed {
-		t.Fatalf("Status()[spec-a].State = %+v, want start_failed", st)
+	if st == nil || (st.State != StateStartFailed && st.State != StateBackoff) {
+		t.Fatalf("Status()[spec-a].State = %+v, want start_failed or backoff", st)
 	}
 	if st.LastError == nil {
 		t.Fatal("Status()[spec-a].LastError is nil, want it set")
@@ -374,6 +381,15 @@ func TestManagerNeverEvictsPinned(t *testing.T) {
 	}
 }
 
+// TestManagerQueueWakesOnCompletion proves B waits for A's release and is
+// woken by it, WITHOUT the M6-flagged time.Sleep(50ms) "peek and see
+// nothing" heuristic: instead it compares monotonic timestamps. B's
+// EnsureRunning call can only complete via the owner processing A's
+// release -> wakeAllPendingWaiters -> admitAndStart(B) -> succeedPending,
+// so if B ever resolved BEFORE release was even called (e.g. a bug that
+// evicts a "busy" process), its recorded completion time would be provably
+// earlier than the moment release was invoked. No polling, no sleep, no
+// flaky race window.
 func TestManagerQueueWakesOnCompletion(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -395,27 +411,22 @@ func TestManagerQueueWakesOnCompletion(t *testing.T) {
 		endpoint string
 		release  func()
 		err      error
+		at       time.Time
 	}
 	resultCh := make(chan result, 1)
 	go func() {
 		ep, rel, err := m.EnsureRunning(ctx, "model-b")
-		resultCh <- result{ep, rel, err}
+		resultCh <- result{ep, rel, err, time.Now()}
 	}()
 
-	// Give B a moment to actually queue (best-effort; correctness does not
-	// depend on this, it only makes the "B is still blocked" assertion below
-	// meaningful rather than trivially true).
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case r := <-resultCh:
-		t.Fatalf("EnsureRunning(model-b) resolved before model-a was released: %+v", r)
-	default:
-	}
-
+	releasedAt := time.Now()
 	releaseA()
 
 	select {
 	case r := <-resultCh:
+		if r.at.Before(releasedAt) {
+			t.Fatalf("EnsureRunning(model-b) completed at %v, before model-a's release was even called at %v -- it must have waited for the release, not evicted a busy process", r.at, releasedAt)
+		}
 		if r.err != nil {
 			t.Fatalf("EnsureRunning(model-b) after release = %v", r.err)
 		}
@@ -683,10 +694,12 @@ func TestManagerTransitionsCoalesce(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix round 1 (task-14-fix-round-1.md), Criticals only: C1, C2, C3 below are
+// Fix round 1 (task-14-fix-round-1.md): C1, C2, C3, I1, I2, I3, I4 below are
 // each written to FAIL against the pre-fix code -- confirmed by running them
 // before applying the corresponding manager.go change; see
 // task-14-report.md's fix-round-1 appendix for the captured "red" output.
+// I5's two tests are new COVERAGE for already-correct behavior (not bugs),
+// so they pass immediately, before and after this round's other changes.
 // ---------------------------------------------------------------------------
 
 // TestManagerEnsureRunningReturnsOnContextCancelWhileQueued is C1: a queued
@@ -812,5 +825,375 @@ func TestManagerInFlightResetAfterCrash(t *testing.T) {
 	st := statusFor(m, "spec-a")
 	if st.InFlight != 0 {
 		t.Fatalf("InFlight = %d after a crash with no release() call, want 0 -- BUG C3: onProcExited never resets InFlight, so this spec becomes permanently un-evictable/never idle-unloadable, as if pinned", st.InFlight)
+	}
+}
+
+// TestBackoffDelayForEscalatesAndCaps is a fast, deterministic unit check
+// on the pure backoff-math helper (no processes spawned) -- a cheap
+// complement to TestManagerCrashBackoffEscalates below, which proves the
+// Manager actually uses this escalation rather than resetting failures too
+// early.
+func TestBackoffDelayForEscalatesAndCaps(t *testing.T) {
+	origBase, origCap := backoffBase, backoffCap
+	backoffBase, backoffCap = 100*time.Millisecond, 1*time.Second
+	defer func() { backoffBase, backoffCap = origBase, origCap }()
+
+	d1 := backoffDelayFor(1)
+	d2 := backoffDelayFor(2)
+	d3 := backoffDelayFor(3)
+	if d1 != 100*time.Millisecond {
+		t.Errorf("backoffDelayFor(1) = %s, want 100ms", d1)
+	}
+	if d2 <= d1 {
+		t.Errorf("backoffDelayFor(2) = %s, want > backoffDelayFor(1) = %s", d2, d1)
+	}
+	if d3 <= d2 {
+		t.Errorf("backoffDelayFor(3) = %s, want > backoffDelayFor(2) = %s", d3, d2)
+	}
+	if d10 := backoffDelayFor(10); d10 != 1*time.Second {
+		t.Errorf("backoffDelayFor(10) = %s, want capped at 1s", d10)
+	}
+}
+
+// TestManagerCrashBackoffEscalates is I1: repeated crashes must produce
+// escalating backoff delays, not the same base delay every time. Before
+// the fix, handleStartResult's success branch reset st.failures to 0 on
+// EVERY successful (re)start, so backoffDelayFor(1) -- the base delay --
+// was recomputed after every single crash, and handleStableRun's
+// stable-run reset (which already implements the behavior the brief asked
+// for) was unreachable dead code.
+func TestManagerCrashBackoffEscalates(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t) // this suite's backoffBase=60ms, backoffCap=500ms
+
+	m := newTestManager(t, allowlistPolicy())
+
+	invocationLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true // so each backoff-fire automatically retries (wantUp requires pending>0 || Pinned || force_running)
+	spec.Args = stubArgs(0, 20*time.Millisecond, 1, invocationLog)
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	const window = 2 * time.Second
+	time.Sleep(window)
+
+	got := countInvocations(t, invocationLog)
+	// Constant (buggy) backoff: ~20ms crash + ~60ms base delay per cycle =>
+	// roughly 20-25 restarts in 2s. True escalation (60,120,240,480,500,500
+	// ms, capped) => roughly 5 restarts in the same window. 15 cleanly
+	// separates the two without being timing-fragile.
+	const maxWithEscalation = 15
+	if got > maxWithEscalation {
+		t.Fatalf("invocation count = %d within %s, want <= %d -- BUG I1: st.failures is reset to 0 on every successful start, so every crash computes the same base backoff delay instead of escalating", got, window, maxWithEscalation)
+	}
+}
+
+// TestManagerStartFailedRetriesWhenPinned is I2(a): a pinned spec whose
+// start never becomes healthy must still be retried automatically, not go
+// permanently dead after one failure. Before the fix, StateStartFailed had
+// no backoff scheduled at all, so a pinned spec sat in start_failed forever
+// until an unrelated config edit.
+func TestManagerStartFailedRetriesWhenPinned(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.Args = stubArgs(10*time.Second, 0, 0, "") // health never arrives
+	spec.StartupTimeoutSeconds = 1
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 3*time.Second, "first start failure observed", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.LastError != nil && st.LastError.Failures >= 1
+	})
+
+	waitUntil(t, 6*time.Second, "a SECOND start failure observed after backoff", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.LastError != nil && st.LastError.Failures >= 2
+	})
+}
+
+// TestManagerStartFailedIsRateLimitedForNonPinned is I2(b): a non-pinned
+// spec whose start always fails must not re-exec once per incoming
+// request with no rate limit. Before the fix, every EnsureRunning call
+// against a start_failed spec triggered a brand new exec attempt.
+func TestManagerStartFailedIsRateLimitedForNonPinned(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origBase, origCap := backoffBase, backoffCap
+	// Long enough that a second rapid request must queue, not re-exec.
+	// backoffCap must be raised too -- shrinkTimings leaves it at 500ms,
+	// which would otherwise silently clamp this back down.
+	backoffBase = 5 * time.Second
+	backoffCap = 10 * time.Second
+	defer func() { backoffBase, backoffCap = origBase, origCap }()
+
+	m := newTestManager(t, allowlistPolicy())
+
+	invocationLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(10*time.Second, 0, 0, invocationLog) // health never arrives -> always start_timeout
+	spec.StartupTimeoutSeconds = 1
+	// Deliberately larger than StartupTimeoutSeconds so this test's first
+	// assertion isolates I2(b) even before I3 (the admission-wait timer
+	// wrongly running through startup) is fixed -- otherwise the two timers
+	// could race at ~1s and the first call could return ErrAdmissionBlocked
+	// instead of ErrStartTimeout for an unrelated reason.
+	spec.AdmissionWaitTimeoutSeconds = 3
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 4*time.Second)
+	_, _, err1 := m.EnsureRunning(ctx1, "model-a")
+	cancel1()
+	if !errors.Is(err1, ErrStartTimeout) {
+		t.Fatalf("first EnsureRunning error = %v, want ErrStartTimeout", err1)
+	}
+	if got := countInvocations(t, invocationLog); got != 1 {
+		t.Fatalf("invocation count after the first failed attempt = %d, want 1", got)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	_, _, err2 := m.EnsureRunning(ctx2, "model-a")
+	cancel2()
+	if !errors.Is(err2, ErrAdmissionBlocked) {
+		t.Fatalf("second EnsureRunning error (issued during the still-active 5s backoff) = %v, want ErrAdmissionBlocked (queued, not re-executed)", err2)
+	}
+	if got := countInvocations(t, invocationLog); got != 1 {
+		t.Fatalf("invocation count after a second request during an active backoff = %d, want still 1 -- BUG I2(b): a non-pinned start_failed spec re-execs once per request with no rate limit", got)
+	}
+}
+
+// TestManagerAdmissionWaitDoesNotFireDuringStartup is I3: the brief
+// specifies EnsureRunning may block for admission-wait PLUS startup, but
+// before the fix the admission-wait timer was never cancelled once the
+// target actually started -- so the first request to any cold model
+// slower than its own admission_wait_timeout_seconds got a misleading
+// ErrAdmissionBlocked instead of the endpoint it should have received a
+// few seconds later.
+func TestManagerAdmissionWaitDoesNotFireDuringStartup(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(2*time.Second, 0, 0, "") // healthy at ~2s
+	spec.StartupTimeoutSeconds = 5
+	spec.AdmissionWaitTimeoutSeconds = 1 // shorter than the time-to-healthy
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	endpoint, release, err := m.EnsureRunning(ctx, "model-a")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("EnsureRunning = %v after %s -- BUG I3: the admission-wait timer is never cancelled once the target enters Starting, so it wrongly fires mid-startup instead of letting the caller wait for health", err, elapsed)
+	}
+	defer release()
+	if endpoint == "" {
+		t.Fatal("expected a non-empty endpoint")
+	}
+	if elapsed < 1900*time.Millisecond {
+		t.Errorf("EnsureRunning returned after only %s, want it to have actually waited for the ~2s health delay", elapsed)
+	}
+}
+
+// TestManagerCrashDuringDrainIsClassifiedAsCrashNotStartFailure is I4: a
+// child that exits on its own (not because the owner signalled it) while
+// Draining must still be classified as a crash, since it had already
+// passed its health check and was genuinely serving. Before the fix,
+// onProcExited keyed the classification off the CURRENT state
+// (st.state == StateRunning), which is false while Draining, so this
+// exact scenario was misreported as start_failed with "process exited
+// before becoming healthy" for a process that had been healthy all along.
+func TestManagerCrashDuringDrainIsClassifiedAsCrashNotStartFailure(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 100*time.Millisecond, 7, "")
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	// Do not release: InFlight stays 1, so the drain below cannot terminate
+	// the process immediately -- it must sit in StateDraining, waiting for
+	// InFlight to reach zero, when the scripted crash fires on its own.
+
+	forced := spec
+	forced.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{forced}})
+
+	waitUntil(t, 2*time.Second, "spec-a is Draining", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateDraining
+	})
+
+	waitUntil(t, 3*time.Second, "the crash is eventually reported", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.LastError != nil
+	})
+
+	st := statusFor(m, "spec-a")
+	if st.State != StateCrashed && st.State != StateBackoff {
+		t.Fatalf("State = %v, want crashed (or backoff, immediately after) -- BUG I4: a child that exits on its own while Draining is misclassified as start_failed because onProcExited keys off the CURRENT state instead of whether the process had ever passed a health check", st.State)
+	}
+	if st.LastError == nil || st.LastError.ExitCode != 7 {
+		t.Fatalf("LastError = %+v, want ExitCode=7", st.LastError)
+	}
+	if !strings.Contains(st.LastError.Message, "unexpectedly") {
+		t.Errorf("LastError.Message = %q, want it to say the process crashed unexpectedly, not that it failed to become healthy", st.LastError.Message)
+	}
+}
+
+// TestManagerRejectsReservedEnvKeyPathOrHome is I5 (first of two): a
+// manager-level test that a spec Env key of PATH or HOME -- one of the two
+// refusals that each cost a review round to establish in ExpandPlaceholders
+// -- actually surfaces as ErrNotPermitted/StateNotPermitted THROUGH the
+// Manager, not just at the policy_local unit level.
+func TestManagerRejectsReservedEnvKeyPathOrHome(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Env = map[string]string{"PATH": "/evil"}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := m.EnsureRunning(ctx, "model-a")
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted (spec env key PATH is agent-owned)", err)
+	}
+	st := statusFor(m, "spec-a")
+	if st == nil || st.State != StateNotPermitted {
+		t.Fatalf("Status()[spec-a].State = %+v, want not_permitted", st)
+	}
+}
+
+// TestManagerRejectsAgentOwnEnvNamespaceReference is I5 (second of two):
+// ${AGENT_ENV:OP_AGENT_*} must never reach a spec through the Manager --
+// the exact exfiltration path a prior review round closed in
+// ExpandPlaceholders.
+func TestManagerRejectsAgentOwnEnvNamespaceReference(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Env = map[string]string{"TOKEN": "${AGENT_ENV:OP_AGENT_TOKEN}"}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := m.EnsureRunning(ctx, "model-a")
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted (${AGENT_ENV:OP_AGENT_*} must never reach a spec)", err)
+	}
+	st := statusFor(m, "spec-a")
+	if st == nil || st.State != StateNotPermitted {
+		t.Fatalf("Status()[spec-a].State = %+v, want not_permitted", st)
+	}
+}
+
+// TestManagerNotPermittedRetriesOnNextRequestNotOnApply is the I6 decision
+// recorded as a test: a spec that was StateNotPermitted because of a
+// missing ${AGENT_ENV:...} variable must succeed on the very next
+// EnsureRunning call once the operator sets that variable on the agent
+// host -- WITHOUT requiring an unrelated Apply/ETag change to clear the
+// stuck state. See task-14-report.md's I6 section for the full reasoning.
+func TestManagerNotPermittedRetriesOnNextRequestNotOnApply(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	var tokenSet atomic.Bool
+	getenv := func(name string) string {
+		if name == "HF_TOKEN" && tokenSet.Load() {
+			return "shh"
+		}
+		return ""
+	}
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: getenv})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Env = map[string]string{"HF_TOKEN": "${AGENT_ENV:HF_TOKEN}"}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := m.EnsureRunning(ctx, "model-a")
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("first EnsureRunning error = %v, want ErrNotPermitted (HF_TOKEN not yet set)", err)
+	}
+
+	// The operator fixes it on the AGENT HOST -- no gateway config change,
+	// no Apply call, no ETag change.
+	tokenSet.Store(true)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	endpoint, release, err := m.EnsureRunning(ctx2, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning after the operator fixed the missing env var = %v, want success -- BUG I6: StateNotPermitted must not be sticky across requests when nothing about the SPEC itself needs to change", err)
+	}
+	defer release()
+	if endpoint == "" {
+		t.Fatal("expected a non-empty endpoint")
+	}
+}
+
+// TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange is M1: an
+// Apply that changes spec B must not let spec A's crash backoff skip its
+// current wait. Before the fix, applyConfig's terminal-state reset ran for
+// every spec whenever the overall Config's ETag changed, regardless of
+// whether THAT spec's own fields were touched.
+func TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origBase, origCap := backoffBase, backoffCap
+	// Long enough that an early Stopped would be observable as a bug;
+	// backoffCap must be raised too, or shrinkTimings' 500ms cap would
+	// silently clamp this back down.
+	backoffBase = 3 * time.Second
+	backoffCap = 10 * time.Second
+	defer func() { backoffBase, backoffCap = origBase, origCap }()
+
+	m := newTestManager(t, allowlistPolicy())
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Args = stubArgs(0, 50*time.Millisecond, 1, "")
+	specB := baseSpec("spec-b", "model-b")
+	m.Apply(Config{Specs: []Spec{specA, specB}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a): %v", err)
+	}
+	release()
+
+	waitUntil(t, 2*time.Second, "spec-a reaches backoff", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateBackoff
+	})
+
+	// Touch only spec-b (spec-a's own fields are byte-identical).
+	specBChanged := specB
+	specBChanged.IdleTimeoutSeconds = 42
+	m.Apply(Config{Specs: []Spec{specA, specBChanged}})
+
+	st := statusFor(m, "spec-a")
+	if st.State != StateBackoff {
+		t.Fatalf("spec-a State = %v after an Apply that only touched spec-b, want it to still be backoff -- BUG M1: any config Apply resets every spec's backoff, letting a crash-looping spec skip its wait after an unrelated edit", st.State)
 	}
 }
