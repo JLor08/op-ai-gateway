@@ -88,6 +88,163 @@ type agentTelemetryRequest struct {
 	// nil slice — AgentProxyStatusRegistry.Report treats that as "no routes",
 	// byte-neutral for every pre-existing agent's telemetry.
 	ProxyRoutes []ProxyRouteSample `json:"proxy_routes"`
+	// Runtimes reports the live state of every agent-managed model process
+	// (agent-runtime-manager Task 9): one entry per running/starting/stopped
+	// spec, published to RuntimeStatusRegistry for the portal's live SSE
+	// stream, plus the per-GPU measured VRAM this sample carries (written
+	// back to the store -- see writeBackRuntimeVRAM). Additive: a legacy
+	// payload without it decodes with a nil slice, which publishes an empty
+	// status snapshot -- never an error.
+	Runtimes []agentRuntimeSample `json:"runtimes"`
+}
+
+// agentRuntimeGPUSample is one GPU's measured VRAM inside an
+// agentRuntimeSample, the gateway-side mirror of the agent's per-runtime GPU
+// sample (agent-runtime-manager Task 9). Consumed ONLY by the VRAM
+// write-back (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO,
+// which carries no per-GPU detail.
+type agentRuntimeGPUSample struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
+// agentRuntimeError is one managed process's last failure, as reported inside
+// an agentRuntimeSample. StderrTail is clamped to maxRuntimeStderrTail bytes
+// on ingest -- volatile only (see runtime_registry.go's runtimeStatusRegistry
+// doc): a chatty model server's stderr can carry prompt fragments, so this
+// value is NEVER persisted to the database, only held in the in-memory
+// status registry.
+type agentRuntimeError struct {
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+	ExitCode   int       `json:"exit_code"`
+	Failures   int       `json:"failures"`
+	StderrTail string    `json:"stderr_tail,omitempty"`
+}
+
+// agentRuntimeSample is one agent-managed model process's live state inside
+// the telemetry sample (agent-runtime-manager Task 9, design spec §7/§9):
+// state machine phase, OS-level identifiers, in-flight/restart counters, and
+// the measured VRAM + last-error detail that back the portal's live runtime
+// status stream. SpecID ties it back to the launch spec (runtime-config's
+// AgentRuntimeSpecDTO.ID) the gateway itself handed the agent, so there is no
+// ambiguity about which mapping/model this entry describes even when the
+// agent has not (yet) resolved Model.
+type agentRuntimeSample struct {
+	SpecID    string                  `json:"spec_id"`
+	Model     string                  `json:"model"`
+	State     string                  `json:"state"`
+	Since     time.Time               `json:"since"`
+	PID       int                     `json:"pid,omitempty"`
+	Port      int                     `json:"port,omitempty"`
+	InFlight  int                     `json:"in_flight"`
+	Restarts  int                     `json:"restarts"`
+	GPUs      []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError *agentRuntimeError      `json:"last_error,omitempty"`
+}
+
+// maxRuntimeStderrTail bounds agentRuntimeError.StderrTail on ingest (Task 9
+// brief): a chatty/hostile agent must never be able to grow the in-memory
+// status registry's per-server footprint without bound. Byte-based, like
+// clampHardwareString elsewhere in this file (a truncation mid multi-byte
+// rune is an acceptable trade-off for a diagnostic tail, not user content).
+const maxRuntimeStderrTail = 2048
+
+// clampRuntimeStderrTail truncates an over-long stderr tail to
+// maxRuntimeStderrTail bytes.
+func clampRuntimeStderrTail(s string) string {
+	if len(s) > maxRuntimeStderrTail {
+		return s[:maxRuntimeStderrTail]
+	}
+	return s
+}
+
+// runtimeStatusDTOsFromSamples maps the wire-decoded runtime samples to the
+// registry's RuntimeStatusDTO, clamping each LastError's stderr tail and
+// always returning a non-nil slice (a nil req.Runtimes -- a legacy agent, or
+// simply a fleet with nothing managed yet -- must publish an EMPTY snapshot,
+// not a JSON null, to any live SSE subscriber).
+func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample) []RuntimeStatusDTO {
+	out := make([]RuntimeStatusDTO, 0, len(samples))
+	for _, rt := range samples {
+		dto := RuntimeStatusDTO{
+			SpecID:   rt.SpecID,
+			Model:    rt.Model,
+			State:    rt.State,
+			Since:    rt.Since,
+			PID:      rt.PID,
+			Port:     rt.Port,
+			InFlight: rt.InFlight,
+			Restarts: rt.Restarts,
+		}
+		if rt.LastError != nil {
+			dto.LastError = &RuntimeErrorDTO{
+				Message:    rt.LastError.Message,
+				At:         rt.LastError.At,
+				ExitCode:   rt.LastError.ExitCode,
+				Failures:   rt.LastError.Failures,
+				StderrTail: clampRuntimeStderrTail(rt.LastError.StderrTail),
+			}
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// writeBackRuntimeVRAM writes each sample GPU's measured VRAM back to its
+// launch spec (agent-runtime-manager Task 9) -- but ONLY for a spec the
+// operator has not pinned (VRAMLocked): vram_estimate_mb is operator-owned,
+// vram_measured_mb is agent-owned, and VRAMLocked is the operator's opt-out
+// of the agent overwriting its own estimate. The spec's VRAMLocked flag is
+// resolved with exactly ONE RuntimeSpecByID read per distinct spec_id in the
+// sample (memoized in locked below), not one read per GPU row.
+//
+// Best-effort throughout, matching the "a report is evidence, not a
+// transaction" ingest discipline this whole file follows: a lookup error or
+// an unknown/since-deleted spec (RuntimeSpecByID's ok=false) is logged at
+// Debug and skipped, never returned -- this must NEVER reject the telemetry
+// sample it rode in on. Called only AFTER every store write in
+// ingestTelemetrySample has succeeded.
+func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	locked := make(map[string]bool, len(runtimes))
+	for _, rt := range runtimes {
+		specID := strings.TrimSpace(rt.SpecID)
+		if specID == "" || len(rt.GPUs) == 0 {
+			continue
+		}
+		isLocked, seen := locked[specID]
+		if !seen {
+			spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+			if err != nil {
+				slog.Debug("runtime vram write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+				continue
+			}
+			if !ok {
+				// The spec has since been deleted (or never existed); nothing
+				// to write the measurement back to. Not an error.
+				continue
+			}
+			isLocked = spec.VRAMLocked
+			locked[specID] = isLocked
+		}
+		if isLocked {
+			continue // the operator pinned this spec's VRAM numbers
+		}
+		for _, g := range rt.GPUs {
+			if g.VRAMMeasuredMB <= 0 {
+				continue
+			}
+			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, g.Index, g.VRAMMeasuredMB); err != nil {
+				// Tolerates ErrNotFound (a GPU row deleted out from under an
+				// in-flight sample) the same as any other failure here: log
+				// and move on, never reject the sample.
+				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", g.Index, "err", err)
+			}
+		}
+	}
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's
@@ -362,6 +519,17 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// (PushRuntimeConfig then correctly withholds delivery) rather than
 	// rejecting the whole sample -- see parseAgentCapabilities.
 	s.AgentFeatures.Set(serverID, parseAgentCapabilities(req.Capabilities))
+	// Publish the agent-managed runtime status snapshot (agent-runtime-manager
+	// Task 9) to the volatile status registry the portal's SSE stream reads.
+	// Deliberately AFTER every store write succeeded, mirroring every other
+	// registry update in this block: a report is evidence about what the
+	// agent is running RIGHT NOW, and stamping it while the sample itself
+	// failed to persist would claim freshness the gateway does not have.
+	s.RuntimeStatus.publish(serverID, runtimeStatusDTOsFromSamples(req.Runtimes))
+	// Best-effort write-back of each managed process's measured VRAM onto its
+	// launch spec (skipped for a VRAMLocked spec) -- see writeBackRuntimeVRAM.
+	// Never rejects the sample; a failure here is logged and dropped.
+	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
 	s.maybeFireReactivation(ctx, server)
 	return nil
 }
