@@ -315,6 +315,36 @@ Agent phase COMPLETE (Tasks 11-18):
   sample JSON shape, and deviations:
   `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-18-report.md`.
 
+Agent phase COMPLETE (Tasks 11-18), server-agent module:
+- Task 11 — feature registry, capabilities reporting, version 0.2.0 (`42d420c`)
+- Task 12 — runtime config types + pure admission policy (`5adee5e`)
+- Task 13 — local policy (allowlist, containment) + placeholder expansion (`cfcb98d`)
+- Task 14 — process manager with a serialized admission owner (`28d4b00`)
+- Task 15 — model router port with cold-load heartbeats (`22f0e3a`)
+- Task 16 — config sources: gateway ETag + disk cache, and local file (`a4f5f31`)
+- Task 17 — WS runtime_config push channel, features client, redacted report (`68d46d6`)
+- Task 18 — driver, run-loop wiring, sample fields, VRAM measurer (`eefb222`)
+
+Durable corrections from the agent phase (fold into docs/architecture in the
+documentation task):
+- `${AGENT_ENV:...}` must refuse the agent's own `OP_AGENT_*` namespace. Without
+  that, a portal-authored launch spec could read the agent's gateway bearer token —
+  which authenticates the certificate endpoint that issues a private key — and then
+  act as that agent.
+- A child process receives only its own expanded environment plus `PATH`/`HOME`; a
+  spec env key of `PATH` or `HOME` is refused outright, because allowing an override
+  would reopen the relative-binary resolution path the allowlist closes.
+- "Config unchanged since last fetch" and "config already applied to the manager"
+  are different facts. They diverge across a process restart once the ETag is
+  persisted to disk, so the driver tracks applied-state separately. Conflating them
+  meant the runtime worked only on a fresh agent's first-ever start.
+- The router port authenticates nothing, so its bind host is operator-controlled
+  (`OP_AGENT_RUNTIME_ROUTER_BIND`), defaulting to the mesh identity derived from the
+  TLS leaf's SAN and only then to all interfaces, with a warning naming the setting.
+- Feature negotiation must be continuous, not decided once at boot: a gateway that
+  is down during agent startup must not disable the feature for the process
+  lifetime.
+
 ## Next planned step
 
 1. Continue the plan at Task 19 (frontend: api module, type union, i18n).
