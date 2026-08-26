@@ -48,6 +48,23 @@ Gateway phase in progress:
   returns the FULLY empty document (router_listen 0, max_processes 0, empty
   gpu_budgets too) rather than a partially-populated one — revisit in Task 24
   if a later task needs GPU budgets visible before the application exists.
+- Task 8 — WS `runtime_config` push + feature-gated delivery (`6f75feb`).
+  Report: `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-8-report.md`.
+  `AgentStreamRegistry.NotifyRuntimeConfig` pushes the FULL runtime-config
+  document (never a command/delta) to every open agent connection;
+  `agentFeaturesRegistry`/`runtimeStatusRegistry` (new `runtime_registry.go`)
+  gate delivery on the agent having declared `runtime_manager` and not being
+  in file mode; `ingestTelemetrySample` now parses `capabilities` into the
+  features registry. One notable deviation: the brief's main.go wiring
+  instruction (`portalService.SetRuntimeConfigChangedHook(...)` "in each of
+  the three driver wirings") assumed a pre-CMP-1 main.go shape; this branch's
+  actual `buildRuntime` consolidation leaves no in-scope `portalService`
+  local at the one shared `gateway.New` call site, so a new
+  `portal.UnwrapService` helper recovers the concrete `*portal.Service`
+  through the OTel tracing decorator instead — see the task report for the
+  two rejected alternatives (threading an extra return value through 5
+  functions/12 test call sites; a forward-referencing closure) and why they
+  were rejected.
 
 Durable corrections discovered during execution (fold into docs/architecture in
 Task 24):
@@ -64,10 +81,17 @@ Task 24):
 - A removal operation must never be gated by the same check that guards creation:
   gating `DeleteRuntimeSpec` on the application type stranded specs permanently
   once an application was retyped via the ordinary `UpdateApplication` path.
+- `go test ./internal/gateway/ -race` needs `-timeout 20m` (not the 10m
+  default) on this machine — the package is large and several tests seed a
+  login user via bcrypt (deliberately expensive), which compounds under race
+  instrumentation. A first attempt at the default timeout panics mid-run
+  with no `DATA RACE` reported (a timeout, not a race/deadlock); the retry
+  with `-timeout 20m` passes cleanly in ~800s. Pre-existing, unrelated to
+  Task 8's changes — worth knowing before any later task re-runs this.
 
 ## Next planned step
 
-1. Continue the plan at Task 8 (WS runtime_config push + feature-gated
-   delivery).
-2. Remaining: Tasks 8-10 (gateway), 11-18 (agent), 19-22 (portal UI),
+1. Continue the plan at Task 9 (runtime status snapshot+subscribe stream,
+   extending `runtimeStatusRegistry`).
+2. Remaining: Tasks 9-10 (gateway), 11-18 (agent), 19-22 (portal UI),
    23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
