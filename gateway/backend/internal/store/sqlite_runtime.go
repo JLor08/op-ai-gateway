@@ -134,6 +134,15 @@ func (s *SQLiteStore) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpu
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
 			insert into agent_runtime_spec_gpus (spec_id, gpu_index, vram_estimate_mb, vram_measured_mb)
 			values (?, ?, ?, ?)`), specID, g.GPUIndex, g.VRAMEstimateMB, g.VRAMMeasuredMB); err != nil {
+			// A duplicate GPUIndex within gpus hits the composite primary key
+			// (spec_id, gpu_index) here — a unique violation, not an FK
+			// violation (specID was already existence-checked above, and a
+			// GPU row has no other FK column), so only isUniqueViolation
+			// applies (mirrors UpsertRuntimeSpec/SetCoResidencyRules' error
+			// classification in this file).
+			if s.dl.isUniqueViolation(err) {
+				return ErrConflict
+			}
 			return fmt.Errorf("insert spec gpu: %w", err)
 		}
 	}
@@ -261,6 +270,15 @@ func (s *SQLiteStore) SetServerGPUBudgets(ctx context.Context, serverID string, 
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
 			insert into ai_server_gpu_budgets (server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at)
 			values (?, ?, ?, ?, ?, ?, ?)`), serverID, b.GPUIndex, b.BudgetMB, b.ExpectedUUID, b.ExpectedName, b.CreatedAt, b.UpdatedAt); err != nil {
+			// A duplicate GPUIndex within budgets hits the composite primary
+			// key (server_id, gpu_index) here — a unique violation, not an FK
+			// violation (serverID was already existence-checked above, and a
+			// budget row has no other FK column), so only isUniqueViolation
+			// applies (mirrors UpsertRuntimeSpec/SetCoResidencyRules' error
+			// classification in this file).
+			if s.dl.isUniqueViolation(err) {
+				return ErrConflict
+			}
 			return fmt.Errorf("insert gpu budget: %w", err)
 		}
 	}

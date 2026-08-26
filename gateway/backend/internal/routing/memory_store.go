@@ -2191,6 +2191,17 @@ func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus 
 	if _, ok := m.runtimeSpecs[specID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	// A duplicate GPUIndex within gpus would hit the composite primary key
+	// (spec_id, gpu_index) on the SQL side — reject it here too so both
+	// backends agree (mirrors sqlite_runtime.go's isUniqueViolation
+	// classification for the same insert).
+	seen := make(map[int]struct{}, len(gpus))
+	for _, g := range gpus {
+		if _, dup := seen[g.GPUIndex]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[g.GPUIndex] = struct{}{}
+	}
 	stored := copyRuntimeSpecGPUs(gpus)
 	for i := range stored {
 		stored[i].SpecID = specID
@@ -2307,6 +2318,17 @@ func (m *MemoryStore) SetServerGPUBudgets(_ context.Context, serverID string, bu
 	defer m.mu.Unlock()
 	if _, ok := m.servers[serverID]; !ok {
 		return storeerr.ErrNotFound
+	}
+	// A duplicate GPUIndex within budgets would hit the composite primary
+	// key (server_id, gpu_index) on the SQL side — reject it here too so
+	// both backends agree (mirrors sqlite_runtime.go's isUniqueViolation
+	// classification for the same insert).
+	seen := make(map[int]struct{}, len(budgets))
+	for _, b := range budgets {
+		if _, dup := seen[b.GPUIndex]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[b.GPUIndex] = struct{}{}
 	}
 	stored := make([]ServerGPUBudget, len(budgets))
 	copy(stored, budgets)

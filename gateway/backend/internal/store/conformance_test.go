@@ -7587,6 +7587,22 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", 7, 1); err != ErrNotFound {
 			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
 		}
+		// Duplicate GPUIndex within one set hits the composite primary key
+		// (spec_id, gpu_index) on insert -> ErrConflict (not a wrapped
+		// generic error), mirroring UpsertRuntimeSpec/SetCoResidencyRules'
+		// unique-violation classification in the same file. The failed
+		// transaction must also leave the previous set untouched.
+		dupGPUs := []routing.RuntimeSpecGPU{
+			{SpecID: "rspec_1", GPUIndex: 0, VRAMEstimateMB: 1000},
+			{SpecID: "rspec_1", GPUIndex: 0, VRAMEstimateMB: 2000},
+		}
+		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_1", dupGPUs); err != ErrConflict {
+			t.Fatalf("duplicate gpu_index: want ErrConflict, got %v", err)
+		}
+		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_1")
+		if len(gotGPUs) != 2 || gotGPUs[0].GPUIndex != 0 || gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[1].GPUIndex != 1 {
+			t.Fatalf("failed duplicate-index set must not clobber the previous set: %+v", gotGPUs)
+		}
 		// FK: spec on a missing mapping -> ErrNotFound
 		orphan := spec
 		orphan.ID, orphan.MappingID = "rspec_orphan", "map_missing"
@@ -7724,6 +7740,22 @@ func TestConformanceServerGPUBudgets(t *testing.T) {
 		}
 		if budgets == nil {
 			t.Fatal("cleared read must be non-nil, empty")
+		}
+
+		// Duplicate GPUIndex within one set hits the composite primary key
+		// (server_id, gpu_index) on insert -> ErrConflict (not a wrapped
+		// generic error), mirroring UpsertRuntimeSpec/SetCoResidencyRules'
+		// unique-violation classification in the same file. The failed
+		// transaction must also leave the previous (empty) set untouched.
+		dup := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 1000, CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 2000, CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", dup); err != ErrConflict {
+			t.Fatalf("duplicate gpu_index: want ErrConflict, got %v", err)
+		}
+		if budgets, err := s.ServerGPUBudgets(ctx, "srv_rt"); err != nil || len(budgets) != 0 {
+			t.Fatalf("failed duplicate-index set must not partially apply: %v %+v", err, budgets)
 		}
 
 		// Unknown server -> ErrNotFound.
