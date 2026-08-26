@@ -103,6 +103,31 @@ func withinDir(candidate, dir string) bool {
 // "${...}" is left untouched -- ExpandPlaceholders only owns these two.
 var placeholderPattern = regexp.MustCompile(`\$\{(PORT|AGENT_ENV:[^}]+)\}`)
 
+// nearMissPlaceholderPattern matches ANY "${...}" shape (including an empty
+// body, unlike placeholderPattern's AGENT_ENV alternative) so that residual
+// text left after known-good substitution can be checked for a near-miss.
+var nearMissPlaceholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
+
+// nearMissPlaceholder scans s (the result of substituting every valid
+// ${PORT}/${AGENT_ENV:NAME} occurrence) for a residual "${...}" whose inner
+// text case-insensitively contains PORT or AGENT_ENV, and returns the first
+// such token verbatim, or "" if none is found. This catches typos --
+// ${AGENT_ENVV:HF_TOKEN}, ${PORTX}, ${port}, ${AGENT_ENV:} -- that would
+// otherwise reach the child process as literal, uninterpolated text and fail
+// as a confusing downstream auth or bind error instead of an honest refusal
+// here. Arbitrary "${...}" text unrelated to either token (a model server's
+// own templating syntax) is left untouched -- this function owns only PORT
+// and AGENT_ENV.
+func nearMissPlaceholder(s string) string {
+	for _, m := range nearMissPlaceholderPattern.FindAllString(s, -1) {
+		inner := strings.ToUpper(m[2 : len(m)-1])
+		if strings.Contains(inner, "PORT") || strings.Contains(inner, "AGENT_ENV") {
+			return m
+		}
+	}
+	return ""
+}
+
 // ExpandPlaceholders resolves every ${PORT} and ${AGENT_ENV:NAME} occurrence
 // in spec.Args and spec.Env values, and builds the exact environment the
 // child process will receive.
@@ -130,6 +155,17 @@ var placeholderPattern = regexp.MustCompile(`\$\{(PORT|AGENT_ENV:[^}]+)\}`)
 // of risk Permit's absolute-binary-path requirement exists to close -- so
 // this treats "minimal base" as agent-controlled rather than
 // spec-overridable.
+//
+// A near-miss placeholder -- text shaped like "${...}" whose inner content
+// case-insensitively contains PORT or AGENT_ENV but does not exactly match
+// either supported form (e.g. a typo'd ${AGENT_ENVV:...}, ${PORTX}, the
+// lowercase ${port}, or the empty ${AGENT_ENV:}) is a hard error naming the
+// malformed token, on the same reasoning as the missing-variable error:
+// silently launching with that text as a literal argument produces a
+// confusing downstream auth or bind failure instead of an honest refusal
+// here. Arbitrary OTHER "${...}" text -- a model server's own templating
+// syntax -- still passes through untouched; this function owns only these
+// two tokens.
 func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args []string, env []string, err error) {
 	expand := func(s string) (string, error) {
 		var firstErr error
@@ -155,6 +191,9 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 		})
 		if firstErr != nil {
 			return "", firstErr
+		}
+		if m := nearMissPlaceholder(result); m != "" {
+			return "", fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", m)
 		}
 		return result, nil
 	}

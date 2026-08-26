@@ -386,6 +386,52 @@ func TestExpandPlaceholdersOmitsAbsentBase(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersNearMissErrors pins the judgment call: a typo'd
+// PORT/AGENT_ENV placeholder is not silently passed through like arbitrary
+// templating syntax (a model server's own "${...}" syntax is a real
+// possibility this function must not break) -- it is a confusing downstream
+// auth or bind failure waiting to happen, so it errors up front naming the
+// malformed token instead.
+func TestExpandPlaceholdersNearMissErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"typo'd AGENT_ENV prefix", "${AGENT_ENVV:HF_TOKEN}"},
+		{"typo'd PORT suffix", "${PORTX}"},
+		{"lowercase port", "${port}"},
+		{"empty AGENT_ENV name", "${AGENT_ENV:}"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := Spec{Args: []string{tc.value}}
+			getenv := func(string) string { return "" }
+
+			_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+			if err == nil {
+				t.Fatalf("ExpandPlaceholders(%q) should error as a malformed near-miss placeholder", tc.value)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough proves arbitrary
+// "${...}" text unrelated to PORT/AGENT_ENV still passes through untouched --
+// ExpandPlaceholders only owns those two tokens, and a model server's own
+// templating syntax is a real possibility.
+func TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough(t *testing.T) {
+	spec := Spec{Args: []string{"${FOO}"}}
+	getenv := func(string) string { return "" }
+
+	args, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders(${FOO}) should pass through untouched, got error: %v", err)
+	}
+	if want := []string{"${FOO}"}; !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %#v, want %#v", args, want)
+	}
+}
+
 // envContainsExactly reports whether env (os/exec-shaped "KEY=value"
 // strings) contains EXACTLY the keys/values in want -- no more, no fewer --
 // and no duplicate keys.
