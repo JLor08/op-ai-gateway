@@ -115,6 +115,21 @@ type agentRegistries struct {
 	// exact interface Task 10's switch reconcile consumes), so Retain below
 	// converts the shared live set once per cycle.
 	proxyStatus *gateway.AgentProxyStatusRegistry
+	// runtimeStatus prunes the agent-runtime-manager per-server status/
+	// file-mode registry (agent-runtime-manager Task 9, gateway.
+	// NewRuntimeStatusRegistry). An inline interface, not a named concrete
+	// type: gateway.runtimeStatusRegistry is unexported, so this field can
+	// only ever be spelled structurally -- Go's interface satisfaction is
+	// structural, so the exported constructor's *runtimeStatusRegistry return
+	// value satisfies this without either side needing to name it. Left as
+	// the interface's zero value (nil) in any test/wiring that does not care
+	// about it; the explicit nil check in Retain below guards that (unlike
+	// the other fields here, a nil INTERFACE cannot forward a method call to
+	// a nil-safe receiver -- calling a method on a nil interface panics
+	// regardless of the underlying method's own nil-receiver handling).
+	runtimeStatus interface {
+		Retain(live map[string]struct{})
+	}
 }
 
 func (a agentRegistries) ReportingWithin(serverID string, window time.Duration) bool {
@@ -125,6 +140,9 @@ func (a agentRegistries) Retain(live map[string]struct{}) {
 	a.presence.Retain(live)
 	a.certReports.Retain(live)
 	a.transport.Retain(live)
+	if a.runtimeStatus != nil {
+		a.runtimeStatus.Retain(live)
+	}
 	liveBool := make(map[string]bool, len(live))
 	for id := range live {
 		liveBool[id] = true

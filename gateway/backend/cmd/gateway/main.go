@@ -851,6 +851,13 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// TLS-proxy routes (agent_proxy_status.go), the switch reconcile reads it,
 	// and the app-health loop prunes it to live servers.
 	agentProxyStatus := gateway.NewAgentProxyStatusRegistry()
+	// runtimeStatus is ONE shared registry too (agent-runtime-manager Task 9):
+	// the agent-telemetry ingest path publishes each managed process's live
+	// status to it and flips its per-server file-mode flag on a runtime
+	// report, the portal's runtime-status SSE stream (ServerDeps) subscribes
+	// to it, and the app-health loop prunes it to live servers -- same shape
+	// as agentProxyStatus/agentCertReports/agentTransport above.
+	runtimeStatus := gateway.NewRuntimeStatusRegistry()
 	// agentStreams is ONE shared registry too: handleAgentStream (ServerDeps)
 	// registers/deregisters each open agent WebSocket connection, and the
 	// OnCertificateIssued hook below pushes a cert_update doorbell to it
@@ -958,7 +965,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		syncer:       portalService,
 		registry:     appHealth,
 		loaded:       loadedModels,
-		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus},
+		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus},
 		groups:       groups,
 		settings:     b.SystemSettings,
 		probeTimeout: cfg.AppHealthProbeTimeout,
@@ -1048,6 +1055,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentTransport:                  agentTransport,
 		AgentProxyStatus:                agentProxyStatus,
 		AgentStreams:                    agentStreams,
+		RuntimeStatus:                   runtimeStatus,
 		Benchmarks:                      gateway.NewBenchmarkRegistry(),
 		Groups:                          groups,
 		Users:                           b.Users,
