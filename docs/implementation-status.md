@@ -85,6 +85,24 @@ Gateway phase in progress:
   (`internal/portal/api_tracing.go` and its test no longer exist) — the
   `ServerDeps.SetRuntimeConfigChangedHook` field above is the sanctioned
   seam instead.
+- Task 9 — runtime status ingest, VRAM write-back, file-mode report ingest
+  (POST + WS), portal report view + live status SSE (`09d85f0`, `595affb`,
+  `3942aa3`, `b5f33f7`, `9be204c`). Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-9-report.md`.
+  `-race -timeout 20m` on `internal/gateway` reconfirmed clean at 803s,
+  matching Task 8's baseline. New store method `RuntimeSpecByID`
+  (conformance-tested on sqlite, memory, and a real local PostgreSQL
+  container). Redaction of a file-mode report's `env` values is structural
+  (re-parse into a fully-typed mirror of the runtime-config schema, mask,
+  re-marshal — an unmodeled field is dropped for free), not a string scan.
+  One deliberate scope expansion beyond the task's file list: wired
+  `runtimeStatusRegistry.Retain` into `cmd/gateway/main.go` +
+  `cmd/gateway/app_health.go`'s per-cycle pruning (an exported
+  `gateway.NewRuntimeStatusRegistry()` + an anonymous-interface field on
+  `agentRegistries`, since the concrete type is unexported) — the
+  "OTHER HOUSE PATTERNS" note about per-server registry leaks turned out to
+  have a small, worthwhile fix once traced through, see the task report's
+  deviation #2 for the full rationale and the reviewer note.
 
 Durable corrections discovered during execution (fold into docs/architecture in
 Task 24):
@@ -111,7 +129,6 @@ Task 24):
 
 ## Next planned step
 
-1. Continue the plan at Task 9 (runtime status snapshot+subscribe stream,
-   extending `runtimeStatusRegistry`).
-2. Remaining: Tasks 9-10 (gateway), 11-18 (agent), 19-22 (portal UI),
+1. Continue the plan at Task 10.
+2. Remaining: Task 10 (gateway), 11-18 (agent), 19-22 (portal UI),
    23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
