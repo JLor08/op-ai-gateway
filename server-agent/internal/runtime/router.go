@@ -1,0 +1,588 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+// This file is the router port (design doc §6.1): the single HTTP port the
+// gateway talks to for a server_agent application, which routes every
+// inference request to the right managed model process, starting it first
+// if necessary. Three route classes:
+//
+//   - GET /health, GET /v1/health -- always 200 while the router is up.
+//     "Reachability means the router accepts, not that a model is warm" --
+//     otherwise a cold server falls out of routing (the gateway's
+//     application health probe has a 3s timeout and flips an application
+//     unreachable after ONE failed cycle) and can never warm up.
+//   - GET /running, GET /v1/models -- the currently-loaded set (llama-swap
+//     shape) and the full managed set including cold specs (OpenAI shape),
+//     respectively. Neither blocks on anything a model is doing: both read
+//     straight off Manager's already-non-blocking Status()/LoadedModels()
+//     (Task 14's serialized owner answers these on its own command channel,
+//     interleaved with -- never behind -- a pending admission/start).
+//   - everything else -- the model-routed reverse proxy.
+//
+// STREAMING ASYMMETRY (the whole point of this design): request bodies are
+// buffered (bounded by maxBodyBytes) because `model`/`stream` must be read
+// out of the JSON before the router knows where to send it. Responses are
+// NEVER buffered -- httputil.ReverseProxy with FlushInterval:-1 for the
+// plain path, and a hand-rolled splice-with-heartbeat loop for the streaming
+// path, both flush after every write so SSE tokens (and any other streamed
+// bytes) reach the client as they are produced.
+//
+// COLD-START HEARTBEATS (design doc §8.3): a request with "stream":true
+// commits 200 + SSE headers immediately, before EnsureRunning is even
+// called -- deterministically, not as a race against how fast the eventual
+// outcome happens to arrive, since a fast failure (a misconfigured binary)
+// must be just as "already committed" as a slow one (a 70B cold load). From
+// that point until the child's response produces its first body byte, a
+// `: keepalive` SSE comment is emitted on every heartbeatInterval tick --
+// this covers BOTH the cold-start wait (EnsureRunning pending) and a
+// time-to-first-token wait on an already-warm child (the upstream request
+// pending), which the design doc treats as the same "silent window" failure
+// class. Once real bytes start flowing, heartbeats stop for good and the
+// upstream body is spliced through verbatim -- the router never re-frames
+// the child's own SSE lines.
+//
+// ACCEPTED TRADE-OFF, deliberately implemented and documented here (design
+// doc §8.3, §15): once 200 has been committed for a streaming request, no
+// later failure -- EnsureRunning erroring, the child returning a non-2xx
+// status, the child dying mid-response -- can be reported as an HTTP status
+// any more. Each is instead reported as a terminal SSE frame
+// (`data: {"error":{"code":"...","message":"..."}}\n\n`) carrying the exact
+// same stable code the non-streaming path would have used for that failure
+// (§6.5's sentinel table, reproduced in sentinelCode below).
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"time"
+)
+
+// maxBodyBytes bounds the buffered read of an inbound request body (needed
+// to extract `model`/`stream` before the destination is known). A request
+// body beyond this is rejected with 413 before any admission decision is
+// even attempted.
+const maxBodyBytes = 32 << 20
+
+// heartbeatInterval is the cadence of `: keepalive` SSE comment lines during
+// a streaming request's silent window (cold start or time-to-first-token).
+// Package-level var, not const, so a test can shrink it -- the
+// manager.go/client.backoffBase/certinstall.hookTimeout convention this
+// module already follows throughout.
+var heartbeatInterval = 10 * time.Second
+
+// hopByHopHeaders are stripped from the outbound request the router builds
+// by hand for the streaming path (RFC 7230 §6.1). httputil.ReverseProxy
+// already does this internally for the plain path; this list exists only
+// because the streaming path bypasses ReverseProxy to interleave heartbeats
+// with the upstream round trip.
+var hopByHopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+// managerPort is the router's view of *Manager: deliberately small and
+// unexported so a hand-written fake can stand in wherever a test needs to
+// observe or control something the real Manager+stub-child combination
+// cannot easily produce (this module's house pattern -- no mocking
+// framework is used or added; see e.g. router_test.go's countingManager,
+// which wraps a real Manager to count release() calls independently of the
+// real EnsureRunning's own internal idempotency guard). nil is a valid
+// managerPort: every handler below treats "no manager" as "nothing is
+// managed" rather than panicking.
+type managerPort interface {
+	EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	LoadedModels() []string
+	Status() []Status
+}
+
+// NewRouter returns the router-port handler. The router serves BOTH
+// "/health" and "/v1/health" as always-200 liveness paths (the agent does not
+// know which HealthCheckPath the gateway application row configures, so it
+// answers both; the portal's server_agent type default is "/v1/health").
+func NewRouter(m *Manager) http.Handler {
+	return newRouter(m)
+}
+
+// router is the concrete handler behind NewRouter; split out from it so
+// tests can construct one directly over a managerPort fake without going
+// through the exported *Manager-typed constructor.
+type router struct {
+	m managerPort
+	// transport is shared by every proxied request (plain and streaming
+	// alike): a bare http.Transport with no timeouts of its own -- the
+	// gateway owns request deadlines end to end, per the design doc's own
+	// framing of this feature as a component that must never add a new
+	// timer to that chain.
+	transport http.RoundTripper
+}
+
+func newRouter(m managerPort) *router {
+	return &router{
+		m:         m,
+		transport: &http.Transport{},
+	}
+}
+
+func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/health", "/v1/health":
+		rt.serveHealth(w, r)
+	case "/running":
+		rt.serveRunning(w, r)
+	case "/v1/models":
+		rt.serveModels(w, r)
+	default:
+		rt.serveProxy(w, r)
+	}
+}
+
+// healthResponse is served unconditionally: liveness means "the router
+// accepts", never "a model is warm". See the package doc above for why this
+// must never block.
+type healthResponse struct {
+	Status string `json:"status"`
+}
+
+func (rt *router) serveHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+}
+
+// runningEntry/runningResponse mirror llama-swap's /running shape exactly,
+// so the gateway's existing LoadedModelsFormat:"llama_swap" detection keeps
+// working unchanged against a server_agent application.
+type runningEntry struct {
+	Model string `json:"model"`
+	State string `json:"state"`
+}
+
+type runningResponse struct {
+	Running []runningEntry `json:"running"`
+}
+
+func (rt *router) serveRunning(w http.ResponseWriter, _ *http.Request) {
+	var loaded []string
+	if rt.m != nil {
+		loaded = rt.m.LoadedModels()
+	}
+	entries := make([]runningEntry, 0, len(loaded))
+	for _, name := range loaded {
+		entries = append(entries, runningEntry{Model: name, State: "ready"})
+	}
+	writeJSON(w, http.StatusOK, runningResponse{Running: entries})
+}
+
+// modelEntry/modelsResponse mirror the OpenAI /v1/models list shape. Unlike
+// /running, this lists EVERY managed (enabled) spec -- cold ones included --
+// since they are servable on demand; the gateway's model-sync health mode
+// and model listing both read this endpoint expecting the full set.
+type modelEntry struct {
+	ID     string `json:"id"`
+	Object string `json:"object"`
+}
+
+type modelsResponse struct {
+	Object string       `json:"object"`
+	Data   []modelEntry `json:"data"`
+}
+
+func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
+	var statuses []Status
+	if rt.m != nil {
+		statuses = rt.m.Status()
+	}
+	data := make([]modelEntry, 0, len(statuses))
+	for _, st := range statuses {
+		data = append(data, modelEntry{ID: st.Model, Object: "model"})
+	}
+	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
+}
+
+// modelStreamPeek is the minimal shape the router reads out of a proxied
+// request body: just enough to route it and decide whether to heartbeat.
+// Every other field of the real request (OpenAI/Anthropic-shaped or
+// otherwise) passes through untouched, byte for byte.
+type modelStreamPeek struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
+// serveProxy is the model-routed reverse proxy: every request that is not
+// one of the three fixed control paths above. It buffers the body (bounded),
+// extracts model/stream, and hands off to the plain or streaming path.
+func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "runtime.request_too_large",
+				fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+			return
+		}
+		writeSentinelError(w, fmt.Errorf("runtime: read request body: %w", err))
+		return
+	}
+
+	var peek modelStreamPeek
+	if err := json.Unmarshal(body, &peek); err != nil || peek.Model == "" {
+		writeError(w, http.StatusNotFound, "runtime.model_not_managed", "request body does not name a managed model")
+		return
+	}
+
+	if peek.Stream {
+		rt.serveStreamProxy(w, r, peek.Model, body)
+		return
+	}
+	rt.servePlainProxy(w, r, peek.Model, body)
+}
+
+// servePlainProxy handles a non-streaming request: EnsureRunning, map any
+// pre-forward failure via the sentinel table, otherwise reverse-proxy with
+// immediate per-write flushing (never buffer the response -- this holds for
+// EVERY proxied response, streaming or not: TestRouterNoResponseBuffering
+// exercises exactly this path).
+func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
+	if rt.m == nil {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	defer release()
+
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		// endpoint is always manager-produced ("http://127.0.0.1:<port>");
+		// a parse failure here would be an internal bug, not a
+		// client-facing condition, but there is no HTTP status left to
+		// invent for it beyond the generic upstream-gone mapping.
+		writeSentinelError(w, fmt.Errorf("runtime: invalid upstream endpoint %q: %w", endpoint, err))
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = rt.transport
+	proxy.FlushInterval = -1 // flush after every write; never buffer a streamed response
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		slog.Warn("runtime: router upstream request failed", "model", model, "error", err)
+		writeSentinelError(w, fmt.Errorf("runtime: upstream request failed: %w", err))
+	}
+
+	outReq := r.Clone(r.Context())
+	outReq.Body = io.NopCloser(bytes.NewReader(body))
+	outReq.ContentLength = int64(len(body))
+	proxy.ServeHTTP(w, outReq)
+}
+
+// serveStreamProxy handles a "stream":true request: commits 200 + SSE
+// headers unconditionally (see the package doc's COLD-START HEARTBEATS
+// section for why this is unconditional rather than a race against how fast
+// the eventual outcome arrives), then heartbeats through EnsureRunning and
+// the upstream round trip until the first real response byte, then splices
+// the remainder through verbatim.
+func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
+	flusher, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	if rt.m == nil {
+		writeSSEError(w, flusher, ErrModelNotManaged)
+		return
+	}
+
+	type ensureResult struct {
+		endpoint string
+		release  func()
+		err      error
+	}
+	ensureCh := make(chan ensureResult, 1)
+	go func() {
+		endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+		ensureCh <- ensureResult{endpoint: endpoint, release: release, err: err}
+	}()
+	eres := heartbeatWait(ticker, ensureCh, w, flusher)
+	if eres.err != nil {
+		writeSSEError(w, flusher, eres.err)
+		return
+	}
+	defer eres.release()
+
+	outReq, err := rt.buildUpstreamRequest(r, eres.endpoint, body)
+	if err != nil {
+		writeSSEError(w, flusher, fmt.Errorf("runtime: build upstream request: %w", err))
+		return
+	}
+
+	type roundTripResult struct {
+		resp *http.Response
+		err  error
+	}
+	rtCh := make(chan roundTripResult, 1)
+	go func() {
+		resp, err := rt.transport.RoundTrip(outReq)
+		rtCh <- roundTripResult{resp: resp, err: err}
+	}()
+	rres := heartbeatWait(ticker, rtCh, w, flusher)
+	if rres.err != nil {
+		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream request failed: %w", rres.err))
+		return
+	}
+	resp := rres.resp
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
+		return
+	}
+
+	// Wait for the first body byte with heartbeats still ticking (a warm
+	// child's time-to-first-token is the same silent-window class as a cold
+	// start, design doc §8); once it arrives, heartbeats stop for good and
+	// the rest is spliced through verbatim -- never re-framed.
+	type readResult struct {
+		n   int
+		err error
+	}
+	buf := make([]byte, 32*1024)
+	firstCh := make(chan readResult, 1)
+	go func() {
+		n, err := resp.Body.Read(buf)
+		firstCh <- readResult{n: n, err: err}
+	}()
+	fres := heartbeatWaitCtx(r.Context(), ticker, firstCh, w, flusher, resp.Body)
+	if fres.n > 0 {
+		if _, werr := w.Write(buf[:fres.n]); werr != nil {
+			return // client gone; nothing further to do
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	if fres.err != nil {
+		if !errors.Is(fres.err, io.EOF) {
+			writeSSEError(w, flusher, fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
+		}
+		return
+	}
+
+	fw := flushWriter{w: w, f: flusher}
+	if err := spliceWithCancel(r.Context(), fw, resp.Body); err != nil {
+		// The child died mid-response after already sending real bytes: no
+		// HTTP status is available any more (spent long ago), but an SSE
+		// client can still parse one more terminal frame appended after
+		// legitimate data -- design doc §6.4 "child dies mid-request".
+		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream body read failed: %w", err))
+	}
+}
+
+// heartbeatWait blocks until resultCh yields a value, writing a `:
+// keepalive\n\n` SSE comment on every tick of ticker in the meantime. ticker
+// is shared across every phase of one streaming request (EnsureRunning, the
+// upstream round trip, the wait for the first body byte) so the interval
+// keeps counting continuously across phase boundaries instead of resetting
+// at each one.
+//
+// Used only for phases where abandoning the wait early is NOT safe: in
+// particular the EnsureRunning phase, where a client disconnecting cannot
+// simply be treated as "done" -- if EnsureRunning goes on to succeed anyway
+// (a narrow but real race between admission completing and the caller's ctx
+// firing, which EnsureRunning itself resolves cleanly either way), the
+// resulting release() MUST still be called or the spec becomes permanently
+// un-evictable (EnsureRunning's own doc comment). See heartbeatWaitCtx for
+// the phases where early abandonment is safe.
+func heartbeatWait[T any](ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher) T {
+	for {
+		select {
+		case v := <-resultCh:
+			return v
+		case <-ticker.C:
+			writeHeartbeat(w, flusher)
+		}
+	}
+}
+
+// heartbeatWaitCtx is heartbeatWait's cancellation-aware sibling, for the
+// phases where the producer feeding resultCh is blocked on body reading a
+// live *http.Response and abandoning the wait early IS safe: closing body
+// unblocks the producer's pending Read with an error, resultCh still always
+// yields a value (the producer is never abandoned/leaked), and there is no
+// release() at stake here (that already happened, or never will, in the
+// EnsureRunning phase above). This exists because relying on ctx
+// cancellation to propagate all the way through an *already-returned*
+// http.Transport.RoundTrip's response-body reads turned out, empirically
+// (TestRouterReleaseCalledExactlyOnce/client_disconnect_midstream), not to
+// be prompt enough on its own -- explicitly closing body on ctx.Done() is
+// the reliable version of the same idea.
+func heartbeatWaitCtx[T any](ctx context.Context, ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher, body io.Closer) T {
+	for {
+		select {
+		case v := <-resultCh:
+			return v
+		case <-ticker.C:
+			writeHeartbeat(w, flusher)
+		case <-ctx.Done():
+			body.Close() //nolint:errcheck // best-effort: only unblocking a pending Read, not reporting an outcome
+			return <-resultCh
+		}
+	}
+}
+
+// spliceWithCancel copies src to dst until EOF, an error, or ctx firing --
+// in which case src is closed to unblock the copy promptly rather than
+// leaving it to whatever latency the underlying transport's own ctx
+// awareness happens to have (see heartbeatWaitCtx). A client disconnect
+// (ctx firing) is reported as no error: there is no one left to report an
+// error TO, and it is not an upstream failure.
+func spliceWithCancel(ctx context.Context, dst io.Writer, src io.ReadCloser) error {
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(dst, src)
+		copyDone <- err
+	}()
+	select {
+	case err := <-copyDone:
+		return err
+	case <-ctx.Done():
+		src.Close() //nolint:errcheck // best-effort: only unblocking the pending Read
+		<-copyDone  // drain so the goroutine above is never leaked
+		return nil
+	}
+}
+
+func writeHeartbeat(w http.ResponseWriter, flusher http.Flusher) {
+	if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+		return // client gone; the next resultCh receive will still resolve and release() will still run
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// writeSSEError emits the terminal SSE error frame described in the package
+// doc's ACCEPTED TRADE-OFF section: the same stable §6.5 code the
+// non-streaming path would have used for err, carried in-stream since the
+// HTTP status was already committed.
+func writeSSEError(w http.ResponseWriter, flusher http.Flusher, err error) {
+	code, _ := sentinelCode(err)
+	payload, marshalErr := json.Marshal(errorEnvelope{Error: errorBody{Code: code, Message: err.Error()}})
+	if marshalErr != nil {
+		return // cannot happen for this static shape; nothing sensible to do if it somehow did
+	}
+	if _, werr := fmt.Fprintf(w, "data: %s\n\n", payload); werr != nil {
+		return
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// buildUpstreamRequest constructs the outbound request for the streaming
+// path (the plain path delegates this to httputil.ReverseProxy instead):
+// method, path, and query preserved verbatim, hop-by-hop headers stripped,
+// body replaced with the already-buffered bytes.
+func (rt *router) buildUpstreamRequest(r *http.Request, endpoint string, body []byte) (*http.Request, error) {
+	target := endpoint + r.URL.Path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = r.Header.Clone()
+	for _, h := range hopByHopHeaders {
+		req.Header.Del(h)
+	}
+	req.Header.Del("Content-Length") // req.ContentLength (set below) is authoritative for the buffered body
+	req.ContentLength = int64(len(body))
+	return req, nil
+}
+
+// flushWriter flushes the underlying ResponseWriter after every Write, so
+// io.Copy never accumulates bytes the client hasn't seen yet.
+type flushWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+// errorEnvelope/errorBody reproduce the gateway's HTTP error envelope by
+// hand: this module imports nothing from the gateway (op-ai-server-agent is
+// a standalone module), so the shape is duplicated deliberately -- the same
+// choice internal/client/ws.go already makes for the WebSocket frame
+// envelope (see streamFrame there).
+type errorEnvelope struct {
+	Error errorBody `json:"error"`
+}
+
+type errorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// sentinelCode maps a Manager error to the design doc §6.5 stable wire code
+// and HTTP status. Any error that is not one of the five named sentinels
+// (including a raw upstream connection failure or non-2xx status, which
+// carry no Manager sentinel of their own) falls through to
+// runtime.upstream_gone/502 -- the same code the design doc assigns to "the
+// child died during the request", which is the closest fit for "something
+// went wrong reaching or using an otherwise-admitted child".
+func sentinelCode(err error) (code string, status int) {
+	switch {
+	case errors.Is(err, ErrModelNotManaged):
+		return "runtime.model_not_managed", http.StatusNotFound
+	case errors.Is(err, ErrStartFailed):
+		return "runtime.start_failed", http.StatusBadGateway
+	case errors.Is(err, ErrStartTimeout):
+		return "runtime.start_timeout", http.StatusGatewayTimeout
+	case errors.Is(err, ErrAdmissionBlocked):
+		return "runtime.admission_blocked", http.StatusServiceUnavailable
+	case errors.Is(err, ErrNotPermitted):
+		return "runtime.not_permitted", http.StatusBadGateway
+	default:
+		return "runtime.upstream_gone", http.StatusBadGateway
+	}
+}
+
+// writeSentinelError writes err's sentinelCode mapping as the JSON error
+// envelope -- the shared implementation behind every pre-forward failure in
+// the non-streaming path.
+func writeSentinelError(w http.ResponseWriter, err error) {
+	code, status := sentinelCode(err)
+	writeError(w, status, code, err.Error())
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body) //nolint:errcheck // best-effort: the client may already be gone
+}
