@@ -48,23 +48,43 @@ Gateway phase in progress:
   returns the FULLY empty document (router_listen 0, max_processes 0, empty
   gpu_budgets too) rather than a partially-populated one — revisit in Task 24
   if a later task needs GPU budgets visible before the application exists.
-- Task 8 — WS `runtime_config` push + feature-gated delivery (`6f75feb`).
-  Report: `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-8-report.md`.
+- Task 8 — WS `runtime_config` push + feature-gated delivery (`6f75feb`,
+  reworked in `575d14a`, timeout/doc fix in `6c16caf`). Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-8-report.md`.
   `AgentStreamRegistry.NotifyRuntimeConfig` pushes the FULL runtime-config
   document (never a command/delta) to every open agent connection;
   `agentFeaturesRegistry`/`runtimeStatusRegistry` (new `runtime_registry.go`)
   gate delivery on the agent having declared `runtime_manager` and not being
   in file mode; `ingestTelemetrySample` now parses `capabilities` into the
-  features registry. One notable deviation: the brief's main.go wiring
-  instruction (`portalService.SetRuntimeConfigChangedHook(...)` "in each of
-  the three driver wirings") assumed a pre-CMP-1 main.go shape; this branch's
-  actual `buildRuntime` consolidation leaves no in-scope `portalService`
-  local at the one shared `gateway.New` call site, so a new
-  `portal.UnwrapService` helper recovers the concrete `*portal.Service`
-  through the OTel tracing decorator instead — see the task report for the
-  two rejected alternatives (threading an extra return value through 5
-  functions/12 test call sites; a forward-referencing closure) and why they
-  were rejected.
+  features registry; `Server.PushRuntimeConfig` bounds its
+  `s.Portal.AgentRuntimeConfig` store read with a 5s timeout (never
+  `context.Background()` unbounded — one goroutine is spawned per portal
+  write, so an unbounded call could accumulate them under sustained write
+  pressure).
+  **main.go wiring, as actually shipped:** the brief's instruction
+  (`portalService.SetRuntimeConfigChangedHook(...)` "in each of the three
+  driver wirings") assumed a pre-CMP-1 main.go shape; this branch's actual
+  `buildRuntime` consolidation leaves no in-scope `portalService` local at
+  the one shared `gateway.New` call site. The setter is instead handed
+  forward as a plain function value: `gateway.ServerDeps` carries a new
+  `SetRuntimeConfigChangedHook func(func(serverID string))` field, set in
+  `buildRuntime` (`deps.SetRuntimeConfigChangedHook =
+  portalService.SetRuntimeConfigChangedHook`, right where `portalService` is
+  already in scope building `ServerDeps.Portal`) and invoked in
+  `buildGatewayServer` immediately after `gateway.New` returns
+  (`deps.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)`). The `Server`
+  itself never sees `*portal.Service`.
+  **Tried and rejected: do not re-attempt.** An earlier version of this
+  wiring added `portal.UnwrapService(api API) *Service`, which reached
+  through the generated OTel tracing decorator (`api_tracing_gen.go`) to
+  recover the concrete `*portal.Service` from `srv.Portal`. Review rejected
+  it: it defeats the exact interface boundary `Portal portal.API` exists to
+  enforce, breaks silently under a decorator change or a second layer of
+  wrapping, and adds permanent public API surface whose only purpose was
+  working around this one wiring-order gap. It has been deleted
+  (`internal/portal/api_tracing.go` and its test no longer exist) — the
+  `ServerDeps.SetRuntimeConfigChangedHook` field above is the sanctioned
+  seam instead.
 
 Durable corrections discovered during execution (fold into docs/architecture in
 Task 24):
