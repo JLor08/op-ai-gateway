@@ -5,6 +5,8 @@ package portal
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/auth"
@@ -672,4 +674,259 @@ func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
 	}
+}
+
+// --- Task 7: agent runtime-config assembly ----------------------------------
+
+// AgentRuntimeSpecGPUDTO is one per-GPU VRAM row inside a runtime-config spec
+// (GET /api/agent/v1/runtime-config). VRAMMB is the single number the agent
+// needs: the MEASURED value when known, else the operator's ESTIMATE -- see
+// AgentRuntimeConfig's VRAM-selection rule. 0 means unknown either way,
+// mirroring RuntimeSpecGPUDTO's two source fields.
+type AgentRuntimeSpecGPUDTO struct {
+	Index  int `json:"index"`
+	VRAMMB int `json:"vram_mb"`
+}
+
+// AgentRuntimeSpecDTO is one ENABLED launch spec inside the runtime-config
+// document -- everything the agent needs to exec and supervise the process.
+// Model/UpstreamModel fold in the owning ModelMapping's two model-name
+// fields (gateway_model_name / app_model_name), since the agent has no other
+// way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}
+// placeholders the agent resolves locally from its own environment -- this
+// DTO, like RuntimeSpecDTO, passes them through untouched: never validated or
+// rewritten here.
+type AgentRuntimeSpecDTO struct {
+	ID                          string                   `json:"id"`
+	Model                       string                   `json:"model"`
+	UpstreamModel               string                   `json:"upstream_model"`
+	Binary                      string                   `json:"binary"`
+	Args                        []string                 `json:"args"`
+	Env                         map[string]string        `json:"env"`
+	WorkDir                     string                   `json:"work_dir,omitempty"`
+	GPUs                        []AgentRuntimeSpecGPUDTO `json:"gpus"`
+	ListenPort                  int                      `json:"listen_port"`
+	HealthPath                  string                   `json:"health_path"`
+	HealthTimeoutSeconds        int                      `json:"health_timeout_seconds"`
+	StartupTimeoutSeconds       int                      `json:"startup_timeout_seconds"`
+	IdleTimeoutSeconds          int                      `json:"idle_timeout_seconds"`
+	AdmissionWaitTimeoutSeconds int                      `json:"admission_wait_timeout_seconds"`
+	Pinned                      bool                     `json:"pinned"`
+	AdminState                  string                   `json:"admin_state"`
+}
+
+// AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
+// document -- mirrors GPUBudgetDTO but drops the portal-only drift-detector
+// fields (expected_uuid/expected_name) the agent has no use for.
+type AgentGPUBudgetDTO struct {
+	Index    int `json:"index"`
+	BudgetMB int `json:"budget_mb"`
+}
+
+// AgentRuntimeConfigDTO is the desired agent-managed runtime state for ONE
+// server (GET /api/agent/v1/runtime-config, spec §11): which model processes
+// may run, with what command line, on which GPUs, which pairs may be
+// co-resident, and the per-GPU VRAM budgets. ETag is a sha256 hex digest over
+// the document with ETag itself blanked (agentRuntimeConfigETag) -- the
+// agent's conditional-GET validator, and (per the design spec) doubles as the
+// WS push / file-mode schema version.
+type AgentRuntimeConfigDTO struct {
+	RouterListen int                   `json:"router_listen"`
+	MaxProcesses int                   `json:"max_processes"`
+	GPUBudgets   []AgentGPUBudgetDTO   `json:"gpu_budgets"`
+	Specs        []AgentRuntimeSpecDTO `json:"specs"`
+	Coresident   [][2]string           `json:"coresident"`
+	ETag         string                `json:"etag"`
+}
+
+// AgentRuntimeConfig derives serverID's runtime-config document -- the server
+// the caller's agent token is bound to. The caller (the gateway handler) has
+// already resolved serverID from that token via authenticateAgent; there is
+// deliberately no parameter here that could redirect the lookup, mirroring
+// AgentProxyRoutes.
+//
+// RouterListen is the Port of serverID's server_agent Application (the design
+// decision: one Application row per server backs the agent's single router
+// port -- see the agent-runtime-manager spec §2). A server with no
+// server_agent application -- the agent polling before anything is
+// configured -- gets the fully empty document: no router to listen on means
+// nothing else in the document is meaningful either, the same safe-empty
+// posture as AgentProxyRoutes' out-of-scope case.
+//
+// Only ENABLED specs are included (a disabled spec is nothing the agent
+// should ever run). Coresidency pairs are stored as MAPPING id pairs
+// (CoResidencyRule); this method translates each to a SPEC id pair, dropping
+// any pair whose either side has no enabled spec -- a pair pointing at a
+// disabled or missing spec is meaningless to the agent, which only ever sees
+// spec ids, never mapping ids.
+//
+// Per-GPU VRAMMB: the measured value when known (non-zero), else the
+// operator's estimate -- see agentRuntimeSpecDTO. 0 means unknown either way.
+//
+// A missing/unreadable server, or a store failure reading it, resolves to
+// the same safe empty default (never an error) -- an agent must never see a
+// raw 500 for a token whose server row briefly failed to read. Once we know
+// the server HAS a server_agent application, a genuine store failure
+// reading its OWN configured state is propagated as a real error (mirrors
+// AgentProxyRoutes' "reads never fail" vs. "a real failure surfaces"
+// split).
+func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (AgentRuntimeConfigDTO, error) {
+	if serverID == "" || s.routes == nil {
+		return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
+	}
+	server, err := s.routes.AIServerByID(ctx, serverID)
+	if err != nil {
+		return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
+	}
+	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	var agentApp *routing.Application
+	for i := range apps {
+		if apps[i].Type == routing.ProviderServerAgent {
+			agentApp = &apps[i]
+			break
+		}
+	}
+	if agentApp == nil {
+		return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
+	}
+	budgets, err := s.routes.ServerGPUBudgets(ctx, serverID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	mappings, err := s.routes.MappingsByApplication(ctx, agentApp.ID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	mappingByID := make(map[string]routing.ModelMapping, len(mappings))
+	for _, m := range mappings {
+		mappingByID[m.ID] = m
+	}
+	specs, err := s.routes.RuntimeSpecsByApplication(ctx, agentApp.ID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	specIDByMapping := make(map[string]string, len(specs))
+	specDTOs := make([]AgentRuntimeSpecDTO, 0, len(specs))
+	for _, spec := range specs {
+		if !spec.Enabled {
+			continue
+		}
+		mapping, ok := mappingByID[spec.MappingID]
+		if !ok {
+			// An orphaned spec (its mapping was deleted out from under it, if
+			// that is ever possible): skip rather than emit a half-populated
+			// entry with no model name.
+			continue
+		}
+		gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
+		if err != nil {
+			return AgentRuntimeConfigDTO{}, err
+		}
+		specDTO, err := agentRuntimeSpecDTO(spec, mapping, gpus)
+		if err != nil {
+			return AgentRuntimeConfigDTO{}, err
+		}
+		specIDByMapping[spec.MappingID] = spec.ID
+		specDTOs = append(specDTOs, specDTO)
+	}
+	rules, err := s.routes.CoResidencyRulesByApplication(ctx, agentApp.ID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	coresident := make([][2]string, 0, len(rules))
+	for _, rule := range rules {
+		specA, okA := specIDByMapping[rule.MappingAID]
+		specB, okB := specIDByMapping[rule.MappingBID]
+		if !okA || !okB {
+			continue
+		}
+		coresident = append(coresident, [2]string{specA, specB})
+	}
+	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+}
+
+// agentRuntimeSpecDTO builds one AgentRuntimeSpecDTO from a stored (already
+// confirmed enabled) spec, its owning mapping (for Model/UpstreamModel), and
+// its GPU rows. Mirrors runtimeSpecDTO's opaque-JSON handling: a corrupt
+// stored Args/Env is a store-data problem, not a client-input one, but still
+// surfaces as the matching domain sentinel rather than a raw JSON error.
+func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU) (AgentRuntimeSpecDTO, error) {
+	var args []string
+	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
+		return AgentRuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
+	}
+	if args == nil {
+		args = []string{}
+	}
+	env := map[string]string{}
+	if err := json.Unmarshal([]byte(spec.Env), &env); err != nil {
+		return AgentRuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
+	}
+	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
+	for _, g := range gpus {
+		vram := g.VRAMMeasuredMB
+		if vram == 0 {
+			vram = g.VRAMEstimateMB
+		}
+		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Index: g.GPUIndex, VRAMMB: vram})
+	}
+	return AgentRuntimeSpecDTO{
+		ID:                          spec.ID,
+		Model:                       mapping.GatewayModelName,
+		UpstreamModel:               mapping.AppModelName,
+		Binary:                      spec.Binary,
+		Args:                        args,
+		Env:                         env,
+		WorkDir:                     spec.WorkDir,
+		GPUs:                        gpuDTOs,
+		ListenPort:                  spec.ListenPort,
+		HealthPath:                  spec.HealthPath,
+		HealthTimeoutSeconds:        spec.HealthTimeoutSeconds,
+		StartupTimeoutSeconds:       spec.StartupTimeoutSeconds,
+		IdleTimeoutSeconds:          spec.IdleTimeoutSeconds,
+		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
+		Pinned:                      spec.Pinned,
+		AdminState:                  spec.AdminState,
+	}, nil
+}
+
+// agentRuntimeConfigDTO assembles the wire DTO, normalizing every
+// collection-shaped field to non-nil (a nil slice must never marshal as JSON
+// null -- this exact defect was caught twice already on this branch) before
+// computing the ETag, so an empty configuration gets a STABLE etag across
+// calls instead of one that depends on which internal slice happened to be
+// nil this time.
+func agentRuntimeConfigDTO(specs []AgentRuntimeSpecDTO, coresident [][2]string, budgets []routing.ServerGPUBudget, routerListen, maxProcesses int) AgentRuntimeConfigDTO {
+	if specs == nil {
+		specs = []AgentRuntimeSpecDTO{}
+	}
+	if coresident == nil {
+		coresident = [][2]string{}
+	}
+	gpuBudgets := make([]AgentGPUBudgetDTO, 0, len(budgets))
+	for _, b := range budgets {
+		gpuBudgets = append(gpuBudgets, AgentGPUBudgetDTO{Index: b.GPUIndex, BudgetMB: b.BudgetMB})
+	}
+	dto := AgentRuntimeConfigDTO{
+		RouterListen: routerListen,
+		MaxProcesses: maxProcesses,
+		GPUBudgets:   gpuBudgets,
+		Specs:        specs,
+		Coresident:   coresident,
+	}
+	dto.ETag = agentRuntimeConfigETag(dto)
+	return dto
+}
+
+// agentRuntimeConfigETag hashes dto with its own ETag field blanked (so the
+// etag never depends on its own previous value), mirroring
+// agentProxyRoutesETag.
+func agentRuntimeConfigETag(dto AgentRuntimeConfigDTO) string {
+	dto.ETag = ""
+	raw, _ := json.Marshal(dto)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

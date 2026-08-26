@@ -27,6 +27,7 @@ type API interface {
 	AgentTokenStatus(context.Context, auth.Token, string) (AgentTokenDTO, error)
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
+	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)

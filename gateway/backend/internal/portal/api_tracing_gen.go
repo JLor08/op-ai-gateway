@@ -143,6 +143,18 @@ func (_d *APIWithTracing) AgentProxyRoutes(ctx context.Context, s1 string) (a1 A
 	return _d.API.AgentProxyRoutes(ctx, s1)
 }
 
+func (_d *APIWithTracing) AgentRuntimeConfig(ctx context.Context, s1 string) (a1 AgentRuntimeConfigDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AgentRuntimeConfig")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AgentRuntimeConfig(ctx, s1)
+}
+
 func (_d *APIWithTracing) AgentTokenStatus(ctx context.Context, t1 auth.Token, s1 string) (a1 AgentTokenDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AgentTokenStatus")
 	defer span.End()

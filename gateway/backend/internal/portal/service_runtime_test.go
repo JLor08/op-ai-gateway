@@ -956,3 +956,202 @@ func TestRuntimeWarningsIgnoresDisabledSpecs(t *testing.T) {
 		t.Fatalf("warnings = %#v, want none (spec is disabled)", warnings)
 	}
 }
+
+// --- Task 7: agent runtime-config assembly ----------------------------------
+
+// TestAgentRuntimeConfigAssembly pins the GET /api/agent/v1/runtime-config
+// wire contract (spec §11): RouterListen is the server_agent application's
+// Port, only ENABLED specs appear, coresidency pairs are translated from
+// mapping ids to spec ids (dropping any pair touching a disabled/missing
+// spec), per-GPU VRAMMB prefers the measured value over the estimate, and a
+// server with no server_agent application yet gets the fully empty document
+// -- never an error.
+func TestAgentRuntimeConfigAssembly(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	// Before any server_agent application exists, the agent must be able to
+	// poll harmlessly: a fully empty, non-nil, stably-etagged document.
+	empty, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig (no app): %v", err)
+	}
+	if empty.RouterListen != 0 || empty.MaxProcesses != 0 {
+		t.Fatalf("empty dto = %#v, want RouterListen=0, MaxProcesses=0", empty)
+	}
+	if empty.Specs == nil || len(empty.Specs) != 0 {
+		t.Fatalf("empty.Specs = %#v, want non-nil empty", empty.Specs)
+	}
+	if empty.Coresident == nil || len(empty.Coresident) != 0 {
+		t.Fatalf("empty.Coresident = %#v, want non-nil empty", empty.Coresident)
+	}
+	if empty.GPUBudgets == nil || len(empty.GPUBudgets) != 0 {
+		t.Fatalf("empty.GPUBudgets = %#v, want non-nil empty", empty.GPUBudgets)
+	}
+	if empty.ETag == "" {
+		t.Fatalf("empty dto must still carry a stable etag")
+	}
+	emptyAgain, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig (no app, second call): %v", err)
+	}
+	if emptyAgain.ETag != empty.ETag {
+		t.Fatalf("empty etag not stable: %q vs %q", empty.ETag, emptyAgain.ETag)
+	}
+
+	app := seedServerAgentApplication(t, routeStore, server.ID, now) // Port 9000
+	maxProc := 3
+	if _, err := svc.UpdateServer(ctx, ownerToken(), server.ID, UpdateServerRequest{RuntimeMaxProcesses: &maxProc}); err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+	if _, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
+		Budgets: []GPUBudgetDTO{{Index: 1, BudgetMB: 21500}, {Index: 0, BudgetMB: 46000}},
+	}); err != nil {
+		t.Fatalf("SetServerGPUBudgets: %v", err)
+	}
+
+	mappingA, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen-coder", AppModelName: "qwen2.5-coder-32b"})
+	if err != nil {
+		t.Fatalf("CreateMapping A: %v", err)
+	}
+	specA, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingA.ID, PutRuntimeSpecRequest{
+		Enabled: true,
+		Binary:  "/usr/bin/vllm",
+		Args:    []string{"--tensor-parallel-size", "2"},
+		Env:     map[string]string{"HF_TOKEN": "${AGENT_ENV:HF_TOKEN}"},
+		GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 22000}, {Index: 1, VRAMEstimateMB: 21500}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec A: %v", err)
+	}
+	// GPU 0 has a measured value on file -- must win over the estimate. GPU 1
+	// has no measurement -- must fall back to the estimate.
+	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, specA.ID, 0, 22500); err != nil {
+		t.Fatalf("seed measured value: %v", err)
+	}
+
+	mappingB, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "llama-small", AppModelName: "llama-3-8b"})
+	if err != nil {
+		t.Fatalf("CreateMapping B: %v", err)
+	}
+	specB, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingB.ID, PutRuntimeSpecRequest{
+		Enabled: true,
+		Binary:  "/usr/bin/llama-server",
+		GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec B: %v", err)
+	}
+
+	mappingDisabled, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "disabled-model", AppModelName: "disabled-model"})
+	if err != nil {
+		t.Fatalf("CreateMapping disabled: %v", err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingDisabled.ID, PutRuntimeSpecRequest{
+		Enabled: false,
+		Binary:  "/usr/bin/disabled-server",
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec disabled: %v", err)
+	}
+
+	// Coresidency: A+B is a real allowed pair; A+disabled must be dropped
+	// (its spec is disabled, hence absent from the wire document).
+	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
+		Pairs: [][2]string{{mappingA.ID, mappingB.ID}, {mappingA.ID, mappingDisabled.ID}},
+	}); err != nil {
+		t.Fatalf("SetCoResidency: %v", err)
+	}
+
+	dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if dto.RouterListen != app.Port {
+		t.Fatalf("router_listen = %d, want the server_agent application's port %d", dto.RouterListen, app.Port)
+	}
+	if dto.MaxProcesses != 3 {
+		t.Fatalf("max_processes = %d, want 3", dto.MaxProcesses)
+	}
+	if len(dto.GPUBudgets) != 2 || dto.GPUBudgets[0].Index != 0 || dto.GPUBudgets[0].BudgetMB != 46000 ||
+		dto.GPUBudgets[1].Index != 1 || dto.GPUBudgets[1].BudgetMB != 21500 {
+		t.Fatalf("gpu_budgets = %#v, want ordered by index [{0 46000} {1 21500}]", dto.GPUBudgets)
+	}
+	if len(dto.Specs) != 2 {
+		t.Fatalf("specs = %#v, want exactly 2 (the disabled spec must be absent)", dto.Specs)
+	}
+	var gotA, gotB *AgentRuntimeSpecDTO
+	for i := range dto.Specs {
+		switch dto.Specs[i].ID {
+		case specA.ID:
+			gotA = &dto.Specs[i]
+		case specB.ID:
+			gotB = &dto.Specs[i]
+		}
+	}
+	if gotA == nil || gotB == nil {
+		t.Fatalf("specs = %#v, want both specA (%s) and specB (%s)", dto.Specs, specA.ID, specB.ID)
+	}
+	if gotA.Model != "qwen-coder" || gotA.UpstreamModel != "qwen2.5-coder-32b" {
+		t.Fatalf("specA model/upstream_model = %q/%q, want qwen-coder/qwen2.5-coder-32b", gotA.Model, gotA.UpstreamModel)
+	}
+	if gotA.Binary != "/usr/bin/vllm" || len(gotA.Args) != 2 || gotA.Args[0] != "--tensor-parallel-size" {
+		t.Fatalf("specA binary/args = %#v", gotA)
+	}
+	if gotA.Env["HF_TOKEN"] != "${AGENT_ENV:HF_TOKEN}" {
+		t.Fatalf("specA env = %#v, want the placeholder preserved verbatim", gotA.Env)
+	}
+	if len(gotA.GPUs) != 2 || gotA.GPUs[0].Index != 0 || gotA.GPUs[0].VRAMMB != 22500 ||
+		gotA.GPUs[1].Index != 1 || gotA.GPUs[1].VRAMMB != 21500 {
+		t.Fatalf("specA gpus = %#v, want [{0 22500} {1 21500}] (measured overrides estimate on GPU 0, estimate used on GPU 1)", gotA.GPUs)
+	}
+	if gotA.HealthPath != "/health" || gotA.HealthTimeoutSeconds != 5 || gotA.StartupTimeoutSeconds != 180 {
+		t.Fatalf("specA defaults = %#v", gotA)
+	}
+	if gotB.Model != "llama-small" || gotB.UpstreamModel != "llama-3-8b" {
+		t.Fatalf("specB model/upstream_model = %q/%q", gotB.Model, gotB.UpstreamModel)
+	}
+
+	if len(dto.Coresident) != 1 {
+		t.Fatalf("coresident = %#v, want exactly 1 pair (the disabled-spec pair must be dropped)", dto.Coresident)
+	}
+	pair := dto.Coresident[0]
+	if !((pair[0] == specA.ID && pair[1] == specB.ID) || (pair[0] == specB.ID && pair[1] == specA.ID)) {
+		t.Fatalf("coresident[0] = %#v, want {%s,%s} in either order", pair, specA.ID, specB.ID)
+	}
+	for _, p := range dto.Coresident {
+		if p[0] == mappingDisabled.ID || p[1] == mappingDisabled.ID {
+			t.Fatalf("coresident leaked a MAPPING id instead of a SPEC id: %#v", p)
+		}
+	}
+
+	if dto.ETag == "" {
+		t.Fatalf("dto.ETag must not be empty")
+	}
+	dtoAgain, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig (second call): %v", err)
+	}
+	if dtoAgain.ETag != dto.ETag {
+		t.Fatalf("etag not stable across identical calls: %q vs %q", dto.ETag, dtoAgain.ETag)
+	}
+	if dtoAgain.ETag == empty.ETag {
+		t.Fatalf("a populated config must not share the empty config's etag")
+	}
+}
+
+// TestAgentRuntimeConfigUnknownServerIsEmptyNotError mirrors AgentProxyRoutes'
+// "a missing/unreadable server resolves to the safe empty default" posture: a
+// serverID naming no AIServer at all must never surface as an error to the
+// agent-token holder.
+func TestAgentRuntimeConfigUnknownServerIsEmptyNotError(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Now())
+	dto, err := svc.AgentRuntimeConfig(context.Background(), "no-such-server")
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if dto.Specs == nil || len(dto.Specs) != 0 || dto.RouterListen != 0 {
+		t.Fatalf("dto = %#v, want the fully empty document", dto)
+	}
+}
