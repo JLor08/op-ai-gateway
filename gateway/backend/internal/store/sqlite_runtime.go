@@ -81,6 +81,21 @@ func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string
 	return spec, true, nil
 }
 
+// RuntimeSpecByID returns the spec for id (the primary-key lookup the
+// telemetry VRAM write-back path uses -- see RuntimeStore.RuntimeSpecByID).
+// Absent -> (zero, false, nil), mirroring RuntimeSpecByMapping.
+func (s *SQLiteStore) RuntimeSpecByID(ctx context.Context, id string) (routing.RuntimeSpec, bool, error) {
+	row := s.queryRow(ctx, `select `+runtimeSpecCols+` from agent_runtime_specs where id = ?`, id)
+	spec, err := scanRuntimeSpec(row)
+	if errors.Is(err, ErrNotFound) {
+		return routing.RuntimeSpec{}, false, nil
+	}
+	if err != nil {
+		return routing.RuntimeSpec{}, false, err
+	}
+	return spec, true, nil
+}
+
 func (s *SQLiteStore) RuntimeSpecsByApplication(ctx context.Context, appID string) ([]routing.RuntimeSpec, error) {
 	rows, err := s.query(ctx, `
 		select `+runtimeSpecColsPrefixed+`

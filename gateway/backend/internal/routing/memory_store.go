@@ -2159,6 +2159,16 @@ func (m *MemoryStore) RuntimeSpecByMapping(_ context.Context, mappingID string) 
 	return RuntimeSpec{}, false, nil
 }
 
+// RuntimeSpecByID returns the spec for id (the telemetry VRAM write-back
+// path's primary-key lookup -- see RuntimeStore.RuntimeSpecByID). RuntimeSpec
+// has no slice/pointer fields, so the map value is already a safe copy.
+func (m *MemoryStore) RuntimeSpecByID(_ context.Context, id string) (RuntimeSpec, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	spec, ok := m.runtimeSpecs[id]
+	return spec, ok, nil
+}
+
 // RuntimeSpecsByApplication lists every spec whose mapping belongs to appID,
 // ordered by spec id (mirrors the SQL join's `order by s.id`).
 func (m *MemoryStore) RuntimeSpecsByApplication(_ context.Context, appID string) ([]RuntimeSpec, error) {

@@ -7607,6 +7607,19 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			!got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
+		// RuntimeSpecByID: the same row, keyed by its own primary key rather
+		// than its owning mapping (the telemetry VRAM write-back path's point
+		// read). Absent -> (zero, false, nil), mirroring RuntimeSpecByMapping.
+		gotByID, ok, err := s.RuntimeSpecByID(ctx, "rspec_1")
+		if err != nil || !ok {
+			t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+		}
+		if gotByID.Binary != spec.Binary || gotByID.MappingID != "map_rt" {
+			t.Fatalf("RuntimeSpecByID mismatch: %+v", gotByID)
+		}
+		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_missing"); err != nil || ok {
+			t.Fatalf("RuntimeSpecByID absent: ok=%v err=%v", ok, err)
+		}
 		// Upsert on the same mapping overwrites (1 spec per mapping)
 		spec.Binary = "/usr/bin/vllm"
 		spec.UpdatedAt = now.Add(time.Minute)
@@ -7676,6 +7689,9 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 		}
 		if gotGPUs, err = s.RuntimeSpecGPUs(ctx, "rspec_1"); err != nil || len(gotGPUs) != 0 {
 			t.Fatalf("gpu rows must cascade: %v %d", err, len(gotGPUs))
+		}
+		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_1"); err != nil || ok {
+			t.Fatalf("RuntimeSpecByID after delete: ok=%v err=%v", ok, err)
 		}
 	})
 }

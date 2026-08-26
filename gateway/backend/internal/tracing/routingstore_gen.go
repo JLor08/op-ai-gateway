@@ -736,6 +736,18 @@ func (_d *RoutingStoreWithTracing) ResourceGroupsByServer(ctx context.Context, s
 	return _d.Store.ResourceGroupsByServer(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) RuntimeSpecByID(ctx context.Context, id string) (r1 _sourceRouting.RuntimeSpec, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecByID")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecByID(ctx, id)
+}
+
 func (_d *RoutingStoreWithTracing) RuntimeSpecByMapping(ctx context.Context, mappingID string) (r1 _sourceRouting.RuntimeSpec, b1 bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.RuntimeSpecByMapping")
 	defer span.End()

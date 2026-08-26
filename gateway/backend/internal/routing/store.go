@@ -1312,6 +1312,15 @@ type RuntimeStore interface {
 	// RuntimeSpecByMapping returns the spec for mappingID; ok is false when
 	// no spec has been created for that mapping yet (not an error).
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
+	// RuntimeSpecByID returns the spec for id, keyed by its own primary key
+	// rather than its owning mapping (RuntimeSpecByMapping's key). Added for
+	// the telemetry VRAM write-back path (agent-runtime-manager Task 9): a
+	// runtime sample carries only spec_id, and resolving whether the operator
+	// has pinned vram_locked requires a point read by that id. ok is false
+	// when no spec has that id (e.g. deleted out from under an in-flight
+	// sample) -- not an error, mirroring RuntimeSpecByMapping's absent-read
+	// contract.
+	RuntimeSpecByID(ctx context.Context, id string) (RuntimeSpec, bool, error)
 	// RuntimeSpecsByApplication lists every spec belonging to a mapping of
 	// appID, ordered by spec id. Always non-nil, empty when none.
 	RuntimeSpecsByApplication(ctx context.Context, appID string) ([]RuntimeSpec, error)
