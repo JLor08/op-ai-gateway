@@ -5,8 +5,11 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,11 +22,20 @@ import (
 // the write-back path under test consults.
 func seedRuntimeIngestSpec(t *testing.T, srv *Server, specID string, vramLocked bool) {
 	t.Helper()
+	seedRuntimeIngestSpecForServer(t, srv, "mock-host-qwen", specID, vramLocked)
+}
+
+// seedRuntimeIngestSpecForServer is seedRuntimeIngestSpec parameterized by
+// owning server id, so a test can seed a spec belonging to a DIFFERENT
+// server than the one it later ingests a sample as (the cross-server
+// authorization tests below).
+func seedRuntimeIngestSpecForServer(t *testing.T, srv *Server, serverID, specID string, vramLocked bool) {
+	t.Helper()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	appID, mappingID := "app_"+specID, "map_"+specID
 	if err := srv.Routes.CreateApplication(ctx, routing.Application{
-		ID: appID, ServerID: "mock-host-qwen", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
+		ID: appID, ServerID: serverID, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("create application: %v", err)
@@ -198,5 +210,155 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackToleratesUnknownSpec(t *testin
 	defer unsub()
 	if len(snap) != 1 || snap[0].SpecID != "rspec_ghost" {
 		t.Fatalf("snapshot = %#v, want the runtime status published regardless", snap)
+	}
+}
+
+// --- Task 9 review fix: cross-server authorization on the VRAM write-back --
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec is the
+// regression guard for the write-back authorization gap: spec_id is an
+// agent-supplied body field, and the ONLY thing binding a telemetry sample
+// to a server is the token-derived serverID passed into
+// ingestTelemetrySample -- nothing previously checked that the spec named
+// by spec_id actually belongs to THAT server. An agent authenticated for
+// "mock-host-qwen" naming a spec_id that belongs to a DIFFERENT server must
+// leave that other server's spec untouched. This test FAILS against the
+// pre-fix writeBackRuntimeVRAM, which resolved only RuntimeSpecByID +
+// VRAMLocked and wrote unconditionally.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	// rspec_cross_tenant belongs to otherServerID, NOT mock-host-qwen.
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_tenant", false)
+
+	// Authenticated as "mock-host-qwen" (the token-derived serverID), the
+	// sample names otherServerID's spec_id with a forged measured VRAM.
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_cross_tenant","state":"running","gpus":[{"index":0,"vram_measured_mb":99999}]}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
+	}
+
+	gpus, err := srv.Routes.RuntimeSpecGPUs(ctx, "rspec_cross_tenant")
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
+	}
+	if gpus[0].VRAMMeasuredMB != 0 {
+		t.Fatalf("VRAMMeasuredMB = %d, want untouched 0 -- an agent for one server must not overwrite another server's spec VRAM via spec_id", gpus[0].VRAMMeasuredMB)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackAcceptsOwnServerSpec is the
+// companion positive case: the SAME spec shape, but owned by the reporting
+// server, must still write back normally -- the authorization check must
+// not become a blanket rejection.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackAcceptsOwnServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_own_tenant", false)
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_own_tenant","state":"running","gpus":[{"index":0,"vram_measured_mb":22222}]}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), "rspec_own_tenant")
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
+	}
+	if gpus[0].VRAMMeasuredMB != 22222 {
+		t.Fatalf("VRAMMeasuredMB = %d, want 22222 (the reporting server owns this spec)", gpus[0].VRAMMeasuredMB)
+	}
+}
+
+// --- Task 9 review fix: bounding + memoizing the VRAM write-back loop ------
+
+// countingRuntimeSpecStore wraps a real *routing.MemoryStore and counts calls
+// to RuntimeSpecByID, so a test can assert on resolution CALL COUNT rather
+// than only on the resulting store state -- the write-back's memoization and
+// length-cap are otherwise invisible from the outside (both a memoized and
+// an un-memoized loop reach the same final GPU-row state).
+type countingRuntimeSpecStore struct {
+	*routing.MemoryStore
+	runtimeSpecByIDCalls atomic.Int32
+}
+
+func (c *countingRuntimeSpecStore) RuntimeSpecByID(ctx context.Context, id string) (routing.RuntimeSpec, bool, error) {
+	c.runtimeSpecByIDCalls.Add(1)
+	return c.MemoryStore.RuntimeSpecByID(ctx, id)
+}
+
+// manyRuntimeSamples builds n agentRuntimeSample entries, each carrying one
+// measured-VRAM GPU row (so none is skipped by the empty-GPUs guard). When
+// specID is "", each entry gets its OWN distinct (unknown) spec_id; when
+// specID is non-empty, every entry shares it.
+func manyRuntimeSamples(n int, specID string) []agentRuntimeSample {
+	out := make([]agentRuntimeSample, n)
+	for i := range out {
+		id := specID
+		if id == "" {
+			id = fmt.Sprintf("rspec_ghost_%d", i)
+		}
+		out[i] = agentRuntimeSample{
+			SpecID: id,
+			State:  "running",
+			GPUs:   []agentRuntimeGPUSample{{Index: 0, VRAMMeasuredMB: 1000}},
+		}
+	}
+	return out
+}
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackMemoizesRepeatedUnknownSpecID
+// proves an unknown spec_id repeated many times in ONE sample resolves
+// exactly once -- the miss itself is memoized, not just a successful
+// resolution (the pre-fix code re-read on every occurrence of a miss).
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackMemoizesRepeatedUnknownSpecID(t *testing.T) {
+	srv := NewTestServer()
+	counting := &countingRuntimeSpecStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	req := agentTelemetryRequest{Host: &agentHostReport{CPUUtilPct: 1}, Runtimes: manyRuntimeSamples(10, "rspec_repeat_unknown")}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.runtimeSpecByIDCalls.Load(); got != 1 {
+		t.Fatalf("RuntimeSpecByID calls = %d, want exactly 1 (an unknown spec_id repeated 10x must resolve once and memoize the miss)", got)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackBoundsSampleCount proves the
+// runtimes array is length-capped at maxRuntimeSamplesPerSample BEFORE any
+// resolution is attempted: 300 entries with 300 DISTINCT unknown spec_ids
+// (so memoization cannot mask the count) must drive at most
+// maxRuntimeSamplesPerSample RuntimeSpecByID calls, not 300.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackBoundsSampleCount(t *testing.T) {
+	srv := NewTestServer()
+	counting := &countingRuntimeSpecStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	const total = maxRuntimeSamplesPerSample + 44
+	req := agentTelemetryRequest{Host: &agentHostReport{CPUUtilPct: 1}, Runtimes: manyRuntimeSamples(total, "")}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.runtimeSpecByIDCalls.Load(); got != maxRuntimeSamplesPerSample {
+		t.Fatalf("RuntimeSpecByID calls = %d, want exactly %d (the runtimes array must be truncated before processing, not just deduplicated)", got, maxRuntimeSamplesPerSample)
 	}
 }

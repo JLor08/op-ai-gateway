@@ -125,11 +125,14 @@ type agentRuntimeError struct {
 // agentRuntimeSample is one agent-managed model process's live state inside
 // the telemetry sample (agent-runtime-manager Task 9, design spec §7/§9):
 // state machine phase, OS-level identifiers, in-flight/restart counters, and
-// the measured VRAM + last-error detail that back the portal's live runtime
-// status stream. SpecID ties it back to the launch spec (runtime-config's
-// AgentRuntimeSpecDTO.ID) the gateway itself handed the agent, so there is no
-// ambiguity about which mapping/model this entry describes even when the
-// agent has not (yet) resolved Model.
+// the last-error detail that back the portal's live runtime status stream.
+// GPUs (measured VRAM) is consumed separately, ONLY by the store write-back
+// (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO, which carries
+// no per-GPU detail (see agentRuntimeGPUSample's doc). SpecID ties it back to
+// the launch spec (runtime-config's AgentRuntimeSpecDTO.ID) the gateway
+// itself handed the agent, so there is no ambiguity about which
+// mapping/model this entry describes even when the agent has not (yet)
+// resolved Model.
 type agentRuntimeSample struct {
 	SpecID    string                  `json:"spec_id"`
 	Model     string                  `json:"model"`
@@ -191,49 +194,132 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample) []RuntimeStatusD
 	return out
 }
 
+// maxRuntimeSamplesPerSample bounds how many entries of a telemetry sample's
+// runtimes array the VRAM write-back loop will process. Nothing else caps
+// this array's length, and within the 1 MiB readRawJSON body cap a minimal
+// runtime entry is only ~55 bytes on the wire -- uncapped, a single POST
+// could drive on the order of 19,000 RuntimeSpecByID/resolution attempts on
+// an endpoint agents hit every second. Clamp, don't reject -- mirrors
+// maxHardwareGPUs/maxHardwareModules elsewhere in this file. Only the
+// write-back loop is bounded here; runtimeStatusDTOsFromSamples' status
+// publish is a pure in-memory transform with no store fan-out per entry, so
+// it is not the concern this constant exists for.
+const maxRuntimeSamplesPerSample = 256
+
+// maxRuntimeGPUsPerSample bounds how many per-GPU measured-VRAM entries one
+// runtime sample's GPUs array will drive a store write for. A real server
+// has at most a handful of GPUs; this is generous headroom (matching
+// maxHardwareGPUs' magnitude), not a realistic ceiling -- it exists so ONE
+// resolved-writable spec_id cannot alone drive unbounded
+// UpdateRuntimeSpecGPUMeasured writes (maxRuntimeSamplesPerSample only
+// bounds the number of DISTINCT/total sample entries considered, not the
+// GPU fan-out within a single one).
+const maxRuntimeGPUsPerSample = 64
+
+// resolveRuntimeSpecWritable reports whether specID's measured VRAM may be
+// written back for THIS sample, reached from server serverID. Three
+// conditions must all hold:
+//
+//  1. The spec exists (RuntimeSpecByID's ok).
+//  2. It is not VRAMLocked (vram_estimate_mb is operator-owned,
+//     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
+//     opt-out of the agent overwriting its own estimate).
+//  3. Its owning application belongs to serverID -- resolved via
+//     spec.MappingID -> MappingByID -> mapping.ApplicationID ->
+//     ApplicationByID -> application.ServerID. This is the authorization
+//     check: spec_id is an agent-supplied body field with no other
+//     verification anywhere in this path, and the connected agent's token
+//     binds it to exactly one server (every other agent endpoint in this
+//     package resolves its target SOLELY from the token, never from a body
+//     parameter -- see handleAgentRuntimeConfig's doc). Without this check
+//     an agent authenticated for server A could name a spec_id belonging to
+//     server B and overwrite B's measured VRAM -- which is not
+//     display-only: agentRuntimeSpecDTO prefers the measured value over the
+//     operator's estimate when building the vram_mb the gateway later
+//     pushes to B's OWN agent, so a forged value would corrupt the
+//     admission arithmetic B's agent runs against a spec it never reported
+//     on.
+//
+// Any failure to resolve (a lookup error, or a spec/mapping/application
+// that no longer exists) is treated the same as "not writable" -- logged and
+// skipped, never propagated -- matching the "a report is evidence, not a
+// transaction" best-effort discipline this whole file follows. A
+// cross-server mismatch is logged at Warn (not Debug): unlike a merely
+// stale id, it is a signal an agent is naming another server's resources.
+func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specID string) bool {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return false
+	}
+	if !ok {
+		// The spec has since been deleted (or never existed); nothing to
+		// write the measurement back to. Not an error.
+		return false
+	}
+	if spec.VRAMLocked {
+		return false // the operator pinned this spec's VRAM numbers
+	}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return false
+	}
+	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return false
+	}
+	if app.ServerID != serverID {
+		slog.Warn("runtime vram write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return false
+	}
+	return true
+}
+
 // writeBackRuntimeVRAM writes each sample GPU's measured VRAM back to its
-// launch spec (agent-runtime-manager Task 9) -- but ONLY for a spec the
-// operator has not pinned (VRAMLocked): vram_estimate_mb is operator-owned,
-// vram_measured_mb is agent-owned, and VRAMLocked is the operator's opt-out
-// of the agent overwriting its own estimate. The spec's VRAMLocked flag is
-// resolved with exactly ONE RuntimeSpecByID read per distinct spec_id in the
-// sample (memoized in locked below), not one read per GPU row.
+// launch spec (agent-runtime-manager Task 9), but only for a spec
+// resolveRuntimeSpecWritable confirms belongs to serverID, is not
+// VRAMLocked, and still exists. That resolution happens with exactly ONE
+// set of reads (RuntimeSpecByID + MappingByID + ApplicationByID) per
+// DISTINCT spec_id in the sample: the outcome -- writable or not, for
+// WHATEVER reason -- is memoized in writable below, so a sample repeating
+// the same spec_id (writable or not) never re-resolves it. runtimes and
+// each entry's GPUs are both length-capped (maxRuntimeSamplesPerSample,
+// maxRuntimeGPUsPerSample) before any store call, bounding the worst case
+// regardless of how many distinct ids a hostile/buggy sample names.
 //
 // Best-effort throughout, matching the "a report is evidence, not a
-// transaction" ingest discipline this whole file follows: a lookup error or
-// an unknown/since-deleted spec (RuntimeSpecByID's ok=false) is logged at
-// Debug and skipped, never returned -- this must NEVER reject the telemetry
-// sample it rode in on. Called only AFTER every store write in
-// ingestTelemetrySample has succeeded.
+// transaction" ingest discipline this whole file follows: nothing here is
+// ever returned as an error -- this must NEVER reject the telemetry sample
+// it rode in on. Called only AFTER every store write in ingestTelemetrySample
+// has succeeded.
 func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
 	if s.Routes == nil {
 		return
 	}
-	locked := make(map[string]bool, len(runtimes))
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	writable := make(map[string]bool, len(runtimes))
 	for _, rt := range runtimes {
 		specID := strings.TrimSpace(rt.SpecID)
 		if specID == "" || len(rt.GPUs) == 0 {
 			continue
 		}
-		isLocked, seen := locked[specID]
+		ok, seen := writable[specID]
 		if !seen {
-			spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
-			if err != nil {
-				slog.Debug("runtime vram write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
-				continue
-			}
-			if !ok {
-				// The spec has since been deleted (or never existed); nothing
-				// to write the measurement back to. Not an error.
-				continue
-			}
-			isLocked = spec.VRAMLocked
-			locked[specID] = isLocked
+			ok = s.resolveRuntimeSpecWritable(ctx, serverID, specID)
+			writable[specID] = ok
 		}
-		if isLocked {
-			continue // the operator pinned this spec's VRAM numbers
+		if !ok {
+			continue
 		}
-		for _, g := range rt.GPUs {
+		gpus := rt.GPUs
+		if len(gpus) > maxRuntimeGPUsPerSample {
+			gpus = gpus[:maxRuntimeGPUsPerSample]
+		}
+		for _, g := range gpus {
 			if g.VRAMMeasuredMB <= 0 {
 				continue
 			}
