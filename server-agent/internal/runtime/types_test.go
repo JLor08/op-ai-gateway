@@ -265,3 +265,25 @@ func TestParseConfigRejectsMalformedJSON(t *testing.T) {
 		t.Fatal("ParseConfig() with malformed JSON: want error, got nil")
 	}
 }
+
+// TestConfigAllowedPairsCanonicalizesReversedInput covers the review's
+// Minor fix: Coresident is kept in wire order (whatever order the gateway
+// happened to emit each pair in), while PolicySnapshot.Allowed is
+// documented as a canonical PairKey set. A consumer that inserted the raw
+// wire pairs directly would get a lookup that only works in the one
+// direction the gateway happened to send -- AllowedPairs must canonicalize
+// so that never happens, regardless of the input pair's own order.
+func TestConfigAllowedPairsCanonicalizesReversedInput(t *testing.T) {
+	cfg := Config{Coresident: [][2]string{{"b", "a"}}}
+	allowed := cfg.AllowedPairs()
+
+	if len(allowed) != 1 {
+		t.Fatalf("len(AllowedPairs()) = %d, want 1", len(allowed))
+	}
+	if !allowed[PairKey("a", "b")] {
+		t.Error("AllowedPairs() must canonicalize a reversed wire pair so PairKey(a, b) is found")
+	}
+	if !allowed[PairKey("b", "a")] {
+		t.Error("PairKey itself must be order-independent on lookup too")
+	}
+}

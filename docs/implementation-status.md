@@ -199,6 +199,26 @@ Agent phase in progress:
   note describes the FULL future package (`config_client.go` et al., not yet
   written). The edge will be added in whichever later task actually adds the
   import.
+- Task 12 review round 1 — coordinator review confirmed all 16 spec cases
+  by hand-trace and found five fixable gaps, all addressed in the same
+  commit: (1) the final victim sort was mutation-survivable (no case had 2+
+  victims) -- added a multi-rule two-victim case; (2) `Admit` could
+  self-evict a candidate already present in `Running` (a double-start
+  race) -- fixed by filtering self out of the effective running set once,
+  up front, ahead of all four rules (extended beyond the review's literal
+  rule-1/rule-4-only scope after tracing the same bug through rules 2/3
+  too); (3) a candidate whose own VRAM demand alone exceeds a GPU's budget
+  used to return `Wait` forever instead of failing fast -- now returns a
+  terminal `Decision{Reason: StateNotPermitted, Message: "..."}` (reused
+  the existing state per the review's own preference so the portal badge
+  mapping needs no new value; added `Decision.Message` to disambiguate
+  from the OTHER not_permitted cause); (4) `sortOldestFirst` ties now break
+  on SpecID for deterministic output; (5) new `Config.AllowedPairs()`
+  canonicalizes `Coresident` pairs via `PairKey` so a consuming task cannot
+  build a one-directional `Allowed` map by accident. Full detail, covering
+  test names, and mutation-testing verification (including a correction to
+  the original report's case-7 mutation description) appended to
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-12-report.md`.
 
 ## Next planned step
 

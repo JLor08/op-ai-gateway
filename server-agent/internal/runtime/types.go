@@ -134,6 +134,23 @@ func ParseConfig(raw []byte) (Config, error) {
 	return cfg, nil
 }
 
+// AllowedPairs returns c.Coresident as a canonical PairKey set, ready to
+// use as PolicySnapshot.Allowed. Coresident is kept in wire order (whatever
+// order the gateway happened to send each pair in); Allowed is documented
+// as a canonical (a<=b) set, so a consumer that instead inserted raw pairs
+// verbatim would get a silently one-directional lookup -- Admit would find
+// PairKey(candidate, running) missing exactly when the wire pair happened
+// to name the two spec IDs in the other order, and would look like a
+// random, hard-to-reproduce matrix failure. Going through this method
+// instead of hand-rolling the map makes that class of bug impossible.
+func (c Config) AllowedPairs() map[[2]string]bool {
+	allowed := make(map[[2]string]bool, len(c.Coresident))
+	for _, pair := range c.Coresident {
+		allowed[PairKey(pair[0], pair[1])] = true
+	}
+	return allowed
+}
+
 // State is a Spec's visible load-lifecycle stage (design doc §7).
 type State string
 

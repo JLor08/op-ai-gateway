@@ -317,6 +317,54 @@ func TestAdmit(t *testing.T) {
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
 			want: Decision{OK: true, Evict: []string{}},
 		},
+		{
+			// Review finding (Important 1): every case above evicts at most
+			// one victim, so the final sortOldestFirst(victims) call at the
+			// end of Admit -- the one place that orders the merged,
+			// map-built victim set -- is never exercised; deleting that
+			// line left the whole suite green. This case forces TWO
+			// victims from TWO different rules (budget evicts "oldest" for
+			// gpu 0; the process-count rule, evaluated after budget's
+			// eviction already lowers the deficit by one, evicts exactly
+			// one more from what remains) so the merge-then-sort step is
+			// actually asserted, deliberately with Running listed out of
+			// LastUsed order (t2, t0, t1) so relying on input order instead
+			// of sorting would also fail.
+			name: "multi-rule eviction set is sorted oldest first",
+			snap: PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "newest", LastUsed: t2}, // does not touch gpu 0
+					{SpecID: "oldest", GPUs: map[int]int{0: 8000}, LastUsed: t0},
+					{SpecID: "middle", LastUsed: t1}, // does not touch gpu 0
+				},
+				MaxProcesses: 2,
+				Budgets:      map[int]int{0: 10000},
+				Allowed:      allowPairs("cand", "newest", "oldest", "middle"),
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
+			want: Decision{Evict: []string{"oldest", "middle"}},
+		},
+		{
+			// Review finding ("also worth closing"): no other case has a
+			// running process spanning multiple GPUs, so summing a
+			// toucher's WHOLE GPUs map instead of only the index under
+			// test (a narrower bug than case 7's fully-global sum) would
+			// not be caught. "multi" occupies both gpu 0 (5000) and gpu 1
+			// (4000); the candidate touches only gpu 0. Using only the
+			// touched index (5000) fits comfortably under budget (OK); a
+			// buggy sum of the whole map (9000) would not (3000+9000 =
+			// 12000 > 10000, wrongly evicting "multi").
+			name: "running process spanning multiple gpus only its touched index counts",
+			snap: PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "multi", GPUs: map[int]int{0: 5000, 1: 4000}, LastUsed: t0},
+				},
+				Budgets: map[int]int{0: 10000},
+				Allowed: allowPairs("cand", "multi"),
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
+			want: Decision{OK: true, Evict: []string{}},
+		},
 	}
 
 	for _, c := range cases {
@@ -359,4 +407,168 @@ func TestAdmitEmptyRunningNeverNilEvict(t *testing.T) {
 	if !got.OK {
 		t.Fatalf("Admit() with nothing running and no constraints should be OK, got %+v", got)
 	}
+}
+
+// --- Review round 1 fixes -----------------------------------------------
+//
+// The four tests below cover Important 2 from the task-12 review: a
+// RunningProc sharing the candidate's own SpecID (a double-start race, or a
+// snapshot assembled a moment too early/late) must never be treated as a
+// foreign blocker or proposed as its own victim, in ANY of the four rules.
+// Each test disables every OTHER rule (no budget, no process limit, no
+// unknown VRAM unless under test) so a self-skip regression in that one
+// rule cannot hide behind another rule reaching the same OK conclusion.
+
+// TestAdmitNeverProposesSelfAsMatrixVictim: without the self-skip, rule 1
+// finds no self-pair in Allowed (the gateway's coresident matrix never
+// contains one), so an idle self would read as matrix-incompatible with
+// itself and get proposed as its own eviction victim.
+func TestAdmitNeverProposesSelfAsMatrixVictim(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", InFlight: 0, LastUsed: t0},
+		},
+	}
+	got := Admit(snap, Spec{ID: "cand"})
+	assertDecision(t, "self is never its own matrix victim", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitNeverWaitsOnBusySelf: the busy-self counterpart -- without the
+// self-skip this would return Wait forever, since the "blocker" (itself)
+// can never finish waiting on... itself.
+func TestAdmitNeverWaitsOnBusySelf(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", InFlight: 5, LastUsed: t0},
+		},
+	}
+	got := Admit(snap, Spec{ID: "cand"})
+	assertDecision(t, "busy self never causes a permanent wait", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitUnknownVRAMSelfIsNotAnOccupant: rule 4's toucher scan (and its
+// pinned short-circuit) must also skip self -- an already-running instance
+// of the very spec being measured is not "another process in the way" of
+// measuring it alone.
+func TestAdmitUnknownVRAMSelfIsNotAnOccupant(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", GPUs: map[int]int{0: 5000}, Pinned: true, LastUsed: t0},
+		},
+	}
+	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	got := Admit(snap, spec)
+	assertDecision(t, "self is never an unknown-vram occupant", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitSelfNotCountedTowardProcessLimit: without the self-skip, the
+// process-count rule would see the sole running entry (itself) as both
+// "already running" (contributing to len(Running)) AND, since it is idle
+// and not otherwise in toEvict, an eviction "candidate" -- proposing to
+// drain-stop the very process the caller is trying to start, to make room
+// for... that same process.
+func TestAdmitSelfNotCountedTowardProcessLimit(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", LastUsed: t0},
+		},
+		MaxProcesses: 1,
+	}
+	got := Admit(snap, Spec{ID: "cand"})
+	assertDecision(t, "self does not count against MaxProcesses", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitSelfVRAMNotDoubleCountedAgainstBudget: without the self-skip,
+// rule 3 would add the running self's own GPU usage on top of the fresh
+// candidate's declared demand for the same GPU -- double-booking one
+// physical process as if it were two, and proposing to evict it to make
+// room for itself.
+func TestAdmitSelfVRAMNotDoubleCountedAgainstBudget(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", GPUs: map[int]int{0: 9000}, LastUsed: t0},
+		},
+		Budgets: map[int]int{0: 10000},
+	}
+	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}}
+	got := Admit(snap, spec)
+	assertDecision(t, "self vram is not double-counted against budget", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitCandidateAloneExceedsBudgetIsNotPermitted covers Important 3:
+// spec's own declared demand on a GPU already exceeds that GPU's budget,
+// with nothing else running at all. No eviction can ever fix this (there
+// is nothing to evict) and waiting cannot help either (nothing here
+// depends on current contention), so Admit must return a durable Reason
+// rather than hanging the caller in Wait until its admission-wait timeout
+// on every single request.
+//
+// StateNotPermitted is reused rather than adding a new State: the design
+// doc already defines it as "a configuration error, visible in the portal,
+// not transient", which is exactly what an over-estimated VRAM demand (or
+// a budget an operator shrank below it) is. Message carries the
+// distinguishing detail so this VRAM-budget cause is not confused with the
+// OTHER thing that produces StateNotPermitted (an agent policy refusing
+// the spec's binary/directory) when both surface through the same State.
+func TestAdmitCandidateAloneExceedsBudgetIsNotPermitted(t *testing.T) {
+	snap := PolicySnapshot{
+		Budgets: map[int]int{0: 8000},
+	}
+	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}}
+	got := Admit(snap, spec)
+
+	if got.OK {
+		t.Fatalf("got OK = true, want a terminal Reason: %+v", got)
+	}
+	if got.Wait {
+		t.Fatalf("got Wait = true, want a terminal Reason (this can never resolve by waiting): %+v", got)
+	}
+	if got.Reason != StateNotPermitted {
+		t.Fatalf("Reason = %q, want %q", got.Reason, StateNotPermitted)
+	}
+	if got.Evict == nil || len(got.Evict) != 0 {
+		t.Fatalf("Evict = %v, want a non-nil empty slice", got.Evict)
+	}
+	if got.Message == "" {
+		t.Fatal("Message must be set to distinguish this cause from the binary/directory not_permitted case")
+	}
+}
+
+// TestSortOldestFirstTieBreaksBySpecID is the Minor fix's direct unit
+// test: sortOldestFirst must be a total, deterministic order even when
+// LastUsed ties, since Admit feeds it a map-iteration-ordered (i.e.
+// per-run randomized) slice.
+func TestSortOldestFirstTieBreaksBySpecID(t *testing.T) {
+	procs := []RunningProc{
+		{SpecID: "zzz", LastUsed: t0},
+		{SpecID: "aaa", LastUsed: t0},
+		{SpecID: "mmm", LastUsed: t0},
+	}
+	sortOldestFirst(procs)
+	got := []string{procs[0].SpecID, procs[1].SpecID, procs[2].SpecID}
+	want := []string{"aaa", "mmm", "zzz"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sortOldestFirst tie-break order = %v, want %v", got, want)
+	}
+}
+
+// TestAdmitTieBreaksDeterministically exercises the tie-break end-to-end
+// through Admit itself (not just the sortOldestFirst unit above): three
+// idle candidates share the exact same LastUsed, and MaxProcesses forces
+// evicting exactly two of the three. Without the SpecID tie-break, which
+// two (and in what order) would depend on Go's map iteration order for
+// toEvict, which is randomized per process run -- run with -count=20 to
+// confirm this no longer flakes.
+func TestAdmitTieBreaksDeterministically(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "zzz", LastUsed: t0},
+			{SpecID: "aaa", LastUsed: t0},
+			{SpecID: "mmm", LastUsed: t0},
+		},
+		MaxProcesses: 2,
+		Allowed:      allowPairs("cand", "zzz", "aaa", "mmm"),
+	}
+	got := Admit(snap, Spec{ID: "cand"})
+	assertDecision(t, "tie-break is deterministic", got, Decision{Evict: []string{"aaa", "mmm"}})
 }
