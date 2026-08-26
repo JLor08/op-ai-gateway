@@ -68,6 +68,20 @@ type WSSender struct {
 	certUpdates  chan struct{}
 	trustUpdates chan struct{}
 
+	// runtimeUpdates is the one genuinely different doorbell shape in this
+	// file: certUpdates/trustUpdates are content-free (chan struct{}) --
+	// the payload is idempotent and cheap to re-fetch over HTTP, so a
+	// coalesced "check again" is all a consumer ever needs. A pushed
+	// runtime_config frame instead CARRIES the whole document, so this is a
+	// latest-wins buffered(1) chan json.RawMessage: wakeRuntimeConfig always
+	// drains any stale pending value before sending the newest one, so a
+	// burst of pushes (or a burst with no reader draining at all) coalesces
+	// into exactly the LAST document, never a stale earlier one. A nil
+	// payload means "resync over HTTP" and is what maybeDial sends on every
+	// successful (re)connect, mirroring how it already wakes certUpdates/
+	// trustUpdates on connect.
+	runtimeUpdates chan json.RawMessage
+
 	mu          sync.Mutex
 	conn        *websocket.Conn
 	connDone    chan struct{} // closed by dropConn when this conn is torn down; stops pingLoop
@@ -76,6 +90,10 @@ type WSSender struct {
 	failures    int
 	closed      bool
 	sysReport   []byte // cached marshaled SystemReport, resent on each (re)connect
+	// runtimeReport is the cached, already-redacted, already-marshaled
+	// file-mode runtime report (internal/runtime.BuildReport), resent on
+	// each (re)connect exactly like sysReport.
+	runtimeReport []byte
 }
 
 // NewWSSender builds a WSSender for gatewayURL (http->ws, https->wss). A nil
@@ -106,6 +124,7 @@ func NewWSSender(gatewayURL, token string, httpClient *http.Client) (*WSSender, 
 		clock:           time.Now,
 		certUpdates:     make(chan struct{}, 1),
 		trustUpdates:    make(chan struct{}, 1),
+		runtimeUpdates:  make(chan json.RawMessage, 1),
 	}, nil
 }
 
@@ -124,6 +143,17 @@ func (s *WSSender) CertUpdates() <-chan struct{} {
 // from CertUpdates so neither consumer can steal the other's wake.
 func (s *WSSender) TrustUpdates() <-chan struct{} { return s.trustUpdates }
 
+// RuntimeUpdates returns a channel that receives the latest gateway-pushed
+// runtime_config document (see the runtimeUpdates field doc) OR a nil
+// payload every time this connection is (re)established -- a nil means
+// "resync over HTTP" (the Task 18 consumer feeds either shape into the same
+// runtime.GatewaySource.ApplyPushed / .Load reconciliation). Buffered(1)
+// with a drain-then-send producer (wakeRuntimeConfig): a burst of pushes,
+// with or without a reader ever draining in between, coalesces into exactly
+// the newest document -- reading this channel is never required to keep the
+// connection alive, and the producer (readLoop) never blocks on it.
+func (s *WSSender) RuntimeUpdates() <-chan json.RawMessage { return s.runtimeUpdates }
+
 // wakeCertUpdates is the shared non-blocking send both wake sources (readLoop's
 // cert_update frame, maybeDial's connect success) use. A full channel (an
 // already-pending, not-yet-consumed wake) means the send is simply dropped --
@@ -139,6 +169,28 @@ func (s *WSSender) wakeCertUpdates() {
 func (s *WSSender) wakeTrustUpdates() {
 	select {
 	case s.trustUpdates <- struct{}{}:
+	default:
+	}
+}
+
+// wakeRuntimeConfig is the latest-wins doorbell producer for
+// RuntimeUpdates(): it unconditionally drains any stale pending document
+// before sending the new one, so a consumer that has not yet read the
+// previous value never observes it once a newer one has arrived. Called
+// from readLoop (a genuine "runtime_config" frame, data = f.Data) and from
+// maybeDial's connect hook (data = nil, meaning "resync over HTTP") -- both
+// non-blocking, by construction: neither select here can ever block, since
+// the channel is buffered(1) and the drain immediately preceding the send
+// guarantees room for exactly one value. This is the load-bearing property
+// for readLoop's caller: readLoop must NEVER block on this send, because it
+// is also the goroutine that detects a dead peer (see readLoop's own doc).
+func (s *WSSender) wakeRuntimeConfig(data json.RawMessage) {
+	select {
+	case <-s.runtimeUpdates: // drop the stale pending document, if any
+	default:
+	}
+	select {
+	case s.runtimeUpdates <- data:
 	default:
 	}
 }
@@ -249,6 +301,54 @@ func (s *WSSender) resendSystemReport(conn *websocket.Conn) {
 	}
 }
 
+// PostRuntimeReport caches an already-built, already-redacted file-mode
+// runtime report (internal/runtime.BuildReport) for resend on every future
+// reconnect, and writes it once on the current connection, dialing if
+// needed -- the exact same shape as PostSystemReport/sysReport, just for the
+// "runtime_report" frame type. raw is written byte-for-byte: redaction
+// already happened at the point the report was built, so this transport
+// must never re-marshal it.
+func (s *WSSender) PostRuntimeReport(ctx context.Context, raw json.RawMessage) error {
+	s.mu.Lock()
+	s.runtimeReport = append([]byte(nil), raw...)
+	s.mu.Unlock()
+
+	conn := s.currentConn()
+	if conn == nil {
+		if err := s.maybeDial(ctx); err != nil {
+			return err
+		}
+		if s.currentConn() == nil {
+			return errBackingOff
+		}
+		return nil // maybeDial already sent the cached report on connect
+	}
+	wctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_report", Data: raw}); err != nil {
+		s.dropConn(conn, isCleanClose(err))
+		return fmt.Errorf("write runtime report frame: %w", err)
+	}
+	return nil
+}
+
+// resendRuntimeReport writes the cached runtime report on a freshly-dialed
+// connection (best-effort; a write error is left for the ping/read loop to
+// reap), mirroring resendSystemReport exactly.
+func (s *WSSender) resendRuntimeReport(conn *websocket.Conn) {
+	s.mu.Lock()
+	data := append([]byte(nil), s.runtimeReport...)
+	s.mu.Unlock()
+	if len(data) == 0 {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_report", Data: data}); err != nil {
+		slog.Debug("ws runtime report resend failed", "err", err)
+	}
+}
+
 // Close cleanly shuts the current connection (agent shutdown). Idempotent. Closing
 // connDone here (not just clearing s.conn) stops pingLoop immediately -- otherwise it
 // would sit idle on its ticker, pinging an already-closed conn, until its next tick
@@ -323,6 +423,7 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 	go s.pingLoop(conn, done)
 	slog.Debug("ws telemetry connected", "url", s.url)
 	s.resendSystemReport(conn)
+	s.resendRuntimeReport(conn)
 	// A fresh (re)connect is itself a "check for a new certificate" moment
 	// (Task 5b, Phase 2 distribution): a certificate issued while this agent
 	// was disconnected must not wait out the full poll interval (up to 6h on
@@ -330,18 +431,23 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 	// wakes a sync exactly like a cert_update doorbell would.
 	s.wakeCertUpdates()
 	s.wakeTrustUpdates()
+	// Likewise for the runtime-config document: a reconnect may have missed
+	// a push while disconnected, so it wakes RuntimeUpdates() with a nil
+	// payload ("resync over HTTP") exactly like the cert/trust wakes above.
+	s.wakeRuntimeConfig(nil)
 	return nil
 }
 
 // readLoop drains incoming frames so coder/websocket auto-pongs the gateway's
 // pings and a server-initiated close is detected promptly, and decodes a
-// cert_update doorbell (Phase 2 distribution) to wake CertUpdates(). It
-// deliberately does NOT use wsjson.Read: that helper writes a close frame with
-// a protocol-error status on ANY JSON decode failure, which would turn a
-// malformed -- or simply forward-incompatible, future-version -- frame into a
-// full connection teardown. Instead this reads the raw message and tolerates
-// anything that does not parse as the {type,data} envelope, or whose type it
-// does not recognize: only "cert_update" is acted on, every other type
+// cert_update/ca_update/runtime_config push to wake the matching doorbell
+// (CertUpdates/TrustUpdates/RuntimeUpdates). It deliberately does NOT use
+// wsjson.Read: that helper writes a close frame with a protocol-error status
+// on ANY JSON decode failure, which would turn a malformed -- or simply
+// forward-incompatible, future-version -- frame into a full connection
+// teardown. Instead this reads the raw message and tolerates anything that
+// does not parse as the {type,data} envelope, or whose type it does not
+// recognize: only the three types above are acted on, every other type
 // (including one this build has never heard of) is silently discarded. This
 // function NEVER writes to conn -- data frames and pings are written
 // exclusively by the future writer path (pingLoop's control frames today); a
@@ -349,6 +455,9 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 // "genau ein Writer" constraint, mirrored on the agent side) forbids. A
 // background context is used deliberately: a cancelled read context would
 // abruptly tear down the connection instead of surfacing the close status.
+// wakeRuntimeConfig's own doc explains why its send here can never block --
+// that is THE load-bearing property for this function: readLoop is also
+// what detects a dead peer, so it must never stall on any of these wakes.
 func (s *WSSender) readLoop(conn *websocket.Conn) {
 	for {
 		_, b, err := conn.Read(context.Background())
@@ -365,6 +474,8 @@ func (s *WSSender) readLoop(conn *websocket.Conn) {
 			s.wakeCertUpdates()
 		case "ca_update":
 			s.wakeTrustUpdates()
+		case "runtime_config":
+			s.wakeRuntimeConfig(f.Data)
 		}
 		// Any other (including unrecognized future) type is discarded --
 		// forward compatibility.

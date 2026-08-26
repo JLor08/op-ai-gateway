@@ -221,6 +221,55 @@ func TestPostSystemReportSendsBearerBodyAndPath(t *testing.T) {
 	}
 }
 
+// TestPostRuntimeReport proves the file-mode upward report POST: bearer
+// auth, the exact path, the body sent through byte-for-byte (BuildReport in
+// internal/runtime has already redacted and marshaled it -- this transport
+// must not touch it further), and the same retry-on-5xx discipline as
+// telemetry/system-report (postBody is shared).
+func TestPostRuntimeReport(t *testing.T) {
+	old := backoffBase
+	backoffBase = time.Millisecond
+	defer func() { backoffBase = old }()
+
+	var calls int32
+	var gotAuth, gotPath string
+	var gotBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		gotBody = body
+		if n < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "secret", nil)
+	raw := json.RawMessage(`{"source":"file","collected_at":"2026-08-26T09:00:00Z","config":{}}`)
+	if err := c.PostRuntimeReport(context.Background(), raw); err != nil {
+		t.Fatalf("PostRuntimeReport: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer secret")
+	}
+	if gotPath != "/api/agent/v1/runtime-report" {
+		t.Errorf("path = %q, want /api/agent/v1/runtime-report", gotPath)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("calls = %d, want 3 (retry on 503)", got)
+	}
+	if string(gotBody) != string(raw) {
+		t.Errorf("body = %s, want %s (byte-for-byte, untouched)", gotBody, raw)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

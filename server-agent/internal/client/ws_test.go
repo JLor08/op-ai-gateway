@@ -5,12 +5,14 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-server-agent/internal/sample"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -627,6 +629,55 @@ func TestWSSenderResendsSystemReportOnReconnect(t *testing.T) {
 	})
 }
 
+// TestWSSenderWritesRuntimeReportFrame proves PostRuntimeReport writes a
+// {"type":"runtime_report","data":<raw>} frame verbatim.
+func TestWSSenderWritesRuntimeReportFrame(t *testing.T) {
+	fg := &fakeGateway{}
+	ts := httptest.NewServer(http.HandlerFunc(fg.handler))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	raw := json.RawMessage(`{"source":"file","collected_at":"2026-08-26T09:00:00Z","config":{}}`)
+	if err := s.PostRuntimeReport(context.Background(), raw); err != nil {
+		t.Fatalf("PostRuntimeReport: %v", err)
+	}
+	waitFor(t, func() bool {
+		got := fg.got()
+		return len(got) >= 1 && got[0] == "runtime_report"
+	})
+}
+
+// TestWSSenderResendsRuntimeReportOnReconnect proves the cached runtime
+// report is re-sent on every future reconnect, exactly like the cached
+// system report.
+func TestWSSenderResendsRuntimeReportOnReconnect(t *testing.T) {
+	fg := &fakeGateway{closeNow: websocket.StatusGoingAway}
+	ts := httptest.NewServer(http.HandlerFunc(fg.handler))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	raw := json.RawMessage(`{"source":"file","collected_at":"2026-08-26T09:00:00Z","config":{}}`)
+	_ = s.PostRuntimeReport(context.Background(), raw)
+	waitFor(t, func() bool { return len(fg.got()) >= 1 })
+	time.Sleep(20 * time.Millisecond) // let the read loop observe the close
+
+	for i := 0; i < 5; i++ {
+		_ = s.Post(context.Background(), wsTestSample())
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitFor(t, func() bool {
+		count := 0
+		for _, f := range fg.got() {
+			if f == "runtime_report" {
+				count++
+			}
+		}
+		return count >= 2
+	})
+}
+
 func wsHTTPToWS(u string) string {
 	return "ws" + u[len("http"):]
 }
@@ -885,5 +936,173 @@ func TestWSSenderCertUpdatesChannelCoalescesBursts(t *testing.T) {
 	case <-s.CertUpdates():
 		t.Fatal("a two-frame burst must coalesce into exactly one pending wake, not two")
 	default:
+	}
+}
+
+// drainInitialRuntimeConfigWake reads and discards the nil payload every
+// successful (re)connect pushes onto RuntimeUpdates() (maybeDial's
+// s.wakeRuntimeConfig(nil) call), so a test's own pushed frame cannot be
+// mistaken for it -- the direct analogue of the cert/trust "drain the
+// connect-triggered wake first" gotcha documented on
+// TestWSSenderCertUpdateFrameWakesCertUpdates.
+func drainInitialRuntimeConfigWake(t *testing.T, s *WSSender) {
+	t.Helper()
+	select {
+	case v := <-s.RuntimeUpdates():
+		if v != nil {
+			t.Fatalf("expected the initial connect wake to carry a nil payload, got %s", v)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected the initial connect wake on RuntimeUpdates()")
+	}
+}
+
+// TestRuntimeConfigFramePayloadDelivered proves the gateway->agent
+// runtime_config push: a well-formed {"type":"runtime_config","data":{...}}
+// frame's Data payload is delivered on RuntimeUpdates() exactly as sent.
+func TestRuntimeConfigFramePayloadDelivered(t *testing.T) {
+	g, up := newServerPusher()
+	ts := httptest.NewServer(g.handler(up))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	if err := s.Post(context.Background(), wsTestSample()); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	<-up
+	drainInitialRuntimeConfigWake(t, s)
+
+	g.push(t, []byte(`{"type":"runtime_config","data":{"router_listen":9000,"specs":[]}}`))
+	select {
+	case got := <-s.RuntimeUpdates():
+		if string(got) != `{"router_listen":9000,"specs":[]}` {
+			t.Fatalf("RuntimeUpdates() payload = %s, want the frame's exact data field", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected the runtime_config frame to deliver its payload on RuntimeUpdates()")
+	}
+}
+
+// TestRuntimeUpdatesLatestWins is the test that distinguishes the required
+// "drain then send" doorbell from a plain buffered(1) non-blocking-send
+// channel: pushing two runtime_config frames back-to-back, without draining
+// RuntimeUpdates() in between, must leave the SECOND document pending, not
+// the first. A plain buffered(1) channel with only a non-blocking send would
+// drop the second send (the channel is already full from the first) and a
+// reader would observe the FIRST, stale document -- exactly what "latest
+// wins" forbids, since each frame is the full config and an older one must
+// never survive over a newer one.
+func TestRuntimeUpdatesLatestWins(t *testing.T) {
+	g, up := newServerPusher()
+	ts := httptest.NewServer(g.handler(up))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	if err := s.Post(context.Background(), wsTestSample()); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	<-up
+	drainInitialRuntimeConfigWake(t, s)
+
+	// Push BOTH frames before this test reads RuntimeUpdates() at all --
+	// that "no drain in between" is load-bearing, exactly as documented on
+	// TestWSSenderCertUpdatesChannelCoalescesBursts.
+	g.push(t, []byte(`{"type":"runtime_config","data":{"v":1}}`))
+	g.push(t, []byte(`{"type":"runtime_config","data":{"v":2}}`))
+	time.Sleep(300 * time.Millisecond)
+
+	var got json.RawMessage
+	select {
+	case got = <-s.RuntimeUpdates():
+	case <-time.After(time.Second):
+		t.Fatal("expected a coalesced pending document after the burst")
+	}
+	if string(got) != `{"v":2}` {
+		t.Fatalf("latest-wins violated: RuntimeUpdates() = %s, want the SECOND (newest) document {\"v\":2}", got)
+	}
+	select {
+	case extra := <-s.RuntimeUpdates():
+		t.Fatalf("a two-frame burst must coalesce into exactly one pending document, got a second: %s", extra)
+	default:
+	}
+}
+
+// TestRuntimeUpdatesReadLoopNeverBlocksWithoutAReader proves the load-bearing
+// constraint from the task brief: readLoop must never block on the
+// RuntimeUpdates() send, even under a sustained burst with NO reader ever
+// draining the channel -- because readLoop is also what detects a dead
+// peer, and a wedged readLoop would silently stall connection health
+// detection. It never drains RuntimeUpdates() at all (not even the initial
+// connect wake), pushes a burst of frames, then proves the connection is
+// still alive two independent ways: a further application-level Post
+// succeeds, and a raw WebSocket ping/pong round-trip on the SAME connection
+// still completes.
+func TestRuntimeUpdatesReadLoopNeverBlocksWithoutAReader(t *testing.T) {
+	g, up := newServerPusher()
+	ts := httptest.NewServer(g.handler(up))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	if err := s.Post(context.Background(), wsTestSample()); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	<-up
+	conn := s.currentConn()
+	if conn == nil {
+		t.Fatal("expected an active connection")
+	}
+
+	// Deliberately never drain RuntimeUpdates() -- not the connect wake, not
+	// any of the pushes below.
+	for i := 0; i < 20; i++ {
+		g.push(t, []byte(`{"type":"runtime_config","data":{"n":`+strconv.Itoa(i)+`}}`))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if s.currentConn() != conn {
+		t.Fatal("connection was dropped by an unread runtime_config burst; readLoop must never block/wedge on the payload channel send")
+	}
+	if err := s.Post(context.Background(), wsTestSample()); err != nil {
+		t.Fatalf("post after unread runtime_config burst: %v", err)
+	}
+	pctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := conn.Ping(pctx); err != nil {
+		t.Fatalf("ping/pong liveness round-trip failed after unread runtime_config burst: %v", err)
+	}
+}
+
+// TestReconnectWakesRuntimeNil proves a reconnect wakes RuntimeUpdates()
+// with a nil payload (meaning "resync over HTTP"), and that this nil is
+// distinguishable from a real pushed document (a non-nil json.RawMessage).
+func TestReconnectWakesRuntimeNil(t *testing.T) {
+	fg := &fakeGateway{closeNow: websocket.StatusGoingAway}
+	ts := httptest.NewServer(http.HandlerFunc(fg.handler))
+	defer ts.Close()
+	s := newTestWSSender(t, wsHTTPToWS(ts.URL))
+	defer s.Close()
+
+	if err := s.Post(context.Background(), wsTestSample()); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	waitFor(t, func() bool { return len(fg.got()) >= 1 })
+	drainInitialRuntimeConfigWake(t, s)
+	time.Sleep(20 * time.Millisecond) // let the read loop observe the close + schedule the reconnect
+
+	for i := 0; i < 5; i++ {
+		_ = s.Post(context.Background(), wsTestSample())
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case v := <-s.RuntimeUpdates():
+		if v != nil {
+			t.Fatalf("expected a nil payload on the reconnect wake, got a real document: %s", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the reconnect to wake RuntimeUpdates() with a nil payload")
 	}
 }
