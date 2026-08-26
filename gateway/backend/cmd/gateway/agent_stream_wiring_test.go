@@ -59,3 +59,57 @@ func TestAllThreeDriversWireAgentStreamsIntoCertificateIssuedHook(t *testing.T) 
 
 	assertAllDriversReachBuildRuntime(t)
 }
+
+// TestBuildGatewayServerWiresRuntimeConfigChangedHookForAllDrivers is Task 8's
+// wiring completeness guard, the counterpart to
+// TestAllThreeDriversWireAgentStreamsIntoCertificateIssuedHook above for the
+// runtime-config PUSH path. Unlike that cert-update wiring (a plain function
+// value the portal Service can be constructed with directly), the
+// runtime-config hook needs the gateway Server itself
+// (Server.PushRuntimeConfig) -- which cmd/gateway builds AFTER the portal
+// Service (deps.Portal wraps it for ServerDeps) -- so it cannot be wired at
+// portal.NewService construction time; see Service.
+// SetRuntimeConfigChangedHook's doc for why it is an exported setter instead,
+// called here once srv exists.
+//
+// buildGatewayServer is the ONE function every OP_AI_GATEWAY_DB_DRIVER branch
+// reaches (its own switch dispatches to memoryDeps/sqliteDeps/postgresDeps
+// and then falls through, unconditionally, to the SAME gateway.New(deps)
+// call), so pinning the wiring there -- AFTER that call -- covers all three
+// drivers by construction; a driver whose path skipped gateway.New would
+// already fail the count check below.
+func TestBuildGatewayServerWiresRuntimeConfigChangedHookForAllDrivers(t *testing.T) {
+	body := funcSource(t, "main.go", "buildGatewayServer")
+
+	if got := strings.Count(body, "gateway.New(deps)"); got != 1 {
+		t.Fatalf("buildGatewayServer calls gateway.New(deps) %d times, want exactly 1 (the ONE call site all three drivers share)", got)
+	}
+	if !containsWired(body, "portal.UnwrapService(srv.Portal)") {
+		t.Fatal("buildGatewayServer does not recover the concrete *portal.Service from srv.Portal via " +
+			"portal.UnwrapService -- without it there is nothing left to call " +
+			"SetRuntimeConfigChangedHook on once gateway.New has wrapped it")
+	}
+	if !containsWired(body, "SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)") {
+		t.Fatal("SetRuntimeConfigChangedHook is not wired to srv.PushRuntimeConfig -- a runtime-spec " +
+			"write can never push to a connected agent, and nothing would ever surface that gap " +
+			"(the agent's own poll cadence masks it)")
+	}
+	newIdx := strings.Index(body, "gateway.New(deps)")
+	hookIdx := strings.Index(body, "SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)")
+	if newIdx < 0 || hookIdx < 0 || hookIdx < newIdx {
+		t.Fatal("SetRuntimeConfigChangedHook must be wired AFTER gateway.New constructs srv -- srv must " +
+			"exist before PushRuntimeConfig, a method on it, can be referenced")
+	}
+
+	for _, want := range []string{
+		`deps, cleanup, err = memoryDeps(cfg)`,
+		`deps, cleanup, err = sqliteDeps(cfg)`,
+		`deps, cleanup, err = postgresDeps(cfg)`,
+	} {
+		if !containsWired(body, want) {
+			t.Fatalf("buildGatewayServer's driver switch is missing %q -- a driver that never reaches "+
+				"the shared gateway.New(deps)/SetRuntimeConfigChangedHook wiring above would never get "+
+				"the runtime-config push either", want)
+		}
+	}
+}

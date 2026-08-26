@@ -271,6 +271,52 @@ func (r *AgentStreamRegistry) NotifyCertUpdate(serverID, fingerprint string) {
 	}
 }
 
+// NotifyRuntimeConfig is the gateway's push half of the agent-runtime-manager
+// design's WS delivery path (see Server.PushRuntimeConfig, agent_runtime.go,
+// for the feature-gate + async wrapper that calls this): every open agent
+// connection for serverID gets a runtime_config frame whose payload IS THE
+// WHOLE AgentRuntimeConfigDTO document, already marshaled by the caller --
+// never a command, never a delta. This is a deliberate design choice
+// (rejected alternative: a command frame like "start spec X", which a WS
+// reconnect could simply lose, forcing acks/retries/dedup on top of a
+// persisted desired-state document that has to exist anyway): every frame is
+// self-contained and idempotent, so last-one-wins and a dropped frame is
+// harmless -- the agent re-fetches via Task 7's ETag GET on every reconnect
+// regardless, which is the resync this push can never be relied on to
+// replace.
+//
+// Same shape as NotifyCertUpdate: marshal (pure CPU) -> snapshot the live
+// connection set under r.mu's READ lock -> release the lock -> enqueue
+// (non-blocking) OUTSIDE it. No error return; best-effort throughout, so an
+// unknown/offline server, a full queue, or a later write failure on the
+// connection all fail silently -- a notification failure must never surface
+// as anything the caller (a portal runtime-spec write) has to handle. An
+// empty/nil payload is a no-op: there is nothing meaningful to push.
+func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.RawMessage) {
+	if r == nil || serverID == "" || len(payload) == 0 {
+		return
+	}
+	b, err := marshalStreamFrame("runtime_config", payload)
+	if err != nil {
+		slog.Debug("agent stream: runtime_config marshal failed", "server_id", serverID, "err", err)
+		return
+	}
+	r.mu.RLock()
+	set := r.conns[serverID]
+	// Snapshot the live connections under the lock, then enqueue OUTSIDE it --
+	// see NotifyCertUpdate's identical comment for why.
+	conns := make([]*agentStreamConn, 0, len(set))
+	for c := range set {
+		conns = append(conns, c)
+	}
+	r.mu.RUnlock()
+	for _, c := range conns {
+		if !c.enqueue(b) {
+			slog.Debug("agent stream: runtime_config queue full, frame dropped", "server_id", serverID)
+		}
+	}
+}
+
 func (r *AgentStreamRegistry) NotifyCAUpdate(fingerprint string) {
 	if r == nil || fingerprint == "" {
 		return

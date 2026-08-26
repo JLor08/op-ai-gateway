@@ -404,6 +404,18 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	deps.TracingOTLPSet = cfg.OTLPEndpoint != ""
 
 	srv := gateway.New(deps)
+	// Task 8 (agent-runtime-manager): wire the runtime-config WS push in now
+	// that srv exists. portalService was constructed BEFORE srv (and wrapped
+	// into deps.Portal by the OTel tracing decorator above), so this cannot
+	// be a ServiceDeps field for the production path -- see
+	// portal.Service.SetRuntimeConfigChangedHook's doc. portal.UnwrapService
+	// recovers the concrete *portal.Service from srv.Portal so the exported
+	// setter can be called; a nil result (only possible if srv.Portal is
+	// neither a *portal.Service nor a decorator wrapping one) leaves the
+	// hook unset, matching a bare test Server's behaviour.
+	if portalSvc := portal.UnwrapService(srv.Portal); portalSvc != nil {
+		portalSvc.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)
+	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the

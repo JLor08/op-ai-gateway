@@ -508,3 +508,125 @@ func TestAgentStreamRegistryConcurrentPingEnqueueAndReadIsRaceFree(t *testing.T)
 		t.Fatal("the writer goroutine never returned after the client closed")
 	}
 }
+
+// TestNotifyRuntimeConfigDeliversFullPayload pins the wire contract: the
+// frame is {"type":"runtime_config","data":<the exact document>} -- the
+// WHOLE document, verbatim, never a reduced command/id like the cert_update
+// doorbell (contrast TestCertUpdateFramePayloadIsExactlyFingerprint above,
+// which pins the OPPOSITE property for that frame -- this one is deliberately
+// different, per the design's rejection of a command frame).
+func TestNotifyRuntimeConfigDeliversFullPayload(t *testing.T) {
+	r := NewAgentStreamRegistry()
+	c := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	r.add("srv-runtime", c)
+
+	payload := json.RawMessage(`{"router_listen":8081,"max_processes":3,"gpu_budgets":[{"index":0,"budget_mb":46000}],"specs":[{"id":"rspec_a","model":"qwen-coder"}],"coresident":[["rspec_a","rspec_b"]],"etag":"cafef00d"}`)
+	r.NotifyRuntimeConfig("srv-runtime", payload)
+
+	select {
+	case raw := <-c.out:
+		var f streamFrame
+		if err := json.Unmarshal(raw, &f); err != nil {
+			t.Fatalf("unmarshal envelope: %v", err)
+		}
+		if f.Type != "runtime_config" {
+			t.Fatalf("type = %q, want runtime_config", f.Type)
+		}
+		var got, want map[string]json.RawMessage
+		if err := json.Unmarshal(f.Data, &got); err != nil {
+			t.Fatalf("unmarshal data: %v", err)
+		}
+		if err := json.Unmarshal(payload, &want); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("data has %d top-level keys, want %d -- the frame must carry the FULL document, "+
+				"never a reduced one: got=%s", len(got), len(want), f.Data)
+		}
+		for k, wv := range want {
+			gv, ok := got[k]
+			if !ok || string(gv) != string(wv) {
+				t.Fatalf("data[%q] = %s, want %s", k, gv, wv)
+			}
+		}
+	default:
+		t.Fatal("connection did not receive the runtime_config frame")
+	}
+}
+
+// TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking mirrors
+// TestNotifyCertUpdateNeverBlocksOnAFullQueue: the push must never stall its
+// caller (PushRuntimeConfig's goroutine) regardless of how full or stuck a
+// given connection's queue is.
+func TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking(t *testing.T) {
+	r := NewAgentStreamRegistry()
+	c := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	r.add("srv-full-rc", c)
+	for i := 0; i < agentStreamQueueCapacity; i++ {
+		c.enqueue([]byte("x"))
+	}
+	done := make(chan struct{})
+	go func() {
+		r.NotifyRuntimeConfig("srv-full-rc", json.RawMessage(`{"etag":"x"}`))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("NotifyRuntimeConfig blocked on a full queue -- it must be safe to call from a hook " +
+			"that itself must never be slowed down by a stuck agent peer")
+	}
+}
+
+// TestAgentStreamRegistryNotifyRuntimeConfigUnknownServerAndNilRegistryAreNoOps
+// mirrors the cert_update nil-registry/unknown-server contract.
+func TestAgentStreamRegistryNotifyRuntimeConfigUnknownServerAndNilRegistryAreNoOps(t *testing.T) {
+	r := NewAgentStreamRegistry()
+	r.NotifyRuntimeConfig("never-registered", json.RawMessage(`{"etag":"x"}`)) // must not panic
+
+	var nilRegistry *AgentStreamRegistry
+	nilRegistry.NotifyRuntimeConfig("anything", json.RawMessage(`{"etag":"x"}`)) // must not panic
+}
+
+// TestNotifyRuntimeConfigEmptyPayloadIsNoOp: an empty/nil payload must never
+// reach the wire as a bodyless or malformed frame -- there is nothing
+// meaningful to push.
+func TestNotifyRuntimeConfigEmptyPayloadIsNoOp(t *testing.T) {
+	r := NewAgentStreamRegistry()
+	c := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	r.add("srv-empty-rc", c)
+	r.NotifyRuntimeConfig("srv-empty-rc", nil)
+	select {
+	case raw := <-c.out:
+		t.Fatalf("an empty payload must not be enqueued, got %s", raw)
+	default:
+	}
+}
+
+// TestNotifyRuntimeConfigBroadcastsToEveryConnectionForTheServer mirrors
+// TestAgentStreamRegistryBothConnectionsGetDoorbellThenRemoveCleansUp: a
+// reconnect overlap can leave more than one open connection for the same
+// server id, and ALL of them must get the push, not just one.
+func TestNotifyRuntimeConfigBroadcastsToEveryConnectionForTheServer(t *testing.T) {
+	r := NewAgentStreamRegistry()
+	a := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	b := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	other := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
+	r.add("srv-multi-rc", a)
+	r.add("srv-multi-rc", b)
+	r.add("srv-other-rc", other)
+
+	r.NotifyRuntimeConfig("srv-multi-rc", json.RawMessage(`{"etag":"x"}`))
+	for name, c := range map[string]*agentStreamConn{"a": a, "b": b} {
+		select {
+		case <-c.out:
+		default:
+			t.Fatalf("connection %s did not receive the runtime_config push", name)
+		}
+	}
+	select {
+	case raw := <-other.out:
+		t.Fatalf("a DIFFERENT server's connection must not receive the push, got %s", raw)
+	default:
+	}
+}

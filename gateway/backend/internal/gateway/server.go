@@ -175,6 +175,24 @@ type ServerDeps struct {
 	// connections (this field) and the side that pushes to them (the portal
 	// hook) agree on which connections exist.
 	AgentStreams *AgentStreamRegistry
+	// AgentFeatures tracks each connected ServerAgent's last-declared
+	// telemetry-capabilities feature set (agent_ingest.go's capabilities
+	// parse writes it; Server.PushRuntimeConfig, agent_runtime.go, reads it
+	// to gate the runtime_config WS push on the agent actually having
+	// declared support -- runtime_registry.go); nil-safe. gateway.New
+	// defaults a nil value to a fresh registry so a bare test Server still
+	// carries a usable one, mirroring AgentStreams above. No production
+	// wiring shares this instance outside the gateway package today, but it
+	// is a ServerDeps field (rather than New-internal only, like Active) in
+	// case a later task needs to inject one.
+	AgentFeatures *agentFeaturesRegistry
+	// RuntimeStatus holds per-server agent-managed-runtime status the
+	// gateway gates its own behavior on (runtime_registry.go); nil-safe.
+	// Task 8 populates only the file-mode flag Server.PushRuntimeConfig
+	// consults; a later task extends the SAME type with the
+	// snapshot+subscribe status stream. gateway.New defaults a nil value to
+	// a fresh registry.
+	RuntimeStatus *runtimeStatusRegistry
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.
@@ -372,6 +390,14 @@ type Server struct {
 	// deregisters each connection here; NotifyCertUpdate is the ONLY way
 	// anything pushes a frame to an agent.
 	AgentStreams *AgentStreamRegistry
+	// AgentFeatures tracks each connected ServerAgent's last-declared
+	// feature set (runtime_registry.go); nil-safe. Written by
+	// ingestTelemetrySample, read by PushRuntimeConfig.
+	AgentFeatures *agentFeaturesRegistry
+	// RuntimeStatus holds per-server agent-managed-runtime status
+	// (runtime_registry.go); nil-safe. PushRuntimeConfig consults its
+	// file-mode flag.
+	RuntimeStatus *runtimeStatusRegistry
 	// onAgentReactivated fires on an inactive->active ServerAgent edge; see
 	// ServerDeps.OnAgentReactivated. nil-safe (unset -> no trigger).
 	onAgentReactivated func(serverID string)
@@ -549,6 +575,14 @@ func New(deps ServerDeps) *Server {
 	if agentStreams == nil {
 		agentStreams = NewAgentStreamRegistry()
 	}
+	agentFeatures := deps.AgentFeatures
+	if agentFeatures == nil {
+		agentFeatures = newAgentFeaturesRegistry()
+	}
+	runtimeStatus := deps.RuntimeStatus
+	if runtimeStatus == nil {
+		runtimeStatus = newRuntimeStatusRegistry()
+	}
 	benchmarks := deps.Benchmarks
 	if benchmarks == nil {
 		benchmarks = NewBenchmarkRegistry()
@@ -687,6 +721,8 @@ func New(deps ServerDeps) *Server {
 		AgentTransport:              agentTransport,
 		AgentProxyStatus:            agentProxyStatus,
 		AgentStreams:                agentStreams,
+		AgentFeatures:               agentFeatures,
+		RuntimeStatus:               runtimeStatus,
 		onAgentReactivated:          deps.OnAgentReactivated,
 		Benchmarks:                  benchmarks,
 		Groups:                      groups,

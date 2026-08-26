@@ -4,6 +4,8 @@
 package gateway
 
 import (
+	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
@@ -81,4 +83,55 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// PushRuntimeConfig is the gateway half of the WS push path (agent-runtime-
+// manager design spec §10, Phase 2 Task 8): a best-effort, feature-gated
+// push of serverID's CURRENT runtime-config document -- the SAME
+// AgentRuntimeConfig assembly handleAgentRuntimeConfig's GET path uses -- to
+// every open agent WebSocket connection for that server, so a portal click
+// reaches a connected agent immediately instead of waiting for the agent's
+// next Task-7 poll. See AgentStreamRegistry.NotifyRuntimeConfig for why the
+// frame carries the WHOLE document rather than a command or a delta.
+//
+// Two fail-closed preconditions gate delivery, checked before any store
+// read: the connected agent must have DECLARED the runtime_manager feature
+// (s.AgentFeatures.Has) -- an agent binary that never declared support would
+// not understand this frame -- and the server must not be running in file
+// mode (s.RuntimeStatus.IsFileMode) -- a file-mode agent manages its runtime
+// from local disk config, not this push/pull loop. Neither gate failing is
+// an error; it is simply nothing to push (the next poll or reconnect is
+// always the backstop).
+//
+// Runs entirely in a goroutine: the intended caller is the portal write-path
+// hook (portal.ServiceDeps.OnRuntimeConfigChanged / Service.
+// SetRuntimeConfigChangedHook, wired to this method in cmd/gateway/main.go
+// via portal.UnwrapService), whose contract is "synchronous but guaranteed
+// fast" because it fires from inside a runtime-spec CRUD write that still
+// holds its own serializing lock -- the store read (s.Portal.
+// AgentRuntimeConfig) and JSON marshal this method performs are both too
+// slow to do inline there. Nil-safe throughout (a nil s.Portal,
+// s.AgentFeatures, s.RuntimeStatus, or s.AgentStreams all degrade to
+// "nothing pushed," never a panic), matching every other best-effort
+// notifier in this package.
+func (s *Server) PushRuntimeConfig(serverID string) {
+	go func() {
+		if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) {
+			return
+		}
+		if s.Portal == nil {
+			return
+		}
+		dto, err := s.Portal.AgentRuntimeConfig(context.Background(), serverID)
+		if err != nil {
+			slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
+			return
+		}
+		b, err := json.Marshal(dto)
+		if err != nil {
+			slog.Debug("push runtime config: marshal failed", "server_id", serverID, "err", err)
+			return
+		}
+		s.AgentStreams.NotifyRuntimeConfig(serverID, b)
+	}()
 }

@@ -351,8 +351,48 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// each sample is a full snapshot, and an agent that never sends proxy_routes
 	// (cert_mode != proxy) reports nil here, which Report treats as "no routes".
 	s.AgentProxyStatus.Report(serverID, proxyRouteStatusesFromSamples(req.ProxyRoutes))
+	// Record the agent's declared feature set (design spec §9, feature
+	// negotiation), so a later portal runtime-spec write's PushRuntimeConfig
+	// knows whether this connected agent understands a runtime_config frame
+	// at all. Deliberately AFTER every store write succeeded, mirroring
+	// AgentCertReports/AgentProxyStatus above: a report is evidence about
+	// this agent's own binary, and stamping it while the sample itself
+	// failed to persist would claim freshness the gateway does not have.
+	// Tolerant: a malformed capabilities blob yields an empty feature set
+	// (PushRuntimeConfig then correctly withholds delivery) rather than
+	// rejecting the whole sample -- see parseAgentCapabilities.
+	s.AgentFeatures.Set(serverID, parseAgentCapabilities(req.Capabilities))
 	s.maybeFireReactivation(ctx, server)
 	return nil
+}
+
+// agentCapabilitiesReport is the tolerant subset of an agent's telemetry
+// capabilities object this gateway currently understands (design spec §9,
+// feature negotiation): the feature names it declares support for. Any other
+// keys an agent may additionally carry here are ignored, not rejected --
+// forward compatibility with a future agent build that adds fields must
+// never break ingest on today's gateway.
+type agentCapabilitiesReport struct {
+	Features []string `json:"features"`
+}
+
+// parseAgentCapabilities tolerantly extracts the declared feature list from a
+// raw telemetry capabilities object. Absent, malformed, or wrong-shaped JSON
+// (not an object, or a "features" that is not a string array) all yield a
+// nil feature set rather than an error -- a capabilities parse failure must
+// NEVER reject the telemetry sample it rode in on (see the call site in
+// ingestTelemetrySample): a garbled or forward-incompatible capabilities blob
+// from a future agent build must not stop routing telemetry from reaching
+// the gateway.
+func parseAgentCapabilities(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var report agentCapabilitiesReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return nil
+	}
+	return report.Features
 }
 
 // proxyRouteStatusesFromSamples maps the wire-decoded ProxyRouteSample slice to
