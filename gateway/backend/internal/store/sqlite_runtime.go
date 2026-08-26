@@ -172,6 +172,71 @@ func (s *SQLiteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID s
 	return requireAffected(result)
 }
 
+// SetCoResidencyRules atomically REPLACES the whole set of allowed
+// co-residency pairs for appID (delete-then-insert in one transaction,
+// mirroring SetRuntimeSpecGPUs above / SetGroupMembers). appID must exist —
+// checked inside the transaction, before the delete — or ErrNotFound. The
+// store does not enforce or rewrite the MappingAID < MappingBID canonical
+// ordering; that is portal-level validation (Task 6).
+func (s *SQLiteStore) SetCoResidencyRules(ctx context.Context, appID string, rules []routing.CoResidencyRule) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin set coresidency rules: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, s.dl.rebind(`select count(*) from applications where id = ?`), appID).Scan(&exists); err != nil {
+		return fmt.Errorf("check application: %w", err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from agent_coresidency_rules where application_id = ?`), appID); err != nil {
+		return fmt.Errorf("clear coresidency rules: %w", err)
+	}
+	for _, r := range rules {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+			insert into agent_coresidency_rules (application_id, mapping_a_id, mapping_b_id, created_at)
+			values (?, ?, ?, ?)`), appID, r.MappingAID, r.MappingBID, r.CreatedAt); err != nil {
+			// FK before unique: sqlite's FK error text also matches the
+			// unique-violation substring (see UpsertRuntimeSpec above /
+			// sqlite_projects.go).
+			if s.dl.isForeignKeyViolation(err) {
+				return ErrNotFound
+			}
+			if s.dl.isUniqueViolation(err) {
+				return ErrConflict
+			}
+			return fmt.Errorf("insert coresidency rule: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// CoResidencyRulesByApplication lists appID's allowed co-residency pairs,
+// ordered by mapping_a_id then mapping_b_id. Always non-nil, empty when none.
+func (s *SQLiteStore) CoResidencyRulesByApplication(ctx context.Context, appID string) ([]routing.CoResidencyRule, error) {
+	rows, err := s.query(ctx, `
+		select application_id, mapping_a_id, mapping_b_id, created_at
+		from agent_coresidency_rules where application_id = ? order by mapping_a_id, mapping_b_id`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("list coresidency rules: %w", err)
+	}
+	defer rows.Close()
+	out := make([]routing.CoResidencyRule, 0)
+	for rows.Next() {
+		var r routing.CoResidencyRule
+		if err := rows.Scan(&r.ApplicationID, &r.MappingAID, &r.MappingBID, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan coresidency rule: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate coresidency rules: %w", err)
+	}
+	return out, nil
+}
+
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
 	var enabled, pinned, vramLocked int64

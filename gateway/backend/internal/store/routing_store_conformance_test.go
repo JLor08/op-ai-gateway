@@ -606,3 +606,79 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		}
 	})
 }
+
+// --- Agent runtime manager: co-residency matrix memory-vs-SQL parity (Task 2) ---
+
+// TestRoutingStoreCoResidencyRules proves routing.MemoryStore and the SQL
+// store agree on the co-residency matrix semantics: empty by default, atomic
+// full replace (set + ordered read, then clear via an empty/nil set),
+// unknown-application ErrNotFound, and the FK error when a rule names a
+// mapping id that does not exist — MemoryStore hand-checks application and
+// mapping existence to mirror the SQL FKs, so the same assertions run
+// unmodified on both backends (mirrors TestRoutingStoreRuntimeSpecs above).
+func TestRoutingStoreCoResidencyRules(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_cr", Name: "CR", Domain: "cr.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://cr", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_cr", ServerID: "srv_cr", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		for _, mid := range []string{"map_cr", "map_cr2"} {
+			if err := s.CreateMapping(ctx, routing.ModelMapping{
+				ID: mid, ApplicationID: "app_cr", GatewayModelName: mid + "-model",
+				AppModelName: mid + "-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("create mapping %s: %v", mid, err)
+			}
+		}
+
+		// Empty by default
+		rules, err := s.CoResidencyRulesByApplication(ctx, "app_cr")
+		if err != nil || rules == nil || len(rules) != 0 {
+			t.Fatalf("default must be non-nil empty: err=%v rules=%#v", err, rules)
+		}
+
+		// Set + ordered read
+		want := []routing.CoResidencyRule{
+			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_cr", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		rules, err = s.CoResidencyRulesByApplication(ctx, "app_cr")
+		if err != nil || len(rules) != 1 || rules[0].MappingAID != "map_cr" || rules[0].MappingBID != "map_cr2" {
+			t.Fatalf("read back: %v %+v", err, rules)
+		}
+
+		// Full replace with empty clears, still non-nil
+		if err := s.SetCoResidencyRules(ctx, "app_cr", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if rules, err = s.CoResidencyRulesByApplication(ctx, "app_cr"); err != nil || rules == nil || len(rules) != 0 {
+			t.Fatalf("clear must leave non-nil empty: err=%v rules=%#v", err, rules)
+		}
+
+		// Unknown application -> ErrNotFound
+		if err := s.SetCoResidencyRules(ctx, "app_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown app: want ErrNotFound, got %v", err)
+		}
+
+		// FK: rule naming a missing mapping -> ErrNotFound
+		bad := []routing.CoResidencyRule{{ApplicationID: "app_cr", MappingAID: "map_missing", MappingBID: "map_cr", CreatedAt: now}}
+		if err := s.SetCoResidencyRules(ctx, "app_cr", bad); err != ErrNotFound {
+			t.Fatalf("missing mapping: want ErrNotFound, got %v", err)
+		}
+	})
+}

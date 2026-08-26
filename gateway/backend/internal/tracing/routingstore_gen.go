@@ -160,6 +160,18 @@ func (_d *RoutingStoreWithTracing) Certificates(ctx context.Context) (ca1 []_sou
 	return _d.Store.Certificates(ctx)
 }
 
+func (_d *RoutingStoreWithTracing) CoResidencyRulesByApplication(ctx context.Context, appID string) (ca1 []_sourceRouting.CoResidencyRule, err error) {
+	ctx, span := Start(ctx, "routing.Store.CoResidencyRulesByApplication")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.CoResidencyRulesByApplication(ctx, appID)
+}
+
 func (_d *RoutingStoreWithTracing) CreateAIServer(ctx context.Context, host _sourceRouting.AIServer) (err error) {
 	ctx, span := Start(ctx, "routing.Store.CreateAIServer")
 	defer span.End()
@@ -914,6 +926,18 @@ func (_d *RoutingStoreWithTracing) ServicesByDelegate(ctx context.Context, userI
 		}
 	}()
 	return _d.Store.ServicesByDelegate(ctx, userID)
+}
+
+func (_d *RoutingStoreWithTracing) SetCoResidencyRules(ctx context.Context, appID string, rules []_sourceRouting.CoResidencyRule) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetCoResidencyRules")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetCoResidencyRules(ctx, appID, rules)
 }
 
 func (_d *RoutingStoreWithTracing) SetGroupMembers(ctx context.Context, groupID string, members []_sourceRouting.GroupMember) (err error) {

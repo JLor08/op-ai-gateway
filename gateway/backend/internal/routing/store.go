@@ -1233,10 +1233,26 @@ type RuntimeSpecGPU struct {
 	VRAMMeasuredMB int
 }
 
+// CoResidencyRule is one ALLOWED pair of model mappings that may be loaded on
+// the same AI server at the same time (agent_coresidency_rules, migration
+// 65, composite primary key (application_id, mapping_a_id, mapping_b_id), all
+// three columns FK on delete cascade). A row's PRESENCE is the only
+// co-residency signal — there is no `allowed` column, so "not co-resident" is
+// the structural default and the table holds nothing but allowed pairs.
+// Canonical ordering (MappingAID < MappingBID, so every unordered pair has
+// exactly one row) is validated by the caller (the portal, Task 6): the
+// store stays a dumb pair table and never sorts, rejects, or rewrites a pair.
+type CoResidencyRule struct {
+	ApplicationID string
+	MappingAID    string // canonical: MappingAID < MappingBID, enforced by the caller (portal)
+	MappingBID    string
+	CreatedAt     time.Time
+}
+
 // RuntimeStore is the agent-runtime-manager persistence surface (migration
-// 65): per-mapping launch specs and their per-GPU VRAM demand rows. Task 2
-// adds the co-residency methods, Task 3 the GPU budgets, Task 4 the runtime
-// reports — all on the same three tables created by migration 65.
+// 65): per-mapping launch specs, their per-GPU VRAM demand rows, and the
+// pairwise co-residency matrix (Task 2). Task 3 adds GPU budgets, Task 4 the
+// runtime reports — all on the same three tables created by migration 65.
 type RuntimeStore interface {
 	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
 	// spec per mapping — the unique key is mapping_id, not id): a fresh
@@ -1263,7 +1279,20 @@ type RuntimeStore interface {
 	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
 	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.
 	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
-	// Task 2 adds the coresidency methods, Task 3 budgets, Task 4 reports.
+	// SetCoResidencyRules atomically REPLACES the whole set of allowed
+	// co-residency pairs for appID (delete-then-insert in one transaction,
+	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). An empty/nil rules
+	// clears the set. appID must exist (ErrNotFound, checked inside the
+	// transaction before the delete); a rule naming a mapping id that does
+	// not exist is also ErrNotFound (FK violation). The store does NOT
+	// enforce or rewrite the MappingAID < MappingBID canonical ordering —
+	// that validation belongs to the portal (Task 6).
+	SetCoResidencyRules(ctx context.Context, appID string, rules []CoResidencyRule) error
+	// CoResidencyRulesByApplication lists appID's allowed co-residency
+	// pairs, ordered by mapping_a_id then mapping_b_id. Always non-nil,
+	// empty when none.
+	CoResidencyRulesByApplication(ctx context.Context, appID string) ([]CoResidencyRule, error)
+	// Task 3 adds GPU budgets, Task 4 runtime reports.
 }
 
 // Store is the full routing persistence surface: the composition of every

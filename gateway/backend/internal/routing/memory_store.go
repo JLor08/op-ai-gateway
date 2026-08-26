@@ -102,6 +102,16 @@ type MemoryStore struct {
 	// read, mirroring the SQL `order by gpu_index`). Deleting a spec cascades
 	// deletion of its entry here (mirrors the table's ON DELETE CASCADE).
 	runtimeSpecGPUs map[string][]RuntimeSpecGPU
+	// coresidency mirrors agent_coresidency_rules (migration 65, Task 2):
+	// applicationID -> its full set of allowed co-residency pairs. A row's
+	// PRESENCE is the "allowed" signal (there is no separate flag) — the
+	// SQL table's shape, mirrored here directly. SetCoResidencyRules
+	// atomically replaces the whole per-application set (delete-then-insert
+	// on the SQL side; a single map assignment here, already atomic under
+	// m.mu). Unordered on write; CoResidencyRulesByApplication sorts by
+	// (MappingAID, MappingBID) on read, mirroring the SQL `order by
+	// mapping_a_id, mapping_b_id` (same pattern as runtimeSpecGPUs above).
+	coresidency map[string][]CoResidencyRule
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -133,6 +143,7 @@ func NewMemoryStore() *MemoryStore {
 		certificates:             map[string]Certificate{},
 		runtimeSpecs:             map[string]RuntimeSpec{},
 		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
+		coresidency:              map[string][]CoResidencyRule{},
 	}
 }
 
@@ -2219,4 +2230,57 @@ func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
 	out := make([]RuntimeSpecGPU, len(gpus))
 	copy(out, gpus)
 	return out
+}
+
+// --- RuntimeStore: co-residency matrix (agent-runtime-manager, Task 2) -----
+
+// SetCoResidencyRules atomically REPLACES appID's whole set of allowed
+// co-residency pairs (mirrors the SQL delete-then-insert transaction; the
+// in-memory assignment below is already atomic under m.mu, so no separate
+// "delete" step is needed — a failed check leaves the previous set
+// untouched, same as a rolled-back SQL transaction). appID must exist
+// (ErrNotFound otherwise); every rule's two mapping ids must also exist — a
+// hand-rolled FK existence check against m.mappings, mirroring
+// UpsertRuntimeSpec's mapping_id check above and the SQL FKs on
+// mapping_a_id/mapping_b_id. The store does NOT enforce or rewrite the
+// MappingAID < MappingBID canonical ordering — that is portal-level
+// validation (Task 6).
+func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules []CoResidencyRule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.applications[appID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	stored := make([]CoResidencyRule, 0, len(rules))
+	for _, r := range rules {
+		if _, ok := m.mappings[r.MappingAID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		if _, ok := m.mappings[r.MappingBID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		r.ApplicationID = appID
+		stored = append(stored, r)
+	}
+	m.coresidency[appID] = stored
+	return nil
+}
+
+// CoResidencyRulesByApplication returns appID's allowed co-residency pairs,
+// ordered by MappingAID then MappingBID (mirrors the SQL `order by
+// mapping_a_id, mapping_b_id`). Always non-nil, empty when none. The result
+// is a fresh copy (CoResidencyRule has no slice/pointer fields, so a plain
+// element copy suffices — mirrors copyRuntimeSpecGPUs' non-nil contract).
+func (m *MemoryStore) CoResidencyRulesByApplication(_ context.Context, appID string) ([]CoResidencyRule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]CoResidencyRule, len(m.coresidency[appID]))
+	copy(out, m.coresidency[appID])
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].MappingAID != out[j].MappingAID {
+			return out[i].MappingAID < out[j].MappingAID
+		}
+		return out[i].MappingBID < out[j].MappingBID
+	})
+	return out, nil
 }

@@ -7568,6 +7568,59 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 	})
 }
 
+// TestConformanceCoResidencyRules proves the co-residency matrix (migration
+// 65: agent_coresidency_rules) behaves identically on both dialects: empty by
+// default, atomic full replace (set + ordered read, then clear via an
+// empty/nil set), unknown-application ErrNotFound, and the FK-before-unique
+// classification when a rule names a mapping id that does not exist. The
+// store itself does not enforce or rewrite the MappingAID < MappingBID
+// canonical ordering — that is portal-level validation added in Task 6.
+func TestConformanceCoResidencyRules(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedRuntimeParents(t, s, now)
+		// Empty by default
+		rules, err := s.CoResidencyRulesByApplication(ctx, "app_rt")
+		if err != nil || len(rules) != 0 {
+			t.Fatalf("default: %v %d", err, len(rules))
+		}
+		if rules == nil {
+			t.Fatal("default must be non-nil, empty")
+		}
+		// Set + ordered read (order by mapping_a_id, mapping_b_id)
+		want := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt")
+		if len(rules) != 1 || rules[0].MappingAID != "map_rt" || rules[0].MappingBID != "map_rt2" {
+			t.Fatalf("read back: %+v", rules)
+		}
+		// Full replace with empty clears
+		if err := s.SetCoResidencyRules(ctx, "app_rt", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 0 {
+			t.Fatalf("clear must empty the set: %+v", rules)
+		}
+		if rules == nil {
+			t.Fatal("cleared read must be non-nil, empty")
+		}
+		// Unknown application -> ErrNotFound
+		if err := s.SetCoResidencyRules(ctx, "app_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown app: want ErrNotFound, got %v", err)
+		}
+		// FK: rule naming a missing mapping -> ErrNotFound
+		bad := []routing.CoResidencyRule{{ApplicationID: "app_rt", MappingAID: "map_missing", MappingBID: "map_rt", CreatedAt: now}}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", bad); err != ErrNotFound {
+			t.Fatalf("missing mapping: want ErrNotFound, got %v", err)
+		}
+	})
+}
+
 // seedRuntimeParents creates server srv_rt, server_agent application app_rt, and
 // mapping map_rt (+ a second mapping map_rt2 for later tasks).
 func seedRuntimeParents(t *testing.T, s *SQLStore, now time.Time) {
