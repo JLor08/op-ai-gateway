@@ -271,16 +271,21 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 }
 
 // DeleteRuntimeSpec removes mappingID's runtime spec. ErrRuntimeSpecNotFound
-// when none exists; ErrRuntimeSpecNotServerAgent when the owning
-// application is not server_agent (mirrors PutRuntimeSpec's write gate — see
-// GetRuntimeSpec's doc for why GET alone skips this check).
+// when none exists. Deliberately does NOT gate on the owning application's
+// type the way PutRuntimeSpec does: UpdateApplication lets an operator
+// retype a server_agent application to something else with no check against
+// its current type, and DeleteApplication does not cascade-clean runtime
+// specs — so a spec can end up on a non-server_agent application through
+// ordinary API use, not just seeded test state. Removal must always be
+// possible regardless of how a dependency became orphaned; only the
+// creation of a NEW dependency on server_agent semantics is gated. (An
+// earlier version of this method gated DELETE the same way as PUT; that was
+// a defect, not a deliberate symmetry — see the fix-round-1 note in the
+// task-5 report.)
 func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) error {
-	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, _, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return err
-	}
-	if app.Type != routing.ProviderServerAgent {
-		return ErrRuntimeSpecNotServerAgent
 	}
 	spec, ok, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)
 	if err != nil {

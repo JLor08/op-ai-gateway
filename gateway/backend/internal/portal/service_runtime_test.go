@@ -100,8 +100,13 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 
 	// A second PUT (upsert) preserves id/created_at and never lets the
 	// client clobber vram_measured_mb -- simulate a prior agent measurement,
-	// then PUT again with a different estimate and confirm the measured
-	// value survives untouched even though the request sends none.
+	// then PUT again with a different estimate AND an explicit (bogus)
+	// VRAMMeasuredMB on the wire, and confirm the measured value survives
+	// untouched. The request deliberately sends a non-zero VRAMMeasuredMB
+	// here (rather than leaving it at zero) so this assertion cannot be
+	// satisfied by accident just because Go's zero value happens to look
+	// like "field omitted" -- it pins that the field is read from the
+	// stored row, never from the request, at all.
 	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, dto.ID, 0, 7500); err != nil {
 		t.Fatalf("seed measured value: %v", err)
 	}
@@ -109,7 +114,7 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 		Enabled: true,
 		Binary:  "/usr/local/bin/llama-server",
 		Args:    []string{"--model", "/models/q.gguf"},
-		GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 9000}},
+		GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 9000, VRAMMeasuredMB: 99999}},
 	})
 	if err != nil {
 		t.Fatalf("PutRuntimeSpec (second): %v", err)
@@ -121,7 +126,7 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 		t.Fatalf("estimate not updated: gpus = %#v", dto2.GPUs)
 	}
 	if dto2.GPUs[0].VRAMMeasuredMB != 7500 {
-		t.Fatalf("measured value clobbered: got %d, want preserved 7500", dto2.GPUs[0].VRAMMeasuredMB)
+		t.Fatalf("measured value clobbered: got %d, want preserved 7500 (request sent bogus 99999)", dto2.GPUs[0].VRAMMeasuredMB)
 	}
 }
 
@@ -201,6 +206,60 @@ func TestPutRuntimeSpecValidation(t *testing.T) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestDeleteRuntimeSpecAllowedAfterApplicationRetyped pins a fix (review
+// finding on the first cut of this file): a runtime spec must remain
+// deletable even after its owning application is retyped away from
+// server_agent through the ordinary UpdateApplication path, which has no
+// check against the application's CURRENT type. Before the fix,
+// DeleteRuntimeSpec mirrored PutRuntimeSpec's server_agent gate, which made
+// such a spec permanently stuck: PutRuntimeSpec would refuse to touch it
+// (gated) and DeleteRuntimeSpec would too, with DeleteApplication itself
+// never cascade-cleaning specs -- the only remaining escape was
+// DeleteMapping, far more destructive than clearing one stray spec. A
+// cleanup operation must never be blockable by the same gate that prevents
+// creating a NEW dependency on server_agent semantics.
+func TestDeleteRuntimeSpecAllowedAfterApplicationRetyped(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{Binary: "/bin/x"}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+
+	retype := routing.ProviderVLLM
+	if _, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{Type: &retype}); err != nil {
+		t.Fatalf("UpdateApplication (retype to vllm): %v", err)
+	}
+
+	// GET stays permissive regardless of the (now non-server_agent) type.
+	if dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID); err != nil || !dto.Configured {
+		t.Fatalf("GetRuntimeSpec after retype = %#v, %v, want Configured:true, nil err", dto, err)
+	}
+
+	// PutRuntimeSpec stays gated -- creating/replacing still needs server_agent.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{Binary: "/bin/y"}); !errors.Is(err, ErrRuntimeSpecNotServerAgent) {
+		t.Fatalf("PutRuntimeSpec after retype = %v, want ErrRuntimeSpecNotServerAgent", err)
+	}
+
+	// DeleteRuntimeSpec must still succeed: this is the fix under test.
+	if err := svc.DeleteRuntimeSpec(ctx, ownerToken(), mapping.ID); err != nil {
+		t.Fatalf("DeleteRuntimeSpec after retype = %v, want success", err)
+	}
+	dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec after delete: %v", err)
+	}
+	if dto.Configured {
+		t.Fatalf("Configured = true after delete, want false")
 	}
 }
 
