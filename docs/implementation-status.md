@@ -183,8 +183,25 @@ docs/architecture in the documentation task):
   activity, so the `server_agent` type defaults to 600000 ms; the stock 30000
   would fail every cold model load reproducibly.
 
+Agent phase in progress:
+- Task 11 — agent feature registry, `Version` 0.1.0 → 0.2.0, capabilities
+  reporting (`42d420c`). (Not logged here at the time; backfilled during
+  Task 12.)
+- Task 12 — `server-agent/internal/runtime` package: wire-mirror types
+  (`types.go`, `ParseConfig`), the visible-load-lifecycle state machine, and
+  the pure `Admit` admission policy (`policy.go`), plus the `archtest`
+  allowlist entry for the new package. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-12-report.md`.
+  One documented judgment call: `archtest`'s `allowedDeps["internal/runtime"]`
+  is an empty slice, not `{"internal/gwapi"}` as the task brief's file list
+  suggested — `types.go`/`policy.go` are pure stdlib-only code and import
+  nothing module-internal; the design doc's "imports only internal/gwapi"
+  note describes the FULL future package (`config_client.go` et al., not yet
+  written). The edge will be added in whichever later task actually adds the
+  import.
+
 ## Next planned step
 
-1. Continue the plan at Task 10.
-2. Remaining: Task 10 (gateway), 11-18 (agent), 19-22 (portal UI),
+1. Continue the plan at Task 13.
+2. Remaining: 13-18 (agent), 19-22 (portal UI),
    23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
