@@ -116,6 +116,18 @@ type Driver struct {
 	// loggedMissing/warnMissingOnce idiom config_client.go and
 	// features_client.go already use in this package.
 	blocked bool
+	// applied tracks whether the CURRENTLY HELD config has been applied to
+	// the manager AT LEAST ONCE in this Driver's lifetime -- fix round 1,
+	// C1. This is NOT the same fact as Source.Load's own `changed` return,
+	// which only means "different from the last document THIS SOURCE
+	// returned": GatewaySource seeds its ETag from its own disk cache, so a
+	// reachable gateway answers 304 (changed=false) starting on the agent's
+	// very SECOND start, and an unreachable one falls back to the same
+	// cached, changed=false config -- either way a config that was never
+	// actually handed to the manager in THIS process would otherwise never
+	// be applied at all. Cleared by stopAll so the next active Sync
+	// (recovering from a drain) also re-applies unconditionally.
+	applied bool
 
 	routerMu     sync.Mutex
 	routerListen int
@@ -165,19 +177,37 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	if err != nil {
 		// ApplyPushed's own contract: a malformed pushed document returns
 		// the last known-good config unchanged alongside this error, so
-		// there is nothing unsafe about falling through below regardless --
+		// there is nothing unsafe about using cfg below regardless --
 		// changed is simply false in that case. Logging here is the only
 		// place this specific failure would otherwise be visible.
 		slog.Warn("runtime: pushed runtime-config invalid; keeping current config", "error", err)
 	}
-	if !changed {
+
+	// Fix round 1, I1: StartRouter is idempotent in the already-desired
+	// state and safe to call on every active Sync, not just a changed one
+	// -- a bind failure at startup (port busy, TIME_WAIT, another service)
+	// must not be stuck behind a single Warn log for the rest of the
+	// process's life just because the config never changes again. On a
+	// failed Load, cfg is still the last known-good document, so this can
+	// never tear down a good listener.
+	if err := d.StartRouter(cfg.RouterListen); err != nil {
+		slog.Warn("runtime: router (re)bind failed", "listen", cfg.RouterListen, "error", err)
+	}
+
+	// Fix round 1, C1: `changed` means "different from the config
+	// Source.Load last returned", NOT "already applied to the manager" --
+	// those two facts only coincide within a single process's uptime
+	// against a config that never repeats. Apply whenever the config
+	// differs OR nothing has ever actually been applied yet in this
+	// Driver's lifetime (a fresh process, or recovering from a drain via
+	// stopAll clearing applied).
+	if !changed && d.applied {
 		return
 	}
 
 	d.mgr.Apply(cfg)
-	if err := d.StartRouter(cfg.RouterListen); err != nil {
-		slog.Warn("runtime: router (re)bind failed", "listen", cfg.RouterListen, "error", err)
-	}
+	d.applied = true
+
 	if _, isFile := d.src.(*FileSource); isFile {
 		d.sendReport(ctx, cfg)
 	}
@@ -218,6 +248,7 @@ func (d *Driver) featureActive(ctx context.Context) bool {
 // field's doc).
 func (d *Driver) stopAll() {
 	d.mgr.Apply(emptyConfig())
+	d.applied = false // C1: force the next active Sync to re-Apply unconditionally
 	if err := d.StartRouter(0); err != nil {
 		slog.Debug("runtime: router stop failed", "error", err)
 	}

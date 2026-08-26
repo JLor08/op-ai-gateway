@@ -8,11 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -39,6 +41,32 @@ func newFeaturesServer(t *testing.T, features []string) *FeaturesClient {
 // that declares runtime_manager.
 func activeFeaturesClient(t *testing.T) *FeaturesClient {
 	return newFeaturesServer(t, []string{runtimeManagerFeature})
+}
+
+// newToggleableFeaturesServer returns a *FeaturesClient whose declared
+// feature set can be flipped live via the returned setter, so a single test
+// can drive ONE Driver through a real active->inactive->active transition
+// (fix round 1, C1 case b) without swapping the Driver's own features
+// client (an unexported field with no setter, by design). The handler never
+// sets an ETag, so FeaturesClient.Fetch never short-circuits on a cached
+// 304 -- every call reflects the CURRENT toggle state.
+func newToggleableFeaturesServer(t *testing.T, activeStart bool) (client *FeaturesClient, setActive func(bool)) {
+	t.Helper()
+	var active atomic.Bool
+	active.Store(activeStart)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var features []string
+		if active.Load() {
+			features = []string{runtimeManagerFeature}
+		}
+		w.WriteHeader(http.StatusOK)
+		body, _ := json.Marshal(struct {
+			Features []string `json:"features"`
+		}{Features: features})
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return NewFeaturesClient(srv.URL, "tok", nil), active.Store
 }
 
 // fakeManager is a hand-written driverManager fake (this module's house
@@ -132,37 +160,138 @@ func (f *fakeReporter) last() json.RawMessage {
 	return f.posts[len(f.posts)-1]
 }
 
-// TestDriverSyncAppliesOnlyOnChange proves Sync's step 3: manager.Apply is
-// called only when the source reports changed=true, never on an unchanged
-// Load.
-func TestDriverSyncAppliesOnlyOnChange(t *testing.T) {
+// TestDriverSyncAppliesOnFirstSyncEvenWhenSourceReportsUnchanged pins fix
+// round 1's Critical finding (C1), case (a). The ORIGINAL version of this
+// test (named TestDriverSyncAppliesOnlyOnChange) asserted the exact
+// OPPOSITE of what is checked below -- it required Apply to be skipped on
+// an unchanged first Load, which is precisely the bug: Source.Load's
+// `changed` flag means "different from what THIS SOURCE last returned",
+// not "already applied to the manager". GatewaySource seeds its ETag from
+// its own disk cache, so a reachable gateway answers 304 -- changed=false
+// -- starting on an agent's very SECOND start, and an unreachable one
+// falls back to the same cached, changed=false config. Gating Apply on
+// `changed` alone meant a restarted (or merely gateway-unreachable-at-boot)
+// agent would manage nothing and never bind its router, for the rest of
+// that process's life.
+func TestDriverSyncAppliesOnFirstSyncEvenWhenSourceReportsUnchanged(t *testing.T) {
 	mgr := &fakeManager{}
-	// RouterListen 0: these tests exercise Apply-on-change, not StartRouter
-	// (that has its own dedicated tests below) -- keeping it 0 means Sync's
-	// own StartRouter(cfg.RouterListen) call stays a no-op, never binding a
+	// RouterListen 0: this test exercises Apply, not StartRouter (which has
+	// its own dedicated tests below) -- keeping it 0 means Sync's own
+	// StartRouter(cfg.RouterListen) call stays a no-op, never binding a
 	// real port.
 	src := &fakeSource{cfg: Config{MaxProcesses: 3, Specs: []Spec{}}, changed: false}
 	d := newDriver(mgr, src, activeFeaturesClient(t), nil)
 
+	// The Driver's FIRST Sync ever, with the source reporting changed=false
+	// from the very first Load -- exactly GatewaySource's restart/
+	// unreachable-gateway shape -- must still apply the config once.
 	d.Sync(context.Background(), nil)
-	if got := mgr.applyCount(); got != 0 {
-		t.Fatalf("Apply calls after unchanged Load = %d, want 0", got)
+	if got := mgr.applyCount(); got != 1 {
+		t.Fatalf("Apply calls after the Driver's FIRST Sync (source reports changed=false) = %d, want 1 -- C1: a fresh Driver must apply its first-ever config even when nothing looks 'changed' to the source", got)
+	}
+	if got := mgr.lastApplied(); got.MaxProcesses != 3 {
+		t.Fatalf("applied config = %+v, want MaxProcesses=3", got)
 	}
 	if got := src.loadCount(); got != 1 {
 		t.Fatalf("Load calls = %d, want 1", got)
 	}
 
+	// Steady state: a second, genuinely-still-unchanged Sync must NOT
+	// re-apply again -- this is the real invariant the original (broken)
+	// test was actually trying to protect, and it must still hold once the
+	// C1 fix is in place.
+	d.Sync(context.Background(), nil)
+	if got := mgr.applyCount(); got != 1 {
+		t.Fatalf("Apply calls after a second, still-unchanged Sync = %d, want still 1 (no redundant re-apply in steady state)", got)
+	}
+
+	// A REAL change must still apply exactly once more.
 	src.mu.Lock()
 	src.changed = true
 	src.mu.Unlock()
+	d.Sync(context.Background(), nil)
+	if got := mgr.applyCount(); got != 2 {
+		t.Fatalf("Apply calls after a real change = %d, want 2", got)
+	}
+}
+
+// TestDriverSyncReappliesAfterInactiveToActiveTransition pins fix round 1's
+// Critical finding (C1), case (b): a drain (runtime_manager negotiated
+// inactive) must not be permanent. When the gateway declares the feature
+// again, the very next Sync must re-apply the config to the manager even
+// though the SOURCE itself still reports changed=false (nothing about the
+// desired document changed across the drain -- only the negotiation
+// outcome did).
+func TestDriverSyncReappliesAfterInactiveToActiveTransition(t *testing.T) {
+	mgr := &fakeManager{}
+	src := &fakeSource{cfg: Config{MaxProcesses: 3, Specs: []Spec{}}, changed: false}
+	features, setActive := newToggleableFeaturesServer(t, true)
+	d := newDriver(mgr, src, features, nil)
 
 	d.Sync(context.Background(), nil)
 	if got := mgr.applyCount(); got != 1 {
-		t.Fatalf("Apply calls after changed Load = %d, want 1", got)
+		t.Fatalf("Apply calls after the first active Sync = %d, want 1", got)
+	}
+
+	// The gateway stops declaring the feature: drain everything.
+	setActive(false)
+	d.Sync(context.Background(), nil)
+	if got := mgr.applyCount(); got != 2 {
+		t.Fatalf("Apply calls after the drain = %d, want 2 (the drain-everything call)", got)
+	}
+
+	// The gateway declares it again -- the SAME (changed=false) config
+	// must still be re-applied to the manager; this is exactly the case
+	// the pre-fix code got wrong.
+	setActive(true)
+	d.Sync(context.Background(), nil)
+	if got := mgr.applyCount(); got != 3 {
+		t.Fatalf("Apply calls after reactivation = %d, want 3 -- C1: must re-apply even though the source's own config is unchanged across the drain", got)
 	}
 	if got := mgr.lastApplied(); got.MaxProcesses != 3 {
-		t.Fatalf("applied config = %+v, want MaxProcesses=3", got)
+		t.Fatalf("re-applied config = %+v, want MaxProcesses=3", got)
 	}
+}
+
+// TestDriverSyncRetriesRouterBindEveryActiveSync pins fix round 1's I1: a
+// failed router bind must not be stuck behind a single Warn log for the
+// rest of the process's life just because the config never changes again.
+// StartRouter is called on EVERY active Sync now (not merely a changed
+// one), so a transient bind failure self-heals on the very next tick, even
+// with a config that never reports `changed`.
+func TestDriverSyncRetriesRouterBindEveryActiveSync(t *testing.T) {
+	mgr := &fakeManager{}
+	src := &fakeSource{cfg: Config{Specs: []Spec{}}, changed: false}
+	d := newDriver(mgr, src, activeFeaturesClient(t), nil)
+
+	port := grabFreePort(t)
+	blocker, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("occupy port: %v", err)
+	}
+	src.mu.Lock()
+	src.cfg = Config{RouterListen: port, Specs: []Spec{}}
+	src.mu.Unlock()
+
+	d.Sync(context.Background(), nil) // bind fails: the port is occupied
+	t.Cleanup(func() { _ = d.StartRouter(0) })
+
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	if resp, err := client.Get(healthURL); err == nil {
+		resp.Body.Close()
+		t.Fatal("router answered on an occupied port; the bind should have failed")
+	}
+
+	if err := blocker.Close(); err != nil {
+		t.Fatalf("release occupied port: %v", err)
+	}
+
+	// The config is UNCHANGED (fakeSource still reports changed=false), yet
+	// the next active Sync must retry the bind and succeed now that the
+	// port is free.
+	d.Sync(context.Background(), nil)
+	waitForHTTP200(t, healthURL, 2*time.Second)
 }
 
 // TestDriverSyncFeatureInactiveStopsManagerAndSkipsLoad proves step 1: when
