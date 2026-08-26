@@ -1747,10 +1747,15 @@ func TestConformanceServerNetbirdPingExclude(t *testing.T) {
 
 // TestConformanceServerAgentPresenceTimeoutSeconds exercises the migration-v31
 // ai_servers.agent_presence_timeout_seconds int column (0 = follow the
-// system-wide default): it round-trips a non-zero value through create ->
-// every read path (AIServerByID / AIServers / ServersByOwner, both scan
-// sites), a second server created without the field defaults to 0, and a
-// full UpdateAIServer changes + persists the value end-to-end. Both dialects.
+// system-wide default) AND (Task 3) migration 66's two additive
+// runtime_max_processes / managed_runtime_only columns: it round-trips
+// non-zero/non-default values through create -> every read path
+// (AIServerByID / AIServers / ServersByOwner, all scan sites), a second
+// server created without the fields defaults to 0/false, and a full
+// UpdateAIServer changes + persists the values end-to-end (including flipping
+// runtime_max_processes and managed_runtime_only to DIFFERENT values, which
+// would fail if any of the insert/update/select/scan sites were missed).
+// Both dialects.
 func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -1761,6 +1766,8 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 			Provider: routing.ProviderVLLM, Endpoint: "http://e",
 			Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			AgentPresenceTimeoutSeconds: 42,
+			RuntimeMaxProcesses:         3,
+			ManagedRuntimeOnly:          true,
 			CreatedAt:                   now, UpdatedAt: now,
 		}
 		if err := s.CreateUser(ctx, newTestUser("usr_apt", "apt@example.test", now)); err != nil {
@@ -1790,6 +1797,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		if gotDef.AgentPresenceTimeoutSeconds != 0 {
 			t.Fatalf("agent_presence_timeout_seconds defaulted to %d, want 0", gotDef.AgentPresenceTimeoutSeconds)
 		}
+		if gotDef.RuntimeMaxProcesses != 0 {
+			t.Fatalf("runtime_max_processes defaulted to %d, want 0", gotDef.RuntimeMaxProcesses)
+		}
+		if gotDef.ManagedRuntimeOnly {
+			t.Fatal("managed_runtime_only defaulted to true, want false")
+		}
 
 		// Round-trips through all three read paths (both scan sites).
 		got, err := s.AIServerByID(ctx, srv.ID)
@@ -1798,6 +1811,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		}
 		if got.AgentPresenceTimeoutSeconds != 42 {
 			t.Fatalf("AIServerByID agent_presence_timeout_seconds = %d, want 42", got.AgentPresenceTimeoutSeconds)
+		}
+		if got.RuntimeMaxProcesses != 3 {
+			t.Fatalf("AIServerByID runtime_max_processes = %d, want 3", got.RuntimeMaxProcesses)
+		}
+		if !got.ManagedRuntimeOnly {
+			t.Fatal("AIServerByID managed_runtime_only = false, want true")
 		}
 		all, err := s.AIServers(ctx)
 		if err != nil {
@@ -1809,16 +1828,21 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 				listed = &all[i]
 			}
 		}
-		if listed == nil || listed.AgentPresenceTimeoutSeconds != 42 {
-			t.Fatalf("AIServers agent_presence_timeout_seconds round-trip: %+v", listed)
+		if listed == nil || listed.AgentPresenceTimeoutSeconds != 42 || listed.RuntimeMaxProcesses != 3 || !listed.ManagedRuntimeOnly {
+			t.Fatalf("AIServers agent_presence_timeout_seconds/runtime round-trip: %+v", listed)
 		}
 		owned, err := s.ServersByOwner(ctx, "usr_apt")
-		if err != nil || len(owned) != 1 || owned[0].AgentPresenceTimeoutSeconds != 42 {
-			t.Fatalf("ServersByOwner agent_presence_timeout_seconds round-trip: err=%v %+v", err, owned)
+		if err != nil || len(owned) != 1 || owned[0].AgentPresenceTimeoutSeconds != 42 || owned[0].RuntimeMaxProcesses != 3 || !owned[0].ManagedRuntimeOnly {
+			t.Fatalf("ServersByOwner agent_presence_timeout_seconds/runtime round-trip: err=%v %+v", err, owned)
 		}
 
-		// A full UpdateAIServer changes + persists a new value end-to-end.
+		// A full UpdateAIServer changes + persists new values end-to-end,
+		// flipping runtime_max_processes and managed_runtime_only to
+		// DIFFERENT values (not just toggling a bool) so a missed set-list/
+		// arg/scan site cannot hide behind reusing the same value.
 		got.AgentPresenceTimeoutSeconds = 99
+		got.RuntimeMaxProcesses = 7
+		got.ManagedRuntimeOnly = false
 		got.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateAIServer(ctx, got); err != nil {
 			t.Fatalf("full update: %v", err)
@@ -1830,9 +1854,17 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		if reread.AgentPresenceTimeoutSeconds != 99 {
 			t.Fatalf("full update did not persist agent_presence_timeout_seconds=99, got %d", reread.AgentPresenceTimeoutSeconds)
 		}
+		if reread.RuntimeMaxProcesses != 7 {
+			t.Fatalf("full update did not persist runtime_max_processes=7, got %d", reread.RuntimeMaxProcesses)
+		}
+		if reread.ManagedRuntimeOnly {
+			t.Fatal("full update did not persist managed_runtime_only=false")
+		}
 
-		// Back to 0 (follow-system) round-trips too.
+		// Back to 0/false (follow-system / unrestricted) round-trips too.
 		reread.AgentPresenceTimeoutSeconds = 0
+		reread.RuntimeMaxProcesses = 0
+		reread.ManagedRuntimeOnly = false
 		reread.UpdatedAt = now.Add(2 * time.Minute)
 		if err := s.UpdateAIServer(ctx, reread); err != nil {
 			t.Fatalf("full update (reset to 0): %v", err)
@@ -1843,6 +1875,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		}
 		if final.AgentPresenceTimeoutSeconds != 0 {
 			t.Fatalf("full update did not persist agent_presence_timeout_seconds=0, got %d", final.AgentPresenceTimeoutSeconds)
+		}
+		if final.RuntimeMaxProcesses != 0 {
+			t.Fatalf("full update did not persist runtime_max_processes=0, got %d", final.RuntimeMaxProcesses)
+		}
+		if final.ManagedRuntimeOnly {
+			t.Fatal("full update did not persist managed_runtime_only=false")
 		}
 	})
 }
@@ -7617,6 +7655,80 @@ func TestConformanceCoResidencyRules(t *testing.T) {
 		bad := []routing.CoResidencyRule{{ApplicationID: "app_rt", MappingAID: "map_missing", MappingBID: "map_rt", CreatedAt: now}}
 		if err := s.SetCoResidencyRules(ctx, "app_rt", bad); err != ErrNotFound {
 			t.Fatalf("missing mapping: want ErrNotFound, got %v", err)
+		}
+	})
+}
+
+// TestConformanceServerGPUBudgets proves the per-GPU VRAM budget table
+// (migration 66, Task 3: ai_server_gpu_budgets) behaves identically on both
+// dialects: empty by default, atomic full replace (two budgets set for
+// indexes 1 and 0 deliberately out of order, ordered read by gpu_index, then
+// a full replace with a different set), clear via a nil set, and
+// unknown-server ErrNotFound. BudgetMB 0 means "no budget" = unconstrained —
+// the store just persists the value, it never interprets it.
+func TestConformanceServerGPUBudgets(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedRuntimeParents(t, s, now) // server srv_rt
+
+		// Empty by default, and non-nil.
+		budgets, err := s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 0 {
+			t.Fatalf("default: %v %d", err, len(budgets))
+		}
+		if budgets == nil {
+			t.Fatal("default must be non-nil, empty")
+		}
+
+		// Set two budgets, indexes 1 then 0 (deliberately out of order) ->
+		// must read back ordered by gpu_index (a broken order-by or sort
+		// comparator would still pass a single-row assertion; Task 2's
+		// review flagged exactly that, hence two rows here).
+		want := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 1, BudgetMB: 12000, ExpectedUUID: "GPU-1", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 24000, ExpectedUUID: "GPU-0", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 2 {
+			t.Fatalf("read back: %v %d", err, len(budgets))
+		}
+		if budgets[0].GPUIndex != 0 || budgets[0].BudgetMB != 24000 || budgets[0].ExpectedUUID != "GPU-0" || budgets[0].ExpectedName != "RTX 4090" {
+			t.Fatalf("position 0 must be gpu_index 0: %+v", budgets[0])
+		}
+		if budgets[1].GPUIndex != 1 || budgets[1].BudgetMB != 12000 || budgets[1].ExpectedUUID != "GPU-1" {
+			t.Fatalf("position 1 must be gpu_index 1: %+v", budgets[1])
+		}
+
+		// Full replace with a different set overwrites the previous one.
+		replacement := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 8000, ExpectedUUID: "GPU-0b", ExpectedName: "A100", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", replacement); err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 1 || budgets[0].BudgetMB != 8000 || budgets[0].ExpectedUUID != "GPU-0b" {
+			t.Fatalf("replace must overwrite the previous set: %v %+v", err, budgets)
+		}
+
+		// Full replace with a nil set clears, still non-nil on read.
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if budgets, err = s.ServerGPUBudgets(ctx, "srv_rt"); err != nil || len(budgets) != 0 {
+			t.Fatalf("clear must empty the set: %v %+v", err, budgets)
+		}
+		if budgets == nil {
+			t.Fatal("cleared read must be non-nil, empty")
+		}
+
+		// Unknown server -> ErrNotFound.
+		if err := s.SetServerGPUBudgets(ctx, "srv_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown server: want ErrNotFound, got %v", err)
 		}
 	})
 }

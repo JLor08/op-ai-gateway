@@ -682,3 +682,77 @@ func TestRoutingStoreCoResidencyRules(t *testing.T) {
 		}
 	})
 }
+
+// --- Agent runtime manager: per-GPU VRAM budgets memory-vs-SQL parity (Task 3) ---
+
+// TestRoutingStoreServerGPUBudgets proves routing.MemoryStore and the SQL
+// store agree on the per-GPU VRAM budget semantics: empty-and-non-nil by
+// default, atomic full replace (two out-of-order rows, ordered read, then a
+// replace with a different set), clear via a nil set, and unknown-server
+// ErrNotFound (MemoryStore hand-checks server existence to mirror the SQL FK
+// on ai_servers, mirroring TestRoutingStoreCoResidencyRules above).
+func TestRoutingStoreServerGPUBudgets(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_gb", Name: "GB", Domain: "gb.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://gb", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		// Empty by default, and non-nil.
+		budgets, err := s.ServerGPUBudgets(ctx, "srv_gb")
+		if err != nil || budgets == nil || len(budgets) != 0 {
+			t.Fatalf("default must be non-nil empty: err=%v budgets=%#v", err, budgets)
+		}
+
+		// Set two budgets, indexes 1 then 0 (deliberately out of order) ->
+		// ordered read by GPUIndex.
+		want := []routing.ServerGPUBudget{
+			{ServerID: "srv_gb", GPUIndex: 1, BudgetMB: 12000, ExpectedUUID: "GPU-1", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_gb", GPUIndex: 0, BudgetMB: 24000, ExpectedUUID: "GPU-0", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_gb", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_gb")
+		if err != nil || len(budgets) != 2 {
+			t.Fatalf("read back: %v %+v", err, budgets)
+		}
+		if budgets[0].GPUIndex != 0 || budgets[0].BudgetMB != 24000 {
+			t.Fatalf("position 0 must be gpu_index 0: %+v", budgets[0])
+		}
+		if budgets[1].GPUIndex != 1 || budgets[1].BudgetMB != 12000 {
+			t.Fatalf("position 1 must be gpu_index 1: %+v", budgets[1])
+		}
+
+		// Full replace with a different set overwrites the previous one.
+		replacement := []routing.ServerGPUBudget{
+			{ServerID: "srv_gb", GPUIndex: 0, BudgetMB: 8000, ExpectedUUID: "GPU-0b", ExpectedName: "A100", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_gb", replacement); err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_gb")
+		if err != nil || len(budgets) != 1 || budgets[0].BudgetMB != 8000 {
+			t.Fatalf("replace must overwrite the previous set: %v %+v", err, budgets)
+		}
+
+		// Full replace with a nil set clears, still non-nil on read.
+		if err := s.SetServerGPUBudgets(ctx, "srv_gb", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if budgets, err = s.ServerGPUBudgets(ctx, "srv_gb"); err != nil || budgets == nil || len(budgets) != 0 {
+			t.Fatalf("clear must leave non-nil empty: err=%v budgets=%#v", err, budgets)
+		}
+
+		// Unknown server -> ErrNotFound.
+		if err := s.SetServerGPUBudgets(ctx, "srv_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown server: want ErrNotFound, got %v", err)
+		}
+	})
+}

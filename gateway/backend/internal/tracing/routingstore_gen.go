@@ -796,6 +796,18 @@ func (_d *RoutingStoreWithTracing) ServerAvailabilitySamples(ctx context.Context
 	return _d.Store.ServerAvailabilitySamples(ctx, serverID, from, to, limit)
 }
 
+func (_d *RoutingStoreWithTracing) ServerGPUBudgets(ctx context.Context, serverID string) (sa1 []_sourceRouting.ServerGPUBudget, err error) {
+	ctx, span := Start(ctx, "routing.Store.ServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ServerGPUBudgets(ctx, serverID)
+}
+
 func (_d *RoutingStoreWithTracing) ServerHardwareByServer(ctx context.Context, serverID string) (s1 _sourceRouting.ServerHardware, b1 bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.ServerHardwareByServer")
 	defer span.End()
@@ -1034,6 +1046,18 @@ func (_d *RoutingStoreWithTracing) SetServerAdminGroup(ctx context.Context, serv
 		}
 	}()
 	return _d.Store.SetServerAdminGroup(ctx, serverID, groupID)
+}
+
+func (_d *RoutingStoreWithTracing) SetServerGPUBudgets(ctx context.Context, serverID string, budgets []_sourceRouting.ServerGPUBudget) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetServerGPUBudgets(ctx, serverID, budgets)
 }
 
 func (_d *RoutingStoreWithTracing) SetServerHealth(ctx context.Context, serverID string, health string) (err error) {

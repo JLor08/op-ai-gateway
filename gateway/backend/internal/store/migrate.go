@@ -96,6 +96,7 @@ var migrations = []migration{
 	{version: 63, name: "token_unknown_model_redirect", up: migration63Up},
 	{version: 64, name: "model_group_min_tps_double_precision", up: migration64Up},
 	{version: 65, name: "agent_runtime_manager", up: migration65Up},
+	{version: 66, name: "server_runtime_limits", up: migration66Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2886,6 +2887,39 @@ func migration65Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	for _, stmt := range stmts {
 		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration66Up creates the per-GPU VRAM budget table (Task 3), keyed by
+// (server_id, gpu_index): how much VRAM (MB) the operator has allotted to
+// agent-managed runtimes on that GPU for co-residency admission math. It also
+// adds two additive ai_servers columns: runtime_max_processes (0 =
+// unlimited) and managed_runtime_only (gates whether non-runtime
+// applications may be created on the server, enforced in Task 6). VRAM is
+// deliberately plain integer MB (ADR-005's wide-type rule applies to
+// floats/64-bit ints, not this bounded value).
+func migration66Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	if err := execTx(ctx, tx, dl, `create table if not exists ai_server_gpu_budgets (
+		server_id text not null references ai_servers(id) on delete cascade,
+		gpu_index integer not null,
+		budget_mb integer not null default 0,
+		expected_uuid text not null default '',
+		expected_name text not null default '',
+		created_at `+ts+` not null, updated_at `+ts+` not null,
+		primary key (server_id, gpu_index)
+	)`); err != nil {
+		return err
+	}
+	cols := []string{
+		"runtime_max_processes integer not null default 0",
+		"managed_runtime_only integer not null default 0",
+	}
+	for _, col := range cols {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
 			return err
 		}
 	}

@@ -237,6 +237,60 @@ func (s *SQLiteStore) CoResidencyRulesByApplication(ctx context.Context, appID s
 	return out, nil
 }
 
+// SetServerGPUBudgets atomically REPLACES the whole set of per-GPU VRAM
+// budgets for serverID (delete-then-insert in one transaction, mirroring
+// SetRuntimeSpecGPUs/SetCoResidencyRules above). serverID must exist —
+// checked inside the transaction, before the delete — or ErrNotFound.
+func (s *SQLiteStore) SetServerGPUBudgets(ctx context.Context, serverID string, budgets []routing.ServerGPUBudget) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin set gpu budgets: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, s.dl.rebind(`select count(*) from ai_servers where id = ?`), serverID).Scan(&exists); err != nil {
+		return fmt.Errorf("check server: %w", err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from ai_server_gpu_budgets where server_id = ?`), serverID); err != nil {
+		return fmt.Errorf("clear gpu budgets: %w", err)
+	}
+	for _, b := range budgets {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+			insert into ai_server_gpu_budgets (server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at)
+			values (?, ?, ?, ?, ?, ?, ?)`), serverID, b.GPUIndex, b.BudgetMB, b.ExpectedUUID, b.ExpectedName, b.CreatedAt, b.UpdatedAt); err != nil {
+			return fmt.Errorf("insert gpu budget: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
+// index. Always non-nil, empty when none.
+func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]routing.ServerGPUBudget, error) {
+	rows, err := s.query(ctx, `
+		select server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at
+		from ai_server_gpu_budgets where server_id = ? order by gpu_index`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("list gpu budgets: %w", err)
+	}
+	defer rows.Close()
+	out := make([]routing.ServerGPUBudget, 0)
+	for rows.Next() {
+		var b routing.ServerGPUBudget
+		if err := rows.Scan(&b.ServerID, &b.GPUIndex, &b.BudgetMB, &b.ExpectedUUID, &b.ExpectedName, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan gpu budget: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate gpu budgets: %w", err)
+	}
+	return out, nil
+}
+
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
 	var enabled, pinned, vramLocked int64

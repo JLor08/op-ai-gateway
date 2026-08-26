@@ -140,13 +140,24 @@ type AIServer struct {
 	// a server OUT; under "selected" this opts a server IN. Routing never reads
 	// it (absent from the candidate join).
 	HTTPSSwitchOverride string
-	Provider            string
-	Endpoint            string
-	Status              string
-	HealthStatus        string
-	LastSeenAt          *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// RuntimeMaxProcesses caps how many agent-managed runtime processes
+	// (server_agent applications, migration 66, Task 3) may run concurrently
+	// on this server. 0 = unlimited. Enforced by the agent-runtime-manager
+	// admission logic (Task 6+); routing never reads it (absent from the
+	// candidate join).
+	RuntimeMaxProcesses int
+	// ManagedRuntimeOnly restricts this server to agent-managed runtime
+	// applications only, gating whether a non-runtime application may be
+	// created on it (migration 66, Task 3; enforced in Task 6+). Routing
+	// never reads it (absent from the candidate join).
+	ManagedRuntimeOnly bool
+	Provider           string
+	Endpoint           string
+	Status             string
+	HealthStatus       string
+	LastSeenAt         *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // Service is a Service Account (Phase 1 service accounts): an autonomous
@@ -1249,10 +1260,30 @@ type CoResidencyRule struct {
 	CreatedAt     time.Time
 }
 
-// RuntimeStore is the agent-runtime-manager persistence surface (migration
-// 65): per-mapping launch specs, their per-GPU VRAM demand rows, and the
-// pairwise co-residency matrix (Task 2). Task 3 adds GPU budgets, Task 4 the
-// runtime reports — all on the same three tables created by migration 65.
+// ServerGPUBudget is a per-GPU VRAM budget for co-residency admission math
+// (ai_server_gpu_budgets, migration 66, Task 3), keyed by (ServerID,
+// GPUIndex): how much VRAM (MB) the operator has allotted to agent-managed
+// runtimes on that GPU. BudgetMB 0 means "no budget for this GPU" =
+// unconstrained (also true for a GPU with no row at all). ExpectedUUID /
+// ExpectedName are a purely descriptive drift detector: snapshotted when the
+// row is created (by the portal, Task 6) and later compared against live
+// telemetry to WARN that a card was renumbered — they never block anything;
+// the store just persists them.
+type ServerGPUBudget struct {
+	ServerID     string
+	GPUIndex     int
+	BudgetMB     int
+	ExpectedUUID string
+	ExpectedName string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// RuntimeStore is the agent-runtime-manager persistence surface: per-mapping
+// launch specs and their per-GPU VRAM demand rows, the pairwise co-residency
+// matrix (Task 2), and per-GPU VRAM budgets (Task 3) — all on tables created
+// by migration 65 (specs/GPUs/co-residency) and migration 66 (GPU budgets +
+// the ai_servers runtime columns). Task 4 adds runtime reports.
 type RuntimeStore interface {
 	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
 	// spec per mapping — the unique key is mapping_id, not id): a fresh
@@ -1292,7 +1323,16 @@ type RuntimeStore interface {
 	// pairs, ordered by mapping_a_id then mapping_b_id. Always non-nil,
 	// empty when none.
 	CoResidencyRulesByApplication(ctx context.Context, appID string) ([]CoResidencyRule, error)
-	// Task 3 adds GPU budgets, Task 4 runtime reports.
+	// SetServerGPUBudgets atomically REPLACES the whole set of per-GPU VRAM
+	// budgets for serverID (delete-then-insert in one transaction, mirroring
+	// SetRuntimeSpecGPUs/SetCoResidencyRules above). An empty/nil budgets
+	// clears the set. serverID must exist (ErrNotFound, checked inside the
+	// transaction before the delete).
+	SetServerGPUBudgets(ctx context.Context, serverID string, budgets []ServerGPUBudget) error
+	// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
+	// index. Always non-nil, empty when none.
+	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
+	// Task 4 adds runtime reports.
 }
 
 // Store is the full routing persistence surface: the composition of every

@@ -376,3 +376,16 @@ func TestMigration65RuntimeTables(t *testing.T) {
 		}
 	}
 }
+
+// TestMigration66GPUBudgetsTable proves migration 66 creates the per-GPU VRAM
+// budget table (Task 3); the two new ai_servers columns
+// (runtime_max_processes, managed_runtime_only) are exercised end-to-end by
+// TestConformanceServerAgentPresenceTimeoutSeconds instead, since
+// sqliteTableExists only checks for tables, not columns.
+func TestMigration66GPUBudgetsTable(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	if !sqliteTableExists(t, s.db, "ai_server_gpu_budgets") {
+		t.Fatal("table ai_server_gpu_budgets missing after migrate")
+	}
+}

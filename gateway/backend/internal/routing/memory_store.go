@@ -112,6 +112,13 @@ type MemoryStore struct {
 	// (MappingAID, MappingBID) on read, mirroring the SQL `order by
 	// mapping_a_id, mapping_b_id` (same pattern as runtimeSpecGPUs above).
 	coresidency map[string][]CoResidencyRule
+	// gpuBudgets mirrors ai_server_gpu_budgets (migration 66, Task 3): serverID
+	// -> its full set of per-GPU VRAM budgets. SetServerGPUBudgets atomically
+	// replaces the whole per-server set (delete-then-insert on the SQL side; a
+	// single map assignment here, already atomic under m.mu). Unordered on
+	// write; ServerGPUBudgets sorts by GPUIndex on read, mirroring the SQL
+	// `order by gpu_index` (same pattern as runtimeSpecGPUs/coresidency above).
+	gpuBudgets map[string][]ServerGPUBudget
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -144,6 +151,7 @@ func NewMemoryStore() *MemoryStore {
 		runtimeSpecs:             map[string]RuntimeSpec{},
 		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
 		coresidency:              map[string][]CoResidencyRule{},
+		gpuBudgets:               map[string][]ServerGPUBudget{},
 	}
 }
 
@@ -2282,5 +2290,43 @@ func (m *MemoryStore) CoResidencyRulesByApplication(_ context.Context, appID str
 		}
 		return out[i].MappingBID < out[j].MappingBID
 	})
+	return out, nil
+}
+
+// --- RuntimeStore: per-GPU VRAM budgets (agent-runtime-manager, Task 3) ----
+
+// SetServerGPUBudgets atomically REPLACES serverID's whole set of per-GPU
+// VRAM budgets (mirrors the SQL delete-then-insert transaction; the
+// in-memory assignment below is already atomic under m.mu, so no separate
+// "delete" step is needed — a failed check leaves the previous set
+// untouched, same as a rolled-back SQL transaction). serverID must exist
+// (ErrNotFound otherwise) — a hand-rolled FK existence check against
+// m.servers, mirroring SetRuntimeSpecGPUs/SetCoResidencyRules above.
+func (m *MemoryStore) SetServerGPUBudgets(_ context.Context, serverID string, budgets []ServerGPUBudget) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[serverID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	stored := make([]ServerGPUBudget, len(budgets))
+	copy(stored, budgets)
+	for i := range stored {
+		stored[i].ServerID = serverID
+	}
+	m.gpuBudgets[serverID] = stored
+	return nil
+}
+
+// ServerGPUBudgets returns serverID's per-GPU VRAM budgets, ordered by GPU
+// index (mirrors the SQL `order by gpu_index`). Always non-nil, empty when
+// none. The result is a fresh copy (ServerGPUBudget has no slice/pointer
+// fields, so a plain element copy suffices — mirrors
+// CoResidencyRulesByApplication's non-nil contract above).
+func (m *MemoryStore) ServerGPUBudgets(_ context.Context, serverID string) ([]ServerGPUBudget, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]ServerGPUBudget, len(m.gpuBudgets[serverID]))
+	copy(out, m.gpuBudgets[serverID])
+	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
 	return out, nil
 }
