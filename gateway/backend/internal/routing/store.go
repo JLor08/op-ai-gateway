@@ -1279,11 +1279,30 @@ type ServerGPUBudget struct {
 	UpdatedAt    time.Time
 }
 
+// ServerRuntimeReport is the latest agent-managed runtime configuration
+// reported UPWARD by a server's ServerAgent when it is configured from a
+// local file on the AI server instead of from the gateway
+// (server_runtime_reports, migration 67). 1:1 per server, upsert-overwrite —
+// shaped exactly like ServerHardware. ReportJSON is a validated canonical
+// JSON blob, opaque to the store: the gateway's ingest layer (a later task)
+// parses, sanitizes, and redacts environment-variable values before the
+// report ever reaches here. The portal displays it read-only (a later
+// task); the store never parses, validates, or inspects it.
+type ServerRuntimeReport struct {
+	ServerID string
+	// CollectedAt is when the agent gathered the report; UpdatedAt is when
+	// the gateway wrote it. Both are supplied by the caller.
+	CollectedAt time.Time
+	ReportJSON  string
+	UpdatedAt   time.Time
+}
+
 // RuntimeStore is the agent-runtime-manager persistence surface: per-mapping
 // launch specs and their per-GPU VRAM demand rows, the pairwise co-residency
-// matrix (Task 2), and per-GPU VRAM budgets (Task 3) — all on tables created
-// by migration 65 (specs/GPUs/co-residency) and migration 66 (GPU budgets +
-// the ai_servers runtime columns). Task 4 adds runtime reports.
+// matrix (Task 2), per-GPU VRAM budgets (Task 3), and file-mode runtime
+// reports (Task 4) — all on tables created by migration 65
+// (specs/GPUs/co-residency), migration 66 (GPU budgets + the ai_servers
+// runtime columns), and migration 67 (runtime reports).
 type RuntimeStore interface {
 	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
 	// spec per mapping — the unique key is mapping_id, not id): a fresh
@@ -1332,7 +1351,14 @@ type RuntimeStore interface {
 	// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
 	// index. Always non-nil, empty when none.
 	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
-	// Task 4 adds runtime reports.
+	// UpsertServerRuntimeReport stores the latest file-mode runtime report
+	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
+	// An unknown ServerID is ErrNotFound (FK violation).
+	UpsertServerRuntimeReport(ctx context.Context, report ServerRuntimeReport) error
+	// ServerRuntimeReportByServer returns the latest runtime report for
+	// serverID; ok is false when no report has ever been stored for that
+	// server (not an error) — mirrors ServerHardwareByServer.
+	ServerRuntimeReportByServer(ctx context.Context, serverID string) (ServerRuntimeReport, bool, error)
 }
 
 // Store is the full routing persistence surface: the composition of every

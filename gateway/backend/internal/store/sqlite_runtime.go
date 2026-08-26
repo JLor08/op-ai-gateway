@@ -326,3 +326,62 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	spec.Enabled, spec.Pinned, spec.VRAMLocked = enabled != 0, pinned != 0, vramLocked != 0
 	return spec, nil
 }
+
+// UpsertServerRuntimeReport stores the latest file-mode runtime report for
+// its server (server_runtime_reports, migration 67). A rename-level copy of
+// UpsertServerHardware: report.ReportJSON is an opaque, already-validated
+// canonical JSON blob — the store never parses or inspects it.
+func (s *SQLiteStore) UpsertServerRuntimeReport(ctx context.Context, report routing.ServerRuntimeReport) error {
+	_, err := s.exec(ctx, `
+		insert into server_runtime_reports (server_id, collected_at, report_json, updated_at)
+		values (?, ?, ?, ?)
+		on conflict(server_id) do update set
+			collected_at = excluded.collected_at,
+			report_json = excluded.report_json,
+			updated_at = excluded.updated_at`,
+		report.ServerID,
+		report.CollectedAt,
+		report.ReportJSON,
+		report.UpdatedAt,
+	)
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("upsert server runtime report: %w", err)
+	}
+	return nil
+}
+
+// ServerRuntimeReportByServer returns the latest runtime report for
+// serverID; ok is false when no report has ever been stored (not an error).
+// A rename-level copy of ServerHardwareByServer.
+func (s *SQLiteStore) ServerRuntimeReportByServer(ctx context.Context, serverID string) (routing.ServerRuntimeReport, bool, error) {
+	row := s.queryRow(ctx, `
+		select server_id, collected_at, report_json, updated_at
+		from server_runtime_reports
+		where server_id = ?`, serverID)
+	report, err := scanServerRuntimeReport(row)
+	if errors.Is(err, ErrNotFound) {
+		return routing.ServerRuntimeReport{}, false, nil
+	}
+	if err != nil {
+		return routing.ServerRuntimeReport{}, false, err
+	}
+	return report, true, nil
+}
+
+func scanServerRuntimeReport(row rowScanner) (routing.ServerRuntimeReport, error) {
+	var report routing.ServerRuntimeReport
+	err := row.Scan(&report.ServerID, &report.CollectedAt, &report.ReportJSON, &report.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return routing.ServerRuntimeReport{}, ErrNotFound
+	}
+	if err != nil {
+		return routing.ServerRuntimeReport{}, fmt.Errorf("scan server runtime report: %w", err)
+	}
+	return report, nil
+}

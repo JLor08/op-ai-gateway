@@ -787,3 +787,60 @@ func TestRoutingStoreServerGPUBudgets(t *testing.T) {
 		}
 	})
 }
+
+// --- Agent runtime manager: file-mode runtime reports memory-vs-SQL parity (Task 4) ---
+
+// TestRoutingStoreServerRuntimeReports proves routing.MemoryStore and the SQL
+// store agree on ServerRuntimeReport semantics: absent read, insert,
+// round-trip, upsert-overwrite, and the orphan-server FK error — mirroring
+// TestRoutingStoreServerGPUBudgets above, but for the 1:1 upsert-overwrite
+// shape server_runtime_reports shares with server_hardware.
+func TestRoutingStoreServerRuntimeReports(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_rr", Name: "RR", Domain: "rr.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://rr", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		// Absent -> (zero, false, nil).
+		if _, ok, err := s.ServerRuntimeReportByServer(ctx, "srv_rr"); err != nil || ok {
+			t.Fatalf("absent report: ok=%v err=%v", ok, err)
+		}
+
+		// Insert, then round-trip.
+		first := routing.ServerRuntimeReport{
+			ServerID: "srv_rr", CollectedAt: now, ReportJSON: `{"mode":"file","binary":"/usr/bin/llama-server"}`, UpdatedAt: now,
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, first); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		got, ok, err := s.ServerRuntimeReportByServer(ctx, "srv_rr")
+		if err != nil || !ok || got.ReportJSON != first.ReportJSON || !got.CollectedAt.Equal(now) || !got.UpdatedAt.Equal(now) {
+			t.Fatalf("read back: ok=%v err=%v got=%#v", ok, err, got)
+		}
+
+		// Upsert overwrites the same server row.
+		second := routing.ServerRuntimeReport{
+			ServerID: "srv_rr", CollectedAt: now.Add(time.Minute), ReportJSON: `{"mode":"file","binary":"/usr/bin/vllm"}`, UpdatedAt: now.Add(time.Minute),
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, second); err != nil {
+			t.Fatalf("overwrite: %v", err)
+		}
+		got, ok, err = s.ServerRuntimeReportByServer(ctx, "srv_rr")
+		if err != nil || !ok || got.ReportJSON != second.ReportJSON || !got.CollectedAt.Equal(now.Add(time.Minute)) {
+			t.Fatalf("after overwrite: ok=%v err=%v got=%#v", ok, err, got)
+		}
+
+		// Unknown server -> ErrNotFound.
+		orphan := routing.ServerRuntimeReport{ServerID: "srv_missing", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
+		if err := s.UpsertServerRuntimeReport(ctx, orphan); err != ErrNotFound {
+			t.Fatalf("unknown server: want ErrNotFound, got %v", err)
+		}
+	})
+}

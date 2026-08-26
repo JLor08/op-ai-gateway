@@ -2610,6 +2610,64 @@ func TestConformanceServerHardware(t *testing.T) {
 	})
 }
 
+// TestConformanceServerRuntimeReports mirrors TestConformanceServerHardware's
+// shape verbatim: server_runtime_reports (migration 67) is deliberately
+// shaped exactly like server_hardware (1:1 per server, upsert-overwrite, one
+// opaque validated JSON blob the store never parses).
+func TestConformanceServerRuntimeReports(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+
+		srv := routing.AIServer{
+			ID: "rr1", Name: "rr1", Domain: "rr1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://rr1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateAIServer(ctx, srv); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		// Absent -> (zero, false, nil).
+		if _, ok, err := s.ServerRuntimeReportByServer(ctx, "rr1"); err != nil || ok {
+			t.Fatalf("ServerRuntimeReportByServer(absent) = ok=%v err=%v, want ok=false", ok, err)
+		}
+
+		// Insert, then round-trip.
+		first := routing.ServerRuntimeReport{
+			ServerID: "rr1", CollectedAt: now, ReportJSON: `{"mode":"file","binary":"/usr/bin/llama-server"}`, UpdatedAt: now,
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, first); err != nil {
+			t.Fatalf("UpsertServerRuntimeReport(insert): %v", err)
+		}
+		got, ok, err := s.ServerRuntimeReportByServer(ctx, "rr1")
+		if err != nil || !ok {
+			t.Fatalf("ServerRuntimeReportByServer = ok=%v err=%v, want ok=true", ok, err)
+		}
+		if got.ReportJSON != `{"mode":"file","binary":"/usr/bin/llama-server"}` || !got.CollectedAt.Equal(now) || !got.UpdatedAt.Equal(now) {
+			t.Fatalf("round-trip = %#v", got)
+		}
+
+		// Upsert overwrites the same server row (still exactly one; report replaced).
+		second := routing.ServerRuntimeReport{
+			ServerID: "rr1", CollectedAt: now.Add(time.Minute), ReportJSON: `{"mode":"file","binary":"/usr/bin/vllm"}`, UpdatedAt: now.Add(time.Minute),
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, second); err != nil {
+			t.Fatalf("UpsertServerRuntimeReport(overwrite): %v", err)
+		}
+		got, ok, err = s.ServerRuntimeReportByServer(ctx, "rr1")
+		if err != nil || !ok || got.ReportJSON != `{"mode":"file","binary":"/usr/bin/vllm"}` || !got.CollectedAt.Equal(now.Add(time.Minute)) {
+			t.Fatalf("after overwrite = %#v ok=%v err=%v", got, ok, err)
+		}
+
+		// Missing server -> ErrNotFound (FK violation classified).
+		orphan := routing.ServerRuntimeReport{ServerID: "nope", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
+		if err := s.UpsertServerRuntimeReport(ctx, orphan); err != ErrNotFound {
+			t.Fatalf("UpsertServerRuntimeReport(missing server) = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 func TestConformanceBenchmarkRuns(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()

@@ -97,6 +97,7 @@ var migrations = []migration{
 	{version: 64, name: "model_group_min_tps_double_precision", up: migration64Up},
 	{version: 65, name: "agent_runtime_manager", up: migration65Up},
 	{version: 66, name: "server_runtime_limits", up: migration66Up},
+	{version: 67, name: "server_runtime_reports", up: migration67Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2924,4 +2925,24 @@ func migration66Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration67Up creates the server_runtime_reports table (Task 4): the 1:1
+// latest agent-managed runtime configuration report per server (PK
+// server_id, upsert-overwrite), reported UPWARD by a server's ServerAgent
+// when it is configured from a local file on the AI server instead of from
+// the gateway. Deliberately shaped exactly like server_hardware (migration
+// 29): report_json is a validated canonical JSON blob the store never
+// parses (the gateway's ingest layer does the parsing, sanitizing, and
+// environment-variable redaction before a report ever reaches here). No
+// index needed (PK lookup).
+func migration67Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmt := `create table if not exists server_runtime_reports (
+		server_id    text primary key references ai_servers(id) on delete cascade,
+		collected_at ` + ts + ` not null,
+		report_json  text not null default '',
+		updated_at   ` + ts + ` not null
+	)`
+	return execTx(ctx, tx, dl, stmt)
 }

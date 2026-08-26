@@ -832,6 +832,18 @@ func (_d *RoutingStoreWithTracing) ServerOwners(ctx context.Context, serverID st
 	return _d.Store.ServerOwners(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) ServerRuntimeReportByServer(ctx context.Context, serverID string) (s1 _sourceRouting.ServerRuntimeReport, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.ServerRuntimeReportByServer")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ServerRuntimeReportByServer(ctx, serverID)
+}
+
 func (_d *RoutingStoreWithTracing) ServersByAdminGroups(ctx context.Context, groupIDs []string) (aa1 []_sourceRouting.AIServer, err error) {
 	ctx, span := Start(ctx, "routing.Store.ServersByAdminGroups")
 	defer span.End()
@@ -1538,6 +1550,18 @@ func (_d *RoutingStoreWithTracing) UpsertServerHardware(ctx context.Context, har
 		}
 	}()
 	return _d.Store.UpsertServerHardware(ctx, hardware)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertServerRuntimeReport(ctx context.Context, report _sourceRouting.ServerRuntimeReport) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertServerRuntimeReport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertServerRuntimeReport(ctx, report)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertTelemetry(ctx context.Context, telemetry _sourceRouting.ServerTelemetry) (err error) {

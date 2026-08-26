@@ -119,6 +119,10 @@ type MemoryStore struct {
 	// write; ServerGPUBudgets sorts by GPUIndex on read, mirroring the SQL
 	// `order by gpu_index` (same pattern as runtimeSpecGPUs/coresidency above).
 	gpuBudgets map[string][]ServerGPUBudget
+	// runtimeReports mirrors server_runtime_reports (migration 67, Task 4):
+	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
+	// same shape as `hardware` above.
+	runtimeReports map[string]ServerRuntimeReport
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -152,6 +156,7 @@ func NewMemoryStore() *MemoryStore {
 		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
 		coresidency:              map[string][]CoResidencyRule{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
+		runtimeReports:           map[string]ServerRuntimeReport{},
 	}
 }
 
@@ -2351,4 +2356,28 @@ func (m *MemoryStore) ServerGPUBudgets(_ context.Context, serverID string) ([]Se
 	copy(out, m.gpuBudgets[serverID])
 	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
 	return out, nil
+}
+
+// --- RuntimeStore: file-mode runtime reports (agent-runtime-manager, Task 4) ---
+
+// UpsertServerRuntimeReport stores the latest file-mode runtime report for
+// its server. An unknown ServerID classifies as ErrNotFound — a rename-level
+// copy of UpsertServerHardware above.
+func (m *MemoryStore) UpsertServerRuntimeReport(_ context.Context, report ServerRuntimeReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[report.ServerID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	m.runtimeReports[report.ServerID] = report
+	return nil
+}
+
+// ServerRuntimeReportByServer returns the latest runtime report for
+// serverID — a rename-level copy of ServerHardwareByServer above.
+func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID string) (ServerRuntimeReport, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	report, ok := m.runtimeReports[serverID]
+	return report, ok, nil
 }

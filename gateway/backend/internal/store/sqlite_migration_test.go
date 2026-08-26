@@ -389,3 +389,14 @@ func TestMigration66GPUBudgetsTable(t *testing.T) {
 		t.Fatal("table ai_server_gpu_budgets missing after migrate")
 	}
 }
+
+// TestMigration67RuntimeReportsTable proves migration 67 creates the
+// server_runtime_reports table (Task 4): 1:1 file-mode runtime report per
+// server, shaped exactly like server_hardware (migration 29).
+func TestMigration67RuntimeReportsTable(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	if !sqliteTableExists(t, s.db, "server_runtime_reports") {
+		t.Fatal("table server_runtime_reports missing after migrate")
+	}
+}
