@@ -149,6 +149,22 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+		case "runtime_report":
+			// context.Background(): a shutdown must not turn an in-flight ingest into a
+			// store error (which would close with 1011 instead of the watcher's 1001).
+			if err := s.ingestRuntimeReport(context.Background(), serverID, f.Data); err != nil {
+				switch {
+				case errors.Is(err, errAgentRuntimeReportInvalid):
+					slog.Debug("agent stream: invalid runtime_report frame", "server_id", serverID, "err", err)
+					continue // skip the bad frame, keep streaming
+				case errors.Is(err, errAgentUnknownServer):
+					_ = conn.Close(websocket.StatusPolicyViolation, "unknown server")
+					return
+				default: // store error
+					_ = conn.Close(websocket.StatusInternalError, "runtime report ingest failed")
+					return
+				}
+			}
 		default:
 			// Unknown frame type: ignore for forward-compat.
 			slog.Debug("agent stream: unknown frame type", "server_id", serverID, "type", f.Type)

@@ -1226,6 +1226,7 @@ func (s *Server) routes() {
 		{"/api/agent/v1/proxy-routes", s.handleAgentProxyRoutes, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 		{"/api/agent/v1/features", s.handleAgentFeatures, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 		{"/api/agent/v1/runtime-config", s.handleAgentRuntimeConfig, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
+		{"/api/agent/v1/runtime-report", s.handleAgentRuntimeReport, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 	}
 	for _, rt := range agentRoutes {
 		s.mux.HandleFunc(rt.path, s.gatedAgentRoute(rt.handler, rt.gate, rt.message))

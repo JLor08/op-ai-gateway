@@ -6,10 +6,14 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
+	"strings"
 	"time"
 )
 
@@ -160,4 +164,247 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 		}
 		s.AgentStreams.NotifyRuntimeConfig(serverID, b)
 	}()
+}
+
+// --- Task 9: file-mode runtime report ingest --------------------------------
+
+// runtimeReportEnvMask replaces every env VALUE (keys stay visible) in a
+// reported file-mode config before it is stored. Defense in depth (design
+// spec §10.2): the agent is REQUIRED to redact env values itself before
+// sending (a local config file may legitimately hold a plaintext secret,
+// e.g. an HF_TOKEN, that belongs to the server operator) -- but the gateway
+// must never trust that. Re-parsing Config into a typed struct and
+// overwriting every value here means a buggy or compromised agent cannot
+// make the gateway persist a secret, regardless of what it actually sent.
+const runtimeReportEnvMask = "•••"
+
+// agentRuntimeReportSpecGPU mirrors AgentRuntimeSpecGPUDTO (portal's
+// runtime-config wire shape, §11) -- the file-mode local config uses EXACTLY
+// that schema (design spec §10.2: "one parser, one validation, one
+// reconciler; the mode is a source switch"). A local gateway-side mirror,
+// not a reuse of the portal type, matching this file's existing convention
+// for every other agent wire struct (agentSystemReport, agentTelemetryRequest).
+type agentRuntimeReportSpecGPU struct {
+	Index  int `json:"index"`
+	VRAMMB int `json:"vram_mb"`
+}
+
+// agentRuntimeReportSpec mirrors AgentRuntimeSpecDTO. Env is the ONLY field
+// this schema uses to carry secrets (design spec §4.6: "env values are
+// referential"), so it is the sole redaction target below.
+type agentRuntimeReportSpec struct {
+	ID                          string                      `json:"id"`
+	Model                       string                      `json:"model"`
+	UpstreamModel               string                      `json:"upstream_model"`
+	Binary                      string                      `json:"binary"`
+	Args                        []string                    `json:"args"`
+	Env                         map[string]string           `json:"env"`
+	WorkDir                     string                      `json:"work_dir,omitempty"`
+	GPUs                        []agentRuntimeReportSpecGPU `json:"gpus"`
+	ListenPort                  int                         `json:"listen_port"`
+	HealthPath                  string                      `json:"health_path"`
+	HealthTimeoutSeconds        int                         `json:"health_timeout_seconds"`
+	StartupTimeoutSeconds       int                         `json:"startup_timeout_seconds"`
+	IdleTimeoutSeconds          int                         `json:"idle_timeout_seconds"`
+	AdmissionWaitTimeoutSeconds int                         `json:"admission_wait_timeout_seconds"`
+	Pinned                      bool                        `json:"pinned"`
+	AdminState                  string                      `json:"admin_state"`
+}
+
+// agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.
+type agentRuntimeReportGPUBudget struct {
+	Index    int `json:"index"`
+	BudgetMB int `json:"budget_mb"`
+}
+
+// agentRuntimeReportConfig mirrors AgentRuntimeConfigDTO (the runtime-config
+// document shape, §11) -- the local file a file-mode agent reads uses this
+// exact schema, and this is what a file-mode report's Config field carries
+// back up. Re-parsing the reported Config into this fully-typed struct (never
+// json.RawMessage passthrough) is itself part of the defense-in-depth: an
+// unknown field a buggy/compromised agent might inject is silently dropped by
+// the unmarshal, never round-tripped into the stored canonical blob -- the
+// SAME re-marshal-what-you-validated technique sanitizeSystemReport uses.
+type agentRuntimeReportConfig struct {
+	RouterListen int                           `json:"router_listen"`
+	MaxProcesses int                           `json:"max_processes"`
+	GPUBudgets   []agentRuntimeReportGPUBudget `json:"gpu_budgets"`
+	Specs        []agentRuntimeReportSpec      `json:"specs"`
+	Coresident   [][2]string                   `json:"coresident"`
+	ETag         string                        `json:"etag,omitempty"`
+}
+
+// agentRuntimeReport mirrors the agent's file-mode upward report (design
+// spec §10.2): which config source produced Config, when the agent last
+// (re)loaded it, any parse error from that load (Config may legitimately be
+// the zero value alongside a non-empty ParseError -- a broken file keeps the
+// agent's last-good runtime running but still reports why disk state
+// couldn't be adopted), and the effective config itself.
+type agentRuntimeReport struct {
+	Source      string          `json:"source"`
+	CollectedAt time.Time       `json:"collected_at"`
+	ParseError  string          `json:"parse_error,omitempty"`
+	Config      json.RawMessage `json:"config"`
+}
+
+// errAgentRuntimeReportInvalid: the runtime-report payload failed to parse
+// (POST -> 400 agent.runtime_report_invalid; WS -> skip the frame, keep
+// streaming). Mirrors errAgentSystemReportInvalid.
+var errAgentRuntimeReportInvalid = errors.New("agent runtime report: invalid payload")
+
+// runtimeReportInvalidError wraps a concrete parse error while matching
+// errAgentRuntimeReportInvalid via errors.Is (so the POST 400 body carries
+// detail), mirroring systemReportInvalidError.
+type runtimeReportInvalidError struct{ cause error }
+
+func (e *runtimeReportInvalidError) Error() string { return e.cause.Error() }
+func (e *runtimeReportInvalidError) Unwrap() error { return e.cause }
+func (e *runtimeReportInvalidError) Is(target error) bool {
+	return target == errAgentRuntimeReportInvalid
+}
+
+// sanitizeRuntimeReportConfig re-parses raw into the fully-typed
+// agentRuntimeReportConfig, masks every spec's env values, normalizes every
+// collection-shaped field to non-nil, and re-marshals canonically. An empty
+// or unparseable raw (a file-mode agent reporting a load failure via
+// ParseError, or a forward-incompatible/hostile payload) yields "{}" rather
+// than an error -- Config failing to parse must never reject the WHOLE
+// report, which still carries meaningful Source/ParseError/CollectedAt.
+func sanitizeRuntimeReportConfig(raw json.RawMessage) json.RawMessage {
+	var cfg agentRuntimeReportConfig
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			cfg = agentRuntimeReportConfig{}
+		}
+	}
+	if cfg.GPUBudgets == nil {
+		cfg.GPUBudgets = []agentRuntimeReportGPUBudget{}
+	}
+	if cfg.Coresident == nil {
+		cfg.Coresident = [][2]string{}
+	}
+	if cfg.Specs == nil {
+		cfg.Specs = []agentRuntimeReportSpec{}
+	}
+	for i := range cfg.Specs {
+		if cfg.Specs[i].Env == nil {
+			cfg.Specs[i].Env = map[string]string{}
+		}
+		for k := range cfg.Specs[i].Env {
+			cfg.Specs[i].Env[k] = runtimeReportEnvMask
+		}
+		if cfg.Specs[i].Args == nil {
+			cfg.Specs[i].Args = []string{}
+		}
+		if cfg.Specs[i].GPUs == nil {
+			cfg.Specs[i].GPUs = []agentRuntimeReportSpecGPU{}
+		}
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		// Impossible for these field types; fall back to an empty object
+		// (mirrors sanitizeSystemReport's equivalent fallback).
+		return json.RawMessage("{}")
+	}
+	return json.RawMessage(b)
+}
+
+// ingestRuntimeReport is the transport-agnostic core shared by the POST
+// handler (handleAgentRuntimeReport) and the WS reader (handleAgentStream
+// case "runtime_report"), mirroring ingestSystemReport exactly: parse,
+// sanitize (clamp strings + redact Config's env values), existence-check the
+// server, and upsert server_runtime_reports. Returns the same typed
+// sentinels the system-report path uses so each transport maps them itself.
+//
+// After a successful upsert, it flips RuntimeStatusRegistry's per-server
+// file-mode flag (report.Source == "file") -- consulted by PushRuntimeConfig
+// so the gateway stops sending runtime_config frames to a file-mode agent
+// (which would discard them anyway; this is belt-and-suspenders, not the
+// only guard).
+func (s *Server) ingestRuntimeReport(ctx context.Context, serverID string, raw json.RawMessage) error {
+	var req agentRuntimeReport
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return &runtimeReportInvalidError{cause: err}
+	}
+	now := time.Now().UTC()
+	req.Source = clampHardwareString(strings.TrimSpace(req.Source))
+	req.ParseError = clampHardwareString(req.ParseError)
+	collectedAt := req.CollectedAt
+	if collectedAt.IsZero() {
+		collectedAt = now
+	}
+	req.CollectedAt = collectedAt
+	req.Config = sanitizeRuntimeReportConfig(req.Config)
+	canonical, err := json.Marshal(req)
+	if err != nil {
+		// Impossible for these field types; fall back to an empty object
+		// (mirrors sanitizeSystemReport's equivalent fallback).
+		canonical = []byte("{}")
+	}
+	if _, err := s.Routes.AIServerByID(ctx, serverID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			slog.Warn("agent runtime report rejected: unknown server", "server_id", serverID)
+			return errAgentUnknownServer
+		}
+		slog.Error("agent runtime report: server lookup failed", "server_id", serverID, "err", err)
+		return &storeTelemetryError{code: "agent.server_lookup_failed", message: "server lookup failed", cause: err}
+	}
+	report := routing.ServerRuntimeReport{ServerID: serverID, CollectedAt: collectedAt, ReportJSON: string(canonical), UpdatedAt: now}
+	if err := s.Routes.UpsertServerRuntimeReport(ctx, report); err != nil {
+		slog.Error("agent runtime report: upsert failed", "server_id", serverID, "err", err)
+		return &storeTelemetryError{code: "agent.runtime_report_failed", message: "runtime report upsert failed", cause: err}
+	}
+	// Deliberately AFTER the store write succeeded, mirroring every other
+	// post-write registry update in this package: a report is evidence about
+	// this agent's own config source, and stamping it while the report
+	// itself failed to persist would claim freshness the gateway does not
+	// have.
+	s.RuntimeStatus.SetFileMode(serverID, req.Source == "file")
+	slog.Debug("agent runtime report stored", "server_id", serverID, "source", req.Source)
+	return nil
+}
+
+// agentRuntimeReportErrRows is writeAgentRuntimeReportError's one
+// mapper-specific row (errAgentRuntimeReportInvalid keeps its dynamic message
+// via msgFn); errAgentUnknownServer maps identically in writeAgentIngestError
+// and writeAgentSystemReportError and lives in sharedErrorMap instead.
+var agentRuntimeReportErrRows = []errRow{
+	{err: errAgentRuntimeReportInvalid, status: http.StatusBadRequest, code: "agent.runtime_report_invalid", msgFn: func(err error) string { return err.Error() }},
+}
+
+// writeAgentRuntimeReportError maps an ingestRuntimeReport error to an HTTP
+// response (POST only; the WS reader ignores the code and closes).
+func writeAgentRuntimeReportError(w http.ResponseWriter, err error) {
+	if writeMappedError(w, err, agentRuntimeReportErrRows, 0, "", "") {
+		return
+	}
+	var se *storeTelemetryError
+	if errors.As(err, &se) {
+		writeJSON(w, http.StatusInternalServerError, apierror.Response(se.code, se.message, ""))
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, apierror.Response("agent.runtime_report_failed", "runtime report ingest failed", ""))
+}
+
+// handleAgentRuntimeReport is the POST /api/agent/v1/runtime-report endpoint
+// (mirrors handleAgentSystemReport): bearer -> LookupAgentToken -> readRawJSON
+// -> ingest.
+func (s *Server) handleAgentRuntimeReport(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	principal, ok := s.authenticateAgent(w, r)
+	if !ok {
+		return
+	}
+	serverID := principal.ServerID
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	if err := s.ingestRuntimeReport(r.Context(), serverID, raw); err != nil {
+		writeAgentRuntimeReportError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "server_id": serverID})
 }
