@@ -221,10 +221,7 @@ const maxRuntimeGPUsPerSample = 64
 // conditions must all hold:
 //
 //  1. The spec exists (RuntimeSpecByID's ok).
-//  2. It is not VRAMLocked (vram_estimate_mb is operator-owned,
-//     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
-//     opt-out of the agent overwriting its own estimate).
-//  3. Its owning application belongs to serverID -- resolved via
+//  2. Its owning application belongs to serverID -- resolved via
 //     spec.MappingID -> MappingByID -> mapping.ApplicationID ->
 //     ApplicationByID -> application.ServerID. This is the authorization
 //     check: spec_id is an agent-supplied body field with no other
@@ -239,6 +236,18 @@ const maxRuntimeGPUsPerSample = 64
 //     pushes to B's OWN agent, so a forged value would corrupt the
 //     admission arithmetic B's agent runs against a spec it never reported
 //     on.
+//  3. It is not VRAMLocked (vram_estimate_mb is operator-owned,
+//     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
+//     opt-out of the agent overwriting its own estimate).
+//
+// The ownership check (2) is evaluated UNCONDITIONALLY, before the
+// VRAMLocked check (3) -- deliberately, so the audit-trail Warn below fires
+// for every genuine cross-server naming attempt regardless of whether the
+// targeted spec happens to be locked. Checking VRAMLocked first would let a
+// locked spec's cross-server mismatch return false silently, leaving no
+// record of exactly the attack this method exists to catch. Still exactly
+// ONE resolution pass per call (RuntimeSpecByID + MappingByID +
+// ApplicationByID, at most) -- reordering costs nothing extra.
 //
 // Any failure to resolve (a lookup error, or a spec/mapping/application
 // that no longer exists) is treated the same as "not writable" -- logged and
@@ -257,9 +266,6 @@ func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specI
 		// write the measurement back to. Not an error.
 		return false
 	}
-	if spec.VRAMLocked {
-		return false // the operator pinned this spec's VRAM numbers
-	}
 	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
 	if err != nil {
 		slog.Debug("runtime vram write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
@@ -271,8 +277,14 @@ func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specI
 		return false
 	}
 	if app.ServerID != serverID {
+		// Checked BEFORE VRAMLocked below: this Warn must fire for a
+		// cross-server naming attempt EVEN when the targeted spec happens to
+		// be locked -- see the doc above.
 		slog.Warn("runtime vram write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
 		return false
+	}
+	if spec.VRAMLocked {
+		return false // the operator pinned this spec's VRAM numbers
 	}
 	return true
 }

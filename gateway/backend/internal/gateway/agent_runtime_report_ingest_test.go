@@ -142,6 +142,81 @@ func TestIngestRuntimeReport(t *testing.T) {
 	})
 }
 
+// TestIngestRuntimeReportParseErrorRedactionShapes is round 2's coverage for
+// redactRuntimeReportParseError: the round-1 "keep everything up to the
+// first colon, pass a colon-less string through untouched" rule leaked a
+// secret in two shapes (no colon at all; a secret sitting BEFORE the first
+// colon). The fixed rule only ever keeps a narrowly classification-shaped
+// prefix and substitutes runtimeReportParseErrorGeneric otherwise. Each
+// case asserts on the STORED blob (not just the pure function), because
+// that is what the report view actually serves.
+func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
+	longToken := strings.Repeat("x", maxRuntimeReportClassificationLen+10)
+	generic := `"parse_error":"` + runtimeReportParseErrorGeneric + `"`
+	cases := []struct {
+		name           string
+		parseError     string
+		wantStored     string
+		mustNotContain []string
+	}{
+		{
+			name:           "classification retained",
+			parseError:     `yaml: line 4: could not find expected ':'`,
+			wantStored:     `"parse_error":"yaml"`,
+			mustNotContain: []string{"could not find expected", "line 4"},
+		},
+		{
+			// No colon anywhere: round 1 passed this through VERBATIM
+			// (clamped only). Must now degrade to the generic constant.
+			name:           "no colon at all",
+			parseError:     `unexpected token "HF_TOKEN=sk-abc123" in config`,
+			wantStored:     generic,
+			mustNotContain: []string{"sk-abc123", "HF_TOKEN"},
+		},
+		{
+			// The secret sits BEFORE the first colon: round 1's
+			// "keep the prefix" rule preserved exactly the wrong half.
+			name:           "secret before the first colon",
+			parseError:     `"HF_TOKEN=sk-abc123": invalid value`,
+			wantStored:     generic,
+			mustNotContain: []string{"sk-abc123", "HF_TOKEN"},
+		},
+		{
+			// Token-shaped (no whitespace/quotes/'=') but longer than
+			// maxRuntimeReportClassificationLen: bounded, so it must NOT be
+			// kept verbatim even though it contains no dangerous characters.
+			name:           "long token-shaped prefix is bounded, not kept",
+			parseError:     longToken + `: something failed`,
+			wantStored:     generic,
+			mustNotContain: []string{longToken},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			raw, err := json.Marshal(map[string]any{"source": "file", "parse_error": tc.parseError})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if err := srv.ingestRuntimeReport(context.Background(), "mock-host-qwen", raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			report, ok, err := srv.Routes.ServerRuntimeReportByServer(context.Background(), "mock-host-qwen")
+			if err != nil || !ok {
+				t.Fatalf("lookup ok=%v err=%v", ok, err)
+			}
+			if !strings.Contains(report.ReportJSON, tc.wantStored) {
+				t.Fatalf("stored blob = %s, want to contain %q", report.ReportJSON, tc.wantStored)
+			}
+			for _, bad := range tc.mustNotContain {
+				if strings.Contains(report.ReportJSON, bad) {
+					t.Fatalf("stored blob leaked %q: %s", bad, report.ReportJSON)
+				}
+			}
+		})
+	}
+}
+
 // TestHandleAgentRuntimeReportPOST proves the POST endpoint is registered on
 // the public mux, authenticates via the agent bearer token, and calls the
 // SAME ingestRuntimeReport (parity with the WS transport) -- mirrors

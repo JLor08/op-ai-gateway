@@ -178,26 +178,57 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 // make the gateway persist a secret, regardless of what it actually sent.
 const runtimeReportEnvMask = "•••"
 
-// redactRuntimeReportParseError keeps only a config-load error's
-// CLASSIFICATION -- the text up to (not including) the first ':' -- and
-// drops everything after it. This is the same defense-in-depth concern as
-// runtimeReportEnvMask, arriving through a NEIGHBORING field: a real
-// config-loader error routinely quotes the offending source line verbatim
-// (e.g. a YAML/JSON parser reporting `yaml: line 12: mapping key "HF_TOKEN:
-// sk-abc123" ...`), so clamping ParseError's LENGTH alone is not enough --
-// storing it unredacted would let a secret reach server_runtime_reports
-// through this field instead of env, defeating the very redaction the env
-// mask exists to enforce. A string with no colon (or empty) passes through
-// unchanged -- there is nothing after a classification to cut. This is a
-// heuristic tied to how error strings are conventionally formatted
-// ("subsystem: detail"), not a general secret scanner; it deliberately
-// trades some diagnostic detail for the guarantee that whatever follows a
-// classifying prefix never reaches storage.
+// runtimeReportParseErrorGeneric is the fixed, content-free string
+// substituted for a file-mode report's ParseError whenever
+// redactRuntimeReportParseError cannot confirm the text is safe. ParseError
+// is PURELY diagnostic -- the operator needs to know the local config file
+// failed to parse and roughly why, never any of the offending content -- so
+// the safe outcome is the DEFAULT here, not a fallback bolted onto a
+// keep-by-default rule (see the round-1-vs-round-2 note below).
+const runtimeReportParseErrorGeneric = "config parse error"
+
+// maxRuntimeReportClassificationLen bounds how long a kept classification
+// prefix (the text before the first ':') may be. A genuine subsystem tag
+// ("yaml", "json", "schema") is a handful of characters; anything past this
+// bound is far more likely to be actual error detail that happens to
+// contain an early colon than a real classification, so it is treated as
+// unsafe rather than kept.
+const maxRuntimeReportClassificationLen = 64
+
+// redactRuntimeReportParseError keeps a config-load error's TEXT only when
+// it looks like a bare "subsystem" classification token -- no whitespace, no
+// quote character, no '=', and no longer than
+// maxRuntimeReportClassificationLen -- and substitutes the fixed
+// runtimeReportParseErrorGeneric constant otherwise. This is the same
+// defense-in-depth concern as runtimeReportEnvMask, arriving through a
+// NEIGHBORING field: a real config-loader error routinely quotes the
+// offending source line verbatim, and that quoted content can land in EVERY
+// shape this field might take -- after a colon
+// (`yaml: line 12: mapping key "HF_TOKEN: sk-abc123"`), with NO colon at all
+// (`unexpected token "HF_TOKEN=sk-abc123" in config`), or even BEFORE the
+// first colon (`"HF_TOKEN=sk-abc123": invalid value`).
+//
+// An EARLIER version of this function kept the text up to the first colon
+// unconditionally and passed a colon-less string through untouched. Review
+// caught both failure modes above: a colon-less message leaked verbatim
+// (nothing to cut), and a secret sitting BEFORE the first colon survived
+// (the split kept precisely the wrong half). The fix is to stop treating
+// "keep it" as the default and "cut it" as the exception -- instead, the
+// classification-shaped prefix is the ONLY thing ever kept, and everything
+// else -- no colon, a too-long prefix, or a prefix containing whitespace/
+// quotes/'=' (the shapes a real secret or quoted detail actually takes) --
+// degrades to the generic constant. A genuine classifier like "yaml" or
+// "json" still survives; nothing else does.
 func redactRuntimeReportParseError(s string) string {
-	if i := strings.IndexByte(s, ':'); i >= 0 {
-		return strings.TrimSpace(s[:i])
+	i := strings.IndexByte(s, ':')
+	if i < 0 || i > maxRuntimeReportClassificationLen {
+		return runtimeReportParseErrorGeneric
 	}
-	return s
+	prefix := s[:i]
+	if prefix == "" || strings.ContainsAny(prefix, " \t\n\r\"'=") {
+		return runtimeReportParseErrorGeneric
+	}
+	return prefix
 }
 
 // agentRuntimeReportSpecGPU mirrors AgentRuntimeSpecGPUDTO (portal's

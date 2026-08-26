@@ -362,3 +362,50 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackBoundsSampleCount(t *testing.T
 		t.Fatalf("RuntimeSpecByID calls = %d, want exactly %d (the runtimes array must be truncated before processing, not just deduplicated)", got, maxRuntimeSamplesPerSample)
 	}
 }
+
+// --- Task 9 review round 2: audit trail must not depend on lock status ----
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLocked
+// is the audit-trail regression guard: resolveRuntimeSpecWritable used to
+// check VRAMLocked BEFORE the cross-server ownership check, so a naming
+// attempt against a spec that happened to be locked returned false with NO
+// Warn logged -- the write was still correctly blocked, but the audit trail
+// for exactly the attack the previous round fixed was silently incomplete.
+// Ownership is now checked UNCONDITIONALLY, so the Warn fires whether or
+// not the targeted spec is locked.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLocked(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant-locked"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	// rspec_cross_locked is BOTH owned by a different server AND VRAMLocked.
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_locked", true)
+
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_cross_locked","state":"running","gpus":[{"index":0,"vram_measured_mb":99999}]}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	// The write is still correctly blocked (cross-server wins regardless of
+	// lock status).
+	gpus, err := srv.Routes.RuntimeSpecGPUs(ctx, "rspec_cross_locked")
+	if err != nil || len(gpus) != 1 || gpus[0].VRAMMeasuredMB != 0 {
+		t.Fatalf("gpus = %#v, err = %v, want untouched", gpus, err)
+	}
+
+	recs := buf.Snapshot()
+	if !findLogRecord(recs, "WARN", "spec belongs to a different server") {
+		t.Fatal("a cross-server naming attempt against a LOCKED spec must still log a Warn -- the audit trail must not depend on lock status")
+	}
+}
