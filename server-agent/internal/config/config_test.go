@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -867,6 +868,218 @@ func TestValidateProxyRoutesModeZeroValueIsFallback(t *testing.T) {
 	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("zero-value CertProxyRoutesMode should validate as fallback: %v", err)
+	}
+}
+
+// TestRuntimeSourceDefaultsToGateway proves an unconfigured runtime source
+// resolves to RuntimeSourceGateway -- the gateway is the default supplier of
+// the runtime-config document.
+func TestRuntimeSourceDefaultsToGateway(t *testing.T) {
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RuntimeSource != RuntimeSourceGateway {
+		t.Fatalf("RuntimeSource = %q, want %q (default)", cfg.RuntimeSource, RuntimeSourceGateway)
+	}
+	if cfg.RuntimeConfigPath != "" {
+		t.Errorf("RuntimeConfigPath = %q, want empty default", cfg.RuntimeConfigPath)
+	}
+}
+
+// TestRuntimeSourcePrecedence mirrors TestCertModePrecedence's shape: file,
+// then env-over-file, then flag-over-env, proven together with the paired
+// RuntimeConfigPath field the same way CertMode is proven together with
+// CertDir.
+func TestRuntimeSourcePrecedence(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_source":"file","runtime_config":"/from-file/runtime.json"}`)
+	// file only
+	if cfg, err := Load([]string{"-config", path}, func(string) string { return "" }); err != nil || cfg.RuntimeSource != "file" || cfg.RuntimeConfigPath != "/from-file/runtime.json" {
+		t.Fatalf("file runtime_source/runtime_config = %q/%q (err %v), want file//from-file/runtime.json", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+	// env overrides file
+	envOnly := func(k string) string {
+		switch k {
+		case "OP_AGENT_RUNTIME_SOURCE":
+			return "gateway"
+		case "OP_AGENT_RUNTIME_CONFIG":
+			return "/from-env/runtime.json"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, envOnly); err != nil || cfg.RuntimeSource != "gateway" || cfg.RuntimeConfigPath != "/from-env/runtime.json" {
+		t.Fatalf("env runtime_source/runtime_config = %q/%q (err %v), want gateway//from-env/runtime.json (env > file)", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+	// flag overrides env and file
+	if cfg, err := Load([]string{"-config", path, "-runtime-source=file", "-runtime-config=/from-flag/runtime.json"}, envOnly); err != nil || cfg.RuntimeSource != "file" || cfg.RuntimeConfigPath != "/from-flag/runtime.json" {
+		t.Fatalf("flag runtime_source/runtime_config = %q/%q (err %v), want file//from-flag/runtime.json (flag > env > file)", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+}
+
+// TestValidateRuntimeSourceEnum pins the exact enum error format, matching
+// the house pattern (e.g. Transport's error).
+func TestValidateRuntimeSourceEnum(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff, RuntimeSource: "bogus"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("unknown runtime-source should error")
+	}
+	want := `runtime-source must be "gateway" or "file", got "bogus"`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRuntimeSourceZeroValueIsGateway proves a directly-constructed
+// zero-value Config (RuntimeSource never set) still validates, mirroring
+// TestValidateProxyRoutesModeZeroValueIsFallback's byte-neutrality guarantee.
+func TestRuntimeSourceZeroValueIsGateway(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero-value RuntimeSource should validate as gateway: %v", err)
+	}
+}
+
+// TestRuntimeFileModeRequiresConfigPath proves runtime-source=file without a
+// runtime-config path fails Validate -- the file source is useless without
+// knowing which file.
+func TestRuntimeFileModeRequiresConfigPath(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff, RuntimeSource: RuntimeSourceFile}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("runtime-source=file without runtime-config should error")
+	}
+	cfg.RuntimeConfigPath = "/some/runtime.json"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("runtime-source=file with runtime-config set should validate: %v", err)
+	}
+}
+
+// TestRuntimeAllowedBinariesFromEnvCommaSeparated proves the comma-separated
+// env encoding for the structured (no-flag) RuntimeAllowedBinaries field:
+// entries are split on commas and trimmed of surrounding whitespace.
+func TestRuntimeAllowedBinariesFromEnvCommaSeparated(t *testing.T) {
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_BINARIES" {
+			return "/usr/bin/ollama, /usr/local/bin/llama-server ,/opt/vllm/bin/vllm"
+		}
+		return ""
+	}
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"/usr/bin/ollama", "/usr/local/bin/llama-server", "/opt/vllm/bin/vllm"}
+	if !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+}
+
+// TestRuntimeAllowedDirsFromEnvCommaSeparated proves RuntimeAllowedDirs
+// follows the identical comma-separated env pattern as RuntimeAllowedBinaries.
+func TestRuntimeAllowedDirsFromEnvCommaSeparated(t *testing.T) {
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_DIRS" {
+			return "/srv/models, /srv/other-models "
+		}
+		return ""
+	}
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"/srv/models", "/srv/other-models"}
+	if !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+}
+
+// TestRuntimeAllowedBinariesAndDirsFromConfigFile proves the JSON-array file
+// encoding, and that an env value overrides the file (env > file, same
+// precedence as every other tri-source-minus-flag field in this package).
+func TestRuntimeAllowedBinariesAndDirsFromConfigFile(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x",`+
+		`"runtime_allowed_binaries":["/usr/bin/ollama"],`+
+		`"runtime_allowed_dirs":["/srv/models"]}`)
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/usr/bin/ollama"}; !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+	if want := []string{"/srv/models"}; !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_BINARIES" {
+			return "/opt/vllm/bin/vllm"
+		}
+		return ""
+	}
+	cfg, err = Load([]string{"-config", path}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/opt/vllm/bin/vllm"}; !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries (env-over-file) = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+	// runtime_allowed_dirs untouched by env: still the file value.
+	if want := []string{"/srv/models"}; !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs (file, env did not set it) = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+}
+
+// TestRuntimeAllowedBinariesAndDirsNilWhenAbsent proves the byte-neutral
+// default (mirroring TestConfigProxyRoutesDefaultWhenAbsent): a config that
+// never mentions either key resolves to nil, not an allocated-but-empty
+// slice, since neither env var nor file key was present at all.
+func TestRuntimeAllowedBinariesAndDirsNilWhenAbsent(t *testing.T) {
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RuntimeAllowedBinaries != nil {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want nil when absent", cfg.RuntimeAllowedBinaries)
+	}
+	if cfg.RuntimeAllowedDirs != nil {
+		t.Errorf("RuntimeAllowedDirs = %#v, want nil when absent", cfg.RuntimeAllowedDirs)
+	}
+}
+
+// TestRuntimeCachePathPrecedence proves flag > env > file > the
+// next-to-binary default for RuntimeCachePath, mirroring the defaultConfigName
+// precedent (TestExplicitMissingConfigErrors's use of the executable() seam).
+func TestRuntimeCachePathPrecedence(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// default: next to the (stubbed) binary.
+	orig := executable
+	t.Cleanup(func() { executable = orig })
+	binDir := t.TempDir()
+	executable = func() (string, error) { return filepath.Join(binDir, "server-agent"), nil }
+	if cfg, err := Load(base, noenv); err != nil || cfg.RuntimeCachePath != filepath.Join(binDir, "server-agent-runtime.cache.json") {
+		t.Fatalf("default RuntimeCachePath = %q (err %v), want %q", cfg.RuntimeCachePath, err, filepath.Join(binDir, "server-agent-runtime.cache.json"))
+	}
+
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_cache":"/from-file/runtime.cache.json"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.RuntimeCachePath != "/from-file/runtime.cache.json" {
+		t.Fatalf("file RuntimeCachePath = %q (err %v), want /from-file/runtime.cache.json", cfg.RuntimeCachePath, err)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_CACHE" {
+			return "/from-env/runtime.cache.json"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.RuntimeCachePath != "/from-env/runtime.cache.json" {
+		t.Fatalf("env RuntimeCachePath = %q (err %v), want /from-env/runtime.cache.json (env > file)", cfg.RuntimeCachePath, err)
+	}
+	args := append([]string{"-config", path}, "-runtime-cache=/from-flag/runtime.cache.json")
+	if cfg, err := Load(args, env); err != nil || cfg.RuntimeCachePath != "/from-flag/runtime.cache.json" {
+		t.Fatalf("flag RuntimeCachePath = %q (err %v), want /from-flag/runtime.cache.json (flag > env > file)", cfg.RuntimeCachePath, err)
 	}
 }
 
