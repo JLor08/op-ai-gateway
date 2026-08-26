@@ -79,8 +79,10 @@ var allowedDeps = map[string][]string{
 		"internal/certfiles",
 		"internal/gwapi",
 	},
-	"internal/runtime": {},
-	"internal/sample":  {},
+	"internal/runtime": {
+		"internal/gwapi",
+	},
+	"internal/sample": {},
 	"internal/trust": {
 		"internal/certfiles",
 		"internal/gwapi",
