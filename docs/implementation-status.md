@@ -153,6 +153,36 @@ Task 24):
   with `-timeout 20m` passes cleanly in ~800s. Pre-existing, unrelated to
   Task 8's changes — worth knowing before any later task re-runs this.
 
+Gateway phase COMPLETE (Tasks 5-10):
+- Task 5 — portal runtime-spec CRUD on mappings (`4bbd256`)
+- Task 6 — co-residency matrix, GPU budgets, managed-runtime-only, warnings (`f9a89af`)
+- Task 7 — agent `features` + `runtime-config` endpoints, ETag (`c3f0b08`)
+- Task 8 — WS runtime_config push, feature-gated (`19f9633`)
+- Task 9 — runtime status ingest, VRAM write-back, report ingest, portal SSE (`60d6e7c`)
+- Task 10 — `server_agent` application type + cold-load-aware timeout (`618516c`)
+
+Additional durable corrections from the gateway phase (fold into
+docs/architecture in the documentation task):
+- An agent endpoint's target server must come ONLY from the bearer token. The
+  VRAM write-back initially took its target from the agent-supplied `spec_id`
+  body field, which allowed an agent for server A to overwrite server B's spec —
+  and because the pushed config prefers the measured value over the operator
+  estimate, that changed the VRAM figure server B's agent did admission
+  arithmetic against. Now resolved spec → mapping → application → server before
+  every write.
+- Ingest paths that fan out to the store need explicit bounds. The runtime
+  status array is clamped, and the per-spec lookup memoizes every outcome
+  (hit, miss, error, locked, cross-server), not just hits.
+- Free-form error text from an agent must be redacted safe-by-default, not by a
+  heuristic split: retain a leading classification token only when it looks like
+  one (no whitespace, quotes or `=`, bounded), else emit a fixed constant.
+- Runtime status, including any stderr tail, is volatile-only by policy — a
+  model server's stderr can carry prompt fragments, which must not be persisted
+  outside the opt-in payload capture.
+- `Application.TimeoutMS` is a TOTAL request deadline, never reset by upstream
+  activity, so the `server_agent` type defaults to 600000 ms; the stock 30000
+  would fail every cold model load reproducibly.
+
 ## Next planned step
 
 1. Continue the plan at Task 10.
