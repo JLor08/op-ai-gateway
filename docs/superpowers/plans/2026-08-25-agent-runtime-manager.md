@@ -802,7 +802,7 @@ type PutRuntimeSpecRequest struct { // PUT = upsert; full document, no pointer-p
 	Pinned                      bool                `json:"pinned"`
 	AdminState                  string              `json:"admin_state"`
 	VRAMLocked                  bool                `json:"vram_locked"`
-	GPUs                        []RuntimeSpecGPUDTO `json:"gpus"` // VRAMMeasuredMB ignored on write unless VRAMLocked flips
+	GPUs                        []RuntimeSpecGPUDTO `json:"gpus"` // VRAMMeasuredMB is ALWAYS ignored on write (agent-owned; see below)
 }
 
 // Service methods (add to api.go by hand, keep neighbor ordering):
@@ -813,6 +813,7 @@ DeleteRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) e
 
 - HTTP (registered in the mappings item dispatcher `handlePortalMappingItem`): `GET/PUT/DELETE /api/portal/mappings/{id}/runtime-spec`. Same authorization as mapping writes — `authorizeMapping` gives exactly that.
 - Defaults applied in `PutRuntimeSpec` when 0/empty: `HealthPath "/health"`, `HealthTimeoutSeconds 5`, `StartupTimeoutSeconds 180`. Validation: Binary required + absolute path; all int fields >= 0 (`ErrRuntimeSpecTuningInvalid`); `AdminState` ∈ {"", "force_running", "force_stopped"}; GPU indexes >= 0 and unique; env keys must match `^[A-Z_][A-Z0-9_]*$` and values must NOT look like raw secrets is NOT checkable — instead: any env value is allowed but the DTO stores it verbatim; document `${AGENT_ENV:NAME}` in the UI (Task 20). Application must be `server_agent` type (`ErrRuntimeSpecNotServerAgent`) — a spec on an ollama app is a config error.
+- **VRAM ownership rule** (one rule, both directions): `vram_estimate_mb` is operator-owned and only the portal writes it; `vram_measured_mb` is agent-owned and only the telemetry write-back (Task 9) writes it. A PUT preserves the stored measured values verbatim and ignores whatever the client sent for them. `vram_locked` gates only the agent's write-back, never the portal's estimate write.
 - Storage mapping: `Args []string` ⇄ opaque JSON string via `json.Marshal`/`Unmarshal` (unmarshal failure on read → `ErrRuntimeSpecArgsInvalid`); same for Env.
 - ID: `"rspec_" + compactRandomHex(16)` on first create; PUT on an existing spec keeps the ID and CreatedAt (read-then-upsert).
 - After every successful write call `s.notifyRuntimeChanged(server.ID)` (nil-safe). The hook is settable two ways: a `ServiceDeps.OnRuntimeConfigChanged func(serverID string)` field (used by tests) AND an exported setter `func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string))` — the setter exists because main.go builds the gateway Server AFTER the portal service and wires `srv.PushRuntimeConfig` late (Task 8).
@@ -1730,7 +1731,11 @@ if runtimeActive { // fetched features intersected with agent.Features at startu
 	} else {
 		src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
 	}
-	drv := runtimectl.NewDriver(mgr, src, featuresClient, deps.Poster.(runtimectl.RuntimeReporter))
+	var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never assert unchecked)
+	if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
+		reporter = r // typed-nil discipline: assign only inside the ok branch
+	}
+	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter)
 	deps.RuntimeDriver = drv
 }
 ```
