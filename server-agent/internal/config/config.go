@@ -201,6 +201,16 @@ type Config struct {
 	// file (the CAFile/CACacheFile precedent) rather than the agent's
 	// process working directory, which for a service is typically "/".
 	RuntimeCachePath string
+	// RuntimeRouterBindHost is the operator-controlled bind address for the
+	// agent-managed model runtime's router port (task-18-fix-round-1.md
+	// I2): an empty string (the default) means "derive a default" -- main.go
+	// tries the agent's own mesh identity first (mirroring
+	// proxy.DeriveBindHost), then falls back to all interfaces, logging a
+	// Warn when it does. Same operator-only provenance as
+	// RuntimeAllowedBinaries/RuntimeAllowedDirs: this value comes ONLY from
+	// this local config, never from the gateway -- the gateway supplies
+	// only the router's PORT (router_listen), never its bind host.
+	RuntimeRouterBindHost string
 }
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
@@ -233,6 +243,7 @@ type fileConfig struct {
 	RuntimeAllowedBinaries []string `json:"runtime_allowed_binaries"`
 	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
 	RuntimeCachePath       string   `json:"runtime_cache"`
+	RuntimeRouterBindHost  string   `json:"runtime_router_bind"`
 }
 
 // executable is os.Executable, indirected so tests can control the
@@ -272,6 +283,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	runtimeSource := fs.String("runtime-source", "", "agent-managed model runtime spec source: gateway|file (env OP_AGENT_RUNTIME_SOURCE / config runtime_source)")
 	runtimeConfigPath := fs.String("runtime-config", "", "path to a local runtime-config JSON file; required when runtime-source=file (env OP_AGENT_RUNTIME_CONFIG / config runtime_config)")
 	runtimeCachePath := fs.String("runtime-cache", "", "path to the runtime process-state cache file (default: "+defaultRuntimeCacheName+" next to the binary; env OP_AGENT_RUNTIME_CACHE / config runtime_cache)")
+	runtimeRouterBindHost := fs.String("runtime-router-bind", "", "bind host for the agent-managed model runtime's router port; empty = derive from the mesh identity, else all interfaces (env OP_AGENT_RUNTIME_ROUTER_BIND / config runtime_router_bind)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -347,6 +359,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
 		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
+		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket

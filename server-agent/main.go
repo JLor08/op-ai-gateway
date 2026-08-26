@@ -31,7 +31,6 @@ import (
 	"op-ai-server-agent/internal/trust"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -134,48 +133,55 @@ func main() {
 		deps.Poster = client.New(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(10*time.Second))
 	}
 
-	// Agent-managed model runtime (Task 18, design spec §9): active only
-	// when BOTH this agent binary and the connected gateway declare
-	// runtime_manager. featuresClient is constructed unconditionally (it is
-	// the very thing this check needs) and, when the feature IS active,
-	// handed to the driver so its own Sync re-checks negotiation on every
-	// call with the SAME cached/conditional-GET state -- no duplicate
-	// startup fetch. cfg.RuntimeSource/RuntimeConfigPath pairing is already
-	// guaranteed valid at this point: config.Load already ran cfg.Validate
-	// and this process would have exited at startup otherwise.
+	// Agent-managed model runtime (Task 18, design spec §9). Fix round 1,
+	// I3: the manager/source/driver are constructed UNCONDITIONALLY now --
+	// feature negotiation (whether runtime_manager is active for THIS
+	// agent<->gateway pair) is decided, and continuously re-decided, by the
+	// Driver's own Sync (its featureActive re-check on every call), never
+	// by a one-shot startup probe. The earlier version blocked startup on a
+	// synchronous features fetch and froze "inactive" for the whole
+	// process on any transient failure (gateway down/restarting/
+	// mid-rollout, or simply a POST-transport agent that will never use
+	// the feature paying up to 30s of the SAME timeout regardless); cert
+	// and trust sync already self-heal on their own tickers, and this
+	// feature now does too. cfg.RuntimeSource/RuntimeConfigPath pairing is
+	// already guaranteed valid at this point: config.Load already ran
+	// cfg.Validate and this process would have exited at startup
+	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
-	fctx, fcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	gatewayFeatures, err := featuresClient.Fetch(fctx)
-	fcancel()
-	if err != nil {
-		slog.Debug("runtime: startup gateway features fetch failed", "err", err)
-	}
-	runtimeActive := slices.Contains(agent.ActiveFeatures(gatewayFeatures), "runtime_manager")
-	if runtimeActive {
-		localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
-		mgr := runtimectl.NewManager(runtimectl.ManagerOptions{Policy: localPolicy, Getenv: os.Getenv})
-		defer mgr.Close()
-		// nvidia-smi is a HARDWARE capability, not a negotiated feature
-		// (design spec §5): NewNvidiaComputeApps returns nil on hosts
-		// without it (AMD, Apple unified memory, no GPU at all), and
-		// SetMeasurer(nil) is exactly NewManager's own default -- operator
-		// VRAM estimates stand.
-		mgr.SetMeasurer(collector.NewNvidiaComputeApps())
+	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
+	mgr := runtimectl.NewManager(runtimectl.ManagerOptions{Policy: localPolicy, Getenv: os.Getenv})
+	defer mgr.Close()
+	// nvidia-smi is a HARDWARE capability, not a negotiated feature (design
+	// spec §5): NewNvidiaComputeApps returns nil on hosts without it (AMD,
+	// Apple unified memory, no GPU at all), and SetMeasurer(nil) is exactly
+	// NewManager's own default -- operator VRAM estimates stand.
+	mgr.SetMeasurer(collector.NewNvidiaComputeApps())
 
-		var src runtimectl.Source
-		if cfg.RuntimeSource == config.RuntimeSourceFile {
-			src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
-		} else {
-			src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
-		}
-		var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
-		if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
-			reporter = r // typed-nil discipline: assign only inside the ok branch
-		}
-		drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter)
-		defer drv.Close()
-		deps.RuntimeDriver = drv
+	var src runtimectl.Source
+	if cfg.RuntimeSource == config.RuntimeSourceFile {
+		src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
+	} else {
+		src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
 	}
+	var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
+	if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
+		reporter = r // typed-nil discipline: assign only inside the ok branch
+	}
+	// Fix round 1, I2: the router's bind HOST is operator-controlled, never
+	// gateway-supplied (only its PORT, router_listen, comes from the
+	// gateway document) -- an explicit OP_AGENT_RUNTIME_ROUTER_BIND wins;
+	// otherwise mirror internal/proxy's own mesh-identity derivation
+	// (proxy.DeriveBindHost, the narrowest available default, matching the
+	// in-module precedent); an empty result falls back to all interfaces,
+	// which StartRouter itself announces at Warn when it actually binds.
+	runtimeBindHost := cfg.RuntimeRouterBindHost
+	if runtimeBindHost == "" {
+		runtimeBindHost = proxy.DeriveBindHost(cfg.CertDir)
+	}
+	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter, runtimeBindHost)
+	defer drv.Close()
+	deps.RuntimeDriver = drv
 
 	a := agent.NewFromDeps(cfg, deps)
 
@@ -194,8 +200,12 @@ func main() {
 		"verbose", cfg.Verbose,
 		"transport", cfg.Transport,
 		"cert_mode", cfg.CertMode,
-		"runtime_manager_active", runtimeActive,
 		"runtime_source", cfg.RuntimeSource)
+	// runtime_manager activation is no longer known synchronously at this
+	// point (fix round 1, I3: no more one-shot startup probe) -- the
+	// Driver's own Sync logs the transition itself the first time it
+	// resolves negotiation (see runtime.Driver.Sync/stopAll), which is the
+	// honest place for this fact to be observed.
 	// Detailed resolved config for debugging. The token is NEVER logged, even
 	// here. cert_reload_command IS included at Debug (unlike the Info line
 	// above) — Debug is opt-in via -v/--verbose for local troubleshooting, and
@@ -220,7 +230,8 @@ func main() {
 		"runtime_config_path", cfg.RuntimeConfigPath,
 		"runtime_cache_path", cfg.RuntimeCachePath,
 		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
-		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs))
+		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
+		"runtime_router_bind_host", runtimeBindHost)
 
 	if err := a.Run(ctx); err != nil {
 		slog.Error("server-agent run failed", "err", err)

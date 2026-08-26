@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1002,13 +1003,15 @@ func TestCollectOnceCarriesProxyRoutes(t *testing.T) {
 // NewFromDeps discovers via a type assertion exactly like Deps.Poster's
 // certWaker/trustWaker.
 type fakeRuntimeDriver struct {
-	mu         sync.Mutex
-	calls      int
-	lastPushed json.RawMessage
-	statuses   []runtimectl.Status
-	block      bool
-	release    chan struct{}
-	trans      chan struct{}
+	mu          sync.Mutex
+	calls       int
+	lastPushed  json.RawMessage
+	statuses    []runtimectl.Status
+	block       bool
+	release     chan struct{}
+	trans       chan struct{}
+	active      atomic.Bool // fix round 1, I3: defaults to false, matching the real Driver's honest "not yet negotiated" zero value
+	resendCalls int
 }
 
 func newFakeRuntimeDriver() *fakeRuntimeDriver {
@@ -1060,6 +1063,30 @@ func (f *fakeRuntimeDriver) lastPush() json.RawMessage {
 	return f.lastPushed
 }
 
+// Active satisfies runtimeDriver's new (fix round 1, I3) required method.
+// Defaults to false -- a test that wants collectOnce's runtime block
+// engaged must call setActive(true) explicitly, matching the real Driver's
+// honest "not yet negotiated" starting state now that main.go no longer
+// blocks startup on a one-shot features probe.
+func (f *fakeRuntimeDriver) Active() bool { return f.active.Load() }
+
+func (f *fakeRuntimeDriver) setActive(b bool) { f.active.Store(b) }
+
+// ResendReport satisfies the optional runtimeReportResender interface
+// (fix round 1, I5), counting calls so tests can prove Run's reportTicker
+// cadence actually reaches it.
+func (f *fakeRuntimeDriver) ResendReport(context.Context) {
+	f.mu.Lock()
+	f.resendCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeRuntimeDriver) resendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resendCalls
+}
+
 // runtimeWakePoster is a poster that also implements runtimeWaker, mirroring
 // trustWakePoster exactly.
 type runtimeWakePoster struct {
@@ -1106,6 +1133,7 @@ func TestCollectOnceRuntimeNilOmitsRuntimesKey(t *testing.T) {
 func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.T) {
 	poster := &capturePoster{}
 	drv := newFakeRuntimeDriver()
+	drv.setActive(true) // fix round 1, I3: the override is gated on Active(), not merely a driver existing
 	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
 	failedAt := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
 	drv.setStatuses([]runtimectl.Status{
@@ -1177,6 +1205,63 @@ type stubLoadedLister struct{ models []string }
 func (s stubLoadedLister) Available() bool { return true }
 func (s stubLoadedLister) Collect(context.Context) ([]string, error) {
 	return s.models, nil
+}
+
+// TestCollectOnceInactiveRuntimeDriverDoesNotOverrideLoadedModels pins fix
+// round 1's I3 trap, exactly as the review named it: main.go now
+// constructs the runtime driver UNCONDITIONALLY, so "a.runtimeDriver !=
+// nil" is no longer sufficient to know whether the runtime feature is
+// doing anything right now. Before the fix, a driver that exists but has
+// never (yet) negotiated runtime_manager active (Active()==false --
+// startup, a drain, a gateway that never declares the feature) would still
+// unconditionally overwrite LoadedModels with an empty list, wiping a
+// non-runtime agent's REAL loaded-model set reported by its own
+// model-status scraper. This test fails against a version of collectOnce
+// that gates the override on "a.runtimeDriver != nil" alone (see
+// task-18-report.md's I3 fix log for the pasted failure).
+func TestCollectOnceInactiveRuntimeDriverDoesNotOverrideLoadedModels(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver() // Active() defaults to false -- never negotiated (yet)
+	loaded := stubLoadedLister{models: []string{"real-model-from-scraper"}}
+
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Loaded: loaded, Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil {
+		t.Fatal("no sample posted")
+	}
+	if got.Runtimes != nil {
+		t.Fatalf("Runtimes = %+v, want nil (driver present but not Active)", got.Runtimes)
+	}
+	if len(got.LoadedModels) != 1 || got.LoadedModels[0] != "real-model-from-scraper" {
+		t.Fatalf("LoadedModels = %v, want [real-model-from-scraper] -- an inactive runtime driver must NOT wipe the real model-status scraper's result", got.LoadedModels)
+	}
+}
+
+// TestResendRuntimeReportPiggybacksOnSystemReportTicker pins fix round 1's
+// I5: the runtime driver's periodic file-mode-report resend rides the SAME
+// ticker cadence as sendSystemReport, not a transport-aware mechanism of
+// its own.
+func TestResendRuntimeReportPiggybacksOnSystemReportTicker(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	cfg := config.Config{Interval: time.Hour, SystemReportInterval: 15 * time.Millisecond}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	waitUntil(t, time.Second, func() bool { return drv.resendCount() >= 2 })
+	cancel()
+	<-done
 }
 
 // TestRuntimeTransitionsWakeTriggersImmediateSample proves the

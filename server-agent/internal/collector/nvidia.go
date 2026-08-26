@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -143,38 +144,57 @@ func NewNvidiaComputeApps() func(pids []int) map[int]map[int]int {
 	if _, err := exec.LookPath("nvidia-smi"); err != nil {
 		return nil
 	}
-	return measureNvidiaComputeApps
+	m := &nvidiaComputeAppsMeasurer{}
+	return m.measure
 }
 
-// measureNvidiaComputeApps is the func(pids []int) map[int]map[int]int
-// shape runtime.Manager.SetMeasurer expects. pids is the manager's own live
-// managed-process PID set; the returned map is restricted to exactly those
-// PIDs (never a bystander process' usage, even though nvidia-smi itself has
-// no notion of "whose child is this" -- the manager is the one that knows).
-// nil pids, or either nvidia-smi invocation failing, returns nil: the
-// caller (buildSnapshot) already treats a nil measurement map as "nothing
-// measured this cycle", falling back to static estimates for every spec,
-// exactly like having no measurer installed at all -- a transient
-// nvidia-smi hiccup must never look like a hard VRAM-budget violation.
-func measureNvidiaComputeApps(pids []int) map[int]map[int]int {
+// nvidiaComputeAppsMeasurer caches the GPU index/uuid mapping across calls
+// (fix round 1, M1): `--query-gpu=index,uuid` describes the host's fixed
+// GPU topology, which does not change between one measurement and the next
+// under normal operation, so the original implementation's re-fetch on
+// EVERY call doubled the worst-case subprocess-spawn cost on the manager's
+// single serialized owner goroutine (which also serves Status() for the 1s
+// telemetry tick and every EnsureRunning) for no benefit in the common
+// case. The cache is invalidated (refetched) whenever a WANTED pid's
+// reported GPU UUID is not found in it -- the one case a stale mapping
+// actually matters (a GPU added/removed/reindexed since the last fetch,
+// e.g. after a driver reset).
+type nvidiaComputeAppsMeasurer struct {
+	mu          sync.Mutex
+	uuidToIndex map[string]int // nil until the first successful --query-gpu fetch
+}
+
+func (m *nvidiaComputeAppsMeasurer) cachedIndex() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.uuidToIndex
+}
+
+func (m *nvidiaComputeAppsMeasurer) setCachedIndex(idx map[string]int) {
+	m.mu.Lock()
+	m.uuidToIndex = idx
+	m.mu.Unlock()
+}
+
+// measure is the func(pids []int) map[int]map[int]int shape
+// runtime.Manager.SetMeasurer expects. pids is the manager's own live
+// managed-process PID set. nil pids, or the compute-apps invocation
+// failing, returns nil: the caller (buildSnapshot) already treats a nil
+// measurement map as "nothing measured this cycle", falling back to static
+// estimates for every spec, exactly like having no measurer installed at
+// all -- a transient nvidia-smi hiccup must never look like a hard
+// VRAM-budget violation. One subprocess spawn in the steady state (the
+// index/uuid mapping is cached, M1); two only on the first call, or after a
+// cache-invalidating miss.
+func (m *nvidiaComputeAppsMeasurer) measure(pids []int) map[int]map[int]int {
 	if len(pids) == 0 {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
 	defer cancel()
-	idxOut, err := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu="+nvidiaGPUIndexFields,
-		"--format=csv,noheader,nounits",
-	).Output()
-	if err != nil {
-		return nil
-	}
-	uuidToIndex := parseNvidiaGPUIndexCSV(idxOut)
 
-	ctx2, cancel2 := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
-	defer cancel2()
-	appsOut, err := exec.CommandContext(ctx2, "nvidia-smi",
+	appsOut, err := exec.CommandContext(ctx, "nvidia-smi",
 		"--query-compute-apps="+nvidiaComputeAppsFields,
 		"--format=csv,noheader,nounits",
 	).Output()
@@ -183,6 +203,57 @@ func measureNvidiaComputeApps(pids []int) map[int]map[int]int {
 	}
 	rows := parseNvidiaComputeAppsCSV(appsOut)
 
+	wanted := make(map[int]bool, len(pids))
+	for _, p := range pids {
+		wanted[p] = true
+	}
+
+	uuidToIndex := m.cachedIndex()
+	if uuidToIndex == nil || hasUnresolvedUUID(rows, wanted, uuidToIndex) {
+		// First call ever, or a wanted row's GPU UUID is not in the cache:
+		// (re)fetch the mapping. Reuses the SAME ctx/deadline as the
+		// compute-apps call above rather than a second independent
+		// timeout, so two subprocess spawns in the worst case still cost
+		// at most ONE nvidiaMeasureTimeout in total, not two.
+		idxOut, err := exec.CommandContext(ctx, "nvidia-smi",
+			"--query-gpu="+nvidiaGPUIndexFields,
+			"--format=csv,noheader,nounits",
+		).Output()
+		if err == nil {
+			uuidToIndex = parseNvidiaGPUIndexCSV(idxOut)
+			m.setCachedIndex(uuidToIndex)
+		}
+	}
+	if uuidToIndex == nil {
+		return nil // never obtained a mapping at all (first call AND that fetch failed)
+	}
+
+	return attributeComputeApps(rows, uuidToIndex, pids)
+}
+
+// hasUnresolvedUUID reports whether any WANTED row's GPU UUID is absent
+// from uuidToIndex -- the cache-invalidation trigger for M1.
+func hasUnresolvedUUID(rows []nvidiaComputeAppRow, wanted map[int]bool, uuidToIndex map[string]int) bool {
+	for _, row := range rows {
+		if !wanted[row.PID] {
+			continue
+		}
+		if _, ok := uuidToIndex[row.GPUUUID]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// attributeComputeApps is the pure attribution logic SetMeasurer's shape
+// needs: filter rows to pids, resolve each row's GPU UUID to its index via
+// uuidToIndex, and nest into map[pid]map[gpuIndex]usedMB. Extracted as a
+// standalone pure function (fix round 1, I4) so the headline test calls the
+// SAME code the production path (measure, above) runs, instead of
+// re-implementing the filter/map loop inside the test body -- a bug here
+// (wrong filter direction, a dropped GPU index, wrong map nesting) would
+// otherwise leave that test green regardless.
+func attributeComputeApps(rows []nvidiaComputeAppRow, uuidToIndex map[string]int, pids []int) map[int]map[int]int {
 	wanted := make(map[int]bool, len(pids))
 	for _, p := range pids {
 		wanted[p] = true

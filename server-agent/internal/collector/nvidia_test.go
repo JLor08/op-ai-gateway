@@ -169,25 +169,21 @@ func TestParseNvidiaComputeAppsCSVEmptyAndShortRows(t *testing.T) {
 // the pure parse functions rather than a real nvidia-smi (which the test
 // host does not have), matching how the manager's buildSnapshot actually
 // consumes this measurer's return value.
-func TestMeasureNvidiaComputeAppsAttributesByPIDAndMapsUUIDToIndex(t *testing.T) {
+// TestAttributeComputeAppsFiltersByPIDAndMapsUUIDToIndex calls the actual
+// production function (fix round 1, I4) instead of re-implementing its
+// filter/map loop inline: the ORIGINAL version of this test
+// (TestMeasureNvidiaComputeAppsAttributesByPIDAndMapsUUIDToIndex) built its
+// own copy of the loop and never called attributeComputeApps or measure at
+// all, so a bug in the real implementation -- wrong filter direction, a
+// dropped GPU index, wrong map nesting -- would have left it green. This is
+// the seventh instance of that class caught on this branch; the fix here is
+// structural (call the extracted pure function), not a patched assertion.
+func TestAttributeComputeAppsFiltersByPIDAndMapsUUIDToIndex(t *testing.T) {
 	uuidToIndex := parseNvidiaGPUIndexCSV([]byte(canned2GPUIndexCSV))
 	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
 
-	wanted := map[int]bool{12345: true} // the manager only cares about ITS OWN child, not pid 99999
-	out := make(map[int]map[int]int)
-	for _, row := range rows {
-		if !wanted[row.PID] {
-			continue
-		}
-		idx, ok := uuidToIndex[row.GPUUUID]
-		if !ok {
-			continue
-		}
-		if out[row.PID] == nil {
-			out[row.PID] = map[int]int{}
-		}
-		out[row.PID][idx] = row.UsedMemoryMB
-	}
+	// The manager only cares about ITS OWN child (12345), not pid 99999.
+	out := attributeComputeApps(rows, uuidToIndex, []int{12345})
 
 	if len(out) != 1 {
 		t.Fatalf("out = %v, want exactly pid 12345", out)
@@ -197,6 +193,61 @@ func TestMeasureNvidiaComputeAppsAttributesByPIDAndMapsUUIDToIndex(t *testing.T)
 	}
 	if _, ok := out[99999]; ok {
 		t.Errorf("out contains pid 99999, which was not in the requested pid set")
+	}
+}
+
+// TestAttributeComputeAppsUnknownUUIDSkippedNotGuessed proves a row whose
+// GPU UUID has no entry in uuidToIndex is skipped rather than attributed to
+// a wrong/zero index.
+func TestAttributeComputeAppsUnknownUUIDSkippedNotGuessed(t *testing.T) {
+	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
+	// Only GPU-bbbb-1 is known here; GPU-aaaa-0 (pid 12345's other row) is
+	// deliberately absent from uuidToIndex.
+	out := attributeComputeApps(rows, map[string]int{"GPU-bbbb-1": 1}, []int{12345, 99999})
+
+	if len(out) != 1 {
+		t.Fatalf("out = %v, want exactly pid 12345", out)
+	}
+	if _, ok := out[12345][0]; ok {
+		t.Errorf("out[12345] = %v, want no entry for index 0 (its GPU UUID was not in uuidToIndex)", out[12345])
+	}
+	if out[12345][1] != 8000 {
+		t.Errorf("out[12345][1] = %v, want 8000", out[12345][1])
+	}
+}
+
+// TestAttributeComputeAppsNilOnNoMatches proves an empty/nil result (not an
+// empty-but-non-nil map) when nothing in rows matches pids -- buildSnapshot
+// (manager.go) treats a nil measurement map as "nothing measured", falling
+// back to static estimates.
+func TestAttributeComputeAppsNilOnNoMatches(t *testing.T) {
+	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
+	if out := attributeComputeApps(rows, map[string]int{"GPU-aaaa-0": 0}, []int{424242}); out != nil {
+		t.Fatalf("out = %v, want nil", out)
+	}
+}
+
+// TestHasUnresolvedUUID pins M1's cache-invalidation trigger: a miss on a
+// WANTED pid's GPU UUID reports true (refetch the mapping); an unwanted
+// pid's unknown UUID must NOT trigger a refetch; a fully-resolved wanted
+// set reports false.
+func TestHasUnresolvedUUID(t *testing.T) {
+	rows := parseNvidiaComputeAppsCSV([]byte(cannedComputeAppsCSV))
+
+	full := map[string]int{"GPU-aaaa-0": 0, "GPU-bbbb-1": 1}
+	if hasUnresolvedUUID(rows, map[int]bool{12345: true}, full) {
+		t.Error("hasUnresolvedUUID with a fully-resolved wanted set = true, want false")
+	}
+
+	partial := map[string]int{"GPU-bbbb-1": 1} // GPU-aaaa-0 missing
+	if !hasUnresolvedUUID(rows, map[int]bool{12345: true}, partial) {
+		t.Error("hasUnresolvedUUID with a wanted pid's UUID missing = false, want true")
+	}
+
+	// pid 99999 uses GPU-aaaa-0, which IS missing from `partial` -- but
+	// 99999 is not in the wanted set, so this must NOT report a miss.
+	if hasUnresolvedUUID(rows, map[int]bool{12345: false, 99999: false}, partial) {
+		t.Error("hasUnresolvedUUID must ignore an unresolved UUID belonging to a PID that is not wanted")
 	}
 }
 

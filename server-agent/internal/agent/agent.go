@@ -108,19 +108,45 @@ type certProxyDriver interface {
 // runtimeDriver is the optional agent-managed model runtime hook set,
 // symmetric with certProxyDriver above: *runtimectl.Driver satisfies it.
 // Sync fetches/reconciles the desired runtime-config document (see
-// runtimectl.Driver.Sync's own doc for the exact three-step contract) and
-// Status reports the live per-spec state for the outgoing telemetry sample.
-// It is an interface (not the concrete type) so a nil value is a
+// runtimectl.Driver.Sync's own doc for the exact three-step contract);
+// Status reports the live per-spec state for the outgoing telemetry
+// sample. It is an interface (not the concrete type) so a nil value is a
 // well-typed no-op -- every call site below guards it with a plain
 // "!= nil" check -- and so tests can inject a counting fake instead of a
-// real process-supervision stack. main.go constructs a real driver ONLY
-// when runtime_manager is active on both this agent and the connected
-// gateway (feature negotiation, design spec §9); every other agent leaves
-// this nil, which is what keeps a legacy agent's telemetry sample
-// byte-identical (no "runtimes" key at all, see collectOnce below).
+// real process-supervision stack.
+//
+// Fix round 1, I3: main.go now constructs the driver UNCONDITIONALLY
+// (never gated on a one-shot startup features probe, which used to freeze
+// "inactive" for the whole process on any transient failure at boot).
+// Active reports the driver's OWN current feature-negotiation outcome
+// (its Sync's own step 1, re-checked on every call) -- collectOnce below
+// gates the Runtimes/LoadedModels override on Active(), NOT merely on this
+// interface being non-nil, precisely because "a driver exists" no longer
+// implies "this agent's runtime feature is doing anything right now". A
+// nil runtimeDriver (still possible: a test, or a hypothetical build that
+// never wires one at all) is the only remaining case that keeps a legacy
+// agent's telemetry sample byte-identical purely by construction (no
+// "runtimes" key at all, see collectOnce below); an inactive-but-non-nil
+// driver reaches the identical byte-neutral outcome via the Active() gate
+// instead.
 type runtimeDriver interface {
 	Sync(ctx context.Context, pushed json.RawMessage)
 	Status() []runtimectl.Status
+	Active() bool
+}
+
+// runtimeReportResender is the optional interface a runtimeDriver may
+// additionally implement to accept a periodic, unconditional resend of its
+// file-mode report (fix round 1, I5): design spec §10.2 requires this as a
+// POST-transport backstop (the WS transport already gets it for free on
+// every reconnect via WSSender's own cached-frame resend). Rather than
+// teaching this package or the driver which transport is in use, Run
+// piggybacks the call on the EXISTING system-report ticker cadence --
+// exactly the same transport-agnostic mechanism the system report itself
+// already relies on. *runtimectl.Driver implements it; a fake that omits
+// it (or a nil runtimeDriver) simply never gets this call.
+type runtimeReportResender interface {
+	ResendReport(ctx context.Context)
 }
 
 // runtimeWaker is the optional interface a poster may additionally
@@ -300,6 +326,12 @@ type Agent struct {
 	// certSyncing/trustSyncing already use, and the pattern the task brief
 	// calls "the AGENT's trigger pattern, not the Driver's own".
 	runtimeSyncing atomic.Bool
+	// runtimeReportResender is the optional periodic file-mode-report
+	// resend hook derived from runtimeDriver (see the interface doc above);
+	// nil when there is no driver, or the driver does not implement it.
+	// Invoked from the same reportTicker cadence sendSystemReport already
+	// uses (fix round 1, I5) -- never on its own ticker.
+	runtimeReportResender runtimeReportResender
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -410,6 +442,9 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	if w, ok := d.RuntimeDriver.(runtimeTransitionsWaker); ok {
 		a.runtimeTransitions = w.Transitions()
 	}
+	if r, ok := d.RuntimeDriver.(runtimeReportResender); ok {
+		a.runtimeReportResender = r
+	}
 	return a
 }
 
@@ -472,6 +507,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.collectOnce(ctx)
 		case <-reportTicker.C:
 			a.sendSystemReport(ctx)
+			a.resendRuntimeReport(ctx)
 		case <-certTickerC:
 			a.triggerCertSync(ctx)
 		case <-a.certWake:
@@ -672,6 +708,19 @@ func (a *Agent) sendSystemReport(ctx context.Context) {
 	}
 }
 
+// resendRuntimeReport re-sends the runtime driver's current file-mode
+// report unconditionally, piggybacking on the SAME ticker cadence as
+// sendSystemReport (fix round 1, I5: design spec §10.2's POST-transport
+// periodic backstop) rather than teaching this loop -- or the driver --
+// which transport is in use. A nil runtimeReportResender (no driver, or a
+// driver/fake that does not implement it) makes this a no-op.
+func (a *Agent) resendRuntimeReport(ctx context.Context) {
+	if a.runtimeReportResender == nil {
+		return
+	}
+	a.runtimeReportResender.ResendReport(ctx)
+}
+
 // collectOnce builds one sample from the host, GPU, and scrape collectors and
 // pushes it. Each collector failure is logged and skipped so a partial sample
 // still ships; a push failure is logged but not returned (the loop keeps going).
@@ -762,18 +811,29 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		}
 	}
 	// Agent-managed model runtime (Task 18, design spec §7/§9): when a
-	// runtime driver is installed, its Status() is AUTHORITATIVE for both
-	// Runtimes and LoadedModels -- this deliberately overrides whatever the
-	// a.loaded model-status scraper above just set, per the design's own
-	// "the gateway treats a fresh agent report as authoritative" contract
-	// applied consistently to the runtime feature's own source of truth.
-	// a.runtimeDriver is non-nil ONLY when runtime_manager negotiated
-	// active (main.go's own gate), so this is what keeps Runtimes
-	// completely absent -- nil, thus omitted by the sample's omitempty tag,
-	// exactly like ProxyRoutes above -- for every agent that never
-	// negotiated the feature: the no-op invariant this whole feature is
-	// built around.
-	if a.runtimeDriver != nil {
+	// runtime driver is installed AND currently negotiated active, its
+	// Status() is AUTHORITATIVE for both Runtimes and LoadedModels -- this
+	// deliberately overrides whatever the a.loaded model-status scraper
+	// above just set, per the design's own "the gateway treats a fresh
+	// agent report as authoritative" contract applied consistently to the
+	// runtime feature's own source of truth.
+	//
+	// Fix round 1, I3: the gate is Active(), NOT merely "a.runtimeDriver !=
+	// nil". main.go now constructs the driver UNCONDITIONALLY (no more
+	// one-shot startup probe that used to decide this forever), so a
+	// non-nil driver no longer implies the feature is doing anything right
+	// now -- gating the LoadedModels override on existence alone would wipe
+	// a non-runtime (or not-yet-negotiated, or currently-drained) agent's
+	// REAL loaded-model list with an empty one. Active() reflects the
+	// driver's own last Sync outcome, re-checked on every call, so this
+	// self-heals exactly when negotiation does. A nil driver (still
+	// possible: a test, or a hypothetical build that never wires one)
+	// short-circuits before even calling Active(), which is what keeps
+	// Runtimes completely absent -- nil, thus omitted by the sample's
+	// omitempty tag, exactly like ProxyRoutes above -- for every agent
+	// that never wires the feature at all: the no-op invariant this whole
+	// feature is built around.
+	if a.runtimeDriver != nil && a.runtimeDriver.Active() {
 		statuses := a.runtimeDriver.Status()
 		var loaded []string
 		if len(statuses) > 0 {

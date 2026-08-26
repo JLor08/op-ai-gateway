@@ -1121,6 +1121,39 @@ func TestRuntimeCachePathPrecedence(t *testing.T) {
 	}
 }
 
+// TestRuntimeRouterBindHostPrecedence proves flag > env > file > empty
+// (the "let main.go derive a default" sentinel) for RuntimeRouterBindHost
+// (task-18-fix-round-1.md, I2): unlike RuntimeCachePath this is a plain
+// operator-supplied string, not a path anchored against the config file, so
+// there is no defaultRuntimeCachePath-style fallback to prove -- absent
+// entirely, it must simply stay "".
+func TestRuntimeRouterBindHostPrecedence(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.RuntimeRouterBindHost != "" {
+		t.Fatalf("default RuntimeRouterBindHost = %q (err %v), want empty", cfg.RuntimeRouterBindHost, err)
+	}
+
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_router_bind":"10.0.0.5"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.RuntimeRouterBindHost != "10.0.0.5" {
+		t.Fatalf("file RuntimeRouterBindHost = %q (err %v), want 10.0.0.5", cfg.RuntimeRouterBindHost, err)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ROUTER_BIND" {
+			return "10.0.0.9"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.RuntimeRouterBindHost != "10.0.0.9" {
+		t.Fatalf("env RuntimeRouterBindHost = %q (err %v), want 10.0.0.9 (env > file)", cfg.RuntimeRouterBindHost, err)
+	}
+	args := append([]string{"-config", path}, "-runtime-router-bind=127.0.0.1")
+	if cfg, err := Load(args, env); err != nil || cfg.RuntimeRouterBindHost != "127.0.0.1" {
+		t.Fatalf("flag RuntimeRouterBindHost = %q (err %v), want 127.0.0.1 (flag > env > file)", cfg.RuntimeRouterBindHost, err)
+	}
+}
+
 // agentConfigJSONCFixture is a byte-for-byte copy of what
 // gateway/backend/internal/gateway/agent_binaries.go's buildAgentConfigJSON
 // produces for gateway_url="https://gw.example.test", token="fixture-token" (as
