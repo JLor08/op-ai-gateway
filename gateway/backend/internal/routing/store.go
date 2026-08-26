@@ -17,6 +17,11 @@ const (
 	ProviderLlamaCPP  = "llama_cpp"
 	ProviderLlamaSwap = "llama_swap"
 	ProviderLiteLLM   = "litellm"
+	// ProviderServerAgent marks an application as an agent-managed model
+	// runtime (the agent-runtime-manager feature): its launch spec, per-GPU
+	// VRAM rows, and co-residency rules live in RuntimeStore. Routing treats
+	// it like any other application type otherwise.
+	ProviderServerAgent = "server_agent"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -1186,6 +1191,81 @@ type CertificateStore interface {
 	DeleteCertificate(ctx context.Context, domain string) error
 }
 
+// RuntimeSpec is a mapping's agent-managed launch spec (agent_runtime_specs,
+// migration 65): 1:1 per ModelMapping (MappingID is unique), owned by the
+// agent-runtime-manager feature. It tells a server's ServerAgent how to
+// launch, health-check, and (un)load the model process backing that mapping.
+type RuntimeSpec struct {
+	ID        string
+	MappingID string
+	Enabled   bool
+	Binary    string
+	// Args is an opaque JSON array string (the netbird_group_ids pattern):
+	// the store never parses it, just round-trips it.
+	Args string
+	// Env is an opaque JSON object string; values are ${AGENT_ENV:NAME}
+	// placeholders resolved by the agent from its own environment — never
+	// secrets at rest here.
+	Env                         string
+	WorkDir                     string
+	ListenPort                  int // 0 = agent picks a free loopback port
+	HealthPath                  string
+	HealthTimeoutSeconds        int
+	StartupTimeoutSeconds       int
+	IdleTimeoutSeconds          int // 0 = never unload
+	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
+	Pinned                      bool
+	AdminState                  string // "" | "force_running" | "force_stopped"
+	VRAMLocked                  bool
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
+}
+
+// RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
+// (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUIndex).
+// VRAMEstimateMB is operator-owned (the portal writes it); VRAMMeasuredMB is
+// agent-owned and written ONLY by UpdateRuntimeSpecGPUMeasured — the two
+// never clobber each other.
+type RuntimeSpecGPU struct {
+	SpecID         string
+	GPUIndex       int
+	VRAMEstimateMB int
+	VRAMMeasuredMB int
+}
+
+// RuntimeStore is the agent-runtime-manager persistence surface (migration
+// 65): per-mapping launch specs and their per-GPU VRAM demand rows. Task 2
+// adds the co-residency methods, Task 3 the GPU budgets, Task 4 the runtime
+// reports — all on the same three tables created by migration 65.
+type RuntimeStore interface {
+	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
+	// spec per mapping — the unique key is mapping_id, not id): a fresh
+	// insert uses spec.CreatedAt, an overwrite preserves the existing
+	// created_at. A missing MappingID is ErrNotFound (FK violation).
+	UpsertRuntimeSpec(ctx context.Context, spec RuntimeSpec) error
+	// RuntimeSpecByMapping returns the spec for mappingID; ok is false when
+	// no spec has been created for that mapping yet (not an error).
+	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
+	// RuntimeSpecsByApplication lists every spec belonging to a mapping of
+	// appID, ordered by spec id. Always non-nil, empty when none.
+	RuntimeSpecsByApplication(ctx context.Context, appID string) ([]RuntimeSpec, error)
+	// DeleteRuntimeSpec removes the spec by id, cascading its GPU rows. An
+	// unknown id is ErrNotFound.
+	DeleteRuntimeSpec(ctx context.Context, id string) error
+	// SetRuntimeSpecGPUs atomically REPLACES the whole set of per-GPU VRAM
+	// rows for specID (delete-then-insert in one transaction, mirroring
+	// SetGroupMembers). An empty gpus clears the set. specID must exist
+	// (ErrNotFound otherwise).
+	SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []RuntimeSpecGPU) error
+	// RuntimeSpecGPUs lists specID's per-GPU VRAM rows, ordered by GPU
+	// index. Always non-nil, empty when none.
+	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
+	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
+	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.
+	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
+	// Task 2 adds the coresidency methods, Task 3 budgets, Task 4 reports.
+}
+
 // Store is the full routing persistence surface: the composition of every
 // role-scoped sub-interface above, grouped by concern. *MemoryStore (this
 // package) and *store.SQLStore implement Store by implementing each
@@ -1208,6 +1288,7 @@ type Store interface {
 	ResourceGroupStore
 	LimitsStore
 	CertificateStore
+	RuntimeStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.

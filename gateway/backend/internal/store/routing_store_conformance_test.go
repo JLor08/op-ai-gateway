@@ -460,3 +460,127 @@ func TestRoutingStoreTelemetrySampleDecimation(t *testing.T) {
 		}
 	})
 }
+
+// --- Agent runtime manager: memory-vs-SQL parity (T1) -----------------------
+
+// TestRoutingStoreRuntimeSpecs proves routing.MemoryStore and the SQL store
+// agree on RuntimeStore semantics: absent read, upsert-by-mapping (CreatedAt
+// preserved across an overwrite), listing by application, atomic GPU-row
+// replace with ordered read, the measured-vs-estimate write isolation, the
+// orphan-mapping FK error, and delete + GPU-row cascade.
+//
+// Unlike route_affinity's api_token_id/user_id (auth concepts routing.Store
+// has no method for), agent_runtime_specs.mapping_id references a row
+// (model_mappings) that IS fully expressible through routing.Store itself
+// (CreateAIServer/CreateApplication/CreateMapping), so both backends seed
+// identically through the interface inside run — no forEachRoutingStoreSeeded
+// SQL-only seed hook is needed here. That also means MemoryStore's
+// hand-rolled FK check (mirroring CreateApplication/CreateMapping) must
+// reject an orphan mapping id the same way the SQL FK does, so the orphan
+// assertion below runs unmodified on both backends.
+func TestRoutingStoreRuntimeSpecs(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_rt2", Name: "RT2", Domain: "rt2.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://rt2", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_rt2", ServerID: "srv_rt2", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_rt2", ApplicationID: "app_rt2", GatewayModelName: "map-rt2-model",
+			AppModelName: "map-rt2-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		if _, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2"); err != nil || ok {
+			t.Fatalf("absent spec: ok=%v err=%v", ok, err)
+		}
+
+		spec := routing.RuntimeSpec{
+			ID: "rspec_rt2", MappingID: "map_rt2", Enabled: true,
+			Binary: "/usr/bin/llama-server", Args: `["--port","${PORT}"]`,
+			Env: `{"HF_TOKEN":"${AGENT_ENV:HF_TOKEN}"}`, WorkDir: "/srv/models",
+			HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
+			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
+			AdminState: "force_running", VRAMLocked: true, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		got, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2")
+		if err != nil || !ok {
+			t.Fatalf("read back: ok=%v err=%v", ok, err)
+		}
+		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
+			!got.Enabled || !got.Pinned || !got.VRAMLocked ||
+			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
+			t.Fatalf("round-trip mismatch: %+v", got)
+		}
+
+		spec.Binary = "/usr/bin/vllm"
+		spec.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert overwrite: %v", err)
+		}
+		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt2")
+		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
+			t.Fatalf("overwrite must keep created_at, got %+v", got)
+		}
+
+		specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt2")
+		if err != nil || len(specs) != 1 {
+			t.Fatalf("by application: %v %d", err, len(specs))
+		}
+
+		gpus := []routing.RuntimeSpecGPU{
+			{SpecID: "rspec_rt2", GPUIndex: 1, VRAMEstimateMB: 21500},
+			{SpecID: "rspec_rt2", GPUIndex: 0, VRAMEstimateMB: 22000},
+		}
+		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_rt2", gpus); err != nil {
+			t.Fatalf("set gpus: %v", err)
+		}
+		gotGPUs, err := s.RuntimeSpecGPUs(ctx, "rspec_rt2")
+		if err != nil || len(gotGPUs) != 2 || gotGPUs[0].GPUIndex != 0 || gotGPUs[1].GPUIndex != 1 {
+			t.Fatalf("gpus must read ordered by index: %v %+v", err, gotGPUs)
+		}
+
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 0, 21800); err != nil {
+			t.Fatalf("measured: %v", err)
+		}
+		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_rt2")
+		if gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[0].VRAMEstimateMB != 22000 {
+			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[0])
+		}
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 7, 1); err != ErrNotFound {
+			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
+		}
+
+		orphan := spec
+		orphan.ID, orphan.MappingID = "rspec_rt2_orphan", "map_missing"
+		if err := s.UpsertRuntimeSpec(ctx, orphan); err != ErrNotFound {
+			t.Fatalf("orphan spec: want ErrNotFound, got %v", err)
+		}
+
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_rt2"); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_rt2"); err != ErrNotFound {
+			t.Fatalf("double delete: want ErrNotFound, got %v", err)
+		}
+		if gotGPUs, err = s.RuntimeSpecGPUs(ctx, "rspec_rt2"); err != nil || len(gotGPUs) != 0 {
+			t.Fatalf("gpu rows must cascade: %v %d", err, len(gotGPUs))
+		}
+	})
+}

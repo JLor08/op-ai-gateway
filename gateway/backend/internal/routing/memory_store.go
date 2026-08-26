@@ -89,6 +89,19 @@ type MemoryStore struct {
 	// plain value-map assignment is a full copy — no copyCertificate helper
 	// needed (mirrors e.g. ResourceGroup's by-value storage).
 	certificates map[string]Certificate
+	// runtimeSpecs mirrors agent_runtime_specs (migration 65, T1): spec id ->
+	// its RuntimeSpec row. RuntimeSpec has no slice/pointer fields, so a plain
+	// value-map assignment is a full copy (mirrors certificates above).
+	// mapping_id is a unique key on the SQL side, NOT the map key here (id is
+	// the primary key there too) — UpsertRuntimeSpec enforces the "1 spec per
+	// mapping" invariant by hand, scanning for an existing entry with the
+	// same MappingID.
+	runtimeSpecs map[string]RuntimeSpec
+	// runtimeSpecGPUs mirrors agent_runtime_spec_gpus: spec id -> its per-GPU
+	// VRAM rows (unordered on write; RuntimeSpecGPUs sorts by GPUIndex on
+	// read, mirroring the SQL `order by gpu_index`). Deleting a spec cascades
+	// deletion of its entry here (mirrors the table's ON DELETE CASCADE).
+	runtimeSpecGPUs map[string][]RuntimeSpecGPU
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -118,6 +131,8 @@ func NewMemoryStore() *MemoryStore {
 		resourceGroupProvisions:  map[string]map[ResourceGroupProvision]struct{}{},
 		principalLimits:          map[string]map[string]LimitConfig{},
 		certificates:             map[string]Certificate{},
+		runtimeSpecs:             map[string]RuntimeSpec{},
+		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
 	}
 }
 
@@ -2073,4 +2088,126 @@ func (m *MemoryStore) DeleteCertificate(_ context.Context, domain string) error 
 	defer m.mu.Unlock()
 	delete(m.certificates, domain)
 	return nil
+}
+
+// --- RuntimeStore (agent-runtime-manager, migration 65, T1) -----------------
+
+// UpsertRuntimeSpec inserts or replaces the launch spec for spec.MappingID.
+// MappingID must reference an existing mapping — a hand-rolled FK existence
+// check against m.mappings, mirroring CreateApplication/CreateMapping's
+// server_id/application_id checks above. Mirrors the SQL upsert's `on
+// conflict(mapping_id) do update set ...`: an existing spec for this mapping
+// is updated IN PLACE (keeping its stored id and CreatedAt — the SQL update
+// set list never touches id or created_at); a spec.ID reused for a DIFFERENT
+// mapping is the primary-key collision the SQL insert would raise as a unique
+// violation, so it is rejected here too.
+func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mappings[spec.MappingID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	for existingID, existing := range m.runtimeSpecs {
+		if existing.MappingID == spec.MappingID {
+			spec.ID = existingID
+			spec.CreatedAt = existing.CreatedAt
+			m.runtimeSpecs[existingID] = spec
+			return nil
+		}
+	}
+	if existing, ok := m.runtimeSpecs[spec.ID]; ok && existing.MappingID != spec.MappingID {
+		return storeerr.ErrConflict
+	}
+	m.runtimeSpecs[spec.ID] = spec
+	return nil
+}
+
+// RuntimeSpecByMapping returns the spec for mappingID, if any. RuntimeSpec has
+// no slice/pointer fields, so the map value is already a safe copy.
+func (m *MemoryStore) RuntimeSpecByMapping(_ context.Context, mappingID string) (RuntimeSpec, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, spec := range m.runtimeSpecs {
+		if spec.MappingID == mappingID {
+			return spec, true, nil
+		}
+	}
+	return RuntimeSpec{}, false, nil
+}
+
+// RuntimeSpecsByApplication lists every spec whose mapping belongs to appID,
+// ordered by spec id (mirrors the SQL join's `order by s.id`).
+func (m *MemoryStore) RuntimeSpecsByApplication(_ context.Context, appID string) ([]RuntimeSpec, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RuntimeSpec, 0)
+	for _, spec := range m.runtimeSpecs {
+		if mapping, ok := m.mappings[spec.MappingID]; ok && mapping.ApplicationID == appID {
+			out = append(out, spec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// DeleteRuntimeSpec removes the spec by id, cascading deletion of its GPU
+// rows (mirrors agent_runtime_spec_gpus' ON DELETE CASCADE).
+func (m *MemoryStore) DeleteRuntimeSpec(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runtimeSpecs[id]; !ok {
+		return storeerr.ErrNotFound
+	}
+	delete(m.runtimeSpecs, id)
+	delete(m.runtimeSpecGPUs, id)
+	return nil
+}
+
+// SetRuntimeSpecGPUs atomically replaces specID's whole set of per-GPU VRAM
+// rows (mirrors the SQL delete-then-insert transaction; the in-memory
+// assignment is already atomic under m.mu). specID must exist.
+func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus []RuntimeSpecGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runtimeSpecs[specID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	stored := make([]RuntimeSpecGPU, len(gpus))
+	copy(stored, gpus)
+	for i := range stored {
+		stored[i].SpecID = specID
+	}
+	m.runtimeSpecGPUs[specID] = stored
+	return nil
+}
+
+// RuntimeSpecGPUs returns specID's per-GPU VRAM rows ordered by GPU index
+// (mirrors the SQL `order by gpu_index`). The slice is deep-copied so the
+// caller cannot alias internal state.
+func (m *MemoryStore) RuntimeSpecGPUs(_ context.Context, specID string) ([]RuntimeSpecGPU, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := copyRuntimeSpecGPUs(m.runtimeSpecGPUs[specID])
+	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
+	return out, nil
+}
+
+// UpdateRuntimeSpecGPUMeasured writes back one agent measurement, touching
+// only VRAMMeasuredMB (VRAMEstimateMB, operator-owned, is never written
+// here). ErrNotFound when the (specID, gpuIndex) row does not exist.
+func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID string, gpuIndex int, measuredMB int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.runtimeSpecGPUs[specID]
+	for i := range rows {
+		if rows[i].GPUIndex == gpuIndex {
+			rows[i].VRAMMeasuredMB = measuredMB
+			return nil
+		}
+	}
+	return storeerr.ErrNotFound
+}
+
+func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
+	return append([]RuntimeSpecGPU(nil), gpus...)
 }

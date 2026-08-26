@@ -95,6 +95,7 @@ var migrations = []migration{
 	{version: 62, name: "model_group_selection_settings", up: migration62Up},
 	{version: 63, name: "token_unknown_model_redirect", up: migration63Up},
 	{version: 64, name: "model_group_min_tps_double_precision", up: migration64Up},
+	{version: 65, name: "agent_runtime_manager", up: migration65Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2835,4 +2836,58 @@ func migration64Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return execTx(ctx, tx, dl,
 		"alter table model_groups alter column min_tokens_per_second type double precision")
+}
+
+// migration65Up creates the agent-runtime-manager tables (T1): launch specs
+// (1:1 per mapping), per-GPU VRAM demand rows, and the pairwise co-residency
+// matrix (row present = pair allowed; mapping_a_id < mapping_b_id canonical).
+// Defaults reproduce the pre-feature behavior exactly: no rows, nothing starts.
+//
+// agent_runtime_specs.binary_path (the RuntimeSpec.Binary field) is named
+// binary_path, not binary: BINARY is a reserved PostgreSQL keyword and an
+// unquoted `binary` column fails DDL with a syntax error on that dialect
+// (caught by running the postgres leg of the conformance suite locally).
+func migration65Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists agent_runtime_specs (
+			id text primary key,
+			mapping_id text not null unique references model_mappings(id) on delete cascade,
+			enabled integer not null default 0,
+			binary_path text not null default '',
+			args text not null default '[]',
+			env text not null default '{}',
+			work_dir text not null default '',
+			listen_port integer not null default 0,
+			health_path text not null default '',
+			health_timeout_seconds integer not null default 0,
+			startup_timeout_seconds integer not null default 0,
+			idle_timeout_seconds integer not null default 0,
+			admission_wait_timeout_seconds integer not null default 0,
+			pinned integer not null default 0,
+			admin_state text not null default '',
+			vram_locked integer not null default 0,
+			created_at ` + ts + ` not null, updated_at ` + ts + ` not null
+		)`,
+		`create table if not exists agent_runtime_spec_gpus (
+			spec_id text not null references agent_runtime_specs(id) on delete cascade,
+			gpu_index integer not null,
+			vram_estimate_mb integer not null default 0,
+			vram_measured_mb integer not null default 0,
+			primary key (spec_id, gpu_index)
+		)`,
+		`create table if not exists agent_coresidency_rules (
+			application_id text not null references applications(id) on delete cascade,
+			mapping_a_id text not null references model_mappings(id) on delete cascade,
+			mapping_b_id text not null references model_mappings(id) on delete cascade,
+			created_at ` + ts + ` not null,
+			primary key (application_id, mapping_a_id, mapping_b_id)
+		)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

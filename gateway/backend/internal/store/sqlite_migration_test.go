@@ -362,3 +362,17 @@ func sqliteIndexExists(t *testing.T, db *sql.DB, name string) bool {
 	}
 	return count == 1
 }
+
+// TestMigration65RuntimeTables proves migration 65 creates all three
+// agent-runtime-manager tables in one migration: launch specs, per-GPU VRAM
+// demand rows, and the co-residency matrix (Task 2 adds that repo's methods;
+// the table exists from this migration on).
+func TestMigration65RuntimeTables(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	for _, table := range []string{"agent_runtime_specs", "agent_runtime_spec_gpus", "agent_coresidency_rules"} {
+		if !sqliteTableExists(t, s.db, table) {
+			t.Fatalf("table %s missing after migrate", table)
+		}
+	}
+}

@@ -340,6 +340,18 @@ func (_d *RoutingStoreWithTracing) DeleteResourceGroup(ctx context.Context, id s
 	return _d.Store.DeleteResourceGroup(ctx, id)
 }
 
+func (_d *RoutingStoreWithTracing) DeleteRuntimeSpec(ctx context.Context, id string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteRuntimeSpec(ctx, id)
+}
+
 func (_d *RoutingStoreWithTracing) DeleteService(ctx context.Context, id string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.DeleteService")
 	defer span.End()
@@ -712,6 +724,42 @@ func (_d *RoutingStoreWithTracing) ResourceGroupsByServer(ctx context.Context, s
 	return _d.Store.ResourceGroupsByServer(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) RuntimeSpecByMapping(ctx context.Context, mappingID string) (r1 _sourceRouting.RuntimeSpec, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecByMapping")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecByMapping(ctx, mappingID)
+}
+
+func (_d *RoutingStoreWithTracing) RuntimeSpecGPUs(ctx context.Context, specID string) (ra1 []_sourceRouting.RuntimeSpecGPU, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecGPUs(ctx, specID)
+}
+
+func (_d *RoutingStoreWithTracing) RuntimeSpecsByApplication(ctx context.Context, appID string) (ra1 []_sourceRouting.RuntimeSpec, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecsByApplication")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecsByApplication(ctx, appID)
+}
+
 func (_d *RoutingStoreWithTracing) ServerAdminGroups(ctx context.Context, serverID string) (sa1 []string, err error) {
 	ctx, span := Start(ctx, "routing.Store.ServerAdminGroups")
 	defer span.End()
@@ -938,6 +986,18 @@ func (_d *RoutingStoreWithTracing) SetResourceGroupServer(ctx context.Context, r
 		}
 	}()
 	return _d.Store.SetResourceGroupServer(ctx, rgID, serverID)
+}
+
+func (_d *RoutingStoreWithTracing) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []_sourceRouting.RuntimeSpecGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetRuntimeSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetRuntimeSpecGPUs(ctx, specID, gpus)
 }
 
 func (_d *RoutingStoreWithTracing) SetServerAdminGroup(ctx context.Context, serverID string, groupID string) (err error) {
@@ -1180,6 +1240,18 @@ func (_d *RoutingStoreWithTracing) UpdateResourceGroupSystemGroup(ctx context.Co
 	return _d.Store.UpdateResourceGroupSystemGroup(ctx, rgID, systemGroupID)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateRuntimeSpecGPUMeasured")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateServerCertificateOverride(ctx context.Context, id string, override string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateServerCertificateOverride")
 	defer span.End()
@@ -1394,6 +1466,18 @@ func (_d *RoutingStoreWithTracing) UpsertModelSetting(ctx context.Context, setti
 		}
 	}()
 	return _d.Store.UpsertModelSetting(ctx, setting)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertRuntimeSpec(ctx context.Context, spec _sourceRouting.RuntimeSpec) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertRuntimeSpec(ctx, spec)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertServerHardware(ctx context.Context, hardware _sourceRouting.ServerHardware) (err error) {
