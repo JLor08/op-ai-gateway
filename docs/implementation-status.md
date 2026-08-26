@@ -27,7 +27,37 @@
   this branch): mislabeled `provider.unavailable` on native pre-header idle
   timeout; hardcoded 60 s `warmCallTimeout`.
 
+## Execution progress (subagent-driven, per-task review)
+
+Store phase COMPLETE (migrations 65/66/67 shipped, all verified on sqlite +
+memory + a real PostgreSQL container):
+- Task 1 — runtime spec + spec-GPU tables and repos (`c9ef6d6`)
+- Task 2 — co-residency matrix repo (`f6ab0af`)
+- Task 3 — per-GPU budgets + `ai_servers` runtime columns (`165a51c`)
+- Task 4 — file-mode runtime reports (`f548d99`)
+
+Gateway phase in progress:
+- Task 5 — portal runtime-spec CRUD on mappings (`4bbd256`)
+- Task 6 — co-residency matrix, GPU budgets, managed-runtime-only, warnings (`f9a89af`)
+
+Durable corrections discovered during execution (fold into docs/architecture in
+Task 24):
+- `binary` is a reserved word in PostgreSQL — the launch-spec column is
+  `binary_path`; the Go field stays `RuntimeSpec.Binary`.
+- Adding a column to `ai_servers` requires SEVEN sites in
+  `internal/store/sqlite_routes.go`, not four: the insert, the update set-list,
+  `AIServerByID`, `AIServers`, `ServersByOwner`, `ServersByAdminGroups`, and
+  `scanAIServer`. `ServersByOwner`/`ServersByAdminGroups` carry their own inlined
+  column lists.
+- Store reads must return non-nil empty slices; a nil there becomes JSON `null`
+  instead of `[]` for API clients. Two separate defects of this class were caught
+  and fixed on this branch.
+- A removal operation must never be gated by the same check that guards creation:
+  gating `DeleteRuntimeSpec` on the application type stranded specs permanently
+  once an application was retyped via the ordinary `UpdateApplication` path.
+
 ## Next planned step
 
-1. User picks the execution mode (subagent-driven vs. inline).
-2. Execute the plan task-by-task; update this file after each task.
+1. Continue the plan at Task 7 (agent endpoints: features + runtime-config ETag).
+2. Remaining: Tasks 7-10 (gateway), 11-18 (agent), 19-22 (portal UI),
+   23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
