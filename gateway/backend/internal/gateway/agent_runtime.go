@@ -178,6 +178,28 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 // make the gateway persist a secret, regardless of what it actually sent.
 const runtimeReportEnvMask = "•••"
 
+// redactRuntimeReportParseError keeps only a config-load error's
+// CLASSIFICATION -- the text up to (not including) the first ':' -- and
+// drops everything after it. This is the same defense-in-depth concern as
+// runtimeReportEnvMask, arriving through a NEIGHBORING field: a real
+// config-loader error routinely quotes the offending source line verbatim
+// (e.g. a YAML/JSON parser reporting `yaml: line 12: mapping key "HF_TOKEN:
+// sk-abc123" ...`), so clamping ParseError's LENGTH alone is not enough --
+// storing it unredacted would let a secret reach server_runtime_reports
+// through this field instead of env, defeating the very redaction the env
+// mask exists to enforce. A string with no colon (or empty) passes through
+// unchanged -- there is nothing after a classification to cut. This is a
+// heuristic tied to how error strings are conventionally formatted
+// ("subsystem: detail"), not a general secret scanner; it deliberately
+// trades some diagnostic detail for the guarantee that whatever follows a
+// classifying prefix never reaches storage.
+func redactRuntimeReportParseError(s string) string {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
 // agentRuntimeReportSpecGPU mirrors AgentRuntimeSpecGPUDTO (portal's
 // runtime-config wire shape, §11) -- the file-mode local config uses EXACTLY
 // that schema (design spec §10.2: "one parser, one validation, one
@@ -312,9 +334,10 @@ func sanitizeRuntimeReportConfig(raw json.RawMessage) json.RawMessage {
 // ingestRuntimeReport is the transport-agnostic core shared by the POST
 // handler (handleAgentRuntimeReport) and the WS reader (handleAgentStream
 // case "runtime_report"), mirroring ingestSystemReport exactly: parse,
-// sanitize (clamp strings + redact Config's env values), existence-check the
-// server, and upsert server_runtime_reports. Returns the same typed
-// sentinels the system-report path uses so each transport maps them itself.
+// sanitize (clamp Source, redact+clamp ParseError, redact Config's env
+// values), existence-check the server, and upsert server_runtime_reports.
+// Returns the same typed sentinels the system-report path uses so each
+// transport maps them itself.
 //
 // After a successful upsert, it flips RuntimeStatusRegistry's per-server
 // file-mode flag (report.Source == "file") -- consulted by PushRuntimeConfig
@@ -328,7 +351,7 @@ func (s *Server) ingestRuntimeReport(ctx context.Context, serverID string, raw j
 	}
 	now := time.Now().UTC()
 	req.Source = clampHardwareString(strings.TrimSpace(req.Source))
-	req.ParseError = clampHardwareString(req.ParseError)
+	req.ParseError = clampHardwareString(redactRuntimeReportParseError(req.ParseError))
 	collectedAt := req.CollectedAt
 	if collectedAt.IsZero() {
 		collectedAt = now

@@ -88,8 +88,36 @@ func TestIngestRuntimeReport(t *testing.T) {
 		if !ok {
 			t.Fatal("report must still be stored")
 		}
-		if !strings.Contains(report.ReportJSON, "mapping values are not allowed") {
-			t.Fatalf("parse_error not preserved: %s", report.ReportJSON)
+		// parse_error is redacted to its classification (the text up to the
+		// first ':') -- everything after it, including line numbers and any
+		// quoted source content, must NOT survive.
+		if !strings.Contains(report.ReportJSON, `"parse_error":"yaml"`) {
+			t.Fatalf("parse_error classification not preserved: %s", report.ReportJSON)
+		}
+		if strings.Contains(report.ReportJSON, "mapping values are not allowed") || strings.Contains(report.ReportJSON, "line 4") {
+			t.Fatalf("parse_error detail beyond the classification must be redacted: %s", report.ReportJSON)
+		}
+	})
+
+	// TestIngestRuntimeReport/parse_error redaction: a secret embedded in a
+	// config-loader's error string (the exact leak class the env mask exists
+	// to prevent, arriving through a NEIGHBORING field -- see
+	// redactRuntimeReportParseError's doc) must never reach the stored blob.
+	t.Run("parse_error redaction strips a secret quoted after the classification", func(t *testing.T) {
+		srv := NewTestServer()
+		raw := json.RawMessage(`{"source":"file","parse_error":"yaml: line 12: found character that cannot start any token near HF_TOKEN=sk-superSecretValue123"}`)
+		if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		report, ok, _ := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+		if !ok {
+			t.Fatal("report must still be stored")
+		}
+		if strings.Contains(report.ReportJSON, "sk-superSecretValue123") {
+			t.Fatalf("stored blob leaked a secret embedded in parse_error: %s", report.ReportJSON)
+		}
+		if !strings.Contains(report.ReportJSON, `"parse_error":"yaml"`) {
+			t.Fatalf("parse_error classification not preserved: %s", report.ReportJSON)
 		}
 	})
 
@@ -163,7 +191,7 @@ func TestHandleAgentRuntimeReportPOSTRejectsBadToken(t *testing.T) {
 // prologue). This test instead uses a payload that is syntactically valid
 // JSON but fails to unmarshal into agentRuntimeReport's typed fields (a
 // string where CollectedAt expects RFC3339), the same payload the WS
-// skip-invalid-frame test above uses to exercise this exact branch.
+// skip-invalid-frame test below uses to exercise this exact branch.
 func TestHandleAgentRuntimeReportPOSTInvalidPayload(t *testing.T) {
 	srv := NewTestServer()
 	seedTestAgentToken(t, srv, "agt_test", "mock-host-qwen", "agent-secret")
