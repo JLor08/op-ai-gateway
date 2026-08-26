@@ -71,7 +71,16 @@ func main() {
 	// time.Duration string, default 0) between them -- the router tests'
 	// no-buffering and verbatim-splice proofs need a real, observable pause
 	// between two flushed writes, which /v1/echo's single Write cannot
-	// provide.
+	// provide. An optional second gap (query param "gap2") sleeps AGAIN
+	// after c2 is written and flushed, before this handler returns (which
+	// is what actually closes the connection) -- needed to discriminate a
+	// missing flush on the CALLER's side of a proxy from an merely-delayed
+	// one: net/http flushes any still-buffered bytes automatically once a
+	// handler returns, so a test whose connection closes immediately after
+	// the second chunk cannot tell "flushed immediately" from "flushed only
+	// because the response just happened to end" -- gap2 keeps the
+	// connection open long enough that the two cases differ by seconds, not
+	// nothing.
 	mux.HandleFunc("/v1/chunked", func(w http.ResponseWriter, r *http.Request) {
 		c1 := r.URL.Query().Get("c1")
 		if c1 == "" {
@@ -82,6 +91,7 @@ func main() {
 			c2 = "chunk2"
 		}
 		gap, _ := time.ParseDuration(r.URL.Query().Get("gap"))
+		gap2, _ := time.ParseDuration(r.URL.Query().Get("gap2"))
 		flusher, _ := w.(http.Flusher)
 
 		w.WriteHeader(http.StatusOK)
@@ -95,6 +105,9 @@ func main() {
 		fmt.Fprint(w, c2)
 		if flusher != nil {
 			flusher.Flush()
+		}
+		if gap2 > 0 {
+			time.Sleep(gap2)
 		}
 	})
 	// /v1/fail returns a fixed non-2xx status (query param "status", default

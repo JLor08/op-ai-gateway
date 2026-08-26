@@ -104,6 +104,55 @@ const maxBodyBytes = 32 << 20
 // module already follows throughout.
 var heartbeatInterval = 10 * time.Second
 
+// writeDeadline bounds how long the router waits for a single write to the
+// DOWNSTREAM client to complete. The upstream leg (router -> child)
+// deliberately has no timeout of its own -- the gateway owns that
+// deadline (router struct's own doc comment) -- but a stalled downstream
+// reader is a different failure mode entirely: without this, a client
+// that simply stops reading pins the response-copying goroutine, and the
+// deferred release() with it, for as long as it stalls, making that spec
+// permanently un-evictable from the outside -- the same failure mode the
+// manager already had to fix once for its own admission path (I5).
+// Refreshed after every successful write rather than set once up front,
+// so a slow-but-still-reading client is never penalized for a long
+// response's cumulative time. Package-level var, not const, so a test can
+// shrink it.
+var writeDeadline = 30 * time.Second
+
+// refreshWriteDeadline extends w's write deadline by writeDeadline from
+// now, best-effort: not every http.ResponseWriter supports a write
+// deadline (e.g. httptest.NewRecorder does not, returning
+// http.ErrNotSupported), and a caller that cannot set one is no worse off
+// than before this existed.
+func refreshWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(writeDeadline))
+}
+
+// deadlineWriter wraps an http.ResponseWriter, calling refreshWriteDeadline
+// before every Write -- used by the plain (non-streaming) proxy path so a
+// downstream client that stops reading cannot pin httputil.ReverseProxy's
+// own internal body-copy loop (and the deferred release() with it)
+// indefinitely, the same I5 concern the streaming path's flushWriter
+// addresses for its own copy loop. Declares its own Flush method
+// (delegating via a type assertion) so it still satisfies http.Flusher for
+// ReverseProxy's FlushInterval:-1 check -- embedding the http.ResponseWriter
+// interface alone promotes Header/Write/WriteHeader but NOT Flush, which is
+// a separate interface.
+type deadlineWriter struct {
+	http.ResponseWriter
+}
+
+func (dw deadlineWriter) Write(p []byte) (int, error) {
+	refreshWriteDeadline(dw.ResponseWriter)
+	return dw.ResponseWriter.Write(p)
+}
+
+func (dw deadlineWriter) Flush() {
+	if f, ok := dw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // hopByHopHeaders are stripped from the outbound request the router builds
 // by hand for the streaming path (RFC 7230 §6.1). httputil.ReverseProxy
 // already does this internally for the plain path; this list exists only
@@ -134,6 +183,15 @@ type managerPort interface {
 // know which HealthCheckPath the gateway application row configures, so it
 // answers both; the portal's server_agent type default is "/v1/health").
 func NewRouter(m *Manager) http.Handler {
+	// M6: a nil *Manager wrapped in the managerPort interface value is a
+	// non-nil interface holding a nil pointer (the classic Go trap) -- the
+	// router's own "rt.m != nil" nil-guards would never fire, silently
+	// defeating the documented "nil is a valid managerPort" property
+	// (managerPort's doc comment above). Pass a literal untyped nil
+	// instead so it is genuinely nil on the other side.
+	if m == nil {
+		return newRouter(nil)
+	}
 	return newRouter(m)
 }
 
@@ -158,12 +216,17 @@ func newRouter(m managerPort) *router {
 }
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/health", "/v1/health":
+	// M9: the brief specifies GET for all three control paths; a
+	// different method on one of these exact paths falls through to the
+	// model-routed proxy instead (the ordinary "everything else" case),
+	// rather than getting the always-200 treatment regardless of method.
+	isGet := r.Method == http.MethodGet
+	switch {
+	case isGet && (r.URL.Path == "/health" || r.URL.Path == "/v1/health"):
 		rt.serveHealth(w, r)
-	case "/running":
+	case isGet && r.URL.Path == "/running":
 		rt.serveRunning(w, r)
-	case "/v1/models":
+	case isGet && r.URL.Path == "/v1/models":
 		rt.serveModels(w, r)
 	default:
 		rt.serveProxy(w, r)
@@ -308,7 +371,12 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	outReq := r.Clone(r.Context())
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
-	proxy.ServeHTTP(w, outReq)
+	// I5: wrap w so a downstream client that stops reading cannot pin
+	// ReverseProxy's own internal body-copy goroutine (and the deferred
+	// release() above with it) indefinitely -- the plain-path counterpart
+	// of the streaming path's flushWriter doing the same for its own copy
+	// loop.
+	proxy.ServeHTTP(deadlineWriter{w}, outReq)
 }
 
 // serveStreamProxy handles a "stream":true request with a LAZY commit (see
@@ -323,6 +391,7 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 // exactly like the non-streaming path.
 func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
 	flusher, _ := w.(http.Flusher)
+	fw := flushWriter{w: w, f: flusher}
 
 	committed := false
 	commit := func() {
@@ -330,6 +399,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 			return
 		}
 		committed = true
+		refreshWriteDeadline(w) // I5: about to write headers -- start the deadline before, not after
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -437,29 +507,39 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 	if fres.n > 0 {
 		// Real data is ready: commit now if a heartbeat never happened to
 		// fire first (the common warm-model case) -- commit is idempotent,
-		// so this is a no-op if it already fired.
+		// so this is a no-op if it already fired. Written through fw (not
+		// a direct w.Write) so this first chunk gets the same I5 write-
+		// deadline refresh as every later one.
 		commit()
-		if _, werr := w.Write(buf[:fres.n]); werr != nil {
+		if _, werr := fw.Write(buf[:fres.n]); werr != nil {
 			return // client gone; nothing further to do
-		}
-		if flusher != nil {
-			flusher.Flush()
 		}
 	}
 	if fres.err != nil {
-		if !errors.Is(fres.err, io.EOF) {
-			failStream(fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
+		if errors.Is(fres.err, io.EOF) {
+			// A genuinely empty but successful stream: still commit
+			// explicitly (rather than relying on net/http's implicit
+			// default-200-on-return) since this path IS a successful
+			// outcome of a stream request.
+			commit()
 			return
 		}
-		// A genuinely empty but successful stream: still commit explicitly
-		// (rather than relying on net/http's implicit default-200-on-return)
-		// since this path IS a successful outcome of a stream request.
-		commit()
+		// M7: heartbeatWaitCtx force-closed resp.Body because r.Context()
+		// fired (the client disconnected) -- that produces a non-EOF read
+		// error here too, but it must be reported the same way
+		// spliceWithCancel already reports the identical event for the
+		// LATER read (as no error: there is no one left to report an
+		// error TO), not as a failStream(runtime.upstream_gone) call that
+		// would otherwise try to write a real HTTP status to a connection
+		// that is already gone.
+		if r.Context().Err() != nil {
+			return
+		}
+		failStream(fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
 		return
 	}
 
 	commit() // defensive: reachable only if Read legally returned (0, nil), which committing again is a no-op for
-	fw := flushWriter{w: w, f: flusher}
 	if err := spliceWithCancel(r.Context(), fw, resp.Body); err != nil {
 		// The child died mid-response after already sending real bytes: no
 		// HTTP status is available any more (spent long ago), but an SSE
@@ -549,6 +629,7 @@ func spliceWithCancel(ctx context.Context, dst io.Writer, src io.ReadCloser) err
 }
 
 func writeHeartbeat(w http.ResponseWriter, flusher http.Flusher) {
+	refreshWriteDeadline(w) // I5
 	if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
 		return // client gone; the next resultCh receive will still resolve and release() will still run
 	}
@@ -629,6 +710,7 @@ func forwardUpstreamResponse(w http.ResponseWriter, flusher http.Flusher, resp *
 			dst.Add(k, v)
 		}
 	}
+	refreshWriteDeadline(w) // I5
 	w.WriteHeader(resp.StatusCode)
 	fw := flushWriter{w: w, f: flusher}
 	if _, err := io.Copy(fw, resp.Body); err != nil {
@@ -653,6 +735,7 @@ type flushWriter struct {
 }
 
 func (fw flushWriter) Write(p []byte) (int, error) {
+	refreshWriteDeadline(fw.w) // I5
 	n, err := fw.w.Write(p)
 	if fw.f != nil {
 		fw.f.Flush()

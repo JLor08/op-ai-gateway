@@ -64,6 +64,38 @@ func readUntilContains(t *testing.T, r io.Reader, want string, timeout time.Dura
 	}
 }
 
+// readNBytesWithTimeout reads exactly n bytes from r, bounded by timeout: a
+// read that never completes (the discriminator TestRouterStreamResponseNot
+// Buffered relies on) fails the test instead of hanging the suite. The
+// spawned goroutine is deliberately not joined on timeout -- it is blocked
+// on Read with no way to cancel it from here, and leaking it for the rest
+// of this process is the accepted cost of a bounded "this must not hang"
+// assertion (it cannot touch shared state after t.Fatalf below unwinds the
+// test).
+func readNBytesWithTimeout(t *testing.T, r io.Reader, n int, timeout time.Duration) []byte {
+	t.Helper()
+	type result struct {
+		buf []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		buf := make([]byte, n)
+		_, err := io.ReadFull(r, buf)
+		ch <- result{buf: buf, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			t.Fatalf("read %d bytes: %v", n, res.err)
+		}
+		return res.buf
+	case <-time.After(timeout):
+		t.Fatalf("timed out after %s reading %d bytes -- response looks buffered", timeout, n)
+		return nil
+	}
+}
+
 // countingManager wraps a managerPort (in every test below, a real
 // *Manager), counting how many times ANY release() func EnsureRunning ever
 // returned was actually invoked. This is deliberately independent of the
@@ -109,7 +141,12 @@ func TestRouterHealthAlwaysAnswers(t *testing.T) {
 
 	rt := NewRouter(m)
 
+	// M12: wait for this goroutine to finish before the test (and its
+	// Manager's Close, via newTestManager's t.Cleanup) returns, instead of
+	// leaving it running past the test's own assertions.
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a"}`))
 		w := httptest.NewRecorder()
 		rt.ServeHTTP(w, req)
@@ -120,7 +157,10 @@ func TestRouterHealthAlwaysAnswers(t *testing.T) {
 		return st != nil && st.State == StateStarting
 	})
 
-	for _, path := range []string{"/health", "/v1/health", "/running"} {
+	// M12: /v1/models is named by the brief, alongside /health and
+	// /running, as an endpoint that must answer instantly regardless of a
+	// pending start -- it was missing from this table.
+	for _, path := range []string{"/health", "/v1/health", "/running", "/v1/models"} {
 		start := time.Now()
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
@@ -132,6 +172,12 @@ func TestRouterHealthAlwaysAnswers(t *testing.T) {
 		if elapsed > 200*time.Millisecond {
 			t.Errorf("%s took %s while spec-a was still starting (300ms health-delay); want it to answer promptly regardless", path, elapsed)
 		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the background proxy request for spec-a did not finish")
 	}
 }
 
@@ -373,13 +419,18 @@ func TestRouterNoResponseBuffering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
-	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
 	defer resp.Body.Close()
 
+	// M11: start the clock only once response headers have actually
+	// arrived, not before Do() was even called -- the request is against a
+	// cold spec, so Do() itself blocks for the child's spawn + first health
+	// probe, which otherwise ate into the gap/2 budget below and made this
+	// test flake on a loaded machine for a reason unrelated to buffering.
+	start := time.Now()
 	buf := make([]byte, len("chunk1"))
 	if _, err := io.ReadFull(resp.Body, buf); err != nil {
 		t.Fatalf("read first chunk: %v", err)
@@ -405,10 +456,73 @@ func TestRouterNoResponseBuffering(t *testing.T) {
 	}
 }
 
+// TestRouterStreamResponseNotBuffered is TestRouterNoResponseBuffering's
+// counterpart for the STREAMING path (I4): that test exercises only the
+// plain path's httputil.ReverseProxy/FlushInterval:-1 mechanism, so nothing
+// discriminates flushWriter's own Flush() call -- the mechanism that
+// delivers every SSE token AFTER the first (spliceWithCancel's io.Copy is
+// the only thing that ever writes through it). Deleting fw.f.Flush() left
+// all twelve tests in this file passing, because net/http flushes any
+// still-buffered bytes automatically once the handler returns, and every
+// existing streaming test's child closes its connection moments after its
+// last write -- "eventually flushed because the response just ended" and
+// "flushed immediately" are indistinguishable there.
+//
+// The discriminator: gap2 keeps the child's connection open for a long
+// time AFTER c2 is written and flushed, so the handler does NOT return
+// (and net/http's implicit end-of-request flush does NOT fire) anywhere
+// near that write. If flushWriter also flushes immediately, the client
+// sees c2 within about the FIRST (short) gap; if it does not, c2 sits in
+// net/http's internal buffer until gap2 finally elapses and the connection
+// closes -- a difference measured in seconds, not milliseconds, so the
+// margin in the assertion below is generous either way.
+func TestRouterStreamResponseNotBuffered(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	spec := baseSpec("spec-a", "model-a")
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	srv := httptest.NewServer(NewRouter(m))
+	defer srv.Close()
+
+	const gap = 50 * time.Millisecond
+	const gap2 = 2 * time.Second
+	body := `{"model":"model-a","stream":true}`
+	target := fmt.Sprintf("%s/v1/chunked?gap=%s&gap2=%s", srv.URL, gap, gap2)
+	req, err := http.NewRequest(http.MethodPost, target, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got1 := readNBytesWithTimeout(t, resp.Body, len("chunk1"), 2*time.Second)
+	if string(got1) != "chunk1" {
+		t.Fatalf("first chunk = %q, want %q", got1, "chunk1")
+	}
+
+	// The discriminating read: chunk2 must arrive well before gap2
+	// elapses, proving flushWriter delivered it as soon as the child sent
+	// it -- not only once the child's connection finally closes.
+	got2 := readNBytesWithTimeout(t, resp.Body, len("chunk2"), gap2/2)
+	if string(got2) != "chunk2" {
+		t.Fatalf("second chunk = %q, want %q", got2, "chunk2")
+	}
+}
+
 // TestRouterStreamHeartbeats proves a streaming request against a
-// slow-to-become-healthy model sees `: keepalive` comment(s) before any real
-// data, and that 200 + SSE headers are committed immediately (before the
-// outcome of the cold start is known at all).
+// slow-to-become-healthy model sees `: keepalive` comment(s) before any
+// real data, and that -- under the lazy-commit design (router.go's COLD-
+// START HEARTBEATS package doc) -- 200 + SSE headers get committed via
+// that first heartbeat, since the cold start genuinely outlives the
+// (shrunk) heartbeat interval here.
 func TestRouterStreamHeartbeats(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -661,6 +775,33 @@ func TestRouterRequestBodyTooLarge(t *testing.T) {
 	}
 }
 
+// assertReleasedExactlyOnce waits (bounded by timeout) for cm's release
+// count to reach at least 1, then polls a settle window to confirm it never
+// advances past 1. waitUntil alone only proves at-least-once: it returns
+// the instant the count reaches the target and never observes a second
+// release() arriving afterward, which is exactly the discriminator this
+// property needs -- a double-release is as bad as a leak (EnsureRunning's
+// own doc comment). The settle-window poll is a deliberate, explained
+// exception to this file's "never sleep to synchronize" rule: it proves an
+// ABSENCE (nothing else happens), which by definition has no event to
+// synchronize on instead.
+func assertReleasedExactlyOnce(t *testing.T, cm *countingManager, timeout, settle time.Duration) {
+	t.Helper()
+	waitUntil(t, timeout, "release called at least once", func() bool {
+		return cm.calls.Load() >= 1
+	})
+	deadline := time.Now().Add(settle)
+	for time.Now().Before(deadline) {
+		if n := cm.calls.Load(); n != 1 {
+			t.Fatalf("release call count = %d before the settle window elapsed, want exactly 1", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := cm.calls.Load(); n != 1 {
+		t.Fatalf("release call count = %d after the settle window, want exactly 1", n)
+	}
+}
+
 // TestRouterReleaseCalledExactlyOnce proves release() is invoked exactly
 // once on every exit path of the streaming handler -- success, a client
 // disconnecting mid-stream, a non-2xx upstream status, and the child dying
@@ -687,9 +828,7 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining only
 		resp.Body.Close()
 
-		waitUntil(t, 3*time.Second, "release called exactly once", func() bool {
-			return cm.calls.Load() == 1
-		})
+		assertReleasedExactlyOnce(t, cm, 3*time.Second, 200*time.Millisecond)
 	})
 
 	t.Run("client_disconnect_midstream", func(t *testing.T) {
@@ -726,9 +865,7 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		cancel() // disconnect mid-stream, before the child's 2s gap elapses
 		resp.Body.Close()
 
-		waitUntil(t, 3*time.Second, "release called exactly once despite client disconnect", func() bool {
-			return cm.calls.Load() == 1
-		})
+		assertReleasedExactlyOnce(t, cm, 3*time.Second, 200*time.Millisecond)
 	})
 
 	// upstream_non2xx deliberately leaves heartbeatInterval at its real
@@ -771,9 +908,7 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		}
 		resp.Body.Close()
 
-		waitUntil(t, 3*time.Second, "release called exactly once on a fast, uncommitted non-2xx upstream status", func() bool {
-			return cm.calls.Load() == 1
-		})
+		assertReleasedExactlyOnce(t, cm, 3*time.Second, 200*time.Millisecond)
 	})
 
 	t.Run("upstream_crash_midstream", func(t *testing.T) {
@@ -795,8 +930,104 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining only
 		resp.Body.Close()
 
-		waitUntil(t, 5*time.Second, "release called exactly once when the child dies mid-response", func() bool {
-			return cm.calls.Load() == 1
-		})
+		assertReleasedExactlyOnce(t, cm, 5*time.Second, 200*time.Millisecond)
 	})
+}
+
+// fakeDeadlineWriter is a hand-written http.ResponseWriter that also
+// implements SetWriteDeadline(time.Time) error directly -- the exact
+// shape http.ResponseController looks for before falling back to an
+// Unwrap chain (net/http's own responsecontroller.go) -- so
+// refreshWriteDeadline's calls (I5) can be observed without any real
+// networking or timing dependence: this tests the WIRING (a deadline is
+// set, and reset, before every write to the client), not an end-to-end
+// "a genuinely stalled TCP peer eventually gets freed" claim, which would
+// need real backpressure on a live socket and is out of scope for a fast,
+// deterministic unit test.
+type fakeDeadlineWriter struct {
+	header       http.Header
+	code         int
+	deadlineSets atomic.Int32
+}
+
+func (f *fakeDeadlineWriter) Header() http.Header {
+	if f.header == nil {
+		f.header = make(http.Header)
+	}
+	return f.header
+}
+
+func (f *fakeDeadlineWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (f *fakeDeadlineWriter) WriteHeader(code int)        { f.code = code }
+func (f *fakeDeadlineWriter) Flush()                      {}
+func (f *fakeDeadlineWriter) SetWriteDeadline(time.Time) error {
+	f.deadlineSets.Add(1)
+	return nil
+}
+
+// TestRouterStreamRefreshesWriteDeadline proves the I5 wiring: every write
+// to the client on the streaming path -- each heartbeat, and the eventual
+// real data -- refreshes a write deadline via http.NewResponseController,
+// not just once at the start. heartbeatInterval is shrunk far below the
+// spec's own health-delay so several heartbeats are guaranteed before the
+// model becomes healthy.
+func TestRouterStreamRefreshesWriteDeadline(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	shrinkHeartbeat(t, 5*time.Millisecond)
+	m := newTestManager(t, allowlistPolicy())
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(30*time.Millisecond, 0, 0, "")
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	fw := &fakeDeadlineWriter{}
+	req := httptest.NewRequest(http.MethodPost, "/v1/echo", strings.NewReader(`{"model":"model-a","stream":true}`))
+	NewRouter(m).ServeHTTP(fw, req)
+
+	if n := fw.deadlineSets.Load(); n < 2 {
+		t.Fatalf("SetWriteDeadline called %d times, want at least 2 (refreshed per write: at least one heartbeat during the 30ms health-delay, plus the eventual real data)", n)
+	}
+}
+
+// TestRouterNilManagerDoesNotPanic proves M6: NewRouter(nil) produces a
+// genuinely nil managerPort (not a non-nil interface wrapping a nil
+// *Manager, the classic Go trap), so the router's own documented "nil
+// means nothing is managed" property (managerPort's doc comment) actually
+// holds instead of the nil guards being dead code.
+func TestRouterNilManagerDoesNotPanic(t *testing.T) {
+	rt := NewRouter(nil)
+
+	for _, path := range []string{"/health", "/v1/health", "/running", "/v1/models"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		rt.ServeHTTP(w, req) // must not panic
+		if w.Code != http.StatusOK {
+			t.Errorf("%s status = %d, want 200 even with a nil manager", path, w.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a"}`))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, req) // must not panic
+	if w.Code != http.StatusNotFound {
+		t.Errorf("proxy status with a nil manager = %d, want 404 (nothing is managed)", w.Code)
+	}
+}
+
+// TestRouterControlPathsRequireGET proves M9: the brief specifies GET for
+// /health, /v1/health, /running, and /v1/models; a different method on one
+// of those exact paths must fall through to the model-routed proxy
+// instead of getting the always-200 treatment regardless of method.
+func TestRouterControlPathsRequireGET(t *testing.T) {
+	skipOnWindows(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{})
+	rt := NewRouter(m)
+
+	req := httptest.NewRequest(http.MethodPost, "/health", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, req)
+	if w.Code == http.StatusOK {
+		t.Errorf("POST /health status = %d, want it to fall through to the model-routed proxy (brief specifies GET), not the always-200 treatment", w.Code)
+	}
 }
