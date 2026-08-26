@@ -498,19 +498,111 @@ func TestRouterStreamSplicesUpstream(t *testing.T) {
 	}
 }
 
-// TestRouterStreamStartFailureTerminalFrame proves that once a streaming
-// request's 200 is committed, a start failure (here: a binary that is
-// allowlisted but does not exist on disk, so exec fails synchronously) is
-// reported as a terminal SSE error frame carrying runtime.start_failed --
-// never as an HTTP status, since none is available any more.
+// TestRouterStreamFastFailureReturnsHTTPStatus proves the lazy-commit
+// design (router.go's package doc, COLD-START HEARTBEATS): a streaming
+// request that fails FAST -- before a heartbeat could possibly fire --
+// gets a genuine HTTP status via the same sentinelCode() mapping the
+// non-streaming path uses, not a 200-already-committed terminal SSE frame.
+// heartbeatInterval is deliberately left at its real (large) default: each
+// of these failures (a map lookup, a policy check, or an exec() call
+// against a nonexistent binary) resolves in well under a millisecond, so
+// the fast side of this race always wins by construction, never by luck.
+// The model_not_managed case is the one this whole redesign exists for: an
+// unmanaged model named in a streaming request must still be a plain 404,
+// discoverable by curl or any non-SSE-aware tooling, not buried in a
+// data: frame.
+func TestRouterStreamFastFailureReturnsHTTPStatus(t *testing.T) {
+	skipOnWindows(t)
+
+	cases := []struct {
+		name       string
+		setup      func(t *testing.T) (m *Manager, model string)
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "model_not_managed",
+			setup: func(t *testing.T) (*Manager, string) {
+				m := newTestManager(t, allowlistPolicy())
+				m.Apply(Config{})
+				return m, "ghost-model"
+			},
+			wantStatus: http.StatusNotFound,
+			wantCode:   "runtime.model_not_managed",
+		},
+		{
+			name: "not_permitted",
+			setup: func(t *testing.T) (*Manager, string) {
+				m := newTestManager(t, LocalPolicy{AllowedBinaries: []string{"/not/the/stub"}})
+				spec := baseSpec("spec-a", "model-a")
+				m.Apply(Config{Specs: []Spec{spec}})
+				return m, "model-a"
+			},
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "runtime.not_permitted",
+		},
+		{
+			name: "start_failed",
+			setup: func(t *testing.T) (*Manager, string) {
+				badBinary := filepath.Join(t.TempDir(), "does-not-exist")
+				m := newTestManager(t, LocalPolicy{AllowedBinaries: []string{badBinary}})
+				spec := baseSpec("spec-a", "model-a")
+				spec.Binary = badBinary
+				m.Apply(Config{Specs: []Spec{spec}})
+				return m, "model-a"
+			},
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "runtime.start_failed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			m, model := tc.setup(t)
+			srv := httptest.NewServer(NewRouter(m))
+			defer srv.Close()
+
+			body := fmt.Sprintf(`{"model":%q,"stream":true}`, model)
+			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json -- nothing should have been committed to SSE for a failure this fast", ct)
+			}
+			got := decodeJSON[errorEnvelope](t, resp.Body)
+			if got.Error.Code != tc.wantCode {
+				t.Errorf("error code = %q, want %q", got.Error.Code, tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestRouterStreamStartFailureTerminalFrame proves the other side of the
+// lazy commit: once a heartbeat has actually fired -- here, because the
+// failure is genuinely slow (a health-delay that outlives the spec's own
+// startup_timeout_seconds, i.e. ErrStartTimeout) -- 200 is already
+// committed, and the eventual failure is reported as a terminal SSE frame
+// carrying the matching runtime.start_timeout code (sentinelCode's dynamic
+// mapping, not a hardcoded example value), never as an HTTP status, since
+// none is available any more. heartbeatInterval is shrunk to a value
+// comfortably SHORTER than the 1-second startup_timeout_seconds below, so
+// the heartbeat deterministically wins this race by construction, the
+// mirror image of TestRouterStreamFastFailureReturnsHTTPStatus.
 func TestRouterStreamStartFailureTerminalFrame(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
-	shrinkHeartbeat(t, 20*time.Millisecond)
-	badBinary := filepath.Join(t.TempDir(), "does-not-exist")
-	m := newTestManager(t, LocalPolicy{AllowedBinaries: []string{badBinary}})
+	shrinkHeartbeat(t, 1*time.Millisecond)
+	m := newTestManager(t, allowlistPolicy())
 	spec := baseSpec("spec-a", "model-a")
-	spec.Binary = badBinary
+	spec.Args = stubArgs(10*time.Second, 0, 0, "") // health never becomes ready in time
+	spec.StartupTimeoutSeconds = 1
 	m.Apply(Config{Specs: []Spec{spec}})
 
 	srv := httptest.NewServer(NewRouter(m))
@@ -528,18 +620,24 @@ func TestRouterStreamStartFailureTerminalFrame(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (already committed before the start failure)", resp.StatusCode)
+		t.Fatalf("status = %d, want 200 (a heartbeat fired and committed before the slow start failure resolved)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 	all, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
 	text := string(all)
-	if !strings.HasPrefix(text, "data: ") {
-		t.Fatalf("body = %q, want the terminal frame written as an SSE `data:` line", text)
+	if !strings.Contains(text, ": keepalive") {
+		t.Fatalf("body = %q, want at least one keepalive before the terminal frame (proves the commit happened via a heartbeat, not the failure itself)", text)
 	}
-	if !strings.Contains(text, `"code":"runtime.start_failed"`) {
-		t.Fatalf("body = %q, want a terminal frame carrying runtime.start_failed", text)
+	if strings.Index(text, ": keepalive") > strings.LastIndex(text, "data: ") {
+		t.Fatalf("body = %q, want keepalive(s) to precede the terminal data: frame", text)
+	}
+	if !strings.Contains(text, `"code":"runtime.start_timeout"`) {
+		t.Fatalf("body = %q, want a terminal frame carrying runtime.start_timeout", text)
 	}
 }
 
@@ -633,9 +731,15 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		})
 	})
 
+	// upstream_non2xx deliberately leaves heartbeatInterval at its real
+	// (large) default: the round trip to /v1/fail is a fast, local,
+	// already-admitted-child response, so nothing should ever be
+	// committed, and this proves the lazy-commit design's fast-uncommitted
+	// path releases exactly once too -- not only the post-commit paths the
+	// other three subtests cover. Shrinking the interval here would risk a
+	// heartbeat racing in first and silently testing the wrong thing.
 	t.Run("upstream_non2xx", func(t *testing.T) {
 		shrinkTimings(t)
-		shrinkHeartbeat(t, 20*time.Millisecond)
 		m := newTestManager(t, allowlistPolicy())
 		spec := baseSpec("spec-a", "model-a")
 		m.Apply(Config{Specs: []Spec{spec}})
@@ -648,10 +752,16 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Post: %v", err)
 		}
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502 -- nothing was committed yet (a fast non-2xx from an already-admitted child), so this must be a real HTTP status via sentinelCode, not a 200-committed terminal SSE frame", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json (nothing committed to SSE)", ct)
+		}
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining only
 		resp.Body.Close()
 
-		waitUntil(t, 3*time.Second, "release called exactly once on a non-2xx upstream status", func() bool {
+		waitUntil(t, 3*time.Second, "release called exactly once on a fast, uncommitted non-2xx upstream status", func() bool {
 			return cm.calls.Load() == 1
 		})
 	})

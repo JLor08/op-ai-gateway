@@ -27,28 +27,43 @@
 // path, both flush after every write so SSE tokens (and any other streamed
 // bytes) reach the client as they are produced.
 //
-// COLD-START HEARTBEATS (design doc §8.3): a request with "stream":true
-// commits 200 + SSE headers immediately, before EnsureRunning is even
-// called -- deterministically, not as a race against how fast the eventual
-// outcome happens to arrive, since a fast failure (a misconfigured binary)
-// must be just as "already committed" as a slow one (a 70B cold load). From
-// that point until the child's response produces its first body byte, a
-// `: keepalive` SSE comment is emitted on every heartbeatInterval tick --
-// this covers BOTH the cold-start wait (EnsureRunning pending) and a
-// time-to-first-token wait on an already-warm child (the upstream request
-// pending), which the design doc treats as the same "silent window" failure
-// class. Once real bytes start flowing, heartbeats stop for good and the
-// upstream body is spliced through verbatim -- the router never re-frames
-// the child's own SSE lines.
+// COLD-START HEARTBEATS, LAZILY COMMITTED (design doc §8.3, brief: "once
+// admission succeeds, commit 200" -- after, not before): a request with
+// "stream":true does NOT commit 200 + SSE headers up front. It arms a
+// heartbeatInterval ticker and starts waiting on EnsureRunning (then, on
+// success, the upstream round trip, then the wait for the first response
+// body byte) with that ticker still running. The FIRST time anything would
+// actually need to be written to the client -- a heartbeat tick fires
+// before the current phase resolves, or the current phase resolves with
+// real data to write -- a single idempotent commit() finally sends 200 +
+// SSE headers. Until that moment, nothing has been written at all, so a
+// failure at any phase (model not managed, policy refusal, a synchronously
+// failing exec, an immediate non-2xx from an already-admitted child, ...)
+// is still reportable as a genuine HTTP status via the same sentinelCode()
+// mapping the non-streaming path uses -- exactly like a non-streaming
+// request would get. Only once a heartbeat has actually fired, or real
+// bytes have actually started flowing, does the router commit to SSE; a
+// failure from that point on can no longer be a status code (see ACCEPTED
+// TRADE-OFF below). heartbeatInterval covers BOTH the cold-start wait
+// (EnsureRunning pending) and a time-to-first-token wait on an
+// already-warm child (the upstream request pending), which the design doc
+// treats as the same "silent window" failure class. Once real bytes start
+// flowing, heartbeats stop for good and the upstream body is spliced
+// through verbatim -- the router never re-frames the child's own SSE
+// lines.
 //
 // ACCEPTED TRADE-OFF, deliberately implemented and documented here (design
-// doc §8.3, §15): once 200 has been committed for a streaming request, no
-// later failure -- EnsureRunning erroring, the child returning a non-2xx
-// status, the child dying mid-response -- can be reported as an HTTP status
-// any more. Each is instead reported as a terminal SSE frame
-// (`data: {"error":{"code":"...","message":"..."}}\n\n`) carrying the exact
-// same stable code the non-streaming path would have used for that failure
-// (§6.5's sentinel table, reproduced in sentinelCode below).
+// doc §8.3, §15): once 200 HAS been committed for a streaming request (a
+// heartbeat fired, or real data started flowing, before the eventual
+// outcome was known), no later failure -- EnsureRunning erroring, the
+// child returning a non-2xx status, the child dying mid-response -- can be
+// reported as an HTTP status any more. Each is instead reported as a
+// terminal SSE frame (`data: {"error":{"code":"...","message":"..."}}\n\n`)
+// carrying the exact same stable code the non-streaming path would have
+// used for that failure (§6.5's sentinel table, reproduced in
+// sentinelCode below). The lazy commit means this trade-off is now paid
+// only when it is actually earned by a genuinely slow phase, not on every
+// streaming request regardless of how fast it resolves.
 package runtime
 
 import (
@@ -285,27 +300,51 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	proxy.ServeHTTP(w, outReq)
 }
 
-// serveStreamProxy handles a "stream":true request: commits 200 + SSE
-// headers unconditionally (see the package doc's COLD-START HEARTBEATS
-// section for why this is unconditional rather than a race against how fast
-// the eventual outcome arrives), then heartbeats through EnsureRunning and
-// the upstream round trip until the first real response byte, then splices
-// the remainder through verbatim.
+// serveStreamProxy handles a "stream":true request with a LAZY commit (see
+// the package doc's COLD-START HEARTBEATS section): nothing is written to
+// w until either a heartbeat actually fires or real data is actually ready
+// to write. commit() is the single idempotent function that sends 200 + SSE
+// headers the first time either of those happens; every error path below
+// checks committed via failStream instead of always emitting an SSE frame,
+// so a failure fast enough to beat the first heartbeat -- model not
+// managed, a policy refusal, a synchronously failing exec, an immediate
+// non-2xx from an already-admitted child -- is still a genuine HTTP status,
+// exactly like the non-streaming path.
 func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
 	flusher, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	if flusher != nil {
-		flusher.Flush()
+
+	committed := false
+	commit := func() {
+		if committed {
+			return
+		}
+		committed = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	// failStream reports err as a genuine HTTP status if nothing has been
+	// committed yet (sentinelCode via the same envelope the non-streaming
+	// path uses), or as a terminal SSE frame if 200 was already sent --
+	// the ACCEPTED TRADE-OFF the package doc describes, now paid only when
+	// a heartbeat or real data actually forced the commit.
+	failStream := func(err error) {
+		if !committed {
+			writeSentinelError(w, err)
+			return
+		}
+		writeSSEError(w, flusher, err)
 	}
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	if rt.m == nil {
-		writeSSEError(w, flusher, ErrModelNotManaged)
+		failStream(ErrModelNotManaged)
 		return
 	}
 
@@ -319,16 +358,16 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 		endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
 		ensureCh <- ensureResult{endpoint: endpoint, release: release, err: err}
 	}()
-	eres := heartbeatWait(ticker, ensureCh, w, flusher)
+	eres := heartbeatWait(ticker, ensureCh, w, flusher, commit)
 	if eres.err != nil {
-		writeSSEError(w, flusher, eres.err)
+		failStream(eres.err)
 		return
 	}
 	defer eres.release()
 
 	outReq, err := rt.buildUpstreamRequest(r, eres.endpoint, body)
 	if err != nil {
-		writeSSEError(w, flusher, fmt.Errorf("runtime: build upstream request: %w", err))
+		failStream(fmt.Errorf("runtime: build upstream request: %w", err))
 		return
 	}
 
@@ -341,15 +380,15 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 		resp, err := rt.transport.RoundTrip(outReq)
 		rtCh <- roundTripResult{resp: resp, err: err}
 	}()
-	rres := heartbeatWait(ticker, rtCh, w, flusher)
+	rres := heartbeatWait(ticker, rtCh, w, flusher, commit)
 	if rres.err != nil {
-		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream request failed: %w", rres.err))
+		failStream(fmt.Errorf("runtime: upstream request failed: %w", rres.err))
 		return
 	}
 	resp := rres.resp
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
+		failStream(fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
 		return
 	}
 
@@ -367,8 +406,12 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 		n, err := resp.Body.Read(buf)
 		firstCh <- readResult{n: n, err: err}
 	}()
-	fres := heartbeatWaitCtx(r.Context(), ticker, firstCh, w, flusher, resp.Body)
+	fres := heartbeatWaitCtx(r.Context(), ticker, firstCh, w, flusher, resp.Body, commit)
 	if fres.n > 0 {
+		// Real data is ready: commit now if a heartbeat never happened to
+		// fire first (the common warm-model case) -- commit is idempotent,
+		// so this is a no-op if it already fired.
+		commit()
 		if _, werr := w.Write(buf[:fres.n]); werr != nil {
 			return // client gone; nothing further to do
 		}
@@ -378,27 +421,36 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 	}
 	if fres.err != nil {
 		if !errors.Is(fres.err, io.EOF) {
-			writeSSEError(w, flusher, fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
+			failStream(fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
+			return
 		}
+		// A genuinely empty but successful stream: still commit explicitly
+		// (rather than relying on net/http's implicit default-200-on-return)
+		// since this path IS a successful outcome of a stream request.
+		commit()
 		return
 	}
 
+	commit() // defensive: reachable only if Read legally returned (0, nil), which committing again is a no-op for
 	fw := flushWriter{w: w, f: flusher}
 	if err := spliceWithCancel(r.Context(), fw, resp.Body); err != nil {
 		// The child died mid-response after already sending real bytes: no
 		// HTTP status is available any more (spent long ago), but an SSE
 		// client can still parse one more terminal frame appended after
 		// legitimate data -- design doc §6.4 "child dies mid-request".
-		writeSSEError(w, flusher, fmt.Errorf("runtime: upstream body read failed: %w", err))
+		failStream(fmt.Errorf("runtime: upstream body read failed: %w", err))
 	}
 }
 
-// heartbeatWait blocks until resultCh yields a value, writing a `:
-// keepalive\n\n` SSE comment on every tick of ticker in the meantime. ticker
-// is shared across every phase of one streaming request (EnsureRunning, the
-// upstream round trip, the wait for the first body byte) so the interval
-// keeps counting continuously across phase boundaries instead of resetting
-// at each one.
+// heartbeatWait blocks until resultCh yields a value, calling commit() (see
+// serveStreamProxy) and writing a `: keepalive\n\n` SSE comment on every
+// tick of ticker in the meantime. ticker is shared across every phase of
+// one streaming request (EnsureRunning, the upstream round trip, the wait
+// for the first body byte) so the interval keeps counting continuously
+// across phase boundaries instead of resetting at each one. commit is
+// idempotent, so calling it from every phase's heartbeatWait/heartbeatWaitCtx
+// call is safe regardless of which phase's ticker fire (if any) actually
+// commits first.
 //
 // Used only for phases where abandoning the wait early is NOT safe: in
 // particular the EnsureRunning phase, where a client disconnecting cannot
@@ -408,12 +460,13 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 // resulting release() MUST still be called or the spec becomes permanently
 // un-evictable (EnsureRunning's own doc comment). See heartbeatWaitCtx for
 // the phases where early abandonment is safe.
-func heartbeatWait[T any](ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher) T {
+func heartbeatWait[T any](ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher, commit func()) T {
 	for {
 		select {
 		case v := <-resultCh:
 			return v
 		case <-ticker.C:
+			commit()
 			writeHeartbeat(w, flusher)
 		}
 	}
@@ -431,12 +484,13 @@ func heartbeatWait[T any](ticker *time.Ticker, resultCh <-chan T, w http.Respons
 // (TestRouterReleaseCalledExactlyOnce/client_disconnect_midstream), not to
 // be prompt enough on its own -- explicitly closing body on ctx.Done() is
 // the reliable version of the same idea.
-func heartbeatWaitCtx[T any](ctx context.Context, ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher, body io.Closer) T {
+func heartbeatWaitCtx[T any](ctx context.Context, ticker *time.Ticker, resultCh <-chan T, w http.ResponseWriter, flusher http.Flusher, body io.Closer, commit func()) T {
 	for {
 		select {
 		case v := <-resultCh:
 			return v
 		case <-ticker.C:
+			commit()
 			writeHeartbeat(w, flusher)
 		case <-ctx.Done():
 			body.Close() //nolint:errcheck // best-effort: only unblocking a pending Read, not reporting an outcome
