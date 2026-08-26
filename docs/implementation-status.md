@@ -219,6 +219,19 @@ Agent phase in progress:
   test names, and mutation-testing verification (including a correction to
   the original report's case-7 mutation description) appended to
   `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-12-report.md`.
+- Task 12 review round 2 — round 1's Finding 5 came back NOT ADDRESSED,
+  correctly: `Config.AllowedPairs()` existed and was tested, but nothing
+  pointed a future implementer at it from `Coresident` or
+  `PolicySnapshot.Allowed`'s own doc comments, so the one-directional-map
+  trap it was meant to close stayed open in practice. Fixed with exactly
+  the two doc comments asked for (no behavior change): `Coresident` now
+  says explicitly not to hand-roll an `Allowed` map from it and names
+  `AllowedPairs()`; `Allowed` now says to build it via
+  `Config.AllowedPairs()`. Bundled minor: `assertDecision` (the shared
+  `policy_test.go` helper) now also checks `Decision.Message`, verified
+  discriminating by a mutation test (a leaked `Message` on the plain-OK
+  path failed 7 table cases as expected, reverted after). Detail appended
+  to the same task-12-report.md.
 
 ## Next planned step
 

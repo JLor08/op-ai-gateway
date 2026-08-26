@@ -59,6 +59,9 @@ func assertDecision(t *testing.T, name string, got, want Decision) {
 	if got.Reason != want.Reason {
 		t.Errorf("%s: Reason = %q, want %q", name, got.Reason, want.Reason)
 	}
+	if got.Message != want.Message {
+		t.Errorf("%s: Message = %q, want %q", name, got.Message, want.Message)
+	}
 	if got.Evict == nil {
 		t.Errorf("%s: Evict = nil, want a non-nil slice (empty or populated)", name)
 	}
@@ -69,9 +72,13 @@ func assertDecision(t *testing.T, name string, got, want Decision) {
 
 // TestAdmit is table-driven over PolicySnapshot x Spec -> Decision, covering
 // every case task-12-brief.md lists. Each case asserts the FULL Decision
-// (OK, Wait, Reason, and the exact Evict slice in order) -- checking OK
-// alone would pass against an implementation that evicts the wrong process,
-// the wrong number of them, or in the wrong order.
+// (OK, Wait, Reason, Message, and the exact Evict slice in order) --
+// checking OK alone would pass against an implementation that evicts the
+// wrong process, the wrong number of them, or in the wrong order; leaving
+// Message unchecked would pass against an implementation that leaked
+// disambiguating text onto the wrong path (every case in this table wants
+// Message == "", the zero value, so assertDecision's check of it here is
+// exercised on every single case, not just the one dedicated Message test).
 func TestAdmit(t *testing.T) {
 	noGPUs := Spec{ID: "cand"}
 

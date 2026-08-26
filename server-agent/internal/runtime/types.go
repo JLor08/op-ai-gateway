@@ -67,8 +67,15 @@ type Config struct {
 	MaxProcesses int         `json:"max_processes"`
 	GPUBudgets   []GPUBudget `json:"gpu_budgets"`
 	Specs        []Spec      `json:"specs"`
-	Coresident   [][2]string `json:"coresident"` // spec-ID pairs, already translated upstream
-	ETag         string      `json:"etag"`
+	// Coresident holds spec-ID pairs, already translated upstream, in WIRE
+	// order (whichever order the gateway happened to send each pair in).
+	// Do NOT build a PolicySnapshot.Allowed lookup map directly from this
+	// slice -- call AllowedPairs() instead, which canonicalizes every pair
+	// via PairKey. A map built from raw pairs looks up correctly only in
+	// whichever direction the wire happened to use, which presents as a
+	// random, hard-to-reproduce matrix failure.
+	Coresident [][2]string `json:"coresident"`
+	ETag       string      `json:"etag"`
 }
 
 // ParseConfig unmarshals and validates raw into a Config.

@@ -28,9 +28,15 @@ type RunningProc struct {
 // admission decision.
 type PolicySnapshot struct {
 	Running      []RunningProc
-	MaxProcesses int                // 0 = unlimited
-	Budgets      map[int]int        // gpu index -> budget MB; an ABSENT index is unconstrained, never zero-budget
-	Allowed      map[[2]string]bool // canonical (a<=b) spec-ID pair set: true = the pair may run together
+	MaxProcesses int         // 0 = unlimited
+	Budgets      map[int]int // gpu index -> budget MB; an ABSENT index is unconstrained, never zero-budget
+	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
+	// may run together. Build it with Config.AllowedPairs(), never by
+	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
+	// AllowedPairs canonicalizes each pair via PairKey so a lookup never
+	// depends on which side is the candidate and which is the
+	// already-running process.
+	Allowed map[[2]string]bool
 }
 
 // Decision is Admit's answer. Exactly one of four shapes holds:
