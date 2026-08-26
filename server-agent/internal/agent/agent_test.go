@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"op-ai-server-agent/internal/certinstall"
@@ -136,6 +137,26 @@ func TestRunCollectsMergesPushes(t *testing.T) {
 	}
 	if got.Arch != runtime.GOARCH {
 		t.Errorf("Arch = %q, want %q", got.Arch, runtime.GOARCH)
+	}
+	// Feature negotiation (design spec §9): collectOnce must actually
+	// populate Capabilities -- a legacy agent that leaves it empty is
+	// normalized to {} downstream, but a current build reports its real
+	// feature set plus its own version.
+	if len(got.Capabilities) == 0 {
+		t.Fatal("Capabilities is empty; want collectOnce to populate it")
+	}
+	var caps struct {
+		Features     []string `json:"features"`
+		AgentVersion string   `json:"agent_version"`
+	}
+	if err := json.Unmarshal(got.Capabilities, &caps); err != nil {
+		t.Fatalf("Capabilities does not decode as the expected shape: %v (raw=%s)", err, got.Capabilities)
+	}
+	if caps.AgentVersion != Version {
+		t.Errorf("Capabilities.agent_version = %q, want %q", caps.AgentVersion, Version)
+	}
+	if len(caps.Features) != 1 || caps.Features[0] != "runtime_manager" {
+		t.Errorf("Capabilities.features = %v, want [runtime_manager]", caps.Features)
 	}
 }
 

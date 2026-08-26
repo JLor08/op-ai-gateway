@@ -111,6 +111,17 @@ type GPU struct {
 	FanPct        float64 `json:"fan_pct"`
 }
 
+// EmptyCapabilities is the canonical "nothing to report" value for
+// Sample.Capabilities: a valid, empty JSON object -- never Go's nil, which
+// json.RawMessage would otherwise marshal as the literal `null` (a
+// nil-vs-null defect this wire field cannot afford: the gateway parses it
+// to negotiate agent feature flags). Normalize substitutes it for an
+// absent/empty Capabilities; agent.capabilitiesJSON falls back to this exact
+// value on its own (practically impossible) marshal failure, so every
+// producer of this field agrees on the same bytes instead of each keeping
+// its own json.RawMessage(`{}`) literal.
+var EmptyCapabilities = json.RawMessage(`{}`)
+
 // Normalize fills defaults so the payload always decodes on the gateway:
 // non-nil GPUs/Net slices, provider_health/capabilities default to {}.
 func (s *Sample) Normalize() {
@@ -133,7 +144,7 @@ func (s *Sample) Normalize() {
 		s.ProviderHealth = json.RawMessage(`{}`)
 	}
 	if len(s.Capabilities) == 0 {
-		s.Capabilities = json.RawMessage(`{}`)
+		s.Capabilities = EmptyCapabilities
 	}
 }
 

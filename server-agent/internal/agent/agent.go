@@ -23,7 +23,12 @@ import (
 )
 
 // Version is the agent's self-reported version, sent as agent_version.
-const Version = "0.1.0"
+// Bump rule (design spec §9, feature negotiation): MINOR when Features
+// gains a new entry (as here -- 0.1.0 -> 0.2.0 for "runtime_manager"),
+// PATCH for anything else. TestFeatureRegistry enforces the MINOR case by
+// failing if any Feature.Since outruns Version; it cannot catch a forgotten
+// PATCH bump after a plain bugfix, which stays a process rule.
+const Version = "0.2.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -518,6 +523,11 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		AgentVersion: Version,
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
+		// Feature negotiation (design spec §9): declare what this agent
+		// binary can do so the gateway can gate agent-only behavior (e.g.
+		// runtime_manager) on name equality instead of guessing from
+		// AgentVersion.
+		Capabilities: capabilitiesJSON(),
 	}
 	if a.host != nil {
 		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
