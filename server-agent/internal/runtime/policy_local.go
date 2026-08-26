@@ -98,35 +98,17 @@ func withinDir(candidate, dir string) bool {
 	return strings.HasPrefix(cleanCandidate, cleanDir+string(filepath.Separator))
 }
 
-// placeholderPattern matches the two placeholders ExpandPlaceholders
-// understands: ${PORT} and ${AGENT_ENV:NAME}. Anything else shaped like
-// "${...}" is left untouched -- ExpandPlaceholders only owns these two.
-var placeholderPattern = regexp.MustCompile(`\$\{(PORT|AGENT_ENV:[^}]+)\}`)
-
-// nearMissPlaceholderPattern matches ANY "${...}" shape (including an empty
-// body, unlike placeholderPattern's AGENT_ENV alternative) so that residual
-// text left after known-good substitution can be checked for a near-miss.
-var nearMissPlaceholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
-
-// nearMissPlaceholder scans s (the result of substituting every valid
-// ${PORT}/${AGENT_ENV:NAME} occurrence) for a residual "${...}" whose inner
-// text case-insensitively contains PORT or AGENT_ENV, and returns the first
-// such token verbatim, or "" if none is found. This catches typos --
-// ${AGENT_ENVV:HF_TOKEN}, ${PORTX}, ${port}, ${AGENT_ENV:} -- that would
-// otherwise reach the child process as literal, uninterpolated text and fail
-// as a confusing downstream auth or bind error instead of an honest refusal
-// here. Arbitrary "${...}" text unrelated to either token (a model server's
-// own templating syntax) is left untouched -- this function owns only PORT
-// and AGENT_ENV.
-func nearMissPlaceholder(s string) string {
-	for _, m := range nearMissPlaceholderPattern.FindAllString(s, -1) {
-		inner := strings.ToUpper(m[2 : len(m)-1])
-		if strings.Contains(inner, "PORT") || strings.Contains(inner, "AGENT_ENV") {
-			return m
-		}
-	}
-	return ""
-}
+// placeholderPattern matches ANY "${...}" shape, including an empty body
+// (${AGENT_ENV:} and ${} both match). ExpandPlaceholders classifies every
+// match in a single pass over the ORIGINAL text -- see the classification
+// logic inside ExpandPlaceholders's expand closure for the exact rule. Using
+// one broad
+// pattern (rather than a narrow pattern for the two valid forms plus a
+// second pattern re-scanning the substituted result) is what makes that
+// single-pass, original-text-only classification possible: the near-miss
+// check needs to see every "${...}" occurrence exactly once, before any
+// substitution happens, never after.
+var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 
 // ExpandPlaceholders resolves every ${PORT} and ${AGENT_ENV:NAME} occurrence
 // in spec.Args and spec.Env values, and builds the exact environment the
@@ -156,16 +138,47 @@ func nearMissPlaceholder(s string) string {
 // this treats "minimal base" as agent-controlled rather than
 // spec-overridable.
 //
-// A near-miss placeholder -- text shaped like "${...}" whose inner content
-// case-insensitively contains PORT or AGENT_ENV but does not exactly match
-// either supported form (e.g. a typo'd ${AGENT_ENVV:...}, ${PORTX}, the
-// lowercase ${port}, or the empty ${AGENT_ENV:}) is a hard error naming the
-// malformed token, on the same reasoning as the missing-variable error:
+// A near-miss placeholder -- text shaped like "${...}" that does not exactly
+// match ${PORT} or ${AGENT_ENV:NAME} (non-empty NAME), but whose inner text,
+// upper-cased, STARTS WITH "PORT" or "AGENT_ENV" -- is a hard error naming
+// the malformed token, on the same reasoning as the missing-variable error:
 // silently launching with that text as a literal argument produces a
 // confusing downstream auth or bind failure instead of an honest refusal
-// here. Arbitrary OTHER "${...}" text -- a model server's own templating
-// syntax -- still passes through untouched; this function owns only these
-// two tokens.
+// here. This catches typos such as ${AGENT_ENVV:...}, ${PORTX}, ${PORT_1},
+// the lowercase ${port}, and the empty-name ${AGENT_ENV:}.
+//
+// The check is a PREFIX match on the classification, not a substring
+// (Contains) check -- and it runs during a SINGLE pass over the ORIGINAL
+// text, never over the substituted result. Both properties are load-bearing
+// fixes from a prior round that got this rule wrong:
+//
+//   - Prefix instead of Contains: a substring check refuses every
+//     legitimate token that merely CONTAINS "PORT" or "AGENT_ENV" anywhere
+//     -- ${TRANSPORT}, ${EXPORT_DIR}, ${REPORT_INTERVAL}, ${IMPORT_PATH},
+//     ${SUPPORT_EMAIL}, ${MY_AGENT_ENVIRONMENT} -- breaking the arbitrary
+//     "${...}" pass-through a model server's own templating syntax relies
+//     on. A prefix match accepts all of these while still catching every
+//     near-miss listed above, because a near-miss is always a malformed
+//     PORT or AGENT_ENV token, never an unrelated word that happens to
+//     embed one.
+//   - Original text, not substituted result: classifying post-substitution
+//     text means a RESOLVED secret whose value happens to contain a
+//     "${...}"-shaped substring (plausible for a JSON blob or connection
+//     string) gets misclassified as a near-miss and that literal fragment
+//     of the secret is echoed into the error message -- exactly what this
+//     file exists to prevent. Classifying each match during the single
+//     ReplaceAllStringFunc pass over the ORIGINAL argument/env-value text
+//     means resolved values are never re-scanned at all.
+//
+// Accepted, deliberate consequence: a hypothetical ${PORT_RANGE} intended as
+// a model server's OWN templating token is refused rather than passed
+// through. In this function's context that shape is far more likely a typo
+// of ${PORT} than genuine unrelated templating, so failing loudly is the
+// right trade -- unlike, say, ${TRANSPORT}, nothing plausible starts with
+// "PORT" or "AGENT_ENV" except an attempt at one of these two placeholders.
+//
+// Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
+// still passes through untouched; this function owns only these two tokens.
 func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args []string, env []string, err error) {
 	expand := func(s string) (string, error) {
 		var firstErr error
@@ -174,26 +187,40 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 				return match
 			}
 			inner := match[2 : len(match)-1] // strip "${" and "}"
+
 			if inner == "PORT" {
 				return strconv.Itoa(port)
 			}
-			name := strings.TrimPrefix(inner, "AGENT_ENV:")
-			if strings.HasPrefix(name, agentOwnEnvPrefix) {
-				firstErr = fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
+
+			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
+				if strings.HasPrefix(name, agentOwnEnvPrefix) {
+					firstErr = fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
+					return match
+				}
+				val := getenv(name)
+				if val == "" {
+					firstErr = fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
+					return match
+				}
+				return val
+			}
+
+			// Not a valid ${PORT} or ${AGENT_ENV:NAME}. Near-miss iff the
+			// upper-cased inner text STARTS WITH one of the two supported
+			// prefixes -- this also catches the empty-name ${AGENT_ENV:}
+			// falling through from the case above. Anything else (including
+			// text that merely CONTAINS "PORT" or "AGENT_ENV") passes
+			// through untouched -- see the doc comment above for why this
+			// must be a prefix match, not Contains.
+			upper := strings.ToUpper(inner)
+			if strings.HasPrefix(upper, "PORT") || strings.HasPrefix(upper, "AGENT_ENV") {
+				firstErr = fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", match)
 				return match
 			}
-			val := getenv(name)
-			if val == "" {
-				firstErr = fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
-				return match
-			}
-			return val
+			return match
 		})
 		if firstErr != nil {
 			return "", firstErr
-		}
-		if m := nearMissPlaceholder(result); m != "" {
-			return "", fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", m)
 		}
 		return result, nil
 	}

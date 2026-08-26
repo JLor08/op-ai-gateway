@@ -220,6 +220,34 @@ func TestExpandPlaceholdersAgentEnvRefusesOwnNamespace(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersAgentEnvRefusesOwnNamespaceViaEnv is the
+// fix-round-2 R2-3 bundled minor: the round-1 CRITICAL refusal
+// (TestExpandPlaceholdersAgentEnvRefusesOwnNamespace above) was exercised
+// only through spec.Args. Both spec.Args and spec.Env values run through
+// the same `expand` closure today, so there is no live gap -- but nothing
+// would catch a future refactor that duplicated the closure and let the
+// spec.Env path diverge. This pins the same refusal through spec.Env.
+func TestExpandPlaceholdersAgentEnvRefusesOwnNamespaceViaEnv(t *testing.T) {
+	spec := Spec{Env: map[string]string{"TOKEN": "${AGENT_ENV:OP_AGENT_TOKEN}"}}
+	getenv := func(k string) string {
+		if k == "OP_AGENT_TOKEN" {
+			return "gateway-bearer-secret"
+		}
+		return ""
+	}
+
+	_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err == nil {
+		t.Fatal("ExpandPlaceholders with spec.Env referencing ${AGENT_ENV:OP_AGENT_TOKEN} should refuse, not resolve the agent's own token")
+	}
+	if !strings.Contains(err.Error(), "OP_AGENT_TOKEN") {
+		t.Errorf("error = %q, want it to name the refused variable OP_AGENT_TOKEN", err.Error())
+	}
+	if strings.Contains(err.Error(), "gateway-bearer-secret") {
+		t.Fatalf("error leaked the secret value: %q", err.Error())
+	}
+}
+
 // TestExpandPlaceholdersAgentEnvOrdinaryNameStillResolves proves the
 // namespace refusal is scoped to OP_AGENT_* -- an ordinary secret name
 // unrelated to the agent's own settings still resolves normally.
@@ -408,12 +436,14 @@ func TestExpandPlaceholdersOmitsAbsentBase(t *testing.T) {
 	}
 }
 
-// TestExpandPlaceholdersNearMissErrors pins the judgment call: a typo'd
-// PORT/AGENT_ENV placeholder is not silently passed through like arbitrary
-// templating syntax (a model server's own "${...}" syntax is a real
-// possibility this function must not break) -- it is a confusing downstream
-// auth or bind failure waiting to happen, so it errors up front naming the
-// malformed token instead.
+// TestExpandPlaceholdersNearMissErrors pins the corrected near-miss rule
+// from the Task 13 fix-round-2 findings: classification happens per
+// placeholder, on the ORIGINAL text, using a PREFIX match on the
+// upper-cased inner token -- never substring containment. This is the
+// "near-miss" half of the worked case table; the pass-through half is
+// TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough below. Each row
+// here would have been (wrongly) accepted or (wrongly) rejected by the
+// round-1 containment-based scan.
 func TestExpandPlaceholdersNearMissErrors(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -421,6 +451,7 @@ func TestExpandPlaceholdersNearMissErrors(t *testing.T) {
 	}{
 		{"typo'd AGENT_ENV prefix", "${AGENT_ENVV:HF_TOKEN}"},
 		{"typo'd PORT suffix", "${PORTX}"},
+		{"PORT with trailing suffix", "${PORT_1}"},
 		{"lowercase port", "${port}"},
 		{"empty AGENT_ENV name", "${AGENT_ENV:}"},
 	}
@@ -440,16 +471,68 @@ func TestExpandPlaceholdersNearMissErrors(t *testing.T) {
 // TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough proves arbitrary
 // "${...}" text unrelated to PORT/AGENT_ENV still passes through untouched --
 // ExpandPlaceholders only owns those two tokens, and a model server's own
-// templating syntax is a real possibility.
+// templating syntax is a real possibility. Every one of these MERELY
+// CONTAINS "PORT" or "AGENT_ENV" as a substring (round 1's bug: it used
+// strings.Contains and refused all of these); the corrected rule only
+// refuses a token whose upper-cased inner text STARTS WITH one of the two
+// prefixes, so none of these should error.
 func TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough(t *testing.T) {
-	spec := Spec{Args: []string{"${FOO}"}}
-	getenv := func(string) string { return "" }
+	cases := []string{
+		"${FOO}",
+		"${TRANSPORT}",
+		"${EXPORT_DIR}",
+		"${REPORT_INTERVAL}",
+		"${IMPORT_PATH}",
+		"${SUPPORT_EMAIL}",
+		"${MY_AGENT_ENVIRONMENT}",
+	}
+	for _, value := range cases {
+		t.Run(value, func(t *testing.T) {
+			spec := Spec{Args: []string{value}}
+			getenv := func(string) string { return "" }
+
+			args, _, err := ExpandPlaceholders(spec, 8080, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got error: %v", value, err)
+			}
+			if want := []string{value}; !reflect.DeepEqual(args, want) {
+				t.Errorf("args = %#v, want %#v", args, want)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersNearMissScanIgnoresResolvedSecretValue pins the
+// fix-round-2 fix for R2-2: the near-miss classification runs over the
+// ORIGINAL text during a single substitution pass, never over the
+// substituted RESULT. So a secret whose resolved value happens to contain a
+// "${...}"-shaped substring that would itself look like a near-miss (e.g. a
+// connection string or JSON blob carrying a stray "${AGENT_ENV:...}" or
+// "${PORTX}" fragment) must NOT be rescanned, must NOT produce an error, and
+// the secret must therefore never be echoed into any error message. getenv
+// fails the test outright if ExpandPlaceholders ever asks it to resolve
+// anything other than the one variable the spec actually referenced --
+// proving no second scan/resolve pass ever happens over resolved output.
+func TestExpandPlaceholdersNearMissScanIgnoresResolvedSecretValue(t *testing.T) {
+	const secretValue = `postgres://user:pass@host/db?token=${AGENT_ENV:LOOKS_LIKE_A_NAME}&mode=${PORTX}`
+	spec := Spec{Args: []string{"${AGENT_ENV:CONN_STRING}"}}
+	getenv := func(k string) string {
+		switch k {
+		case "CONN_STRING":
+			return secretValue
+		case "PATH", "HOME":
+			return "" // ExpandPlaceholders always probes these for the base env
+		default:
+			t.Fatalf("getenv called with unexpected key %q -- the near-miss scan must not rescan/re-resolve the substituted result", k)
+			return ""
+		}
+	}
 
 	args, _, err := ExpandPlaceholders(spec, 8080, getenv)
 	if err != nil {
-		t.Fatalf("ExpandPlaceholders(${FOO}) should pass through untouched, got error: %v", err)
+		t.Fatalf("ExpandPlaceholders should not error just because a RESOLVED secret value contains near-miss-shaped text: %v", err)
 	}
-	if want := []string{"${FOO}"}; !reflect.DeepEqual(args, want) {
+	if want := []string{secretValue}; !reflect.DeepEqual(args, want) {
 		t.Errorf("args = %#v, want %#v", args, want)
 	}
 }
