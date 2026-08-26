@@ -39,6 +39,15 @@ memory + a real PostgreSQL container):
 Gateway phase in progress:
 - Task 5 — portal runtime-spec CRUD on mappings (`4bbd256`)
 - Task 6 — co-residency matrix, GPU budgets, managed-runtime-only, warnings (`f9a89af`)
+- Task 7 — agent endpoints: `GET /api/agent/v1/features` +
+  `GET /api/agent/v1/runtime-config` (ETag), portal `AgentRuntimeConfig`
+  assembly (`dc1c284`). Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-7-report.md`
+  (carries a full sample JSON document for Tasks 16/17 to code against).
+  One documented design call: a server with no `server_agent` application
+  returns the FULLY empty document (router_listen 0, max_processes 0, empty
+  gpu_budgets too) rather than a partially-populated one — revisit in Task 24
+  if a later task needs GPU budgets visible before the application exists.
 
 Durable corrections discovered during execution (fold into docs/architecture in
 Task 24):
@@ -58,6 +67,7 @@ Task 24):
 
 ## Next planned step
 
-1. Continue the plan at Task 7 (agent endpoints: features + runtime-config ETag).
-2. Remaining: Tasks 7-10 (gateway), 11-18 (agent), 19-22 (portal UI),
+1. Continue the plan at Task 8 (WS runtime_config push + feature-gated
+   delivery).
+2. Remaining: Tasks 8-10 (gateway), 11-18 (agent), 19-22 (portal UI),
    23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
