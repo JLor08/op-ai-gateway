@@ -184,7 +184,7 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 			}
 			val := getenv(name)
 			if val == "" {
-				firstErr = fmt.Errorf("runtime: required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
+				firstErr = fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
 				return match
 			}
 			return val

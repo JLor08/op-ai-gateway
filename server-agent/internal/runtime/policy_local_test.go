@@ -5,7 +5,6 @@ package runtime
 
 import (
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -259,6 +258,26 @@ func TestExpandPlaceholdersMissingAgentEnvErrors(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersMissingAgentEnvErrorHasNoDoubledPrefix pins the
+// exact wrapped error text for a missing AGENT_ENV var in an arg: the
+// "runtime: " prefix must appear exactly once. expand()'s own errors carry
+// no prefix precisely so that the call-site wrap ("runtime: expand arg %d:
+// %w") is the only place it is added -- an inner error that also started
+// with "runtime: " would double it (e.g. "runtime: expand arg 0: runtime:
+// required ...").
+func TestExpandPlaceholdersMissingAgentEnvErrorHasNoDoubledPrefix(t *testing.T) {
+	spec := Spec{Args: []string{"${AGENT_ENV:HF_TOKEN}"}}
+	getenv := func(string) string { return "" }
+
+	_, _, err := ExpandPlaceholders(spec, 8080, getenv)
+	if err == nil {
+		t.Fatal("ExpandPlaceholders with an unset AGENT_ENV var should error")
+	}
+	if got := strings.Count(err.Error(), "runtime:"); got != 1 {
+		t.Errorf("error = %q, want exactly one %q prefix, got %d", err.Error(), "runtime:", got)
+	}
+}
+
 // TestExpandPlaceholdersMissingAgentEnvInEnvValueErrors proves the same
 // missing-variable check applies to spec.Env values, not just spec.Args.
 func TestExpandPlaceholdersMissingAgentEnvInEnvValueErrors(t *testing.T) {
@@ -271,6 +290,9 @@ func TestExpandPlaceholdersMissingAgentEnvInEnvValueErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "HF_TOKEN") {
 		t.Errorf("error = %q, want it to name the missing variable HF_TOKEN", err.Error())
+	}
+	if got := strings.Count(err.Error(), "runtime:"); got != 1 {
+		t.Errorf("error = %q, want exactly one %q prefix (no doubling from expand's env wrap), got %d", err.Error(), "runtime:", got)
 	}
 }
 
@@ -467,27 +489,24 @@ func TestExpandPlaceholdersArgsNeverNil(t *testing.T) {
 }
 
 // TestExpandPlaceholdersEnvSortedDeterministic proves the spec.Env portion of
-// the result is emitted in a deterministic (sorted-by-key) order, so two
-// calls over the same map never differ just because Go's map iteration order
-// is randomized.
+// the result is emitted in a deterministic sorted-BY-KEY order -- not merely
+// the same SET of entries across calls. Sorting both sides before comparing
+// (as an earlier version of this test did) only proves set equality: it
+// would pass just as well against a randomized-order implementation, since
+// sorting erases the very order it claims to pin. Comparing the raw,
+// unsorted env slice against a fixed expected order catches that.
 func TestExpandPlaceholdersEnvSortedDeterministic(t *testing.T) {
 	spec := Spec{Env: map[string]string{"ZKEY": "z", "AKEY": "a", "MKEY": "m"}}
 	getenv := func(string) string { return "" }
 
-	var last []string
+	want := []string{"AKEY=a", "MKEY=m", "ZKEY=z"}
 	for i := 0; i < 5; i++ {
 		_, env, err := ExpandPlaceholders(spec, 80, getenv)
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
-		sorted := append([]string(nil), env...)
-		sort.Strings(sorted)
-		if i == 0 {
-			last = sorted
-			continue
-		}
-		if !reflect.DeepEqual(sorted, last) {
-			t.Fatalf("iteration %d produced a different env set: %#v vs %#v", i, sorted, last)
+		if !reflect.DeepEqual(env, want) {
+			t.Fatalf("iteration %d env = %#v, want %#v (sorted-by-key order)", i, env, want)
 		}
 	}
 }
