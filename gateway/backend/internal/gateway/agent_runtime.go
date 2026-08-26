@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/portal"
+	"time"
 )
 
 // handleAgentRuntimeConfig serves ONE ServerAgent the desired agent-managed
@@ -85,6 +86,18 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// pushRuntimeConfigTimeout bounds the s.Portal.AgentRuntimeConfig store read
+// PushRuntimeConfig performs -- a package-level var (not const), following
+// the established shrink-in-tests pattern (chat_runs.go's
+// runCheckpointInterval) so a test can drive it down to milliseconds without
+// sleeping out a real multi-second deadline. 5s matches capture.go's
+// persistCapture timeout for its SaveCapture call, not model_warmer.go's 60s
+// warmCallTimeout: AgentRuntimeConfig is a bounded local store-read assembly
+// (a handful of RuntimeStore reads), the same shape and cost class as
+// persisting one capture row, not a network round trip to an upstream
+// inference server loading a model (what warmCallTimeout's 60s budgets for).
+var pushRuntimeConfigTimeout = 5 * time.Second
+
 // PushRuntimeConfig is the gateway half of the WS push path (agent-runtime-
 // manager design spec §10, Phase 2 Task 8): a best-effort, feature-gated
 // push of serverID's CURRENT runtime-config document -- the SAME
@@ -105,15 +118,26 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 //
 // Runs entirely in a goroutine: the intended caller is the portal write-path
 // hook (portal.ServiceDeps.OnRuntimeConfigChanged / Service.
-// SetRuntimeConfigChangedHook, wired to this method in cmd/gateway/main.go
-// via portal.UnwrapService), whose contract is "synchronous but guaranteed
-// fast" because it fires from inside a runtime-spec CRUD write that still
-// holds its own serializing lock -- the store read (s.Portal.
+// SetRuntimeConfigChangedHook), wired to this method in
+// cmd/gateway/main.go's buildGatewayServer via the
+// gateway.ServerDeps.SetRuntimeConfigChangedHook handoff (buildRuntime hands
+// portalService's own setter forward through ServerDeps, since portalService
+// is constructed before this Server is, and the setter needs a bound
+// PushRuntimeConfig -- see that ServerDeps field's doc for the full
+// construction-order rationale). The hook's contract is "synchronous but
+// guaranteed fast" because it fires from inside a runtime-spec CRUD write
+// that still holds its own serializing lock -- the store read (s.Portal.
 // AgentRuntimeConfig) and JSON marshal this method performs are both too
-// slow to do inline there. Nil-safe throughout (a nil s.Portal,
-// s.AgentFeatures, s.RuntimeStatus, or s.AgentStreams all degrade to
-// "nothing pushed," never a panic), matching every other best-effort
-// notifier in this package.
+// slow to do inline there.
+//
+// The store read is bounded by pushRuntimeConfigTimeout (never
+// context.Background() unbounded): one goroutine is spawned per portal
+// write, so an unbounded call stuck on lock contention or a wedged query
+// would accumulate goroutines without limit under sustained write pressure.
+//
+// Nil-safe throughout (a nil s.Portal, s.AgentFeatures, s.RuntimeStatus, or
+// s.AgentStreams all degrade to "nothing pushed," never a panic), matching
+// every other best-effort notifier in this package.
 func (s *Server) PushRuntimeConfig(serverID string) {
 	go func() {
 		if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) {
@@ -122,7 +146,9 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 		if s.Portal == nil {
 			return
 		}
-		dto, err := s.Portal.AgentRuntimeConfig(context.Background(), serverID)
+		ctx, cancel := context.WithTimeout(context.Background(), pushRuntimeConfigTimeout)
+		defer cancel()
+		dto, err := s.Portal.AgentRuntimeConfig(ctx, serverID)
 		if err != nil {
 			slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
 			return

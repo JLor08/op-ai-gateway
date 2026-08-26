@@ -156,3 +156,57 @@ func (f *blockingPortalAgentRuntimeConfig) AgentRuntimeConfig(ctx context.Contex
 	<-f.release
 	return f.fakePortalAgentRuntimeConfig.AgentRuntimeConfig(ctx, serverID)
 }
+
+// ctxDoneSignalingPortal's AgentRuntimeConfig blocks until its ctx argument
+// is Done, then closes returned. It never returns on its own -- only ctx
+// expiring (or cancellation) unblocks it -- so it proves whatever timeout
+// PushRuntimeConfig applies to the context it passes in, rather than proving
+// anything about the fake's own behavior.
+type ctxDoneSignalingPortal struct {
+	fakePortalAgentRuntimeConfig
+	returned chan struct{}
+}
+
+func (f *ctxDoneSignalingPortal) AgentRuntimeConfig(ctx context.Context, _ string) (portal.AgentRuntimeConfigDTO, error) {
+	<-ctx.Done()
+	close(f.returned)
+	return portal.AgentRuntimeConfigDTO{}, ctx.Err()
+}
+
+// TestPushRuntimeConfigBoundsThePortalReadWithATimeout is the Important-3
+// review fix's covering test: PushRuntimeConfig must never hand
+// s.Portal.AgentRuntimeConfig a context.Background() with no deadline --
+// one goroutine is spawned per portal write, so a stuck store read
+// (lock contention, a wedged query) would otherwise accumulate goroutines
+// without bound under sustained write pressure.
+//
+// pushRuntimeConfigTimeout is shrunk to milliseconds for the duration of
+// this test (the established chat_runs.go runCheckpointInterval
+// shrink-in-tests pattern, restored via defer) so this test does not need to
+// sleep out the real 5s production budget: if PushRuntimeConfig is bounding
+// the call correctly, ctxDoneSignalingPortal's ctx.Done() fires almost
+// immediately; if a regression reintroduced context.Background(), ctx.Done()
+// would never fire and this test would time out waiting for `returned`.
+func TestPushRuntimeConfigBoundsThePortalReadWithATimeout(t *testing.T) {
+	oldTimeout := pushRuntimeConfigTimeout
+	pushRuntimeConfigTimeout = 20 * time.Millisecond
+	defer func() { pushRuntimeConfigTimeout = oldTimeout }()
+
+	const serverID = "mock-host-qwen"
+	fake := &ctxDoneSignalingPortal{returned: make(chan struct{})}
+	srv := NewTestServer()
+	srv.Portal = fake
+	srv.AgentFeatures.Set(serverID, []string{"runtime_manager"})
+
+	srv.PushRuntimeConfig(serverID)
+
+	select {
+	case <-fake.returned:
+		// The context PushRuntimeConfig passed in reached Done on its own --
+		// proof it carries a deadline, not context.Background().
+	case <-time.After(2 * time.Second):
+		t.Fatal("s.Portal.AgentRuntimeConfig's context was never canceled within 2s of a 20ms " +
+			"pushRuntimeConfigTimeout -- PushRuntimeConfig must bound the call with " +
+			"context.WithTimeout, never a bare context.Background()")
+	}
+}
