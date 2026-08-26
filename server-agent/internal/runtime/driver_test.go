@@ -413,6 +413,48 @@ func TestDriverSyncFileModeSendsReportOnChange(t *testing.T) {
 	}
 }
 
+// TestResendReportRequiresActiveFeature pins fix round 1 review 2's finding:
+// ResendReport sits OUTSIDE Sync (internal/agent calls it from its
+// system-report ticker, not from a Sync cycle), so it must check Active()
+// itself rather than inheriting the gate Sync's own feature-active branch
+// gives sendReport for free. Without this, a file-mode agent whose gateway
+// has never negotiated runtime_manager would still POST its report on
+// every system-report tick -- exactly the data exposure and per-tick
+// gateway noise the negotiation gate exists to prevent. Fails against the
+// pre-fix driver.go (verified by hand: reverting the Active() check made
+// the inactive case observe count()==1, not 0).
+func TestResendReportRequiresActiveFeature(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime-config.json")
+	if err := os.WriteFile(path, []byte(minimalConfigJSON(0, "file-e1")), 0o600); err != nil {
+		t.Fatalf("write local config: %v", err)
+	}
+
+	// Inactive: the gateway has never negotiated runtime_manager (an older
+	// build, or one down/mid-rollout at every boot). ResendReport must post
+	// nothing, even though the local file is present and parses fine.
+	inactiveRep := &fakeReporter{}
+	dInactive := newDriver(&fakeManager{}, NewFileSource(path), newFeaturesServer(t, nil), inactiveRep, "")
+	dInactive.ResendReport(context.Background())
+	if got := inactiveRep.count(); got != 0 {
+		t.Fatalf("ResendReport posts while inactive = %d, want 0", got)
+	}
+
+	// Active: the SAME call, against a Driver that has actually negotiated
+	// the feature (a real Sync first, matching how main.go's Driver is
+	// always used), must post exactly once.
+	activeRep := &fakeReporter{}
+	dActive := newDriver(&fakeManager{}, NewFileSource(path), activeFeaturesClient(t), activeRep, "")
+	dActive.Sync(context.Background(), nil) // negotiates active, sets d.active
+	activeRep.mu.Lock()
+	activeRep.posts = nil // discard Sync's own send; this test isolates ResendReport's own gate
+	activeRep.mu.Unlock()
+	dActive.ResendReport(context.Background())
+	if got := activeRep.count(); got != 1 {
+		t.Fatalf("ResendReport posts while active = %d, want 1", got)
+	}
+}
+
 // TestDriverSyncRetriesRouterBindEveryActiveSync pins fix round 1's I1: a
 // failed router bind must not be stuck behind a single Warn log for the
 // rest of the process's life just because the config never changes again.

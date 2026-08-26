@@ -364,12 +364,29 @@ func (d *Driver) sendReport(ctx context.Context, cfg Config) {
 // system report itself already relies on (a WS agent resends it on
 // reconnect AND on that same ticker; the ticker is what covers POST). A
 // no-op when d.src is not a *FileSource (the report is a file-mode-only
-// concept) or there is no reporter to send it to. Does not take syncMu:
-// Source.Load and sendReport are each independently safe for concurrent
-// use, and at most this races an in-flight Sync into sending the report
-// bytes twice in quick succession, which is harmless (the report is
-// idempotent, last-write-wins on the gateway side).
+// concept), there is no reporter to send it to, or -- fix round 1 review 2
+// -- runtime_manager is not CURRENTLY negotiated active (Active()). Design
+// spec §10.2: the report is sent "only when the gateway declared
+// runtime_manager". Every other send path already has this gate for free
+// because sendReport is reached only from Sync's own feature-active
+// branch; ResendReport sits outside Sync entirely (it is called from
+// internal/agent's system-report ticker, not from a Sync cycle), so it
+// must check Active() itself rather than relying on a caller to remember
+// to -- the driver owns this invariant, not its callers. Without this, a
+// file-mode agent whose gateway has never negotiated the feature (an older
+// build, or one that is down/mid-rollout at every boot) would still POST
+// its runtime-config report on every system-report tick: exactly the data
+// exposure the negotiation gate exists to prevent, plus per-tick
+// error/404 noise against a gateway with no such endpoint.
+//
+// Does not take syncMu: Source.Load and sendReport are each independently
+// safe for concurrent use, and at most this races an in-flight Sync into
+// sending the report bytes twice in quick succession, which is harmless
+// (the report is idempotent, last-write-wins on the gateway side).
 func (d *Driver) ResendReport(ctx context.Context) {
+	if !d.Active() {
+		return
+	}
 	fs, ok := d.src.(*FileSource)
 	if !ok || d.reporter == nil {
 		return
