@@ -233,8 +233,29 @@ Agent phase in progress:
   path failed 7 table cases as expected, reverted after). Detail appended
   to the same task-12-report.md.
 
+- Task 13 — `server-agent/internal/runtime/policy_local.go`: the
+  agent-operator-controlled admission boundary. `LocalPolicy.Permit`
+  refuses every spec when `AllowedBinaries` is empty (spec decision 2 — an
+  unconfigured agent starts nothing), then matches `spec.Binary` exactly,
+  then checks `spec.WorkDir` containment against `AllowedDirs` via
+  `filepath.Clean` on both sides plus a separator-boundary comparison
+  (rejects both `../` traversal and the sibling-prefix case, e.g.
+  `/srv/models-evil` vs `/srv/models`). `ExpandPlaceholders` resolves
+  `${PORT}` and `${AGENT_ENV:NAME}` in args/env (a missing `AGENT_ENV`
+  variable is a hard error naming the variable, never an empty
+  substitution) and builds the child's env from scratch: only the
+  expanded spec env plus `PATH`/`HOME` from the agent's own environment
+  (only if present) — never the agent's full environment, which holds its
+  gateway bearer token and other models' secrets. `internal/config`
+  gained the five `OP_AGENT_RUNTIME_*` settings (`RuntimeSource`,
+  `RuntimeConfigPath`, `RuntimeAllowedBinaries`, `RuntimeAllowedDirs`,
+  `RuntimeCachePath`) on the existing tri-source pattern. No `archtest`
+  change needed — the new file is stdlib-only, and `internal/runtime`'s
+  allowlist entry was already `{}`. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-13-report.md`.
+
 ## Next planned step
 
-1. Continue the plan at Task 13.
-2. Remaining: 13-18 (agent), 19-22 (portal UI),
+1. Continue the plan at Task 14.
+2. Remaining: 14-18 (agent), 19-22 (portal UI),
    23 (e2e), 24 (docs + Sonar gate + working-file cleanup before the PR).
