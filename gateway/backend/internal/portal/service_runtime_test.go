@@ -5,10 +5,12 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1153,5 +1155,103 @@ func TestAgentRuntimeConfigUnknownServerIsEmptyNotError(t *testing.T) {
 	}
 	if dto.Specs == nil || len(dto.Specs) != 0 || dto.RouterListen != 0 {
 		t.Fatalf("dto = %#v, want the fully empty document", dto)
+	}
+}
+
+// TestAgentRuntimeConfigEnvNullNormalizedToEmptyObject pins the nil-vs-empty
+// wire-shape defect class (already caught twice on this branch, and fixed a
+// third time in agentRuntimeSpecDTO/runtimeSpecDTO/the gateway handler's
+// defensive loop as part of this test): a stored spec whose env column holds
+// the literal JSON "null" -- something PutRuntimeSpec itself can never
+// produce (it always marshals a non-nil map before storing), but a
+// plausible outcome of a direct store write or a future writer that
+// bypasses PutRuntimeSpec's normalization -- must still marshal as
+// "env":{} on the wire, never "env":null. Asserted on the marshaled JSON
+// BYTES, not the Go map, since the whole point is the wire shape a
+// JSON-strict agent parser sees.
+func TestAgentRuntimeConfigEnvNullNormalizedToEmptyObject(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	// Write directly at the store layer: PutRuntimeSpec always marshals a
+	// non-nil map for Env, so the literal "null" string can only be produced
+	// by bypassing it.
+	spec := routing.RuntimeSpec{
+		ID:        "rspec_" + compactRandomHex(16),
+		MappingID: mapping.ID,
+		Enabled:   true,
+		Binary:    "/usr/bin/x",
+		Args:      "[]",
+		Env:       "null",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := routeStore.UpsertRuntimeSpec(ctx, spec); err != nil {
+		t.Fatalf("seed spec with literal null env: %v", err)
+	}
+
+	dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if strings.Contains(string(raw), `"env":null`) {
+		t.Fatalf("wire body = %s, want \"env\":{} not \"env\":null", raw)
+	}
+	if !strings.Contains(string(raw), `"env":{}`) {
+		t.Fatalf("wire body = %s, want an explicit \"env\":{}", raw)
+	}
+}
+
+// TestGetRuntimeSpecEnvNullNormalizedToEmptyObject covers the sibling
+// portal-facing path (runtimeSpecDTO, Task 5) that has the identical
+// nil-vs-empty gap the review flagged: GetRuntimeSpec must never marshal
+// "env":null either.
+func TestGetRuntimeSpecEnvNullNormalizedToEmptyObject(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	spec := routing.RuntimeSpec{
+		ID:        "rspec_" + compactRandomHex(16),
+		MappingID: mapping.ID,
+		Enabled:   true,
+		Binary:    "/usr/bin/x",
+		Args:      "[]",
+		Env:       "null",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := routeStore.UpsertRuntimeSpec(ctx, spec); err != nil {
+		t.Fatalf("seed spec with literal null env: %v", err)
+	}
+
+	dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if strings.Contains(string(raw), `"env":null`) {
+		t.Fatalf("wire body = %s, want \"env\":{} not \"env\":null", raw)
+	}
+	if !strings.Contains(string(raw), `"env":{}`) {
+		t.Fatalf("wire body = %s, want an explicit \"env\":{}", raw)
 	}
 }

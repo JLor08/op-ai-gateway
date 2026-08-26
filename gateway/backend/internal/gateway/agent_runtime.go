@@ -66,6 +66,9 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 		if dto.Specs[i].Args == nil {
 			dto.Specs[i].Args = []string{}
 		}
+		if dto.Specs[i].Env == nil {
+			dto.Specs[i].Env = map[string]string{}
+		}
 		if dto.Specs[i].GPUs == nil {
 			dto.Specs[i].GPUs = []portal.AgentRuntimeSpecGPUDTO{}
 		}

@@ -368,6 +368,9 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 	if err := json.Unmarshal([]byte(spec.Env), &env); err != nil {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
 	}
+	if env == nil {
+		env = map[string]string{}
+	}
 	gpuDTOs := make([]RuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
 		gpuDTOs = append(gpuDTOs, RuntimeSpecGPUDTO{
@@ -864,6 +867,9 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	env := map[string]string{}
 	if err := json.Unmarshal([]byte(spec.Env), &env); err != nil {
 		return AgentRuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
+	}
+	if env == nil {
+		env = map[string]string{}
 	}
 	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
