@@ -1255,3 +1255,122 @@ func TestGetRuntimeSpecEnvNullNormalizedToEmptyObject(t *testing.T) {
 		t.Fatalf("wire body = %s, want an explicit \"env\":{}", raw)
 	}
 }
+
+// --- Task 9: ServerRuntimeReportView -----------------------------------------
+
+// TestServerRuntimeReportViewAbsent proves the hardware-panel model: a
+// server with no runtime report EVER stored returns Available:false (not an
+// error), with a non-nil-but-empty AgentFeatures even though no telemetry
+// has been reported either.
+func TestServerRuntimeReportViewAbsent(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.ServerRuntimeReportView(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("ServerRuntimeReportView: %v", err)
+	}
+	if dto.Available {
+		t.Fatalf("dto = %#v, want Available=false", dto)
+	}
+	if dto.CollectedAt != "" || dto.UpdatedAt != "" || len(dto.Report) != 0 {
+		t.Fatalf("absent report must leave the report fields empty: %#v", dto)
+	}
+	if dto.AgentVersion != "" {
+		t.Fatalf("agent_version = %q, want empty (no telemetry)", dto.AgentVersion)
+	}
+	if dto.AgentFeatures == nil || len(dto.AgentFeatures) != 0 {
+		t.Fatalf("agent_features = %#v, want non-nil empty", dto.AgentFeatures)
+	}
+}
+
+// TestServerRuntimeReportViewFound proves a stored report is surfaced
+// verbatim (this method never parses/rewrites Report -- that is the ingest
+// layer's job) alongside agent_version/agent_features parsed from the
+// server's latest telemetry row, independent of the report itself.
+func TestServerRuntimeReportViewFound(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{
+		ServerID: server.ID, ReportedAt: now, AgentVersion: "2.0.1",
+		Capabilities: `{"features":["runtime_manager"]}`, ProviderHealth: "{}", RawSummary: "{}", UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	reportJSON := `{"source":"file","collected_at":"2026-07-11T12:00:00Z","config":{"specs":[]}}`
+	if err := routeStore.UpsertServerRuntimeReport(ctx, routing.ServerRuntimeReport{
+		ServerID: server.ID, CollectedAt: now, ReportJSON: reportJSON, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertServerRuntimeReport: %v", err)
+	}
+
+	dto, err := svc.ServerRuntimeReportView(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("ServerRuntimeReportView: %v", err)
+	}
+	if !dto.Available || dto.CollectedAt == "" || dto.UpdatedAt == "" {
+		t.Fatalf("dto = %#v, want Available with timestamps", dto)
+	}
+	if string(dto.Report) != reportJSON {
+		t.Fatalf("report = %s, want the stored blob verbatim: %s", dto.Report, reportJSON)
+	}
+	if dto.AgentVersion != "2.0.1" {
+		t.Fatalf("agent_version = %q, want 2.0.1", dto.AgentVersion)
+	}
+	if len(dto.AgentFeatures) != 1 || dto.AgentFeatures[0] != "runtime_manager" {
+		t.Fatalf("agent_features = %#v", dto.AgentFeatures)
+	}
+}
+
+// TestServerRuntimeReportViewMalformedCapabilitiesYieldsEmptyFeatures proves
+// a garbled/forward-incompatible telemetry capabilities blob never rejects
+// the whole read -- it degrades to an empty (non-nil) feature list, the same
+// tolerant-parse discipline the gateway ingest layer's parseAgentCapabilities
+// uses.
+func TestServerRuntimeReportViewMalformedCapabilitiesYieldsEmptyFeatures(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{
+		ServerID: server.ID, ReportedAt: now, AgentVersion: "1.0.0",
+		Capabilities: `"not an object"`, ProviderHealth: "{}", RawSummary: "{}", UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+
+	dto, err := svc.ServerRuntimeReportView(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("ServerRuntimeReportView: %v", err)
+	}
+	if dto.AgentVersion != "1.0.0" {
+		t.Fatalf("agent_version = %q, want 1.0.0 (unaffected by the malformed capabilities)", dto.AgentVersion)
+	}
+	if dto.AgentFeatures == nil || len(dto.AgentFeatures) != 0 {
+		t.Fatalf("agent_features = %#v, want non-nil empty on malformed capabilities", dto.AgentFeatures)
+	}
+}
+
+// TestServerRuntimeReportViewForeignUserForbidden proves authorizeServer
+// gates this read like every other server-scoped one: a non-owner gets
+// ErrServerNotFound (404-no-leak upstream), never the report contents.
+func TestServerRuntimeReportViewForeignUserForbidden(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	if err := routeStore.UpsertServerRuntimeReport(ctx, routing.ServerRuntimeReport{
+		ServerID: server.ID, CollectedAt: now, ReportJSON: `{}`, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertServerRuntimeReport: %v", err)
+	}
+
+	if _, err := svc.ServerRuntimeReportView(ctx, otherToken(), server.ID); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("err = %v, want ErrServerNotFound", err)
+	}
+}

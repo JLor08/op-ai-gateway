@@ -936,3 +936,84 @@ func agentRuntimeConfigETag(dto AgentRuntimeConfigDTO) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
+
+// --- Task 9: file-mode runtime report view ----------------------------------
+
+// ServerRuntimeReportViewDTO is the GET /api/portal/servers/{id}/runtime/report
+// body: the operator-facing, read-only view of a file-mode agent's latest
+// reported runtime configuration (server_runtime_reports) -- the same
+// available/collected_at/report shape as the hardware panel (hardwareDTO in
+// the gateway package). Report is the gateway ingest layer's already
+// sanitized+redacted canonical blob, passed through opaquely (this method
+// never parses it). AgentVersion/AgentFeatures are read from the server's
+// LATEST telemetry row regardless of whether a runtime report has ever been
+// stored, so a later portal task can render a feature-mismatch banner
+// without a new endpoint.
+type ServerRuntimeReportViewDTO struct {
+	Available     bool            `json:"available"`
+	CollectedAt   string          `json:"collected_at,omitempty"`
+	UpdatedAt     string          `json:"updated_at,omitempty"`
+	Report        json.RawMessage `json:"report,omitempty"`
+	AgentVersion  string          `json:"agent_version"`
+	AgentFeatures []string        `json:"agent_features"`
+}
+
+// ServerRuntimeReportView returns serverID's latest file-mode runtime report
+// (Available:false when none has ever been stored -- not an error, mirroring
+// ServerHardware's absent-read contract) plus agent_version/agent_features.
+// authorizeServer gates the whole read (404-no-leak, same collapse as every
+// other server-scoped portal read).
+func (s *Service) ServerRuntimeReportView(ctx context.Context, principal auth.Token, serverID string) (ServerRuntimeReportViewDTO, error) {
+	server, err := s.authorizeServer(ctx, principal, serverID)
+	if err != nil {
+		return ServerRuntimeReportViewDTO{}, err
+	}
+	dto := ServerRuntimeReportViewDTO{AgentFeatures: []string{}}
+	if telemetry, ok, err := s.routes.TelemetryByServer(ctx, server.ID); err != nil {
+		return ServerRuntimeReportViewDTO{}, err
+	} else if ok {
+		dto.AgentVersion = telemetry.AgentVersion
+		dto.AgentFeatures = parseRuntimeReportAgentFeatures(telemetry.Capabilities)
+	}
+	report, ok, err := s.routes.ServerRuntimeReportByServer(ctx, server.ID)
+	if err != nil {
+		return ServerRuntimeReportViewDTO{}, err
+	}
+	if !ok {
+		return dto, nil
+	}
+	dto.Available = true
+	dto.CollectedAt = report.CollectedAt.UTC().Format(time.RFC3339)
+	dto.UpdatedAt = report.UpdatedAt.UTC().Format(time.RFC3339)
+	if report.ReportJSON == "" {
+		dto.Report = json.RawMessage("null")
+	} else {
+		dto.Report = json.RawMessage(report.ReportJSON)
+	}
+	return dto, nil
+}
+
+// runtimeReportAgentCapabilities is the tolerant subset of a server's latest
+// telemetry capabilities object this method understands -- mirrors the
+// gateway ingest layer's agentCapabilitiesReport (agent_ingest.go), kept as a
+// SEPARATE local copy rather than an import: portal must not depend on the
+// gateway package.
+type runtimeReportAgentCapabilities struct {
+	Features []string `json:"features"`
+}
+
+// parseRuntimeReportAgentFeatures tolerantly extracts the declared feature
+// list from a server's stored telemetry capabilities JSON. Absent, empty, or
+// malformed input all yield a non-nil empty slice -- never an error and
+// never a nil slice (a collection-shaped field must never serialize as JSON
+// null).
+func parseRuntimeReportAgentFeatures(raw string) []string {
+	if raw == "" {
+		return []string{}
+	}
+	var caps runtimeReportAgentCapabilities
+	if err := json.Unmarshal([]byte(raw), &caps); err != nil || caps.Features == nil {
+		return []string{}
+	}
+	return caps.Features
+}

@@ -83,6 +83,18 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServerNotFound, msgServerNotFound, ""))
 		return
 	}
+	if len(parts) == 3 && parts[1] == "runtime" && parts[0] != "" {
+		if parts[2] == "events" {
+			s.handleRuntimeEvents(w, r, token, parts[0])
+			return
+		}
+		if parts[2] == "report" {
+			s.handleRuntimeReportView(w, r, token, parts[0])
+			return
+		}
+		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServerNotFound, msgServerNotFound, ""))
+		return
+	}
 	if len(parts) == 2 && parts[1] == "availability" && parts[0] != "" {
 		s.handleServerAvailability(w, r, token, parts[0])
 		return

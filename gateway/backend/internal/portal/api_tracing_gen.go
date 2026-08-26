@@ -1738,6 +1738,18 @@ func (_d *APIWithTracing) ServerPerfHistory(ctx context.Context, t1 auth.Token, 
 	return _d.API.ServerPerfHistory(ctx, t1, s1, d1)
 }
 
+func (_d *APIWithTracing) ServerRuntimeReportView(ctx context.Context, t1 auth.Token, s1 string) (s2 ServerRuntimeReportViewDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServerRuntimeReportView")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServerRuntimeReportView(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminGroupCandidateDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServiceAdminGroupCandidates")
 	defer span.End()
