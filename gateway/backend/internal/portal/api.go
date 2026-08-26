@@ -64,6 +64,7 @@ type API interface {
 	DeleteModelGroup(context.Context, auth.Token, string) error
 	DeleteProject(context.Context, auth.Token, string) error
 	DeleteResourceGroup(context.Context, auth.Token, string) error
+	DeleteRuntimeSpec(context.Context, auth.Token, string) error
 	DeleteServer(context.Context, auth.Token, string, bool) (bool, error)
 	DeleteService(context.Context, auth.Token, string) error
 	DeleteServiceToken(context.Context, auth.Token, string, string) error
@@ -87,6 +88,7 @@ type API interface {
 	GetChat(context.Context, auth.Token, string) (ChatDTO, error)
 	GetModelGroup(context.Context, auth.Token, string) (ModelGroupDTO, error)
 	GetResourceGroup(context.Context, auth.Token, string) (ResourceGroupDTO, error)
+	GetRuntimeSpec(context.Context, auth.Token, string) (RuntimeSpecDTO, error)
 	GetServer(context.Context, auth.Token, string) (ServerDTO, error)
 	GetService(context.Context, auth.Token, string) (ServiceDTO, error)
 	GroupMemberCandidates(context.Context, auth.Token, string) ([]UserRefDTO, error)
@@ -133,6 +135,7 @@ type API interface {
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView
+	PutRuntimeSpec(context.Context, auth.Token, string, PutRuntimeSpecRequest) (RuntimeSpecDTO, error)
 	ReassignGroupsOwnedBy(context.Context, auth.Token, string) error
 	ReconcileCertificates(context.Context)
 	ReconcileGatewayPeer(context.Context) (string, bool, error)

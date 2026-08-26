@@ -394,6 +394,18 @@ type ServiceDeps struct {
 	// transaction publishes a new public root bundle. It must be non-blocking;
 	// the periodic agent refresh is the delivery backstop.
 	OnCABundleChanged func(fingerprint string)
+	// OnRuntimeConfigChanged, when set, is invoked (best-effort) after a
+	// successful agent-runtime-spec CRUD write (Service.PutRuntimeSpec /
+	// DeleteRuntimeSpec) with the AFFECTED server's id, so the caller can
+	// push that server's current runtime config to its connected
+	// ServerAgent instead of waiting for the agent's next poll. Nil = no
+	// push (a later poll/reconnect is the backstop). Also settable AFTER
+	// construction via Service.SetRuntimeConfigChangedHook — see that
+	// method's doc for why: cmd/gateway builds the gateway Server (which
+	// owns the real push) AFTER the portal Service, so this field alone
+	// cannot carry it for the production wiring; ServiceDeps still exists
+	// for tests that want the hook from construction.
+	OnRuntimeConfigChanged func(serverID string)
 	// ACMEChallenges is the HTTP-01 token store the ACME issuer publishes
 	// key authorizations into (the gateway's /.well-known/acme-challenge/
 	// handler serves from the same instance). nil = the acme issuer mode cannot
@@ -577,9 +589,13 @@ type Service struct {
 	// AgentPresenceTimeoutSeconds when the KV is unset/invalid.
 	agentPresenceTimeoutDefault int
 	settingsVolatile            bool
-	clock                       func() time.Time
-	secretGenerator             func() (string, error)
-	idGenerator                 func() string
+	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
+	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
+	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
+	runtimeChanged  func(serverID string)
+	clock           func() time.Time
+	secretGenerator func() (string, error)
+	idGenerator     func() string
 	// themes is the loaded external-theme registry (see ServiceDeps.Themes).
 	// Always non-nil after NewService -- a nil deps.Themes is defaulted to an
 	// empty *theme.Registry so every reader can call its methods unguarded.
@@ -679,6 +695,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentTLSSeparateDefault:     deps.AgentTLSSeparateDefault,
 		agentPresenceTimeoutDefault: agentPresenceDefault,
 		settingsVolatile:            deps.SettingsVolatile,
+		runtimeChanged:              deps.OnRuntimeConfigChanged,
 		clock:                       clock,
 		secretGenerator:             secretGenerator,
 		idGenerator:                 idGenerator,
@@ -687,6 +704,17 @@ func NewService(deps ServiceDeps) *Service {
 	// Bound after construction so the method value carries the finished Service.
 	svc.cert.issuer = svc.issueCertificate
 	return svc
+}
+
+// SetRuntimeConfigChangedHook sets (or replaces) the best-effort callback
+// invoked after a successful agent-runtime-spec write (see ServiceDeps.
+// OnRuntimeConfigChanged for the exact contract). Exported as a setter,
+// distinct from every other ServiceDeps-only hook, because cmd/gateway
+// constructs the gateway Server -- which owns the real push implementation
+// -- AFTER the portal Service; this lets main.go wire the real hook in once
+// the gateway Server exists instead of restructuring construction order.
+func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string)) {
+	s.runtimeChanged = fn
 }
 
 type CurrentUser struct {

@@ -553,6 +553,18 @@ func (_d *APIWithTracing) DeleteResourceGroup(ctx context.Context, t1 auth.Token
 	return _d.API.DeleteResourceGroup(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) DeleteRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteRuntimeSpec(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) DeleteServer(ctx context.Context, t1 auth.Token, s1 string, b1 bool) (b2 bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteServer")
 	defer span.End()
@@ -771,6 +783,18 @@ func (_d *APIWithTracing) GetResourceGroup(ctx context.Context, t1 auth.Token, s
 		}
 	}()
 	return _d.API.GetResourceGroup(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) GetRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string) (r1 RuntimeSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetRuntimeSpec(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) GetServer(ctx context.Context, t1 auth.Token, s1 string) (s2 ServerDTO, err error) {
@@ -1261,6 +1285,18 @@ func (_d *APIWithTracing) PublicThemeView(ctx context.Context) (t1 ThemePublicVi
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PublicThemeView")
 	defer span.End()
 	return _d.API.PublicThemeView(ctx)
+}
+
+func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string, p1 PutRuntimeSpecRequest) (r1 RuntimeSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PutRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PutRuntimeSpec(ctx, t1, s1, p1)
 }
 
 func (_d *APIWithTracing) ReassignGroupsOwnedBy(ctx context.Context, t1 auth.Token, s1 string) (err error) {
