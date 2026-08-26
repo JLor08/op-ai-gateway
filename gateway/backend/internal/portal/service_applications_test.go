@@ -505,7 +505,7 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
@@ -522,6 +522,131 @@ func TestNormalizeApplicationTypeLiteLLM(t *testing.T) {
 	}
 	if got != routing.ProviderLiteLLM {
 		t.Fatalf("normalizeApplicationType(litellm) = %q, want %q", got, routing.ProviderLiteLLM)
+	}
+}
+
+// TestNormalizeApplicationTypeServerAgent pins that "server_agent" is a
+// creatable application type (Task 10 -- the agent-runtime-manager feature
+// is built entirely around applications of this type, so the portal's own
+// create/update path must accept it like any other provider type).
+func TestNormalizeApplicationTypeServerAgent(t *testing.T) {
+	got, err := normalizeApplicationType("server_agent")
+	if err != nil {
+		t.Fatalf("normalizeApplicationType(server_agent) err: %v", err)
+	}
+	if got != routing.ProviderServerAgent {
+		t.Fatalf("normalizeApplicationType(server_agent) = %q, want %q", got, routing.ProviderServerAgent)
+	}
+}
+
+// TestCreateApplicationServerAgentDefaultTimeoutIsColdStartAware pins the
+// cold-load-aware default: an agent-managed runtime's very first request for
+// a cold model waits for that model process to start and load, which for a
+// large model can take minutes, so a server_agent application defaults to a
+// 600000ms (10 minute) TimeoutMS instead of the stock 30000ms -- otherwise
+// every cold start would reproducibly fail with 502 provider.timeout.
+func TestCreateApplicationServerAgentDefaultTimeoutIsColdStartAware(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.TimeoutMS != 600000 {
+		t.Fatalf("TimeoutMS = %d, want 600000", dto.TimeoutMS)
+	}
+
+	// An explicit non-zero TimeoutMS is never overridden, for server_agent or
+	// any other type.
+	explicit, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderServerAgent, Port: 9001, Scheme: "http", TimeoutMS: 12345,
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication (explicit timeout): %v", err)
+	}
+	if explicit.TimeoutMS != 12345 {
+		t.Fatalf("TimeoutMS = %d, want 12345 (explicit value preserved)", explicit.TimeoutMS)
+	}
+
+	// Other types are unaffected by the server_agent default -- still 30000.
+	other, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 9002, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication (vllm): %v", err)
+	}
+	if other.TimeoutMS != 30000 {
+		t.Fatalf("TimeoutMS = %d, want 30000 for a non-server_agent type", other.TimeoutMS)
+	}
+}
+
+// TestUpdateApplicationServerAgentTimeoutZeroReappliesServerAgentDefault pins
+// the second call site normalizeApplicationTimeoutMS has: PATCHing
+// timeout_ms back to 0 on an existing server_agent application must
+// re-apply 600000, not the generic 30000 default -- a regression here would
+// silently shrink a cold-start-tolerant timeout back to one that fails
+// every cold load.
+func TestUpdateApplicationServerAgentTimeoutZeroReappliesServerAgentDefault(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http", TimeoutMS: 45000,
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if app.TimeoutMS != 45000 {
+		t.Fatalf("precondition: TimeoutMS = %d, want 45000", app.TimeoutMS)
+	}
+
+	zero := 0
+	updated, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{TimeoutMS: &zero})
+	if err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	if updated.TimeoutMS != 600000 {
+		t.Fatalf("TimeoutMS after timeout_ms:0 update = %d, want 600000", updated.TimeoutMS)
+	}
+}
+
+// TestUpdateApplicationTimeoutZeroUsesTheApplicationsOwnTypeAfterATypeChange
+// pins that when a single PATCH both retypes an application to
+// server_agent AND resets timeout_ms to 0, the default applied is the NEW
+// type's default (600000), not the type the application had before the
+// update -- the update call site must pass the application's OWN
+// (post-mutation) type, not a stale one.
+func TestUpdateApplicationTimeoutZeroUsesTheApplicationsOwnTypeAfterATypeChange(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 9000, Scheme: "https",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if app.TimeoutMS != 30000 {
+		t.Fatalf("precondition: TimeoutMS = %d, want 30000", app.TimeoutMS)
+	}
+
+	newType := routing.ProviderServerAgent
+	zero := 0
+	updated, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{Type: &newType, TimeoutMS: &zero})
+	if err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	if updated.Type != routing.ProviderServerAgent {
+		t.Fatalf("Type = %q, want server_agent", updated.Type)
+	}
+	if updated.TimeoutMS != 600000 {
+		t.Fatalf("TimeoutMS after retype+timeout_ms:0 = %d, want 600000 (the new type's default)", updated.TimeoutMS)
 	}
 }
 

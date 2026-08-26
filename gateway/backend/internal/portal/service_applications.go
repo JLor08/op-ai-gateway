@@ -70,6 +70,16 @@ const (
 	defaultApplicationTimeoutMS          = 30000
 	defaultApplicationAffinityTTLSeconds = 1800
 	defaultApplicationHealthCheckPath    = "/v1/health"
+	// defaultServerAgentTimeoutMS is the TimeoutMS default for
+	// routing.ProviderServerAgent applications. Application.TimeoutMS is a
+	// TOTAL request deadline: it starts when the provider adapter is entered
+	// and is never reset by upstream activity, covering the dial, the request
+	// write, the silent wait for response headers, and the full body read. An
+	// agent-managed runtime's very first request for a cold model must wait
+	// for that model process to start and load, which for a large model can
+	// take minutes -- with the stock 30s default every cold start would
+	// reproducibly fail with 502 provider.timeout.
+	defaultServerAgentTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -241,13 +251,13 @@ func (s *Service) ListApplications(ctx context.Context, principal auth.Token, se
 // (409 -- a conflict with the server's own configuration, not a malformed
 // request). The comparison uses the RAW requested type, deliberately checked
 // BEFORE normalizeApplicationType below: "server_agent" itself is exempt from
-// this gate. Note that normalizeApplicationType does not (yet) accept
-// "server_agent" as a creatable type at all (Task 5 -- registering
-// server_agent applications through this generic create form is a later
-// task's concern), so on a ManagedRuntimeOnly server today every create
-// still fails one way or another; what this ordering guarantees is that a
-// "server_agent" attempt fails with ErrApplicationTypeInvalid, never the
-// misleading ErrServerManagedRuntimeOnly.
+// this gate -- and, since Task 10 registered "server_agent" as a creatable
+// type, that exemption now lets a ManagedRuntimeOnly server actually accept
+// the server_agent creates the flag exists to allow (before Task 10,
+// normalizeApplicationType did not accept "server_agent" at all, so every
+// create on such a server still failed one way or another; this ordering
+// only guaranteed the failure was ErrApplicationTypeInvalid, never the
+// misleading ErrServerManagedRuntimeOnly).
 func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, serverID string, req CreateApplicationRequest) (ApplicationDTO, error) {
 	server, err := s.authorizeServer(ctx, principal, serverID)
 	if err != nil {
@@ -333,7 +343,7 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		APIFlavors:                       flavors,
 		Priority:                         req.Priority,
 		Weight:                           req.Weight,
-		TimeoutMS:                        normalizeApplicationTimeoutMS(req.TimeoutMS),
+		TimeoutMS:                        normalizeApplicationTimeoutMS(appType, req.TimeoutMS),
 		AffinityTTLSeconds:               normalizeApplicationAffinityTTLSeconds(req.AffinityTTLSeconds),
 		AdmissionQueueTimeoutSeconds:     req.AdmissionQueueTimeoutSeconds,
 		Status:                           status,
@@ -493,7 +503,10 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		app.Weight = *req.Weight
 	}
 	if req.TimeoutMS != nil {
-		app.TimeoutMS = normalizeApplicationTimeoutMS(*req.TimeoutMS)
+		// app.Type has already been reassigned above if req.Type != nil, so this
+		// picks up the application's OWN (post-mutation) type -- see
+		// normalizeApplicationTimeoutMS's doc comment.
+		app.TimeoutMS = normalizeApplicationTimeoutMS(app.Type, *req.TimeoutMS)
 	}
 	if req.AffinityTTLSeconds != nil {
 		app.AffinityTTLSeconds = normalizeApplicationAffinityTTLSeconds(*req.AffinityTTLSeconds)
@@ -809,6 +822,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderLlamaSwap, nil
 	case routing.ProviderLiteLLM:
 		return routing.ProviderLiteLLM, nil
+	case routing.ProviderServerAgent:
+		return routing.ProviderServerAgent, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -914,11 +929,23 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 	return nil
 }
 
-func normalizeApplicationTimeoutMS(timeoutMS int) int {
-	if timeoutMS == 0 {
-		return defaultApplicationTimeoutMS
+// normalizeApplicationTimeoutMS maps a zero TimeoutMS to the type-appropriate
+// default: defaultServerAgentTimeoutMS for a server_agent application (cold
+// model loads can take minutes -- see defaultServerAgentTimeoutMS), or
+// defaultApplicationTimeoutMS for every other type. A non-zero value is
+// always preserved as given. Both CreateApplication and UpdateApplication
+// call this -- UpdateApplication passes the application's own (already
+// mutated, if req.Type changed in the same request) type so that a PATCH
+// combining a retype to/from server_agent with timeout_ms:0 applies the
+// NEW type's default rather than a stale one.
+func normalizeApplicationTimeoutMS(appType string, timeoutMS int) int {
+	if timeoutMS != 0 {
+		return timeoutMS
 	}
-	return timeoutMS
+	if appType == routing.ProviderServerAgent {
+		return defaultServerAgentTimeoutMS
+	}
+	return defaultApplicationTimeoutMS
 }
 
 func normalizeApplicationAffinityTTLSeconds(affinityTTLSeconds int) int {

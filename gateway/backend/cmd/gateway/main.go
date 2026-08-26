@@ -1222,6 +1222,9 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		routing.ProviderLlamaCPP:  openAICompatible,
 		routing.ProviderLlamaSwap: openAICompatible,
 		routing.ProviderLiteLLM:   openAICompatible,
+		// ProviderServerAgent: the agent-managed runtime's router port speaks
+		// the OpenAI-compatible dialect, same as vllm/llama_cpp/llama_swap/litellm.
+		routing.ProviderServerAgent: openAICompatible,
 	}, nil)
 }
 

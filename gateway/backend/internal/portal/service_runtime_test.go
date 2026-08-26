@@ -17,13 +17,16 @@ import (
 )
 
 // seedServerAgentApplication inserts a server_agent-typed application
-// directly at the store layer for serverID. The portal's own
-// CreateApplication.normalizeApplicationType does not accept "server_agent"
-// as a creatable type (routing.ProviderServerAgent applications are
-// provisioned by the agent-runtime-manager feature outside the generic
-// application form — a later task's concern), so runtime-spec tests seed it
-// directly on the store, mirroring seedServerTestGroups' direct-store
-// seeding of admin groups for the same reason.
+// directly at the store layer for serverID, bypassing CreateApplication's
+// validation/timeout-default/policy-reconciliation path entirely. Runtime-spec
+// tests use this to get a minimal, fully-controlled fixture application
+// without depending on (or re-asserting) CreateApplication's own behavior --
+// mirroring seedServerTestGroups' direct-store seeding of admin groups for
+// the same reason. (Historically this was also the ONLY way to get a
+// server_agent application at all, since CreateApplication.
+// normalizeApplicationType did not accept "server_agent" as a creatable
+// type before Task 10; that gate is gone now, but the direct-store seed
+// remains the right tool for these tests' purposes.)
 func seedServerAgentApplication(t *testing.T, routeStore *routing.MemoryStore, serverID string, now time.Time) routing.Application {
 	t.Helper()
 	app := routing.Application{
@@ -840,13 +843,15 @@ func TestUpdateServerRuntimeMaxProcessesNegativeInvalid(t *testing.T) {
 
 // TestCreateApplicationManagedRuntimeOnlyGate pins the managed-runtime-only
 // gate: a non-server_agent application create on a ManagedRuntimeOnly server
-// is rejected with ErrServerManagedRuntimeOnly, but the "server_agent" type
-// itself is exempt from THIS gate -- it may still fail for the unrelated,
-// pre-existing reason that CreateApplication does not yet accept
-// "server_agent" as a creatable type (Task 5 -- registering server_agent
-// applications through the generic create form is deliberately a later
-// task's concern), but that failure must never be misreported as the
-// managed-runtime-only violation.
+// is rejected with ErrServerManagedRuntimeOnly, while a "server_agent" create
+// on that same server is exempt from the gate and now (Task 10 registered
+// "server_agent" as a creatable application type) genuinely SUCCEEDS -- that
+// is the whole point of the ManagedRuntimeOnly flag: such a server hosts
+// agent-managed model processes and nothing else. (Before Task 10 this test
+// could only assert that the server_agent create failed for the separate,
+// pre-existing reason that CreateApplication did not yet accept
+// "server_agent" as a creatable type at all; now that gate is gone, the test
+// asserts the real, positive behavior instead.)
 func TestCreateApplicationManagedRuntimeOnlyGate(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -865,9 +870,12 @@ func TestCreateApplicationManagedRuntimeOnlyGate(t *testing.T) {
 		t.Fatalf("vllm create on managed-only server: err = %v, want ErrServerManagedRuntimeOnly", err)
 	}
 
-	_, err = svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http"})
-	if errors.Is(err, ErrServerManagedRuntimeOnly) {
-		t.Fatalf("server_agent create on managed-only server incorrectly gated: err = %v", err)
+	dto, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http"})
+	if err != nil {
+		t.Fatalf("server_agent create on managed-only server: err = %v, want success", err)
+	}
+	if dto.Type != routing.ProviderServerAgent {
+		t.Fatalf("dto.Type = %q, want server_agent", dto.Type)
 	}
 
 	// A normal (non-managed-only) server is unaffected.

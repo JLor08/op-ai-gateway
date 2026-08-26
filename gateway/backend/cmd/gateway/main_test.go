@@ -1041,12 +1041,16 @@ func TestProviderClientsWireModelListerForEveryApplicationType(t *testing.T) {
 	// Every application type selectable in the drill-down UI must be wired to a
 	// functioning ModelLister so SyncApplicationModels works against a reachable
 	// upstream. Mock is exercised elsewhere; this guards the real client seam.
+	// server_agent (Task 10) dispatches through the same OpenAI-compatible
+	// client as vllm/llama_cpp/llama_swap/litellm -- the agent-managed
+	// runtime's router port speaks that dialect.
 	types := []string{
 		routing.ProviderOllama,
 		routing.ProviderVLLM,
 		routing.ProviderLlamaCPP,
 		routing.ProviderLlamaSwap,
 		routing.ProviderLiteLLM,
+		routing.ProviderServerAgent,
 	}
 	for _, providerType := range types {
 		t.Run(providerType, func(t *testing.T) {
