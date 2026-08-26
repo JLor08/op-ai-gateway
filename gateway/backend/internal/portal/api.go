@@ -86,10 +86,12 @@ type API interface {
 	GatewayMeshCertificate(context.Context) (GatewayMeshCertificateMaterial, error)
 	GetApplication(context.Context, auth.Token, string) (ApplicationDTO, error)
 	GetChat(context.Context, auth.Token, string) (ChatDTO, error)
+	GetCoResidency(context.Context, auth.Token, string) (CoResidencyDTO, error)
 	GetModelGroup(context.Context, auth.Token, string) (ModelGroupDTO, error)
 	GetResourceGroup(context.Context, auth.Token, string) (ResourceGroupDTO, error)
 	GetRuntimeSpec(context.Context, auth.Token, string) (RuntimeSpecDTO, error)
 	GetServer(context.Context, auth.Token, string) (ServerDTO, error)
+	GetServerGPUBudgets(context.Context, auth.Token, string) ([]GPUBudgetDTO, error)
 	GetService(context.Context, auth.Token, string) (ServiceDTO, error)
 	GroupMemberCandidates(context.Context, auth.Token, string) ([]UserRefDTO, error)
 	GroupMembers(context.Context, auth.Token, string) ([]UserGroupMemberDTO, error)
@@ -161,6 +163,7 @@ type API interface {
 	RotateNetbirdToken(context.Context, auth.Token) (RotateNetbirdTokenResult, error)
 	RotateServiceToken(context.Context, auth.Token, string, string) (CreateServiceTokenResponse, error)
 	RotateToken(context.Context, auth.Token, string) (CreateTokenResponse, error)
+	RuntimeWarnings(context.Context, auth.Token, string) ([]string, error)
 	SMTPRuntimeConfig(context.Context) (SMTPRuntimeConfig, error)
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)
 	ServerAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
@@ -171,6 +174,7 @@ type API interface {
 	ServerPerfHistory(context.Context, auth.Token, string, time.Duration) ([]routing.TelemetrySample, error)
 	ServiceAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
 	SetCaptureSecret(auth.Token, string, bool) error
+	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
 	SetManagerPermissions(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool) error
 	SetModelVisibility(context.Context, auth.Token, string, string) error
 	SetNetbirdNetwork(context.Context, auth.Token, NetbirdNetworkDTO) (NetbirdNetworkDTO, error)
@@ -180,6 +184,7 @@ type API interface {
 	SetServerAdminGroups(context.Context, auth.Token, string, []string) (ServerDTO, error)
 	SetServerCertificateOverride(context.Context, auth.Token, string, string) (ServerDTO, error)
 	SetServerEnergyConfig(context.Context, auth.Token, string, float64, float64, float64, float64, string) (ServerDTO, error)
+	SetServerGPUBudgets(context.Context, auth.Token, string, SetGPUBudgetsRequest) ([]GPUBudgetDTO, error)
 	SetServerHTTPSSwitchOverride(context.Context, auth.Token, string, string) (ServerDTO, error)
 	SetServerNetbird(context.Context, auth.Token, string, bool, string, []string, bool, string, bool, bool) (ServerDTO, error)
 	SetServiceAdminGroups(context.Context, auth.Token, string, []string) (ServiceDTO, error)

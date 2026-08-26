@@ -1025,6 +1025,14 @@ type ServerDTO struct {
 	// AgentPresenceTimeoutSeconds is the per-server override (seconds) for "the
 	// agent is delivering values"; 0 = follow the system-wide default.
 	AgentPresenceTimeoutSeconds int `json:"agent_presence_timeout_seconds"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6, migration 66) mirror
+	// routing.AIServer's fields of the same name: how many agent-managed
+	// runtime processes (server_agent applications) may run concurrently on
+	// this server (0 = unlimited), and whether the server is restricted to
+	// agent-managed runtime applications only (gating CreateApplication --
+	// see ErrServerManagedRuntimeOnly).
+	RuntimeMaxProcesses int  `json:"runtime_max_processes"`
+	ManagedRuntimeOnly  bool `json:"managed_runtime_only"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet). All default 0 = "unset / use default".
 	EstimatedWatts float64 `json:"estimated_watts"`
@@ -1072,6 +1080,11 @@ type CreateServerRequest struct {
 	// override (seconds); nil = follow the system default (stored as 0). Must be
 	// >= 0 when set.
 	AgentPresenceTimeoutSeconds *int `json:"agent_presence_timeout_seconds,omitempty"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6): nil = default (0 /
+	// false). RuntimeMaxProcesses must be >= 0 when set (else
+	// ErrServerRuntimeLimitInvalid).
+	RuntimeMaxProcesses *int  `json:"runtime_max_processes,omitempty"`
+	ManagedRuntimeOnly  *bool `json:"managed_runtime_only,omitempty"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet). nil = unset (stored as 0). Must be >= 0 when set.
 	EstimatedWatts *float64 `json:"estimated_watts,omitempty"`
@@ -1106,6 +1119,11 @@ type UpdateServerRequest struct {
 	// override (seconds); a supplied 0 resets to "follow the system default".
 	// Must be >= 0 when set.
 	AgentPresenceTimeoutSeconds *int `json:"agent_presence_timeout_seconds,omitempty"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6): a supplied 0/false
+	// resets to the default. RuntimeMaxProcesses must be >= 0 when set (else
+	// ErrServerRuntimeLimitInvalid).
+	RuntimeMaxProcesses *int  `json:"runtime_max_processes,omitempty"`
+	ManagedRuntimeOnly  *bool `json:"managed_runtime_only,omitempty"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet); a supplied 0 resets to "unset". Must be >= 0 when set.
 	EstimatedWatts *float64 `json:"estimated_watts,omitempty"`
@@ -2415,6 +2433,17 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		}
 		agentPresenceTimeout = *req.AgentPresenceTimeoutSeconds
 	}
+	runtimeMaxProcesses := 0
+	if req.RuntimeMaxProcesses != nil {
+		if *req.RuntimeMaxProcesses < 0 {
+			return ServerDTO{}, ErrServerRuntimeLimitInvalid
+		}
+		runtimeMaxProcesses = *req.RuntimeMaxProcesses
+	}
+	managedRuntimeOnly := false
+	if req.ManagedRuntimeOnly != nil {
+		managedRuntimeOnly = *req.ManagedRuntimeOnly
+	}
 	var estimatedWatts, idleWatts, pricePerKwh, pue float64
 	if req.EstimatedWatts != nil {
 		if *req.EstimatedWatts < 0 {
@@ -2451,6 +2480,8 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		Status: status, HealthStatus: routing.HealthUnknown, NetbirdEnabled: netbirdEnabled,
 		NetbirdPolicyOverride:       policyOverride,
 		AgentPresenceTimeoutSeconds: agentPresenceTimeout,
+		RuntimeMaxProcesses:         runtimeMaxProcesses,
+		ManagedRuntimeOnly:          managedRuntimeOnly,
 		EstimatedWatts:              estimatedWatts,
 		IdleWatts:                   idleWatts,
 		PricePerKwh:                 pricePerKwh,
@@ -2567,6 +2598,15 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 			return ServerDTO{}, ErrServerAgentPresenceTimeoutInvalid
 		}
 		server.AgentPresenceTimeoutSeconds = *req.AgentPresenceTimeoutSeconds
+	}
+	if req.RuntimeMaxProcesses != nil {
+		if *req.RuntimeMaxProcesses < 0 {
+			return ServerDTO{}, ErrServerRuntimeLimitInvalid
+		}
+		server.RuntimeMaxProcesses = *req.RuntimeMaxProcesses
+	}
+	if req.ManagedRuntimeOnly != nil {
+		server.ManagedRuntimeOnly = *req.ManagedRuntimeOnly
 	}
 	if req.EstimatedWatts != nil {
 		if *req.EstimatedWatts < 0 {
@@ -3133,6 +3173,8 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
 		AgentStatus:                 s.agentStatus(ctx, server),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
+		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
+		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
 		EstimatedWatts:              server.EstimatedWatts,
 		IdleWatts:                   server.IdleWatts,
 		PricePerKwh:                 server.PricePerKwh,

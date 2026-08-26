@@ -150,6 +150,10 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		s.handlePortalServerEnergy(w, r, token, parts[0])
 		return
 	}
+	if len(parts) == 2 && parts[1] == "gpu-budgets" && parts[0] != "" {
+		s.handlePortalServerGPUBudgets(w, r, token, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "certificate" && parts[0] != "" {
 		s.handlePortalServerCertificate(w, r, token, parts[0])
 		return
@@ -311,6 +315,44 @@ func (s *Server) handlePortalServerEnergy(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// handlePortalServerGPUBudgets backs GET/PUT /api/portal/servers/{id}/gpu-budgets
+// (Task 6): the per-GPU VRAM budget rows used by the co-residency admission
+// math. Owner/admin-scoped (SetServerGPUBudgets/GetServerGPUBudgets gate via
+// authorizeServer -> 404 no-leak). PUT is a full-document replace, mirroring
+// handlePortalMappingRuntimeSpec's PUT semantics; both responses wrap the
+// slice under "budgets" (matching the request field name and the
+// warnings-endpoint envelope convention below).
+func (s *Server) handlePortalServerGPUBudgets(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		budgets, err := s.Portal.GetServerGPUBudgets(r.Context(), token, id)
+		if err != nil {
+			writePortalServerError(w, err, codeServerUpdateFailed)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"budgets": budgets})
+	case http.MethodPut:
+		raw, ok := readRawJSON(w, r)
+		if !ok {
+			return
+		}
+		var req portal.SetGPUBudgetsRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+			return
+		}
+		budgets, err := s.Portal.SetServerGPUBudgets(r.Context(), token, id, req)
+		if err != nil {
+			writePortalServerError(w, err, codeServerUpdateFailed)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"budgets": budgets})
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
+	}
+}
+
 // handleServerAdminGroupCandidates backs GET /api/portal/server-admin-group-candidates:
 // the admin-tier groups the caller may create/link a server into (system
 // scope -> every admin-tier group; anyone else -> the groups they may manage
@@ -367,6 +409,8 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrServerStatusInvalid, status: http.StatusBadRequest, code: "server.status_invalid", msg: "server status is invalid"},
 	{err: portal.ErrServerOwnerInvalid, status: http.StatusBadRequest, code: "server.owner_invalid", msg: "owner is invalid"},
 	{err: portal.ErrServerAgentPresenceTimeoutInvalid, status: http.StatusBadRequest, code: "server.agent_presence_timeout_invalid", msg: "agent presence timeout must be >= 0"},
+	{err: portal.ErrServerRuntimeLimitInvalid, status: http.StatusBadRequest, code: "server.runtime_limit_invalid", msg: "runtime_max_processes must be >= 0"},
+	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and index must be unique"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
 	{err: portal.ErrServerAdminGroupRequired, status: http.StatusBadRequest, code: "server.admin_group_required", msg: "at least one admin group is required"},
 	{err: portal.ErrServerAdminGroupInvalid, status: http.StatusBadRequest, code: "server.admin_group_invalid", msg: "admin group is invalid"},

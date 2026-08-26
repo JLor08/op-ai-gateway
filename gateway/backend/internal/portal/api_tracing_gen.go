@@ -761,6 +761,18 @@ func (_d *APIWithTracing) GetChat(ctx context.Context, t1 auth.Token, s1 string)
 	return _d.API.GetChat(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) GetCoResidency(ctx context.Context, t1 auth.Token, s1 string) (c2 CoResidencyDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetCoResidency")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetCoResidency(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) GetModelGroup(ctx context.Context, t1 auth.Token, s1 string) (m1 ModelGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetModelGroup")
 	defer span.End()
@@ -807,6 +819,18 @@ func (_d *APIWithTracing) GetServer(ctx context.Context, t1 auth.Token, s1 strin
 		}
 	}()
 	return _d.API.GetServer(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) GetServerGPUBudgets(ctx context.Context, t1 auth.Token, s1 string) (ga1 []GPUBudgetDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetServerGPUBudgets(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) GetService(ctx context.Context, t1 auth.Token, s1 string) (s2 ServiceDTO, err error) {
@@ -1594,6 +1618,18 @@ func (_d *APIWithTracing) RotateToken(ctx context.Context, t1 auth.Token, s1 str
 	return _d.API.RotateToken(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) RuntimeWarnings(ctx context.Context, t1 auth.Token, s1 string) (sa1 []string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RuntimeWarnings")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RuntimeWarnings(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) SMTPRuntimeConfig(ctx context.Context) (s1 SMTPRuntimeConfig, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SMTPRuntimeConfig")
 	defer span.End()
@@ -1706,6 +1742,18 @@ func (_d *APIWithTracing) SetCaptureSecret(t1 auth.Token, s1 string, b1 bool) (e
 	return _d.API.SetCaptureSecret(t1, s1, b1)
 }
 
+func (_d *APIWithTracing) SetCoResidency(ctx context.Context, t1 auth.Token, s1 string, s2 SetCoResidencyRequest) (c2 CoResidencyDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetCoResidency")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetCoResidency(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetManagerPermissions")
 	defer span.End()
@@ -1812,6 +1860,18 @@ func (_d *APIWithTracing) SetServerEnergyConfig(ctx context.Context, t1 auth.Tok
 		}
 	}()
 	return _d.API.SetServerEnergyConfig(ctx, t1, s1, f1, f2, f3, f4, s2)
+}
+
+func (_d *APIWithTracing) SetServerGPUBudgets(ctx context.Context, t1 auth.Token, s1 string, s2 SetGPUBudgetsRequest) (ga1 []GPUBudgetDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetServerGPUBudgets(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) SetServerHTTPSSwitchOverride(ctx context.Context, t1 auth.Token, s1 string, s2 string) (s3 ServerDTO, err error) {

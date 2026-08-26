@@ -234,10 +234,27 @@ func (s *Service) ListApplications(ctx context.Context, principal auth.Token, se
 }
 
 // CreateApplication validates and persists a new application under serverID.
+//
+// Managed-runtime-only gate (Task 6): a server with ManagedRuntimeOnly set
+// may only host agent-managed model processes, so any create whose type is
+// not routing.ProviderServerAgent is rejected with ErrServerManagedRuntimeOnly
+// (409 -- a conflict with the server's own configuration, not a malformed
+// request). The comparison uses the RAW requested type, deliberately checked
+// BEFORE normalizeApplicationType below: "server_agent" itself is exempt from
+// this gate. Note that normalizeApplicationType does not (yet) accept
+// "server_agent" as a creatable type at all (Task 5 -- registering
+// server_agent applications through this generic create form is a later
+// task's concern), so on a ManagedRuntimeOnly server today every create
+// still fails one way or another; what this ordering guarantees is that a
+// "server_agent" attempt fails with ErrApplicationTypeInvalid, never the
+// misleading ErrServerManagedRuntimeOnly.
 func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, serverID string, req CreateApplicationRequest) (ApplicationDTO, error) {
 	server, err := s.authorizeServer(ctx, principal, serverID)
 	if err != nil {
 		return ApplicationDTO{}, err
+	}
+	if server.ManagedRuntimeOnly && strings.TrimSpace(req.Type) != routing.ProviderServerAgent {
+		return ApplicationDTO{}, ErrServerManagedRuntimeOnly
 	}
 	appType, err := normalizeApplicationType(req.Type)
 	if err != nil {

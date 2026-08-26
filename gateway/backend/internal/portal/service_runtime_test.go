@@ -438,3 +438,521 @@ func TestPutRuntimeSpecFiresRuntimeChangedHook(t *testing.T) {
 		t.Fatalf("calls after DELETE = %#v, want exactly [%q, %q]", gotAfterDelete, server.ID, server.ID)
 	}
 }
+
+// --- Task 6: co-residency matrix -------------------------------------------
+
+// seedTwoMappings creates a server_agent application on server and two
+// mappings on it, for co-residency tests that need a pair of mapping ids
+// belonging to the SAME application.
+func seedTwoMappings(t *testing.T, svc *Service, routeStore *routing.MemoryStore, serverID string, now time.Time) (routing.Application, ModelMappingDTO, ModelMappingDTO) {
+	t.Helper()
+	ctx := context.Background()
+	app := seedServerAgentApplication(t, routeStore, serverID, now)
+	m1, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m1", AppModelName: "m1"})
+	if err != nil {
+		t.Fatalf("CreateMapping m1: %v", err)
+	}
+	m2, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m2", AppModelName: "m2"})
+	if err != nil {
+		t.Fatalf("CreateMapping m2: %v", err)
+	}
+	return app, m1, m2
+}
+
+func TestSetCoResidencyCanonicalizesPair(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+
+	// Submit the pair with the higher id first -- SetCoResidency must sort it
+	// server-side so the client never has to care about ordering.
+	a, b := m1.ID, m2.ID
+	if a > b {
+		a, b = b, a
+	}
+	dto, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: [][2]string{{b, a}}})
+	if err != nil {
+		t.Fatalf("SetCoResidency: %v", err)
+	}
+	if len(dto.Pairs) != 1 || dto.Pairs[0][0] != a || dto.Pairs[0][1] != b {
+		t.Fatalf("pairs = %#v, want canonical [[%q,%q]]", dto.Pairs, a, b)
+	}
+
+	got, err := svc.GetCoResidency(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("GetCoResidency: %v", err)
+	}
+	if len(got.Pairs) != 1 || got.Pairs[0][0] != a || got.Pairs[0][1] != b {
+		t.Fatalf("GetCoResidency pairs = %#v, want canonical [[%q,%q]]", got.Pairs, a, b)
+	}
+}
+
+func TestGetCoResidencyEmptyIsNonNil(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	got, err := svc.GetCoResidency(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("GetCoResidency: %v", err)
+	}
+	if got.Pairs == nil || len(got.Pairs) != 0 {
+		t.Fatalf("pairs = %#v, want non-nil empty", got.Pairs)
+	}
+}
+
+// TestSetCoResidencyRejectsDuplicateAfterNormalization pins the exact case
+// called out by the task brief: submitting the same unordered pair twice,
+// once in each order, must be rejected as a duplicate AFTER normalization --
+// not silently accepted as "two different pairs".
+func TestSetCoResidencyRejectsDuplicateAfterNormalization(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+
+	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
+		Pairs: [][2]string{{m1.ID, m2.ID}, {m2.ID, m1.ID}},
+	})
+	if !errors.Is(err, ErrCoResidencyPairInvalid) {
+		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
+	}
+}
+
+func TestSetCoResidencyRejectsSameMappingTwice(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, m1, _ := seedTwoMappings(t, svc, routeStore, server.ID, now)
+
+	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
+		Pairs: [][2]string{{m1.ID, m1.ID}},
+	})
+	if !errors.Is(err, ErrCoResidencyPairInvalid) {
+		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
+	}
+}
+
+// TestSetCoResidencyRejectsForeignMapping pins that a pair naming a mapping
+// belonging to a DIFFERENT application is invalid -- verified against the
+// application's own mappings, not merely a global existence check.
+func TestSetCoResidencyRejectsForeignMapping(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, m1, _ := seedTwoMappings(t, svc, routeStore, server.ID, now)
+
+	// A separate server (seedServerAgentApplication hardcodes port 9000, so a
+	// second application on the SAME server would collide on port instead)
+	// with its own server_agent application and mapping -- "foreign" only in
+	// the sense that matters here: a mapping id that exists but belongs to a
+	// DIFFERENT application than app.
+	otherServer := createTestServer(t, svc, "S2", "s2.example.test")
+	otherApp := seedServerAgentApplication(t, routeStore, otherServer.ID, now)
+	foreign, err := svc.CreateMapping(ctx, ownerToken(), otherApp.ID, CreateMappingRequest{GatewayModelName: "f", AppModelName: "f"})
+	if err != nil {
+		t.Fatalf("CreateMapping foreign: %v", err)
+	}
+
+	_, err = svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
+		Pairs: [][2]string{{m1.ID, foreign.ID}},
+	})
+	if !errors.Is(err, ErrCoResidencyPairInvalid) {
+		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
+	}
+}
+
+func TestSetCoResidencyFiresRuntimeChangedHookAndClearsOnEmpty(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	for _, u := range []string{"usr_admin", "usr_owner", "usr_other"} {
+		if err := dir.CreateUser(ctx, store.User{ID: u, Email: u + "@example.test", DisplayName: u, Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateUser %s: %v", u, err)
+		}
+	}
+	seedServerTestGroups(t, dir, now)
+	routeStore := routing.NewMemoryStore()
+	var mu sync.Mutex
+	var calls []string
+	svc := NewService(ServiceDeps{
+		Users: dir, Groups: dir, Routes: routeStore, Clock: func() time.Time { return now },
+		OnRuntimeConfigChanged: func(serverID string) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls = append(calls, serverID)
+		},
+	})
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+
+	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: [][2]string{{m1.ID, m2.ID}}}); err != nil {
+		t.Fatalf("SetCoResidency: %v", err)
+	}
+	// Clearing the set (empty Pairs) is a valid write too and must also fire
+	// the hook -- an empty PUT is how an operator removes every rule.
+	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{}); err != nil {
+		t.Fatalf("SetCoResidency (clear): %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != server.ID || got[1] != server.ID {
+		t.Fatalf("calls = %#v, want exactly [%q, %q]", got, server.ID, server.ID)
+	}
+	final, err := svc.GetCoResidency(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("GetCoResidency: %v", err)
+	}
+	if len(final.Pairs) != 0 {
+		t.Fatalf("pairs after clear = %#v, want empty", final.Pairs)
+	}
+}
+
+// --- Task 6: per-GPU VRAM budgets -------------------------------------------
+
+func TestSetServerGPUBudgetsRoundTrip(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
+		Budgets: []GPUBudgetDTO{{Index: 1, BudgetMB: 4000}, {Index: 0, BudgetMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("SetServerGPUBudgets: %v", err)
+	}
+	if len(dto) != 2 || dto[0].Index != 0 || dto[0].BudgetMB != 8000 || dto[1].Index != 1 || dto[1].BudgetMB != 4000 {
+		t.Fatalf("dto = %#v, want ordered by index", dto)
+	}
+	// No telemetry sample exists -- expected_* stay empty rather than failing.
+	if dto[0].ExpectedUUID != "" || dto[0].ExpectedName != "" {
+		t.Fatalf("dto[0] = %#v, want empty expected_* (no telemetry sample)", dto[0])
+	}
+
+	got, err := svc.GetServerGPUBudgets(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("GetServerGPUBudgets: %v", err)
+	}
+	if len(got) != 2 || got[0].BudgetMB != 8000 || got[1].BudgetMB != 4000 {
+		t.Fatalf("GetServerGPUBudgets round trip = %#v", got)
+	}
+}
+
+func TestGetServerGPUBudgetsEmptyIsNonNil(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	got, err := svc.GetServerGPUBudgets(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("GetServerGPUBudgets: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("budgets = %#v, want non-nil empty", got)
+	}
+}
+
+func TestSetServerGPUBudgetsValidation(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	cases := []struct {
+		name    string
+		budgets []GPUBudgetDTO
+	}{
+		{"negative index", []GPUBudgetDTO{{Index: -1, BudgetMB: 100}}},
+		{"negative budget_mb", []GPUBudgetDTO{{Index: 0, BudgetMB: -1}}},
+		{"duplicate index", []GPUBudgetDTO{{Index: 0, BudgetMB: 100}, {Index: 0, BudgetMB: 200}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{Budgets: tc.budgets})
+			if !errors.Is(err, ErrGPUBudgetInvalid) {
+				t.Fatalf("err = %v, want ErrGPUBudgetInvalid", err)
+			}
+		})
+	}
+}
+
+// TestSetServerGPUBudgetsSnapshotsExpectedAndNeverOverwrites pins the drift-
+// detector contract: expected_uuid/expected_name are captured from the
+// latest telemetry sample ONLY when the budget row is first created, and a
+// later PUT -- even one whose request carries different (here: deliberately
+// bogus) values, and even after a NEWER telemetry sample reports a
+// different card at the same index -- must never overwrite them.
+func TestSetServerGPUBudgetsSnapshotsExpectedAndNeverOverwrites(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	if err := routeStore.InsertTelemetrySample(ctx, routing.TelemetrySample{
+		ServerID: server.ID, ReportedAt: now,
+		GPUs: []routing.GPUSample{{Index: 0, UUID: "GPU-111", Name: "RTX 4090"}},
+	}); err != nil {
+		t.Fatalf("seed telemetry sample: %v", err)
+	}
+
+	dto, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
+		Budgets: []GPUBudgetDTO{{Index: 0, BudgetMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("SetServerGPUBudgets (create): %v", err)
+	}
+	if len(dto) != 1 || dto[0].ExpectedUUID != "GPU-111" || dto[0].ExpectedName != "RTX 4090" {
+		t.Fatalf("dto = %#v, want expected_uuid/expected_name snapshotted from telemetry", dto)
+	}
+
+	// A later telemetry sample reports a DIFFERENT card at the same index
+	// (the renumbering/renaming scenario the drift detector exists for).
+	if err := routeStore.InsertTelemetrySample(ctx, routing.TelemetrySample{
+		ServerID: server.ID, ReportedAt: now.Add(time.Minute),
+		GPUs: []routing.GPUSample{{Index: 0, UUID: "GPU-222", Name: "RTX 5090"}},
+	}); err != nil {
+		t.Fatalf("seed second telemetry sample: %v", err)
+	}
+
+	// The second PUT changes budget_mb and sends bogus expected_* values on
+	// the wire (a client would normally just echo back the GET response, but
+	// this pins that the server NEVER trusts the request for these fields,
+	// on a create OR an update).
+	dto2, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
+		Budgets: []GPUBudgetDTO{{Index: 0, BudgetMB: 9000, ExpectedUUID: "bogus-uuid", ExpectedName: "bogus-name"}},
+	})
+	if err != nil {
+		t.Fatalf("SetServerGPUBudgets (update): %v", err)
+	}
+	if len(dto2) != 1 || dto2[0].BudgetMB != 9000 {
+		t.Fatalf("budget_mb not updated: dto2 = %#v", dto2)
+	}
+	if dto2[0].ExpectedUUID != "GPU-111" || dto2[0].ExpectedName != "RTX 4090" {
+		t.Fatalf("expected_* clobbered: got %#v, want the ORIGINAL snapshot (GPU-111/RTX 4090) preserved", dto2[0])
+	}
+}
+
+func TestSetServerGPUBudgetsFiresRuntimeChangedHook(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	for _, u := range []string{"usr_admin", "usr_owner", "usr_other"} {
+		if err := dir.CreateUser(ctx, store.User{ID: u, Email: u + "@example.test", DisplayName: u, Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateUser %s: %v", u, err)
+		}
+	}
+	seedServerTestGroups(t, dir, now)
+	routeStore := routing.NewMemoryStore()
+	var mu sync.Mutex
+	var calls []string
+	svc := NewService(ServiceDeps{
+		Users: dir, Groups: dir, Routes: routeStore, Clock: func() time.Time { return now },
+		OnRuntimeConfigChanged: func(serverID string) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls = append(calls, serverID)
+		},
+	})
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	if _, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{Budgets: []GPUBudgetDTO{{Index: 0, BudgetMB: 1000}}}); err != nil {
+		t.Fatalf("SetServerGPUBudgets: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != server.ID {
+		t.Fatalf("calls = %#v, want exactly [%q]", got, server.ID)
+	}
+}
+
+// --- Task 6: server runtime flags -------------------------------------------
+
+func TestServerRuntimeFlagsCreateAndUpdateRoundTrip(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+
+	maxProc := 3
+	managed := true
+	dto, err := svc.CreateServer(ctx, adminToken(), CreateServerRequest{
+		Name: "S", Domain: "s.example.test", OwnerIDs: []string{"usr_owner"},
+		AdminGroupIDs:       []string{testAdminGroupID},
+		RuntimeMaxProcesses: &maxProc, ManagedRuntimeOnly: &managed,
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if dto.RuntimeMaxProcesses != 3 || !dto.ManagedRuntimeOnly {
+		t.Fatalf("create dto = %#v, want RuntimeMaxProcesses=3, ManagedRuntimeOnly=true", dto)
+	}
+
+	newMax := 5
+	unmanaged := false
+	updated, err := svc.UpdateServer(ctx, ownerToken(), dto.ID, UpdateServerRequest{
+		RuntimeMaxProcesses: &newMax, ManagedRuntimeOnly: &unmanaged,
+	})
+	if err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+	if updated.RuntimeMaxProcesses != 5 || updated.ManagedRuntimeOnly {
+		t.Fatalf("update dto = %#v, want RuntimeMaxProcesses=5, ManagedRuntimeOnly=false", updated)
+	}
+}
+
+func TestCreateServerRuntimeMaxProcessesNegativeInvalid(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	neg := -1
+	_, err := svc.CreateServer(ctx, adminToken(), CreateServerRequest{
+		Name: "S", Domain: "s.example.test", OwnerIDs: []string{"usr_owner"},
+		AdminGroupIDs: []string{testAdminGroupID}, RuntimeMaxProcesses: &neg,
+	})
+	if !errors.Is(err, ErrServerRuntimeLimitInvalid) {
+		t.Fatalf("err = %v, want ErrServerRuntimeLimitInvalid", err)
+	}
+}
+
+func TestUpdateServerRuntimeMaxProcessesNegativeInvalid(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	neg := -1
+	_, err := svc.UpdateServer(ctx, ownerToken(), server.ID, UpdateServerRequest{RuntimeMaxProcesses: &neg})
+	if !errors.Is(err, ErrServerRuntimeLimitInvalid) {
+		t.Fatalf("err = %v, want ErrServerRuntimeLimitInvalid", err)
+	}
+}
+
+// TestCreateApplicationManagedRuntimeOnlyGate pins the managed-runtime-only
+// gate: a non-server_agent application create on a ManagedRuntimeOnly server
+// is rejected with ErrServerManagedRuntimeOnly, but the "server_agent" type
+// itself is exempt from THIS gate -- it may still fail for the unrelated,
+// pre-existing reason that CreateApplication does not yet accept
+// "server_agent" as a creatable type (Task 5 -- registering server_agent
+// applications through the generic create form is deliberately a later
+// task's concern), but that failure must never be misreported as the
+// managed-runtime-only violation.
+func TestCreateApplicationManagedRuntimeOnlyGate(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	managed := true
+	server, err := svc.CreateServer(ctx, adminToken(), CreateServerRequest{
+		Name: "S", Domain: "s.example.test", OwnerIDs: []string{"usr_owner"},
+		AdminGroupIDs: []string{testAdminGroupID}, ManagedRuntimeOnly: &managed,
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	_, err = svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if !errors.Is(err, ErrServerManagedRuntimeOnly) {
+		t.Fatalf("vllm create on managed-only server: err = %v, want ErrServerManagedRuntimeOnly", err)
+	}
+
+	_, err = svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http"})
+	if errors.Is(err, ErrServerManagedRuntimeOnly) {
+		t.Fatalf("server_agent create on managed-only server incorrectly gated: err = %v", err)
+	}
+
+	// A normal (non-managed-only) server is unaffected.
+	plain := createTestServer(t, svc, "S2", "s2.example.test")
+	if _, err := svc.CreateApplication(ctx, ownerToken(), plain.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"}); err != nil {
+		t.Fatalf("vllm create on a plain server: %v, want success", err)
+	}
+}
+
+// --- Task 6: runtime timeout warning ----------------------------------------
+
+func TestRuntimeWarningsTimeoutBelowStartup(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	// No runtime spec yet -- non-nil empty, no warning.
+	warnings, err := svc.RuntimeWarnings(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("RuntimeWarnings: %v", err)
+	}
+	if warnings == nil || len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want non-nil empty", warnings)
+	}
+
+	// An ENABLED spec with a 60s startup timeout (60000ms) exceeds the
+	// application's stored TimeoutMS (seedServerAgentApplication leaves it at
+	// the zero value) -- must warn.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Binary: "/bin/x", Enabled: true, StartupTimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	warnings, err = svc.RuntimeWarnings(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("RuntimeWarnings: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0] != "timeout_ms_below_startup_timeout" {
+		t.Fatalf("warnings = %#v, want [timeout_ms_below_startup_timeout]", warnings)
+	}
+
+	// Raising the application's TimeoutMS to/above the 60000ms threshold
+	// clears the warning.
+	raised := 90000
+	if _, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{TimeoutMS: &raised}); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	warnings, err = svc.RuntimeWarnings(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("RuntimeWarnings: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings after raising timeout_ms = %#v, want none", warnings)
+	}
+}
+
+// TestRuntimeWarningsIgnoresDisabledSpecs pins the "ENABLED specs" wording:
+// a disabled spec's startup timeout must never count toward the max.
+func TestRuntimeWarningsIgnoresDisabledSpecs(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	// Enabled:false with a huge startup timeout -- must not trigger the
+	// warning even though the application's TimeoutMS (zero value here) is
+	// nowhere near it.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Binary: "/bin/x", Enabled: false, StartupTimeoutSeconds: 600,
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	warnings, err := svc.RuntimeWarnings(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("RuntimeWarnings: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none (spec is disabled)", warnings)
+	}
+}
