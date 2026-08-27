@@ -367,10 +367,19 @@ independent implementations must agree on:
 **A server with no `server_agent` application returns a fully zeroed document**
 (`router_listen` 0, `max_processes` 0, all arrays empty) as a normal 200 with a
 stable, reproducible ETag — not a partially populated one carrying the server's
-real GPU budgets or process limit, and never an error. It mirrors
-`/proxy-routes`' all-or-nothing "reads never fail" degradation; without a router
-port there is nothing to apply budgets against; and it keeps the empty-document
-ETag trivially reproducible.
+real GPU budgets or process limit, and never an error: without a router port
+there is nothing to apply budgets against, and it keeps the empty-document ETag
+trivially reproducible. `/proxy-routes` answers its own genuinely-empty cases
+the same way (unknown server, or a server out of https-auto-switch scope).
+
+**Neither endpoint degrades a store failure into that empty answer.** Both used
+to — "reads never fail" — and both now propagate it as a 500 instead, because
+on both endpoints a well-formed empty body is not an absence of instruction but
+a **teardown**: the runtime agent drops its router listener and drains every
+spec, and the proxy agent closes every TLS listener it is running. A 500 is the
+safe answer on both, since each client keeps its last known-good state on a
+non-200. The empty document is reserved for the cases that genuinely mean
+"nothing here".
 
 ### 5.2 WebSocket frames and the runtime report
 

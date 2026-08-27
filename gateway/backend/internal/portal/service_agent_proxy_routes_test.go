@@ -165,10 +165,13 @@ func TestAgentProxyRoutesSelectedModeRequiresInclude(t *testing.T) {
 	}
 }
 
-// TestAgentProxyRoutesUnknownOrEmptyServerReturnsEmptyNoError mirrors the
-// "reads never fail" convention used elsewhere in this file (NetbirdOnly,
-// CertHTTPSSwitchMode): a server that does not exist, or an empty serverID,
-// is the same safe empty default as out-of-scope -- never an error.
+// TestAgentProxyRoutesUnknownOrEmptyServerReturnsEmptyNoError pins the
+// GENUINELY-empty cases: a server that does not exist (store.ErrNotFound), or
+// an empty serverID, is the same safe empty default as out-of-scope -- never
+// an error. It is the other half of
+// TestAgentProxyRoutesPropagatesTransientServerAndSettingsReadFailures below,
+// and the reason that fix discriminates on store.ErrNotFound rather than
+// propagating every AIServerByID error.
 func TestAgentProxyRoutesUnknownOrEmptyServerReturnsEmptyNoError(t *testing.T) {
 	svc, ctx := certEnv(t)
 	if dto, err := svc.AgentProxyRoutes(ctx, "does-not-exist"); err != nil || len(dto.Routes) != 0 {
@@ -218,24 +221,74 @@ func TestAgentProxyRoutesPreservesExplicitProxyListenPort(t *testing.T) {
 	}
 }
 
-// TestAgentProxyRoutesSettingsReadFailureIsSafeEmpty mirrors NetbirdOnly's
-// nil-safe convention: a settings-store read glitch must never be reported to
-// the agent as a hard error, only as the same safe empty default as
-// out-of-scope.
-func TestAgentProxyRoutesSettingsReadFailureIsSafeEmpty(t *testing.T) {
-	svc, ctx := certEnv(t)
-	setHTTPSSwitchMode(t, svc, ctx, "auto")
-	mustCreateSwitchTestServer(t, svc, ctx, "srv-g", "")
-	mustCreateSwitchTestApp(t, svc, ctx, "app-g1", "srv-g", 7000, 0)
+// TestAgentProxyRoutesPropagatesTransientServerAndSettingsReadFailures is the
+// proxy-route half of C1, decided separately from it rather than inherited by
+// silence.
+//
+// This method used to answer BOTH reads' failures with the safe-empty route
+// list and err == nil, on NetbirdOnly's "reads never fail" convention. That
+// convention belongs to accessors whose signature has no error channel at all
+// (NetbirdOnly returns a bare bool, so a glitch has to become SOME value);
+// this one returns an error, its only caller already answers a non-nil error
+// with 500, and the agent's Fetch already keeps its current routes on any
+// non-200. Collapsing here therefore throws away the one signal every layer
+// downstream is built to handle.
+//
+// What the collapse costs, concretely -- an EMPTY route list is not "the
+// agent runs no local TLS proxy", it is a TEARDOWN of the ones it is running:
+//
+//   - Driver.SyncRoutes applies the empty set (only a fetch ERROR keeps the
+//     current routes), and Manager.reconcileLocked closes every listener no
+//     longer desired -- proxy_test.go's TestManagerDrainsRemovedRoute pins
+//     exactly that: the dropped listener stops accepting and leaves Status().
+//   - Every app already proxy-switched has scheme https + ProxyListenPort, so
+//     routing.ApplicationEndpoint points at the port just closed: connection
+//     refused for every request AND for the health probe.
+//   - ReconcileHTTPSSwitch cannot undo it. The torn-down route is MISSING from
+//     the status snapshot, not explicitly tls_active=false, and a missing route
+//     is deliberately never a revert (an agent that merely went silent must not
+//     lose a working switch). The unconditional scope-exit revert does not
+//     apply either: the server is still in scope -- the collapse happened
+//     BEFORE the scope test.
+//   - Recovery waits for the agent's next certificate-poll tick, which is the
+//     cadence SyncRoutes rides: 6h on the WebSocket transport, 15m on POST.
+//
+// store.ErrNotFound stays the genuinely-empty case, exactly as in
+// AgentRuntimeConfig: no such server row really does mean "no routes".
+func TestAgentProxyRoutesPropagatesTransientServerAndSettingsReadFailures(t *testing.T) {
+	t.Run("server read failure", func(t *testing.T) {
+		transient := errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+		svc, ctx := certEnv(t)
+		setHTTPSSwitchMode(t, svc, ctx, "auto")
+		mustCreateSwitchTestServer(t, svc, ctx, "srv-g0", "")
+		mustCreateSwitchTestApp(t, svc, ctx, "app-g0", "srv-g0", 7000, 0)
 
-	svc.settings = &failSystemSettingsReadAt{SystemSettingsStore: svc.settings, failAt: 1, failErr: errors.New("settings down")}
-	dto, err := svc.AgentProxyRoutes(ctx, "srv-g")
-	if err != nil {
-		t.Fatalf("settings read failure must be a safe empty default, not an error: %v", err)
-	}
-	if len(dto.Routes) != 0 {
-		t.Fatalf("routes = %+v, want empty on a settings read failure", dto.Routes)
-	}
+		svc.routes = &failAIServerByIDStore{Store: svc.routes, err: transient}
+		dto, err := svc.AgentProxyRoutes(ctx, "srv-g0")
+		if err == nil {
+			t.Fatalf("AgentProxyRoutes returned dto = %+v with a nil error; a transient server read failure must be propagated, never collapsed into the empty route list", dto)
+		}
+		if !errors.Is(err, transient) {
+			t.Fatalf("err = %v, want it to wrap %v", err, transient)
+		}
+	})
+
+	t.Run("settings read failure", func(t *testing.T) {
+		transient := errors.New("settings down")
+		svc, ctx := certEnv(t)
+		setHTTPSSwitchMode(t, svc, ctx, "auto")
+		mustCreateSwitchTestServer(t, svc, ctx, "srv-g", "")
+		mustCreateSwitchTestApp(t, svc, ctx, "app-g1", "srv-g", 7000, 0)
+
+		svc.settings = &failSystemSettingsReadAt{SystemSettingsStore: svc.settings, failAt: 1, failErr: transient}
+		dto, err := svc.AgentProxyRoutes(ctx, "srv-g")
+		if err == nil {
+			t.Fatalf("AgentProxyRoutes returned dto = %+v with a nil error; a transient settings read failure must be propagated, never collapsed into the empty route list", dto)
+		}
+		if !errors.Is(err, transient) {
+			t.Fatalf("err = %v, want it to wrap %v", err, transient)
+		}
+	})
 }
 
 // failApplicationsByServerStore injects an ApplicationsByServer failure onto an

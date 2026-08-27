@@ -8,8 +8,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 )
 
 // AgentProxyRoutesDTO is the P4 gateway-guided TLS-proxy topology handed to a
@@ -53,25 +55,52 @@ type AgentProxyRouteDTO struct {
 // not already have one, persisted immediately via UpdateApplication so the port
 // is stable across calls and matches what the switch reconcile routes to.
 //
-// A missing/unreadable server or settings store resolves to the same safe
-// empty-routes default as out-of-scope (mirrors the NetbirdOnly/
-// CertHTTPSSwitchMode "reads never fail" convention elsewhere in this file) --
-// an agent must never be left thinking a route exists that a transient portal
-// glitch merely failed to report. A failure reading or persisting the
-// server's applications IS propagated as a real error, since a partial
-// port-assignment write is exactly the kind of state corruption that must
-// surface rather than be silently swallowed.
+// The empty route list means exactly one thing: "this server runs no
+// gateway-guided TLS proxy" -- an empty serverID, no such AIServer row
+// (store.ErrNotFound), or a server out of https-auto-switch scope. EVERY
+// OTHER store error is propagated, like the ApplicationsByServer read below.
+//
+// That split is the proxy-route half of the runtime config's C1 fix, and it
+// replaced the opposite posture, so the reasoning is worth keeping. Both
+// reads above used to collapse ANY failure into the safe-empty list WITH
+// err == nil, on the NetbirdOnly/CertHTTPSSwitchMode "reads never fail"
+// convention. That convention belongs to accessors with no error channel at
+// all (NetbirdOnly returns a bare bool, so a glitch must become SOME value).
+// Here it discards the one signal every layer downstream is built to handle:
+// handleAgentProxyRoutes already answers a non-nil error with 500, and the
+// agent's RoutesClient.Fetch already keeps its current routes on any non-200.
+//
+// And the empty list is not an absence of instruction, it is a TEARDOWN:
+// Driver.SyncRoutes applies it (only a fetch ERROR keeps the current routes)
+// and the proxy Manager closes every listener no longer desired. Every app
+// already proxy-switched then points routing.ApplicationEndpoint at a closed
+// port -- connection refused for requests and for the health probe -- and
+// ReconcileHTTPSSwitch cannot undo it: a torn-down route is MISSING from the
+// status snapshot rather than explicitly tls_active=false, and a missing
+// route is deliberately never a revert. The scope-exit revert does not apply
+// either, because the server is still in scope: the collapse happened before
+// the scope test. Recovery would wait for the agent's next certificate-poll
+// tick, the cadence SyncRoutes rides -- 6h on WebSocket, 15m on POST.
+//
+// A failure reading or persisting the server's applications was already
+// propagated, since a partial port-assignment write is exactly the kind of
+// state corruption that must surface rather than be silently swallowed.
 func (s *Service) AgentProxyRoutes(ctx context.Context, serverID string) (AgentProxyRoutesDTO, error) {
 	if serverID == "" || s.routes == nil || s.settings == nil {
 		return agentProxyRoutesDTO(nil), nil
 	}
 	server, err := s.routes.AIServerByID(ctx, serverID)
 	if err != nil {
-		return agentProxyRoutesDTO(nil), nil
+		if errors.Is(err, store.ErrNotFound) {
+			// The genuinely-empty case: no such server row. Same safe empty
+			// list as out-of-scope, and the same err == nil.
+			return agentProxyRoutesDTO(nil), nil
+		}
+		return AgentProxyRoutesDTO{}, err
 	}
 	values, err := s.settings.SystemSettings(ctx)
 	if err != nil {
-		return agentProxyRoutesDTO(nil), nil
+		return AgentProxyRoutesDTO{}, err
 	}
 	if !httpsSwitchInScope(server, CertHTTPSSwitchMode(values)) {
 		return agentProxyRoutesDTO(nil), nil
