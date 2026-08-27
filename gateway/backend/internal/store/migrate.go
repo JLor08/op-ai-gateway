@@ -98,6 +98,7 @@ var migrations = []migration{
 	{version: 65, name: "agent_runtime_manager", up: migration65Up},
 	{version: 66, name: "server_runtime_limits", up: migration66Up},
 	{version: 67, name: "server_runtime_reports", up: migration67Up},
+	{version: 68, name: "application_single_server_agent", up: migration68Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2945,4 +2946,64 @@ func migration67Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		updated_at   ` + ts + ` not null
 	)`
 	return execTx(ctx, tx, dl, stmt)
+}
+
+// migration68Up adds the database-level guarantee behind the "at most one
+// server_agent application per AI server" invariant: a PARTIAL unique index on
+// applications(server_id) restricted to type = 'server_agent'. The
+// authoritative enforcement is in the portal service
+// (CreateApplication/UpdateApplication return
+// portal.ErrServerAgentApplicationExists); this index is defence in depth for
+// any future write path that forgets the gate. It matters because
+// portal.AgentRuntimeConfig derives a server's entire agent runtime-config
+// document from THE server_agent application — with two of them, whichever
+// the store returns first wins and configuration edited under the other one
+// persists but never reaches the agent.
+//
+// WHY IT CANNOT FAIL ON LIVE DATA. Two independent reasons:
+//
+//  1. 'server_agent' is not a value that any released deployment can hold.
+//     The type is only writable through portal.normalizeApplicationType, and
+//     that function first accepted "server_agent" in the same (unreleased)
+//     feature branch as migrations 65–67. A database migrated from any
+//     shipped version therefore has zero rows matching this index's WHERE
+//     clause, so creating it is a no-op on real data.
+//  2. Belt and braces for a pre-invariant DEVELOPMENT database of that same
+//     branch, which could have collected two such rows before the service
+//     gate existed: the duplicate pre-check below skips index creation
+//     instead of aborting. A migration failure here would refuse to start
+//     the gateway, and this index is a redundant guard, not the primary
+//     enforcement — bricking startup over it would trade a silent
+//     misconfiguration for a hard outage. The version is still recorded, so
+//     the skip is not retried on the next boot; such a database keeps the
+//     service-layer gate only, and the operator can delete the extra
+//     application and re-create the index by hand.
+//
+// Both dialects support partial and IF NOT EXISTS indexes (SQLite ≥ 3.8.0,
+// PostgreSQL ≥ 9.5), so no dialect branch is needed. The index name is
+// lower-case and unquoted, so PostgreSQL's identifier folding is a non-issue.
+//
+// NOTE: if the index ever does fire, the SQL store classifies it as
+// ErrConflict, which the portal maps to "application.port_conflict" — a
+// misleading code. That is accepted: the service-layer gate returns the
+// honest sentinel on every reachable path, and distinguishing WHICH unique
+// constraint failed would mean parsing dialect-specific error text.
+func migration68Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	row := tx.QueryRowContext(ctx, dl.rebind(`
+		select count(*) from (
+			select server_id from applications
+			where type = 'server_agent'
+			group by server_id
+			having count(*) > 1
+		) dup`))
+	var offenders int
+	if err := row.Scan(&offenders); err != nil {
+		return fmt.Errorf("check duplicate server_agent applications: %w", err)
+	}
+	if offenders > 0 {
+		// See reason 2 above: leave the index off rather than fail the boot.
+		return nil
+	}
+	return execTx(ctx, tx, dl, `create unique index if not exists idx_applications_single_server_agent
+		on applications(server_id) where type = 'server_agent'`)
 }

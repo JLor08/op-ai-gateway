@@ -561,8 +561,12 @@ func TestCreateApplicationServerAgentDefaultTimeoutIsColdStartAware(t *testing.T
 	}
 
 	// An explicit non-zero TimeoutMS is never overridden, for server_agent or
-	// any other type.
-	explicit, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+	// any other type. This second server_agent application needs its OWN
+	// server: at most one server_agent application per AI server is allowed
+	// (ErrServerAgentApplicationExists), and that invariant is not what this
+	// test is about.
+	second := createTestServer(t, svc, "S2", "s2.example.test")
+	explicit, err := svc.CreateApplication(context.Background(), ownerToken(), second.ID, CreateApplicationRequest{
 		Type: routing.ProviderServerAgent, Port: 9001, Scheme: "http", TimeoutMS: 12345,
 	})
 	if err != nil {

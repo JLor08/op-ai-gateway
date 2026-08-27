@@ -69,6 +69,23 @@ var (
 	// ErrServerRuntimeLimitInvalid rejects a negative
 	// CreateServerRequest/UpdateServerRequest.RuntimeMaxProcesses.
 	ErrServerRuntimeLimitInvalid = errors.New("server.runtime_limit_invalid")
+	// ErrServerAgentApplicationExists rejects a CreateApplication or
+	// UpdateApplication that would leave an AI server with more than ONE
+	// routing.ProviderServerAgent application. That is a load-bearing
+	// invariant, not tidiness: a server's single server_agent Application row
+	// backs the agent's single router port, and AgentRuntimeConfig derives
+	// the whole runtime-config document from THAT application. With two such
+	// rows the document is built from whichever one the store returns first
+	// (ids are random hex and the store orders by id), so runtime
+	// configuration edited under the other one would persist in the store
+	// and never reach the agent -- the portal would accept configuration
+	// that silently never takes effect.
+	//
+	// Enforced on BOTH write paths: create, and update (retyping an existing
+	// application to server_agent is the easy way past a create-only gate).
+	// HTTP 409 -- a conflict with the server's existing configuration, not a
+	// malformed request (mirrors ErrServerManagedRuntimeOnly above).
+	ErrServerAgentApplicationExists = errors.New("application.server_agent_exists")
 )
 
 const (
@@ -785,6 +802,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	// First match wins. That is DETERMINISTIC only because of the "at most one
+	// server_agent application per AI server" invariant enforced by
+	// CreateApplication/UpdateApplication (ErrServerAgentApplicationExists)
+	// and backed by the partial unique index from migration 68 -- it is not
+	// an arbitrary pick. Without that invariant this loop would silently
+	// choose by id ordering (ids are random hex, and the store orders by id),
+	// so runtime configuration edited under the other application would
+	// persist and never reach the agent. Do not relax the invariant without
+	// giving this lookup a real tie-break.
 	var agentApp *routing.Application
 	for i := range apps {
 		if apps[i].Type == routing.ProviderServerAgent {

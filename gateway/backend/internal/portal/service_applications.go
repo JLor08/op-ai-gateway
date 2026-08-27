@@ -327,6 +327,15 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	if proxyPortTaken {
 		return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
 	}
+	if appType == routing.ProviderServerAgent {
+		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, "")
+		if err != nil {
+			return ApplicationDTO{}, err
+		}
+		if exists {
+			return ApplicationDTO{}, ErrServerAgentApplicationExists
+		}
+	}
 	// Seal the upstream token up front so a disk-store-without-key rejection surfaces
 	// BEFORE anything is persisted ("" seals to "" = no token).
 	sealedToken, err := capture.SealSecret(s.cipher, s.settingsVolatile, req.APIToken)
@@ -479,6 +488,23 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		if proxyPortTaken {
 			return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
+		}
+	}
+	// The same "at most one server_agent application per server" invariant the
+	// create path enforces. Gated on req.Type being present AND resolving to
+	// server_agent: an update that does not touch the type is never refused
+	// here, so ordinary edits to an application on a server that already
+	// violates the invariant (only reachable on a pre-invariant dev database)
+	// keep working instead of becoming un-editable. app.ID is excluded, so
+	// re-sending the same type on the server's own server_agent application is
+	// not a self-collision.
+	if req.Type != nil && appType == routing.ProviderServerAgent {
+		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, app.ID)
+		if err != nil {
+			return ApplicationDTO{}, err
+		}
+		if exists {
+			return ApplicationDTO{}, ErrServerAgentApplicationExists
 		}
 	}
 	if req.Type != nil {
@@ -878,6 +904,33 @@ func (s *Service) proxyListenPortTakenOnServer(ctx context.Context, serverID str
 			continue
 		}
 		if app.ProxyListenPort == port {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// serverAgentApplicationExistsOnServer reports whether serverID already has a
+// routing.ProviderServerAgent application other than excludeAppID (pass "" on
+// the create path; the updated application's own id on the update path, so a
+// no-op retype of the server's own server_agent application is not a
+// self-collision).
+//
+// Mirrors proxyListenPortTakenOnServer above: one ApplicationsByServer read,
+// no store-layer support needed. Callers gate on the requested type first, so
+// the extra read only happens for a write that actually targets
+// server_agent. See ErrServerAgentApplicationExists for why the invariant
+// matters.
+func (s *Service) serverAgentApplicationExistsOnServer(ctx context.Context, serverID, excludeAppID string) (bool, error) {
+	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	for _, app := range apps {
+		if app.ID == excludeAppID {
+			continue
+		}
+		if app.Type == routing.ProviderServerAgent {
 			return true, nil
 		}
 	}

@@ -203,6 +203,11 @@ var portalApplicationErrRows = []errRow{
 	// server's own configuration), not a 400 -- the request shape is fine,
 	// it is simply refused given the server's current state.
 	{err: portal.ErrServerManagedRuntimeOnly, status: http.StatusConflict, code: "application.managed_runtime_only", msg: "server is restricted to agent-managed runtime applications"},
+	// ErrServerAgentApplicationExists is a 409 for the same reason as
+	// ErrServerManagedRuntimeOnly above: the request shape is valid, it
+	// conflicts with the server's existing configuration (it already has the
+	// one server_agent application it is allowed).
+	{err: portal.ErrServerAgentApplicationExists, status: http.StatusConflict, code: "application.server_agent_exists", msg: "server already has a server_agent application"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 
