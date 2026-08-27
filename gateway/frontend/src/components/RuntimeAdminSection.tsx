@@ -201,6 +201,28 @@ function runtimeStateLabel(state: string, t: Translation): string {
   return key ? t[key] : state;
 }
 
+// The file-mode `parse_error` codes, mapped to the sentence the operator
+// reads. The field carries a CODE from a closed set and NEVER free text: the
+// agent classifies its own parse failure (`json_syntax`, `duplicate_spec_id`,
+// plus an `unclassified` floor) and the gateway allow-lists the two real codes,
+// degrading anything else to its own generic constant. That contract is
+// THREE-SIDED and no compiler checks either seam -- adding a code means the
+// agent's set, the gateway's allow-list, and this map plus its two i18n keys.
+const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
+  json_syntax: 'runtimeParseErrorJsonSyntax',
+  duplicate_spec_id: 'runtimeParseErrorDuplicateSpecId',
+};
+
+// Unlike runtimeStateLabel above, an unrecognised value does NOT fall back to
+// the raw wire value: the whole point of the closed set is that the operator
+// is never shown an identifier. A code this build does not know -- a newer
+// agent, the agent's `unclassified` floor, or the gateway's generic constant
+// for a value outside its allow-list -- says so in a sentence instead.
+function runtimeParseErrorReason(code: string, t: Translation): string {
+  const key = runtimeParseErrorReasonByCode[code];
+  return key ? t[key] : t.runtimeParseErrorUnknown;
+}
+
 // The portal has exactly THREE status colours: the theme defines
 // success/watch/standby pairs and nothing else (theme/ThemeRoot.tsx), and
 // statusClassByKey collapses `error`/`disabled`/`expired` onto standby
@@ -1262,6 +1284,13 @@ export function RuntimeAdminSection({
   // `config` is whatever survived (possibly the zero value), so it must not be
   // rendered at all -- and this, not a missing tooltip, is what the operator
   // needs to see.
+  //
+  // The value is a CODE (runtimeParseErrorReasonByCode), and every gate below
+  // tests TRUTHINESS rather than membership of that map, deliberately: a code
+  // this build does not recognise still means "the agent could not parse its
+  // file", so the unusable config must stay suppressed. The field is
+  // `omitempty` on the wire, so a HEALTHY agent sends nothing here and none of
+  // these gates fire.
   const parseError = reportContent?.parse_error ?? '';
   const reportConfig = useMemo(
     () => (fileMode && !parseError ? narrowReportConfig(reportContent?.config) : null),
@@ -2688,7 +2717,7 @@ export function RuntimeAdminSection({
             </Alert>
           )}
           {fileMode && parseError && (
-            <Alert severity="warning">{`${t.runtimeParseError} (${parseError})`}</Alert>
+            <Alert severity="warning">{`${t.runtimeParseError} ${runtimeParseErrorReason(parseError, t)}`}</Alert>
           )}
           {fileMode && configuredSpecCount > 0 && (
             <Alert severity="warning">{t.runtimeIneffectiveSpecs}</Alert>

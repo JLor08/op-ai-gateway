@@ -618,6 +618,9 @@ const de = {
   runtimeAgentNeverReported:
     'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber es liegt noch keine Agent-Telemetrie vor: Der Agent hat sich noch nie gemeldet. Die Spezifikationen bleiben wirkungslos, bis der Agent auf diesem Server installiert und verbunden ist.',
   runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht auswerten.',
+  runtimeParseErrorJsonSyntax: 'Die Datei ist kein gültiges JSON.',
+  runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
+  runtimeParseErrorUnknown: 'Der Grund wurde nicht übermittelt.',
   runtimeConfigUnavailable: 'Die gemeldete Konfiguration ist deshalb nicht verfügbar.',
   runtimeConfigUnrecognised:
     'Teile der gemeldeten Konfiguration haben ein unbekanntes Format und werden nicht angezeigt.',
@@ -2449,6 +2452,9 @@ const en: PortalMessages = {
   runtimeAgentNeverReported:
     'This server has runtime specs configured, but no agent telemetry exists yet: the agent has never reported. The specs stay ineffective until the agent is installed on this server and connected.',
   runtimeParseError: 'The agent could not parse its local configuration file.',
+  runtimeParseErrorJsonSyntax: 'The file is not valid JSON.',
+  runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
+  runtimeParseErrorUnknown: 'The reason was not reported.',
   runtimeConfigUnavailable: 'The reported configuration is therefore unavailable.',
   runtimeConfigUnrecognised:
     'Parts of the reported configuration have an unrecognised shape and are not shown.',

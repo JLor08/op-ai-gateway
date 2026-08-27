@@ -1750,10 +1750,20 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
 
   // Correction 5: parse_error is the agent saying it could not read its own
   // config file. In that state `config` is unusable, so it must not be shown.
-  it('surfaces parse_error prominently and stops rendering config', async () => {
-    renderFileMode(fileConfig, { parse_error: 'yaml' });
-    expect(await screen.findByText(t.runtimeParseError, { exact: false })).toBeInTheDocument();
-    expect(screen.getByText('yaml', { exact: false })).toBeInTheDocument();
+  //
+  // C2 fix round: the field carries a CODE from a closed set
+  // (`json_syntax`, `duplicate_spec_id`, and the agent's `unclassified`
+  // floor), never free text -- so the operator must be shown a sentence, not
+  // the identifier. The gating stays truthiness-based, which is why the
+  // unknown-code case below still suppresses the config exactly as a known
+  // one does.
+  it('surfaces parse_error as a sentence, not a code, and stops rendering config', async () => {
+    renderFileMode(fileConfig, { parse_error: 'json_syntax' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorJsonSyntax}`),
+    ).toBeInTheDocument();
+    // The raw code never reaches the operator.
+    expect(screen.queryByText('json_syntax', { exact: false })).not.toBeInTheDocument();
     expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
@@ -1762,6 +1772,43 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
         screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha` }),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  it('maps the duplicate_spec_id code to its own sentence', async () => {
+    renderFileMode(fileConfig, { parse_error: 'duplicate_spec_id' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorDuplicateSpecId}`),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('duplicate_spec_id', { exact: false })).not.toBeInTheDocument();
+  });
+
+  // A code this build does not know: the agent's `unclassified` floor, a code
+  // added on the agent side ahead of the portal, or the gateway's own generic
+  // constant for a value outside its allow-list. All three must degrade to
+  // one honest sentence rather than printing an identifier -- and must still
+  // suppress the unusable config, which is why the gate is truthiness and not
+  // a code lookup.
+  it('falls back to the unknown-reason sentence for a code it does not recognise', async () => {
+    renderFileMode(fileConfig, { parse_error: 'config parse error' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorUnknown}`),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
+  });
+
+  // The HEALTHY file-mode path, which four rounds of review never asked
+  // about: `parse_error` is `omitempty`, so a healthy agent sends no field at
+  // all. The gateway used to fabricate one here (its redaction had no
+  // empty-input case), which meant every healthy file-mode server showed the
+  // parse-error banner with its config view suppressed, permanently. Fixed on
+  // the backend; this pins the frontend half of the same contract.
+  it('shows no parse-error banner at all when the agent reports none', async () => {
+    renderFileMode();
+    expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeParseError, { exact: false })).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeConfigUnavailable)).not.toBeInTheDocument();
+    // ... and the config it could not have parsed is on screen.
+    expect(screen.getByText('File-Alpha')).toBeInTheDocument();
   });
 
   // Correction 6: `config` is typed `unknown` on purpose -- it is whatever

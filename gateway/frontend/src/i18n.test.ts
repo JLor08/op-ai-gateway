@@ -1938,6 +1938,12 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
       'runtimeRestartTimeout',
       'runtimeRestartVanished',
       'runtimeParseError',
+      // C2 fix round: parse_error is a closed set of CODES, not free
+      // text, so the portal owns one sentence per code plus a fallback
+      // for a code this build does not know.
+      'runtimeParseErrorJsonSyntax',
+      'runtimeParseErrorDuplicateSpecId',
+      'runtimeParseErrorUnknown',
       'runtimeConfigUnavailable',
       'runtimeConfigUnrecognised',
       'runtimeFeatureMismatch',
