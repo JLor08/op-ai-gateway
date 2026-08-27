@@ -4,7 +4,12 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -418,5 +423,117 @@ func TestStatusAndLastErrorJSONTags(t *testing.T) {
 		if _, ok := le[key]; !ok {
 			t.Errorf("last_error missing key %q in %s", key, decoded["last_error"])
 		}
+	}
+}
+
+// TestParseConfigErrorsAreAllClassified is C2's agent-side pin: EVERY error
+// the real ParseConfig can produce must carry a ParseErrorCode from the
+// closed set, because that code -- and nothing else -- is what the file-mode
+// report sends upward for an operator to read.
+//
+// The table is the exhaustive reachable surface, not a sample. Config, Spec
+// and GPUBudget declare no custom UnmarshalJSON, so a malformed document can
+// only fail in two places: json.Unmarshal (syntax errors and type mismatches,
+// including the whole-document non-object cases) and the duplicate-spec-id
+// check. Both are covered below in several shapes each.
+//
+// It also pins the literal wire VALUES. They are a three-sided contract --
+// this set, the gateway's allow-list (redactRuntimeReportParseError), and the
+// portal's i18n label map -- and no compiler checks any of those seams, so a
+// rename has to fail here.
+func TestParseConfigErrorsAreAllClassified(t *testing.T) {
+	if ParseErrorJSONSyntax != "json_syntax" || ParseErrorDuplicateSpecID != "duplicate_spec_id" {
+		t.Fatalf("the wire values changed (%q, %q): the gateway's allow-list and the portal's i18n labels must change in the same unit of work",
+			ParseErrorJSONSyntax, ParseErrorDuplicateSpecID)
+	}
+	closed := map[ParseErrorCode]bool{
+		ParseErrorJSONSyntax:      true,
+		ParseErrorDuplicateSpecID: true,
+	}
+
+	const dupSpecs = `{"specs":[{"id":"dup","binary":"/bin/a"},{"id":"dup","binary":"/bin/b"}]}`
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want ParseErrorCode
+	}{
+		{"truncated object", `{not json`, ParseErrorJSONSyntax},
+		{"empty input", ``, ParseErrorJSONSyntax},
+		{"trailing comma", `{"router_listen":1,}`, ParseErrorJSONSyntax},
+		{"bare array", `[]`, ParseErrorJSONSyntax},
+		{"bare string", `"nope"`, ParseErrorJSONSyntax},
+		{"null document", `null-ish`, ParseErrorJSONSyntax},
+		{"int field given a string", `{"router_listen":"8080"}`, ParseErrorJSONSyntax},
+		{"specs given an object", `{"specs":{"a":1}}`, ParseErrorJSONSyntax},
+		{"spec env given a string", `{"specs":[{"id":"a","env":"HF_TOKEN=sk-secret"}]}`, ParseErrorJSONSyntax},
+		{"coresident pair given numbers", `{"coresident":[[1,2]]}`, ParseErrorJSONSyntax},
+		{"gpu budget index given a string", `{"gpu_budgets":[{"index":"zero"}]}`, ParseErrorJSONSyntax},
+		{"duplicate spec id", dupSpecs, ParseErrorDuplicateSpecID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("ParseConfig(%q) = nil error, want a classified failure", tc.raw)
+			}
+			var pe *ParseError
+			if !errors.As(err, &pe) {
+				t.Fatalf("err = %v (%T), want a *ParseError -- an unclassified error reaches the operator as the gateway's generic message", err, err)
+			}
+			if !closed[pe.Code] {
+				t.Fatalf("code = %q, which is not in the closed set; the gateway allow-lists that set and would degrade this to the generic message", pe.Code)
+			}
+			if pe.Code != tc.want {
+				t.Fatalf("code = %q, want %q", pe.Code, tc.want)
+			}
+			if got := ClassifyParseError(err); got != tc.want {
+				t.Fatalf("ClassifyParseError = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// A wrapped *ParseError still classifies (the report path may sit behind
+	// a fmt.Errorf), and a foreign error never leaks its text as a code.
+	if got := ClassifyParseError(fmt.Errorf("load %s: %w", "/etc/runtime.json", &ParseError{Code: ParseErrorJSONSyntax})); got != ParseErrorJSONSyntax {
+		t.Fatalf("wrapped classify = %q, want %q", got, ParseErrorJSONSyntax)
+	}
+	if got := ClassifyParseError(errors.New("HF_TOKEN=sk-abc123 is invalid")); got != ParseErrorUnclassified {
+		t.Fatalf("foreign classify = %q, want %q -- an unclassified error must never carry its own text onto the wire", got, ParseErrorUnclassified)
+	}
+	if got := ClassifyParseError(nil); got != "" {
+		t.Fatalf("ClassifyParseError(nil) = %q, want the empty code", got)
+	}
+}
+
+// TestFileSourceReportsOnlyTheParseErrorCode is the second half of the
+// agent-side C2 pin, at the seam that actually reaches the wire: a local file
+// whose contents are a plaintext secret in a malformed document must leave
+// NOTHING of that content in what BuildReport marshals. Before the closed
+// set, LastParseError held err.Error() and the gateway had to guess which
+// part of it was safe.
+func TestFileSourceReportsOnlyTheParseErrorCode(t *testing.T) {
+	const secret = "sk-live-51H8xQZa0000SECRET"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.json")
+	if err := os.WriteFile(path, []byte(`{"specs":[{"id":"a","env":{"HF_TOKEN":"`+secret+`"}},,]}`), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	src := NewFileSource(path)
+	cfg, _, err := src.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	code, _ := src.LastParseError()
+	if code != ParseErrorJSONSyntax {
+		t.Fatalf("code = %q, want %q", code, ParseErrorJSONSyntax)
+	}
+	raw, err := BuildReport(cfg, "file", code, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("BuildReport: %v", err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("the report carries the file's secret: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"parse_error":"json_syntax"`) {
+		t.Fatalf("report = %s, want the classification code on the wire", raw)
 	}
 }

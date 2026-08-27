@@ -179,56 +179,75 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 const runtimeReportEnvMask = "•••"
 
 // runtimeReportParseErrorGeneric is the fixed, content-free string
-// substituted for a file-mode report's ParseError whenever
-// redactRuntimeReportParseError cannot confirm the text is safe. ParseError
-// is PURELY diagnostic -- the operator needs to know the local config file
+// substituted for a file-mode report's ParseError whenever it is not one of
+// the classification codes the agent's wire contract allows. ParseError is
+// PURELY diagnostic -- the operator needs to know the local config file
 // failed to parse and roughly why, never any of the offending content -- so
 // the safe outcome is the DEFAULT here, not a fallback bolted onto a
-// keep-by-default rule (see the round-1-vs-round-2 note below).
+// keep-by-default rule.
 const runtimeReportParseErrorGeneric = "config parse error"
 
-// maxRuntimeReportClassificationLen bounds how long a kept classification
-// prefix (the text before the first ':') may be. A genuine subsystem tag
-// ("yaml", "json", "schema") is a handful of characters; anything past this
-// bound is far more likely to be actual error detail that happens to
-// contain an early colon than a real classification, so it is treated as
-// unsafe rather than kept.
-const maxRuntimeReportClassificationLen = 64
-
-// redactRuntimeReportParseError keeps a config-load error's TEXT only when
-// it looks like a bare "subsystem" classification token -- no whitespace, no
-// quote character, no '=', and no longer than
-// maxRuntimeReportClassificationLen -- and substitutes the fixed
-// runtimeReportParseErrorGeneric constant otherwise. This is the same
-// defense-in-depth concern as runtimeReportEnvMask, arriving through a
-// NEIGHBORING field: a real config-loader error routinely quotes the
-// offending source line verbatim, and that quoted content can land in EVERY
-// shape this field might take -- after a colon
-// (`yaml: line 12: mapping key "HF_TOKEN: sk-abc123"`), with NO colon at all
-// (`unexpected token "HF_TOKEN=sk-abc123" in config`), or even BEFORE the
-// first colon (`"HF_TOKEN=sk-abc123": invalid value`).
+// runtimeReportParseErrorCodes is the ALLOW-LIST half of the file-mode
+// parse-error wire contract. The producing side is the agent's
+// runtime.ParseErrorCode closed set (server-agent/internal/runtime/types.go),
+// which documents the same contract from the other end; these string values
+// and that set must change together, and the agent carries a test that fails
+// on a rename for exactly that reason. Deliberately a literal map rather than
+// an import: the two Go modules share no code, and the whole point of a
+// closed set is that this side states independently what it will accept.
 //
-// An EARLIER version of this function kept the text up to the first colon
-// unconditionally and passed a colon-less string through untouched. Review
-// caught both failure modes above: a colon-less message leaked verbatim
-// (nothing to cut), and a secret sitting BEFORE the first colon survived
-// (the split kept precisely the wrong half). The fix is to stop treating
-// "keep it" as the default and "cut it" as the exception -- instead, the
-// classification-shaped prefix is the ONLY thing ever kept, and everything
-// else -- no colon, a too-long prefix, or a prefix containing whitespace/
-// quotes/'=' (the shapes a real secret or quoted detail actually takes) --
-// degrades to the generic constant. A genuine classifier like "yaml" or
-// "json" still survives; nothing else does.
+// Not listed here (including the agent's own defensive "unclassified") means
+// the value degrades to runtimeReportParseErrorGeneric.
+var runtimeReportParseErrorCodes = map[string]bool{
+	"json_syntax":       true,
+	"duplicate_spec_id": true,
+}
+
+// redactRuntimeReportParseError keeps a file-mode report's parse_error only
+// when it is exactly one of the agent's classification codes, and returns the
+// fixed runtimeReportParseErrorGeneric constant for anything else. An EMPTY
+// input stays empty -- "this agent reported no parse failure" is not a
+// redaction case at all.
+//
+// This is defense in depth of the same kind as runtimeReportEnvMask, on a
+// neighbouring field: a config-loader error routinely quotes the offending
+// source line verbatim, and in this schema that line may legitimately hold a
+// plaintext secret (an HF_TOKEN written directly rather than as an
+// ${AGENT_ENV:NAME} placeholder). The gateway must never store agent-chosen
+// free text here, however well-behaved the agent is expected to be.
+//
+// TWO EARLIER RULES, AND WHY BOTH FAILED -- worth keeping, because each was a
+// reasonable-looking answer to the half of the problem it could see:
+//
+//  1. Round 1 kept everything up to the first ':' and passed a colon-less
+//     string through untouched. Review found two leak shapes: a colon-less
+//     message leaked verbatim (nothing to cut), and a secret sitting BEFORE
+//     the first colon survived (the split kept precisely the wrong half).
+//  2. Round 2 therefore kept the prefix ONLY when it looked like a bare
+//     classification token (no whitespace/quote/'=', bounded length). That
+//     closed the leak and broke the field: the actual producer is
+//     runtime.ParseConfig, whose every error begins "runtime: ", so the ONE
+//     reachable non-generic output for every malformed file an operator could
+//     write was the single word "runtime" -- a token that looks like a
+//     meaningful subsystem tag and carries no information whatsoever. It also
+//     rewrote the EMPTY string (the healthy case, since parse_error is
+//     omitempty) to "config parse error", so every file-mode agent whose
+//     config parsed perfectly was stored, and rendered in the portal, as one
+//     that had failed to parse -- with the portal suppressing the config view
+//     on exactly that field.
+//
+// An allow-list over a closed set ends the fight between redaction and
+// diagnosis instead of picking a winner: the wire contract STATES what this
+// field may contain, both sides can be read against it, and free text has no
+// path in at all.
 func redactRuntimeReportParseError(s string) string {
-	i := strings.IndexByte(s, ':')
-	if i < 0 || i > maxRuntimeReportClassificationLen {
-		return runtimeReportParseErrorGeneric
+	if s == "" {
+		return ""
 	}
-	prefix := s[:i]
-	if prefix == "" || strings.ContainsAny(prefix, " \t\n\r\"'=") {
-		return runtimeReportParseErrorGeneric
+	if runtimeReportParseErrorCodes[s] {
+		return s
 	}
-	return prefix
+	return runtimeReportParseErrorGeneric
 }
 
 // agentRuntimeReportSpecGPU mirrors AgentRuntimeSpecGPUDTO (portal's

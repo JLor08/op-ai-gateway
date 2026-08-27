@@ -335,7 +335,7 @@ type FileSource struct {
 	seenMod  time.Time
 	haveSeen bool // distinguishes "never successfully stat'd" from a legitimate zero seenMod
 
-	lastErr   string
+	lastErr   ParseErrorCode
 	lastErrAt time.Time
 }
 
@@ -385,7 +385,11 @@ func (s *FileSource) Load(_ context.Context) (Config, bool, error) {
 		// every subsequent poll.
 		s.seenMod = info.ModTime()
 		s.haveSeen = true
-		s.lastErr = err.Error()
+		// The CODE, never err.Error(): this value is sent upward to the
+		// gateway, and a parse error routinely quotes the offending line of
+		// a file that may legitimately hold a plaintext secret. The full
+		// detail stays in the local Debug log above. See ParseErrorCode.
+		s.lastErr = ClassifyParseError(err)
 		s.lastErrAt = time.Now()
 		current := s.cached
 		s.mu.Unlock()
@@ -405,10 +409,12 @@ func (s *FileSource) Load(_ context.Context) (Config, bool, error) {
 	return cfg, true, nil
 }
 
-// LastParseError returns the most recent parse failure's message and
-// timestamp, cleared by the next successful parse. An empty message (with
-// a zero time) means no parse failure is currently on record.
-func (s *FileSource) LastParseError() (string, time.Time) {
+// LastParseError returns the most recent parse failure's wire
+// CLASSIFICATION CODE and timestamp, cleared by the next successful parse.
+// An empty code (with a zero time) means no parse failure is currently on
+// record. The code -- never the underlying error text -- is what the
+// file-mode report carries upward; see ParseErrorCode for why.
+func (s *FileSource) LastParseError() (ParseErrorCode, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastErr, s.lastErrAt

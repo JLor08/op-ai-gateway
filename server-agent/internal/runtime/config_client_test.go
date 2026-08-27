@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -500,12 +499,9 @@ func TestFileSourceParseErrorKeepsLastGood(t *testing.T) {
 	if !reflect.DeepEqual(cfg1, cfg2) {
 		t.Fatalf("Load on broken file returned %+v, want the last known-good %+v", cfg2, cfg1)
 	}
-	msg, at := s.LastParseError()
-	if msg == "" {
-		t.Fatal("LastParseError message is empty after a parse failure")
-	}
-	if !strings.Contains(msg, "runtime") && !strings.Contains(msg, "parse") {
-		t.Fatalf("LastParseError message = %q, does not look like a parse error", msg)
+	code, at := s.LastParseError()
+	if code != ParseErrorJSONSyntax {
+		t.Fatalf("LastParseError code = %q, want %q -- the recorded value is the wire CLASSIFICATION CODE, never the error text (see ParseErrorCode)", code, ParseErrorJSONSyntax)
 	}
 	if at.Before(before) || at.After(time.Now()) {
 		t.Fatalf("LastParseError timestamp %v not within the call's window (after %v)", at, before)

@@ -80,7 +80,7 @@ func TestIngestRuntimeReport(t *testing.T) {
 
 	t.Run("malformed config does not reject the report", func(t *testing.T) {
 		srv := NewTestServer()
-		raw := json.RawMessage(`{"source":"file","parse_error":"yaml: line 4: mapping values are not allowed","config":"not-an-object"}`)
+		raw := json.RawMessage(`{"source":"file","parse_error":"json_syntax","config":"not-an-object"}`)
 		if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -88,14 +88,10 @@ func TestIngestRuntimeReport(t *testing.T) {
 		if !ok {
 			t.Fatal("report must still be stored")
 		}
-		// parse_error is redacted to its classification (the text up to the
-		// first ':') -- everything after it, including line numbers and any
-		// quoted source content, must NOT survive.
-		if !strings.Contains(report.ReportJSON, `"parse_error":"yaml"`) {
+		// parse_error is an allow-listed classification code and survives
+		// verbatim; the unusable config alongside it is dropped, not fatal.
+		if !strings.Contains(report.ReportJSON, `"parse_error":"json_syntax"`) {
 			t.Fatalf("parse_error classification not preserved: %s", report.ReportJSON)
-		}
-		if strings.Contains(report.ReportJSON, "mapping values are not allowed") || strings.Contains(report.ReportJSON, "line 4") {
-			t.Fatalf("parse_error detail beyond the classification must be redacted: %s", report.ReportJSON)
 		}
 	})
 
@@ -103,6 +99,8 @@ func TestIngestRuntimeReport(t *testing.T) {
 	// config-loader's error string (the exact leak class the env mask exists
 	// to prevent, arriving through a NEIGHBORING field -- see
 	// redactRuntimeReportParseError's doc) must never reach the stored blob.
+	// A compromised or buggy agent CAN send free text here; the allow-list is
+	// what makes that harmless.
 	t.Run("parse_error redaction strips a secret quoted after the classification", func(t *testing.T) {
 		srv := NewTestServer()
 		raw := json.RawMessage(`{"source":"file","parse_error":"yaml: line 12: found character that cannot start any token near HF_TOKEN=sk-superSecretValue123"}`)
@@ -116,8 +114,8 @@ func TestIngestRuntimeReport(t *testing.T) {
 		if strings.Contains(report.ReportJSON, "sk-superSecretValue123") {
 			t.Fatalf("stored blob leaked a secret embedded in parse_error: %s", report.ReportJSON)
 		}
-		if !strings.Contains(report.ReportJSON, `"parse_error":"yaml"`) {
-			t.Fatalf("parse_error classification not preserved: %s", report.ReportJSON)
+		if !strings.Contains(report.ReportJSON, `"parse_error":"`+runtimeReportParseErrorGeneric+`"`) {
+			t.Fatalf("free text must degrade to the generic constant: %s", report.ReportJSON)
 		}
 	})
 
@@ -142,16 +140,23 @@ func TestIngestRuntimeReport(t *testing.T) {
 	})
 }
 
-// TestIngestRuntimeReportParseErrorRedactionShapes is round 2's coverage for
-// redactRuntimeReportParseError: the round-1 "keep everything up to the
-// first colon, pass a colon-less string through untouched" rule leaked a
-// secret in two shapes (no colon at all; a secret sitting BEFORE the first
-// colon). The fixed rule only ever keeps a narrowly classification-shaped
-// prefix and substitutes runtimeReportParseErrorGeneric otherwise. Each
-// case asserts on the STORED blob (not just the pure function), because
+// TestIngestRuntimeReportParseErrorRedactionShapes is C2's gateway-side pin.
+// parse_error is now an ALLOW-LIST over the agent's closed set of
+// classification codes (runtime.ParseErrorCode): a code in the set survives
+// verbatim, EVERYTHING else degrades to runtimeReportParseErrorGeneric, and
+// an empty field stays empty.
+//
+// The table keeps every leak shape the two earlier rules failed on, so the
+// history stays covered, and adds the two failures that motivated the
+// closed set: the degenerate "runtime" output (the ONE thing the previous
+// rule could ever keep, for every malformed file an operator could write),
+// and the empty field -- which the previous rule rewrote into a fabricated
+// "config parse error" on every healthy file-mode report.
+//
+// Each case asserts on the STORED blob (not just the pure function), because
 // that is what the report view actually serves.
 func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
-	longToken := strings.Repeat("x", maxRuntimeReportClassificationLen+10)
+	longToken := strings.Repeat("x", 80)
 	generic := `"parse_error":"` + runtimeReportParseErrorGeneric + `"`
 	cases := []struct {
 		name           string
@@ -160,14 +165,41 @@ func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
 		mustNotContain []string
 	}{
 		{
-			name:           "classification retained",
-			parseError:     `yaml: line 4: could not find expected ':'`,
-			wantStored:     `"parse_error":"yaml"`,
-			mustNotContain: []string{"could not find expected", "line 4"},
+			name:       "json_syntax code kept",
+			parseError: "json_syntax",
+			wantStored: `"parse_error":"json_syntax"`,
 		},
 		{
-			// No colon anywhere: round 1 passed this through VERBATIM
-			// (clamped only). Must now degrade to the generic constant.
+			name:       "duplicate_spec_id code kept",
+			parseError: "duplicate_spec_id",
+			wantStored: `"parse_error":"duplicate_spec_id"`,
+		},
+		{
+			// The whole reason for the closed set: the previous rule kept
+			// this, and it was the only non-generic value ANY real parse
+			// failure could produce.
+			name:           "the degenerate package prefix is not a code",
+			parseError:     "runtime",
+			wantStored:     generic,
+			mustNotContain: []string{`"parse_error":"runtime"`},
+		},
+		{
+			name:           "a real ParseConfig error text is not a code",
+			parseError:     `runtime: parse config: invalid character 'n' looking for beginning of value`,
+			wantStored:     generic,
+			mustNotContain: []string{"invalid character", "looking for beginning"},
+		},
+		{
+			// The agent's own defensive floor is deliberately NOT allowed:
+			// "could not classify" and "the gateway did not recognise it"
+			// deserve the same, single generic rendering.
+			name:       "the agent's unclassified floor degrades to generic",
+			parseError: "unclassified",
+			wantStored: generic,
+		},
+		{
+			// Round 1 kept the text up to the first colon and passed a
+			// colon-less string through VERBATIM.
 			name:           "no colon at all",
 			parseError:     `unexpected token "HF_TOKEN=sk-abc123" in config`,
 			wantStored:     generic,
@@ -182,10 +214,7 @@ func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
 			mustNotContain: []string{"sk-abc123", "HF_TOKEN"},
 		},
 		{
-			// Token-shaped (no whitespace/quotes/'=') but longer than
-			// maxRuntimeReportClassificationLen: bounded, so it must NOT be
-			// kept verbatim even though it contains no dangerous characters.
-			name:           "long token-shaped prefix is bounded, not kept",
+			name:           "long token-shaped prefix",
 			parseError:     longToken + `: something failed`,
 			wantStored:     generic,
 			mustNotContain: []string{longToken},
@@ -214,6 +243,34 @@ func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIngestRuntimeReportHealthyFileModeReportHasNoParseError is the second
+// C2 defect, found while fixing the first and reproduced against 86a287b:
+// parse_error is omitempty, so a file-mode agent whose local config parsed
+// PERFECTLY sends no such field -- and the old redaction rule, which had no
+// empty-input case, rewrote that "" into the generic "config parse error".
+//
+// The consequence was not cosmetic. The portal renders parse_error as a
+// warning alert AND uses it to decide whether to render the reported config
+// at all (RuntimeAdminSection.tsx: `fileMode && !parseError ? ... : null`),
+// so EVERY healthy file-mode server permanently displayed "the agent could
+// not parse its local configuration file" with its config view suppressed.
+func TestIngestRuntimeReportHealthyFileModeReportHasNoParseError(t *testing.T) {
+	srv := NewTestServer()
+	// Exactly what runtime.BuildReport emits when the local file parsed:
+	// no parse_error key at all.
+	raw := []byte(`{"source":"file","collected_at":"2026-07-11T12:00:00Z","config":{"router_listen":9000,"max_processes":2,"gpu_budgets":[],"specs":[],"coresident":[]}}`)
+	if err := srv.ingestRuntimeReport(context.Background(), "mock-host-qwen", raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(context.Background(), "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("lookup ok=%v err=%v", ok, err)
+	}
+	if strings.Contains(report.ReportJSON, "parse_error") {
+		t.Fatalf("a healthy file-mode report was stored with a fabricated parse error: %s", report.ReportJSON)
 	}
 }
 

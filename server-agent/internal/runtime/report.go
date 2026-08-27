@@ -51,19 +51,20 @@ const envRedactedMask = "•••"
 type Report struct {
 	Source      string          `json:"source"`
 	CollectedAt time.Time       `json:"collected_at"`
-	ParseError  string          `json:"parse_error,omitempty"`
+	ParseError  ParseErrorCode  `json:"parse_error,omitempty"`
 	Config      json.RawMessage `json:"config"`
 }
 
 // BuildReport redacts every env value out of cfg, marshals the result as the
 // report's config object, and returns the fully marshaled Report ready to
 // hand to Client.PostRuntimeReport or WSSender.PostRuntimeReport verbatim.
-// source and parseErr are round-tripped unchanged (parseErr is expected to
-// already be free of embedded secrets -- Task 18's local file loader is
-// responsible for that, matching the gateway's own belt-and-suspenders
-// redactRuntimeReportParseError on ingest; this function's job is the env
-// map only).
-func BuildReport(cfg Config, source string, parseErr string, at time.Time) ([]byte, error) {
+// source and parseErr are round-tripped unchanged. parseErr is a
+// ParseErrorCode from that type's CLOSED SET, not free text -- the type is
+// what makes "free of embedded secrets" a compile-time property here rather
+// than a promise the loader is trusted to keep (the C2 fix; the gateway
+// still allow-lists the value on ingest as defense in depth). This
+// function's own job remains the env map.
+func BuildReport(cfg Config, source string, parseErr ParseErrorCode, at time.Time) ([]byte, error) {
 	cfgRaw, err := json.Marshal(redactConfigEnv(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("runtime: marshal report config: %w", err)

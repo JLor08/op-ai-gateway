@@ -19,6 +19,7 @@ package runtime
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -78,6 +79,89 @@ type Config struct {
 	ETag       string      `json:"etag"`
 }
 
+// ParseErrorCode is the CLOSED set of classification codes the agent may
+// report for a failed local runtime-config load. It is a wire contract, not
+// an internal enum: the value travels upward in a file-mode report's
+// parse_error field, the gateway allow-lists it verbatim
+// (redactRuntimeReportParseError in
+// gateway/backend/internal/gateway/agent_runtime.go), and the portal maps it
+// to a localized sentence.
+//
+// WHY A CODE AND NOT THE ERROR TEXT (the C2 fix). parse_error exists so an
+// operator learns roughly WHY their local file was not adopted, and the
+// gateway must never store text an agent chose freely -- a config-loader
+// error routinely quotes the offending source line, which in this schema can
+// be a plaintext secret. The gateway used to reconcile those two by keeping
+// only the text before the first ':' when it looked like a bare
+// classification token. Against THIS producer that rule had exactly one
+// reachable output: every error ParseConfig can return begins "runtime: ",
+// so every operator, for every malformed file, read the single word
+// "runtime" -- a token that looks like a meaningful subsystem tag and
+// carries no information at all. Redaction and diagnosis were fighting each
+// other, and redaction won completely.
+//
+// A closed set ends that fight: the agent states what the field may contain,
+// the gateway allow-lists exactly those values (anything else degrades to
+// its generic constant, so a buggy or compromised agent still cannot put
+// free text in front of an operator), and the portal owns the wording.
+//
+// ADDING A CODE IS A THREE-SIDED CHANGE. A new code must be added here, to
+// the gateway's allow-list, and to the portal's i18n label map (German and
+// English together) -- a code the gateway does not know degrades to the
+// generic message, which is safe but silently drops the diagnosis this
+// mechanism exists to deliver. TestParseConfigErrorsAreAllClassified pins
+// that every error ParseConfig can actually produce carries one of these.
+type ParseErrorCode string
+
+const (
+	// ParseErrorJSONSyntax: the bytes are not valid JSON, or a value does
+	// not fit its field's type. Every stdlib json.Unmarshal failure --
+	// SyntaxError and UnmarshalTypeError alike -- lands here: the two are
+	// not worth separating for an operator who has to open the file either
+	// way, and Config/Spec/GPUBudget declare no custom UnmarshalJSON, so
+	// those two are the whole surface.
+	ParseErrorJSONSyntax ParseErrorCode = "json_syntax"
+	// ParseErrorDuplicateSpecID: two specs share an id. Structural, and
+	// deliberately fatal to the whole document -- see ParseConfig.
+	ParseErrorDuplicateSpecID ParseErrorCode = "duplicate_spec_id"
+	// ParseErrorUnclassified is the defensive floor for a load failure that
+	// carries no *ParseError at all. Nothing produces it today (every
+	// ParseConfig return path is classified, and a test pins that), and it
+	// is deliberately NOT in the gateway's allow-list: if it ever appears
+	// it degrades to the gateway's generic message, which is the honest
+	// rendering of "the agent could not say why".
+	ParseErrorUnclassified ParseErrorCode = "unclassified"
+)
+
+// ParseError is the error ParseConfig returns: a Code from the closed set
+// above for the wire, plus the full underlying detail for LOCAL diagnosis
+// only. Err is never sent upward -- it is exactly the text that may quote
+// the operator's file.
+type ParseError struct {
+	Code ParseErrorCode
+	Err  error
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("runtime: parse config [%s]: %v", e.Code, e.Err)
+}
+
+func (e *ParseError) Unwrap() error { return e.Err }
+
+// ClassifyParseError extracts the wire code from a config-load error. Any
+// error that is not (and does not wrap) a *ParseError classifies as
+// ParseErrorUnclassified rather than leaking its text.
+func ClassifyParseError(err error) ParseErrorCode {
+	if err == nil {
+		return ""
+	}
+	var pe *ParseError
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	return ParseErrorUnclassified
+}
+
 // ParseConfig unmarshals and validates raw into a Config.
 //
 // Tolerant of unknown top-level fields (forward compatibility with a newer
@@ -100,13 +184,13 @@ type Config struct {
 func ParseConfig(raw []byte) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return Config{}, fmt.Errorf("runtime: parse config: %w", err)
+		return Config{}, &ParseError{Code: ParseErrorJSONSyntax, Err: err}
 	}
 
 	specIDs := make(map[string]bool, len(cfg.Specs))
 	for _, spec := range cfg.Specs {
 		if specIDs[spec.ID] {
-			return Config{}, fmt.Errorf("runtime: duplicate spec id %q", spec.ID)
+			return Config{}, &ParseError{Code: ParseErrorDuplicateSpecID, Err: fmt.Errorf("duplicate spec id %q", spec.ID)}
 		}
 		specIDs[spec.ID] = true
 	}

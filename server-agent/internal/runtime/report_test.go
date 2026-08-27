@@ -80,17 +80,20 @@ func TestBuildReportRedactsEnvValues(t *testing.T) {
 	}
 }
 
-// TestBuildReportParseErrorRoundTrips proves the parse_error field (and a
-// non-file source) survive BuildReport unchanged.
+// TestBuildReportParseErrorRoundTrips proves the parse_error CODE (and a
+// non-file source) survive BuildReport unchanged. The parameter is a
+// ParseErrorCode, not free text, so "round-trips" is all this function is
+// allowed to do with it -- see ParseErrorCode for why the field carries a
+// code at all.
 func TestBuildReportParseErrorRoundTrips(t *testing.T) {
-	raw, err := BuildReport(Config{}, "gateway", "yaml: line 4: bad indent", time.Unix(0, 0).UTC())
+	raw, err := BuildReport(Config{}, "gateway", ParseErrorDuplicateSpecID, time.Unix(0, 0).UTC())
 	if err != nil {
 		t.Fatalf("BuildReport: %v", err)
 	}
 	if !strings.Contains(string(raw), `"source":"gateway"`) {
 		t.Errorf("source did not round-trip: %s", raw)
 	}
-	if !strings.Contains(string(raw), `"parse_error":"yaml: line 4: bad indent"`) {
+	if !strings.Contains(string(raw), `"parse_error":"duplicate_spec_id"`) {
 		t.Errorf("parse_error did not round-trip: %s", raw)
 	}
 }
