@@ -9,15 +9,20 @@ import {
   Checkbox,
   Chip,
   FormControlLabel,
+  IconButton,
   Tab,
   Tabs,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import type {
   ApplicationStatus,
+  GPUBudget,
+  HardwareGPU,
   PortalApplication,
   PortalModelMapping,
   PortalServer,
@@ -28,6 +33,7 @@ import type {
 import type { Translation, PortalApi, MessageKey } from './shared/types';
 import { formatPortalError, formatMetric } from './shared/format';
 import { useResource } from './shared/useResource';
+import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
@@ -38,10 +44,12 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
+import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 
-// Area 1 (this task, Task 20) is "Launch specs"; matrix/limits/status are
-// Tasks 21-22 stubs rendered from the same tab strip so the whole section's
-// navigation is visible/testable now (see the task-20 brief).
+// Area 1 (Task 20) is "Launch specs"; areas 2-3 (this task, Task 21) are the
+// co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
+// still a stub rendered from the same tab strip so the whole section's
+// navigation is visible/testable now.
 type Tab = 'specs' | 'matrix' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
@@ -226,11 +234,12 @@ function formatEnvText(env: Record<string, string>): string {
 export function RuntimeAdminSection({
   t,
   api,
-  // Not read by area 1 (server context already folds into `trail` before this
-  // component ever mounts, same as MappingSection); the co-residency/limits/
-  // status tabs (Tasks 21-22) are server-scoped (gpuBudgets/runtimeReport/
-  // subscribeRuntimeStatus all take a server id) and will need it then.
-  server: _server,
+  // Area 1 doesn't read this (server context already folds into `trail`
+  // before this component ever mounts, same as MappingSection); areas 2-3
+  // (this task) are server-scoped -- the matrix's budget-sum tooltip and the
+  // "server limits" tab both need server.id, and the latter also reads/writes
+  // server.runtime_max_processes. Live status (Task 22) will need it too.
+  server,
   application,
   trail = [],
 }: Readonly<{
@@ -251,12 +260,17 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // Task 21 (matrix + server limits): the process-limit field is saved
+    // through the general server PATCH, and a new budget row is prefilled
+    // from the same live-telemetry hardware report the Hardware tab reads.
+    | 'updateServer'
+    | 'serverHardware'
   >;
   server: PortalServer;
   application: PortalApplication;
   trail?: BreadcrumbItem[];
 }>) {
-  const { showError } = useToast();
+  const { showError, showSuccess } = useToast();
   const [tab, setTab] = useState<Tab>('specs');
   const [specMode, setSpecMode] = useState<SpecMode>('list');
   const [busy, setBusy] = useState(false);
@@ -319,6 +333,187 @@ export function RuntimeAdminSection({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappings, api]);
+
+  // ---- Area 2: co-residency matrix --------------------------------------
+  // Canonicalisation (which of the two mapping ids sorts first) is entirely
+  // the BACKEND's job (SetCoResidency sorts each pair before storing/
+  // comparing -- see service_runtime.go) -- RuntimeMatrix mirrors the same
+  // rule client-side purely so the UI never has to wait on a round trip to
+  // know which cell a click means. `pairs` is always the FULL current set;
+  // toggling computes the complete new set and PUTs it (full replace, never a
+  // delta -- this is how the backend models it and avoids lost updates
+  // between two admins editing concurrently).
+  const {
+    data: coresidencyData,
+    setData: setCoresidencyData,
+    error: coresidencyError,
+  } = useResource(
+    () => api.runtimeCoresidency(application.id).then((r) => r.pairs),
+    [api, application.id, t],
+    t,
+  );
+  const coresidencyPairs = coresidencyData ?? [];
+  useEffect(() => {
+    if (coresidencyError) showError(coresidencyError);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coresidencyError]);
+
+  const matrixSpecs: RuntimeMatrixSpec[] = mappings.map((m) => ({
+    id: m.id,
+    model: m.gateway_model_name,
+    gpus: (specsById[m.id]?.gpus ?? []).map((g) => ({
+      index: g.index,
+      vramMb: g.vram_estimate_mb,
+    })),
+  }));
+
+  async function toggleCoresidency(a: string, b: string) {
+    const exists = coresidencyPairs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
+    const next: [string, string][] = exists
+      ? coresidencyPairs.filter(([p, q]) => !((p === a && q === b) || (p === b && q === a)))
+      : [...coresidencyPairs, [a, b]];
+    const previous = coresidencyPairs;
+    setCoresidencyData(next); // optimistic
+    try {
+      const stored = await api.putRuntimeCoresidency(application.id, { pairs: next });
+      setCoresidencyData(stored.pairs);
+    } catch (err) {
+      setCoresidencyData(previous);
+      showError(formatPortalError(err, t));
+    }
+  }
+
+  // ---- Area 3: server limits ---------------------------------------------
+  // Live telemetry -- the SAME hardware report the Hardware tab reads
+  // (api.serverHardware -> HardwareResponse.report.gpus, each carrying
+  // index/name/uuid/memory_total_bytes) -- drives two things here: prefilling
+  // a NEW budget row's index+VRAM so the operator never has to hand-look-up a
+  // card's memory, and the expected_uuid drift check below.
+  const hardware = useLatestFetch(() => api.serverHardware(server.id), [api, server.id]);
+  const telemetryGpus: HardwareGPU[] =
+    hardware.data?.available && hardware.data.report ? hardware.data.report.gpus : [];
+
+  const {
+    data: gpuBudgetsData,
+    setData: setGpuBudgetsData,
+    error: gpuBudgetsError,
+  } = useResource(() => api.gpuBudgets(server.id).then((r) => r.budgets), [api, server.id, t], t);
+  useEffect(() => {
+    if (gpuBudgetsError) showError(gpuBudgetsError);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gpuBudgetsError]);
+  // The matrix's advisory tooltip reflects the last SAVED budgets, never
+  // Area 3's possibly-unsaved edits below (budgetRows) -- an in-progress
+  // draft on another tab must not change what the matrix claims is "the
+  // budget".
+  const savedBudgetsByGpuIndex: Record<number, number> = Object.fromEntries(
+    (gpuBudgetsData ?? []).map((b) => [b.index, b.budget_mb]),
+  );
+
+  type BudgetRow = { index: number; budgetMb: number; expectedUuid: string; expectedName: string };
+  const [budgetRows, setBudgetRows] = useState<BudgetRow[]>([]);
+  // Re-seeds the editable rows whenever gpuBudgetsData gets a genuinely NEW
+  // value -- the initial load, or the fresh authoritative list this
+  // component itself feeds back via setGpuBudgetsData after a successful
+  // save (see saveLimits). It is never refreshed by a background poll, so
+  // this can't clobber an in-progress edit.
+  useEffect(() => {
+    if (gpuBudgetsData === null) return;
+    setBudgetRows(
+      gpuBudgetsData.map((b) => ({
+        index: b.index,
+        budgetMb: b.budget_mb,
+        expectedUuid: b.expected_uuid,
+        expectedName: b.expected_name,
+      })),
+    );
+  }, [gpuBudgetsData]);
+
+  const [maxProcesses, setMaxProcesses] = useState(() => server.runtime_max_processes ?? 0);
+  const [limitsBusy, setLimitsBusy] = useState(false);
+
+  function addBudgetRow() {
+    setBudgetRows((rows) => {
+      const used = new Set(rows.map((r) => r.index));
+      // Prefer the next telemetry-reported GPU not yet configured -- the
+      // agent already told us its index AND its total VRAM, so the operator
+      // shouldn't have to look either up (see the task-21 brief).
+      const fromTelemetry = telemetryGpus.find((g) => !used.has(g.index));
+      if (fromTelemetry) {
+        return [
+          ...rows,
+          {
+            index: fromTelemetry.index,
+            budgetMb: Math.round(fromTelemetry.memory_total_bytes / (1024 * 1024)),
+            expectedUuid: '',
+            expectedName: '',
+          },
+        ];
+      }
+      let index = 0;
+      while (used.has(index)) index++;
+      return [...rows, { index, budgetMb: 0, expectedUuid: '', expectedName: '' }];
+    });
+  }
+  function removeBudgetRow(idx: number) {
+    setBudgetRows((rows) => rows.filter((_, i) => i !== idx));
+  }
+  function updateBudgetRow(idx: number, patch: Partial<Pick<BudgetRow, 'index' | 'budgetMb'>>) {
+    setBudgetRows((rows) =>
+      rows.map((r, i) => {
+        if (i !== idx) return r;
+        // Changing the index changes the row's identity: the loaded
+        // expected_* snapshot belonged to the OLD index and would misreport
+        // drift against whatever card now sits at the new one. The backend
+        // re-snapshots it from telemetry on save if the new index is
+        // genuinely unconfigured.
+        if (patch.index !== undefined && patch.index !== r.index) {
+          return { ...r, ...patch, expectedUuid: '', expectedName: '' };
+        }
+        return { ...r, ...patch };
+      }),
+    );
+  }
+
+  // expected_uuid/expected_name are a DRIFT DETECTOR, never a setting: the
+  // backend snapshots them once, from telemetry, when a budget row is first
+  // created, and never overwrites them again. A live mismatch means the card
+  // at this index changed (driver update renumbering GPUs, or a hardware
+  // swap) -- worth a warning, never a block: a renumbered card must not take
+  // the server out of service. UUID is NVIDIA-only (AMD reports none, Apple
+  // is a single unified-memory device), so an absent UUID on either side
+  // means "no drift detection available here", not "drift detected".
+  function driftFor(row: BudgetRow): HardwareGPU | undefined {
+    if (!row.expectedUuid) return undefined;
+    const live = telemetryGpus.find((g) => g.index === row.index);
+    if (!live?.uuid) return undefined;
+    return live.uuid !== row.expectedUuid ? live : undefined;
+  }
+
+  async function saveLimits() {
+    setLimitsBusy(true);
+    try {
+      const body: { budgets: GPUBudget[] } = {
+        budgets: budgetRows.map((r) => ({
+          index: r.index,
+          budget_mb: r.budgetMb,
+          expected_uuid: r.expectedUuid,
+          expected_name: r.expectedName,
+        })),
+      };
+      const savedBudgets = await api.putGpuBudgets(server.id, body);
+      setGpuBudgetsData(savedBudgets.budgets);
+      const updatedServer = await api.updateServer(server.id, {
+        runtime_max_processes: maxProcesses,
+      });
+      setMaxProcesses(updatedServer.runtime_max_processes ?? 0);
+      showSuccess(t.systemSaved);
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    } finally {
+      setLimitsBusy(false);
+    }
+  }
 
   // ---- create/edit form state -----------------------------------------
   const [gatewayName, setGatewayName] = useState('');
@@ -945,13 +1140,127 @@ export function RuntimeAdminSection({
         </Panel>
       )}
       {tab === 'matrix' && (
-        <Panel titleId="runtime-matrix-heading" title={t.runtimeMatrix}>
-          <Typography color="text.secondary">{t.runtimeAreaPlaceholder}</Typography>
+        <Panel
+          titleId="runtime-matrix-heading"
+          title={t.runtimeMatrix}
+          subtitle={t.runtimeMatrixHint}
+        >
+          <RuntimeMatrix
+            t={t}
+            specs={matrixSpecs}
+            pairs={coresidencyPairs}
+            onToggle={(a, b) => void toggleCoresidency(a, b)}
+            budgets={savedBudgetsByGpuIndex}
+          />
         </Panel>
       )}
       {tab === 'limits' && (
-        <Panel titleId="runtime-limits-heading" title={t.runtimeLimits}>
-          <Typography color="text.secondary">{t.runtimeAreaPlaceholder}</Typography>
+        <Panel
+          titleId="runtime-limits-heading"
+          title={t.runtimeLimits}
+          subtitle={t.runtimeLimitsIntro}
+        >
+          <Box sx={{ display: 'grid', gap: 2.5 }}>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <Typography variant="subtitle2" component="h3">
+                {t.runtimeGpuBudget}
+              </Typography>
+              {budgetRows.map((row, idx) => {
+                const live = driftFor(row);
+                return (
+                  <Box
+                    key={idx}
+                    sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
+                  >
+                    <Field
+                      id={`runtime-budget-index-${idx}`}
+                      label={t.runtimeSpecGpuIndex}
+                      type="number"
+                      value={String(row.index)}
+                      onChange={(e) =>
+                        updateBudgetRow(idx, {
+                          index: e.target.value === '' ? 0 : Number(e.target.value),
+                        })
+                      }
+                      inputProps={{ min: 0 }}
+                      sx={{ maxWidth: 140 }}
+                    />
+                    <Field
+                      id={`runtime-budget-mb-${idx}`}
+                      label={t.runtimeGpuBudget}
+                      type="number"
+                      value={String(row.budgetMb)}
+                      onChange={(e) =>
+                        updateBudgetRow(idx, {
+                          budgetMb: e.target.value === '' ? 0 : Number(e.target.value),
+                        })
+                      }
+                      inputProps={{ min: 0 }}
+                      sx={{ maxWidth: 200 }}
+                    />
+                    {live && (
+                      <Tooltip
+                        title={
+                          <Box sx={{ display: 'grid', gap: 0.25 }}>
+                            <Typography variant="caption">{t.runtimeGpuDriftWarning}</Typography>
+                            <Typography variant="caption">
+                              {t.runtimeGpuDriftExpected}: {row.expectedName || '—'} (
+                              {row.expectedUuid})
+                            </Typography>
+                            <Typography variant="caption">
+                              {t.runtimeGpuDriftCurrent}: {live.name || '—'} ({live.uuid})
+                            </Typography>
+                          </Box>
+                        }
+                      >
+                        <IconButton
+                          size="small"
+                          color="warning"
+                          aria-label={`${t.runtimeGpuDriftWarning}: GPU ${row.index}`}
+                        >
+                          <WarningAmberIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                    <Button
+                      type="button"
+                      size="small"
+                      color="secondary"
+                      onClick={() => removeBudgetRow(idx)}
+                    >
+                      {t.runtimeSpecGpuRemove}
+                    </Button>
+                  </Box>
+                );
+              })}
+              <Box>
+                <Button type="button" variant="outlined" size="small" onClick={addBudgetRow}>
+                  {t.runtimeSpecGpuAdd}
+                </Button>
+              </Box>
+            </Box>
+
+            <Field
+              id="runtime-max-processes"
+              type="number"
+              label={t.runtimeMaxProcesses}
+              value={String(maxProcesses)}
+              onChange={(e) => setMaxProcesses(e.target.value === '' ? 0 : Number(e.target.value))}
+              inputProps={{ min: 0 }}
+              sx={{ maxWidth: 280 }}
+            />
+
+            <Box>
+              <Button
+                type="button"
+                variant="contained"
+                disabled={limitsBusy}
+                onClick={() => void saveLimits()}
+              >
+                {t.save}
+              </Button>
+            </Box>
+          </Box>
         </Panel>
       )}
       {tab === 'status' && (

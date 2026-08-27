@@ -131,6 +131,9 @@ export function ApplicationSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // Task 21 (matrix + server limits): forwarded the same way.
+    | 'updateServer'
+    | 'serverHardware'
   >;
   server: PortalServer;
   onModelsChanged?: () => void;

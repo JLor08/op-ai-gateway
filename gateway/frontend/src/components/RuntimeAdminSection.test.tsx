@@ -8,12 +8,16 @@ import { ToastProvider } from './shared/ToastProvider';
 import { messages } from '../i18n';
 import type {
   CreateMappingRequest,
+  GPUBudget,
+  HardwareGPU,
+  HardwareResponse,
   PortalApplication,
   PortalModelMapping,
   PortalServer,
   PutRuntimeSpecRequest,
   RuntimeSpec,
   UpdateMappingRequest,
+  UpdateServerRequest,
 } from '../api';
 
 const t = messages.de;
@@ -133,11 +137,35 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
   };
 }
 
+// Minimal-but-valid HardwareResponse for the "server limits" telemetry-prefill
+// and drift-warning tests: only the GPU list varies per test, everything else
+// is boilerplate HardwareReport shape the type requires.
+function makeHardware(gpus: HardwareGPU[]): HardwareResponse {
+  return {
+    available: true,
+    report: {
+      collected_at: '2026-07-16T12:00:00Z',
+      agent_version: '1.0.0',
+      os: 'linux',
+      arch: 'amd64',
+      cpu: { model: '', vendor: '', physical_cores: 0, logical_threads: 0, base_mhz: 0 },
+      memory: { total_bytes: 0 },
+      mainboard: { vendor: '', product: '', version: '' },
+      bios: { vendor: '', version: '' },
+      gpus,
+    },
+  };
+}
+
 function renderSection(
   opts: {
     mappings?: PortalModelMapping[];
     specsByMappingId?: Record<string, RuntimeSpec>;
     warnings?: string[];
+    coresidencyPairs?: [string, string][];
+    gpuBudgets?: GPUBudget[];
+    hardware?: HardwareResponse;
+    runtimeMaxProcesses?: number;
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
@@ -147,6 +175,13 @@ function renderSection(
   const putSpecs: { mappingId: string; body: PutRuntimeSpecRequest }[] = [];
   const deletedSpecIds: string[] = [];
   const deletedMappingIds: string[] = [];
+  const putCoresidencyBodies: [string, string][][] = [];
+  const putBudgets: GPUBudget[][] = [];
+  const updatedServers: { id: string; body: UpdateServerRequest }[] = [];
+  const serverForTest: PortalServer = {
+    ...server,
+    runtime_max_processes: opts.runtimeMaxProcesses,
+  };
 
   const fakeApi = {
     mappings: vi.fn(async () => ({ data: mappings })),
@@ -174,27 +209,52 @@ function renderSection(
       deletedSpecIds.push(id);
       return { ok: true };
     }),
-    runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
-    putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    runtimeCoresidency: vi.fn(async () => ({ pairs: opts.coresidencyPairs ?? [] })),
+    putRuntimeCoresidency: vi.fn(async (_appId: string, body: { pairs: [string, string][] }) => {
+      putCoresidencyBodies.push(body.pairs);
+      return { pairs: body.pairs };
+    }),
     runtimeWarnings: vi.fn(async () => ({ warnings: opts.warnings ?? [] })),
-    gpuBudgets: vi.fn(async () => ({ budgets: [] })),
-    putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
+    gpuBudgets: vi.fn(async () => ({ budgets: opts.gpuBudgets ?? [] })),
+    putGpuBudgets: vi.fn(async (_serverId: string, body: { budgets: GPUBudget[] }) => {
+      putBudgets.push(body.budgets);
+      return { budgets: body.budgets };
+    }),
     runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
     subscribeRuntimeStatus: vi.fn(() => () => {}),
+    updateServer: vi.fn(async (id: string, body: UpdateServerRequest) => {
+      updatedServers.push({ id, body });
+      // Only runtime_max_processes matters to Area 3's own round trip; the
+      // other UpdateServerRequest fields are typed looser (e.g. `status` as
+      // a bare `string`) than PortalServer's own field types, so they are
+      // deliberately not blindly spread onto the returned server here.
+      return { ...serverForTest, id, runtime_max_processes: body.runtime_max_processes };
+    }),
+    serverHardware: vi.fn(async () => opts.hardware ?? ({ available: false } as HardwareResponse)),
   };
 
   render(
     <ToastProvider>
-      <RuntimeAdminSection t={t} api={fakeApi} server={server} application={application} />
+      <RuntimeAdminSection t={t} api={fakeApi} server={serverForTest} application={application} />
     </ToastProvider>,
   );
-  return { fakeApi, created, updatedMappings, putSpecs, deletedSpecIds, deletedMappingIds };
+  return {
+    fakeApi,
+    created,
+    updatedMappings,
+    putSpecs,
+    deletedSpecIds,
+    deletedMappingIds,
+    putCoresidencyBodies,
+    putBudgets,
+    updatedServers,
+  };
 }
 
 afterEach(cleanup);
 
 describe('RuntimeAdminSection tab strip', () => {
-  it('renders the specs/matrix/limits/status tabs, with area-1 stubs for the other three', async () => {
+  it('renders the specs/matrix/limits/status tabs; matrix + limits are now real, status stays a Task-22 stub', async () => {
     renderSection();
     // "specs" is the active tab, so its Tab label AND its Panel title render
     // at once (both say "Runtime-Spezifikationen") -- scope to the tab role.
@@ -203,7 +263,19 @@ describe('RuntimeAdminSection tab strip', () => {
     expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeLiveStatus)).toBeInTheDocument();
 
+    // Matrix: with zero launch specs (default renderSection), the "need two"
+    // hint renders instead of a table -- proves this tab is wired to real
+    // data, not the old placeholder.
     fireEvent.click(screen.getByText(t.runtimeMatrix));
+    expect(await screen.findByText(t.runtimeMatrixNeedTwo)).toBeInTheDocument();
+
+    // Limits: the GPU-budget/process-limit form renders (also no longer a
+    // placeholder).
+    fireEvent.click(screen.getByText(t.runtimeLimits));
+    expect(await screen.findByLabelText(t.runtimeMaxProcesses)).toBeInTheDocument();
+
+    // Status is Task 22's remaining stub.
+    fireEvent.click(screen.getByText(t.runtimeLiveStatus));
     expect(screen.getByText(t.runtimeAreaPlaceholder)).toBeInTheDocument();
   });
 });
@@ -322,6 +394,12 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         agent_features: [],
       })),
       subscribeRuntimeStatus: vi.fn(() => () => {}),
+      updateServer: vi.fn(async (id: string, body: UpdateServerRequest) => ({
+        ...server,
+        id,
+        runtime_max_processes: body.runtime_max_processes,
+      })),
+      serverHardware: vi.fn(async () => ({ available: false }) as HardwareResponse),
     };
 
     render(
@@ -551,5 +629,139 @@ describe('RuntimeAdminSection edit-without-changes round trip', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.args).toEqual(originalArgs);
     expect(putSpecs[0].body.env).toEqual(originalEnv);
+  });
+});
+
+// Task 21: the matrix tab is wired to real co-residency data (see
+// RuntimeMatrix.test.tsx for the component's own rendering/canonicalisation/
+// tooltip unit tests) -- these tests pin the SECTION's data flow: computing
+// the full replaced pair list and PUTting it as a full replace, never a
+// delta.
+describe('RuntimeAdminSection co-residency matrix wiring', () => {
+  function threeMappings() {
+    return [
+      makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' }),
+      makeMapping({ id: 'map_2', gateway_model_name: 'Bravo' }),
+      makeMapping({ id: 'map_3', gateway_model_name: 'Charlie' }),
+    ];
+  }
+
+  it('toggling a new cell persists the FULL replaced pair list, not just the toggled pair', async () => {
+    const { putCoresidencyBodies } = renderSection({
+      mappings: threeMappings(),
+      coresidencyPairs: [['map_1', 'map_2']],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+    );
+
+    await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
+    // The pre-existing pair survives AND the newly toggled one is added -- a
+    // delta-only (buggy) implementation would send just [["map_1","map_3"]].
+    expect(putCoresidencyBodies[0]).toHaveLength(2);
+    expect(putCoresidencyBodies[0]).toEqual(
+      expect.arrayContaining([
+        ['map_1', 'map_2'],
+        ['map_1', 'map_3'],
+      ]),
+    );
+  });
+
+  it('un-toggling an already-allowed pair removes only that pair from the persisted list', async () => {
+    const { putCoresidencyBodies } = renderSection({
+      mappings: threeMappings(),
+      coresidencyPairs: [
+        ['map_1', 'map_2'],
+        ['map_1', 'map_3'],
+      ],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Bravo + Alpha` }),
+    );
+
+    await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
+    expect(putCoresidencyBodies[0]).toEqual([['map_1', 'map_3']]);
+  });
+});
+
+// Task 21: "server limits" -- GPU budget rows prefilled from live telemetry,
+// the never-blocking UUID-drift warning, and saving budgets + the process
+// limit together.
+describe('RuntimeAdminSection server limits wiring', () => {
+  it("prefills a new budget row's index and VRAM (in MB) from live telemetry", async () => {
+    renderSection({
+      hardware: makeHardware([
+        {
+          index: 0,
+          name: 'RTX 4090',
+          uuid: 'GPU-aaa',
+          memory_total_bytes: 24 * 1024 * 1024 * 1024,
+        },
+      ]),
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecGpuAdd }));
+
+    const indexField = await screen.findByLabelText(t.runtimeSpecGpuIndex);
+    expect((indexField as HTMLInputElement).value).toBe('0');
+    const budgetField = screen.getByLabelText(t.runtimeGpuBudget);
+    expect((budgetField as HTMLInputElement).value).toBe('24576'); // 24 GiB, in MB
+  });
+
+  it('renders a UUID-drift warning without disabling any control on that row', async () => {
+    renderSection({
+      hardware: makeHardware([
+        { index: 0, name: 'RTX 5090', uuid: 'GPU-live', memory_total_bytes: 0 },
+      ]),
+      gpuBudgets: [
+        { index: 0, budget_mb: 24000, expected_uuid: 'GPU-old', expected_name: 'RTX 4090' },
+      ],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    const warningIcon = await screen.findByRole('button', {
+      name: `${t.runtimeGpuDriftWarning}: GPU 0`,
+    });
+    expect(warningIcon).not.toBeDisabled();
+    expect(screen.getByLabelText(t.runtimeSpecGpuIndex)).not.toBeDisabled();
+    expect(screen.getByLabelText(t.runtimeGpuBudget)).not.toBeDisabled();
+  });
+
+  it('shows no drift warning when the GPU reports no UUID (AMD/Apple -- no drift detection available, not "drift detected")', async () => {
+    renderSection({
+      hardware: makeHardware([{ index: 0, name: 'Apple GPU', memory_total_bytes: 0 }]),
+      gpuBudgets: [{ index: 0, budget_mb: 10000, expected_uuid: '', expected_name: 'Apple GPU' }],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    await screen.findByLabelText(t.runtimeGpuBudget);
+    expect(
+      screen.queryByRole('button', { name: `${t.runtimeGpuDriftWarning}: GPU 0` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('saves the GPU budgets and the process limit together', async () => {
+    const { putBudgets, updatedServers } = renderSection({
+      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      runtimeMaxProcesses: 2,
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    const maxProcField = await screen.findByLabelText(t.runtimeMaxProcesses);
+    expect((maxProcField as HTMLInputElement).value).toBe('2');
+    fireEvent.change(maxProcField, { target: { value: '5' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putBudgets).toHaveLength(1));
+    expect(putBudgets[0]).toEqual([
+      { index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+    ]);
+    await waitFor(() => expect(updatedServers).toHaveLength(1));
+    expect(updatedServers[0].body.runtime_max_processes).toBe(5);
   });
 });

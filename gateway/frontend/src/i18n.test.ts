@@ -1912,3 +1912,25 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
     }
   });
 });
+
+describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
+  it('defines every co-residency-matrix and server-limits key in de and en', () => {
+    const keys = [
+      'runtimeMatrixCell',
+      'runtimeMatrixNeedTwo',
+      'runtimeMatrixNoSharedGpu',
+      'runtimeMatrixAdvisory',
+      'runtimeMatrixOverBudget',
+      'runtimeLimitsIntro',
+      'runtimeGpuDriftWarning',
+      'runtimeGpuDriftExpected',
+      'runtimeGpuDriftCurrent',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});

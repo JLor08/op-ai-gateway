@@ -345,8 +345,42 @@ documentation task):
   is down during agent startup must not disable the feature for the process
   lifetime.
 
+Portal phase in progress:
+- Task 19 — `gateway/frontend/src/api/runtime.ts` (new domain module): the
+  mapping-scoped launch-spec CRUD, application-scoped co-residency +
+  warnings, server-scoped GPU budgets + file-mode report view, and the live
+  runtime-status SSE subscription. Three of the plan's original TypeScript
+  interfaces were corrected against the Go DTOs while implementing. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-19-report.md`.
+- Task 20 — `gateway/frontend/src/components/RuntimeAdminSection.tsx` (new):
+  the operator screen for one `server_agent` application's runtime, wired
+  into `ApplicationSection`'s drill-down (replaces `MappingSection` for that
+  application type) and `ServerList`'s `managed_runtime_only` banner/
+  auto-drill. Area 1 ("Launch specs") fully implemented; matrix/limits/status
+  shipped as stubs for Tasks 21-22. Client-side placeholder-policy validation
+  mirrors the agent's real `ExpandPlaceholders` rule exactly (round 2 fix).
+  Commits `adf6865`, `8cf3729`. Reports:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-20-report.md`.
+- Task 21 — `gateway/frontend/src/components/RuntimeMatrix.tsx` (new): the
+  lower-triangle co-residency grid (canonical-order enforced on both read
+  and write, advisory per-GPU-budget tooltip, never-blocking `disabled`
+  prop). `RuntimeAdminSection`'s areas 2 ("Koresidenz-Matrix") and 3
+  ("Runtime-Limits") replace their Task-20 placeholders: full-replace
+  co-residency toggling with optimistic update, and per-GPU budget rows
+  prefilled from the same live-telemetry hardware report `HardwareSection`
+  already reads, plus a never-blocking UUID-drift warning and the
+  `runtime_max_processes` field (saved via the general server PATCH).
+  `PortalServer`/`UpdateServerRequest` gained an optional
+  `runtime_max_processes` field. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-21-report.md`.
+
 ## Next planned step
 
-1. Continue the plan at Task 19 (frontend: api module, type union, i18n).
-2. Remaining: 19-22 (portal UI), 23 (e2e),
+1. Continue the plan at Task 22 (frontend: live status tab — SSE subscription
+   to `subscribeRuntimeStatus`, per-process state/PID/port/in-flight/uptime/
+   restarts/`last_error` incl. stderr tail, admin-override start/stop
+   buttons; also the natural place to compute a shared file-mode signal from
+   `api.runtimeReport` and thread it into `RuntimeMatrix`'s `disabled` prop
+   and area 3's read-only treatment, both left unwired after Task 21).
+2. Remaining: 22 (portal UI), 23 (e2e),
    24 (docs + Sonar gate + working-file cleanup before the PR).

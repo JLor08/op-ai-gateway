@@ -471,9 +471,23 @@ const de = {
   runtimeMatrix: 'Koresidenz-Matrix',
   runtimeMatrixHint:
     'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen.',
+  runtimeMatrixCell: 'Koresidenz umschalten',
+  runtimeMatrixNeedTwo:
+    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz-Matrix zu verwalten.',
+  runtimeMatrixNoSharedGpu:
+    'Keine gemeinsame GPU – diese beiden Modelle konkurrieren um kein VRAM.',
+  runtimeMatrixAdvisory:
+    'Nur ein Hinweis: Die endgültige Entscheidung trifft der Agent zur Laufzeit anhand der tatsächlich laufenden Prozesse.',
+  runtimeMatrixOverBudget: 'über Budget',
   runtimeLimits: 'Runtime-Limits',
+  runtimeLimitsIntro:
+    'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
   runtimeGpuBudget: 'GPU-VRAM-Budget (MB)',
   runtimeMaxProcesses: 'Max. gleichzeitige Prozesse',
+  runtimeGpuDriftWarning:
+    'Die Hardware an diesem GPU-Index hat sich seit der Budget-Anlage verändert (z. B. durch ein Treiber-Update oder Hardware-Tausch); der Server bleibt dadurch weiterhin in Betrieb.',
+  runtimeGpuDriftExpected: 'Erwartet',
+  runtimeGpuDriftCurrent: 'Aktuell',
   runtimeLiveStatus: 'Live-Status',
   runtimeStateStopped: 'Gestoppt',
   runtimeStateStarting: 'Startet…',
@@ -2206,9 +2220,21 @@ const en: PortalMessages = {
   runtimeSpecEnabled: 'Enabled',
   runtimeMatrix: 'Co-residency matrix',
   runtimeMatrixHint: 'Choose which model processes may run on the same server at the same time.',
+  runtimeMatrixCell: 'Toggle co-residency',
+  runtimeMatrixNeedTwo: 'At least two launch specs are needed to manage the co-residency matrix.',
+  runtimeMatrixNoSharedGpu: 'No shared GPU — these two models never compete for VRAM.',
+  runtimeMatrixAdvisory:
+    'Advisory only — the agent makes the final call at runtime based on the processes actually running.',
+  runtimeMatrixOverBudget: 'over budget',
   runtimeLimits: 'Runtime limits',
+  runtimeLimitsIntro:
+    'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',
   runtimeGpuBudget: 'GPU VRAM budget (MB)',
   runtimeMaxProcesses: 'Max concurrent processes',
+  runtimeGpuDriftWarning:
+    'The hardware at this GPU index has changed since the budget was created (e.g. a driver update or a hardware swap); the server stays in service regardless.',
+  runtimeGpuDriftExpected: 'Expected',
+  runtimeGpuDriftCurrent: 'Now',
   runtimeLiveStatus: 'Live status',
   runtimeStateStopped: 'Stopped',
   runtimeStateStarting: 'Starting…',

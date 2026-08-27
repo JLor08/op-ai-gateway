@@ -103,6 +103,15 @@ export type PortalServer = {
   // PortalServer literal fixtures across the test suite compile unchanged
   // (mirrors certificate_override/https_switch_override above).
   managed_runtime_only?: boolean;
+  // RuntimeMaxProcesses caps how many agent-managed runtime processes may run
+  // concurrently on this server (0 = unlimited; Task 6, migration 66 --
+  // declared alongside managed_runtime_only server-side). Drives the "server
+  // limits" tab's process-limit field (agent-runtime-manager feature, Task
+  // 21). Always present on the real wire DTO (no omitempty --
+  // ServerDTO.RuntimeMaxProcesses in service.go); optional here so existing
+  // PortalServer literal fixtures across the test suite compile unchanged
+  // (mirrors managed_runtime_only above).
+  runtime_max_processes?: number;
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
@@ -196,6 +205,13 @@ export type UpdateServerRequest = {
   price_per_kwh?: number;
   pue?: number;
   price_unit?: CurrencyUnit;
+  // The "server limits" tab's process-limit field (agent-runtime-manager
+  // feature, Task 21): caps concurrent agent-managed runtime processes; a
+  // supplied 0 resets to unlimited (mirrors the Go
+  // UpdateServerRequest.RuntimeMaxProcesses `*int` -- undefined here means
+  // "leave unchanged", matching every other optional field in this request).
+  // Must be >= 0 (else server.runtime_limit_invalid).
+  runtime_max_processes?: number;
 };
 
 // One resource group a server OWNER may enter their server into (spec
