@@ -184,9 +184,10 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // emitted in sorted-key order so the result is deterministic across calls
 // (spec.Env is a Go map with randomized iteration order).
 //
-// A spec.Env key of PATH or HOME is refused outright rather than allowed to
-// override the agent-provided base: these two are agent-owned, not
-// spec-negotiable. A gateway-supplied PATH would let a spec choose where the
+// A spec.Env key of PATH or HOME -- in ANY case spelling, since Windows
+// resolves and deduplicates environment names case-insensitively -- is
+// refused outright rather than allowed to override the agent-provided base:
+// these two are agent-owned, not spec-negotiable. A gateway-supplied PATH would let a spec choose where the
 // child resolves shared libraries and helper subprocesses -- the same class
 // of risk Permit's absolute-binary-path requirement exists to close -- so
 // this treats "minimal base" as agent-controlled rather than
@@ -247,7 +248,30 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 			}
 
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
-				if strings.HasPrefix(name, agentOwnEnvPrefix) {
+				// CASE-INSENSITIVE, and that is a security property, not a
+				// nicety (S1). The refusal decides whether a
+				// gateway-supplied spec may read the agent's OWN namespace;
+				// the LOOKUP it guards is os.Getenv, which on Windows is
+				// GetEnvironmentVariableW and resolves case-INSENSITIVELY.
+				// A case-sensitive guard in front of a case-insensitive
+				// lookup is not a guard: ${AGENT_ENV:op_agent_token} walked
+				// straight past it and received OP_AGENT_TOKEN -- the
+				// agent's gateway bearer credential, which authenticates the
+				// certificate endpoint that issues a private key. The value
+				// then has a ready path back to the gateway even without
+				// network egress from the child, because a model server that
+				// echoes its argv (vLLM and llama.cpp both do) and then
+				// exits non-zero has that line captured into
+				// LastError.StderrTail and reported upward.
+				//
+				// Deliberately folded on unix too, where a variable named
+				// "op_agent_token" IS distinct from "OP_AGENT_TOKEN":
+				// refusing that hypothetical is the safe direction, and one
+				// rule on every platform is the only version a reader can
+				// check. Note the near-miss classifier ten lines below
+				// already upper-cases before comparing -- the asymmetry was
+				// visible inside this one function.
+				if strings.HasPrefix(strings.ToUpper(name), agentOwnEnvPrefix) {
 					firstErr = fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
 					return match
 				}
@@ -301,7 +325,15 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 	// because the rule is about which party controls these keys, not about
 	// detecting an actual collision.
 	for _, k := range envKeys {
-		if k == "PATH" || k == "HOME" {
+		// Case-insensitive for the same reason as the AGENT_ENV guard above
+		// (S2): on Windows the native spelling is "Path", and os/exec
+		// deduplicates the child's environment case-insensitively there --
+		// so a spec key of "Path" passed this reservation and then WON
+		// against the agent-provided PATH, handing a gateway-supplied spec
+		// exactly the control over library and helper-binary resolution
+		// this rule exists to keep agent-side. Refusing a lowercase "path"
+		// on unix, where it is a different variable, is the safe direction.
+		if upper := strings.ToUpper(k); upper == "PATH" || upper == "HOME" {
 			return nil, nil, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
 		}
 	}

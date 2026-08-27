@@ -686,3 +686,97 @@ func TestExpandPlaceholdersEnvSortedDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// windowsStyleGetenv is a case-INSENSITIVE environment lookup: exactly what
+// os.Getenv does on Windows, where it goes through
+// GetEnvironmentVariableW. Injecting it here is what makes S1 and S2
+// testable on any host -- CI compiles nothing for Windows, so without this
+// seam the entire class is unobservable from a Linux or macOS runner.
+func windowsStyleGetenv(vars map[string]string) func(string) string {
+	folded := make(map[string]string, len(vars))
+	for k, v := range vars {
+		folded[strings.ToUpper(k)] = v
+	}
+	return func(name string) string { return folded[strings.ToUpper(name)] }
+}
+
+// TestExpandPlaceholdersAgentEnvRefusalIsCaseInsensitive is S1's covering
+// test. The refusal that keeps a gateway-supplied spec out of the agent's
+// own OP_AGENT_* namespace was a case-SENSITIVE prefix test in front of a
+// lookup that is case-INSENSITIVE on Windows, so every non-uppercase
+// spelling walked past the guard and resolved the agent's gateway bearer
+// token -- the credential that authenticates the certificate endpoint which
+// issues a private key.
+//
+// The value has a path back to the gateway even from a model server with no
+// network egress of its own: a child that echoes its argv (vLLM and
+// llama.cpp both do at startup) and then exits non-zero has that output
+// captured into LastError.StderrTail and reported upward in telemetry. The
+// operator-controlled binary allowlist therefore narrows this, but does not
+// close it.
+func TestExpandPlaceholdersAgentEnvRefusalIsCaseInsensitive(t *testing.T) {
+	const secret = "gateway-bearer-secret"
+	getenv := windowsStyleGetenv(map[string]string{"OP_AGENT_TOKEN": secret})
+
+	for _, name := range []string{
+		"OP_AGENT_TOKEN",
+		"op_agent_token",
+		"Op_Agent_Token",
+		"oP_aGeNt_ToKeN",
+		"op_AGENT_token",
+		"Op_agent_TOKEN",
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, spec := range []Spec{
+				{Args: []string{"--api-key", "${AGENT_ENV:" + name + "}"}},
+				{Env: map[string]string{"TOKEN": "${AGENT_ENV:" + name + "}"}},
+			} {
+				args, env, err := ExpandPlaceholders(spec, 8080, getenv)
+				if err == nil {
+					t.Fatalf("${AGENT_ENV:%s} resolved instead of being refused: args=%v env=%v", name, args, env)
+				}
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked the secret value: %q", err.Error())
+				}
+				for _, s := range append(append([]string{}, args...), env...) {
+					if strings.Contains(s, secret) {
+						t.Fatalf("the agent's own token reached the child: %q", s)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive is S2's covering
+// test, the sibling of S1 with the same root cause and the same blast
+// radius on Windows: os/exec deduplicates the child environment
+// case-insensitively there, so a spec key spelled "Path" (the native
+// Windows spelling) passed the case-sensitive reservation AND then won
+// against the agent-provided PATH -- handing a gateway-supplied spec control
+// over where the child resolves shared libraries and helper binaries, the
+// exact class of risk Permit's absolute-binary-path rule exists to close.
+func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
+	getenv := windowsStyleGetenv(map[string]string{"PATH": `C:\Windows\System32`, "HOME": `C:\Users\agent`})
+
+	for _, key := range []string{"PATH", "Path", "path", "pAtH", "HOME", "Home", "home", "hOmE"} {
+		t.Run(key, func(t *testing.T) {
+			spec := Spec{Env: map[string]string{key: `C:\attacker\bin`}}
+			_, env, err := ExpandPlaceholders(spec, 8080, getenv)
+			if err == nil {
+				t.Fatalf("a spec env key %q was accepted; the child environment would be %v", key, env)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error = %q, want it to name the refused key %q", err.Error(), key)
+			}
+		})
+	}
+
+	// The reservation is scoped to those two names, not to anything that
+	// merely resembles them: a spec may still set its own PATH-adjacent
+	// variables.
+	spec := Spec{Env: map[string]string{"LD_LIBRARY_PATH": "/opt/cuda/lib64", "HOMEBREW_PREFIX": "/opt/homebrew", "PATHOLOGY": "x"}}
+	if _, _, err := ExpandPlaceholders(spec, 8080, getenv); err != nil {
+		t.Fatalf("ExpandPlaceholders refused a legitimate env key: %v", err)
+	}
+}
