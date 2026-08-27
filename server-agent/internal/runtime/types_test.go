@@ -326,6 +326,50 @@ func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
 	}
 }
 
+// TestStatusMarshalJSONAppliesToCollections is the receiver check B2 asked
+// for: Status.MarshalJSON has a VALUE receiver, and this pins that the
+// normalization therefore survives every placement Status can appear in --
+// not just a bare Status.
+//
+// []Status is the one that matters in practice (Manager.Status() returns
+// exactly that), but a slice alone cannot distinguish a value receiver from
+// a pointer receiver: slice elements are addressable, so encoding/json's
+// addrMarshalerEncoder would call a *Status method too. The map case is what
+// actually discriminates -- a map VALUE is not addressable, so a pointer
+// receiver is skipped entirely there and measured_vram silently regresses to
+// "null", the exact nil-vs-null defect this MarshalJSON exists to prevent.
+// Verified by probe: with a pointer receiver, map[string]T marshals the nil
+// map as null while []T still normalizes correctly.
+func TestStatusMarshalJSONAppliesToCollections(t *testing.T) {
+	// Manager.Status()'s own shape.
+	rawSlice, err := json.Marshal([]Status{
+		{SpecID: "s1", State: StateRunning},
+		{SpecID: "s2", State: StateStopped, MeasuredVRAM: map[int]int{0: 4096}},
+	})
+	if err != nil {
+		t.Fatalf("marshal []Status: %v", err)
+	}
+	if strings.Contains(string(rawSlice), "null") {
+		t.Errorf("[]Status marshalled to %s; the value receiver must normalize every element, so null must never appear", rawSlice)
+	}
+	if strings.Count(string(rawSlice), `"measured_vram"`) != 2 {
+		t.Errorf("[]Status marshalled to %s, want measured_vram on both elements", rawSlice)
+	}
+
+	// A non-addressable placement: this is where a pointer receiver would
+	// have been skipped and emitted null.
+	rawMap, err := json.Marshal(map[string]Status{"s1": {SpecID: "s1", State: StateRunning}})
+	if err != nil {
+		t.Fatalf("marshal map[string]Status: %v", err)
+	}
+	if !strings.Contains(string(rawMap), `"measured_vram":{}`) {
+		t.Errorf("map[string]Status marshalled to %s, want measured_vram:{} -- a pointer receiver would be skipped for a non-addressable map value and emit null", rawMap)
+	}
+	if strings.Contains(string(rawMap), "null") {
+		t.Errorf("map[string]Status marshalled to %s; null must never appear", rawMap)
+	}
+}
+
 // TestStatusAndLastErrorJSONTags pins the exact wire tags Status/LastError
 // carry now that Task 18 puts them on the wire (via
 // sample.RuntimeSample/RuntimeErrorSample, built field-by-field from these
