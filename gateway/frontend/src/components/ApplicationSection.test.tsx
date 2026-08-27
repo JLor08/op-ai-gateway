@@ -14,6 +14,7 @@ import type {
   PortalApplication,
   PortalModelMapping,
   PortalServer,
+  RuntimeSpec,
   UpdateApplicationRequest,
   UpdateMappingRequest,
 } from '../api';
@@ -118,6 +119,31 @@ function makeMapping(overrides: Partial<PortalModelMapping> = {}): PortalModelMa
   };
 }
 
+// A benign "not configured" runtime spec (RuntimeSpec's own zero-value
+// convention), used only by the server_agent drill-down tests below.
+function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+  return {
+    configured: false,
+    mapping_id: 'map_1',
+    enabled: false,
+    binary: '',
+    args: [],
+    env: {},
+    work_dir: '',
+    listen_port: 0,
+    health_path: '',
+    health_timeout_seconds: 0,
+    startup_timeout_seconds: 0,
+    idle_timeout_seconds: 0,
+    admission_wait_timeout_seconds: 0,
+    pinned: false,
+    admin_state: '',
+    vram_locked: false,
+    gpus: [],
+    ...overrides,
+  };
+}
+
 const idleBenchmark: BenchmarkStatus = {
   running: false,
   server_id: 'srv_1',
@@ -127,9 +153,14 @@ const idleBenchmark: BenchmarkStatus = {
 };
 
 function renderSection(
-  opts: { apps?: PortalApplication[]; healthInterval?: number | 'error' } = {},
+  opts: {
+    apps?: PortalApplication[];
+    healthInterval?: number | 'error';
+    server?: PortalServer;
+  } = {},
 ) {
   const apps = opts.apps ?? [];
+  const activeServer = opts.server ?? server;
   const created: CreateApplicationRequest[] = [];
   const updated: { id: string; body: UpdateApplicationRequest }[] = [];
   const fakeApi = {
@@ -170,11 +201,23 @@ function renderSection(
     mappingBenchmarks: vi.fn(async () => []),
     activeBenchmarks: vi.fn(async () => []),
     probeMappingContext: vi.fn(async () => idleBenchmark),
+    // RuntimeAdminSection's Pick (reached only by the server_agent drill-down
+    // tests below; unused defaults for every other test).
+    runtimeSpec: vi.fn(async () => makeRuntimeSpec()),
+    putRuntimeSpec: vi.fn(async () => makeRuntimeSpec()),
+    deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
+    runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    runtimeWarnings: vi.fn(async () => ({ warnings: [] })),
+    gpuBudgets: vi.fn(async () => ({ budgets: [] })),
+    putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
+    runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
+    subscribeRuntimeStatus: vi.fn(() => () => {}),
   };
 
   render(
     <ToastProvider>
-      <ApplicationSection t={t} api={fakeApi} server={server} />
+      <ApplicationSection t={t} api={fakeApi} server={activeServer} />
     </ToastProvider>,
   );
   return { fakeApi, created, updated };
@@ -683,5 +726,62 @@ describe('ApplicationSection health-interval default display', () => {
     await waitFor(() => {
       expect(screen.queryByText(new RegExp(`${t.applicationHealthIntervalCurrent}:`))).toBeNull();
     });
+  });
+});
+
+// Agent-runtime-manager (Task 20): the "manage models" drill-down opens
+// RuntimeAdminSection instead of MappingSection for a server_agent
+// application, and the managed_runtime_only server restriction (mirroring
+// the backend's own CreateApplication gate, Task 6) drives the create
+// button + auto-drill in the list view.
+describe('ApplicationSection server_agent drill-down + managed_runtime_only', () => {
+  it('opens RuntimeAdminSection instead of MappingSection for server_agent apps', async () => {
+    renderSection({ apps: [makeApp({ id: 'app_1', type: 'server_agent' })] });
+    await screen.findByText('https://s1.example.test:8000');
+
+    fireEvent.click(screen.getByRole('button', { name: t.mappingManage }));
+
+    // RuntimeAdminSection's tab strip, not MappingSection's list heading.
+    expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeLiveStatus)).toBeInTheDocument();
+    expect(screen.queryByText(t.modelMappings)).not.toBeInTheDocument();
+  });
+
+  it('auto-drills into the one server_agent app on a managed_runtime_only server', async () => {
+    renderSection({
+      server: { ...server, managed_runtime_only: true },
+      apps: [makeApp({ id: 'app_1', type: 'server_agent' })],
+    });
+
+    // Auto-drilled straight past the one-item list into the runtime admin.
+    expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.applicationCreate })).not.toBeInTheDocument();
+  });
+
+  it('hides create (without auto-drilling) and shows the banner with more than one server_agent app', async () => {
+    renderSection({
+      server: { ...server, managed_runtime_only: true },
+      apps: [
+        makeApp({ id: 'app_1', type: 'server_agent' }),
+        makeApp({ id: 'app_2', type: 'server_agent' }),
+      ],
+    });
+
+    expect(await screen.findByText(t.runtimeManagedOnlyBanner)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.applicationCreate })).not.toBeInTheDocument();
+    // Stayed on the list (two candidates -> no unambiguous auto-drill target).
+    expect(screen.getAllByRole('button', { name: t.mappingManage })).toHaveLength(2);
+  });
+
+  it('shows create (defaulted to server_agent) and no banner when managed_runtime_only has no app yet', async () => {
+    renderSection({ server: { ...server, managed_runtime_only: true }, apps: [] });
+
+    await screen.findByText(t.runtimeManagedOnlyBanner);
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent(
+      'server_agent',
+    );
   });
 });

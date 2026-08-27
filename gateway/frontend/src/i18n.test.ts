@@ -1875,3 +1875,39 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
     }
   });
 });
+
+describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
+  it('defines every launch-spec form/list/stub key in de and en', () => {
+    const keys = [
+      'runtimeSpecsIntro',
+      'runtimeSpecCreate',
+      'runtimeSpecEditAction',
+      'runtimeSpecDelete',
+      'runtimeSpecDeleteConfirm',
+      'runtimeSpecMappingSection',
+      'runtimeSpecConfigSection',
+      'runtimeSpecListenPort',
+      'runtimeSpecListenPortHelp',
+      'runtimeSpecHealthPath',
+      'runtimeSpecHealthTimeout',
+      'runtimeSpecAdmissionWaitTimeout',
+      'runtimeSpecAdminState',
+      'runtimeSpecVramLocked',
+      'runtimeSpecVramMeasured',
+      'runtimeSpecGpuIndex',
+      'runtimeSpecGpuAdd',
+      'runtimeSpecGpuRemove',
+      'runtimeSpecEnvHint',
+      'runtimeSpecEnvReserved',
+      'runtimeSpecPartialFailure',
+      'runtimeAreaPlaceholder',
+      'runtimeStatusUnknown',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});

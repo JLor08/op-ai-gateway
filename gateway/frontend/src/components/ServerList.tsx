@@ -196,6 +196,18 @@ export function ServerList({
     | 'probeMappingContext'
     | 'regenerateNetbirdKey'
     | 'revokeAgentToken'
+    // Agent-runtime-manager (Task 20): forwarded on to ApplicationSection ->
+    // RuntimeAdminSection for a server_agent application's launch specs.
+    | 'runtimeSpec'
+    | 'putRuntimeSpec'
+    | 'deleteRuntimeSpec'
+    | 'runtimeCoresidency'
+    | 'putRuntimeCoresidency'
+    | 'runtimeWarnings'
+    | 'gpuBudgets'
+    | 'putGpuBudgets'
+    | 'runtimeReport'
+    | 'subscribeRuntimeStatus'
     | 'serverAdminGroupCandidates'
     | 'serverAvailability'
     | 'serverHardware'

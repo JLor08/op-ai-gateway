@@ -94,6 +94,15 @@ export type PortalServer = {
   // existing PortalServer literal fixtures across the test suite compile
   // unchanged.
   https_switch_override?: string;
+  // Managed-runtime-only restriction (Task 6, migration 66; surfaced to the
+  // portal in the agent-runtime-manager feature): true when this server only
+  // accepts server_agent applications (CreateApplication otherwise rejects a
+  // non-server_agent type with ErrServerManagedRuntimeOnly / the
+  // application.managed_runtime_only error code). Always present on the real
+  // wire DTO (no omitempty server-side); optional here so existing
+  // PortalServer literal fixtures across the test suite compile unchanged
+  // (mirrors certificate_override/https_switch_override above).
+  managed_runtime_only?: boolean;
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
