@@ -793,6 +793,7 @@ const de = {
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
   errorServerRuntimeLimitInvalid: 'Ungültiges Prozess-Limit',
   errorApplicationManagedRuntimeOnly: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen',
+  errorApplicationServerAgentExists: 'Dieser Server hat bereits eine Server-Agent-Anwendung',
   errorBenchmarkAlreadyRunning: 'Auf diesem Server läuft bereits ein Benchmark.',
   errorBenchmarkServerInUse:
     'Der Server wird gerade verwendet; bitte erneut versuchen, wenn er frei ist.',
@@ -2616,6 +2617,7 @@ const en: PortalMessages = {
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
   errorServerRuntimeLimitInvalid: 'Invalid process limit',
   errorApplicationManagedRuntimeOnly: 'This server only accepts agent-managed applications',
+  errorApplicationServerAgentExists: 'This server already has a server_agent application',
   errorBenchmarkAlreadyRunning: 'A benchmark is already running on this server.',
   errorBenchmarkServerInUse: 'The server is in use; try again when idle.',
   errorBenchmarkNoModels: 'No models to benchmark.',

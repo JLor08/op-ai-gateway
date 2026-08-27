@@ -65,6 +65,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',
   'server.runtime_limit_invalid': 'errorServerRuntimeLimitInvalid',
   'application.managed_runtime_only': 'errorApplicationManagedRuntimeOnly',
+  'application.server_agent_exists': 'errorApplicationServerAgentExists',
   'benchmark.already_running': 'errorBenchmarkAlreadyRunning',
   'benchmark.server_in_use': 'errorBenchmarkServerInUse',
   'benchmark.no_models': 'errorBenchmarkNoModels',
