@@ -347,11 +347,21 @@ export function RuntimeAdminSection({
     data: coresidencyData,
     setData: setCoresidencyData,
     error: coresidencyError,
+    loading: coresidencyLoading,
   } = useResource(
     () => api.runtimeCoresidency(application.id).then((r) => r.pairs),
     [api, application.id, t],
     t,
   );
+  // `null` (not loaded yet) and `[]` (loaded, genuinely empty) are DIFFERENT
+  // facts -- collapsing them with `coresidencyData ?? []` would make a click
+  // that lands before the GET settles compute its full-replace PUT from an
+  // empty list, wiping every pair a previous admin already saved. `ready`
+  // gates both rendering (a loading message instead of the matrix) and
+  // writing (see the missing-loading-state fix, task-21 review round 1) on
+  // the SAME `data !== null` signal the specs list already uses
+  // (`mappingsLoading || mappingsData === null`, above).
+  const coresidencyReady = !coresidencyLoading && coresidencyData !== null;
   const coresidencyPairs = coresidencyData ?? [];
   useEffect(() => {
     if (coresidencyError) showError(coresidencyError);
@@ -397,7 +407,15 @@ export function RuntimeAdminSection({
     data: gpuBudgetsData,
     setData: setGpuBudgetsData,
     error: gpuBudgetsError,
+    loading: gpuBudgetsLoading,
   } = useResource(() => api.gpuBudgets(server.id).then((r) => r.budgets), [api, server.id, t], t);
+  // Same "null (not loaded) vs. [] (loaded, empty)" distinction as the
+  // co-residency matrix above: `budgetRows` starts `[]` and would look
+  // exactly like "no budgets configured" if Save were reachable before this
+  // GET settles -- and Save PUTs whatever `budgetRows` holds as the FULL
+  // replacement set, so that would erase every previously configured
+  // per-GPU budget on a single premature click.
+  const gpuBudgetsReady = !gpuBudgetsLoading && gpuBudgetsData !== null;
   useEffect(() => {
     if (gpuBudgetsError) showError(gpuBudgetsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1145,13 +1163,20 @@ export function RuntimeAdminSection({
           title={t.runtimeMatrix}
           subtitle={t.runtimeMatrixHint}
         >
-          <RuntimeMatrix
-            t={t}
-            specs={matrixSpecs}
-            pairs={coresidencyPairs}
-            onToggle={(a, b) => void toggleCoresidency(a, b)}
-            budgets={savedBudgetsByGpuIndex}
-          />
+          {coresidencyReady ? (
+            <RuntimeMatrix
+              t={t}
+              specs={matrixSpecs}
+              pairs={coresidencyPairs}
+              onToggle={(a, b) => void toggleCoresidency(a, b)}
+              budgets={savedBudgetsByGpuIndex}
+            />
+          ) : (
+            // Deliberately NOT the matrix with an empty pair list: the GET
+            // hasn't settled yet, so there is no "current pairs" to render
+            // or toggle from -- see the task-21 review's Critical finding.
+            <Typography color="text.secondary">{t.loading}</Typography>
+          )}
         </Panel>
       )}
       {tab === 'limits' && (
@@ -1160,107 +1185,119 @@ export function RuntimeAdminSection({
           title={t.runtimeLimits}
           subtitle={t.runtimeLimitsIntro}
         >
-          <Box sx={{ display: 'grid', gap: 2.5 }}>
-            <Box sx={{ display: 'grid', gap: 1 }}>
-              <Typography variant="subtitle2" component="h3">
-                {t.runtimeGpuBudget}
-              </Typography>
-              {budgetRows.map((row, idx) => {
-                const live = driftFor(row);
-                return (
-                  <Box
-                    key={idx}
-                    sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
-                  >
-                    <Field
-                      id={`runtime-budget-index-${idx}`}
-                      label={t.runtimeSpecGpuIndex}
-                      type="number"
-                      value={String(row.index)}
-                      onChange={(e) =>
-                        updateBudgetRow(idx, {
-                          index: e.target.value === '' ? 0 : Number(e.target.value),
-                        })
-                      }
-                      inputProps={{ min: 0 }}
-                      sx={{ maxWidth: 140 }}
-                    />
-                    <Field
-                      id={`runtime-budget-mb-${idx}`}
-                      label={t.runtimeGpuBudget}
-                      type="number"
-                      value={String(row.budgetMb)}
-                      onChange={(e) =>
-                        updateBudgetRow(idx, {
-                          budgetMb: e.target.value === '' ? 0 : Number(e.target.value),
-                        })
-                      }
-                      inputProps={{ min: 0 }}
-                      sx={{ maxWidth: 200 }}
-                    />
-                    {live && (
-                      <Tooltip
-                        title={
-                          <Box sx={{ display: 'grid', gap: 0.25 }}>
-                            <Typography variant="caption">{t.runtimeGpuDriftWarning}</Typography>
-                            <Typography variant="caption">
-                              {t.runtimeGpuDriftExpected}: {row.expectedName || '—'} (
-                              {row.expectedUuid})
-                            </Typography>
-                            <Typography variant="caption">
-                              {t.runtimeGpuDriftCurrent}: {live.name || '—'} ({live.uuid})
-                            </Typography>
-                          </Box>
-                        }
-                      >
-                        <IconButton
-                          size="small"
-                          color="warning"
-                          aria-label={`${t.runtimeGpuDriftWarning}: GPU ${row.index}`}
-                        >
-                          <WarningAmberIcon fontSize="small" />
-                        </IconButton>
-                      </Tooltip>
-                    )}
-                    <Button
-                      type="button"
-                      size="small"
-                      color="secondary"
-                      onClick={() => removeBudgetRow(idx)}
+          {!gpuBudgetsReady ? (
+            // The GET hasn't settled yet -- `budgetRows` is still its
+            // initial `[]`, indistinguishable from "no budgets configured".
+            // Rendering the form (and its Save button) here would let a
+            // premature click PUT that empty list as the full replacement,
+            // erasing every previously configured budget (task-21 review's
+            // Critical finding). No form, no click, no write.
+            <Typography color="text.secondary">{t.loading}</Typography>
+          ) : (
+            <Box sx={{ display: 'grid', gap: 2.5 }}>
+              <Box sx={{ display: 'grid', gap: 1 }}>
+                <Typography variant="subtitle2" component="h3">
+                  {t.runtimeGpuBudget}
+                </Typography>
+                {budgetRows.map((row, idx) => {
+                  const live = driftFor(row);
+                  return (
+                    <Box
+                      key={idx}
+                      sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                     >
-                      {t.runtimeSpecGpuRemove}
-                    </Button>
-                  </Box>
-                );
-              })}
+                      <Field
+                        id={`runtime-budget-index-${idx}`}
+                        label={t.runtimeSpecGpuIndex}
+                        type="number"
+                        value={String(row.index)}
+                        onChange={(e) =>
+                          updateBudgetRow(idx, {
+                            index: e.target.value === '' ? 0 : Number(e.target.value),
+                          })
+                        }
+                        inputProps={{ min: 0 }}
+                        sx={{ maxWidth: 140 }}
+                      />
+                      <Field
+                        id={`runtime-budget-mb-${idx}`}
+                        label={t.runtimeGpuBudget}
+                        type="number"
+                        value={String(row.budgetMb)}
+                        onChange={(e) =>
+                          updateBudgetRow(idx, {
+                            budgetMb: e.target.value === '' ? 0 : Number(e.target.value),
+                          })
+                        }
+                        inputProps={{ min: 0 }}
+                        sx={{ maxWidth: 200 }}
+                      />
+                      {live && (
+                        <Tooltip
+                          title={
+                            <Box sx={{ display: 'grid', gap: 0.25 }}>
+                              <Typography variant="caption">{t.runtimeGpuDriftWarning}</Typography>
+                              <Typography variant="caption">
+                                {t.runtimeGpuDriftExpected}: {row.expectedName || '—'} (
+                                {row.expectedUuid})
+                              </Typography>
+                              <Typography variant="caption">
+                                {t.runtimeGpuDriftCurrent}: {live.name || '—'} ({live.uuid})
+                              </Typography>
+                            </Box>
+                          }
+                        >
+                          <IconButton
+                            size="small"
+                            color="warning"
+                            aria-label={`${t.runtimeGpuDriftWarning}: GPU ${row.index}`}
+                          >
+                            <WarningAmberIcon fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
+                      )}
+                      <Button
+                        type="button"
+                        size="small"
+                        color="secondary"
+                        onClick={() => removeBudgetRow(idx)}
+                      >
+                        {t.runtimeSpecGpuRemove}
+                      </Button>
+                    </Box>
+                  );
+                })}
+                <Box>
+                  <Button type="button" variant="outlined" size="small" onClick={addBudgetRow}>
+                    {t.runtimeSpecGpuAdd}
+                  </Button>
+                </Box>
+              </Box>
+
+              <Field
+                id="runtime-max-processes"
+                type="number"
+                label={t.runtimeMaxProcesses}
+                value={String(maxProcesses)}
+                onChange={(e) =>
+                  setMaxProcesses(e.target.value === '' ? 0 : Number(e.target.value))
+                }
+                inputProps={{ min: 0 }}
+                sx={{ maxWidth: 280 }}
+              />
+
               <Box>
-                <Button type="button" variant="outlined" size="small" onClick={addBudgetRow}>
-                  {t.runtimeSpecGpuAdd}
+                <Button
+                  type="button"
+                  variant="contained"
+                  disabled={limitsBusy}
+                  onClick={() => void saveLimits()}
+                >
+                  {t.save}
                 </Button>
               </Box>
             </Box>
-
-            <Field
-              id="runtime-max-processes"
-              type="number"
-              label={t.runtimeMaxProcesses}
-              value={String(maxProcesses)}
-              onChange={(e) => setMaxProcesses(e.target.value === '' ? 0 : Number(e.target.value))}
-              inputProps={{ min: 0 }}
-              sx={{ maxWidth: 280 }}
-            />
-
-            <Box>
-              <Button
-                type="button"
-                variant="contained"
-                disabled={limitsBusy}
-                onClick={() => void saveLimits()}
-              >
-                {t.save}
-              </Button>
-            </Box>
-          </Box>
+          )}
         </Panel>
       )}
       {tab === 'status' && (

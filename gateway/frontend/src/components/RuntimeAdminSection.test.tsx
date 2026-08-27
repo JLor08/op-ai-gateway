@@ -163,7 +163,11 @@ function renderSection(
     specsByMappingId?: Record<string, RuntimeSpec>;
     warnings?: string[];
     coresidencyPairs?: [string, string][];
+    // Never resolves -- simulates the GET still being in flight, for the
+    // "must not write before the fetch settles" regression tests.
+    coresidencyPending?: boolean;
     gpuBudgets?: GPUBudget[];
+    gpuBudgetsPending?: boolean;
     hardware?: HardwareResponse;
     runtimeMaxProcesses?: number;
   } = {},
@@ -209,13 +213,21 @@ function renderSection(
       deletedSpecIds.push(id);
       return { ok: true };
     }),
-    runtimeCoresidency: vi.fn(async () => ({ pairs: opts.coresidencyPairs ?? [] })),
+    runtimeCoresidency: vi.fn(() =>
+      opts.coresidencyPending
+        ? new Promise<{ pairs: [string, string][] }>(() => {})
+        : Promise.resolve({ pairs: opts.coresidencyPairs ?? [] }),
+    ),
     putRuntimeCoresidency: vi.fn(async (_appId: string, body: { pairs: [string, string][] }) => {
       putCoresidencyBodies.push(body.pairs);
       return { pairs: body.pairs };
     }),
     runtimeWarnings: vi.fn(async () => ({ warnings: opts.warnings ?? [] })),
-    gpuBudgets: vi.fn(async () => ({ budgets: opts.gpuBudgets ?? [] })),
+    gpuBudgets: vi.fn(() =>
+      opts.gpuBudgetsPending
+        ? new Promise<{ budgets: GPUBudget[] }>(() => {})
+        : Promise.resolve({ budgets: opts.gpuBudgets ?? [] }),
+    ),
     putGpuBudgets: vi.fn(async (_serverId: string, body: { budgets: GPUBudget[] }) => {
       putBudgets.push(body.budgets);
       return { budgets: body.budgets };
@@ -686,12 +698,56 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
     await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
     expect(putCoresidencyBodies[0]).toEqual([['map_1', 'map_3']]);
   });
+
+  // Review round 1, CRITICAL: `coresidencyData ?? []` collapses "GET still
+  // loading" and "GET resolved to genuinely empty" into the same value. If
+  // the matrix rendered (and accepted clicks) from that collapsed `[]`
+  // before the real GET settled, a single click would PUT a full-replace
+  // list containing ONLY the just-toggled pair -- silently erasing every
+  // pair a previous admin had already saved. The fix is to render nothing
+  // clickable until the fetch has actually resolved.
+  it('CRITICAL: shows a loading state and performs no write while the co-residency GET is still pending', async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      coresidencyPending: true,
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+
+    // The matrix must not exist yet -- there is nothing to click, so there
+    // is nothing that could PUT an empty replacement list.
+    await screen.findByText(t.loading);
+    expect(
+      screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+    ).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
+  });
 });
 
 // Task 21: "server limits" -- GPU budget rows prefilled from live telemetry,
 // the never-blocking UUID-drift warning, and saving budgets + the process
 // limit together.
 describe('RuntimeAdminSection server limits wiring', () => {
+  // Review round 1, CRITICAL: `budgetRows` starts `[]` and is only ever
+  // re-seeded once the GET resolves. If Save were reachable before that,
+  // `budgetRows` (still `[]`) would PUT as the full replacement -- erasing
+  // every previously configured per-GPU budget on a single premature click.
+  // The fix is to render nothing (no Save button, no fields) until the
+  // fetch has actually resolved.
+  it('CRITICAL: shows a loading state and performs no write while the GPU-budgets GET is still pending', async () => {
+    const { fakeApi } = renderSection({ gpuBudgetsPending: true });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+
+    await screen.findByText(t.loading);
+    // Neither the Save button nor the process-limit field exist yet -- there
+    // is no way to trigger a write.
+    expect(screen.queryByRole('button', { name: t.save })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeMaxProcesses)).not.toBeInTheDocument();
+    expect(fakeApi.putGpuBudgets).not.toHaveBeenCalled();
+    expect(fakeApi.updateServer).not.toHaveBeenCalled();
+  });
+
   it("prefills a new budget row's index and VRAM (in MB) from live telemetry", async () => {
     renderSection({
       hardware: makeHardware([
