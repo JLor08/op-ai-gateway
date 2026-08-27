@@ -95,6 +95,48 @@ func TestConformanceSingleServerAgentPartialUniqueIndex(t *testing.T) {
 	})
 }
 
+// TestConformanceSingleServerAgentMigrationUpgradesAnExistingDatabase covers
+// the realistic upgrade path the two tests around it do not: a database that
+// already holds server_agent applications but NO duplicates -- the state every
+// development database of this branch is in -- must gain the index when
+// migration 68 runs, not skip it. (The fresh-database case is covered by
+// TestConformanceSingleServerAgentPartialUniqueIndex above; the
+// duplicates-present skip by the test below. Without this one, a
+// pre-check that wrongly skipped whenever ANY server_agent row existed would
+// pass both of them.)
+func TestConformanceSingleServerAgentMigrationUpgradesAnExistingDatabase(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedServerForSingleAgentTest(t, s, "srv1", now)
+		seedServerForSingleAgentTest(t, s, "srv2", now)
+		if err := s.CreateApplication(ctx, serverAgentApp("app_agent1", "srv1", 9000, now)); err != nil {
+			t.Fatalf("server_agent application on srv1: %v", err)
+		}
+		if err := s.CreateApplication(ctx, serverAgentApp("app_agent2", "srv2", 9000, now)); err != nil {
+			t.Fatalf("server_agent application on srv2: %v", err)
+		}
+		// Back to the pre-68 state, with those two (legal) rows in place.
+		if _, err := s.db.ExecContext(ctx, `drop index idx_applications_single_server_agent`); err != nil {
+			t.Fatalf("drop index: %v", err)
+		}
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`delete from schema_migrations where version = ?`), 68); err != nil {
+			t.Fatalf("un-record migration 68: %v", err)
+		}
+
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate over existing non-duplicate server_agent rows: %v", err)
+		}
+		if !indexExists(t, s, "idx_applications_single_server_agent") {
+			t.Fatalf("index was NOT created on an upgrade with no duplicates (%s)", s.dl.name())
+		}
+		// And it is live: a second server_agent application on srv1 is refused.
+		if err := s.CreateApplication(ctx, serverAgentApp("app_agent3", "srv1", 9001, now)); err != ErrConflict {
+			t.Fatalf("after upgrade, second server_agent on srv1: err = %v, want ErrConflict", err)
+		}
+	})
+}
+
 // TestConformanceSingleServerAgentMigrationToleratesExistingDuplicates pins the
 // deliberate "cannot fail a migration on live data" property of migration 68:
 // on a database that already holds two server_agent applications for one server
