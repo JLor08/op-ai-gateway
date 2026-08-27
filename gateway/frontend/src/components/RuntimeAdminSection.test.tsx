@@ -722,6 +722,54 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
     ).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
   });
+
+  // Review round 1, Important: two clicks in quick succession must not let a
+  // slow first response overwrite state a second toggle already advanced --
+  // that would silently drop the second pair on the next write. The chosen
+  // fix mirrors Area 3's `limitsBusy`: disable the whole matrix while a PUT
+  // is outstanding, so a second click physically cannot fire until the
+  // first response has been reconciled.
+  it('IMPORTANT: disables the matrix while a toggle PUT is in flight, so a second click cannot race a still-pending response', async () => {
+    let resolveFirst: (v: { pairs: [string, string][] }) => void = () => {};
+    const firstPut = new Promise<{ pairs: [string, string][] }>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const { fakeApi, putCoresidencyBodies } = renderSection({
+      mappings: threeMappings(),
+      coresidencyPairs: [],
+    });
+    fakeApi.putRuntimeCoresidency.mockImplementationOnce(async () => firstPut);
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    const firstCell = await screen.findByRole('button', {
+      name: `${t.runtimeMatrixCell}: Bravo + Alpha`,
+    });
+    fireEvent.click(firstCell);
+
+    const secondCell = await screen.findByRole('button', {
+      name: `${t.runtimeMatrixCell}: Charlie + Bravo`,
+    });
+    await waitFor(() => expect(secondCell).toBeDisabled());
+    fireEvent.click(secondCell); // disabled -- must be a no-op
+    expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ pairs: [['map_1', 'map_2']] });
+    await waitFor(() => expect(secondCell).not.toBeDisabled());
+
+    fireEvent.click(secondCell);
+    await waitFor(() => expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(2));
+    // Only the second call reaches the default (pushing) mock implementation
+    // -- the first was overridden above -- so exactly one entry is expected,
+    // and it must contain BOTH the reconciled first pair and the new one.
+    expect(putCoresidencyBodies).toHaveLength(1);
+    expect(putCoresidencyBodies[0]).toHaveLength(2);
+    expect(putCoresidencyBodies[0]).toEqual(
+      expect.arrayContaining([
+        ['map_1', 'map_2'],
+        ['map_2', 'map_3'],
+      ]),
+    );
+  });
 });
 
 // Task 21: "server limits" -- GPU budget rows prefilled from live telemetry,
@@ -781,23 +829,29 @@ describe('RuntimeAdminSection server limits wiring', () => {
 
     fireEvent.click(await screen.findByText(t.runtimeLimits));
     const warningIcon = await screen.findByRole('button', {
-      name: `${t.runtimeGpuDriftWarning}: GPU 0`,
+      name: `${t.runtimeGpuDriftIconLabel}: GPU 0`,
     });
     expect(warningIcon).not.toBeDisabled();
     expect(screen.getByLabelText(t.runtimeSpecGpuIndex)).not.toBeDisabled();
     expect(screen.getByLabelText(t.runtimeGpuBudget)).not.toBeDisabled();
   });
 
-  it('shows no drift warning when the GPU reports no UUID (AMD/Apple -- no drift detection available, not "drift detected")', async () => {
+  it('shows no drift warning when the GPU reports no UUID, even if expected_name differs (AMD/Apple -- no drift detection available, not "drift detected")', async () => {
     renderSection({
-      hardware: makeHardware([{ index: 0, name: 'Apple GPU', memory_total_bytes: 0 }]),
-      gpuBudgets: [{ index: 0, budget_mb: 10000, expected_uuid: '', expected_name: 'Apple GPU' }],
+      // Live name deliberately differs from the stored expected_name -- the
+      // drift check compares ONLY the UUID (per the brief); a name mismatch
+      // alone must never trigger a warning when no UUID is available on
+      // either side.
+      hardware: makeHardware([{ index: 0, name: 'Apple M3 Max GPU', memory_total_bytes: 0 }]),
+      gpuBudgets: [
+        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: 'Apple M2 Max GPU' },
+      ],
     });
 
     fireEvent.click(await screen.findByText(t.runtimeLimits));
     await screen.findByLabelText(t.runtimeGpuBudget);
     expect(
-      screen.queryByRole('button', { name: `${t.runtimeGpuDriftWarning}: GPU 0` }),
+      screen.queryByRole('button', { name: `${t.runtimeGpuDriftIconLabel}: GPU 0` }),
     ).not.toBeInTheDocument();
   });
 

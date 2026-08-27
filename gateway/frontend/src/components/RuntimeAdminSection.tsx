@@ -377,6 +377,17 @@ export function RuntimeAdminSection({
     })),
   }));
 
+  // Serializes toggles: while a PUT is in flight, the matrix is disabled
+  // (mirrors Area 3's limitsBusy) so a second click cannot compute its next
+  // full-replace list from state a still-outstanding first response might
+  // later overwrite. Chosen over a toggle QUEUE (buffering clicks and
+  // replaying them once the in-flight PUT settles) because every other
+  // full-replace write in this section (spec save, limits save) already
+  // uses the same "disable until the response lands" idiom, and a silently
+  // queued click is easy to mistake for a dropped one -- the operator sees
+  // the matrix visibly busy instead.
+  const [coresidencyBusy, setCoresidencyBusy] = useState(false);
+
   async function toggleCoresidency(a: string, b: string) {
     const exists = coresidencyPairs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
     const next: [string, string][] = exists
@@ -384,12 +395,15 @@ export function RuntimeAdminSection({
       : [...coresidencyPairs, [a, b]];
     const previous = coresidencyPairs;
     setCoresidencyData(next); // optimistic
+    setCoresidencyBusy(true);
     try {
       const stored = await api.putRuntimeCoresidency(application.id, { pairs: next });
       setCoresidencyData(stored.pairs);
     } catch (err) {
       setCoresidencyData(previous);
       showError(formatPortalError(err, t));
+    } finally {
+      setCoresidencyBusy(false);
     }
   }
 
@@ -1170,6 +1184,7 @@ export function RuntimeAdminSection({
               pairs={coresidencyPairs}
               onToggle={(a, b) => void toggleCoresidency(a, b)}
               budgets={savedBudgetsByGpuIndex}
+              disabled={coresidencyBusy}
             />
           ) : (
             // Deliberately NOT the matrix with an empty pair list: the GET
@@ -1250,7 +1265,7 @@ export function RuntimeAdminSection({
                           <IconButton
                             size="small"
                             color="warning"
-                            aria-label={`${t.runtimeGpuDriftWarning}: GPU ${row.index}`}
+                            aria-label={`${t.runtimeGpuDriftIconLabel}: GPU ${row.index}`}
                           >
                             <WarningAmberIcon fontSize="small" />
                           </IconButton>

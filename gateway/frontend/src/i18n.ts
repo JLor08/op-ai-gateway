@@ -486,6 +486,7 @@ const de = {
   runtimeMaxProcesses: 'Max. gleichzeitige Prozesse',
   runtimeGpuDriftWarning:
     'Die Hardware an diesem GPU-Index hat sich seit der Budget-Anlage verändert (z. B. durch ein Treiber-Update oder Hardware-Tausch); der Server bleibt dadurch weiterhin in Betrieb.',
+  runtimeGpuDriftIconLabel: 'GPU-Hardware-Warnung',
   runtimeGpuDriftExpected: 'Erwartet',
   runtimeGpuDriftCurrent: 'Aktuell',
   runtimeLiveStatus: 'Live-Status',
@@ -2233,6 +2234,7 @@ const en: PortalMessages = {
   runtimeMaxProcesses: 'Max concurrent processes',
   runtimeGpuDriftWarning:
     'The hardware at this GPU index has changed since the budget was created (e.g. a driver update or a hardware swap); the server stays in service regardless.',
+  runtimeGpuDriftIconLabel: 'GPU hardware warning',
   runtimeGpuDriftExpected: 'Expected',
   runtimeGpuDriftCurrent: 'Now',
   runtimeLiveStatus: 'Live status',

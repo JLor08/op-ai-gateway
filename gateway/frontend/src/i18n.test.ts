@@ -1923,6 +1923,7 @@ describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
       'runtimeMatrixOverBudget',
       'runtimeLimitsIntro',
       'runtimeGpuDriftWarning',
+      'runtimeGpuDriftIconLabel',
       'runtimeGpuDriftExpected',
       'runtimeGpuDriftCurrent',
     ] as const;
