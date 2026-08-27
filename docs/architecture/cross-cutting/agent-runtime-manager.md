@@ -606,12 +606,44 @@ non-pinned occupant yields `Wait`, because it can drain.
 ### 5.4 Eviction, queueing and drain
 
 When admission is blocked, the policy proposes victims: **only processes
-currently serving no request, oldest-`last_used` first, never a `pinned` spec.**
-Ties break on ascending spec id — not determinism theatre: the victim set is
-accumulated in a map (Go randomises map iteration order per run) and
-`sort.Slice` is not stable, so without the tie-break the same snapshot evicts
-different processes on different runs, a non-reproducible failure single-run
-testing cannot detect.
+currently serving no request and not still loading, oldest-`last_used` first,
+never a `pinned` spec.** Ties break on ascending spec id — not determinism
+theatre: the victim set is accumulated in a map (Go randomises map iteration
+order per run) and `sort.Slice` is not stable, so without the tie-break the
+same snapshot evicts different processes on different runs, a non-reproducible
+failure single-run testing cannot detect.
+
+**A process that has not yet passed a health probe is never an eviction
+victim.** "Serving no request" alone reads a still-loading process as idle,
+when it is in fact the most expensive thing on the host *and* has a request
+queued on it. Two concurrent requests for two models that cannot co-reside then
+evict each other while loading, forever: each eviction frees the slot the other
+immediately takes, no request ever progresses, and every iteration is a model
+server beginning to map a model file and then being killed. It is unbounded
+rather than self-limiting, because `admission_wait_timeout_seconds` bounds the
+*duration* of the storm and never its rate. With the clause, each exec buys at
+least one served request: the loser Waits (bounded by `startup_timeout_seconds`,
+which is what actually bounds `starting`), the winner finishes loading and
+serves, and only then becomes evictable. This is **not** the same guard as
+`pinned`: `pinned` is permanent, while `starting` is a state every process
+passes through exactly once per generation and always leaves — healthy, start
+timeout, or exit.
+
+**A spec evicted *for* another spec's queued request gives that spec first
+refusal on the freed slot.** The victim records who it was drained for, and
+when its process finally exits those specs are admitted *by name* before the
+victim may re-admit itself. Without it the fix above trades a busy loop for
+starvation: sustained traffic for the victim's own model can keep re-taking the
+slot its eviction paid for, one full model load per cycle. A bare reordering of
+the two admission attempts is not sufficient, because the general wake pass
+reaches the victim too, in randomised map order; only the explicit by-name step
+orders the two.
+
+Every other admission retry runs **oldest-queued-request-first**, and covers
+every spec that *wants* to be up rather than only those with a queued request —
+a `pinned` or `force_running` spec has no waiter at all, so a wake keyed on
+"has a pending request" would leave it Stopped after a `Wait` until some
+unrelated config `Apply` happened to retry it.
 
 **`Admit` never returns a partial eviction list.** If any blocker anywhere in
 the pipeline is non-evictable — busy, or pinned outside the unknown-VRAM
@@ -1006,6 +1038,28 @@ Four rules on the config-source side, each with a total failure behind it:
   config regardless of the error cannot tear anything down over one corrupt
   frame. Returning a zero-value config plus an error — the idiomatic Go shape —
   would stop every managed model on a single bad frame or a brief gateway outage.
+
+  **The rule binds the gateway too, and stating only the agent's half is not
+  enough** — every clause above keys on the outcome *not* being a 200, so the
+  whole discipline is defeated by an answer that **is** one. The gateway must
+  therefore **never synthesise a well-formed document it did not derive.** The
+  empty runtime-config document means exactly one thing — "this server runs
+  nothing managed" (no such server row, or no `server_agent` application) — and
+  a *derivation failure* is a **500** on the HTTP path and **no push at all**
+  on the WS path, because on both transports the last known-good config is the
+  safe answer and only a non-200 (or silence) reaches it. This was a real
+  defect, not a hypothetical: a transient store read failure used to collapse
+  into the empty document with a nil error, which parses happily, carries a
+  valid but different ETag, overwrites the agent's disk cache, drops the router
+  listener and drains every spec — and, having a nil error, also walked
+  straight through the WS push path's own never-push-on-error guard.
+
+  The same obligation binds **`/proxy-routes`**, for the same reason and with a
+  different blast radius: its empty route list closes every TLS listener the
+  agent is running, leaving each already-proxy-switched application pointed at
+  a dead port, and the https-auto-switch reconcile cannot undo it (a torn-down
+  route reads as *missing* from the status snapshot, which is deliberately
+  never a revert). A store failure there is a 500 as well.
 - **"Config unchanged since the last fetch" and "config already applied to the
   manager" are different facts**, and the driver tracks applied-state separately
   from the ETag. They diverge across a process restart: the agent restarts,
@@ -1122,12 +1176,46 @@ already masked.
 `parse_error` is a first-class case, not an edge case: the agent may
 legitimately report an empty `config` alongside a non-empty `parse_error` — a
 broken file keeps the last-good runtime running while still reporting why the
-on-disk state could not be adopted. The gateway reduces it to a **classification
-token** (see [Security](security-auth-rbac.md) for the exact rule and why a
-length clamp or a colon split is not enough), and the portal raises it as its
-own banner, names the classification, and stops rendering `config` while it is
-set. Treating an empty config as "nothing configured" produces a confidently
-empty screen for the one case where the operator most needs the truth.
+on-disk state could not be adopted. The portal raises it as its own banner and
+stops rendering `config` while it is set. Treating an empty config as "nothing
+configured" produces a confidently empty screen for the one case where the
+operator most needs the truth.
+
+**The field carries a code from a closed set, and no free text at all.** That
+is the whole contract, and it is what makes the field simultaneously safe and
+useful — a config-loader error routinely quotes the offending source line, and
+in this schema that line may legitimately hold a plaintext secret, so
+agent-chosen prose can never be allowed through (see
+[Security](security-auth-rbac.md)):
+
+| Code | Meaning |
+|---|---|
+| `json_syntax` | The file is not valid JSON, in any of the ways `encoding/json` reports. |
+| `duplicate_spec_id` | Two entries in the file share a spec id — the one parse failure that is not a syntax error. |
+| *(empty)* | **No failure.** The field is `omitempty`, so a healthy agent sends nothing here. |
+
+The agent additionally owns an `unclassified` floor which nothing currently
+produces; it is a defensive value, not a third meaning, and the gateway
+degrades it like any other unknown code.
+
+It is a **three-sided contract with no compiler on any seam**, so adding a code
+is three coordinated changes:
+
+1. the **agent's** closed `ParseErrorCode` set — typed end to end (`ParseConfig`
+   → `FileSource` → `BuildReport`), so "this field carries no free text" is a
+   compile-time property of the agent rather than a promise its loader is
+   trusted to keep;
+2. the **gateway's** allow-list on ingest, which keeps a listed code verbatim,
+   rewrites everything else — the agent's own floor included — to a fixed
+   generic constant, and leaves an **empty** value empty (an empty
+   `parse_error` is not a redaction case, it is the healthy case);
+3. the **portal's** code→sentence map plus its i18n keys, which never renders
+   the raw identifier: an unrecognised code degrades to "the reason was not
+   reported" and still suppresses the config view, because the gate is
+   truthiness rather than membership of the map.
+
+Steps 2 and 3 each degrade independently, so an agent that ships a new code
+ahead of the gateway or the portal produces a vaguer banner, never a wrong one.
 
 The report's `config` is an opaque document from a file a human edits on another
 machine, so the portal narrows it defensively at every level rather than casting

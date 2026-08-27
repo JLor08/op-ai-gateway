@@ -292,15 +292,38 @@ nothing.)
 `parse_error` is the second, non-obvious leak path into that table, and it needs
 its own rule: **a configuration-loader error routinely quotes the offending
 line**, so an unparsed secret-bearing line could reach the report even though
-`env` values are masked. The reduction is therefore to a bare **classification
-token**: only the text before the first `:` is kept, and only when it actually
-looks like a classification (non-empty, at most 64 bytes, containing none of
-whitespace, `"`, `'`, `=`); **every other shape** — no colon at all, an over-long
-prefix, or a quoted secret before the colon — is replaced by a fixed constant.
-It is a heuristic tied to the conventional `subsystem: detail` format, not a
-general secret scanner. The first version of this rule (keep the prefix, pass
-colon-less strings through) leaked in two concrete shapes; length-clamping or a
-plain colon split looks sufficient and still persists the quoted secret.
+`env` values are masked. The rule is an **allow-list over a closed set of
+codes**: the field may only ever be one of the classification codes the agent's
+wire contract defines (`json_syntax`, `duplicate_spec_id` — see
+[the runtime chapter](agent-runtime-manager.md)), anything else is replaced by
+a fixed generic constant, and an **empty** value stays empty, because "this
+agent reported no parse failure" is not a redaction case at all. Free text has
+no path in, whatever the agent sends.
+
+Two earlier rules were tried and both failed, each a reasonable answer to the
+half of the problem it could see, and the pair is worth keeping because a
+future reader will otherwise re-derive them:
+
+1. **Keep everything before the first `:`, pass a colon-less string through.**
+   Leaked in two shapes: a colon-less message survived verbatim (nothing to
+   cut), and a secret sitting *before* the first colon survived too — the split
+   kept precisely the wrong half.
+2. **Keep that prefix only when it looks like a bare classification token**
+   (non-empty, bounded length, no whitespace/quote/`=`). That closed the leak
+   and broke the field. The actual producer's every error begins `"runtime: "`,
+   so the one reachable non-generic output, for every malformed file an
+   operator could write, was the single word `runtime` — a token that looks
+   like a meaningful subsystem tag and carries no information at all. Worse, it
+   had no empty-input case, and `""` is exactly what a *healthy* agent sends
+   (the field is `omitempty`), so it rewrote the healthy case into
+   `"config parse error"`: every file-mode agent whose config parsed perfectly
+   was stored, and shown in the portal, as one that had failed to parse — with
+   the portal suppressing the config view on exactly that field.
+
+The lesson generalises past this field: a redaction heuristic negotiates
+between hiding content and reporting a diagnosis, and loses both. Stating what
+the field **may contain** ends that negotiation instead of picking a winner,
+and it makes both sides readable against the same contract.
 
 ### 8.3 What a gateway-authored launch spec may not reach
 
