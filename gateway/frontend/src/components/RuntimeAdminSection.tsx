@@ -678,9 +678,16 @@ export function RuntimeAdminSection({
     (async () => {
       for (const m of toLoad) {
         loadedIdsRef.current.add(m.id);
+        // A read, ordered against this mapping's writes (`commitSpecRead`,
+        // declared below). A mapping with no cached spec renders no override
+        // actions, so THIS loop cannot be overtaken by an override write -- but
+        // `openEdit` is clickable on a row whose lazy GET is still in flight,
+        // and a save from that form is a write this GET would otherwise land on
+        // top of with a pre-save snapshot.
+        const seen = beginSpecRead(m.id);
         try {
           const spec = await api.runtimeSpec(m.id);
-          if (!cancelled) setSpecsById((cur) => ({ ...cur, [m.id]: spec }));
+          if (!cancelled) commitSpecRead(m.id, seen, spec);
         } catch (err) {
           if (!cancelled) showError(formatPortalError(err, t));
         } finally {
@@ -705,43 +712,92 @@ export function RuntimeAdminSection({
     mappingsStatus === 'ready' && mappings.every((m) => specLoadSettled.has(m.id));
 
   /**
-   * Per-mapping write ticket, and the only way `specsById` is written from a
-   * response.
+   * Per-mapping ordering for `specsById`. Every write to that cache goes
+   * through `commitSpecCache`/`forgetSpecCache` and every read through
+   * `commitSpecRead`; nothing else may call `setSpecsById`.
    *
    * `specsById` is a cache of server truth, and the three override/restart
    * writes deliberately update it ABOVE their run token (fix round 2, N1) so a
    * write abandoned by its watchdog that later succeeds still corrects the row.
-   * That left ARRIVAL ORDER deciding what the cache holds when two writes to
-   * the SAME mapping overlap: `RuntimeSpec` carries no version/etag, so a late
-   * response is indistinguishable from a current one. The sequence that hurts
-   * is reachable: an override PUT hangs past the 30 s watchdog, the row
+   * That left ARRIVAL ORDER deciding what the cache holds when two operations
+   * on the SAME mapping overlap: `RuntimeSpec` carries no version/etag, so a
+   * late response is indistinguishable from a current one. The sequence that
+   * hurts is reachable: an override PUT hangs past the 30 s watchdog, the row
    * unlocks, a second write on the same mapping resolves, and then the first
    * finally resolves and overwrites the cache with the outcome of the write the
    * operator was already told had been given up on -- so the row offers the
    * inverse of the actions that apply.
    *
-   * A monotonic per-mapping ticket restores the ordering the payload cannot
-   * carry: only the most recently ISSUED write for a mapping may write that
-   * mapping's cache entry. It does NOT re-tighten N1 -- an abandoned write that
-   * is still the latest one issued applies exactly as before.
+   * Two counters, because writes and reads need OPPOSITE tests (fix round 1,
+   * C1/C2 -- the first version had one counter and used the write test for
+   * both):
    *
-   * Every write path that puts a response (or a delete's zero value) into the
-   * cache takes a ticket, deliberately including the create/edit form: a hung
-   * override write resolving after a form save is the same bug with only ONE
-   * hang, and the form is reachable while an override write is outstanding (the
-   * specs tab's Edit action is not covered by `overridesLocked`). `openEdit`'s
-   * GET stays plain: it is a read, and a read-modify-write against a spec whose
-   * PUT is still in flight server-side is an etag problem this cache cannot
-   * solve.
+   *  - a WRITE's payload is what the server acknowledged storing, so it may
+   *    become the cache entry unless a LATER write has already COMMITTED one.
+   *    Comparing against the last ISSUED ticket instead made any later write
+   *    burn the comparison even when it wrote nothing at all -- so a later
+   *    write that FAILED (its retry rejecting, a spec delete failing, a form
+   *    save's spec PUT failing) permanently discarded an earlier
+   *    abandoned-then-successful write, leaving the cache at `admin_state: ''`
+   *    while the server held `force_stopped`. That is precisely the N1 defect,
+   *    back again: the row then offers Force start / Force stop / Restart and
+   *    NO Clear override while the model is admission-blocked, with the write
+   *    timeout notice on screen telling the operator to clear by hand an
+   *    override the row denies exists. A failure must NOT retire its ticket by
+   *    decrementing the counter either -- that races a third write.
+   *  - a READ's payload is only a snapshot, so it may become the cache entry
+   *    only while NO write has been issued for that mapping since the read
+   *    started. `openEdit`'s GET is issued from the specs tab, which
+   *    `overrideBusy` does not lock (`rowActions` gates only on
+   *    `loadingEditFor`), so a slow one landed after a successful Force stop
+   *    and overwrote it with its pre-PUT snapshot -- and nothing re-fetches on
+   *    the way back (`loadedIdsRef` blocks the lazy loader), so that poison was
+   *    permanent. A read never advances the committed counter: an older write
+   *    still in flight is more authoritative than a snapshot that may have been
+   *    served before that write applied.
+   *
+   * Every write path takes a ticket, deliberately including the create/edit
+   * form and both delete branches: a hung override write resolving after a form
+   * save is the same bug with only ONE hang, and a delete is a write to the
+   * same cache entry.
    */
   const specWriteSeqRef = useRef<Map<string, number>>(new Map());
+  const specCommittedSeqRef = useRef<Map<string, number>>(new Map());
+  /** Issues the next write ticket for this mapping's cache entry. */
   function beginSpecWrite(mappingId: string): number {
     const ticket = (specWriteSeqRef.current.get(mappingId) ?? 0) + 1;
     specWriteSeqRef.current.set(mappingId, ticket);
     return ticket;
   }
+  /** True when no LATER write has already committed for this mapping. */
+  function acceptSpecWrite(mappingId: string, ticket: number): boolean {
+    if (ticket < (specCommittedSeqRef.current.get(mappingId) ?? 0)) return false;
+    specCommittedSeqRef.current.set(mappingId, ticket);
+    return true;
+  }
   function commitSpecCache(mappingId: string, ticket: number, spec: RuntimeSpec) {
-    if (specWriteSeqRef.current.get(mappingId) !== ticket) return;
+    if (!acceptSpecWrite(mappingId, ticket)) return;
+    setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
+  }
+  /** The mapping-delete half: the entry is gone, and that fact is ordered too. */
+  function forgetSpecCache(mappingId: string, ticket: number) {
+    if (!acceptSpecWrite(mappingId, ticket)) return;
+    setSpecsById((cur) => {
+      const next = { ...cur };
+      delete next[mappingId];
+      return next;
+    });
+  }
+  /**
+   * Snapshots the write counter for a READ. Deliberately does not increment:
+   * a GET issues no write, so it must not stop a write that is already in
+   * flight from committing.
+   */
+  function beginSpecRead(mappingId: string): number {
+    return specWriteSeqRef.current.get(mappingId) ?? 0;
+  }
+  function commitSpecRead(mappingId: string, seen: number, spec: RuntimeSpec) {
+    if ((specWriteSeqRef.current.get(mappingId) ?? 0) !== seen) return;
     setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
   }
 
@@ -1287,7 +1343,10 @@ export function RuntimeAdminSection({
       // ARE user-visible, and an abandoned flow must not resurrect them.
       // The per-mapping TICKET is a different guard from the run token: it
       // drops this payload only when a LATER write to the same mapping has
-      // already been issued, i.e. only when it is genuinely stale.
+      // already COMMITTED one, i.e. only when it is genuinely stale. Not when
+      // a later write merely STARTED -- a later write that failed writes
+      // nothing, and discarding this payload for it re-opens N1 (see the
+      // ticket block's own comment).
       commitSpecCache(spec.mapping_id, ticket, updated);
       if (overrideRunRef.current !== run) return;
       showSuccess(t.systemSaved);
@@ -1457,14 +1516,20 @@ export function RuntimeAdminSection({
   // Re-reads the spec fresh (rather than trusting the bulk-loaded map, which
   // may not have settled yet for a just-rendered row) so the full-document
   // PUT this form issues on save never clobbers fields it never saw.
+  //
+  // `hydrateSpecFields` deliberately uses this GET's OWN payload even when the
+  // cache refuses it: the form is about to PUT that document back, so it must
+  // show what it will send. The stale FORM is the etag problem this cache
+  // cannot solve; the stale CACHE is not (fix round 1, C2).
   async function openEdit(mapping: PortalModelMapping) {
     setGatewayName(mapping.gateway_model_name);
     setAppName(mapping.app_model_name);
     setStatus(mapping.status);
     setLoadingEditFor(mapping.id);
+    const seen = beginSpecRead(mapping.id);
     try {
       const spec = await api.runtimeSpec(mapping.id);
-      setSpecsById((cur) => ({ ...cur, [mapping.id]: spec }));
+      commitSpecRead(mapping.id, seen, spec);
       loadedIdsRef.current.add(mapping.id);
       hydrateSpecFields(spec);
       setSpecMode({ kind: 'edit', mapping });
@@ -1636,13 +1701,18 @@ export function RuntimeAdminSection({
         commitSpecCache(id, ticket, emptySpec(id));
         void reloadWarnings();
       } else {
+        // The other half of the same rule (fix round 1, M5): dropping the
+        // entry is a write to it too. Without a ticket a spec write still in
+        // flight for this mapping resurrected it -- reachable because the
+        // create form's spec PUT has no watchdog and `busy` disables only
+        // Submit, so Cancel returns to a list that already holds the new
+        // mapping with nothing cached for it, i.e. to THIS branch. The status
+        // row then offered four override actions that all PUT to a mapping id
+        // that no longer exists, on a row `mappingForStatus` could not name.
+        const ticket = beginSpecWrite(id);
         await api.deleteMapping(id);
         setMappings((current) => (current ?? []).filter((m) => m.id !== id));
-        setSpecsById((cur) => {
-          const next = { ...cur };
-          delete next[id];
-          return next;
-        });
+        forgetSpecCache(id, ticket);
         loadedIdsRef.current.delete(id);
       }
       setConfirmingDeleteId('');

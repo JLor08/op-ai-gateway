@@ -221,6 +221,10 @@ function renderSection(
     // failed-RELOAD-over-an-existing-payload state (`stale-error`). Both are
     // the same options the report resource already had.
     mappingsFailing?: boolean;
+    // Fix round 1, C4: the mappings resource was the one of the three that
+    // gained no `*FailsOnCall`, so its `stale-error` state -- the only one that
+    // still renders rows and override actions -- had no test at all.
+    mappingsFailsOnCall?: number;
     coresidencyFailing?: boolean;
     coresidencyFailsOnCall?: number;
     gpuBudgetsFailing?: boolean;
@@ -274,7 +278,10 @@ function renderSection(
   const fakeApi = {
     mappings: vi.fn(() => {
       mappingsCalls += 1;
-      if (opts.mappingsFailing && mappingsCalls === 1) {
+      if (
+        (opts.mappingsFailing && mappingsCalls === 1) ||
+        opts.mappingsFailsOnCall === mappingsCalls
+      ) {
         return Promise.reject(new Error('mappings unavailable'));
       }
       return Promise.resolve({ data: mappings });
@@ -2781,5 +2788,268 @@ describe('RuntimeAdminSection trailing empty argument (task 22b, C4)', () => {
     // The internal blank survives; the trailing one is indistinguishable from
     // the textarea artifact the pop exists to swallow, so it does not.
     expect(putSpecs[0].body.args).toEqual(['--foo', '', '--bar']);
+  });
+});
+
+// ===========================================================================
+// Task 22b, batch C -- fix round 1
+// ===========================================================================
+
+// C1: the per-mapping write ticket compared the resolving write against the
+// last ISSUED ticket, so ANY later write burned the comparison even when it
+// wrote nothing. A later write that FAILS therefore discarded an earlier
+// abandoned-but-successful one permanently -- which is exactly the N1 defect
+// fix round 2 closed, reached through the fix for C6. Four of the five review
+// lenses found this independently.
+describe('RuntimeAdminSection ticket compares against the last COMMITTED write (fix round 1, C1)', () => {
+  it('still lands an abandoned override write when the LATER write to the same mapping failed', async () => {
+    vi.useFakeTimers();
+    try {
+      let landFirst: (updated: RuntimeSpec) => void = () => {};
+      const first = new Promise<RuntimeSpec>((resolve) => {
+        landFirst = resolve;
+      });
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+
+      // Write A: force_stopped, hangs past its 30 s watchdog. The row unlocks
+      // and the operator is told the outcome is unknown.
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
+
+      // Write B: the retry, on the same mapping -- and it REJECTS, so it never
+      // writes the cache. It must not burn A's right to commit.
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() =>
+        Promise.reject(new Error('write B failed')),
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // ...and only now does A land, having actually stored force_stopped.
+      await act(async () => {
+        landFirst(fullSpec({ admin_state: 'force_stopped' }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // The row has to follow the server, or it offers Force stop / Force start
+      // / Restart and NO Clear override while the model is admission-blocked --
+      // with the write-timeout notice on screen telling the operator to clear
+      // by hand an override the row denies exists.
+      expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+      // The user-visible half stays abandoned: no success toast for a write the
+      // operator was already told had been given up on.
+      expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A door that needs no watchdog at all, because `overrideBusy` does not
+  // disable the specs tab's row actions (`rowActions` gates only on
+  // `loadingEditFor`): a spec DELETE that fails burns a ticket without
+  // committing, and here the override's run token was never bumped either --
+  // so the operator sees a "saved" toast for a write the row then denies
+  // happened.
+  it('still lands an in-flight override write when a later spec DELETE failed', async () => {
+    let landOverride: (updated: RuntimeSpec) => void = () => {};
+    const override = new Promise<RuntimeSpec>((resolve) => {
+      landOverride = resolve;
+    });
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => override);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The specs tab stays reachable while that PUT is outstanding. Delete the
+    // spec -- and the delete fails, so it writes nothing.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    fakeApi.deleteRuntimeSpec.mockImplementationOnce(() =>
+      Promise.reject(new Error('delete failed')),
+    );
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // A failed delete leaves the confirm dialog open (`setConfirmingDeleteId('')`
+    // is only reached on success), and an open modal aria-hides the tab strip.
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingCancel }),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // Now the override write lands. Its run token was never bumped, so it
+    // toasts success -- and the row must agree with that toast.
+    await act(async () => {
+      landOverride(fullSpec({ admin_state: 'force_stopped' }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+  });
+});
+
+// C2: `openEdit` wrote `specsById` straight from its GET, with no ticket. That
+// GET is issued from the specs tab while nothing locks the status tab, so a
+// slow one lands AFTER a successful override write and overwrites the entry
+// with its pre-PUT snapshot -- and nothing re-fetches on the way back
+// (`loadedIdsRef` blocks the lazy loader), so the poison is permanent.
+describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', () => {
+  it('does not let a slow Edit GET overwrite a newer override write', async () => {
+    let landGet: (spec: RuntimeSpec) => void = () => {};
+    const slowGet = new Promise<RuntimeSpec>((resolve) => {
+      landGet = resolve;
+    });
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The lazy per-mapping GET has settled; THIS one -- the Edit GET -- is slow.
+    fakeApi.runtimeSpec.mockImplementationOnce(() => slowGet);
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // Still on the list: `specMode` only flips once the GET resolves, so
+    // nothing on this screen is locked.
+    expect(screen.queryByLabelText(t.runtimeSpecBinary)).not.toBeInTheDocument();
+
+    // The operator switches to the live-status tab and forces the model down.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+
+    // ...and only NOW the Edit GET lands, carrying its pre-PUT snapshot.
+    await act(async () => {
+      landGet(fullSpec({ admin_state: '' }));
+      await Promise.resolve();
+    });
+
+    // The form opened and hydrated from that snapshot -- which is right, it is
+    // the document this form will PUT back. Back out of it.
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+
+    // The CACHE, though, must still hold the override the server actually has.
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+  });
+});
+
+// M5: the mapping-delete branch removed `specsById[id]` directly and recorded
+// no ticket, so a spec write still in flight for that mapping resurrected the
+// deleted mapping's spec. `confirmDelete`'s own comment states this rule for
+// the sibling (spec-delete) branch: "a delete is a write to the same cache
+// entry, so it takes a ticket too".
+//
+// The reachable route in: the create form's spec PUT has no watchdog and
+// `busy` disables only Submit, so Cancel gets the operator back to a list that
+// already holds the new mapping (createMapping resolved first) with NO cache
+// entry for it -- which is the mapping-delete branch. Deleting it there, then
+// having the PUT land, invents a configured spec for a mapping that is gone.
+describe('RuntimeAdminSection mapping delete takes a ticket (fix round 1, M5)', () => {
+  it('does not let an in-flight spec write resurrect a deleted mapping', async () => {
+    let landSpecPut: (spec: RuntimeSpec) => void = () => {};
+    const specPut = new Promise<RuntimeSpec>((resolve) => {
+      landSpecPut = resolve;
+    });
+    const { fakeApi, created, deletedMappingIds } = renderSection({
+      mappings: [],
+      // A process the agent reports under the spec id the pending PUT will
+      // return, so the resurrection is visible where it does harm.
+      statusRows: [makeStatus({ spec_id: 'spec_new', model: 'orphan-model' })],
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    // The mapping POST resolves; the spec PUT hangs.
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => specPut);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Cancel is not disabled by `busy`, so the operator is back on the list
+    // while the PUT is still outstanding -- with the new mapping already in it
+    // and no spec cached for it, i.e. the mapping-delete branch.
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingDelete }),
+    );
+    await waitFor(() => expect(deletedMappingIds).toEqual(['map_created']));
+    // The dialog's exit transition keeps the tab strip aria-hidden until it is
+    // unmounted.
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // ...and only now does the spec PUT land.
+    await act(async () => {
+      landSpecPut(fullSpec({ id: 'spec_new', mapping_id: 'map_created' }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The cache must stay empty. A resurrected entry gives the status row four
+    // override actions that all PUT to a mapping id that no longer exists, on
+    // a row `mappingForStatus` can no longer even name.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    expect(screen.getByText('orphan-model')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 });
