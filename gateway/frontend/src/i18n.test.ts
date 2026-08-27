@@ -2024,6 +2024,17 @@ describe('agent-managed runtime i18n keys (task 22b, batch C)', () => {
       'runtimeMappingsUnavailable',
       'runtimeCoresidencyUnavailable',
       'runtimeBudgetsUnavailable',
+      // Fix round 1, M8: the fourth resource, which C1 left on the two-state
+      // shape although its title said "every remaining resource".
+      'runtimeWarningsUnavailable',
+      // Fix round 1, C4/M7: the `stale-error` half. The `*Unavailable` texts
+      // above state that nothing is loaded and nothing is possible, which is
+      // false once a payload is in hand and only the REFRESH failed -- and all
+      // four call sites were rendering them in that state.
+      'runtimeMappingsStale',
+      'runtimeCoresidencyStale',
+      'runtimeBudgetsStale',
+      'runtimeWarningsStale',
       // C5: the collision the backend refuses without naming it.
       'runtimeGpuIndexDuplicate',
     ] as const;

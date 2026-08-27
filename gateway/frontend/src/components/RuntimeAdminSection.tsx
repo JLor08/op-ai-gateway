@@ -646,6 +646,7 @@ export function RuntimeAdminSection({
   const {
     data: warningsData,
     error: warningsError,
+    loading: warningsLoading,
     reload: reloadWarnings,
   } = useResource(
     () => api.runtimeWarnings(application.id).then((r) => r.warnings),
@@ -653,6 +654,21 @@ export function RuntimeAdminSection({
     t,
   );
   const warnings = warningsData ?? [];
+  // The fourth resource, and the one C1 left behind although its own title was
+  // "every remaining resource" (fix round 1, M8). It gates nothing and its
+  // failure is not silent (the error toast below does not auto-dismiss), so
+  // this is the mildest instance of the pattern -- but it is the same one: with
+  // `warningsData ?? []` an operator cannot tell "this application has no
+  // advisory warnings" from "we failed to find out", and the list carries facts
+  // like a timeout configured below the startup timeout. Hence `info`, not
+  // `warning`: a failed advisory read is not the same event as a failed read
+  // that turns a screen read-only.
+  const warningsStatus = resourceState({
+    loading: warningsLoading,
+    error: warningsError,
+    data: warningsData,
+  });
+  const warningsFailed = warningsStatus === 'error' || warningsStatus === 'stale-error';
   useEffect(() => {
     if (warningsError) showError(warningsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -704,12 +720,24 @@ export function RuntimeAdminSection({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappings, api]);
-  // `ready`, not `!loading && data !== null`: with a stale mapping list in hand
-  // (a failed reload) we cannot claim a status row is unmatched -- we only know
-  // we failed to refresh the list it would be matched against. The screen-wide
-  // banner says that instead.
+  // NOT `!loading && data !== null`, and not `ready` alone either.
+  //
+  // `loading` must be excluded: a status row is only "unmatched" once every
+  // one-GET-per-mapping request has settled, or the marker flashes on every
+  // ordinary row during the initial fan-out.
+  //
+  // `stale-error` is deliberately INCLUDED (fix round 1, C4). Excluding it read
+  // as caution but was the opposite: `mappings` and `specsById` still hold the
+  // previous payload, so the rows that resolve go on resolving and go on
+  // offering their overrides -- and the ONLY thing that disappeared was the
+  // marker on the rows that genuinely do not resolve, i.e. the silent blank
+  // task 22's N3 removed, reached through the fix for N3. The chip's claim is
+  // about the list this row was already matched against; that the list could
+  // not be REFRESHED is what the screen-wide banner is for, and it now says so
+  // in its own words instead of borrowing the hard-failure text.
   const specsSettled =
-    mappingsStatus === 'ready' && mappings.every((m) => specLoadSettled.has(m.id));
+    (mappingsStatus === 'ready' || mappingsStatus === 'stale-error') &&
+    mappings.every((m) => specLoadSettled.has(m.id));
 
   /**
    * Per-mapping ordering for `specsById`. Every write to that cache goes
@@ -939,13 +967,29 @@ export function RuntimeAdminSection({
 
   type BudgetRow = { index: number; budgetMb: number; expectedUuid: string; expectedName: string };
   const [budgetRows, setBudgetRows] = useState<BudgetRow[]>([]);
+  // Whether the operator has touched the rows since the last seed. Only the
+  // three mutators below set it; the seed and a successful save clear it.
+  const budgetRowsDirtyRef = useRef(false);
   // Re-seeds the editable rows whenever gpuBudgetsData gets a genuinely NEW
-  // value -- the initial load, or the fresh authoritative list this
-  // component itself feeds back via setGpuBudgetsData after a successful
-  // save (see saveLimits). It is never refreshed by a background poll, so
-  // this can't clobber an in-progress edit.
+  // value. That has THREE triggers, not one (fix round 1, M9 -- this comment
+  // used to claim "it is never refreshed by a background poll, so this can't
+  // clobber an in-progress edit", and two of the three make that false):
+  //
+  //  - the initial load, and the fresh authoritative list this component feeds
+  //    back via setGpuBudgetsData after a successful save (see saveLimits);
+  //  - a LANGUAGE SWITCH: `t` is a dep of this loader, so switching language
+  //    re-GETs the budgets with the component mounted and hands back a new
+  //    array identity -- no failure needed;
+  //  - C1's new Retry button, after a failed reload.
+  //
+  // In the last two an unsaved edit used to snap back to the server's values
+  // with no toast and no indication. So the seed is skipped while the draft is
+  // dirty: the operator keeps their edits, and their Save still PUTs the
+  // complete list they can see. Nothing here loosens the `gpuBudgetsReady`
+  // gate, which is what actually decides whether Save exists at all.
   useEffect(() => {
     if (gpuBudgetsData === null) return;
+    if (budgetRowsDirtyRef.current) return;
     setBudgetRows(
       gpuBudgetsData.map((b) => ({
         index: b.index,
@@ -960,6 +1004,7 @@ export function RuntimeAdminSection({
   const [limitsBusy, setLimitsBusy] = useState(false);
 
   function addBudgetRow() {
+    budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) => {
       const used = new Set(rows.map((r) => r.index));
       // Prefer the next telemetry-reported GPU not yet configured -- the
@@ -983,9 +1028,11 @@ export function RuntimeAdminSection({
     });
   }
   function removeBudgetRow(idx: number) {
+    budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) => rows.filter((_, i) => i !== idx));
   }
   function updateBudgetRow(idx: number, patch: Partial<Pick<BudgetRow, 'index' | 'budgetMb'>>) {
+    budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) =>
       rows.map((r, i) => {
         if (i !== idx) return r;
@@ -1037,6 +1084,11 @@ export function RuntimeAdminSection({
         })),
       };
       const savedBudgets = await api.putGpuBudgets(server.id, body);
+      // Cleared BEFORE the state that re-arms the seed effect: what comes back
+      // is the authoritative post-save list, and re-seeding from it (including
+      // the expected_* snapshots the backend just took) is the whole reason
+      // saveLimits feeds it back.
+      budgetRowsDirtyRef.current = false;
       setGpuBudgetsData(savedBudgets.budgets);
       const updatedServer = await api.updateServer(server.id, {
         runtime_max_processes: maxProcesses,
@@ -1108,13 +1160,17 @@ export function RuntimeAdminSection({
     error: reportError,
     data: reportData,
   });
-  // `stale-error` is a FAILED report GET that left an earlier payload behind --
-  // reachable here because a server switch re-runs the loader (deps include
-  // `server.id`) while `data` keeps the PREVIOUS server's report. On most
-  // screens the last known values are worth showing; here they are not, because
-  // "which runtime mode is this server in" is exactly the fact that would be
-  // about the wrong server. So both failures get the same treatment: read-only,
-  // say so, offer the retry.
+  // `stale-error` is a FAILED report GET that left an earlier payload behind.
+  // Reached here by the LANGUAGE SWITCH (fix round 1, M10 -- this used to name
+  // a server switch, which task 22b established does not reach it): `t` is a
+  // dep of every loader on this screen, so switching language re-runs them all
+  // with the component mounted, while a real server switch REMOUNTS
+  // (`ServerList.tsx` renders `ApplicationSection` with `key={`app-${id}`}`).
+  // `server.id` is a dep too, so the cross-server payload is the defensive case
+  // rather than the reachable one -- and either way the last known values are
+  // not worth showing here, because "which runtime mode is this server in" is
+  // exactly the fact that must not be answered from an unconfirmed payload. So
+  // both failures get the same treatment: read-only, say so, offer the retry.
   const reportFailed = reportStatus === 'error' || reportStatus === 'stale-error';
   // `source` lives on the NESTED report object; RuntimeReport itself has none.
   // Gated on `ready` for the same reason: a stale payload must not decide
@@ -1305,6 +1361,28 @@ export function RuntimeAdminSection({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusRows, restart]);
+
+  /**
+   * The form/delete half of the notice clearing `setOverride` already does
+   * (fix round 1, M6).
+   *
+   * C7 lifted the three restart notices to screen level, and their advice
+   * points at the specs tab ("check it and clear the override by hand"). But
+   * nothing on the specs tab cleared them, and the form sub-view early-returns
+   * without the banner stack -- so the operator did exactly what the notice
+   * said, saved, and landed back on the specs tab with that same notice as the
+   * first thing they saw. A spec write that lands NO override, and a delete
+   * that removes the spec (or the mapping) outright, are both that remediation.
+   *
+   * Not correlated to the notice's own mapping, matching `setOverride`, which
+   * clears on an override action taken on ANY row: the notice carries no
+   * mapping id, and "the operator has just resolved an override by hand" is the
+   * fact both call sites are reading off. A save that leaves an override IN
+   * place (`admin_state` set in the form) deliberately does not clear it.
+   */
+  function clearRestartNoticeAfter(spec: RuntimeSpec) {
+    if (spec.admin_state === '') setRestartNotice(null);
+  }
 
   async function setOverride(spec: RuntimeSpec, adminState: string) {
     // A timeout/aborted notice tells the operator an override was left in
@@ -1615,7 +1693,16 @@ export function RuntimeAdminSection({
         status,
       });
       setMappings((current) => [mapping, ...(current ?? [])]);
+      // Pre-seeding `loadedIdsRef` keeps the lazy loader off a row we are about
+      // to write ourselves -- but `specLoadSettled`'s only writer is that
+      // loader's `finally`, which the pre-seed then skips. Without this line
+      // `specsSettled` was false for the rest of the mount the moment anyone
+      // created a mapping, so the `Unmatched` chip vanished from every
+      // genuinely unresolved status row (fix round 1, C3). This id's spec state
+      // IS known either way: committed below on success, or genuinely absent
+      // after the partial failure -- which is what "settled" means.
       loadedIdsRef.current.add(mapping.id);
+      setSpecLoadSettled((cur) => new Set(cur).add(mapping.id));
     } catch (err) {
       showError(formatPortalError(err, t));
       setBusy(false);
@@ -1628,6 +1715,7 @@ export function RuntimeAdminSection({
     try {
       const spec = await api.putRuntimeSpec(mapping.id, buildSpecBody(args, parsedEnv.env));
       commitSpecCache(mapping.id, ticket, spec);
+      clearRestartNoticeAfter(spec);
       void reloadWarnings();
       setSpecMode('list');
     } catch (err) {
@@ -1675,6 +1763,7 @@ export function RuntimeAdminSection({
     try {
       const spec = await api.putRuntimeSpec(id, buildSpecBody(args, parsedEnv.env));
       commitSpecCache(id, ticket, spec);
+      clearRestartNoticeAfter(spec);
       void reloadWarnings();
       setSpecMode('list');
     } catch (err) {
@@ -1698,7 +1787,9 @@ export function RuntimeAdminSection({
         // resurrect the spec that has just been deleted.
         const ticket = beginSpecWrite(id);
         await api.deleteRuntimeSpec(id);
-        commitSpecCache(id, ticket, emptySpec(id));
+        const deleted = emptySpec(id);
+        commitSpecCache(id, ticket, deleted);
+        clearRestartNoticeAfter(deleted);
         void reloadWarnings();
       } else {
         // The other half of the same rule (fix round 1, M5): dropping the
@@ -1714,6 +1805,7 @@ export function RuntimeAdminSection({
         setMappings((current) => (current ?? []).filter((m) => m.id !== id));
         forgetSpecCache(id, ticket);
         loadedIdsRef.current.delete(id);
+        clearRestartNoticeAfter(emptySpec(id));
       }
       setConfirmingDeleteId('');
     } catch (err) {
@@ -2397,12 +2489,18 @@ export function RuntimeAdminSection({
               (the list itself, the matrix's spec set, and the status table's
               spec_id -> mapping resolution, without which no row can be
               named or overridden). Left as the old two-state test this said
-              "loading" forever and every status row went quietly blank. */}
+              "loading" forever and every status row went quietly blank.
+              The two states need DIFFERENT words (fix round 1, C4): the
+              hard-error text states that no process can be matched and no
+              override actions are available, and on a failed RELOAD both
+              clauses are false -- the previous payload is still in hand, the
+              rows resolve and the overrides work. Only the refresh failed. */}
           {mappingsFailed && (
             <ResourceFallback
               state={mappingsStatus}
               loadingLabel={t.loading}
               errorLabel={t.runtimeMappingsUnavailable}
+              staleErrorLabel={t.runtimeMappingsStale}
               errorDetail={mappingsError}
               retry={{ label: t.resourceRetry, onRetry: () => void reloadMappings() }}
             />
@@ -2515,8 +2613,22 @@ export function RuntimeAdminSection({
             )
           ) : (
             <>
-              {warnings.length > 0 && (
+              {(warningsFailed || warnings.length > 0) && (
                 <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+                  {/* Sits with the warnings it replaces, not in the screen-wide
+                      stack: these are advisory facts about this application's
+                      specs, which is this tab. */}
+                  {warningsFailed && (
+                    <ResourceFallback
+                      state={warningsStatus}
+                      loadingLabel={t.loading}
+                      errorLabel={t.runtimeWarningsUnavailable}
+                      staleErrorLabel={t.runtimeWarningsStale}
+                      errorDetail={warningsError}
+                      severity="info"
+                      retry={{ label: t.resourceRetry, onRetry: () => void reloadWarnings() }}
+                    />
+                  )}
                   {warnings.map((code) => (
                     <Alert key={code} severity="warning">
                       {runtimeWarningLabelByCode[code] ? t[runtimeWarningLabelByCode[code]] : code}
@@ -2598,10 +2710,15 @@ export function RuntimeAdminSection({
             // toggle would PUT the full replacement list computed from it.
             // Neither may be clicked, and both get the retry this tab never
             // had -- the resource's `reload()` was not even destructured.
+            //
+            // Both states hide the matrix, but they are not the same sentence
+            // (fix round 1, M7): "could not be loaded" is false once a payload
+            // is in hand and only the refresh failed.
             <ResourceFallback
               state={coresidencyStatus}
               loadingLabel={t.loading}
               errorLabel={t.runtimeCoresidencyUnavailable}
+              staleErrorLabel={t.runtimeCoresidencyStale}
               errorDetail={coresidencyError}
               retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
             />
@@ -2677,11 +2794,14 @@ export function RuntimeAdminSection({
             // hazard with a worse disguise: on a failed RELOAD `budgetRows`
             // still holds the pre-failure values, so the form would look
             // perfectly normal and Save would write values we had just failed
-            // to re-read. Both states get the message and the retry instead.
+            // to re-read. Both states get the message and the retry instead --
+            // each in its own words (fix round 1, M7), because on a failed
+            // reload "could not be loaded" is simply not what happened.
             <ResourceFallback
               state={gpuBudgetsStatus}
               loadingLabel={t.loading}
               errorLabel={t.runtimeBudgetsUnavailable}
+              staleErrorLabel={t.runtimeBudgetsStale}
               errorDetail={gpuBudgetsError}
               retry={{ label: t.resourceRetry, onRetry: () => void reloadGpuBudgets() }}
             />

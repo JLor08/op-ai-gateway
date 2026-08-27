@@ -588,6 +588,20 @@ const de = {
     'Die Co-Residency-Regeln konnten nicht geladen werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Paare löschen.',
   runtimeBudgetsUnavailable:
     'Die GPU-Budgets konnten nicht geladen werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Budgets löschen.',
+  runtimeWarningsUnavailable:
+    'Die Hinweise zu dieser Anwendung konnten nicht geladen werden. „Keine Hinweise“ ist hier deshalb keine Aussage.',
+  // Task 22b (Batch C, Fix-Runde 1, C4/M7): eine fehlgeschlagene AKTUALISIERUNG
+  // ist eine andere Tatsache als eine fehlgeschlagene Erstabfrage -- die zuvor
+  // geladenen Daten sind weiterhin vorhanden. Die Texte oben behaupteten in
+  // diesem Fall, es sei nichts geladen und nichts möglich; beides war falsch.
+  runtimeMappingsStale:
+    'Die Modell-Zuordnungen konnten nicht aktualisiert werden. Angezeigt wird — und zugeordnet wird gegen — die zuletzt geladene Liste; sie kann veraltet sein.',
+  runtimeCoresidencyStale:
+    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+  runtimeBudgetsStale:
+    'Die GPU-Budgets konnten nicht aktualisiert werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+  runtimeWarningsStale:
+    'Die Hinweise konnten nicht aktualisiert werden. Angezeigt wird der zuletzt geladene Stand.',
   // Task 22b (Batch C, C5): das Backend weist einen doppelten GPU-Index ab,
   // ohne zu sagen, welcher es ist -- hier wird er benannt, vor dem Schreiben.
   runtimeGpuIndexDuplicate: 'Ein GPU-Index ist mehrfach vergeben',
@@ -2401,6 +2415,20 @@ const en: PortalMessages = {
     'The co-residency rules could not be loaded, so the matrix stays hidden: a toggle writes the complete pair list, and computing it from a list we could not load would delete pairs that are already saved.',
   runtimeBudgetsUnavailable:
     'The GPU budgets could not be loaded, so the form stays hidden: saving writes the complete budget list, and computing it from a list we could not load would delete budgets that are already saved.',
+  runtimeWarningsUnavailable:
+    'The advisory notices for this application could not be loaded, so "no notices" is not a statement here.',
+  // Task 22b (Batch C, fix round 1, C4/M7): a failed REFRESH is a different
+  // fact from a failed first load -- the previously loaded data is still in
+  // hand. The texts above claimed nothing was loaded and nothing was possible;
+  // in this state both clauses are false.
+  runtimeMappingsStale:
+    'The model mappings could not be refreshed. What is shown — and what every reported process is matched against — is the last list loaded, which may be out of date.',
+  runtimeCoresidencyStale:
+    'The co-residency rules could not be refreshed, so the matrix stays hidden: a toggle writes the complete pair list, and the last one loaded may no longer be current.',
+  runtimeBudgetsStale:
+    'The GPU budgets could not be refreshed, so the form stays hidden: saving writes the complete budget list, and the last one loaded may no longer be current.',
+  runtimeWarningsStale:
+    'The advisory notices could not be refreshed. What is shown is the last state loaded.',
   // Task 22b (Batch C, C5): the backend refuses a duplicate GPU index without
   // saying which one it is -- named here, before the write.
   runtimeGpuIndexDuplicate: 'A GPU index is used more than once',

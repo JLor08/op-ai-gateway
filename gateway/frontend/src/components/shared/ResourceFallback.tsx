@@ -17,10 +17,13 @@ import { Alert, Box, Button, Typography } from '@mui/material';
  *  - `stale-error` — a reload failed but the PREVIOUS payload is still held.
  *    The two-state test reports this as `ready` and the error is invisible, so
  *    the screen silently shows values that may no longer be true. Call sites
- *    with a `reload()` on a resource that already holds data (and any call site
- *    whose `useResource` deps change — a server switch re-runs the loader while
- *    `data` keeps the OLD server's payload) must handle this one: keep
- *    rendering the data, say it is the last known state, and offer the retry;
+ *    with a `reload()` on a resource that already holds data — and any call
+ *    site whose `useResource` deps change WITHOUT the component remounting,
+ *    which for `t` (a dep of every loader in this portal) means every language
+ *    switch — must handle this one: keep rendering the data, say it is the last
+ *    known state, and offer the retry. Say it in ITS OWN words: a `errorLabel`
+ *    written for the hard failure ("could not be loaded", "nothing is
+ *    available") is FALSE here, which is what `staleErrorLabel` is for;
  *  - `ready`.
  *
  * `resourceState` names them and `ResourceFallback` renders the three
