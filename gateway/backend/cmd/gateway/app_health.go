@@ -130,6 +130,14 @@ type agentRegistries struct {
 	runtimeStatus interface {
 		Retain(live map[string]struct{})
 	}
+	// agentFeatures prunes the per-server declared-feature-set registry
+	// (gateway.NewAgentFeaturesRegistry). Same inline-structural-interface
+	// shape, and for exactly the same two reasons, as runtimeStatus above --
+	// see its comment: the concrete type is unexported, and the explicit nil
+	// check in Retain below is what makes the zero value safe.
+	agentFeatures interface {
+		Retain(live map[string]struct{})
+	}
 }
 
 func (a agentRegistries) ReportingWithin(serverID string, window time.Duration) bool {
@@ -142,6 +150,9 @@ func (a agentRegistries) Retain(live map[string]struct{}) {
 	a.transport.Retain(live)
 	if a.runtimeStatus != nil {
 		a.runtimeStatus.Retain(live)
+	}
+	if a.agentFeatures != nil {
+		a.agentFeatures.Retain(live)
 	}
 	liveBool := make(map[string]bool, len(live))
 	for id := range live {

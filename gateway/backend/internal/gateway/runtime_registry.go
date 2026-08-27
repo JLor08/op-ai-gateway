@@ -55,7 +55,8 @@ type RuntimeStatusDTO struct {
 //
 // In-memory and nil-safe on every method, mirroring every other per-server
 // registry in this package (e.g. AgentCertReportRegistry): a bare *Server
-// built directly in a test, bypassing New, must keep working.
+// built directly in a test, bypassing New, must keep working. Bounded to the
+// live server set by Retain below, like those same siblings.
 type agentFeaturesRegistry struct {
 	mu       sync.RWMutex
 	features map[string][]string
@@ -63,6 +64,19 @@ type agentFeaturesRegistry struct {
 
 func newAgentFeaturesRegistry() *agentFeaturesRegistry {
 	return &agentFeaturesRegistry{features: make(map[string][]string)}
+}
+
+// NewAgentFeaturesRegistry builds an empty agent-features registry, exported
+// (unlike the type itself, which stays lowercase) so cmd/gateway OWNS the one
+// instance it prunes: it hands the same value to ServerDeps.AgentFeatures and
+// to the app-health loop's per-cycle pruning bundle (cmd/gateway/
+// app_health.go's agentRegistries) -- mirroring NewRuntimeStatusRegistry's
+// exported-constructor-over-unexported-type pattern below. Without this,
+// gateway.New's internal default-construction fallback builds an instance
+// cmd/gateway never sees, so Retain -- however correct -- would never
+// actually run against the registry production writes to.
+func NewAgentFeaturesRegistry() *agentFeaturesRegistry {
+	return newAgentFeaturesRegistry()
 }
 
 // Set replaces serverID's declared feature set. A fresh telemetry sample is a
@@ -97,6 +111,26 @@ func (r *agentFeaturesRegistry) Has(serverID, feature string) bool {
 		}
 	}
 	return false
+}
+
+// Retain evicts the declared feature sets of servers no longer in live
+// (mirrors runtimeStatusRegistry.Retain below and AgentCertReportRegistry.
+// Retain, called at the end of every app-health cycle): a deleted server's
+// last-declared features must not sit in memory for the rest of the
+// process's lifetime. This is a memory bound, not a correctness fix -- a
+// stale entry can never make Has return true for a live server, because
+// server ids are never reused. A nil registry is a no-op.
+func (r *agentFeaturesRegistry) Retain(live map[string]struct{}) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id := range r.features {
+		if _, ok := live[id]; !ok {
+			delete(r.features, id)
+		}
+	}
 }
 
 // runtimeStatusRegistry holds per-server agent-managed-runtime STATUS the

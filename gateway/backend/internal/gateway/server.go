@@ -181,10 +181,12 @@ type ServerDeps struct {
 	// to gate the runtime_config WS push on the agent actually having
 	// declared support -- runtime_registry.go); nil-safe. gateway.New
 	// defaults a nil value to a fresh registry so a bare test Server still
-	// carries a usable one, mirroring AgentStreams above. No production
-	// wiring shares this instance outside the gateway package today, but it
-	// is a ServerDeps field (rather than New-internal only, like Active) in
-	// case a later task needs to inject one.
+	// carries a usable one, mirroring AgentStreams above. ONE shared
+	// registry in production: cmd/gateway constructs it
+	// (gateway.NewAgentFeaturesRegistry), hands it here, and hands the SAME
+	// instance to the app-health loop's end-of-cycle pruning bundle -- if the
+	// two diverged, the loop would prune an instance nothing writes to while
+	// this one grew for every server ever deleted.
 	AgentFeatures *agentFeaturesRegistry
 	// RuntimeStatus holds per-server agent-managed-runtime status the
 	// gateway gates its own behavior on (runtime_registry.go); nil-safe.

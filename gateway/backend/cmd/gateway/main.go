@@ -858,6 +858,14 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// to it, and the app-health loop prunes it to live servers -- same shape
 	// as agentProxyStatus/agentCertReports/agentTransport above.
 	runtimeStatus := gateway.NewRuntimeStatusRegistry()
+	// agentFeatures is ONE shared registry too (agent-runtime-manager): the
+	// agent-telemetry ingest path records each agent's declared capabilities
+	// in it, PushRuntimeConfig reads it to gate the runtime_config WS push,
+	// and the app-health loop prunes it to live servers -- same shape as
+	// runtimeStatus above. Constructed HERE (not left to gateway.New's
+	// default) precisely so the pruned instance and the written instance are
+	// the same object.
+	agentFeatures := gateway.NewAgentFeaturesRegistry()
 	// agentStreams is ONE shared registry too: handleAgentStream (ServerDeps)
 	// registers/deregisters each open agent WebSocket connection, and the
 	// OnCertificateIssued hook below pushes a cert_update doorbell to it
@@ -965,7 +973,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		syncer:       portalService,
 		registry:     appHealth,
 		loaded:       loadedModels,
-		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus},
+		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
 		groups:       groups,
 		settings:     b.SystemSettings,
 		probeTimeout: cfg.AppHealthProbeTimeout,
@@ -1056,6 +1064,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentProxyStatus:                agentProxyStatus,
 		AgentStreams:                    agentStreams,
 		RuntimeStatus:                   runtimeStatus,
+		AgentFeatures:                   agentFeatures,
 		Benchmarks:                      gateway.NewBenchmarkRegistry(),
 		Groups:                          groups,
 		Users:                           b.Users,

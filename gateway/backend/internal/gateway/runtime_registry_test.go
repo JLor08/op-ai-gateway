@@ -47,6 +47,34 @@ func TestAgentFeaturesRegistryNilSafe(t *testing.T) {
 	}
 }
 
+// Retain bounds the per-server map to the live server set at the end of every
+// app-health cycle (mirroring runtimeStatusRegistry.Retain below and
+// AgentCertReportRegistry.Retain): a deleted server's declared feature set
+// must not sit in memory for the rest of the process's lifetime. Asserted
+// through Has -- the only reader anything else has -- not by reaching into
+// the map.
+func TestAgentFeaturesRegistryRetainDropsDeletedServers(t *testing.T) {
+	r := newAgentFeaturesRegistry()
+	r.Set("srv-live", []string{"runtime_manager"})
+	r.Set("srv-deleted", []string{"runtime_manager"})
+
+	r.Retain(map[string]struct{}{"srv-live": {}})
+
+	if !r.Has("srv-live", "runtime_manager") {
+		t.Fatal("Retain evicted a LIVE server's declared feature set")
+	}
+	if r.Has("srv-deleted", "runtime_manager") {
+		t.Fatal("Retain kept a server that is no longer in the live set")
+	}
+}
+
+// Retain is nil-safe like every other method on this registry (the
+// package-wide convention -- see TestAgentFeaturesRegistryNilSafe above).
+func TestAgentFeaturesRegistryRetainNilSafe(t *testing.T) {
+	var r *agentFeaturesRegistry
+	r.Retain(map[string]struct{}{"srv-live": {}}) // must not panic
+}
+
 func TestRuntimeStatusRegistrySetAndIsFileMode(t *testing.T) {
 	r := newRuntimeStatusRegistry()
 	if r.IsFileMode("srv-a") {
