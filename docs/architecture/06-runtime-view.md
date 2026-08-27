@@ -142,7 +142,56 @@ sequenceDiagram
     Note over GW,APP: gateway now dispatches over HTTPS to the<br/>agent proxy — a scope-exit reverts to http
 ```
 
-## 6.7 Theme resolution (built-in vs external)
+## 6.7 Agent-managed model runtime: on-demand start
+
+```mermaid
+sequenceDiagram
+    participant C as AI client
+    participant GW as Gateway
+    participant RT as agent router
+    participant MG as runtime manager (owner goroutine)
+    participant CH as model process
+
+    C->>GW: inference (gateway model name)
+    GW->>RT: proxied request (app_model_name in JSON body)
+    RT->>RT: buffer body, read `model` + `stream`
+    RT->>MG: EnsureRunning(upstream model)
+    MG->>MG: Permit (local policy) → Admit (matrix · limit · per-GPU VRAM)
+    Note over MG: stopped → starting
+    MG->>CH: exec (argv, scratch env, loopback port)
+    MG->>CH: poll health until green (or startup_timeout_seconds)
+    Note over MG: starting → running
+    MG-->>RT: admitted + release()
+    RT->>CH: forward, splice response unbuffered
+    CH-->>C: tokens
+    Note over MG,GW: every transition rings the doorbell →<br/>immediate coalesced telemetry sample →<br/>portal SSE shows stopped → starting → running
+```
+
+**The externally observable contract**, verified end to end with a real agent and
+real child processes: an inference for a mapped model whose spec is not running
+**blocks in the gateway** while the agent admits and starts the child, and the
+request that triggered the start is the one that receives the answer — the first
+request pays the start latency rather than failing fast. The state sequence on
+the portal's runtime event stream is exactly `stopped → starting → running`, and
+the status frame for the running spec reports the child's real `pid` and the
+ephemeral loopback `port`. Nobody should redesign the router around a fail-fast
+assumption.
+
+**The degradation ladder is layered on purpose, and the WebSocket push is an
+optimisation, not a dependency.** If a doorbell or a config frame is lost, the
+agent's 60 s runtime poll catches up. If the gateway is entirely unreachable, the
+agent keeps running from the last good runtime-config document it persisted
+atomically to its own disk cache. In the reverse direction, every state
+transition triggers an immediate coalesced out-of-band telemetry sample, so a
+portal click feels like network latency rather than tick cadence. The
+`RuntimeUpdates()` channel is buffered(1) with a non-blocking, coalescing send —
+exactly like `certUpdates`. A reader who treats the push as *the* delivery
+mechanism will "fix" a missed-frame bug with acks and retries instead of relying
+on the poll and disk-cache fallbacks already designed in.
+
+See [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).
+
+## 6.8 Theme resolution (built-in vs external)
 
 ```mermaid
 sequenceDiagram
