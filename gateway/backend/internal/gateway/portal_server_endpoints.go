@@ -83,12 +83,22 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServerNotFound, msgServerNotFound, ""))
 		return
 	}
-	if len(parts) == 3 && parts[1] == "runtime" && parts[0] != "" {
-		if parts[2] == "events" {
+	// `>= 2`, not `== 3`: like the `perf` and `benchmark` guards around it,
+	// this claims the WHOLE /runtime subtree, so an unrecognised shape under
+	// it is answered by this guard's own 404 instead of falling through the
+	// rest of the chain to the trailing pathID branch. The response is the
+	// same either way today (pathID rejects any multi-segment tail with the
+	// same server.not_found), so this is a shape/consistency change, not a
+	// behaviour change -- but it keeps a future guard added below from
+	// accidentally catching a /runtime path. The inner branches carry their
+	// OWN length checks; without them parts[2] panics on a bare
+	// /servers/{id}/runtime.
+	if len(parts) >= 2 && parts[1] == "runtime" && parts[0] != "" {
+		if len(parts) == 3 && parts[2] == "events" {
 			s.handleRuntimeEvents(w, r, token, parts[0])
 			return
 		}
-		if parts[2] == "report" {
+		if len(parts) == 3 && parts[2] == "report" {
 			s.handleRuntimeReportView(w, r, token, parts[0])
 			return
 		}
@@ -538,9 +548,23 @@ func (s *Server) decorateAgentTokenStatus(ctx context.Context, fallbackOrigin st
 // other mappers, so it must stay here (both it and the shared
 // portal.ErrServerNotFound row happen to resolve to the same
 // server.not_found response, exactly as the original combined case did).
+//
+// The store.ErrConflict row matches a GENERIC store sentinel, so its message
+// must name the condition that sentinel can actually mean HERE rather than
+// restate the endpoint's own name ("agent token conflict" told an operator
+// nothing the code had not already said). Every write reachable through this
+// mapper is an agent-token write (AgentTokenStatus / GenerateAgentToken /
+// RevokeAgentToken), and UpsertAgentToken's only reachable conflict in either
+// store is a secret_hash collision with ANOTHER server's token: server_id
+// uniqueness is absorbed by the on-conflict-do-update rotate path, and a
+// missing server classifies as ErrNotFound, not ErrConflict. The CODE stays
+// `agent_token.conflict` -- it is part of the stable API surface and the
+// portal maps it to a translated label. If a NON-agent-token write is ever
+// routed through writePortalAgentTokenError, this row stops being honest and
+// must be split.
 var portalAgentTokenErrRows = []errRow{
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeServerNotFound, msg: msgServerNotFound},
-	{err: store.ErrConflict, status: http.StatusConflict, code: "agent_token.conflict", msg: "agent token conflict"},
+	{err: store.ErrConflict, status: http.StatusConflict, code: "agent_token.conflict", msg: "agent token secret collides with an existing token"},
 }
 
 func writePortalAgentTokenError(w http.ResponseWriter, err error) {

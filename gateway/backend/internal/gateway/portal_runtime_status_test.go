@@ -216,3 +216,55 @@ func TestRuntimeEventsForbidden(t *testing.T) {
 		t.Fatalf("error code = %q, want server.not_found (no existence leak)", code)
 	}
 }
+
+// TestRuntimeSubtreeShapesAllResolve pins the OBSERVABLE contract of the
+// /runtime route guard: the two real children route, and every other shape
+// under /runtime answers 404 server.not_found without panicking.
+//
+// Honest about what this can and cannot catch (Task 22b/A9): the guard was
+// widened from `len(parts) == 3` to `len(parts) >= 2` to match its `perf` and
+// `benchmark` siblings, and that change is NOT observable — under `== 3` the
+// unmatched shapes fell through to the trailing pathID branch, which rejects
+// any multi-segment tail with the same 404 and the same code. So this test
+// does not distinguish the old guard from the new one, and does not pretend
+// to. What it DOES catch is the regression the widening actually risks: with
+// `>= 2` reaching the inner branches, a bare /servers/{id}/runtime would
+// panic on parts[2] if either inner length check were ever dropped.
+func TestRuntimeSubtreeShapesAllResolve(t *testing.T) {
+	base := "/api/portal/servers/" + runtimeEventsServerID + "/runtime"
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"bare runtime, no child", base},
+		{"trailing slash", base + "/"},
+		{"unknown child", base + "/nope"},
+		{"deeper than any child", base + "/report/extra"},
+		{"deeper than any child (events)", base + "/events/extra"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newRuntimeEventsTestServer(t)
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+runtimeEventsOwnerSecret)
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req) // must not panic
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), portal.CodeServerNotFound) {
+				t.Fatalf("body = %s, want the %s code", rec.Body.String(), portal.CodeServerNotFound)
+			}
+		})
+	}
+
+	// The two real children still route (a 200, not the guard's 404) -- the
+	// widened guard must not have swallowed them.
+	srv := newRuntimeEventsTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, base+"/report", nil)
+	req.Header.Set("Authorization", "Bearer "+runtimeEventsOwnerSecret)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/runtime/report status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+}
