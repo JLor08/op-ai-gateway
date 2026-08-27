@@ -1955,6 +1955,10 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
       'runtimeStatusUnresolved',
       'runtimeAgentNeverReported',
       'resourceRetry',
+      // Fix round 2: the hover reason for a disabled Restart. A successful
+      // restart leaves the row `stopped`, where Restart is disabled, so this
+      // is the resting state of a healthy row and every operator meets it.
+      'runtimeRestartUnavailable',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');

@@ -559,6 +559,11 @@ const de = {
   runtimeLastErrorFailures: 'Fehlversuche',
   runtimeLastErrorStderr: 'stderr (Auszug)',
   runtimeRestart: 'Neu starten',
+  // Task 22, Fix-Runde 2 (N-Accepted): der Hover-Grund fuer eine
+  // ausgegraute Aktion. Nach einem erfolgreichen Neustart ist genau dieser
+  // Zustand der Ruhezustand der Zeile, also begegnet er jedem Betreiber.
+  runtimeRestartUnavailable:
+    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Start erzwingen“ verwenden.',
   runtimeRestartStopping: 'Neustart: wird gestoppt…',
   runtimeRestartClearing: 'Neustart: Übersteuerung wird aufgehoben…',
   runtimeRestartTimeout:
@@ -2354,6 +2359,11 @@ const en: PortalMessages = {
   runtimeLastErrorFailures: 'Failures',
   runtimeLastErrorStderr: 'stderr (tail)',
   runtimeRestart: 'Restart',
+  // Task 22, fix round 2 (accepted): the hover reason for a greyed-out
+  // action. A successful restart leaves the row in exactly this state, so it
+  // is the resting state every operator meets, not an edge case.
+  runtimeRestartUnavailable:
+    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "force start" instead.',
   runtimeRestartStopping: 'Restart: stopping…',
   runtimeRestartClearing: 'Restart: clearing the override…',
   runtimeRestartTimeout:

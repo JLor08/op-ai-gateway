@@ -885,14 +885,24 @@ export function RuntimeAdminSection({
   // see RestartFlow.waitFrom. A ref, not state: the counter must not itself
   // trigger a render or re-arm an effect.
   const frameSeqRef = useRef(0);
+  // The LATEST frame, readable outside a render. `startRestart` has to
+  // re-check the state gate against what the stream says NOW, not against the
+  // row its onClick closure captured when the cell rendered -- frames arrive
+  // ~1/s, and a state change landing between that render's commit and the
+  // click's dispatch would otherwise let a non-restartable row start a
+  // sequence that can never complete. `statusRows` state cannot serve: the
+  // handler closes over the same stale render.
+  const statusRowsRef = useRef<RuntimeStatus[]>([]);
   const onStatusFrame = useCallback((rows: RuntimeStatus[]) => {
     frameSeqRef.current += 1;
+    statusRowsRef.current = rows;
     setStatusRows(rows);
   }, []);
   useEffect(() => {
     // A server switch must not leave the previous server's processes on
     // screen while the new stream connects.
     setStatusRows([]);
+    statusRowsRef.current = [];
     setStreamStatus('loading');
     frameSeqRef.current = 0;
     return api.subscribeRuntimeStatus(server.id, onStatusFrame, setStreamStatus);
@@ -1117,8 +1127,19 @@ export function RuntimeAdminSection({
         spec.mapping_id,
         specBodyWithAdminState(spec, adminState),
       );
-      if (!mountedRef.current || overrideRunRef.current !== run) return;
+      if (!mountedRef.current) return;
+      // ABOVE the run-token guard, deliberately. `specsById` is a cache of
+      // server truth with no user-visible side effect of its own, and the
+      // server has just told us what it now holds. Behind the token, a write
+      // abandoned by its watchdog that then resolved left the cache stale
+      // forever: the row kept `admin_state: ''`, so it offered Force stop and
+      // Restart and NO Clear override, while the server actually held
+      // force_stopped -- and the timeout notice was simultaneously telling the
+      // operator to clear an override by hand that the row denied existed.
+      // The toast and the lock release below stay behind the token: those
+      // ARE user-visible, and an abandoned flow must not resurrect them.
       setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      if (overrideRunRef.current !== run) return;
       showSuccess(t.systemSaved);
     } catch (err) {
       if (mountedRef.current && overrideRunRef.current === run)
@@ -1131,6 +1152,16 @@ export function RuntimeAdminSection({
 
   async function startRestart(specId: string, spec: RuntimeSpec) {
     if (restart !== null) return;
+    // Re-assert the state gate here, not only in the `disabled` prop. That
+    // prop is evaluated at render time and the onClick closure carries the row
+    // from that same render, so a frame landing between the commit and the
+    // click's dispatch (they arrive ~1/s) let a `stopped` /
+    // `pending_vram_unknown` / `not_permitted` row start the sequence anyway --
+    // the exact harm the gate exists to prevent: a force_stopped override that
+    // no `stopped` frame can ever clear, leaving the model admission-blocked
+    // behind a timeout notice. Read the LIVE frame, not the captured row.
+    const live = statusRowsRef.current.find((r) => r.spec_id === specId);
+    if (live === undefined || !restartableStates.has(live.state)) return;
     const run = ++restartRunRef.current;
     absentSinceRef.current = null;
     setRestartNotice(null);
@@ -1146,13 +1177,18 @@ export function RuntimeAdminSection({
         spec.mapping_id,
         specBodyWithAdminState(spec, 'force_stopped'),
       );
-      if (!mountedRef.current || restartRunRef.current !== run) return;
+      if (!mountedRef.current) return;
       // Read the watermark HERE, not inside the updater below: the updater may
       // run a render later, by which time another frame could have arrived and
       // a legitimate `stopped` transition would be skipped. What we want is
       // "frames from after this write landed", which is exactly now.
       const waitFrom = frameSeqRef.current;
+      // Above the run-token guard for the reason spelled out in setOverride:
+      // the cache must not stay stale just because the sequence this write
+      // belonged to was abandoned. Everything below IS user-visible and stays
+      // behind the token.
       setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      if (restartRunRef.current !== run) return;
       setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting', waitFrom } : cur));
     } catch (err) {
       if (!mountedRef.current || restartRunRef.current !== run) return;
@@ -1181,8 +1217,13 @@ export function RuntimeAdminSection({
     });
     try {
       const updated = await api.putRuntimeSpec(flow.mappingId, specBodyWithAdminState(spec, ''));
-      if (!mountedRef.current || restartRunRef.current !== run) return;
+      if (!mountedRef.current) return;
+      // Same reasoning as the other two writes: an abandoned clear PUT that
+      // then succeeds must still refresh the cache, or the row goes on
+      // offering a Clear override that is already cleared and hiding the
+      // Restart that is now available again.
       setSpecsById((cur) => ({ ...cur, [flow.mappingId]: updated }));
+      if (restartRunRef.current !== run) return;
       showSuccess(t.systemSaved);
     } catch (err) {
       if (mountedRef.current && restartRunRef.current === run) showError(formatPortalError(err, t));
@@ -1767,6 +1808,7 @@ export function RuntimeAdminSection({
     // forgotten. While this row's own sequence runs the action stays visible
     // but disabled, so it is obvious why nothing else responds.
     if (spec.admin_state === '' || restart?.specId === row.spec_id) {
+      const restartBlocked = !restartableStates.has(row.state);
       actions.push({
         key: 'restart',
         label: t.runtimeRestart,
@@ -1780,7 +1822,15 @@ export function RuntimeAdminSection({
         // explanation, and an action that silently comes and goes reads like
         // a portal bug -- but never clickable there. `force_running`, offered
         // above, is the action that does something on those three.
-        disabled: overridesLocked || !restartableStates.has(row.state),
+        disabled: overridesLocked || restartBlocked,
+        // …and SAY so on hover. A successful restart ends with the row
+        // `stopped`, where Restart is disabled -- so this is the RESTING state
+        // of a healthy row, not an edge case, and every operator meets it. An
+        // unexplained grey button is what makes a correct gate look like a
+        // portal bug. (`overridesLocked` gets no reason of its own: it is
+        // transient and already narrated by the row's own "stopping…" /
+        // "clearing…" chip.)
+        title: restartBlocked ? t.runtimeRestartUnavailable : undefined,
         onClick: () => void startRestart(row.spec_id, spec),
       });
     }

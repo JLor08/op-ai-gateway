@@ -357,6 +357,15 @@ function renderSection(
     stream: {
       /** One full-replacement frame (`snapshot` or `update` -- same shape). */
       push: (rows: RuntimeStatus[]) => act(() => onDataCb?.(rows)),
+      /**
+       * A frame pushed WITHOUT act(), i.e. handed to the component but not
+       * yet flushed to the DOM. That is what makes the render-vs-click race
+       * reproducible: the button in the document still carries the previous
+       * render's `disabled` and its onClick still closes over the previous
+       * render's row, exactly as in the browser during the ~1 s between two
+       * frames.
+       */
+      pushUnflushed: (rows: RuntimeStatus[]) => onDataCb?.(rows),
       setStatus: (status: 'open' | 'error') => act(() => onStatusCb?.(status)),
       unsubscribes: () => unsubscribeCount,
       subscribedServerIds,
@@ -2043,6 +2052,117 @@ describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => 
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('RuntimeAdminSection abandoned writes still refresh the cache (fix round 2, N1)', () => {
+  // The run token (fix round 1, M4) correctly keeps the success toast and the
+  // lock release behind it -- but it also gated `setSpecsById`, which is a
+  // CACHE OF SERVER TRUTH. So a write abandoned by its watchdog that then
+  // resolved left the row claiming the opposite of the facts: `admin_state:
+  // ''`, i.e. Force stop and Restart offered and NO Clear override, while the
+  // server actually held force_stopped -- with the timeout notice at the same
+  // time telling the operator that an override is in effect and must be
+  // cleared by hand. The row pointed away from the only action that fixes it.
+  it('refreshes the row after an abandoned override write later succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      let landWrite: (updated: RuntimeSpec) => void = () => {};
+      const write = new Promise<RuntimeSpec>((resolve) => {
+        landWrite = resolve;
+      });
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => write);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // The watchdog gives the write up and says the outcome is unknown.
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
+
+      // ...and THEN the PUT lands successfully. The server now holds
+      // force_stopped.
+      await act(async () => {
+        landWrite(fullSpec({ admin_state: 'force_stopped' }));
+        await Promise.resolve();
+      });
+
+      // Clear override is the only action that undoes it, and the notice just
+      // told the operator to use it -- so the row has to offer it.
+      expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+      // And must no longer offer the write that already happened.
+      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+      // The user-visible halves stay abandoned: no success toast for a flow
+      // the operator has already been told is over.
+      expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('RuntimeAdminSection restart state gate is re-asserted on click (fix round 2, N2)', () => {
+  // The gate lived ONLY in the `disabled` prop, and the onClick closure
+  // carries the row from the render that set it. Frames arrive ~1/s, so a
+  // state change landing between that render's commit and the click's
+  // dispatch let a `stopped` row start the sequence -- a force_stopped
+  // override no `stopped` frame can ever clear, i.e. exactly the
+  // admission-blocked model the gate exists to prevent.
+  it('refuses a restart whose row went non-restartable between the render and the click', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const restartButton = await screen.findByRole('button', { name: t.runtimeRestart });
+    expect(restartButton).toBeEnabled();
+
+    // The race: the frame is in, the DOM is not yet.
+    stream.pushUnflushed([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    restartButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Nothing was written and no sequence is running.
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+    expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.runtimeRestart })).toBeDisabled();
+  });
+
+  // A greyed-out Restart with no explanation is the RESTING state of a healthy
+  // row: a successful restart ends `stopped`, where Restart is disabled. So
+  // every operator meets it, and it has to say why.
+  it('explains on hover why Restart is disabled on a stopped row', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'stopped' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const restartButton = await screen.findByRole('button', { name: t.runtimeRestart });
+    expect(restartButton).toBeDisabled();
+    // The wrapper span, not the button: a disabled MUI button is pointer-inert
+    // and a Tooltip anchored on it never fires.
+    fireEvent.mouseOver(restartButton.parentElement as HTMLElement);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeRestartUnavailable);
   });
 });
 
