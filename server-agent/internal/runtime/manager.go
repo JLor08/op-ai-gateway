@@ -850,8 +850,8 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 }
 
 // handleWaiterTimeout resolves the queued waiter whose admission-wait timer
-// just fired with ErrAdmissionBlocked -- unless this spec already has a live
-// process, in which case the wait is no longer an ADMISSION wait at all.
+// just fired with ErrAdmissionBlocked -- unless this spec is STARTING, in
+// which case the wait is no longer an ADMISSION wait at all.
 //
 // B6 fix, and it closes a wider hole than the "nanosecond-scale Stop() race"
 // it was deferred as. I3 established the rule (startProcess cancels the
@@ -872,13 +872,28 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 //     misleading ErrAdmissionBlocked I3 exists to prevent -- deterministic,
 //     on ordinary traffic.
 //
-// st.proc != nil is the honest expression of the rule for both: a spec with
-// a live process has already been admitted, and startup_timeout_seconds
-// (enforced by pollHealth, reported through handleStartResult's
-// failPending(ErrStartTimeout)) is the bound that applies. The timer is left
-// alone rather than cleared: whichever of succeedPending/failPending later
-// resolves this waiter calls cancelTimer, whose Stop() correctly returns
-// false for an already-fired timer, so the wg accounting stays balanced.
+// THE GUARD IS StateStarting, NOT st.proc != nil (fix round 1, F1). Trading
+// the timer away is only defensible where something else takes over the
+// bound, and startup_timeout_seconds does that in exactly one state:
+// StateStarting, where pollHealth enforces it and handleStartResult reports
+// it via failPending(ErrStartTimeout). st.proc != nil is TRUE IN
+// StateDraining as well, and in that window there is no bound left at all --
+// handleStartResult returns early for a draining generation (B6's own fix
+// #1) so ErrStartTimeout can never be reported, pollHealth returns silently
+// on <-proc.exited once the generation is killed, and scheduleAfter is
+// one-shot so nothing re-arms the timer discarded here. A request that
+// queues while its spec is being torn down (idle-unload, force_stopped, an
+// admission eviction) would then run to its caller's HTTP context instead of
+// getting the bounded 503 admission_wait_timeout_seconds promises. Draining
+// is also the state where the timer is most obviously still MEANINGFUL: a
+// dying generation has been DE-admitted, not admitted, so the request is
+// once again waiting for a slot -- precisely what design spec §4.1's
+// "blocked by busy/pinned processes" bound is for.
+//
+// The timer is left alone rather than cleared: whichever of
+// succeedPending/failPending later resolves this waiter calls cancelTimer,
+// whose Stop() correctly returns false for an already-fired timer, so the wg
+// accounting stays balanced.
 //
 // Known, accepted consequence: a waiter that survives a failed generation
 // and re-queues behind a fresh admission decision no longer carries an
@@ -891,8 +906,8 @@ func (o *owner) handleWaiterTimeout(c cmdWaiterTimeout) {
 	if st == nil {
 		return
 	}
-	if st.proc != nil {
-		slog.Debug("runtime: admission-wait timeout ignored; the spec's process is already up", "spec", c.specID, "state", string(st.state))
+	if st.proc != nil && st.state == StateStarting {
+		slog.Debug("runtime: admission-wait timeout ignored; the spec is starting, which startup_timeout_seconds bounds", "spec", c.specID, "state", string(st.state))
 		return
 	}
 	for i, w := range st.pending {

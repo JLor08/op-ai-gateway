@@ -4,11 +4,14 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1102,4 +1105,161 @@ func TestDeadlineWriterDoesNotForwardReadFrom(t *testing.T) {
 	if _, ok := w.(io.ReaderFrom); ok {
 		t.Fatal("deadlineWriter implements io.ReaderFrom; io.Copy would then bypass Write and skip the write-deadline refresh this wrapper exists for")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1, F2: B7's Unwrap() addition promoted http.Hijacker along with
+// SetWriteDeadline, which let httputil.ReverseProxy hijack a 101 from an
+// allowlisted child and pin the deferred release() for the agent's lifetime --
+// the exact un-evictable-spec failure mode deadlineWriter exists to prevent.
+// Both halves are asserted: the wrapper's own refusal (type level, below) and
+// the router's observable behavior on an upgrade-shaped request (end to end).
+// ---------------------------------------------------------------------------
+
+// hijackableDeadlineWriter is fakeDeadlineWriter plus a WORKING http.Hijacker,
+// standing in for the real net/http response writer -- which does implement
+// Hijack, and which http.ResponseController happily reaches through any
+// Unwrap chain to find (net/http's responsecontroller.go: "case Hijacker"
+// then "case rwUnwrapper"). Without it a test over fakeDeadlineWriter alone
+// would pass vacuously: there would be nothing at the end of the chain to
+// hijack, so the refusal could not be told apart from its absence.
+type hijackableDeadlineWriter struct {
+	fakeDeadlineWriter
+	hijacks atomic.Int32
+}
+
+func (h *hijackableDeadlineWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacks.Add(1)
+	return nil, nil, nil // a "successful" hijack: this must never be reached
+}
+
+// TestDeadlineWriterRefusesHijack is the second counter-guard to Unwrap
+// (TestDeadlineWriterDoesNotForwardReadFrom is the first): a hijacked
+// connection has no ResponseWriter write path left for a write deadline to
+// bound, so handing one out through this wrapper defeats the wrapper. Unlike
+// io.ReaderFrom, NOT declaring the method is not enough -- ResponseController
+// walks the Unwrap chain for every optional method, Hijack included -- so the
+// refusal has to be explicit.
+//
+// Both properties are asserted together, because either one alone is
+// satisfiable by the wrong fix: dropping Unwrap would refuse the hijack and
+// lose the SetWriteDeadline reach-through B7 added it for; keeping Unwrap
+// without the explicit refusal reaches the deadline AND the hijack.
+func TestDeadlineWriterRefusesHijack(t *testing.T) {
+	hw := &hijackableDeadlineWriter{}
+	rc := http.NewResponseController(deadlineWriter{hw})
+
+	conn, brw, err := rc.Hijack()
+	if !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("Hijack through a deadlineWriter = (%v, %v, %v), want http.ErrNotSupported -- BUG: Unwrap() promotes http.Hijacker, so httputil.ReverseProxy hijacks a 101 from the child and blocks on the raw connection with no write deadline, no request-context cancellation and no rescue from Server.Close, pinning the deferred release() and making that spec permanently un-evictable", conn, brw, err)
+	}
+	if n := hw.hijacks.Load(); n != 0 {
+		t.Fatalf("the wrapped writer's Hijack was called %d time(s), want 0 -- the refusal must stop the Unwrap chain HERE, not merely rewrite what the real writer returned", n)
+	}
+	if err := rc.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline through a deadlineWriter = %v, want nil -- refusing Hijack must not cost the reach-through Unwrap exists for", err)
+	}
+	if n := hw.deadlineSets.Load(); n != 1 {
+		t.Fatalf("the wrapped writer saw %d SetWriteDeadline calls, want exactly 1", n)
+	}
+}
+
+// fixedEndpointManager is a managerPort whose EnsureRunning always succeeds
+// with one fixed endpoint. The house fake pattern (managerPort's doc comment):
+// stubchild speaks ordinary HTTP and cannot answer 101 Switching Protocols,
+// so an upgrade-shaped exchange is exactly the case a hand-written stand-in
+// exists for.
+type fixedEndpointManager struct{ endpoint string }
+
+func (f fixedEndpointManager) EnsureRunning(context.Context, string) (string, func(), error) {
+	return f.endpoint, func() {}, nil
+}
+
+func (f fixedEndpointManager) LoadedModels() []string { return nil }
+func (f fixedEndpointManager) Status() []Status       { return nil }
+
+// upgradingUpstream returns a server that answers EVERY request with a raw
+// "101 Switching Protocols" carrying a matching Upgrade token -- the shape
+// net/http's Transport recognizes as a protocol switch (so ReverseProxy gets
+// an io.ReadWriteCloser body and proceeds to hijack) -- and then holds the
+// connection open until the test ends. Holding it open is load-bearing: the
+// pinned release() this test is about is only pinned for as long as neither
+// side of the spliced pair closes, so an upstream that returned immediately
+// would release the spec by accident and the test would pass against the bug.
+func upgradingUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("upstream could not hijack to write a raw 101: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, err := brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: op-test\r\nConnection: Upgrade\r\n\r\n"); err != nil {
+			t.Errorf("upstream write 101: %v", err)
+			return
+		}
+		if err := brw.Flush(); err != nil {
+			t.Errorf("upstream flush 101: %v", err)
+			return
+		}
+		<-hold
+	}))
+	// Cleanup runs LIFO, so this releases the blocked handler BEFORE the
+	// server is closed.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(hold) })
+	return srv
+}
+
+// TestRouterPlainProxyDoesNotHijackAnUpgradeResponse is F2 end to end. The
+// router authenticates nothing (driver.go's own comment) and an unset
+// OP_AGENT_RUNTIME_ROUTER_BIND binds every interface, so an upgrade-shaped
+// request reaching servePlainProxy is not a hypothetical: ReverseProxy
+// deliberately re-adds Connection/Upgrade to the outbound request
+// (reverseproxy.go's non-empty reqUpType branch), the child is offered the switch,
+// and a 101 back used to be hijacked -- after which the copy loop blocks with
+// no write deadline (the deadlineWriter is out of the picture once the
+// connection is raw), no request-context cancellation, and no rescue from
+// Server.Close (hijacked connections are untracked, so a router restart will
+// not close it). The deferred release() never ran: one un-evictable spec
+// holding its VRAM until the agent exits.
+//
+// What must happen instead: the upgrade is not offered to the child at all,
+// any 101 that still arrives falls into ErrorHandler, the client gets the
+// pre-batch 502, and release() runs promptly and exactly once.
+func TestRouterPlainProxyDoesNotHijackAnUpgradeResponse(t *testing.T) {
+	upstream := upgradingUpstream(t)
+	cm := &countingManager{inner: fixedEndpointManager{endpoint: upstream.URL}}
+	srv := httptest.NewServer(newRouter(cm))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial the router: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	// Hand-written request rather than http.Client: the client's own
+	// protocol-switch handling would otherwise decide part of what is under
+	// test, and this way the connection stays open and unread afterwards --
+	// exactly the stalled peer that makes a hijack unbounded.
+	body := `{"model":"model-a"}`
+	if _, err := fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\nConnection: Upgrade\r\nUpgrade: op-test\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body); err != nil {
+		t.Fatalf("write the request: %v", err)
+	}
+
+	statusLine, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read the status line: %v", err)
+	}
+	if !strings.Contains(statusLine, "502") {
+		t.Fatalf("status line = %q, want a 502 -- BUG: deadlineWriter's Unwrap() promotes http.Hijacker, so ReverseProxy switched protocols to the child instead of taking its non-Hijacker ErrorHandler path, and the deferred release() is now pinned for as long as the connection lives", strings.TrimSpace(statusLine))
+	}
+
+	assertReleasedExactlyOnce(t, cm, 3*time.Second, 200*time.Millisecond)
 }

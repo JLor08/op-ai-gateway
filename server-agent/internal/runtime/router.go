@@ -78,6 +78,7 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -85,6 +86,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -172,15 +174,40 @@ func (dw deadlineWriter) Flush() {
 //
 // Deliberately NOT forwarded: io.ReaderFrom. Promoting ReadFrom would let
 // io.Copy bypass Write entirely and with it the deadline refresh that is
-// this type's whole purpose -- the opposite of robustness. http.Hijacker is
-// likewise left unforwarded: a hijacked connection has no ResponseWriter
-// write path left for a deadline to bound, and nothing on the router's
-// paths hijacks. (Anything reached through Unwrap, including
+// this type's whole purpose -- the opposite of robustness. For ReaderFrom,
+// simply not declaring the method is enough; for http.Hijacker it is NOT
+// (see Hijack below). (Anything reached through Unwrap, including
 // ResponseController's own Flush, is by definition outside the
 // Write-refresh discipline; callers wanting the deadline must go through
 // Write/Flush above.)
 func (dw deadlineWriter) Unwrap() http.ResponseWriter {
 	return dw.ResponseWriter
+}
+
+// Hijack refuses, explicitly, and stops the Unwrap chain here.
+//
+// Fix round 1, F2 -- correcting this type's earlier claim that http.Hijacker
+// was "left unforwarded" because the method is not declared:
+// http.ResponseController walks the Unwrap chain for EVERY optional method,
+// Hijack included (net/http's responsecontroller.go: "case Hijacker", then
+// "case rwUnwrapper"), and httputil.ReverseProxy reaches Hijack by exactly
+// that route when a child answers 101 Switching Protocols. So adding Unwrap
+// promoted Hijack, and the hijack SUCCEEDED: ReverseProxy then blocks
+// splicing the two raw connections with no write deadline (a deadlineWriter
+// is out of the picture once the connection is raw), no request-context
+// cancellation, and no rescue from Server.Close (hijacked connections are
+// untracked, so stopRouterLocked's restart cannot close it) -- and
+// servePlainProxy's deferred release() never runs. One un-evictable spec
+// holding its VRAM for the agent's lifetime: precisely the failure mode this
+// wrapper exists to prevent, reintroduced through the door opened for
+// SetWriteDeadline.
+//
+// http.ErrNotSupported specifically, because ReverseProxy tests for it
+// (errors.Is(hijackErr, http.ErrNotSupported)) and answers the client
+// through ErrorHandler -- the pre-Unwrap 502, with a prompt release() --
+// instead of failing some other way.
+func (dw deadlineWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
 }
 
 // hopByHopHeaders are stripped from the outbound request the router builds
@@ -401,6 +428,25 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	outReq := r.Clone(r.Context())
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
+	// F2, second half: do not OFFER the child a protocol switch. This is not
+	// hop-by-hop hygiene -- httputil.ReverseProxy already strips hop-by-hop
+	// headers from the outbound request -- it is declining to forward the
+	// upgrade: ReverseProxy deliberately re-adds Connection/Upgrade after that
+	// strip when the inbound request carried them, so without this an
+	// upgrade-shaped client request reaches the child as an upgrade request.
+	// The router cannot honour a switch (it buffers request bodies to route on
+	// `model`, and deadlineWriter.Hijack refuses), so a child that switched
+	// would be abandoned mid-protocol -- and on ReverseProxy's non-Hijacker
+	// path the upstream 101's body, i.e. the raw child connection, is never
+	// closed, leaking it until the child or the OS gives up. Not offering the
+	// switch means no child ever gets into that state. It does NOT replace
+	// deadlineWriter.Hijack's refusal: a 101 no client asked for still reaches
+	// handleUpgradeResponse, and one whose Upgrade token is absent matches the
+	// (now empty) requested type, so the refusal is what stops the hijack
+	// there. Also the same posture as the streaming path, which strips both
+	// headers via hopByHopHeaders.
+	outReq.Header.Del("Connection")
+	outReq.Header.Del("Upgrade")
 	// I5: wrap w so a downstream client that stops reading cannot pin
 	// ReverseProxy's own internal body-copy goroutine (and the deferred
 	// release() above with it) indefinitely -- the plain-path counterpart

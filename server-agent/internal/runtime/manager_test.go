@@ -1666,3 +1666,85 @@ func TestManagerCloseDoesNotWaitOutACrashBackoff(t *testing.T) {
 		t.Fatal("Close() has blocked for over 3s -- BUG: a crash-backoff entered while closing schedules a retry timer through m.wg, and Close's wg.Wait() waits it out")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 1. The Critical (F1) and one minor (M3) below are REGRESSIONS this
+// branch's own B6 batch introduced: in both cases the fix reached past the
+// window its rationale actually covered.
+// ---------------------------------------------------------------------------
+
+// TestManagerAdmissionWaitStillBoundsARequestQueuedWhileDraining is fix round
+// 1's Critical (F1). handleWaiterTimeout's B6 guard was st.proc != nil, but
+// the rule it expresses -- "the request is no longer waiting for a SLOT, it is
+// waiting on a startup that has its own bound" -- only holds while the state
+// is StateStarting. StateDraining ALSO has st.proc != nil, and there no bound
+// applies at all:
+//
+//   - the admission-wait timer is discarded here, and scheduleAfter is
+//     one-shot: nothing re-arms it, so that request never gets an
+//     admission-wait answer again;
+//   - startup_timeout_seconds cannot substitute, because handleStartResult
+//     returns early for a draining generation (its own B6 fix #1) and
+//     pollHealth returns silently on <-proc.exited for a killed one -- so
+//     failPending(ErrStartTimeout) can never fire in this window either.
+//
+// The request therefore hangs to its caller's HTTP context instead of getting
+// a bounded 503, which is exactly what admission_wait_timeout_seconds is for
+// (design spec §4.1: it bounds "how long a request may queue when blocked by
+// busy/pinned processes" -- a dying process is the busiest kind).
+//
+// Vehicle: an idle-unload drain of a child that ignores SIGTERM, so the
+// SIGTERM->SIGKILL window (killGrace) is a real, controllable observation
+// window rather than the microseconds a cooperative child leaves. Eviction
+// produces the identical state via a second spec; the idle path needs only
+// one, so nothing about the second spec's admission can be mistaken for the
+// bound under test.
+func TestManagerAdmissionWaitStillBoundsARequestQueuedWhileDraining(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setKillGrace(t, 3*time.Second) // the drain window this test observes
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgsStubborn(0) // healthy at once, then ignores SIGTERM
+	spec.IdleTimeoutSeconds = 1     // the drain vehicle
+	spec.AdmissionWaitTimeoutSeconds = 1
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	// This request both starts the child and proves it is serving: the manager
+	// only reports success once a health probe returned 2xx, which the child's
+	// own HTTP server answers strictly AFTER stubchild's main() has installed
+	// its SIGTERM disposition. So the drain below cannot degenerate into
+	// "SIGTERM's default action killed it instantly", which is what would make
+	// this test vacuous (see waitUntilChildIsServing's doc comment).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("first EnsureRunning: %v", err)
+	}
+	release() // idle from here: scanIdle drains it one second later
+
+	waitUntil(t, 4*time.Second, "spec-a is Draining with its child still alive", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateDraining && st.PID != 0
+	})
+
+	// The request under test. handleEnsure sees StateDraining (not the
+	// StateRunning fast path), so it queues with a FRESH admission-wait timer
+	// -- the one whose expiry must still be honoured.
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer reqCancel()
+	start := time.Now()
+	_, lateRelease, err := m.EnsureRunning(reqCtx, "model-a")
+	elapsed := time.Since(start)
+	if lateRelease != nil {
+		lateRelease()
+	}
+	if !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("EnsureRunning issued while spec-a was Draining = %v after %s, want ErrAdmissionBlocked at ~1s (admission_wait_timeout_seconds) -- BUG: handleWaiterTimeout's st.proc != nil guard also covers StateDraining, where NEITHER bound applies (handleStartResult returns early for a draining generation, so failPending(ErrStartTimeout) can never fire), so the request runs to its HTTP context instead of getting a bounded 503", err, elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("EnsureRunning returned ErrAdmissionBlocked after %s, want ~1s (the configured admission_wait_timeout_seconds) -- the bound fired for some other reason than its own timer", elapsed)
+	}
+}
