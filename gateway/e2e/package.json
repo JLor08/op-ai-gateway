@@ -18,6 +18,7 @@
     "e2e:perf": "playwright test -c playwright.perf.config.ts",
     "e2e:projects": "playwright test -c playwright.projects.config.ts",
     "e2e:resource-groups": "playwright test -c playwright.resource-groups.config.ts",
+    "e2e:runtime": "playwright test -c playwright.runtime.config.ts",
     "e2e:services": "playwright test -c playwright.services.config.ts",
     "e2e:servers": "playwright test -c playwright.servers.config.ts",
     "e2e:smtp": "playwright test -c playwright.smtp.config.ts",

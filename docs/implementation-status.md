@@ -374,13 +374,50 @@ Portal phase in progress:
   `runtime_max_processes` field. Report:
   `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-21-report.md`.
 
+- Tasks 22 and 22b (live-status tab, then three review batches plus two extra
+  items) are complete; their per-task detail lives in
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/progress.md` and the
+  `task-22*` reports.
+
+E2E phase:
+- Task 23 — `gateway/e2e/playwright.runtime.config.ts`,
+  `gateway/e2e/e2e-runtime/runtime.spec.ts`, and the new stdlib-only Go
+  fixture module `gateway/e2e/e2e-runtime/fixtures/stubserver/` (`go.mod`,
+  `main.go`, `main_test.go`), plus `"e2e:runtime"` in
+  `gateway/e2e/package.json`. Six serial scenarios prove the cross-process
+  circle with a REAL server-agent binary and REAL child processes: cold start
+  on demand (with `starting` observed on the runtime SSE stream, not raced
+  past), portal force-stop and restart-on-demand, and the admission
+  arithmetic in both directions (a 1000 MB GPU-0 budget against two 700 MB
+  specs evicts the idle one; raising it to 2000 MB and changing nothing else
+  makes the same two co-resident). The stub model server is BUILT by the
+  spec's `beforeAll` and never started by the harness — starting it is the
+  agent's job, which is the property under test. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-23-report.md`.
+
+Durable facts found while writing Task 23 (for Task 24's docs):
+
+- The runtime-config-changed hook fires ONLY from `PutRuntimeSpec`,
+  `DeleteRuntimeSpec`, `SetCoResidency` and `SetServerGPUBudgets`
+  (`portal/service_runtime.go`'s `notifyRuntimeChanged` call sites). Creating
+  or editing the `server_agent` APPLICATION — the row `router_listen` is
+  derived from — does not notify the agent, so a newly created application (or
+  a changed router port) is picked up only by the agent's 60 s
+  `runtimePollInterval` backstop. Operator-visible as "the router takes up to
+  a minute to come up"; worth documenting, and a candidate follow-up fix.
+- With `OP_AGENT_RUNTIME_ALLOWED_DIRS` set, a spec with an EMPTY `work_dir` is
+  refused outright (`LocalPolicy.Permit`). Configuring the agent's permitted
+  directories therefore makes `work_dir` mandatory on every spec.
+- No make target, CI job or Sonar source root enumerates the e2e fixture Go
+  modules: `make lint`/`make test-go` cover `gateway/backend` and
+  `server-agent` only, `.github/workflows/ci.yml` runs no e2e suite at all,
+  and `sonar.sources` lists `gateway/backend,server-agent,gateway/frontend/src`.
+  The new `stubserver` module needs no registration — the same posture as the
+  existing `fakeacme` and `mailcatcher` fixtures.
+
 ## Next planned step
 
-1. Continue the plan at Task 22 (frontend: live status tab — SSE subscription
-   to `subscribeRuntimeStatus`, per-process state/PID/port/in-flight/uptime/
-   restarts/`last_error` incl. stderr tail, admin-override start/stop
-   buttons; also the natural place to compute a shared file-mode signal from
-   `api.runtimeReport` and thread it into `RuntimeMatrix`'s `disabled` prop
-   and area 3's read-only treatment, both left unwired after Task 21).
-2. Remaining: 22 (portal UI), 23 (e2e),
-   24 (docs + Sonar gate + working-file cleanup before the PR).
+1. Task 24 (docs + Sonar gate + working-file cleanup before the PR). The e2e
+   suite catalogue that needs `e2e:runtime` added is
+   `docs/architecture/cross-cutting/development-and-quality.md` §"e2e" (the
+   `e2e:agent` … `e2e:system-admin-mode` list, currently lines 127-132).
