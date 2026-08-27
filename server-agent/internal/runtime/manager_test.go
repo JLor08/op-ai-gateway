@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -2152,5 +2153,165 @@ func TestManagerCloseDoesNotWaitOutTheBackoffOfADeletedSpec(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close() has blocked for over 2s -- BUG: applyConfig's removal loop deletes a spec without cancelling its backoff timer, and handleClose only cancels the timers of specs still in o.specs, so Close's wg.Wait() waits out the whole remaining delay for a spec that no longer exists")
+	}
+}
+
+// execCounter counts the manager's own "runtime: process starting" records,
+// one per SUCCESSFUL fork+exec (startProcess logs it immediately after
+// cmd.Start() returns, with the child's real pid).
+//
+// The stub child's own -invocation-log cannot be used for this measurement,
+// and the reason is worth recording: under the C3 storm each child is
+// SIGTERMed within microseconds of exec -- before the Go runtime finishes
+// starting it, let alone reaches the log write -- so the log stays EMPTY
+// while thousands of processes are being forked. A count that reads 0 during
+// the exact failure it exists to detect is worse than no count at all. The
+// manager's own log line is emitted on the parent side, after a fork that
+// really happened, and cannot be lost that way.
+type execCounter struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func newExecCounter(t *testing.T) *execCounter {
+	t.Helper()
+	c := &execCounter{n: map[string]int{}}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return c
+}
+
+func (c *execCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *execCounter) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "runtime: process starting" {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key != "spec" {
+			return true
+		}
+		c.mu.Lock()
+		c.n[a.Value.String()]++
+		c.mu.Unlock()
+		return false
+	})
+	return nil
+}
+
+func (c *execCounter) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *execCounter) WithGroup(string) slog.Handler      { return c }
+
+func (c *execCounter) count(specID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n[specID]
+}
+
+// TestConcurrentAdmissionUnderPressureDoesNotForkExecStorm is C3's covering
+// test, in the exact shape the defect needs and the branch's own e2e
+// scenarios could not produce: two requests for DIFFERENT models, CONCURRENT
+// (scenarios 5 and 6 issue theirs sequentially), under admission pressure.
+//
+// At 86a287b this loops with no delay anywhere in it -- A execs, B evicts A
+// while A is still loading, A's own still-queued waiter re-execs it, that
+// same wake reaches B, repeat -- measured at over a thousand execs per
+// second with NEITHER request ever completing. The exec count comes from the
+// stub child's own invocation log, so it counts real fork+execs, not the
+// manager's bookkeeping.
+//
+// Both pressure shapes are covered because they reach the eviction through
+// different Admit rules (rule 2's process limit and rule 3's VRAM
+// arithmetic), and both were reproduced independently.
+func TestConcurrentAdmissionUnderPressureDoesNotForkExecStorm(t *testing.T) {
+	skipOnWindows(t)
+
+	for _, tc := range []struct {
+		name string
+		cfg  func(specA, specB Spec) Config
+	}{
+		{
+			name: "process limit",
+			cfg: func(specA, specB Spec) Config {
+				return Config{MaxProcesses: 1, Specs: []Spec{specA, specB}}
+			},
+		},
+		{
+			name: "gpu budget",
+			cfg: func(specA, specB Spec) Config {
+				specA.GPUs = []SpecGPU{{Index: 0, VRAMMB: 700}}
+				specB.GPUs = []SpecGPU{{Index: 0, VRAMMB: 700}}
+				return Config{
+					GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 1000}},
+					Specs:      []Spec{specA, specB},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			execs := newExecCounter(t)
+
+			specA := baseSpec("spec-a", "model-a")
+			specB := baseSpec("spec-b", "model-b")
+			// A load slow enough that the second request lands while the
+			// first spec is still Starting -- the whole precondition of the
+			// defect. Anything from a few hundred milliseconds up behaves
+			// identically; a real model load is tens of seconds.
+			specA.Args = stubArgs(300*time.Millisecond, 0, 0, "")
+			specB.Args = stubArgs(300*time.Millisecond, 0, 0, "")
+			specA.AdmissionWaitTimeoutSeconds = 10
+			specB.AdmissionWaitTimeoutSeconds = 10
+
+			m := newTestManager(t, allowlistPolicy())
+			m.Apply(tc.cfg(specA, specB))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+
+			var wg sync.WaitGroup
+			errs := make([]error, 2)
+			for i, model := range []string{"model-a", "model-b"} {
+				wg.Add(1)
+				go func(i int, model string) {
+					defer wg.Done()
+					endpoint, release, err := m.EnsureRunning(ctx, model)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					// Release immediately: the point is that each request
+					// gets served, not that it holds the slot.
+					_ = endpoint
+					release()
+				}(i, model)
+			}
+			// The second request must land while the first spec is loading.
+			// Both goroutines start together above; the manager serializes
+			// them on its owner loop, so no extra synchronization is needed.
+			wg.Wait()
+
+			// The exec count is asserted FIRST, deliberately: under the
+			// defect neither request is ever served, and a "not served"
+			// failure would hide the number that actually names the bug.
+			execsA, execsB := execs.count("spec-a"), execs.count("spec-b")
+			// Two concurrent requests need two model loads. One retry per
+			// spec is generous headroom for a genuine eviction-then-restart;
+			// the defect produced four figures.
+			const maxExecs = 4
+			if execsA+execsB > maxExecs {
+				t.Fatalf("fork-exec storm: spec-a exec'd %d time(s), spec-b %d time(s) (%d total, want <= %d) -- an evicted-while-loading spec is re-execing immediately",
+					execsA, execsB, execsA+execsB, maxExecs)
+			}
+			for i, model := range []string{"model-a", "model-b"} {
+				if errs[i] != nil {
+					t.Fatalf("EnsureRunning(%s) = %v, want it to be served (spec-a exec'd %d time(s), spec-b %d)", model, errs[i], execsA, execsB)
+				}
+			}
+			if execsA == 0 || execsB == 0 {
+				t.Fatalf("spec-a exec'd %d time(s), spec-b %d -- both requests must actually be served", execsA, execsB)
+			}
+		})
 	}
 }

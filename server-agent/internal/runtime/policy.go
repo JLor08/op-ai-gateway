@@ -20,6 +20,11 @@ type RunningProc struct {
 	InFlight int
 	Pinned   bool
 	LastUsed time.Time // idle-victim ordering: oldest evicted first
+	// Starting is true while this process is still loading -- it has been
+	// exec'd but has never passed a health probe, so it is serving nothing
+	// and its InFlight is necessarily 0. Such a process is NEVER an eviction
+	// victim (isEvictable), which is the C3 fix. See that function.
+	Starting bool
 }
 
 // PolicySnapshot is the pure input to Admit: the currently running set plus
@@ -63,9 +68,9 @@ type PolicySnapshot struct {
 //     drain-stop first, oldest LastUsed first. Once they are gone, Admit
 //     applied again to the reduced running set is expected to return OK.
 //   - Wait: OK is false, Wait is true, Evict is empty. Every remaining
-//     blocker is busy (or, outside the unknown-VRAM case below, pinned):
-//     nothing can be evicted to help right now, so the caller queues the
-//     request and re-asks on the next completion.
+//     blocker is busy, still loading, or (outside the unknown-VRAM case
+//     below) pinned: nothing can be evicted to help right now, so the caller
+//     queues the request and re-asks on the next completion.
 //   - Reason: OK is false, Wait is false, Evict is empty, and Reason names
 //     a durable, non-transient block -- one that cannot resolve by
 //     eviction OR by waiting, so reporting it as either of the other two
@@ -108,10 +113,43 @@ func PairKey(a, b string) [2]string {
 }
 
 // isEvictable reports whether r may ever appear in a Decision.Evict list:
-// never a pinned process, regardless of its InFlight count, and only when
-// it is serving no request right now.
+// never a pinned process, never one that is still loading, and only when it
+// is serving no request right now.
+//
+// THE Starting CLAUSE IS THE C3 FIX, and it is load-bearing rather than a
+// refinement. InFlight == 0 was meant to mean "idle, so nothing is lost by
+// stopping it", but a process that is still LOADING also has InFlight == 0
+// while being the opposite of idle: it is the most expensive thing on the
+// host, and the request that asked for it is still queued on it. Evicting
+// one produced an unbounded fork-exec loop with no delay anywhere in it:
+//
+//	request for A -> A execs, Starting, A's waiter queued
+//	request for B -> A is "idle" -> Evict[A] -> A has nothing in flight, so
+//	                it is SIGTERMed immediately
+//	A exits        -> intentional stop -> Stopped -> A's own waiter is still
+//	                queued and nothing is running, so A execs AGAIN
+//	                -> ... and the same event wakes B, which evicts A again.
+//
+// Measured at 86a287b: 1762 execs in 1.5s (two 700MB specs against a 1000MB
+// budget) and 2267 in 2.3s (max_processes: 1). Neither request ever
+// progressed; on a real host each iteration is a model server beginning to
+// map a model file and then being killed. It is unbounded rather than
+// self-limiting because admission_wait_timeout_seconds defaults to 0 ("wait
+// until the client disconnects"), and a positive timeout only bounds the
+// DURATION -- 1s still measured 1284 execs.
+//
+// With this clause the same collision terminates: B's admission finds a
+// blocker it may not evict, so it Waits (bounded by StartupTimeoutSeconds,
+// which is what actually bounds StateStarting), A finishes loading and
+// serves the request it was started for, and B evicts A once it is genuinely
+// idle. Every exec now buys at least one served request.
+//
+// Note this is NOT the same guard as Pinned: a pinned process is
+// permanently unevictable, whereas Starting is a state every process passes
+// through exactly once per generation, and always leaves (healthy, start
+// timeout, or exit).
 func isEvictable(r RunningProc) bool {
-	return !r.Pinned && r.InFlight == 0
+	return !r.Pinned && !r.Starting && r.InFlight == 0
 }
 
 // touchesAnyGPU reports whether r occupies any GPU index named in idx.

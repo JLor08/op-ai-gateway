@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -495,6 +496,11 @@ type ensureOutcome struct {
 type ensureWaiter struct {
 	reply chan ensureOutcome
 	timer *time.Timer
+	// queuedAt is when handleEnsure queued this waiter. It orders admission
+	// retries oldest-first (wakeAdmissionCandidates), so a spec whose
+	// request has been waiting longest gets the freed slot rather than
+	// whichever spec Go's randomized map iteration happened to visit first.
+	queuedAt time.Time
 }
 
 // runningProc is one live generation of a managed process. Its pointer
@@ -582,6 +588,21 @@ type specState struct {
 	// the first one. handleEnsure compares this against
 	// notPermittedRetryInterval (fix round 2 / R2-1).
 	notPermittedAt time.Time
+
+	// drainedFor names the specs whose QUEUED REQUESTS this generation was
+	// drain-stopped for -- set by admitAndStart when Admit picks this spec
+	// as an eviction victim, consumed by onProcExited, and empty for every
+	// other kind of stop (idle unload, config removal, force_stopped,
+	// shutdown).
+	//
+	// It exists to give the beneficiary first refusal on the slot its own
+	// eviction just freed. Without it the victim re-admits itself first
+	// (onProcExited calls admitAndStart for the spec that just exited before
+	// waking anyone else), so under sustained traffic for the victim's model
+	// the spec that paid for the eviction can be starved indefinitely --
+	// each cycle costing a full model load. Reordering alone would not do:
+	// the wake loop would still reach the victim in randomized map order.
+	drainedFor []string
 
 	pending []*ensureWaiter
 }
@@ -758,7 +779,7 @@ func (o *owner) applyConfig(cfg Config) {
 			o.admitAndStart(id)
 		}
 	}
-	o.wakeAllPendingWaiters()
+	o.wakeAdmissionCandidates()
 }
 
 func (o *owner) rebuildUpstreamIndex() {
@@ -833,7 +854,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 
-	w := &ensureWaiter{reply: c.reply}
+	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now()}
 	if st.spec.AdmissionWaitTimeoutSeconds > 0 {
 		d := time.Duration(st.spec.AdmissionWaitTimeoutSeconds) * time.Second
 		reply := c.reply
@@ -960,7 +981,7 @@ func (o *owner) handleRelease(c cmdRelease) {
 	if st.state == StateDraining && st.inFlight == 0 {
 		o.terminateNow(st, c.proc)
 	}
-	o.wakeAllPendingWaiters()
+	o.wakeAdmissionCandidates()
 }
 
 // failPending resolves and clears every waiter queued on st with err.
@@ -1058,13 +1079,23 @@ func (o *owner) admitAndStart(specID string) {
 		o.failPending(st, ErrAdmissionBlocked)
 	case dec.Wait:
 		// Leave st queued; a future completion event elsewhere re-triggers
-		// this via wakeAllPendingWaiters.
+		// this via wakeAdmissionCandidates.
 	case len(dec.Evict) > 0:
 		for _, victimID := range dec.Evict {
+			// Record WHO this eviction is for before asking for it: the
+			// victim's exit path gives these specs their admission attempt
+			// before the victim may re-take the slot (see
+			// specState.drainedFor). Recorded even when beginDrain turns out
+			// to be a no-op because the victim is already draining -- the
+			// claim on the freed slot is what matters, not who started the
+			// drain.
+			if victim := o.specs[victimID]; victim != nil && victimID != specID {
+				victim.drainedFor = appendUnique(victim.drainedFor, specID)
+			}
 			o.beginDrain(victimID)
 		}
 		// Retried once every victim is confirmed gone (onProcExited calls
-		// wakeAllPendingWaiters).
+		// wakeAdmissionCandidates).
 	default: // dec.OK
 		o.startProcess(st)
 	}
@@ -1110,6 +1141,12 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			InFlight: st.inFlight,
 			Pinned:   st.spec.Pinned,
 			LastUsed: st.lastUsed,
+			// A process that has been exec'd but never passed a health
+			// probe. It occupies its resources exactly like a running one
+			// (which is why it is in this list at all) but must never be
+			// evicted -- see isEvictable for the fork-exec storm that
+			// produced.
+			Starting: st.state == StateStarting,
 		})
 	}
 
@@ -1337,7 +1374,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	// generation's teardown (terminateNow's SIGTERM plus the killGrace
 	// escalation), so the exit is reported and classified by onProcExited
 	// exactly as the drain intends. Queued waiters stay queued and are woken
-	// by wakeAllPendingWaiters once the process is gone -- a drain-then-start,
+	// by wakeAdmissionCandidates once the process is gone -- a drain-then-start,
 	// which is what a request for a spec being drained should get.
 	if c.ok {
 		// Recorded BEFORE the draining discard below (fix round 1, M6):
@@ -1457,6 +1494,12 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	deferredBackoff := st.backoffOnExit
 	st.backoffOnExit = false
 	removed := st.removed
+	// Whoever this generation was evicted FOR gets its admission attempt
+	// before this spec may re-admit itself -- see specState.drainedFor.
+	// Consumed unconditionally: the claim belongs to THIS generation's exit,
+	// and a later drain records its own beneficiaries.
+	drainedFor := st.drainedFor
+	st.drainedFor = nil
 	// I4 fix: classify by whether THIS GENERATION ever passed a health
 	// probe, not by the current display state. A healthy, serving process
 	// that happens to exit on its own (for an unrelated reason) while
@@ -1494,7 +1537,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	if removed {
 		o.failPending(st, ErrModelNotManaged)
 		delete(o.specs, st.spec.ID)
-		o.wakeAllPendingWaiters()
+		o.wakeAdmissionCandidates()
 		return
 	}
 
@@ -1521,16 +1564,25 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 			// CRASHES on its way out is still a crash (I4), and the guard
 			// there would erase that from the status table.
 			o.enterBackoff(st)
-			o.wakeAllPendingWaiters()
+			o.wakeAdmissionCandidates()
 			return
 		}
 		if st.state == StateDraining {
 			o.setState(st, StateStopped)
 		}
 		if st.state == StateStopped {
+			// FAIRNESS, and the reason a bare reorder of these two calls
+			// would not have worked: the beneficiaries of this eviction are
+			// admitted BY NAME, before the victim's own re-admission.
+			// wakeAdmissionCandidates below would reach them too, but it
+			// would also reach the victim, and only this explicit step
+			// guarantees the ordering between the two.
+			for _, id := range drainedFor {
+				o.admitAndStart(id)
+			}
 			o.admitAndStart(st.spec.ID)
 		}
-		o.wakeAllPendingWaiters()
+		o.wakeAdmissionCandidates()
 		return
 	}
 
@@ -1551,7 +1603,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.failPending(st, ErrStartFailed)
 		o.enterBackoff(st)
 	}
-	o.wakeAllPendingWaiters()
+	o.wakeAdmissionCandidates()
 }
 
 // enterBackoff puts st into the crash-loop wait and schedules the retry.
@@ -1714,17 +1766,74 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 	})
 }
 
-// wakeAllPendingWaiters re-attempts admission for every spec that is idle
-// (no live process), not in an active crash-backoff wait, and has at least
-// one request queued -- called after any event that could plausibly have
-// freed a resource another spec's admission decision depends on (a release,
-// a process actually exiting, a config Apply).
-func (o *owner) wakeAllPendingWaiters() {
+// wakeAdmissionCandidates re-attempts admission for every spec that is idle
+// (no live process), not in an active crash-backoff wait, and WANTS to be up
+// -- called after any event that could plausibly have freed a resource
+// another spec's admission decision depends on (a release, a process actually
+// exiting, a config Apply).
+//
+// "Wants to be up" is admitAndStart's own wantUp rule, not "has a queued
+// request": a PINNED or force_running spec wants to be up with no waiter at
+// all. Its predecessor (wakeAllPendingWaiters) required len(pending) > 0, so
+// a pinned spec whose admission returned Wait -- blocked by a busy process,
+// or, since the C3 fix, by one that is still loading -- was never retried by
+// anything. It stayed Stopped until an unrelated config Apply happened to
+// call admitAndStart for it again. That was a latent hole before C3 and a
+// guaranteed one after it (the Starting clause makes Wait strictly more
+// likely), so the wake loop has to cover every spec that wants to be up, not
+// only the ones with someone waiting.
+//
+// Order is oldest-queued-request-first, not Go's randomized map order: when
+// one freed slot cannot satisfy everyone, the request that has been waiting
+// longest should get it. Specs with no queued request (pinned/force_running)
+// sort last -- nobody is waiting on them, and they will be retried by the
+// next event either way.
+func (o *owner) wakeAdmissionCandidates() {
+	type candidate struct {
+		id       string
+		queuedAt time.Time
+	}
+	candidates := make([]candidate, 0, len(o.specs))
 	for id, st := range o.specs {
-		if st.proc == nil && len(st.pending) > 0 && st.state != StateBackoff {
-			o.admitAndStart(id)
+		if st.proc != nil || st.state == StateBackoff {
+			continue
+		}
+		if len(st.pending) == 0 && !st.spec.Pinned && st.spec.AdminState != "force_running" {
+			continue
+		}
+		c := candidate{id: id}
+		for _, w := range st.pending {
+			if c.queuedAt.IsZero() || w.queuedAt.Before(c.queuedAt) {
+				c.queuedAt = w.queuedAt
+			}
+		}
+		candidates = append(candidates, c)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if a.queuedAt.IsZero() != b.queuedAt.IsZero() {
+			return b.queuedAt.IsZero() // a real queue time sorts before "no waiter"
+		}
+		if !a.queuedAt.Equal(b.queuedAt) {
+			return a.queuedAt.Before(b.queuedAt)
+		}
+		return a.id < b.id // total order: never leave a tie to map iteration
+	})
+	for _, c := range candidates {
+		o.admitAndStart(c.id)
+	}
+}
+
+// appendUnique appends v to list unless it is already present. The lists it
+// serves (specState.drainedFor) are bounded by the number of specs and are
+// almost always length 0 or 1, so a linear scan is the right shape.
+func appendUnique(list []string, v string) []string {
+	for _, existing := range list {
+		if existing == v {
+			return list
 		}
 	}
+	return append(list, v)
 }
 
 // scanIdle drain-stops every Running, unpinned, non-force_running spec whose
