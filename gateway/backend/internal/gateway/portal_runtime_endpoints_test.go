@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -507,6 +508,108 @@ func TestHandlePortalCreateApplicationManagedRuntimeOnlyReturns409(t *testing.T)
 	}
 	if code := errorBodyOf(t, appRec); code != "application.managed_runtime_only" {
 		t.Fatalf("error code = %q, want application.managed_runtime_only", code)
+	}
+}
+
+// createServerAgentTestServer POSTs an ordinary AI server (no
+// managed_runtime_only, so the create form is fully open) plus one
+// server_agent application on port, and returns the server id and the
+// application id.
+func createServerAgentTestServer(t *testing.T, srv *Server, domain string, port int) (serverID, appID string) {
+	t.Helper()
+	createBody := `{"name":"Agent Host","domain":"` + domain + `","owner_ids":["usr_dev"],"admin_group_ids":["` + testAdminGroupID + `"]}`
+	createRec := httptest.NewRecorder()
+	srv.ServeHTTP(createRec, newJSONRequest(http.MethodPost, "/api/portal/servers", createBody))
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create server status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal server: %v, body = %s", err, createRec.Body.String())
+	}
+
+	appRec := httptest.NewRecorder()
+	appBody := `{"type":"server_agent","port":` + strconv.Itoa(port) + `,"scheme":"http"}`
+	srv.ServeHTTP(appRec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+created.ID+"/applications", appBody))
+	if appRec.Code != http.StatusCreated {
+		t.Fatalf("create server_agent application status = %d, body = %s", appRec.Code, appRec.Body.String())
+	}
+	var app struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(appRec.Body.Bytes(), &app); err != nil {
+		t.Fatalf("unmarshal application: %v, body = %s", err, appRec.Body.String())
+	}
+	if app.Type != "server_agent" {
+		t.Fatalf("created application type = %q, want server_agent", app.Type)
+	}
+	return created.ID, app.ID
+}
+
+// TestHandlePortalCreateApplicationSecondServerAgentReturns409 pins the WIRE
+// contract of the "at most one server_agent application per AI server"
+// invariant: HTTP 409 and the error code "application.server_agent_exists".
+//
+// The portal-package tests assert only the Go sentinel
+// (portal.ErrServerAgentApplicationExists), which leaves the errRow in
+// portal_application_endpoints.go's portalApplicationErrRows completely
+// untested — deleting that row makes this request answer 500
+// "application.request_failed" instead, and every other test in this module
+// still passes. Shaped after
+// TestHandlePortalCreateApplicationManagedRuntimeOnlyReturns409 above, which
+// is the sibling row added by the same design and the convention this
+// follows.
+//
+// The second create uses a DIFFERENT, free port, so a 409 here can only be
+// the server_agent gate and never application.port_conflict.
+func TestHandlePortalCreateApplicationSecondServerAgentReturns409(t *testing.T) {
+	srv := NewTestServerWithGroups([]string{"gateway:use", "admin"})
+	serverID, _ := createServerAgentTestServer(t, srv, "agent-create.example.test", 8081)
+
+	rec := httptest.NewRecorder()
+	body := `{"type":"server_agent","port":8082,"scheme":"http"}`
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications", body))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "application.server_agent_exists" {
+		t.Fatalf("error code = %q, want application.server_agent_exists, body = %s", code, rec.Body.String())
+	}
+}
+
+// TestHandlePortalUpdateApplicationRetypeToServerAgentReturns409 is the same
+// wire contract on the PATCH path, the second route mapped to
+// ErrServerAgentApplicationExists: retyping an existing non-server_agent
+// application is the easy way past a create-only gate, so it must answer with
+// the same status and code.
+func TestHandlePortalUpdateApplicationRetypeToServerAgentReturns409(t *testing.T) {
+	srv := NewTestServerWithGroups([]string{"gateway:use", "admin"})
+	serverID, _ := createServerAgentTestServer(t, srv, "agent-patch.example.test", 8081)
+
+	plainRec := httptest.NewRecorder()
+	srv.ServeHTTP(plainRec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications",
+		`{"type":"vllm","port":8082,"scheme":"http"}`))
+	if plainRec.Code != http.StatusCreated {
+		t.Fatalf("create vllm application status = %d, body = %s", plainRec.Code, plainRec.Body.String())
+	}
+	var plain struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(plainRec.Body.Bytes(), &plain); err != nil {
+		t.Fatalf("unmarshal vllm application: %v, body = %s", err, plainRec.Body.String())
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+plain.ID,
+		`{"type":"server_agent"}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "application.server_agent_exists" {
+		t.Fatalf("error code = %q, want application.server_agent_exists, body = %s", code, rec.Body.String())
 	}
 }
 
