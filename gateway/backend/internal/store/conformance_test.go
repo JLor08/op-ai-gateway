@@ -7834,7 +7834,12 @@ func TestConformanceCoResidencyRules(t *testing.T) {
 // indexes 1 and 0 deliberately out of order, ordered read by gpu_index, then
 // a full replace with a different set), clear via a nil set, and
 // unknown-server ErrNotFound. BudgetMB 0 means "no budget" = unconstrained —
-// the store just persists the value, it never interprets it.
+// the store just persists the value, it never interprets it, and a 0 row is
+// asserted to survive the round trip AS 0 on both dialects (a driver that
+// coerced it to NULL, or dropped the row, would break the layer above: the
+// agent's admission policy relies on receiving that 0 to skip the GPU, and
+// the portal keeps the row's expected_uuid/expected_name drift snapshot on
+// it).
 func TestConformanceServerGPUBudgets(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -7882,6 +7887,30 @@ func TestConformanceServerGPUBudgets(t *testing.T) {
 		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
 		if err != nil || len(budgets) != 1 || budgets[0].BudgetMB != 8000 || budgets[0].ExpectedUUID != "GPU-0b" {
 			t.Fatalf("replace must overwrite the previous set: %v %+v", err, budgets)
+		}
+
+		// A BudgetMB of 0 -- "no budget for this GPU" = unconstrained -- is
+		// persisted and read back as 0, alongside a real budget on another
+		// index, with the expected_* snapshot on the zero row intact. This
+		// is the store-level half of the contract the agent's admission
+		// policy depends on: it can only treat a 0 as unconstrained if a 0
+		// actually reaches it.
+		withZero := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 0, ExpectedUUID: "GPU-0z", ExpectedName: "A100", CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 1, BudgetMB: 16000, CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", withZero); err != nil {
+			t.Fatalf("set with a zero budget: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 2 {
+			t.Fatalf("read back zero budget: %v %d", err, len(budgets))
+		}
+		if budgets[0].GPUIndex != 0 || budgets[0].BudgetMB != 0 || budgets[0].ExpectedUUID != "GPU-0z" {
+			t.Fatalf("a 0 budget must round-trip as 0 with its expected_* intact: %+v", budgets[0])
+		}
+		if budgets[1].GPUIndex != 1 || budgets[1].BudgetMB != 16000 {
+			t.Fatalf("a real budget alongside a 0 one must survive unchanged: %+v", budgets[1])
 		}
 
 		// Full replace with a nil set clears, still non-nil on read.

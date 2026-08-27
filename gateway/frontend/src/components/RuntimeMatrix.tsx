@@ -42,6 +42,15 @@ function canonicalPair(x: string, y: string): [string, string] {
 // is guidance only -- the agent's own per-GPU arithmetic at admission time is
 // the real veto, so the note at the bottom says so explicitly (a
 // matrix-allowed pair can still be refused at runtime, and vice versa).
+//
+// A budget of 0 is "no budget for this GPU" = unconstrained, identical to a
+// GPU with no budget row at all (`routing.ServerGPUBudget.BudgetMB` in the
+// backend defines it, `runtime.Admit` in the agent honours it). Since this
+// tooltip's whole job is to predict what the agent will do, it must render a
+// 0 the same way it renders an absent row -- a bare sum, never a "/ 0 MB"
+// over-budget warning for a limit the agent does not enforce. 0 is reachable
+// operator input: a fresh budget row starts at 0 MB here in the portal, and
+// clearing the MB field yields 0 too.
 function MatrixTooltip({
   t,
   a,
@@ -62,7 +71,8 @@ function MatrixTooltip({
       ) : (
         shared.map((g) => {
           const sum = g.vramMb + (bByIndex.get(g.index) ?? 0);
-          const budget = budgets[g.index];
+          const raw = budgets[g.index];
+          const budget = raw !== undefined && raw > 0 ? raw : undefined;
           const over = budget !== undefined && sum > budget;
           const base =
             budget !== undefined

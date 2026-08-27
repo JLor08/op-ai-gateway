@@ -1264,7 +1264,15 @@ type CoResidencyRule struct {
 // (ai_server_gpu_budgets, migration 66, Task 3), keyed by (ServerID,
 // GPUIndex): how much VRAM (MB) the operator has allotted to agent-managed
 // runtimes on that GPU. BudgetMB 0 means "no budget for this GPU" =
-// unconstrained (also true for a GPU with no row at all). ExpectedUUID /
+// unconstrained (also true for a GPU with no row at all) — which is why
+// SetServerGPUBudgets accepts 0 and rejects only negatives. This meaning is
+// consumed on the far side of the wire by the agent's admission policy:
+// runtime.Admit / PolicySnapshot.Budgets in
+// server-agent/internal/runtime/policy.go skips any index whose budget is
+// <= 0 precisely to honour it. The two comments are a matched pair —
+// changing what 0 means here without changing it there gives every model on
+// a zero-budget GPU a permanent not_permitted, which is exactly the bug that
+// pairing them documents. ExpectedUUID /
 // ExpectedName are a purely descriptive drift detector: snapshotted when the
 // row is created (by the portal, Task 6) and later compared against live
 // telemetry to WARN that a card was renumbered — they never block anything;

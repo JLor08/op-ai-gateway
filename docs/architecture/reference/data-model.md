@@ -412,13 +412,16 @@ plausible-looking validation rule would break the normal case:
   (`runtime_spec.args_invalid` / `runtime_spec.env_invalid`), never a raw JSON
   error or a 500. **`env` must never hold a secret value** — only
   `${AGENT_ENV:…}` references (see [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway)).
-- **Four zero-values mean "unbounded" or "automatic", not "off":**
+- **Five zero-values mean "unbounded" or "automatic", not "off":**
   `listen_port` 0 = the agent picks a free loopback port (the normal case);
   `idle_timeout_seconds` 0 = never unload; `admission_wait_timeout_seconds` 0 =
   wait until the client disconnects; `ai_servers.runtime_max_processes` 0 =
-  unlimited. A validator that rejects 0 as unset breaks all four. **The one
-  exception is `ai_server_gpu_budgets.budget_mb`, where a present row with 0 is a
-  real zero budget** — what is unconstrained there is an *absent row*.
+  unlimited; `ai_server_gpu_budgets.budget_mb` 0 = no budget for that GPU, i.e.
+  unconstrained, **identical to an absent row** (which is why the portal's write
+  validation rejects only negative values, and why the agent's admission policy
+  skips any GPU index whose budget is `<= 0`). A validator that rejects 0 as
+  unset breaks all five; one that reads `budget_mb` 0 as a literal ceiling of
+  zero refuses every model on that card.
 - `pinned` means "starts with the agent and is never evicted"; `admin_state` is
   `''` | `force_running` | `force_stopped`. `vram_locked` lives on the **spec**
   rather than per GPU, because an operator thinks "pin this model's numbers", not

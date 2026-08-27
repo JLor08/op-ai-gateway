@@ -130,6 +130,25 @@ describe('RuntimeMatrix advisory tooltip', () => {
     ).toBeInTheDocument();
   });
 
+  it('renders a budget of 0 exactly like an absent row, never as over budget', async () => {
+    // A budget of 0 means "no budget for this GPU" = unconstrained, the same
+    // as a GPU with no budget row (see the comment on MatrixTooltip). This
+    // tooltip predicts what the agent will do, so a 0 must render as the bare
+    // sum -- not "44000 / 0 MB (over budget)", a limit the agent's admission
+    // policy does not enforce. 0 is reachable: a fresh budget row starts at 0
+    // MB in the limits form, and clearing the MB field yields 0.
+    render(
+      <RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{ 0: 0 }} />,
+    );
+    const bravoAlpha = screen.getByRole('button', {
+      name: `${t.runtimeMatrixCell}: Bravo + Alpha`,
+    });
+    fireEvent.mouseOver(bravoAlpha);
+    expect(await screen.findByText('GPU 0: 44000 MB')).toBeInTheDocument();
+    expect(screen.queryByText(/\/ 0 MB/)).not.toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(t.runtimeMatrixOverBudget))).not.toBeInTheDocument();
+  });
+
   it('says something sensible for two specs that share no GPU', async () => {
     // Bravo touches GPU0 only, Charlie touches GPU1 only -- disjoint.
     render(<RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{}} />);

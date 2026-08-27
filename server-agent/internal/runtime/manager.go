@@ -1113,6 +1113,12 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		})
 	}
 
+	// Every row is copied verbatim, zero budgets included. Do NOT add a
+	// "skip BudgetMB == 0" filter here: Admit already treats a 0 budget and
+	// an absent index identically (PolicySnapshot.Budgets), and it owns that
+	// rule because it is the only code that interprets a budget, whereas a
+	// snapshot can be built by any caller. A second copy of the rule here
+	// would be one more place for the two to drift apart.
 	budgets := make(map[int]int, len(o.cfg.GPUBudgets))
 	for _, b := range o.cfg.GPUBudgets {
 		budgets[b.Index] = b.BudgetMB

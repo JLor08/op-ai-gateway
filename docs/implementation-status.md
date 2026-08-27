@@ -448,6 +448,27 @@ Durable facts found while writing Task 23 (for Task 24's docs):
   The new `stubserver` module needs no registration — the same posture as the
   existing `fakeacme` and `mailcatcher` fixtures.
 
+Post-documentation fixes:
+
+- Task 24b — **a zero GPU budget now means unconstrained**, as
+  `routing.ServerGPUBudget.BudgetMB` always claimed. The agent's admission
+  policy had read a present `budget_mb = 0` as a real ceiling of zero
+  (`not_permitted` for every spec on that GPU) while the store's doc comment
+  defined `0` as "no budget for this GPU" = unconstrained; nothing tied the two
+  comments together and no compiler check spans the wire. `Admit` now skips any
+  GPU index whose budget is `<= 0`. The filter sits in `Admit` — the single
+  place that *interprets* a budget — not in `owner.buildSnapshot`, because
+  `PolicySnapshot.Budgets` is an exported field any caller can populate. The
+  two doc comments now name each other by file. Same divergence fixed in the
+  portal's advisory matrix tooltip (`RuntimeMatrix.tsx`), which rendered a `0`
+  row as red "over budget". Contract pinned at four seams (policy, manager,
+  portal service, store conformance on both dialects) plus the tooltip. The
+  §11.1 risk row and the "delete the row, never set 0" operator guidance are
+  removed from `docs/architecture/`; §5.1/§5.2, the glossary and
+  `reference/data-model.md` corrected. No `Version` bump: this branch's single
+  bump to `0.2.0` covers the whole feature. Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-24b-zero-budget-report.md`.
+
 ## Next planned step
 
 1. Task 24 (docs + Sonar gate + working-file cleanup before the PR). The e2e

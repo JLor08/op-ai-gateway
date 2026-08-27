@@ -722,6 +722,48 @@ func TestSetServerGPUBudgetsValidation(t *testing.T) {
 	}
 }
 
+// TestSetServerGPUBudgetsZeroIsAcceptedAndMeansUnconstrained pins the other
+// half of the validation contract, which TestSetServerGPUBudgetsValidation
+// only implies: `BudgetMB < 0` is refused, and `BudgetMB == 0` is therefore
+// ACCEPTED on purpose. It is not an oversight to be tightened later --
+// `routing.ServerGPUBudget.BudgetMB` defines 0 as "no budget for this GPU" =
+// unconstrained, identical to a GPU with no row at all, and the agent's
+// admission policy (runtime.Admit in server-agent/internal/runtime/policy.go)
+// honours that by skipping any index whose budget is <= 0.
+//
+// So a row an operator cleared to 0 is a no-op, not an error and not a hard
+// refusal of every model on that card. Making this method reject 0 instead
+// would break the runtime screen, whose limits form seeds a brand-new budget
+// row at 0 MB and turns a cleared MB input into 0, and it would leave the
+// gateway and the agent disagreeing about a value the store already persists.
+func TestSetServerGPUBudgetsZeroIsAcceptedAndMeansUnconstrained(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
+		Budgets: []GPUBudgetDTO{{Index: 0, BudgetMB: 0}, {Index: 1, BudgetMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("SetServerGPUBudgets with budget_mb 0 = %v, want nil: 0 is unconstrained, not invalid", err)
+	}
+	if len(dto) != 2 || dto[0].Index != 0 || dto[0].BudgetMB != 0 {
+		t.Fatalf("dto = %#v, want the 0 budget stored verbatim at index 0", dto)
+	}
+
+	// It must also SURVIVE the round trip as 0 -- silently dropping the row
+	// would reach the same admission outcome today by accident, while
+	// destroying the operator's row and the expected_* drift snapshot on it.
+	got, err := svc.GetServerGPUBudgets(ctx, ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("GetServerGPUBudgets: %v", err)
+	}
+	if len(got) != 2 || got[0].Index != 0 || got[0].BudgetMB != 0 || got[1].BudgetMB != 8000 {
+		t.Fatalf("round trip = %#v, want [{0 0} {1 8000}]", got)
+	}
+}
+
 // TestSetServerGPUBudgetsSnapshotsExpectedAndNeverOverwrites pins the drift-
 // detector contract: expected_uuid/expected_name are captured from the
 // latest telemetry sample ONLY when the budget row is first created, and a

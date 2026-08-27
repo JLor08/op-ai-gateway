@@ -451,7 +451,7 @@ here:
 | `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. |
 | `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each index's stored measured value forward. |
 | `agent_runtime_specs.vram_locked` | Operator | Gates only the agent's write-back; never consulted by the portal write path. |
-| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **A row with `0` is a real zero budget** — see the warning in §5.2. |
+| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget for this GPU" = unconstrained**, identical to an absent row — see §5.2. |
 | `ai_servers.runtime_max_processes` | Operator | Concurrent managed processes; `0` = unlimited. |
 
 The split of VRAM ownership is the load-bearing rule of the whole budget
@@ -472,11 +472,13 @@ A spec `S` may start alongside the running set `R` only if **all three** hold:
    "not co-resident" is the structural default (exactly llama-swap's behaviour
    until an operator opens a cell).
 2. **Process limit** — `|R| + 1 ≤ runtime_max_processes` (`0` = unlimited).
-3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches, the sum of VRAM
-   demand over `S` and every `r ∈ R` that also touches `g` is within `budget(g)`.
-   GPUs no common spec touches do not compete, and a running process is charged
-   only its usage **on the index being checked** — never the sum of its whole
-   GPU map, which would produce spurious evictions on multi-GPU hosts.
+3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches *and that has a
+   budget* (`budget(g) > 0`; an absent row or a `0` is unconstrained and not
+   gated at all), the sum of VRAM demand over `S` and every `r ∈ R` that also
+   touches `g` is within `budget(g)`. GPUs no common spec touches do not
+   compete, and a running process is charged only its usage **on the index being
+   checked** — never the sum of its whole GPU map, which would produce spurious
+   evictions on multi-GPU hosts.
 
 **The matrix and the arithmetic are not redundant.** The matrix expresses
 operator *intent* and covers the non-VRAM constraints nobody can compute — PCIe
@@ -488,22 +490,35 @@ per-cell VRAM tooltip says so on every cell.
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
 my model get evicted" requires checking both the matrix and the arithmetic.
 
-Two zero-values mean "no constraint", not "zero": `max_processes == 0` is
-unlimited, and a spec GPU entry with `vram_mb == 0` means *unknown* demand and
-routes to §5.3 rather than to the arithmetic. Reading either as a literal zero
-turns an unconfigured field into a hard refusal of every start.
+Three zero-values mean "no constraint", not "zero": `max_processes == 0` is
+unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand and
+routes to §5.3 rather than to the arithmetic, and `budget_mb == 0` means "no
+budget for this GPU" — **unconstrained, identical to a GPU with no budget row
+at all**. Reading any of them as a literal zero turns an unconfigured field
+into a hard refusal of every start.
 
-> **The GPU budget is the exception, and the asymmetry is easy to get wrong.**
-> What is unconstrained is a GPU index **absent from the budget map** — *not* a
-> budget of zero. A stored budget row with `budget_mb = 0` reaches the agent,
-> is present in the policy's budget map, and therefore terminally refuses
-> (`not_permitted`) every spec with a known non-zero demand on that GPU. The
-> portal's write validation rejects only negative values, so `0` is a reachable
-> operator input. Treat "no budget for this GPU" as *delete the row*, never as
-> *set it to 0*. **Note for maintainers:** the doc comment on
-> `routing.ServerGPUBudget.BudgetMB` currently states the opposite
-> (`BudgetMB 0` = unconstrained) and contradicts the agent's policy — see
-> [§11.1 Operational risks](../11-risks-and-technical-debt.md).
+> **A budget of `0` and an absent budget row must stay indistinguishable, and
+> that is easy to break.** `0` is reachable operator input, not a hypothetical:
+> the portal's write validation rejects only *negative* values, the limits form
+> seeds a brand-new budget row at `0` MB when telemetry offers no total-memory
+> figure, and clearing the MB field yields `0` too. The meaning is defined by
+> the data model — the doc comment on `routing.ServerGPUBudget.BudgetMB` — and
+> honoured on the far side of the wire by the agent: `Admit` skips any GPU index
+> whose budget is `<= 0`, so an operator who zeroes a budget gets a no-op, not
+> `not_permitted` for every model on that card. The two comments name each
+> other deliberately; change one and the other must change in the same commit.
+> The check lives in `Admit` rather than in `owner.buildSnapshot`, where the
+> budget map is built, because `PolicySnapshot.Budgets` is an exported field any
+> caller can populate: filtering at one producer would leave every other
+> producer free to reintroduce the divergence, while filtering at the single
+> place that *interprets* a budget cannot be bypassed. The portal's advisory
+> matrix tooltip follows the same rule — it renders a `0` as a bare sum, never
+> as an over-budget warning for a ceiling the agent does not enforce.
+>
+> **Do not "fix" a future recurrence by making the portal reject `0`.** That
+> would turn a row an operator cleared to zero into an error rather than a
+> no-op, and would leave the gateway and the agent disagreeing about a value the
+> store already persists.
 
 `Admit` evaluates in a fixed order, and the order is deliberate: an
 unknown-VRAM candidate blocked by a *pinned* occupant short-circuits first;
@@ -1538,7 +1553,10 @@ The per-cell VRAM tooltip is **advisory and says so on every cell**. It sums eac
 budget — never the limits tab's in-progress draft, because an unsaved edit on
 another tab must not change what the matrix claims the budget is. Over-budget is
 conveyed by red text *and* an explicit text marker, since colour alone would be
-lost on a colour-blind operator. Every tooltip ends by reminding the reader that
+lost on a colour-blind operator. Because the tooltip's job is to *predict the
+agent*, it applies the agent's own zero rule (§5.2): a budget of `0` renders as a
+bare sum, exactly like a GPU with no budget row, never as `/ 0 MB (over budget)`
+for a ceiling admission does not enforce. Every tooltip ends by reminding the reader that
 the agent's own arithmetic at admission time is the actual veto, so a
 matrix-allowed pair can still be refused at runtime and vice versa. Turning
 either this or the drift warning below into a hard client-side block would make
@@ -1549,7 +1567,9 @@ from the **existing** hardware telemetry path the hardware panel already uses �
 reading each GPU's index, name, optional UUID and total memory, seeding the
 budget from total memory — falling back to "lowest unused index, 0 MB" only when
 telemetry offers no further unconfigured GPU. Reusing that fetch is what prevents
-a second, divergent source of GPU inventory.
+a second, divergent source of GPU inventory. That `0 MB` fallback is safe
+precisely because `0` means unconstrained (§5.2): a row the operator saves
+without filling in is a no-op, not a refusal of every model on that card.
 
 **Drift detection is descriptive and must never block.** A budget row's
 `expected_uuid` / `expected_name` are snapshotted server-side from live telemetry

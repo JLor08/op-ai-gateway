@@ -28,8 +28,26 @@ type RunningProc struct {
 // admission decision.
 type PolicySnapshot struct {
 	Running      []RunningProc
-	MaxProcesses int         // 0 = unlimited
-	Budgets      map[int]int // gpu index -> budget MB; an ABSENT index is unconstrained, never zero-budget
+	MaxProcesses int // 0 = unlimited
+	// Budgets maps a GPU index to its VRAM budget in MB. An index that is
+	// ABSENT and an index whose budget is 0 are the SAME thing:
+	// unconstrained. That is the gateway data model's own definition --
+	// see the doc comment on routing.ServerGPUBudget.BudgetMB in
+	// gateway/backend/internal/routing/store.go, which spells out that
+	// "no budget for this GPU" is expressed either way; if the meaning of
+	// 0 ever changes there, it must change here in the same commit.
+	//
+	// A 0 is real operator input, not a defensive hypothetical: the
+	// portal's SetServerGPUBudgets rejects only NEGATIVE values, and the
+	// runtime screen seeds a fresh budget row at 0 MB. Admit therefore
+	// skips any index whose budget is <= 0 (see rule 3) rather than
+	// treating it as a ceiling of zero, which would refuse every spec on
+	// that GPU terminally. This also keeps the budget consistent with
+	// every other zero-value in this feature -- MaxProcesses above,
+	// Spec.IdleTimeoutSeconds, AdmissionWaitTimeoutSeconds, ListenPort,
+	// SpecGPU.VRAMMB -- where 0 means unbounded, automatic, or unknown,
+	// never "off".
+	Budgets map[int]int
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -172,8 +190,10 @@ func sortOldestFirst(procs []RunningProc) {
 //  3. Per-GPU budget (rule 3), evaluated with step 2's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
-//     demand. A GPU absent from Budgets is unconstrained, never
-//     zero-budget. If spec's own demand alone already exceeds the budget,
+//     demand. A GPU absent from Budgets, and one whose budget is 0, are
+//     both unconstrained and are skipped identically (see
+//     PolicySnapshot.Budgets). If spec's own demand alone already exceeds a
+//     real, positive budget,
 //     that is the SECOND unresolvable-by-eviction-or-waiting condition --
 //     no toucher, present or absent, changes that -- so it returns a
 //     terminal StateNotPermitted immediately rather than evicting or
@@ -237,14 +257,25 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 		}
 	}
 
-	// Rule 3: per-GPU VRAM arithmetic, only over GPUs with a KNOWN demand.
+	// Rule 3: per-GPU VRAM arithmetic, only over GPUs with a KNOWN demand
+	// and a REAL (positive) budget.
 	for _, g := range spec.GPUs {
 		if g.VRAMMB == 0 {
 			continue
 		}
-		budget, budgeted := snap.Budgets[g.Index]
-		if !budgeted {
-			continue // absent from Budgets = unconstrained, never zero-budget
+		// Absent from Budgets and a budget of 0 both mean "no budget for
+		// this GPU" = unconstrained, and must behave identically -- see
+		// PolicySnapshot.Budgets, and routing.ServerGPUBudget.BudgetMB in
+		// the gateway (gateway/backend/internal/routing/store.go), which is
+		// where that meaning is defined. The check lives HERE, at the one
+		// place that interprets a budget, rather than in
+		// owner.buildSnapshot where the map happens to be built: Budgets is
+		// an exported field on an exported struct that any caller can
+		// populate, so filtering at a single producer would leave every
+		// other producer free to reintroduce the divergence.
+		budget := snap.Budgets[g.Index]
+		if budget <= 0 {
+			continue
 		}
 		if g.VRAMMB > budget {
 			// spec's own single-GPU demand alone already exceeds the

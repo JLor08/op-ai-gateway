@@ -276,6 +276,66 @@ func TestManagerRespectsAllowlist(t *testing.T) {
 	}
 }
 
+// TestManagerZeroGPUBudgetIsUnconstrained is the whole-path counterpart to
+// TestAdmitZeroBudgetIsUnconstrained: it drives a `budget_mb: 0` row through
+// the real Config -> buildSnapshot -> Admit chain rather than a hand-built
+// PolicySnapshot, so the map-construction step (which copies every row
+// verbatim, zeros included) is covered too. A spec on a GPU whose budget row
+// is 0 must actually START; the paired sub-test keeps a real ceiling
+// refusing, so "admit everything" cannot pass this.
+func TestManagerZeroGPUBudgetIsUnconstrained(t *testing.T) {
+	t.Run("zero budget starts the spec", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		m := newTestManager(t, allowlistPolicy())
+
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 8000}}
+		m.Apply(Config{
+			GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 0}},
+			Specs:      []Spec{spec},
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if err != nil {
+			t.Fatalf("EnsureRunning with a 0 MB budget row = %v, want nil: a 0 budget means unconstrained, exactly like an absent row", err)
+		}
+		defer release()
+
+		st := statusFor(m, "spec-a")
+		if st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[spec-a].State = %+v, want running", st)
+		}
+	})
+
+	t.Run("positive budget below demand still refuses", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		m := newTestManager(t, allowlistPolicy())
+
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 8000}}
+		m.Apply(Config{
+			GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 4000}},
+			Specs:      []Spec{spec},
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, err := m.EnsureRunning(ctx, "model-a")
+		if !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+		}
+
+		st := statusFor(m, "spec-a")
+		if st == nil || st.State != StateNotPermitted {
+			t.Fatalf("Status()[spec-a].State = %+v, want not_permitted", st)
+		}
+	})
+}
+
 func TestManagerStartTimeout(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)

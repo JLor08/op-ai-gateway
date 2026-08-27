@@ -311,8 +311,12 @@ func TestAdmit(t *testing.T) {
 		},
 		{
 			// 16: budget missing for a touched gpu -> that gpu is
-			// unconstrained, never zero-budget. A huge existing occupant
-			// does not block the candidate.
+			// unconstrained, never a ceiling of zero (which is what a Go
+			// map's zero value would silently supply). A huge existing
+			// occupant does not block the candidate. An explicit budget of
+			// 0 must reach the same decision -- see
+			// TestAdmitZeroBudgetIsUnconstrained, which asserts the two
+			// cases are identical.
 			name: "missing budget is unconstrained not zero",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
@@ -538,6 +542,115 @@ func TestAdmitCandidateAloneExceedsBudgetIsNotPermitted(t *testing.T) {
 	}
 	if got.Message == "" {
 		t.Fatal("Message must be set to distinguish this cause from the binary/directory not_permitted case")
+	}
+}
+
+// TestAdmitZeroBudgetIsUnconstrained pins the meaning the DATA MODEL
+// assigns to a zero budget, which the policy previously contradicted.
+// `routing.ServerGPUBudget.BudgetMB` (gateway/backend/internal/routing/
+// store.go) defines `BudgetMB 0` as "no budget for this GPU" =
+// unconstrained, explicitly "also true for a GPU with no row at all" -- so a
+// present 0 and an absent row must produce the IDENTICAL decision, not
+// merely similar ones. Admit used to read a present 0 as a real ceiling of
+// zero, which made every spec with a known non-zero demand on that GPU
+// terminally not_permitted: a launch spec that silently never runs, refused
+// with a message about exceeding a 0 MB budget.
+//
+// A 0 is reachable operator input, not a hypothetical: the portal's
+// SetServerGPUBudgets validates `Index < 0 || BudgetMB < 0` and therefore
+// accepts 0 deliberately, and the runtime screen seeds a brand-new budget
+// row at 0 MB when telemetry offers no total-memory figure (and turns a
+// cleared MB input into 0). It was also the ONE place in this feature where
+// 0 did not mean unbounded: MaxProcesses 0, idle_timeout_seconds 0,
+// admission_wait_timeout_seconds 0, listen_port 0 and a spec GPU's vram_mb
+// 0 all read as "no constraint" / "automatic".
+//
+// The two "still constrains" cases are load-bearing, not padding: they are
+// what stops this fix from degenerating into "ignore budgets", which would
+// defeat the OOM protection the whole budget feature exists for.
+func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
+	cases := []struct {
+		name string
+		snap PolicySnapshot
+		spec Spec
+		want Decision
+	}{
+		{
+			// The headline case: a 0 budget row, nothing running at all.
+			// Before the fix this was the terminal
+			// "demand 9000 MB exceeds budget 0 MB on its own" refusal.
+			name: "zero budget alone admits the candidate",
+			snap: PolicySnapshot{
+				Budgets: map[int]int{0: 0},
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}},
+			want: Decision{OK: true, Evict: []string{}},
+		},
+		{
+			// Identical, decision for decision, to the absent-row case in
+			// TestAdmit ("missing budget is unconstrained not zero"): a
+			// huge occupant on the same GPU is neither summed against nor
+			// evicted, because there is no ceiling to overflow.
+			name: "zero budget matches an absent row exactly",
+			snap: PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "occupant", GPUs: map[int]int{0: 999999}, LastUsed: t0},
+				},
+				Budgets: map[int]int{0: 0},
+				Allowed: allowPairs("cand", "occupant"),
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
+			want: Decision{OK: true, Evict: []string{}},
+		},
+		{
+			// A 0 on ONE index must not leak into a sibling index that
+			// does carry a real ceiling -- the skip is per GPU, not a
+			// whole-snapshot opt-out.
+			name: "zero on one gpu leaves a sibling budget enforced",
+			snap: PolicySnapshot{
+				Budgets: map[int]int{0: 0, 1: 4000},
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}, {Index: 1, VRAMMB: 9000}}},
+			want: Decision{
+				Reason:  StateNotPermitted,
+				Message: "spec cand: gpu 1 demand 9000 MB exceeds budget 4000 MB on its own",
+				Evict:   []string{},
+			},
+		},
+		{
+			// Still constrains, 1: a real ceiling below the candidate's own
+			// demand is still the terminal refusal.
+			name: "positive budget below own demand still refuses",
+			snap: PolicySnapshot{
+				Budgets: map[int]int{0: 8000},
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}},
+			want: Decision{
+				Reason:  StateNotPermitted,
+				Message: "spec cand: gpu 0 demand 9000 MB exceeds budget 8000 MB on its own",
+				Evict:   []string{},
+			},
+		},
+		{
+			// Still constrains, 2: a real ceiling the candidate fits under
+			// alone but not alongside the occupant still evicts.
+			name: "positive budget still evicts on overflow",
+			snap: PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "occupant", GPUs: map[int]int{0: 6000}, LastUsed: t0},
+				},
+				Budgets: map[int]int{0: 8000},
+				Allowed: allowPairs("cand", "occupant"),
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
+			want: Decision{Evict: []string{"occupant"}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, tc.name, Admit(tc.snap, tc.spec), tc.want)
+		})
 	}
 }
 
