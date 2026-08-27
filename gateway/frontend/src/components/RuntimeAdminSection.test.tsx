@@ -3108,72 +3108,71 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
   });
 
   // The other half of the same one-word change, and the mirror of C1 for
-  // READS: a write that FAILED wrote nothing, so it must not cost the mapping
-  // its single lazy read either. The reachable route needs no override at all,
-  // because the row that has not loaded its spec yet is exactly the row whose
-  // Delete means "delete the MAPPING" -- so the operator's click issues a
-  // write ticket on the mapping whose read is still in flight.
-  it('keeps a lazy read that a FAILED mapping delete overlapped', async () => {
-    let landLazyGet: (spec: RuntimeSpec) => void = () => {};
-    const lazyGet = new Promise<RuntimeSpec>((resolve) => {
-      landLazyGet = resolve;
+  // READS: a write that FAILED wrote nothing, so it must not cost this mapping
+  // the read that overlapped it. `commitSpecRead` compares the COMMIT counter
+  // at landing time; compared against the ISSUE counter it would see the failed
+  // write's ticket and throw the payload away.
+  //
+  // This used to be driven through a mapping delete on a row whose lazy spec
+  // GET was still in flight -- the route task 22b's delete gate deliberately
+  // CLOSED, because a Delete on a row whose spec state is unknown is exactly
+  // what must not reach an endpoint (see the delete-gate suite below). The
+  // failing write is therefore an override PUT, which is still reachable on a
+  // row that HAS a cached spec, and the read is the Edit GET: it starts before
+  // the write's ticket is issued, so a correct `seen` still matches at landing.
+  it('keeps an Edit read that a FAILED override write overlapped', async () => {
+    let landGet: (spec: RuntimeSpec) => void = () => {};
+    const slowGet = new Promise<RuntimeSpec>((resolve) => {
+      landGet = resolve;
     });
-    const { fakeApi, stream, deletedMappingIds } = renderSection({
+    const { fakeApi, stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
       specsByMappingId: { map_1: fullSpec() },
       statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
     });
-    // Held open BEFORE the fan-out can issue it: `mappings` is `mappingsData ??
-    // []`, so the lazy loader's effect finds nothing to load on the first
-    // render and only fires once the mappings GET resolves -- which is a
-    // microtask, i.e. strictly after this synchronous line.
-    fakeApi.runtimeSpec.mockImplementationOnce(() => lazyGet);
     stream.setStatus('open');
     await screen.findByText('gw-model');
     await act(async () => {
       await Promise.resolve();
     });
 
-    // Nothing is cached for the row yet, so its Delete is the MAPPING delete --
-    // and that branch takes a write ticket (fix round 1, M5). It fails, so it
-    // commits nothing and the mapping stays in the list.
-    fakeApi.deleteMapping.mockImplementationOnce(() => Promise.reject(new Error('delete failed')));
-    fireEvent.click(await screen.findByRole('button', { name: t.mappingDelete }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingDelete }),
-    );
+    // The lazy per-mapping GET has settled; THIS one -- the Edit GET -- hangs.
+    // It snapshots the counters while nothing has been written at all.
+    fakeApi.runtimeSpec.mockImplementationOnce(() => slowGet);
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
     await act(async () => {
       await Promise.resolve();
-      await Promise.resolve();
     });
-    expect(deletedMappingIds).toEqual([]);
-    // A failed delete leaves the confirm dialog open (`setConfirmingDeleteId('')`
-    // is only reached on success), and an open modal aria-hides the tab strip.
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingCancel }),
-    );
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
 
-    // ...and only now does the mapping's ONE spec GET land.
+    // Now a write takes a ticket for the same mapping and FAILS, so it commits
+    // nothing -- the issue counter has moved, the commit counter has not.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() =>
+      Promise.reject(new Error('override failed')),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
     await act(async () => {
-      landLazyGet(fullSpec());
       await Promise.resolve();
       await Promise.resolve();
     });
+    // Nothing was stored, so nothing about the row may have changed.
+    expect(screen.queryByRole('button', { name: t.runtimeClearOverride })).not.toBeInTheDocument();
+
+    // ...and only NOW the Edit GET lands, carrying an override a SECOND admin
+    // put in place. It is the freshest thing anyone has said about this spec.
+    await act(async () => {
+      landGet(fullSpec({ admin_state: 'force_running' }));
+      await Promise.resolve();
+    });
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
 
     // It has to be kept. Discarded, it is discarded for good -- `loadedIdsRef`
-    // already holds this id and never retries -- and all three of these go
-    // wrong at once.
+    // already holds this id and never retries -- and the row would then deny
+    // the Clear override that is the only way out of a force_running.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
-    // The row resolves against the stream instead of being marked unmatched...
-    expect(screen.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
-    // ...it offers its overrides instead of a blank actions cell...
-    expect(screen.getByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
-    // ...and its Delete is the SPEC delete again. Left downgraded, the next
-    // click on it destroys the mapping the operator only meant to unconfigure.
-    expect(await screen.findByRole('button', { name: t.runtimeSpecDelete })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.mappingDelete })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
   });
 });
 
@@ -3557,5 +3556,225 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
         expected_name: 'card-at-0',
       },
     ]);
+  });
+});
+
+// Task 22b: a row action that performs a strictly LARGER destructive operation
+// than the operator asked for.
+//
+// The row's one Delete means "delete the spec" or "delete the MAPPING", and it
+// was decided by `specsById[id]?.configured` -- a cache filled by a sequential
+// per-row fan-out that `loadedIdsRef` never retries. So "no entry" was read as
+// "no spec" while it still meant "we have not found out": for the length of the
+// fan-out on every row, and for the whole mount on a row whose one spec GET
+// failed. `confirmDelete` then honoured that reading and called
+// `api.deleteMapping`, destroying the model route the operator only meant to
+// unconfigure. `disabled: rowBusy` never covered that window, and the
+// destructive branch was the DEFAULT when knowledge was missing.
+describe('RuntimeAdminSection delete gate (task 22b)', () => {
+  /** The row's single Delete, whichever of the two things it currently says. */
+  function rowDelete(): HTMLElement {
+    return (
+      screen.queryByRole('button', { name: t.mappingDelete }) ??
+      screen.getByRole('button', { name: t.runtimeSpecDelete })
+    );
+  }
+
+  /**
+   * Clicks the row's Delete and, if that opened the confirmation, confirms it.
+   * A gated Delete opens no dialog at all; an ungated one opens the confirm,
+   * and THAT second click is what reaches an endpoint.
+   */
+  async function clickThroughDelete() {
+    fireEvent.click(rowDelete());
+    const dialog = screen.queryByRole('dialog');
+    if (dialog !== null) {
+      fireEvent.click(
+        within(dialog).queryByRole('button', { name: t.mappingDelete }) ??
+          within(dialog).getByRole('button', { name: t.runtimeSpecDelete }),
+      );
+    }
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it('never deletes the mapping while this row’s spec state is unknown', async () => {
+    let landLazyGet: (spec: RuntimeSpec) => void = () => {};
+    const lazyGet = new Promise<RuntimeSpec>((resolve) => {
+      landLazyGet = resolve;
+    });
+    const { fakeApi, deletedMappingIds, deletedSpecIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      // The server HAS a configured spec for this mapping. Nothing on the
+      // screen knows that yet, which is the entire point.
+      specsByMappingId: { map_1: fullSpec() },
+    });
+    // Held open BEFORE the fan-out can issue it: `mappings` is `mappingsData ??
+    // []`, so the lazy loader's effect finds nothing to load on the first
+    // render and only fires once the mappings GET resolves -- which is a
+    // microtask, i.e. strictly after this synchronous line.
+    fakeApi.runtimeSpec.mockImplementationOnce(() => lazyGet);
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const del = rowDelete();
+    await clickThroughDelete();
+
+    // THE assertion, and deliberately about the OUTCOME rather than the label:
+    // a label that reads wrongly is a nuisance, a model route that no longer
+    // exists is data loss. Whatever this control says it does, it must not have
+    // deleted the mapping.
+    expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
+    expect(deletedMappingIds).toEqual([]);
+    // Nor may it have quietly done the other one instead.
+    expect(fakeApi.deleteRuntimeSpec).not.toHaveBeenCalled();
+    expect(deletedSpecIds).toEqual([]);
+    expect(screen.getByText('gw-model')).toBeInTheDocument();
+
+    // How that is achieved: the action is still offered, but locked -- and it
+    // says why, because a greyed-out control with no account of itself is its
+    // own defect (RowAction.title, forwarded on the inline path).
+    expect(del).toBeDisabled();
+    fireEvent.mouseOver(del.parentElement as HTMLElement);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeSpecDeleteStateLoading);
+
+    // And it resolves itself the moment the read answers.
+    await act(async () => {
+      landLazyGet(fullSpec());
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled();
+  });
+
+  it('offers the spec delete on that same row once the read answers', async () => {
+    const { fakeApi, deletedSpecIds, deletedMappingIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+    });
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Settled and configured: the smaller operation, offered and working.
+    expect(screen.queryByRole('button', { name: t.mappingDelete })).not.toBeInTheDocument();
+    const del = await screen.findByRole('button', { name: t.runtimeSpecDelete });
+    expect(del).toBeEnabled();
+    await clickThroughDelete();
+    expect(deletedSpecIds).toEqual(['map_1']);
+    expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
+    expect(deletedMappingIds).toEqual([]);
+  });
+
+  // M5, first half: "no cache entry" legitimately means "no spec" for a mapping
+  // created through the form whose spec PUT then failed -- `submitCreate` seeds
+  // `loadedIdsRef` AND `specLoadSettled` for it, so the state is known, and the
+  // partial failure is precisely the case where the operator wants the mapping
+  // gone again. The gate must not take that away.
+  it('keeps the mapping delete on a created mapping whose spec PUT failed', async () => {
+    const { fakeApi, created, deletedMappingIds, deletedSpecIds } = renderSection({
+      mappings: [],
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    // The mapping POST succeeds, the spec PUT does not: a partial failure, so
+    // there is genuinely no spec and nothing in the cache to say so.
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => Promise.reject(new Error('spec failed')));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const del = await screen.findByRole('button', { name: t.mappingDelete });
+    expect(del).toBeEnabled();
+    await clickThroughDelete();
+    expect(deletedMappingIds).toEqual(['map_created']);
+    expect(fakeApi.deleteRuntimeSpec).not.toHaveBeenCalled();
+    expect(deletedSpecIds).toEqual([]);
+  });
+
+  // M5, second half: a spec that was just DELETED. `commitSpecCache` writes an
+  // `emptySpec` for it, so the entry exists and says "not configured" -- the
+  // one case where the cache answers the question negatively by itself. The
+  // next Delete on that row is the mapping delete, and must still work.
+  it('keeps the mapping delete on a row whose spec was just deleted', async () => {
+    const { fakeApi, deletedSpecIds, deletedMappingIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+    });
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await clickThroughDelete();
+    expect(deletedSpecIds).toEqual(['map_1']);
+    // The dialog's exit transition keeps the rest of the screen aria-hidden
+    // until it is unmounted.
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    const del = await screen.findByRole('button', { name: t.mappingDelete });
+    expect(del).toBeEnabled();
+    await clickThroughDelete();
+    expect(deletedMappingIds).toEqual(['map_1']);
+    expect(fakeApi.deleteRuntimeSpec).toHaveBeenCalledTimes(1);
+  });
+
+  // The permanent case, and the reason the gate cannot key on `specLoadSettled`
+  // alone: the loader's `finally` records a FAILED GET as settled too (it has
+  // to -- `specsSettled` gates the `Unmatched` marker and must not wedge). A
+  // rejected GET answers nothing, so it must not license the mapping delete
+  // either -- and since `loadedIdsRef` never retries, it would license it for
+  // the rest of the mount. Edit is the retry: it is non-destructive, left
+  // ungated on purpose, and does its own GET.
+  it('locks the delete on a row whose spec read FAILED, and Edit re-answers it', async () => {
+    const { fakeApi, deletedMappingIds, deletedSpecIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+    });
+    fakeApi.runtimeSpec.mockImplementationOnce(() => Promise.reject(new Error('spec GET failed')));
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const del = rowDelete();
+    await clickThroughDelete();
+    expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
+    expect(deletedMappingIds).toEqual([]);
+    expect(deletedSpecIds).toEqual([]);
+    expect(del).toBeDisabled();
+    // A different sentence from the still-loading one: this state does not
+    // resolve itself, so the tooltip names the way out instead of asking for
+    // patience.
+    fireEvent.mouseOver(del.parentElement as HTMLElement);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeSpecDeleteStateUnknown);
+
+    // Take that way out. The Edit GET answers the question, so the control is
+    // no longer dead for the rest of the mount.
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.cancel }));
+
+    const retried = await screen.findByRole('button', { name: t.mappingDelete });
+    expect(retried).toBeEnabled();
+    await clickThroughDelete();
+    expect(deletedMappingIds).toEqual(['map_1']);
   });
 });

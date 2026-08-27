@@ -687,6 +687,14 @@ export function RuntimeAdminSection({
   // from "not loaded yet" -- and rendering the unresolved marker in that
   // window would make every perfectly normal row flash "Unmatched".
   const [specLoadSettled, setSpecLoadSettled] = useState<ReadonlySet<string>>(new Set());
+  // Which mapping ids' spec GET settled by FAILING. `specLoadSettled` counts
+  // both outcomes deliberately -- it answers "is the fan-out over", which is
+  // all the `Unmatched` marker needs -- but "does this mapping have a spec" is
+  // a different question, and a rejected GET does not answer it. Both leave
+  // `specsById` without an entry, so this set is the only thing that separates
+  // "the server said there is no spec" from "we never found out" (see
+  // `specStateKnown`, which is where the difference is consumed).
+  const [specReadFailedIds, setSpecReadFailedIds] = useState<ReadonlySet<string>>(new Set());
   useEffect(() => {
     const toLoad = mappings.filter((m) => !loadedIdsRef.current.has(m.id));
     if (toLoad.length === 0) return undefined;
@@ -706,6 +714,12 @@ export function RuntimeAdminSection({
           if (!cancelled) commitSpecRead(m.id, seen, spec);
         } catch (err) {
           if (!cancelled) showError(formatPortalError(err, t));
+          // Not guarded by `cancelled` either, and for the same reason as the
+          // `finally` below: this mapping's one lazy read is over and answered
+          // nothing, and that stays true across the deps change that cancelled
+          // it. `loadedIdsRef` never retries, so it stays true until something
+          // else answers the question (`openEdit`'s own GET).
+          setSpecReadFailedIds((cur) => new Set(cur).add(m.id));
         } finally {
           // Deliberately NOT guarded by `cancelled`: this records that the
           // request is over, which stays true across the deps change that
@@ -1636,6 +1650,18 @@ export function RuntimeAdminSection({
       const spec = await api.runtimeSpec(mapping.id);
       commitSpecRead(mapping.id, seen, spec);
       loadedIdsRef.current.add(mapping.id);
+      // This GET doubles as the RETRY for a lazy read that failed: the fan-out
+      // never re-fetches (`loadedIdsRef`), so without this a mapping whose one
+      // spec GET rejected would stay unknown -- and its Delete gated -- for the
+      // rest of the mount, with no way back. Cleared even if `commitSpecRead`
+      // refused this payload, because a refusal means a LATER write already
+      // committed for this mapping: either way the state is no longer unknown.
+      setSpecReadFailedIds((cur) => {
+        if (!cur.has(mapping.id)) return cur;
+        const next = new Set(cur);
+        next.delete(mapping.id);
+        return next;
+      });
       hydrateSpecFields(spec);
       setSpecMode({ kind: 'edit', mapping });
     } catch (err) {
@@ -1801,8 +1827,49 @@ export function RuntimeAdminSection({
     }
   }
 
-  const confirmTargetSpec = confirmingDeleteId ? specsById[confirmingDeleteId] : undefined;
-  const confirmIsSpecDelete = Boolean(confirmTargetSpec?.configured);
+  /**
+   * Whether this mapping's spec state is a KNOWN fact rather than an open
+   * question.
+   *
+   * "No entry in `specsById`" means BOTH things at once: it is what a settled
+   * read of a mapping that has no spec looks like, and it is equally what a
+   * read that never answered looks like -- a rejected GET never lands in the
+   * cache, and a still-running one has not landed yet. Conflating the two is
+   * not a cosmetic slip, because one of them is the licence to delete the
+   * MAPPING (see `deleteMeaning`).
+   */
+  function specStateKnown(mappingId: string): boolean {
+    // An entry is an answer, whoever wrote it: a lazy GET, `openEdit`'s own
+    // GET, or one of our own spec writes (a spec delete commits `emptySpec`).
+    if (specsById[mappingId] !== undefined) return true;
+    // No entry, so the only remaining answer is a read that came back empty
+    // handed on purpose -- settled AND not settled by failing. `submitCreate`
+    // seeds both sets for a mapping it created, whose spec PUT may have failed:
+    // no entry, and yet genuinely no spec.
+    return specLoadSettled.has(mappingId) && !specReadFailedIds.has(mappingId);
+  }
+
+  /**
+   * What this row's single Delete means -- decided in ONE place, because the
+   * defect this replaces was two places agreeing on a guess: the label was
+   * `specsById[id]?.configured` and `confirmDelete` then chose its endpoint
+   * from the same expression, with nothing anywhere saying whether that
+   * expression was even answerable yet.
+   *
+   * `'mapping'` -- the strictly LARGER operation, which destroys the model
+   * route and not just its launch configuration -- is returned only when we
+   * know there is no spec. An unknown state falls to `'spec'`, the smaller of
+   * the two, so that even a stale render that somehow got past `disabled`
+   * cannot delete a route the operator never asked to delete.
+   */
+  function deleteMeaning(mappingId: string): 'spec' | 'mapping' | 'unknown' {
+    if (specsById[mappingId]?.configured) return 'spec';
+    return specStateKnown(mappingId) ? 'mapping' : 'unknown';
+  }
+
+  const confirmIsSpecDelete = confirmingDeleteId
+    ? deleteMeaning(confirmingDeleteId) !== 'mapping'
+    : false;
 
   async function confirmDelete() {
     const id = confirmingDeleteId;
@@ -1922,10 +1989,20 @@ export function RuntimeAdminSection({
   ];
 
   const rowActions = (m: PortalModelMapping): RowAction[] => {
-    const configured = Boolean(specsById[m.id]?.configured);
+    const meaning = deleteMeaning(m.id);
     const rowBusy = loadingEditFor === m.id;
+    // Why the Delete is locked, which is a different sentence in each of the
+    // two unknown states: one resolves itself, the other needs the operator.
+    let deleteBlocked: string | undefined;
+    if (meaning === 'unknown') {
+      deleteBlocked = specReadFailedIds.has(m.id)
+        ? t.runtimeSpecDeleteStateUnknown
+        : t.runtimeSpecDeleteStateLoading;
+    }
     return [
       {
+        // Left ungated on purpose: it is non-destructive, and its own GET is
+        // what re-answers the question for a row whose lazy read failed.
         key: 'edit',
         label: t.runtimeSpecEditAction,
         icon: <EditIcon fontSize="small" />,
@@ -1933,12 +2010,20 @@ export function RuntimeAdminSection({
         disabled: rowBusy,
       },
       {
+        // The label is not decoration: `confirmDelete` performs whatever it
+        // says, so a Delete labelled from a guess IS a delete performed from a
+        // guess -- and the guess used to default to destroying the mapping
+        // during the whole per-row fan-out, and permanently on any row whose
+        // spec GET failed. Offered-but-locked instead, with the reason in the
+        // tooltip: `disabled` alone would be a dead control with no account of
+        // itself, and `rowBusy` never covered this window at all.
         key: 'delete',
-        label: configured ? t.runtimeSpecDelete : t.mappingDelete,
+        label: meaning === 'mapping' ? t.mappingDelete : t.runtimeSpecDelete,
         color: 'error',
         icon: <DeleteIcon fontSize="small" />,
         onClick: () => setConfirmingDeleteId(m.id),
-        disabled: rowBusy,
+        disabled: rowBusy || meaning === 'unknown',
+        title: deleteBlocked,
       },
     ];
   };

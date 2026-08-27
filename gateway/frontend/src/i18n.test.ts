@@ -1884,6 +1884,8 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
       'runtimeSpecEditAction',
       'runtimeSpecDelete',
       'runtimeSpecDeleteConfirm',
+      'runtimeSpecDeleteStateLoading',
+      'runtimeSpecDeleteStateUnknown',
       'runtimeSpecMappingSection',
       'runtimeSpecConfigSection',
       'runtimeSpecListenPort',

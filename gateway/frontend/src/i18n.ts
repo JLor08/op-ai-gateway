@@ -519,6 +519,10 @@ const de = {
   runtimeSpecDelete: 'Spezifikation löschen',
   runtimeSpecDeleteConfirm:
     'Runtime-Spezifikation wirklich löschen? Die Modell-Zuordnung bleibt erhalten.',
+  runtimeSpecDeleteStateLoading:
+    'Löschen ist gesperrt, solange noch nicht bekannt ist, ob für diese Zuordnung eine Runtime-Spezifikation existiert – die Abfrage läuft noch.',
+  runtimeSpecDeleteStateUnknown:
+    'Löschen ist gesperrt: Die Runtime-Spezifikation dieser Zuordnung konnte nicht geladen werden, daher ist unbekannt, ob eine existiert. Über „Bearbeiten“ erneut laden.',
   runtimeSpecMappingSection: 'Modell-Zuordnung',
   runtimeSpecConfigSection: 'Startkonfiguration',
   runtimeSpecListenPort: 'Listen-Port',
@@ -2348,6 +2352,10 @@ const en: PortalMessages = {
   runtimeSpecEditAction: 'Edit',
   runtimeSpecDelete: 'Delete spec',
   runtimeSpecDeleteConfirm: 'Really delete this runtime spec? The model mapping itself is kept.',
+  runtimeSpecDeleteStateLoading:
+    'Deleting is locked while it is not yet known whether this mapping has a runtime spec — the query is still running.',
+  runtimeSpecDeleteStateUnknown:
+    'Deleting is locked: this mapping\'s runtime spec could not be loaded, so whether one exists is unknown. Use "Edit" to load it again.',
   runtimeSpecMappingSection: 'Model mapping',
   runtimeSpecConfigSection: 'Launch configuration',
   runtimeSpecListenPort: 'Listen port',
