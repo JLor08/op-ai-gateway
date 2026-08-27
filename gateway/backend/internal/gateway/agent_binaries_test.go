@@ -568,6 +568,12 @@ func TestBuildAgentConfigJSONKeySet(t *testing.T) {
 		"metrics_url", "model_status_url", "model_status_format", "lhm_url",
 		"cert_mode", "cert_dir", "cert_reload_command", "cert_poll_interval",
 		"ca_file", "ca_cache_file", "ca_pem",
+		// The operator-only half of the managed-runtime router bind contract:
+		// the gateway supplies the router PORT, this decides its bind host,
+		// and an empty value means the agent falls back to ALL INTERFACES.
+		// A generated config that never mentions it leaves that decision
+		// invisible to the operator who is making it.
+		"runtime_router_bind",
 		"tls_insecure", "verbose",
 	}
 	wantSet := make(map[string]bool, len(want))

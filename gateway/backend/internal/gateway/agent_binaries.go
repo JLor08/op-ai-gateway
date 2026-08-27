@@ -424,6 +424,18 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // currently served leaf is signed by the internal CA.
   "ca_pem": ` + string(caPEM) + `,
 
+  // Bind host for the agent-managed model runtime's router port -- the port the
+  // gateway sends inference requests to for a server_agent application. This
+  // value comes ONLY from this local file: the gateway supplies the router's
+  // PORT, never its bind host. Empty (the default) means the agent derives one
+  // -- its own mesh identity first, otherwise ALL INTERFACES with a warning in
+  // the agent log. Set it explicitly (e.g. the mesh IP, or "127.0.0.1") to
+  // decide that yourself. The rest of the managed-runtime settings
+  // (runtime_source, runtime_config, runtime_allowed_binaries,
+  // runtime_allowed_dirs, runtime_cache) are documented in the server-agent
+  // README; nothing starts at all until runtime_allowed_binaries is configured.
+  "runtime_router_bind": "",
+
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
   "tls_insecure": false,
 

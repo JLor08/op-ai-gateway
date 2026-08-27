@@ -1238,6 +1238,18 @@ const agentConfigJSONCFixture = `{
   // currently served leaf is signed by the internal CA.
   "ca_pem": "",
 
+  // Bind host for the agent-managed model runtime's router port -- the port the
+  // gateway sends inference requests to for a server_agent application. This
+  // value comes ONLY from this local file: the gateway supplies the router's
+  // PORT, never its bind host. Empty (the default) means the agent derives one
+  // -- its own mesh identity first, otherwise ALL INTERFACES with a warning in
+  // the agent log. Set it explicitly (e.g. the mesh IP, or "127.0.0.1") to
+  // decide that yourself. The rest of the managed-runtime settings
+  // (runtime_source, runtime_config, runtime_allowed_binaries,
+  // runtime_allowed_dirs, runtime_cache) are documented in the server-agent
+  // README; nothing starts at all until runtime_allowed_binaries is configured.
+  "runtime_router_bind": "",
+
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
   "tls_insecure": false,
 
@@ -1283,11 +1295,38 @@ func TestAgentConfigJSONCFixtureLoadsToDocumentedDefaults(t *testing.T) {
 	if cfg.CertPollInterval != 0 {
 		t.Errorf("CertPollInterval = %v, want 0 (automatic)", cfg.CertPollInterval)
 	}
+	if cfg.RuntimeRouterBindHost != "" {
+		t.Errorf("RuntimeRouterBindHost = %q, want empty (the documented default: derive from the mesh identity, else all interfaces)", cfg.RuntimeRouterBindHost)
+	}
 	if cfg.TLSInsecure {
 		t.Error("TLSInsecure = true, want false")
 	}
 	if cfg.Verbose {
 		t.Error("Verbose = true, want false")
+	}
+}
+
+// TestGeneratedAgentConfigFixtureHonoursAnExplicitRouterBind is the other half
+// of the runtime_router_bind contract: the key the gateway now emits must
+// actually take effect when an operator fills it in, not merely parse. The
+// fixture is a byte-for-byte copy of buildAgentConfigJSON's template
+// (gateway/backend/internal/gateway/agent_binaries.go), so this is what proves
+// the generated document and this module's own loader agree -- the two live in
+// separate Go modules and cannot share code.
+func TestGeneratedAgentConfigFixtureHonoursAnExplicitRouterBind(t *testing.T) {
+	body := strings.Replace(agentConfigJSONCFixture,
+		`"runtime_router_bind": ""`, `"runtime_router_bind": "100.64.0.7"`, 1)
+	if body == agentConfigJSONCFixture {
+		t.Fatal("the fixture no longer contains a runtime_router_bind key; the generated config template and this fixture have drifted")
+	}
+	path := writeConfig(t, body)
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load generated fixture: %v", err)
+	}
+	if cfg.RuntimeRouterBindHost != "100.64.0.7" {
+		t.Errorf("RuntimeRouterBindHost = %q, want %q", cfg.RuntimeRouterBindHost, "100.64.0.7")
 	}
 }
 

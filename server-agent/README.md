@@ -51,6 +51,12 @@ Every setting can be given three ways. Precedence, highest first:
 | `OP_AGENT_CA_FILE` | `-ca-file` | `ca_file` | — | Optional operator-managed public CA bundle. Read-only: the agent never overwrites it. |
 | `OP_AGENT_CA_CACHE_FILE` | `-ca-cache-file` | `ca_cache_file` | — | Optional agent-managed public CA cache. Generated self-signed mesh configs use `server-agent-ca.pem`. |
 | `OP_AGENT_CA_PEM` | `-ca-pem` | `ca_pem` | — | Optional inline public CA bootstrap bundle, generated only when the currently served gateway leaf uses the internal CA. |
+| `OP_AGENT_RUNTIME_SOURCE` | `-runtime-source` | `runtime_source` | `gateway` | Where the agent-managed model runtime's launch specs come from: `gateway` (fetched from `GET /api/agent/v1/runtime-config`, portal-maintained) or `file` (read from `runtime_config` locally and reported upward read-only). See [Managed model runtime](#managed-model-runtime). |
+| `OP_AGENT_RUNTIME_CONFIG` | `-runtime-config` | `runtime_config` | — | Path to the local runtime-config JSON file. **Required** when `runtime_source` is `file`; ignored otherwise. |
+| `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
+| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). Env value is comma-separated. |
+| `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
+| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive — the agent's own mesh identity first, otherwise **all interfaces**, with a warning in the agent log. Set it explicitly (mesh IP, or `127.0.0.1`) to decide that yourself. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
 
 ### Config file
@@ -98,6 +104,10 @@ curl -fL -H "Authorization: Bearer <per-server-agent-token>" \
   "ca_file": "",
   "ca_cache_file": "",
   "ca_pem": "",
+  "runtime_source": "gateway",
+  "runtime_allowed_binaries": ["/usr/local/bin/llama-server"],
+  "runtime_allowed_dirs": ["/srv/models"],
+  "runtime_router_bind": "",
   "tls_insecure": false
 }
 ```
@@ -122,6 +132,36 @@ and standard hostname/chain/expiry verification. A failed HTTPS or WSS
 verification is reported and retried with the existing backoff — the agent
 never falls back to HTTP. Only an explicitly configured `tls_insecure=true`
 disables verification, for emergency/development use.
+
+### Managed model runtime
+
+When the gateway's portal defines an application of type `server_agent` for this
+server, the agent itself starts, health-waits, drains, restarts and idle-unloads
+the model-server processes (llama.cpp server, vLLM, …) and reverse-proxies each
+inference request to the right one, on a single router port.
+
+Two things stay entirely under the server operator's control, and come **only**
+from this local config — never from the gateway:
+
+- **`runtime_allowed_binaries`** — the boundary. A launch spec may only exec an
+  absolute path that is in this list, matched exactly. With the list empty
+  (the default) **nothing starts**, and every spec reports `not_permitted` with
+  that reason. The gateway decides *when and how* a model process runs; this
+  decides *whether it may run at all*.
+- **`runtime_router_bind`** — where the router port listens. Leaving it empty
+  means the agent picks: its own mesh identity if it has one, otherwise **all
+  interfaces**, which it warns about at startup. On a host that is not
+  mesh-only, set this explicitly.
+
+`runtime_allowed_dirs` additionally restricts a spec's `work_dir`; it is
+convenience/defence-in-depth, not a boundary (containment is a lexical
+path-prefix check and does not resolve symlinks).
+
+Set `runtime_source: "file"` plus `runtime_config: <path>` to own the launch
+specs locally instead of in the portal. The file uses the identical JSON schema
+the gateway serves; the agent reports the effective document upward with every
+env **value** redacted (keys stay visible) and the portal renders it read-only,
+including hiding start/stop — whoever owns the config owns the operations.
 
 ## Build & run
 
