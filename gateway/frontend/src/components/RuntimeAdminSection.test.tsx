@@ -2384,11 +2384,14 @@ describe('RuntimeAdminSection status row identity (fix round 1, accepted design 
   });
 
   // The status stream is SERVER-scoped while the spec/mapping join is
-  // APPLICATION-scoped, and nothing in the backend stops a server from
-  // carrying a second `server_agent` application (only `unique(server_id,
-  // port)` exists). On such a server most rows hit this fallback, and an
-  // empty actions cell with no explanation would make the override feature
-  // look broken.
+  // APPLICATION-scoped, so a row can arrive that this application's mappings
+  // cannot resolve: a spec deleted here while the agent still reports it until
+  // its next config sync, or a snapshot landing before every per-mapping spec
+  // GET has settled. (A second `server_agent` application on one server is no
+  // longer among the causes -- the portal refuses it on create and on retype,
+  // and migration 68 indexes it; see the fallback's own comment in
+  // RuntimeAdminSection.tsx.) An empty actions cell with no explanation would
+  // make the override feature look broken.
   it('says so when a row cannot be resolved to a mapping of this application', async () => {
     const { stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Gateway-Alpha' })],

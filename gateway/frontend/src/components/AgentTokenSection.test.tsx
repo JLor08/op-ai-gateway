@@ -354,6 +354,61 @@ describe('AgentTokenSection agent-binary downloads', () => {
     expect(raw).toContain('the gateway can never deliver');
     // Windows guidance for the reload command.
     expect(raw).toContain('quote-free');
+    // The operator-only half of the managed-runtime router bind contract: the
+    // gateway supplies the router PORT, this file decides its bind host, and an
+    // empty value means the agent falls back to ALL INTERFACES. A generated
+    // config that never mentions the key leaves that decision invisible to the
+    // one person making it.
+    expect(cfg.runtime_router_bind).toBe('');
+    expect(raw).toContain('the gateway supplies the router');
+  });
+
+  // Drift guard, and the frontend half of one that was blind. The JSONC
+  // template is hand-duplicated in FOUR places that cannot share code: this
+  // function, the Go backend's buildAgentConfigJSON
+  // (gateway/backend/internal/gateway/agent_binaries.go), the standalone
+  // server-agent module's fileConfig + its config fixture, and the
+  // server-agent README's example. The Go side pins its own exact key set
+  // (TestBuildAgentConfigJSONKeySet) but cannot see this file, and the test
+  // above asserts keys one at a time, so a key added on either side used to be
+  // able to skip this copy silently -- which is exactly what happened to
+  // runtime_router_bind. This pins the EXACT set instead: adding, removing or
+  // renaming a key here fails until the expectation list is updated, and the
+  // list is deliberately identical to the Go test's.
+  it('buildServerAgentConfig emits exactly the documented key set (four-copy drift guard)', () => {
+    const raw = buildServerAgentConfig(configMaterial, 'sk-abc');
+    const cfg = JSON.parse(
+      raw
+        .split('\n')
+        .filter((l) => !l.trim().startsWith('//'))
+        .join('\n'),
+    ) as Record<string, unknown>;
+    // Maintained by hand, in template order. When adding a key here, add it to
+    // buildAgentConfigJSON's own expectation list too, AND to
+    // server-agent/internal/config/config.go's fileConfig (+ its README table
+    // and JSONC example).
+    const want = [
+      'gateway_url',
+      'token',
+      'transport',
+      'interval',
+      'system_report_interval',
+      'metrics_url',
+      'model_status_url',
+      'model_status_format',
+      'lhm_url',
+      'cert_mode',
+      'cert_dir',
+      'cert_reload_command',
+      'cert_poll_interval',
+      'ca_file',
+      'ca_cache_file',
+      'ca_pem',
+      'runtime_router_bind',
+      'tls_insecure',
+      'verbose',
+    ];
+    expect(Object.keys(cfg).sort()).toEqual([...want].sort());
   });
 
   it('uses token.config even when the binary manifest is unavailable', async () => {

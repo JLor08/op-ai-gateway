@@ -41,8 +41,19 @@ function curlCommand(base: string, token: string, b: { os: string; arch: string 
 // gateway_url + token filled in and every other key pre-set to the agent's own
 // default, each preceded by an English comment explaining it. Output is JSONC — the
 // agent's config loader strips whole-line `//` comments before parsing (see
-// server-agent/internal/config/config.go stripJSONLineComments). Keep the
-// keys/defaults in sync with that file's fileConfig.
+// server-agent/internal/config/config.go stripJSONLineComments).
+//
+// This is the FOURTH hand-maintained copy of one template, and the copies
+// cannot share code (two languages, two Go modules): the Go backend's
+// buildAgentConfigJSON serves the same document over
+// /api/agent/v1/download/config, server-agent's fileConfig defines what the
+// agent will actually read, and the server-agent README documents it. The
+// portal shows the curl for the backend's copy one row above this file's
+// download button, so a key missing here is a visible disagreement on one
+// screen. Each side pins its own exact key set -- here in
+// AgentTokenSection.test.tsx, on the Go side in TestBuildAgentConfigJSONKeySet
+// -- because neither test can see the other's template; changing this one
+// therefore means updating its expectation list AND the other three copies.
 export function buildServerAgentConfig(config: AgentConfigMaterial, token: string): string {
   return `{
   // The gateway base URL the agent sends telemetry to (origin only, no path).
@@ -116,6 +127,18 @@ export function buildServerAgentConfig(config: AgentConfigMaterial, token: strin
   // Optional inline CA bootstrap bundle. Present only when the gateway's
   // currently served leaf is signed by the internal CA.
   "ca_pem": ${JSON.stringify(config.ca_pem)},
+
+  // Bind host for the agent-managed model runtime's router port -- the port the
+  // gateway sends inference requests to for a server_agent application. This
+  // value comes ONLY from this local file: the gateway supplies the router's
+  // PORT, never its bind host. Empty (the default) means the agent derives one
+  // -- its own mesh identity first, otherwise ALL INTERFACES with a warning in
+  // the agent log. Set it explicitly (e.g. the mesh IP, or "127.0.0.1") to
+  // decide that yourself. The rest of the managed-runtime settings
+  // (runtime_source, runtime_config, runtime_allowed_binaries,
+  // runtime_allowed_dirs, runtime_cache) are documented in the server-agent
+  // README; nothing starts at all until runtime_allowed_binaries is configured.
+  "runtime_router_bind": "",
 
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
   "tls_insecure": false,

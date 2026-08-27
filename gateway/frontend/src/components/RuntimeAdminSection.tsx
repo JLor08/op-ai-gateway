@@ -2126,14 +2126,32 @@ export function RuntimeAdminSection({
       // expose. So both are shown -- gateway name on top, the agent's own
       // upstream name beneath it -- with an explicit marker when they differ.
       //
-      // The fallback is REACHABLE, not theoretical: this stream is
-      // SERVER-scoped while the spec/mapping join is APPLICATION-scoped, and
-      // nothing in the backend stops a server from carrying a second
-      // `server_agent` application (the only relevant constraint is
-      // `unique(server_id, port)`; AgentRuntimeConfig just takes the first
-      // match). On such a server most rows land here, and since they get no
-      // override actions either, the row SAYS so rather than showing a blank
-      // actions cell.
+      // The fallback is REACHABLE, not theoretical, because this stream is
+      // SERVER-scoped while the spec/mapping join is APPLICATION-scoped. Two
+      // causes survive on a healthy deployment:
+      //
+      //   - a spec deleted here while the agent still runs it: the agent keeps
+      //     reporting that spec_id until its next config sync, and the mapping
+      //     it resolved through is already gone;
+      //   - the fan-out race on mount: the stream can deliver a snapshot
+      //     before every per-mapping spec GET has settled, so the join is
+      //     merely INCOMPLETE rather than final (which is why the marker below
+      //     waits for `specsSettled` before calling it a fact).
+      //
+      // A second `server_agent` application on one server is NOT one of them
+      // any more, whatever an older version of this comment said: the portal
+      // refuses that on both write paths
+      // (portal.ErrServerAgentApplicationExists, on create AND on retype),
+      // MemoryStore mirrors it, and migration 68 adds a partial unique index
+      // on applications(server_id) where type='server_agent'. It survives only
+      // on a pre-invariant development database of this branch, where
+      // migration 68 deliberately skipped index creation over existing
+      // duplicates -- `server_agent` is not a type any released version can
+      // write, so no live deployment can be in that state.
+      //
+      // On such a server most rows land here, and since they get no override
+      // actions either, the row SAYS so rather than showing a blank actions
+      // cell.
       //
       // Search/sort key carries every name a searching operator might type.
       value: (row) => [gatewayNameFor(row), row.model, row.spec_id].filter(Boolean).join(' '),
