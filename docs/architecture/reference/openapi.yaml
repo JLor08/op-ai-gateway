@@ -667,6 +667,10 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        # Two distinct 404s, as on get/put: runtime_spec.not_found when the
+        # mapping carries no spec row, and mapping.not_found from the
+        # authorization no-leak collapse.
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/portal/applications/{id}/runtime/coresidency:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

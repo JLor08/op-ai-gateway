@@ -414,8 +414,9 @@ server file-mode on a failed ingest.
 ### 5.3 The agent's own router port (not a gateway endpoint)
 
 For completeness, since the gateway's `server_agent` provider talks to it: the
-agent's managed-runtime router serves **exactly three GET control paths** and
-routes everything else on a `model` field in a JSON request body.
+agent's managed-runtime router serves **exactly four GET control paths** —
+`/health`, `/v1/health`, `/running`, `/v1/models` — and routes everything else
+on a `model` field in a JSON request body.
 
 | Path | Answers |
 |---|---|

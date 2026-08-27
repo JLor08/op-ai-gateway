@@ -147,10 +147,14 @@ with an argv array, as an unprivileged user, in its own process group on unix.
 ### 3.2 Placeholders, and why no secret enters the gateway
 
 A spec's `env` values are **referential placeholders** resolved on the AI
-server, e.g. `{"HF_TOKEN": "${AGENT_ENV:HF_TOKEN}"}`. The gateway never stores
-or transports a model secret, so the system-wide no-plaintext-secrets rule needs
-no new exception. The accepted cost, stated plainly: the secret must already
-exist on the AI server, and the portal cannot set it.
+server, e.g. `{"HF_TOKEN": "${AGENT_ENV:HF_TOKEN}"}`. The value stays on the AI
+server, so the system-wide no-plaintext-secrets rule needs no new exception:
+nothing here gives the gateway a model secret to store. The accepted cost,
+stated plainly: the secret must already exist on the AI server, and the portal
+cannot set it. Two channels can still carry a **resolved** value upward, both
+arising on the agent side and both stated in §8.3: a secret written into `args`
+rather than `env`, and a child that prints its own argv or environment into the
+output that `last_error.stderr_tail` samples.
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
 Exactly two placeholders are resolved, in both `args` and `env` values:
@@ -392,8 +396,8 @@ its socket endpoints do not (text-generation-webui's and koboldcpp's streaming
 sockets are the concrete cases). This is a design boundary, not a missing
 feature: adding upgrade support would need an in-flight model for long-lived
 connections, an idle-based deadline on the raw connection, and a drain that
-closes hijacked connections. It is not a re-added `Hijack`. See
-[§11.1](../11-risks-and-technical-debt.md).
+closes hijacked connections. It is not a re-added `Hijack`. The limitation is
+recorded in §13 of this document.
 
 One residual risk is accepted rather than fixed: **a child that answers `101`
 unsolicited leaks its raw connection.** Verified against the Go 1.26.5 source,
@@ -417,13 +421,17 @@ host never comes from the gateway. Resolution order:
 3. else **all interfaces**, logged at Warn naming the setting that would
    restrict it.
 
-The derivation in step 2 yields an address only when `cert_mode` is not `off`
-**and** a certificate is already installed — and the portal's generated agent
-config ships `cert_mode: "off"` with an empty `cert_dir`. **The shipped default
-therefore always falls through to all interfaces.** Deriving a mesh address is
-the unusual case, not the default. An operator who does not want an
-unauthenticated inference port on every interface must set the value explicitly
-(the mesh IP, or `127.0.0.1`).
+The derivation in step 2 tests one thing only: whether `cert_dir` holds a
+loadable leaf certificate with a usable SAN. `DeriveBindHost` takes the
+directory as its single argument and **never consults `cert_mode`** — so a
+`cert_dir` left populated after the mode was switched back to `"off"` still
+derives an address, which is worth knowing when the router turns out to be
+bound somewhere narrower than expected. The portal's generated agent config
+ships `cert_mode: "off"` with an **empty `cert_dir`**, and that empty directory
+— not the mode — is why **the shipped default always falls through to all
+interfaces.** Deriving a mesh address is the unusual case, not the default. An
+operator who does not want an unauthenticated inference port on every interface
+must set the value explicitly (the mesh IP, or `127.0.0.1`).
 
 Binding all interfaces is also the only way "router behind the agent's own proxy
 listener, loopback only" is expressible as *unavailable*: that deployment needs
@@ -558,13 +566,23 @@ other order, presenting as a random, hard-to-reproduce matrix failure.
 
 A spec whose demand on a GPU is unknown may start only **alone** on that GPU;
 otherwise it sits in `pending_vram_unknown` with the reason visible in the
-portal. The agent then measures actual usage of **its own child PIDs** —
-`nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`, which is exact
-because the agent knows which PIDs are its children; AMD `rocm-smi --showpids`
-best-effort; on Apple unified memory the operator estimate stays authoritative
-and the portal says so — and writes the measurement back to the gateway. So
-"unknown" is a self-resolving transient, not a permanent hole in the OOM
-protection.
+portal. On an NVIDIA host the agent then measures actual usage of **its own
+child PIDs** — `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`,
+which is exact because the agent knows which PIDs are its children — and writes
+the measurement back to the gateway. There "unknown" is a self-resolving
+transient, not a permanent hole in the OOM protection.
+
+**Measurement is NVIDIA-only.** `main.go` installs exactly one measurer,
+`collector.NewNvidiaComputeApps()`, and that constructor returns nil when
+`nvidia-smi` is not on PATH — so an AMD host (the host-level `rocm-smi`
+collector reports no per-PID split), an Apple unified-memory host, and a host
+with no GPU at all install **no** measurer and never write a measurement back.
+On those hosts the operator's `vram_estimate_mb` is the only number there will
+ever be. The rule above still applies — a spec left at the default `0` waits
+while a pinned or busy spec holds one of its GPUs — but nothing resolves it
+except the other spec becoming evictable or the operator filling the estimate
+in. Waiting for the measurement to arrive is waiting for something that will
+not happen (§13).
 
 **Fail-open was explicitly rejected**: letting an unknown-demand spec start
 anyway hollows out exactly the protection the VRAM budget exists for, and
@@ -956,10 +974,11 @@ Switching to deltas to save bandwidth would make frame delivery order and
 completeness load-bearing, which the reconnect path cannot guarantee. Old agents
 discard unknown frame types — a verified contract of `ws.go`.
 
-`runtime_config` is the first gateway→agent frame that carries a *payload*
-rather than being a content-free doorbell like `cert_update`/`trust_update`. It
-reaches the agent loop on a latest-wins buffered(1) channel: **drain any stale
-pending document, then send non-blocking.** A plain buffered(1) channel without
+`runtime_config` is the first gateway→agent frame that carries an *instruction*
+rather than being a doorbell like `cert_update`/`ca_update`, which carry a
+fingerprint at most and tell the agent only to go and look. It reaches the agent
+loop on a latest-wins buffered(1) channel: **drain any stale pending document,
+then send non-blocking.** A plain buffered(1) channel without
 the drain is wrong in the opposite direction from the intuition — the *second*
 send is dropped, so the consumer observes the **stale** document. Both halves of
 drain-then-send are non-blocking selects (a blocked WS read loop stops answering
@@ -1086,6 +1105,19 @@ already masked.
 > expansion resolves `${AGENT_ENV:NAME}` in `args` too, so **a secret placed in
 > an argument reaches the gateway unmasked.** This was reviewed and upheld as
 > spec-correct. **Operator guidance: put secrets in `env`, never in `args`.**
+>
+> **The report is not the only upward channel, either.** `last_error.stderr_tail`
+> carries the tail of the child's own combined output (§6), and the child was
+> launched with every `${AGENT_ENV:NAME}` already resolved — in `env` as well as
+> in `args`. A model server that echoes its command line or its environment at
+> startup and then dies, which is what a bad flag or a missing model file looks
+> like, puts that plaintext into the tail. From there it rides telemetry to the
+> gateway and is rendered to portal admins on the runtime screen. Everything
+> mechanical around it is deliberate and correct — volatile registry, never
+> persisted, clamped on ingest (see
+> [Telemetry & Observability](telemetry-usage-observability.md)) — but the scope
+> of the redaction claim is `env` values **in the report**, not "no secret ever
+> reaches the wire".
 
 `parse_error` is a first-class case, not an edge case: the agent may
 legitimately report an empty `config` alongside a non-empty `parse_error` — a
@@ -1660,7 +1692,15 @@ consistent if configured together.
 | `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s | Idle watchdog on streaming responses. |
 | `spec.admission_wait_timeout_seconds` | Agent, per spec | `0` = until the client disconnects | Queueing for a slot. |
 | `spec.startup_timeout_seconds` | Agent, per spec | 180 (floored at 30 when unset) | Process start until first green health probe. |
-| `spec.health_timeout_seconds` | Agent, per spec | 5 | One health probe. |
+| `spec.health_timeout_seconds` | Agent, per spec | 5 (agent falls back to 2 when unset) | One health probe. |
+
+The two parenthesised fallbacks belong to the agent; the headline numbers
+belong to the gateway. `180` and `5` are what `PutRuntimeSpec` normalises a
+gateway-authored spec to, so a spec that reaches the agent through the portal
+never exercises the fallbacks. A **file-mode** document (§8.2) uses the same
+schema with **no** such normalisation, so a field left out there gets 30 s of
+startup budget and a 2 s probe timeout instead. A model server whose health
+endpoint answers slowly under load is where that difference shows.
 
 The portal's one cross-field warning
 (`timeout_ms_below_startup_timeout`, §11.3) exists because the gateway's total
@@ -1698,8 +1738,13 @@ operator meets first:
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
   application (§4.5). Their HTTP/JSON endpoints work.
-- **A secret in `args` reaches the gateway unmasked** (§8.3). Put secrets in
-  `env`.
+- **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
+  GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
+  authoritative for good and an unfilled estimate is not something waiting for
+  the agent to resolve.
+- **A secret in `args` reaches the gateway unmasked**, and a resolved secret of
+  either kind can also reach it inside `last_error.stderr_tail` (§8.3). Put
+  secrets in `env`.
 - **The router authenticates nothing and its shipped default binds all
   interfaces** (§4.6).
 - **A pairwise matrix plus per-GPU arithmetic cannot express every co-residency
