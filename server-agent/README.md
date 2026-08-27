@@ -162,6 +162,33 @@ from this local config — never from the gateway:
 convenience/defence-in-depth, not a boundary (containment is a lexical
 path-prefix check and does not resolve symlinks).
 
+#### What the router port serves
+
+Apart from three `GET` control paths — `/health` (and `/v1/health`), `/running`
+(llama-swap shape, so the gateway's existing loaded-model detection works
+unchanged) and `/v1/models` — **the router routes exclusively on a `model`
+field in a JSON request body.** Everything else is a proxied inference request,
+and to be proxied it must carry a body that parses as JSON and names a model
+this agent manages. Consequences worth knowing before pointing an application
+at it:
+
+- A request with no body, a non-JSON body, or no `model` field gets
+  **`404 runtime.model_not_managed`** — including WebSocket handshakes, which
+  are bodiless `GET`s. There is no `/ws`, no streaming-socket endpoint, and no
+  path that upgrades: **protocol upgrades are never proxied**, and a child that
+  answers `101 Switching Protocols` anyway has its response refused.
+- So a model server whose API is WebSocket-first — text-generation-webui's
+  streaming socket, koboldcpp's — cannot be driven through a `server_agent`
+  application. Its HTTP/JSON endpoints work; its socket endpoints answer 404.
+  This is a deliberate limitation, not an oversight: the router owns a write
+  deadline and a per-request in-flight count for every proxied request, and a
+  long-lived tunnel is by definition outside both, so supporting one would need
+  its own design (an in-flight model for long-lived connections, an idle-based
+  deadline, and a drain that can close them) rather than an added upgrade path.
+- Request bodies are read fully before routing, capped at **32 MiB**; beyond
+  that the answer is `413 runtime.request_too_large`. Responses are never
+  buffered — every write is flushed straight through, streaming or not.
+
 Set `runtime_source: "file"` plus `runtime_config: <path>` to own the launch
 specs locally instead of in the portal. The file uses the identical JSON schema
 the gateway serves; the agent reports the effective document upward with every

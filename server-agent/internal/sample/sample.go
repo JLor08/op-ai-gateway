@@ -167,8 +167,11 @@ type GPU struct {
 // to negotiate agent feature flags). Normalize substitutes it for an
 // absent/empty Capabilities, so every producer of this field agrees on the
 // same bytes instead of each keeping its own json.RawMessage(`{}`) literal.
-// (internal/agent's own capabilitiesJSON does NOT fall back to this value:
-// it panics at package init instead. Fix round 1, M4: the reason is NOT
+// (internal/agent does NOT fall back to this value for its own capabilities
+// blob: mustMarshalCapabilities panics, at package init, and capabilitiesJSON
+// then only ever copies the bytes that init produced -- capabilitiesJSON
+// itself neither marshals nor panics (fix round 2, G4, correcting this
+// parenthesis's attribution). Fix round 1, M4: the reason is NOT
 // that "{}" would deactivate runtime_manager gateway-side -- it would not,
 // the agent gates on the gateway's declared list and the config poll path
 // is not gated at all -- but that "{}" silently costs WebSocket push

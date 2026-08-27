@@ -144,13 +144,13 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 
 ## Agent (`OP_AGENT_*`)
 
-Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) and JSON config-file key (snake_case, e.g. `gateway_url`), all with the same precedence: flag > env > file > default. Two exceptions, marked in the table: `OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are list-valued and have no flag form (env, comma-separated, > file > default).
+Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) and JSON config-file key (snake_case, e.g. `gateway_url`), all with the same precedence: flag > env > file > default. Three exceptions, all marked in the table: `OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are list-valued and have **no flag form** (env, comma-separated, > file > default); `OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key**, necessarily — it is what names the file to read.
 
 | Variable | Type | Purpose | Default |
 |---|---|---|---|
 | `OP_AGENT_GATEWAY_URL` | string, required | Gateway base URL (must be an absolute `http://`/`https://` URL) | — (startup error if empty) |
 | `OP_AGENT_TOKEN` | string, required | Per-server agent bearer token issued by the portal | — (startup error if empty) |
-| `OP_AGENT_CONFIG` | string | Path to the optional JSON config file; unset → `server-agent.json` next to the binary | `` |
+| `OP_AGENT_CONFIG` | string (**no config-file key**) | Path to the optional JSON config file; unset → `server-agent.json` next to the binary | `` |
 | `OP_AGENT_INTERVAL` | duration (floor 250ms) | Telemetry collection cadence | `1s` |
 | `OP_AGENT_SYSTEM_REPORT_INTERVAL` | duration (floor 1m) | Cadence at which the POST transport re-sends the static hardware inventory (self-heals a gateway restart); the WebSocket transport also re-sends on every reconnect | `30m` |
 | `OP_AGENT_TRANSPORT` | string enum | Telemetry transport: `post` (one HTTP POST per sample) or `websocket` (one persistent connection) | `websocket` (resolved when unset — see [Configuration](../cross-cutting/configuration.md#2-sensible-defaults)) |

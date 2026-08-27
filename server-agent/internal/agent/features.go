@@ -86,11 +86,17 @@ func FeatureNames() []string {
 //     gatewayAgentFeatures, served by handleAgentFeatures) -- never against
 //     whatever the gateway derived from this blob. The config POLL path
 //     (handleAgentRuntimeConfig's GET) is not feature-gated at all.
-//   - Push immediacy is lost. The gateway's derived per-agent feature set
-//     has exactly ONE consumer: PushRuntimeConfig's fail-closed gate
+//   - Push immediacy is lost. The gateway's agentFeaturesRegistry
+//     (s.AgentFeatures, fed by agent_ingest.go's parseAgentCapabilities) has
+//     exactly ONE consumer: PushRuntimeConfig's fail-closed gate
 //     (agent_runtime.go, s.AgentFeatures.Has(serverID, "runtime_manager")).
 //     So a portal spec edit no longer reaches the agent over its open
-//     WebSocket; it arrives on the agent's next poll instead.
+//     WebSocket; it arrives on the agent's next poll instead. Named as the
+//     REGISTRY, not as "the derived feature set" (fix round 2, G4): the
+//     gateway derives a per-agent feature list from this same blob a second,
+//     independent time, with its own consumer -- which is precisely what the
+//     next bullet describes, so the loose phrasing made the two contradict
+//     each other.
 //   - The portal MISATTRIBUTES an unrelated fault. The report DTO's
 //     agent_features would be [] (portal/service_runtime.go's
 //     parseRuntimeReportAgentFeatures), and RuntimeAdminSection's

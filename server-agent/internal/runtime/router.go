@@ -436,11 +436,29 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	// upgrade-shaped client request reaches the child as an upgrade request.
 	// The router cannot honour a switch (it buffers request bodies to route on
 	// `model`, and deadlineWriter.Hijack refuses), so a child that switched
-	// would be abandoned mid-protocol -- and on ReverseProxy's non-Hijacker
-	// path the upstream 101's body, i.e. the raw child connection, is never
-	// closed, leaking it until the child or the OS gives up. Not offering the
-	// switch means no child ever gets into that state. Also the same posture
-	// as the streaming path, which strips both headers via hopByHopHeaders.
+	// would be abandoned mid-protocol. Also the same posture as the streaming
+	// path, which strips both headers via hopByHopHeaders.
+	//
+	// What the strip does NOT do is stop the raw child connection from leaking
+	// (fix round 2, G3 -- this comment previously offered exactly that as one
+	// of its benefits, and it is false). EVERY early return in
+	// handleUpgradeResponse sits ahead of ReverseProxy's own
+	// `defer res.Body.Close()` (reverseproxy.go:605, past the 101 branch at
+	// 574-579), so whichever branch a 101 leaves through, the upstream body --
+	// i.e. the raw connection to the child -- is never closed. The strip only
+	// changes WHICH branch: from Hijack's ErrNotSupported refusal (see
+	// deadlineWriter.Hijack above) to the EqualFold mismatch at
+	// reverseproxy.go:827-829. A child answering 101 unsolicited still leaks
+	// its connection until the child or the OS gives up.
+	//
+	// The trade is deliberate and it is the right one. What the strip buys is
+	// that the router never ASKS for the state it cannot honour: without it an
+	// ordinary upgrade-shaped client request (websocket headers plus a JSON
+	// body naming a model) made a COMPLIANT child switch protocols and then be
+	// abandoned, so the leak was reachable from client traffic; with it, only a
+	// child that switches protocols nobody offered can reach it at all. One
+	// leaked TCP connection to a local child process, in exchange for never
+	// abandoning one mid-protocol.
 	//
 	// With this in place ReverseProxy can no longer reach a hijack through its
 	// 101 path at all, and the two halves of the fix should not be mistaken
