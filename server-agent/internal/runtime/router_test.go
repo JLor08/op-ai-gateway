@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -947,6 +948,7 @@ func TestRouterReleaseCalledExactlyOnce(t *testing.T) {
 type fakeDeadlineWriter struct {
 	header       http.Header
 	code         int
+	body         bytes.Buffer
 	deadlineSets atomic.Int32
 }
 
@@ -957,7 +959,7 @@ func (f *fakeDeadlineWriter) Header() http.Header {
 	return f.header
 }
 
-func (f *fakeDeadlineWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (f *fakeDeadlineWriter) Write(p []byte) (int, error) { return f.body.Write(p) }
 func (f *fakeDeadlineWriter) WriteHeader(code int)        { f.code = code }
 func (f *fakeDeadlineWriter) Flush()                      {}
 func (f *fakeDeadlineWriter) SetWriteDeadline(time.Time) error {
@@ -1029,5 +1031,75 @@ func TestRouterControlPathsRequireGET(t *testing.T) {
 	rt.ServeHTTP(w, req)
 	if w.Code == http.StatusOK {
 		t.Errorf("POST /health status = %d, want it to fall through to the model-routed proxy (brief specifies GET), not the always-200 treatment", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B7: deadlineWriter / writeSSEError robustness. All three properties below
+// were inert under the router's CURRENT control flow and latent under
+// refactoring; each test asserts the property of the unit itself, not of the
+// call site that happens to make it moot today.
+// ---------------------------------------------------------------------------
+
+// TestWriteSSEErrorArmsItsOwnWriteDeadline proves writeSSEError does not
+// depend on the caller having just refreshed a deadline. It is only ever
+// reached once 200 is committed, and commit() does refresh -- but that is a
+// coincidence of the current control flow, and a refactor decoupling the two
+// would leave the request's LAST write unbounded, pinning the copying
+// goroutine (and the deferred release() with it) on a stalled reader.
+func TestWriteSSEErrorArmsItsOwnWriteDeadline(t *testing.T) {
+	fw := &fakeDeadlineWriter{}
+	writeSSEError(fw, fw, ErrStartFailed)
+
+	if n := fw.deadlineSets.Load(); n < 1 {
+		t.Fatalf("SetWriteDeadline called %d times, want at least 1 -- writeSSEError must arm its own write deadline instead of inheriting whatever the caller happened to leave behind", n)
+	}
+	if fw.body.String() == "" {
+		t.Fatal("writeSSEError wrote nothing")
+	}
+	if !strings.Contains(fw.body.String(), "runtime.start_failed") {
+		t.Errorf("writeSSEError body = %q, want the stable sentinel code", fw.body.String())
+	}
+}
+
+// TestDeadlineWriterFlushRefreshesDeadline proves deadlineWriter.Flush arms
+// a deadline itself rather than relying on httputil.ReverseProxy's
+// maxLatencyWriter always calling Write immediately before Flush. That is
+// true of today's ReverseProxy internals, not of this wrapper -- and Flush
+// is where the bytes actually leave for the client.
+func TestDeadlineWriterFlushRefreshesDeadline(t *testing.T) {
+	fw := &fakeDeadlineWriter{}
+	deadlineWriter{fw}.Flush()
+
+	if n := fw.deadlineSets.Load(); n < 1 {
+		t.Fatalf("SetWriteDeadline called %d times after a bare Flush() with no preceding Write, want at least 1 -- a flush that blocks on a stalled reader with no deadline armed is the unbounded hang deadlineWriter exists to prevent", n)
+	}
+}
+
+// TestDeadlineWriterUnwrapReachesTheRealWriter proves the Unwrap()
+// convention (gateway/backend/internal/gateway/server.go's
+// accessLogResponseWriter) is honoured: http.ResponseController must be able
+// to reach the wrapped writer THROUGH the wrapper. Without Unwrap,
+// deadlineWriter only promotes Header/Write/WriteHeader from the embedded
+// interface, so a controller built over it returns ErrNotSupported and every
+// optional capability of the real connection is silently lost.
+func TestDeadlineWriterUnwrapReachesTheRealWriter(t *testing.T) {
+	fw := &fakeDeadlineWriter{}
+	if err := http.NewResponseController(deadlineWriter{fw}).SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline through a deadlineWriter = %v, want nil -- deadlineWriter needs Unwrap() so http.ResponseController can reach the real writer", err)
+	}
+	if n := fw.deadlineSets.Load(); n != 1 {
+		t.Fatalf("the wrapped writer saw %d SetWriteDeadline calls, want exactly 1 (the controller reached it through Unwrap)", n)
+	}
+}
+
+// TestDeadlineWriterDoesNotForwardReadFrom is the counter-guard to Unwrap:
+// io.ReaderFrom must stay UNforwarded. Promoting ReadFrom would let io.Copy
+// bypass Write entirely -- and with it the per-write deadline refresh that is
+// this wrapper's entire purpose.
+func TestDeadlineWriterDoesNotForwardReadFrom(t *testing.T) {
+	var w http.ResponseWriter = deadlineWriter{&fakeDeadlineWriter{}}
+	if _, ok := w.(io.ReaderFrom); ok {
+		t.Fatal("deadlineWriter implements io.ReaderFrom; io.Copy would then bypass Write and skip the write-deadline refresh this wrapper exists for")
 	}
 }

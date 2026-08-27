@@ -147,10 +147,40 @@ func (dw deadlineWriter) Write(p []byte) (int, error) {
 	return dw.ResponseWriter.Write(p)
 }
 
+// Flush refreshes the write deadline before flushing, rather than relying on
+// a Write having just happened. httputil.ReverseProxy's maxLatencyWriter
+// currently always calls Write immediately before Flush under
+// FlushInterval:-1, so the refresh in Write does cover today's only caller
+// -- but that is a property of ReverseProxy's internals, not of this type,
+// and Flush is where the bytes actually leave for the client. A flush that
+// blocks on a stalled reader with no deadline armed is the unbounded hang
+// this wrapper exists to prevent, so it arms one itself.
 func (dw deadlineWriter) Flush() {
+	refreshWriteDeadline(dw.ResponseWriter)
 	if f, ok := dw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Unwrap exposes the wrapped writer, the codebase-wide convention for a
+// ResponseWriter wrapper (gateway/backend/internal/gateway/server.go's
+// accessLogResponseWriter). It is what lets http.NewResponseController
+// reach through this wrapper to the real connection -- so a future caller
+// that hands a deadlineWriter (rather than the bare w) to a
+// ResponseController still gets working deadline/flush control instead of
+// http.ErrNotSupported.
+//
+// Deliberately NOT forwarded: io.ReaderFrom. Promoting ReadFrom would let
+// io.Copy bypass Write entirely and with it the deadline refresh that is
+// this type's whole purpose -- the opposite of robustness. http.Hijacker is
+// likewise left unforwarded: a hijacked connection has no ResponseWriter
+// write path left for a deadline to bound, and nothing on the router's
+// paths hijacks. (Anything reached through Unwrap, including
+// ResponseController's own Flush, is by definition outside the
+// Write-refresh discipline; callers wanting the deadline must go through
+// Write/Flush above.)
+func (dw deadlineWriter) Unwrap() http.ResponseWriter {
+	return dw.ResponseWriter
 }
 
 // hopByHopHeaders are stripped from the outbound request the router builds
@@ -642,12 +672,25 @@ func writeHeartbeat(w http.ResponseWriter, flusher http.Flusher) {
 // doc's ACCEPTED TRADE-OFF section: the same stable §6.5 code the
 // non-streaming path would have used for err, carried in-stream since the
 // HTTP status was already committed.
+//
+// It arms its own write deadline (I5) instead of relying on the caller
+// having just refreshed one. Today every reachable call site does happen to
+// leave a fresh deadline behind -- writeSSEError only runs once committed is
+// true, and commit() refreshes before writing the headers -- but that is a
+// coincidence of the current control flow, not a property of this function.
+// A refactor that decouples the commit from the failure path (or one that
+// lets a long silent phase elapse between them) would reintroduce exactly
+// the unbounded hang the deadline exists to prevent, on the very last write
+// of a request: a stalled reader would pin this goroutine and the deferred
+// release() with it, making the spec un-evictable. One line here removes
+// that dependency permanently.
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, err error) {
 	code, _ := sentinelCode(err)
 	payload, marshalErr := json.Marshal(errorEnvelope{Error: errorBody{Code: code, Message: err.Error()}})
 	if marshalErr != nil {
 		return // cannot happen for this static shape; nothing sensible to do if it somehow did
 	}
+	refreshWriteDeadline(w) // I5: about to write; never inherit whatever deadline the caller happened to leave
 	if _, werr := fmt.Fprintf(w, "data: %s\n\n", payload); werr != nil {
 		return
 	}
