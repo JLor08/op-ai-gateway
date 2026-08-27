@@ -316,11 +316,16 @@ export type HardwareReport = {
   bios: HardwareBIOS;
   gpus: HardwareGPU[];
 };
+// `report` is `| null` as well as optional for the same reason as
+// RuntimeReport.report (api/runtime.ts): `report,omitempty` on a
+// `json.RawMessage` only omits an EMPTY blob, and hardware_endpoints.go writes
+// an empty stored ReportJSON out as the JSON literal `null`. Absent, `null`
+// and an object are all on the wire.
 export type HardwareResponse = {
   available: boolean;
   collected_at?: string;
   updated_at?: string;
-  report?: HardwareReport;
+  report?: HardwareReport | null;
 };
 
 // A gateway model one specific server offers (see api.serverModels), used to

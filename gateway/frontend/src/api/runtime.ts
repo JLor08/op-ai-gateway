@@ -126,11 +126,19 @@ export interface RuntimeReportContent {
 // row regardless of whether a runtime report was ever stored (so a
 // feature-mismatch banner needs no new endpoint) and are always present
 // (never omitted), unlike the report-derived fields.
+//
+// `report` is `| null` as well as optional, and that is not defensive padding:
+// `report,omitempty` on a `json.RawMessage` omits the field only when the blob
+// is EMPTY, and the builder never leaves it empty on an existing row -- an
+// empty stored ReportJSON is written out as the JSON literal `null`
+// (service_runtime.go's ServerRuntimeReportView). So all three of absent,
+// `null` and an object are on the wire, and a type naming only two of them is
+// a lie the `?.` at every read site silently covers for.
 export interface RuntimeReport {
   available: boolean;
   collected_at?: string;
   updated_at?: string;
-  report?: RuntimeReportContent;
+  report?: RuntimeReportContent | null;
   agent_version: string;
   agent_features: string[];
 }
