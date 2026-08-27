@@ -1305,6 +1305,25 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	// exactly as the drain intends. Queued waiters stay queued and are woken
 	// by wakeAllPendingWaiters once the process is gone -- a drain-then-start,
 	// which is what a request for a spec being drained should get.
+	if c.ok {
+		// Recorded BEFORE the draining discard below (fix round 1, M6):
+		// everHealthy is a fact about this PROCESS -- "this generation passed a
+		// health probe" (see its own field comment; I4 turns on exactly that
+		// distinction from the display state) -- so a result whose state
+		// transitions are discarded must still leave the fact true. Discarding
+		// it too would leave a generation that WAS healthy classified, on a
+		// non-intentional exit, as "exited before becoming healthy".
+		//
+		// No reachable behavior depends on this today, and no test can
+		// therefore fail on it: a discarded ok result implies the generation
+		// never reached StateRunning, hence st.inFlight == 0 (only the Running
+		// fast path and succeedPending increment it), hence beginDrain
+		// terminated it at once and set intentionalStop -- and wasHealthy is
+		// only ever read on the NON-intentional branch. That is a chain of
+		// four other invariants; the field is cheaper to keep honest than the
+		// chain is to keep verified.
+		c.proc.everHealthy = true
+	}
 	if st.state == StateDraining {
 		slog.Debug("runtime: discarding start result for a draining generation", "spec", c.specID, "ok", c.ok)
 		return
@@ -1324,8 +1343,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// unreachable dead code. failures now resets ONLY via
 		// handleStableRun, after a run has been stable for
 		// stableRunThreshold.
-		proc := c.proc
-		proc.everHealthy = true
+		proc := c.proc // everHealthy is already set above, ahead of the draining discard
 		proc.stableTimer = o.m.scheduleAfter(stableRunThreshold, func() {
 			o.m.postCmd(cmdStableRun{specID: c.specID, proc: proc})
 		})
@@ -1398,23 +1416,59 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	slog.Info("runtime: process exited", "spec", st.spec.ID, "intentional", wasIntentional, "exit_code", extractExitCode(exitErr))
 
+	// A spec deleted from the config is dropped on this exit however the
+	// process happened to die -- being removed is a property of the SPEC, not
+	// of the exit's intent.
+	//
+	// M7 fix (fix round 1, and PRE-EXISTING rather than a defect of this
+	// batch): this block used to sit inside the wasIntentional branch below,
+	// so a removed spec whose child died on its own instead of being signalled
+	// fell through to the crash classification and was never deleted -- it
+	// kept appearing in Status() and telemetry, entered a crash-loop backoff,
+	// and if pinned was RESTARTED by handleBackoffFire, for a spec the
+	// operator had deleted. Reached without exotic timing: a removal while a
+	// request is in flight drains via the drainGrace path, which does not set
+	// intentionalStop (only terminateNow does, and it has not run yet), so a
+	// child that crashes in that window is a non-intentional exit. The next
+	// Apply cleaned it up (its removal loop deletes any absent spec once
+	// st.proc is nil), which is why this only ever showed up as a spec that
+	// lingered for one config-poll interval.
+	//
+	// No recordFailure and no state transition: the spec is about to cease to
+	// exist, so there is nowhere for either to be read from.
+	//
+	// C2 fix: resolve any queued waiter before dropping the spec -- otherwise
+	// it (and even its own admission_wait_timeout, since handleWaiterTimeout
+	// is itself a no-op once the spec is gone) would never be resolved at all.
+	if removed {
+		o.failPending(st, ErrModelNotManaged)
+		delete(o.specs, st.spec.ID)
+		o.wakeAllPendingWaiters()
+		return
+	}
+
 	if wasIntentional {
-		if removed {
-			// C2 fix: resolve any queued waiter before dropping the spec --
-			// otherwise it (and even its own admission_wait_timeout, since
-			// handleWaiterTimeout is itself a no-op once the spec is gone)
-			// would never be resolved at all.
-			o.failPending(st, ErrModelNotManaged)
-			delete(o.specs, st.spec.ID)
-			o.wakeAllPendingWaiters()
-			return
-		}
-		if deferredBackoff {
+		if deferredBackoff && st.spec.AdminState != "force_stopped" {
 			// The failure was already recorded (handleStartResult's
 			// start-timeout path); this generation was merely still alive
 			// then. Now that it is gone, start the crash-loop wait -- so the
 			// delay bounds the interval between ATTEMPTS, which is what a
 			// rate limit has to mean.
+			//
+			// ... except for a spec the OPERATOR stopped (fix round 1, M3).
+			// This branch used to precede the Draining->Stopped normalization
+			// unconditionally, so a force-stop landing on a spec whose start
+			// had just timed out reported "backoff" -- design spec §7's
+			// crash-loop WAIT -- for up to backoffCap (60s by default) on a
+			// spec the operator had explicitly stopped, in the portal's live
+			// status table. The wait was also a fiction: when the timer fired,
+			// handleBackoffFire's admitAndStart refused to start a
+			// force_stopped spec, so no retry was ever coming. The deferred
+			// backoff is therefore DROPPED (never entered, no timer) and the
+			// fall-through below rests the spec at Stopped. Deliberately not
+			// hoisted into enterBackoff: a force_stopped spec whose child
+			// CRASHES on its way out is still a crash (I4), and the guard
+			// there would erase that from the status table.
 			o.enterBackoff(st)
 			o.wakeAllPendingWaiters()
 			return
@@ -1477,6 +1531,14 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 // happened whenever the process finally exited instead. Deferring to
 // onProcExited keeps the spec in the honest StateStartFailed until the
 // process is genuinely gone, then starts the delay from there.
+//
+// NOT a precondition here: st.spec.AdminState == "force_stopped". A
+// force-stopped spec must not sit in a crash-loop wait either (fix round 1,
+// M3), but that belongs to the ONE caller whose exit is a deliberate stop --
+// onProcExited's deferred branch -- and not to this function: a force_stopped
+// spec whose child CRASHES on its way out is still a crash (I4), and
+// short-circuiting it here would report "stopped" for it and erase that from
+// the status table.
 func (o *owner) enterBackoff(st *specState) {
 	if o.closing {
 		o.setState(st, StateStopped)

@@ -168,9 +168,13 @@ type GPU struct {
 // absent/empty Capabilities, so every producer of this field agrees on the
 // same bytes instead of each keeping its own json.RawMessage(`{}`) literal.
 // (internal/agent's own capabilitiesJSON does NOT fall back to this value:
-// it panics at package init instead, because a silent "{}" there would
-// declare no features and deactivate runtime_manager gateway-side -- see
-// its comment.)
+// it panics at package init instead. Fix round 1, M4: the reason is NOT
+// that "{}" would deactivate runtime_manager gateway-side -- it would not,
+// the agent gates on the gateway's declared list and the config poll path
+// is not gated at all -- but that "{}" silently costs WebSocket push
+// immediacy for portal spec edits and makes the portal's
+// feature-mismatch banner blame a current agent for an unrelated silent
+// runtime. See mustMarshalCapabilities' comment for the full trace.)
 //
 // A FUNCTION, not a package-level var: json.RawMessage is a []byte under
 // the hood, so a single shared package-level slice would let any future

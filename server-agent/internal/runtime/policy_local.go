@@ -105,8 +105,13 @@ func (p LocalPolicy) Permit(spec Spec) error {
 //
 // SYMLINKS ARE DELIBERATELY NOT RESOLVED -- accepted residual risk, recorded
 // here so the next reader does not have to rediscover the reasoning (Task 13
-// decision; catalogued in docs/architecture/11-risks-and-technical-debt.md
-// §11.4 alongside the other deliberate acceptances).
+// decision; stated operator-side in server-agent/README.md's
+// runtime_allowed_dirs entry, which points back at this comment). Fix round
+// 1, M5: this used to claim the acceptance was "catalogued in
+// docs/architecture/11-risks-and-technical-debt.md §11.4". That section is
+// real but has no such entry -- the architecture docs carry no
+// runtime-manager content yet at all -- so the citation was a false trail.
+// Cite something that exists, or nothing.
 //
 // The gap: a symlink at, or under, an allowed dir can point outside it, so a
 // spec whose work_dir passes this lexical check can still give the child a

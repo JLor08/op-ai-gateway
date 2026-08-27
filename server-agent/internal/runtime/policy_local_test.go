@@ -224,7 +224,7 @@ func TestPermitDoesNotResolveSymlinksAcceptedResidualRisk(t *testing.T) {
 
 	p := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{allowed}}
 	if err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: escape}); err != nil {
-		t.Fatalf("Permit(work_dir=%q, a symlink out of the allowed dir) = %v, want nil -- containment is lexical BY DESIGN (see withinDir's doc comment: EvalSymlinks would introduce a TOCTOU window, and AllowedBinaries, not work_dir, is the boundary). If this failure is intentional, update withinDir's comment and §11.4 together with it.", escape, err)
+		t.Fatalf("Permit(work_dir=%q, a symlink out of the allowed dir) = %v, want nil -- containment is lexical BY DESIGN (see withinDir's doc comment: EvalSymlinks would introduce a TOCTOU window, and AllowedBinaries, not work_dir, is the boundary). If this failure is intentional, update withinDir's comment and the README's runtime_allowed_dirs entry together with it.", escape, err)
 	}
 }
 

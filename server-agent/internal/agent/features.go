@@ -73,10 +73,32 @@ func FeatureNames() []string {
 // mustMarshalCapabilities PANICS instead of falling back to a "{}"
 // literal. json.Marshal cannot fail for a struct holding nothing but a
 // []string, so the old fallback branch was both unreachable and untestable
-// -- and it was the wrong fallback anyway: shipping "{}" would silently
-// declare no features at all, which on the gateway side deactivates
-// runtime_manager and stops every managed model process, explained only by
-// one log line. Panicking at package init instead runs on every process
+// -- and it was the wrong fallback anyway. What shipping "{}" actually
+// costs, traced end to end (fix round 1, M4 -- this comment previously
+// claimed it "deactivates runtime_manager and stops every managed model
+// process", which is FALSE and is exactly the kind of load-bearing,
+// compiler-uncheckable cross-module claim a maintainer would consult
+// here):
+//
+//   - Managed processes keep running. The agent's own gate is
+//     runtime.Driver.featureActive, which matches against the GATEWAY's
+//     declared list (gateway/backend/internal/gateway/agent_features.go's
+//     gatewayAgentFeatures, served by handleAgentFeatures) -- never against
+//     whatever the gateway derived from this blob. The config POLL path
+//     (handleAgentRuntimeConfig's GET) is not feature-gated at all.
+//   - Push immediacy is lost. The gateway's derived per-agent feature set
+//     has exactly ONE consumer: PushRuntimeConfig's fail-closed gate
+//     (agent_runtime.go, s.AgentFeatures.Has(serverID, "runtime_manager")).
+//     So a portal spec edit no longer reaches the agent over its open
+//     WebSocket; it arrives on the agent's next poll instead.
+//   - The portal MISATTRIBUTES an unrelated fault. The report DTO's
+//     agent_features would be [] (portal/service_runtime.go's
+//     parseRuntimeReportAgentFeatures), and RuntimeAdminSection's
+//     featureMismatch banner fires for any silent runtime on a server whose
+//     agent IS active -- telling the operator to update an agent that is
+//     current, about a silence with some other cause entirely.
+//
+// Panicking at package init instead runs on every process
 // start and in every test binary that touches this package, so a future
 // edit that ever makes this payload unmarshalable (a channel, a func, a
 // NaN float) fails immediately, loudly, and identically everywhere,

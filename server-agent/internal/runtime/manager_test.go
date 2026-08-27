@@ -1748,3 +1748,128 @@ func TestManagerAdmissionWaitStillBoundsARequestQueuedWhileDraining(t *testing.T
 		t.Fatalf("EnsureRunning returned ErrAdmissionBlocked after %s, want ~1s (the configured admission_wait_timeout_seconds) -- the bound fired for some other reason than its own timer", elapsed)
 	}
 }
+
+// setBackoffWindow overrides backoffBase/backoffCap AFTER shrinkTimings (whose
+// t.Cleanup restores the originals) and BEFORE the Manager is created, per
+// shrinkTimings' documented ordering rule -- the setKillGrace pattern, for the
+// two vars a test needs to WIDEN rather than shrink: shrinkTimings' 60ms base
+// is far too short to observe a backoff state at all.
+func setBackoffWindow(t *testing.T, d time.Duration) {
+	t.Helper()
+	origBase, origCap := backoffBase, backoffCap
+	backoffBase, backoffCap = d, d
+	t.Cleanup(func() { backoffBase, backoffCap = origBase, origCap })
+}
+
+// TestManagerRestsAtStoppedAfterAForceStopWithADeferredBackoff is fix round
+// 1's M3, and it belongs to
+// TestManagerNeverReportsBackoffWhileItsProcessIsStillAlive's family: the same
+// invariant (a resting status must not contradict what the manager actually
+// did), in a different interleaving.
+//
+// B6's fix #2 deferred a backoff entered while the process was still alive to
+// onProcExited -- correctly, so the delay bounds the interval between
+// ATTEMPTS. But it put that deferred branch AHEAD of the Draining->Stopped
+// normalization, so it also claims the exits that were not failures at all.
+// After an operator force-stops a spec whose start had timed out, the portal's
+// live status table shows "backoff" -- design spec §7's crash-loop WAIT --
+// for up to backoffCap (60s with production defaults) on a spec the operator
+// explicitly stopped, and the wait is a fiction on top of being a
+// contradiction: when the timer fires, handleBackoffFire's admitAndStart
+// refuses to start a force_stopped spec, so no retry was ever coming.
+//
+// Pinned only to start the spec without a request goroutine; unlike the
+// sibling test above, a restart cannot confuse this one, because
+// admitAndStart never starts a force_stopped spec.
+func TestManagerRestsAtStoppedAfterAForceStopWithADeferredBackoff(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setKillGrace(t, 2*time.Second)     // the window in which the force-stop lands
+	setBackoffWindow(t, 3*time.Second) // long enough for a wrong "backoff" to be observable
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.Args = stubArgsStubborn(30 * time.Second) // health never arrives -> start timeout
+	spec.StartupTimeoutSeconds = 1
+	spec.AdmissionWaitTimeoutSeconds = 0
+	m.Apply(Config{Specs: []Spec{spec}})
+	waitUntilChildIsServing(t, m, "spec-a")
+
+	// The start timeout: recordFailure, terminateNow (the child ignores
+	// SIGTERM, so it lives until killGrace elapses) and a backoff DEFERRED
+	// because st.proc is still non-nil.
+	waitUntil(t, 4*time.Second, "spec-a's start timeout is recorded", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.LastError != nil
+	})
+
+	// The operator stops it, while that deferred backoff is still pending.
+	forced := spec
+	forced.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{forced}})
+	waitUntil(t, 2*time.Second, "spec-a is Draining after the force-stop", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateDraining
+	})
+
+	// SIGKILL ends it. Status() is answered on the owner goroutine, the same
+	// goroutine that runs onProcExited, so the first snapshot with no PID
+	// already carries the final post-exit state -- there is no intermediate
+	// value to race with.
+	waitUntil(t, 4*time.Second, "spec-a's process is gone", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.PID == 0
+	})
+	if st := statusFor(m, "spec-a"); st.State != StateStopped {
+		t.Fatalf("Status()[spec-a].State = %v right after the force-stopped spec's process exited, want %v -- BUG: onProcExited's deferred-backoff branch precedes the Draining->Stopped normalization, so the portal reports a crash-loop wait for up to backoffCap on a spec the OPERATOR stopped, and no retry is coming (admitAndStart refuses a force_stopped spec)", st.State, StateStopped)
+	}
+}
+
+// TestManagerDeletesARemovedSpecWhoseChildDiesUnintentionally is fix round 1's
+// M7, and it is PRE-EXISTING (not a defect of this batch). onProcExited reads
+// st.removed but only acts on it inside the wasIntentional branch, so a spec
+// deleted from the config whose child then dies on its own -- rather than
+// being signalled -- is never dropped from o.specs.
+//
+// Reached without any exotic timing, the same interleaving
+// TestManagerCloseDoesNotWaitOutACrashBackoff uses: a removal while a request
+// is in flight drains via the drainGrace path, which does NOT set
+// intentionalStop (only terminateNow does, and it has not run yet), so a child
+// that crashes in that window lands as a NON-intentional exit.
+//
+// The spec then keeps appearing in Status() and enters a crash-loop backoff --
+// and if it was pinned, handleBackoffFire restarts a model process for a spec
+// the operator deleted. It self-heals on the NEXT Apply (the removal loop
+// deletes it once st.proc is nil), so the damage is bounded by the config poll
+// interval; this test therefore issues no second Apply.
+func TestManagerDeletesARemovedSpecWhoseChildDiesUnintentionally(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origDrain := drainGrace
+	drainGrace = 3 * time.Second // long enough that the scripted crash lands first
+	t.Cleanup(func() { drainGrace = origDrain })
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 500*time.Millisecond, 9, "") // healthy at once, crashes at ~500ms
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := m.EnsureRunning(ctx, "model-a"); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	// Deliberately NOT released: InFlight stays 1, so the removal below drains
+	// via drainGrace and never marks intentionalStop before the crash.
+
+	m.Apply(Config{}) // spec-a is gone from the config
+	waitUntil(t, 2*time.Second, "spec-a is Draining after its removal", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateDraining
+	})
+
+	waitUntil(t, 3*time.Second, "spec-a is gone from Status() after its child crashed mid-drain -- BUG: onProcExited only honours st.removed on the intentional branch, so a removed spec whose child dies on its own is never deleted; it keeps being reported and enters a crash-loop backoff (and a pinned one is restarted) until the next Apply happens to clean it up", func() bool {
+		return statusFor(m, "spec-a") == nil
+	})
+}
