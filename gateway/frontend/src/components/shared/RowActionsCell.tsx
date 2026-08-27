@@ -34,6 +34,11 @@ export function RowActionsCell({
             onClick={action.onClick}
             color={action.color}
             disabled={action.disabled}
+            // RowAction.title is documented as "why a disabled action is
+            // disabled". It used to be dropped on this path, so an inline
+            // greyed-out icon had no explanation at all -- and for some tables
+            // a disabled action is the RESTING state, not an edge case.
+            title={action.title}
           />
         ))}
       </Box>

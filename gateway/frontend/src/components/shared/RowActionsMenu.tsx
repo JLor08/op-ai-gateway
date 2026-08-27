@@ -18,9 +18,11 @@ export type RowAction = {
   color?: 'error';
   disabled?: boolean;
   /**
-   * Optional hover tooltip (e.g. why a disabled action is disabled). When set, the
-   * menu item is wrapped in a Tooltip + span so the hint shows even for a disabled
-   * item (a disabled MUI item alone would swallow pointer events).
+   * Optional hover tooltip (e.g. why a disabled action is disabled). Honoured on
+   * BOTH render paths: the menu item is wrapped in a Tooltip + span, and
+   * RowActionsCell forwards it to IconAction on the inline path, which wraps a
+   * disabled button the same way (a disabled MUI control alone would swallow
+   * pointer events and show nothing).
    */
   title?: string;
 };
