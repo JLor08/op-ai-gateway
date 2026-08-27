@@ -538,14 +538,24 @@ func TestHandleAgentDownloadServesConfig(t *testing.T) {
 }
 
 // TestBuildAgentConfigJSONKeySet is a drift guard: the JSONC template is
-// hand-duplicated in THREE places that cannot share code (this Go backend,
-// the frontend's buildServerAgentConfig in AgentTokenSection.tsx, and the
-// standalone server-agent module's config fixture, which this package cannot
-// import since it is a separate Go module). This test pins the EXACT key set
-// buildAgentConfigJSON emits against a maintained expectation list below —
-// adding, removing, or renaming a key here without updating the other two
-// copies fails this test, forcing whoever changes one template to look at all
-// three rather than silently drift.
+// hand-duplicated in FOUR places that cannot share code (two languages, two
+// Go modules) --
+//
+//  1. this Go backend's buildAgentConfigJSON, served over
+//     /api/agent/v1/download/config;
+//  2. the frontend's buildServerAgentConfig in AgentTokenSection.tsx, behind
+//     the download button one row from the curl for copy 1;
+//  3. the standalone server-agent module's config fixture, which defines what
+//     the agent will actually read and which this package cannot import,
+//     being a separate Go module;
+//  4. server-agent/README.md, which documents it for the operator.
+//
+// This test pins the EXACT key set buildAgentConfigJSON emits against a
+// maintained expectation list below. It guards THIS copy only, and cannot see
+// any of the other three: copy 2 has its own equivalent pin (in
+// AgentTokenSection.test.tsx), copies 3 and 4 have none. So adding, removing
+// or renaming a key here fails this test, which is the prompt to go and
+// update the other three by hand -- not a guarantee that they were.
 func TestBuildAgentConfigJSONKeySet(t *testing.T) {
 	raw := buildAgentConfigJSON(agentConfigMaterial{GatewayURL: "https://gw.example"}, "tok")
 	var kept []string

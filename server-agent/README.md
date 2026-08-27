@@ -152,11 +152,13 @@ from this local config — never from the gateway:
 - **`runtime_router_bind`** — where the router port listens. Leaving it empty
   means the agent picks: its own mesh identity if it has one, otherwise **all
   interfaces**, which it warns about at startup. "If it has one" is narrow:
-  the identity is read from the installed mesh leaf in `cert_dir`, so it
-  requires `cert_mode` other than `off` *and* an already-installed
-  certificate — and the portal's generated config ships `cert_mode: "off"`
-  with an empty `cert_dir`, which means the shipped default binds all
-  interfaces. On a host that is not mesh-only, set this explicitly.
+  the identity is read from a loadable mesh leaf in `cert_dir`, and that
+  directory is the *only* thing consulted — `cert_mode` is not, so a
+  `cert_dir` still populated after the mode was set back to `off` does derive
+  an address. The portal's generated config ships `cert_mode: "off"` with an
+  **empty `cert_dir`**, and it is that empty directory, not the mode, that
+  makes the shipped default bind all interfaces. On a host that is not
+  mesh-only, set this explicitly.
 
 `runtime_allowed_dirs` additionally restricts a spec's `work_dir`; it is
 convenience/defence-in-depth, not a boundary (containment is a lexical
@@ -194,6 +196,29 @@ specs locally instead of in the portal. The file uses the identical JSON schema
 the gateway serves; the agent reports the effective document upward with every
 env **value** redacted (keys stay visible) and the portal renders it read-only,
 including hiding start/stop — whoever owns the config owns the operations.
+
+> **Put secrets in `env`, never in `args`.** The upward report masks `env`
+> values only. `args` are **not** masked, and they are reported verbatim —
+> even though `${AGENT_ENV:NAME}` placeholders are expanded in `args` exactly
+> as they are in `env`, so a resolved secret in an argument reaches the
+> gateway in plaintext and is shown to portal admins. This is the wire
+> contract, not a bug, and writing a local `runtime.json` is the only way to
+> create the hazard, which is why it is stated here:
+>
+> ```jsonc
+> // NO -- reaches the gateway unmasked, in the report and in stderr
+> "args": ["--api-key", "hf_realsecret"],
+> "args": ["--api-key", "${AGENT_ENV:HF_TOKEN}"],
+>
+> // YES -- the value is masked in the report
+> "env":  { "HF_TOKEN": "${AGENT_ENV:HF_TOKEN}" },
+> ```
+>
+> The report is not the only upward channel either: on a non-zero exit the
+> tail of the child's own stderr travels up with the telemetry and is shown on
+> the runtime screen, and model servers routinely print their full command
+> line at startup. That is a second reason an argument is the wrong place for
+> a secret, and it applies to portal-authored specs too.
 
 ## Build & run
 
