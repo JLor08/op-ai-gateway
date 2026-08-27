@@ -382,6 +382,12 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		}
 		return ApplicationDTO{}, err
 	}
+	// Best-effort: a new server_agent application IS the agent's router-port
+	// configuration, so tell any connected agent immediately instead of
+	// leaving it to the 60 s poll backstop. No previous type (the row did not
+	// exist). Fired BEFORE reconcileServerPolicy so a slow NetBird round trip
+	// cannot delay the push this fix exists to make prompt.
+	s.notifyRuntimeChangedForApplication(server.ID, "", app.Type)
 	// Best-effort: a new application changes the server's active port set, so its
 	// NetBird access policy (if managed) may need to grow. reconcileServerPolicy
 	// gates internally on the module + policy management and never errors.
@@ -404,6 +410,11 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	if err != nil {
 		return ApplicationDTO{}, err
 	}
+	// Captured before the mutation block below reassigns app.Type: the runtime
+	// notification needs BOTH sides of a retype (see
+	// notifyRuntimeChangedForApplication -- retyping AWAY from server_agent
+	// must notify too).
+	previousType := app.Type
 	// Validate everything that can fail BEFORE mutating the loaded application.
 	var appType, scheme, status, healthCheckPath string
 	var port int
@@ -619,6 +630,13 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		return ApplicationDTO{}, err
 	}
+	// Best-effort: an edit to a server_agent application changes the agent's
+	// runtime config (its Port is router_listen), and retyping one away from
+	// server_agent means the agent must tear that router down. Both directions
+	// notify; so does an edit that touches no runtime-relevant field at all --
+	// see notifyRuntimeChangedForApplication for why over-notifying is the
+	// deliberate choice here.
+	s.notifyRuntimeChangedForApplication(server.ID, previousType, app.Type)
 	// Best-effort: a port/status change may alter the server's active port set, so
 	// its NetBird access policy (if managed) may need to be updated. Gates
 	// internally on the module + policy management and never errors.
@@ -635,6 +653,11 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 	if err := s.routes.DeleteApplication(ctx, app.ID); err != nil {
 		return err
 	}
+	// Best-effort: deleting the server_agent application empties the server's
+	// runtime-config document (AgentRuntimeConfig's "no server_agent
+	// application" case), which the agent must act on by tearing its router
+	// and every managed process down. No current type (the row is gone).
+	s.notifyRuntimeChangedForApplication(server.ID, app.Type, "")
 	// Best-effort: removing an application may drop ports from the server's active
 	// set, so its NetBird access policy (if managed) may need to shrink or be
 	// deleted. server was captured BEFORE the delete; reconcileServerPolicy

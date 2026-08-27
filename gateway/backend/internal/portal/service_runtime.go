@@ -696,6 +696,44 @@ func (s *Service) notifyRuntimeChanged(serverID string) {
 	}
 }
 
+// notifyRuntimeChangedForApplication is notifyRuntimeChanged for the
+// APPLICATION write paths (CreateApplication / UpdateApplication /
+// DeleteApplication in service_applications.go). The application row is a
+// runtime-config input in its own right -- AgentRuntimeConfig derives
+// RouterListen from the server's server_agent application's Port, and keys
+// every mapping/spec/co-residency lookup off that application's id -- so a
+// create, retype or delete changes the document the agent must act on just
+// as much as a runtime-spec write does. Without this the agent only learned
+// about a brand-new server_agent application on its next 60 s poll, which
+// showed up as "the router takes up to a minute to come up" (the app-health
+// probe does not special-case server_agent, so the application reads
+// unhealthy until the router is bound).
+//
+// previousType is the application's type BEFORE the write ("" when it is
+// being created), currentType the type AFTER it ("" when it is being
+// deleted). EITHER side matching routing.ProviderServerAgent notifies:
+// gating on currentType alone would miss retyping an application AWAY from
+// server_agent, which is precisely when the agent must be told to tear its
+// router down and stop managing specs it no longer owns.
+//
+// Deliberately does NOT try to decide whether the write touched a
+// runtime-RELEVANT field: every successful write to a server_agent
+// application notifies, including one that only changes, say, its weight.
+// Over-notifying is cheap and idempotent (the hook is one goroutine; the
+// agent re-fetches and its driver applies only on a real ETag change),
+// whereas a "relevant fields" allow-list is a second copy of
+// AgentRuntimeConfig's derivation that would silently rot the moment that
+// derivation grows a field -- and under-notifying is the actual bug.
+//
+// Best-effort like every other notifyRuntimeChanged call site: it returns no
+// error and must never turn a successful write into a failed request.
+func (s *Service) notifyRuntimeChangedForApplication(serverID, previousType, currentType string) {
+	if previousType != routing.ProviderServerAgent && currentType != routing.ProviderServerAgent {
+		return
+	}
+	s.notifyRuntimeChanged(serverID)
+}
+
 // --- Task 7: agent runtime-config assembly ----------------------------------
 
 // AgentRuntimeSpecGPUDTO is one per-GPU VRAM row inside a runtime-config spec

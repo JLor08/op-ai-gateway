@@ -397,14 +397,29 @@ E2E phase:
 
 Durable facts found while writing Task 23 (for Task 24's docs):
 
-- The runtime-config-changed hook fires ONLY from `PutRuntimeSpec`,
-  `DeleteRuntimeSpec`, `SetCoResidency` and `SetServerGPUBudgets`
-  (`portal/service_runtime.go`'s `notifyRuntimeChanged` call sites). Creating
-  or editing the `server_agent` APPLICATION — the row `router_listen` is
-  derived from — does not notify the agent, so a newly created application (or
-  a changed router port) is picked up only by the agent's 60 s
-  `runtimePollInterval` backstop. Operator-visible as "the router takes up to
-  a minute to come up"; worth documenting, and a candidate follow-up fix.
+- The runtime-config-changed hook fires from seven call sites (all of
+  `notifyRuntimeChanged`): `PutRuntimeSpec`, `DeleteRuntimeSpec`,
+  `SetCoResidency` and `SetServerGPUBudgets` in
+  `portal/service_runtime.go`, plus `CreateApplication`,
+  `UpdateApplication` and `DeleteApplication` in
+  `portal/service_applications.go` — the last three via
+  `notifyRuntimeChangedForApplication(serverID, previousType, currentType)`,
+  which fires when EITHER side of the write is `server_agent` (so retyping an
+  application AWAY from `server_agent` notifies too) and deliberately does not
+  filter on whether the write touched a runtime-relevant field. The
+  application call sites were the Task-23b fix: before them, creating the
+  `server_agent` APPLICATION — the row `router_listen` is derived from — did
+  not notify, so a new application or a changed router port waited for the
+  agent's 60 s `runtimePollInterval` backstop, operator-visible as "the router
+  takes up to a minute to come up" (the app-health probe does not
+  special-case `server_agent`, so the application reads unhealthy for that
+  whole minute). Report:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-23b-notify-report.md`.
+  Still NOT notified, and left for Task 24 to judge: `CreateMapping`/
+  `UpdateMapping`/`DeleteMapping` on a `server_agent` application (a mapping's
+  `gateway_model_name`/`app_model_name` are a spec's `model`/`upstream_model`
+  in the document) and `UpdateServer`'s `RuntimeMaxProcesses` (the document's
+  `max_processes`).
 - With `OP_AGENT_RUNTIME_ALLOWED_DIRS` set, a spec with an EMPTY `work_dir` is
   refused outright (`LocalPolicy.Permit`). Configuring the agent's permitted
   directories therefore makes `work_dir` mandatory on every spec.

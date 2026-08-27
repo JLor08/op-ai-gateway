@@ -545,14 +545,16 @@ test("2 — a spec written in the portal reaches the real agent: its router come
   await setGpuBudget(BUDGET_TIGHT_MB);
 
   // The agent binds its router once a runtime-config carrying a non-zero
-  // router_listen reaches it. NOTE, and it is worth knowing: creating the
-  // `server_agent` APPLICATION does not itself notify the agent — the
-  // runtime-config-changed hook fires only on spec/co-residency/budget writes
-  // (portal/service_runtime.go's notifyRuntimeChanged call sites), so an
-  // application created on its own is picked up by the agent's 60s poll
-  // backstop (agent.runtimePollInterval) rather than pushed. The spec write
-  // above is what pushes here; the timeout below stays generous enough to
-  // cover the poll backstop if a push is ever withheld.
+  // router_listen reaches it. Two writes can deliver that here, and BOTH now
+  // push: creating the `server_agent` APPLICATION in scenario 1 (its Type +
+  // Port are where router_listen comes from) and the spec write above --
+  // portal/service_runtime.go's notifyRuntimeChanged fires for the
+  // application write paths too, not only for spec/co-residency/budget
+  // writes. Which one wins the race is not asserted; the point is that
+  // neither leaves the router waiting on the agent's 60s poll backstop
+  // (agent.runtimePollInterval), which is what the application create used to
+  // do before that gate existed. The timeout below stays generous enough to
+  // cover that backstop anyway, if a push is ever withheld.
   await expect.poll(routerHealthStatus, { timeout: 90000, intervals: [500] }).toBe(200);
 
   // Design §6.1, and the reason a managed server can warm up at all: the
