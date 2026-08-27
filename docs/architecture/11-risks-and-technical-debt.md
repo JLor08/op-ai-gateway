@@ -17,7 +17,7 @@ hidden.
 | **The agent's model-runtime router authenticates nothing, and its shipped default binds all interfaces** | Every managed model on that host is reachable from any interface that can reach the port | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` is the operator's control (mesh IP, or `127.0.0.1`). The empty-value fallback derives a mesh address from the installed leaf certificate, but that requires `cert_mode != off` **and** an installed certificate, and the portal's generated agent config ships `cert_mode: "off"` — so **the shipped default always falls through to all interfaces**, logged at Warn. Set it explicitly. |
 | **A secret placed in a launch spec's `args` reaches the gateway unmasked** | The upward file-mode report masks `env` values only, while placeholder expansion resolves `${AGENT_ENV:NAME}` in `args` too | Reviewed and upheld as spec-correct: the wire contract scopes redaction to `env`. **Operator guidance: put secrets in `env`, never in `args`.** |
 | **`work_dir` containment for managed processes is lexical** — symlinks under an allowed directory can point outside it | A spec could run an allowlisted binary with its working directory effectively outside the permitted tree | Accepted. The security boundary is `runtime_allowed_binaries` (an exact absolute-path match against the agent's own local list), so a gateway-supplied spec cannot choose *what* executes; `work_dir` only decides where an already-allowlisted binary resolves relative paths, and an attacker able to plant symlinks there already has local write access. `filepath.EvalSymlinks` was **rejected deliberately, not overlooked**: it resolves at *check* time while `os/exec` applies the directory at *start* time, so anything able to rewrite the link between those moments defeats the check **while making it look enforced** — strictly worse than an honest lexical check, because it invites treating containment as a boundary. It would also break the legitimate case of an allowed directory that is itself a symlink to a mounted volume. If containment ever has to *be* a boundary, the non-TOCTOU direction is `openat`/`O_NOFOLLOW` resolution plus `fchdir` in the child, which `exec.Cmd.Dir` cannot express portably. |
-| **Windows managed-process stop is kill-only** | On a Windows AI server a stop terminates the child rather than letting it finish in-flight work — there is no graceful-drain equivalent | Accepted for now; the code compiles and looks complete, so the gap is only discoverable by reading the platform file. A real fix needs `CREATE_NEW_PROCESS_GROUP` plus `GenerateConsoleCtrlEvent`. CI only checks that the Windows build compiles. |
+| **Windows managed-process stop is kill-only** | On a Windows AI server a stop terminates the child rather than letting it finish in-flight work — there is no graceful-drain equivalent | Accepted for now; the code compiles and looks complete, so the gap is only discoverable by reading the platform file. A real fix needs `CREATE_NEW_PROCESS_GROUP` plus `GenerateConsoleCtrlEvent`. **Correction: CI does not check this — it compiles nothing for Windows at all** (see §11.3), so `proc_windows.go` is never built there; cross-compile locally with `GOOS=windows GOARCH=amd64 go vet ./...` before changing it. |
 | **Volatile runtime status loses `last_error` on an agent restart** | The last load failure for a managed model is gone after the agent restarts | Honest and documented, not a defect: gateway-side status is deliberately never persisted (a stderr tail can carry prompt fragments, which the capture policy forbids at rest), and a gateway restart self-heals within one ~1 s sample. Only an *agent* restart loses it permanently. |
 | **The runtime report is fetched once per (api, server), with no polling refresh** | A file-mode agent's re-report after a config-file edit is only picked up on a remount or navigation | Deliberate split: the report is navigation-fresh, live status rides the SSE stream. Switching to a polled fetch is a small change if operators need it. |
 | **A pairwise co-residency matrix plus per-GPU arithmetic cannot express every constraint** | Exotic interconnect or bandwidth contention is not modelled | Accepted: the matrix's role is operator *intent*, which covers the known non-VRAM cases (PCIe bandwidth, system RAM, CPU contention) that nobody can compute. |
@@ -66,6 +66,36 @@ hidden.
   the corollary ("no test can fail on this line" is an invitation to delete a
   load-bearing guard) are in
   [Development Tooling & Quality Gates §9](cross-cutting/development-and-quality.md).
+- **CI compiles nothing for Windows**, although the gateway ships `windows-amd64`
+  and `windows-arm64` agent binaries. Every job in `.github/workflows/ci.yml` runs
+  on `ubuntu-latest` with no `GOOS` set, so `proc_windows.go` and every
+  Windows-only behaviour are unbuilt and untested. This document previously
+  claimed the opposite, and that false claim is part of why a whole defect class
+  went unnoticed: **a case-sensitive guard in front of an OS API that is
+  case-insensitive on Windows**. Two shipped —
+  `${AGENT_ENV:op_agent_token}` slipped past the agent's own-namespace refusal
+  because `GetEnvironmentVariableW` resolves case-insensitively, and a spec env
+  key spelled `Path` slipped past the `PATH`/`HOME` reservation and then won
+  `os/exec`'s case-insensitive deduplication. Both are fixed by folding case at
+  the guard, and both are tested on any host via the injectable `getenv` seam.
+  Until CI grows a Windows step, `GOOS=windows GOARCH={amd64,arm64} go vet ./...`
+  is the check, and it belongs in any review that touches path handling,
+  environment variables, filenames, or process control.
+- **"Pre-existing" means present on `main`, never "present at an earlier commit
+  of this branch".** A finding on the agent-managed runtime was dismissed as
+  pre-existing at an intermediate commit of its own feature branch — for a
+  package that does not exist on `main` at all, so nothing about it could be
+  pre-existing. The refutation was sound about the change it examined and wrong
+  about the baseline, and the finding (an unbounded fork-exec loop) survived a
+  further review round because of the label. Verify with
+  `git show main:<path>`, and state the commit you checked.
+- **Concurrency defects need concurrent tests, and a scenario suite that issues
+  its requests sequentially cannot see them.** The same fork-exec loop was
+  reachable from two ordinary inference requests for different models, yet the
+  e2e scenarios that exercise exactly those two models passed, because they issue
+  the two requests one after the other. When a rule is about admission,
+  eviction, locking or generation identity, the covering test has to overlap the
+  requests in time.
 - **`agentFeaturesRegistry` is a `Retain`-pruned per-server registry.** It is in
   `cmd/gateway`'s prune bundle alongside `runtimeStatusRegistry`, and a
   mutation-proof wiring test pins that both sides hold the same instance — but the
