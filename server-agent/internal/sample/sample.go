@@ -165,10 +165,12 @@ type GPU struct {
 // json.RawMessage would otherwise marshal as the literal `null` (a
 // nil-vs-null defect this wire field cannot afford: the gateway parses it
 // to negotiate agent feature flags). Normalize substitutes it for an
-// absent/empty Capabilities; agent.capabilitiesJSON falls back to this exact
-// value on its own (practically impossible) marshal failure, so every
-// producer of this field agrees on the same bytes instead of each keeping
-// its own json.RawMessage(`{}`) literal.
+// absent/empty Capabilities, so every producer of this field agrees on the
+// same bytes instead of each keeping its own json.RawMessage(`{}`) literal.
+// (internal/agent's own capabilitiesJSON does NOT fall back to this value:
+// it panics at package init instead, because a silent "{}" there would
+// declare no features and deactivate runtime_manager gateway-side -- see
+// its comment.)
 //
 // A FUNCTION, not a package-level var: json.RawMessage is a []byte under
 // the hood, so a single shared package-level slice would let any future

@@ -2,8 +2,9 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // This file is the agent-side client for GET /api/agent/v1/features
-// (task-7-report.md): the gateway's declared feature-name set, used to
-// compute internal/agent.ActiveFeatures. It follows the exact same
+// (task-7-report.md): the gateway's declared feature-name set, which
+// Driver.featureActive intersects with this package's own
+// runtimeManagerFeature name. It follows the exact same
 // ETag-conditional-GET discipline as GatewaySource (config_client.go):
 // a transient failure never looks like "the gateway declares nothing" to a
 // caller that only checks the error.
@@ -64,8 +65,8 @@ type featuresResponse struct {
 //   - 304 Not Modified returns the cached set, nil error;
 //   - 404 returns an EMPTY set with a nil error -- an older gateway that
 //     predates this endpoint is not a failure, it is exactly the legacy
-//     agent behavior (internal/agent.ActiveFeatures already treats a nil/
-//     empty gateway set as "no active features").
+//     agent behavior (Driver.featureActive finds no match in a nil/empty
+//     gateway set, so nothing activates).
 func (c *FeaturesClient) Fetch(ctx context.Context) ([]string, error) {
 	c.mu.Lock()
 	knownETag := c.etag

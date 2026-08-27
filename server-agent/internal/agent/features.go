@@ -5,8 +5,6 @@ package agent
 
 import (
 	"encoding/json"
-	"log/slog"
-	"op-ai-server-agent/internal/sample"
 )
 
 // Feature is one named capability this agent binary ships. Behavior gates on
@@ -14,8 +12,18 @@ import (
 // compare: a version gate breaks under forks, backports, and custom builds,
 // while a name states plainly what the binary can actually do. A feature is
 // active only when BOTH this agent and the connected gateway declare its
-// name (see ActiveFeatures); an unknown name on either side is ignored --
-// that is forward compatibility, not an error.
+// name; an unknown name on either side is ignored -- that is forward
+// compatibility, not an error.
+//
+// This side of the negotiation only DECLARES: FeatureNames() rides on every
+// telemetry sample as capabilities.features (capabilitiesJSON below). The
+// intersection itself is computed where the behavior it gates actually
+// lives -- runtime.Driver.featureActive, against runtime.FeaturesClient's
+// fetch of GET /api/agent/v1/features. internal/runtime cannot import this
+// package (internal/agent already imports internal/runtime for the runtime
+// driver seam, so the reverse edge would be an import cycle), which is why
+// runtime declares its own runtimeManagerFeature constant naming the
+// identical string rather than referencing this registry.
 type Feature struct {
 	Name  string // snake_case, unique across Features
 	Since string // SemVer ("x.y.z") at which the feature shipped; must be <= Version
@@ -45,48 +53,56 @@ func FeatureNames() []string {
 	return names
 }
 
-// ActiveFeatures returns the intersection of this agent's Features with the
-// gateway's declared set: a feature is active only when both sides name it.
-// A nil/empty gateway set -- a legacy gateway that predates feature
-// negotiation, or a 404 from GET /api/agent/v1/features -- yields no active
-// features, which is exactly a legacy agent's behavior: unchanged.
-func ActiveFeatures(gateway []string) []string {
-	if len(gateway) == 0 {
-		return nil
-	}
-	declared := make(map[string]bool, len(gateway))
-	for _, name := range gateway {
-		declared[name] = true
-	}
-	var active []string
-	for _, name := range FeatureNames() {
-		if declared[name] {
-			active = append(active, name)
-		}
-	}
-	return active
-}
+// capabilitiesTemplate holds the capabilities object's bytes, marshaled
+// ONCE at package initialization: Features is a compile-time registry, so
+// the bytes are identical for the whole process lifetime and there is
+// nothing per-sample about them.
+//
+// It carries ONLY the declared feature names. The agent version is NOT
+// repeated here: it already rides on every sample as the top-level
+// agent_version field (sample.Sample.AgentVersion), which is what the
+// gateway persists (routing.ServerTelemetry.AgentVersion) and what the
+// portal renders (hardware section, runtime report). The gateway's own
+// capabilities parser reads nothing but "features"
+// (gateway/backend/internal/gateway/agent_ingest.go's
+// agentCapabilitiesReport). Reporting the same fact through two wire
+// fields is the shape that rots -- one eventually gets updated alone -- so
+// a version bump now has exactly ONE place to touch: the Version constant
+// in agent.go.
+//
+// mustMarshalCapabilities PANICS instead of falling back to a "{}"
+// literal. json.Marshal cannot fail for a struct holding nothing but a
+// []string, so the old fallback branch was both unreachable and untestable
+// -- and it was the wrong fallback anyway: shipping "{}" would silently
+// declare no features at all, which on the gateway side deactivates
+// runtime_manager and stops every managed model process, explained only by
+// one log line. Panicking at package init instead runs on every process
+// start and in every test binary that touches this package, so a future
+// edit that ever makes this payload unmarshalable (a channel, a func, a
+// NaN float) fails immediately, loudly, and identically everywhere,
+// instead of rotting as a branch nothing can reach.
+var capabilitiesTemplate = mustMarshalCapabilities()
 
-// capabilitiesJSON builds the capabilities object collectOnce attaches to
-// every telemetry sample: this agent's declared feature names plus its own
-// version (informational only -- the gateway negotiates on the features list
-// by name, never by comparing this version string). It never returns a nil
-// or otherwise invalid json.RawMessage: on the practically-impossible
-// json.Marshal failure it falls back to sample.EmptyCapabilities, the same
-// "nothing to report" literal sample.Normalize substitutes for an absent
-// value, so this field is always a valid JSON object on the wire.
-func capabilitiesJSON() json.RawMessage {
-	payload := struct {
-		Features     []string `json:"features"`
-		AgentVersion string   `json:"agent_version"`
-	}{
-		Features:     FeatureNames(),
-		AgentVersion: Version,
-	}
-	raw, err := json.Marshal(payload)
+func mustMarshalCapabilities() json.RawMessage {
+	raw, err := json.Marshal(struct {
+		Features []string `json:"features"`
+	}{Features: FeatureNames()})
 	if err != nil {
-		slog.Error("capabilities marshal failed", "err", err)
-		return sample.EmptyCapabilities()
+		panic("agent: marshal capabilities: " + err.Error())
 	}
 	return raw
+}
+
+// capabilitiesJSON returns the capabilities object for one telemetry
+// sample: a FRESH copy of capabilitiesTemplate on every call, never the
+// package-level slice itself. json.RawMessage is a []byte, and the same
+// reasoning sample.EmptyCapabilities records applies here -- a caller that
+// ever wrote through a Sample.Capabilities value would otherwise corrupt
+// the template for every later sample in the process. Copying ~30 bytes is
+// far cheaper than the marshal it replaces, so nothing is lost by keeping
+// the aliasing bug impossible rather than merely unlikely.
+func capabilitiesJSON() json.RawMessage {
+	out := make(json.RawMessage, len(capabilitiesTemplate))
+	copy(out, capabilitiesTemplate)
+	return out
 }

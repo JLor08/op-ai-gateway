@@ -143,22 +143,28 @@ func TestRunCollectsMergesPushes(t *testing.T) {
 	// Feature negotiation (design spec §9): collectOnce must actually
 	// populate Capabilities -- a legacy agent that leaves it empty is
 	// normalized to {} downstream, but a current build reports its real
-	// feature set plus its own version.
+	// feature set. The version is reported ONCE, as the top-level
+	// agent_version asserted above, and deliberately NOT repeated inside
+	// capabilities (see capabilitiesTemplate's comment).
 	if len(got.Capabilities) == 0 {
 		t.Fatal("Capabilities is empty; want collectOnce to populate it")
 	}
-	var caps struct {
-		Features     []string `json:"features"`
-		AgentVersion string   `json:"agent_version"`
-	}
+	var caps map[string]json.RawMessage
 	if err := json.Unmarshal(got.Capabilities, &caps); err != nil {
-		t.Fatalf("Capabilities does not decode as the expected shape: %v (raw=%s)", err, got.Capabilities)
+		t.Fatalf("Capabilities does not decode as a JSON object: %v (raw=%s)", err, got.Capabilities)
 	}
-	if caps.AgentVersion != Version {
-		t.Errorf("Capabilities.agent_version = %q, want %q", caps.AgentVersion, Version)
+	if _, dup := caps["agent_version"]; dup {
+		t.Errorf("Capabilities carries agent_version (%s); the version must be reported ONCE, via the top-level agent_version field, so a version bump has a single place to touch", got.Capabilities)
 	}
-	if len(caps.Features) != 1 || caps.Features[0] != "runtime_manager" {
-		t.Errorf("Capabilities.features = %v, want [runtime_manager]", caps.Features)
+	if len(caps) != 1 {
+		t.Errorf("Capabilities has %d keys (%s), want exactly one (features)", len(caps), got.Capabilities)
+	}
+	var features []string
+	if err := json.Unmarshal(caps["features"], &features); err != nil {
+		t.Fatalf("Capabilities.features does not decode as a string array: %v (raw=%s)", err, got.Capabilities)
+	}
+	if len(features) != 1 || features[0] != "runtime_manager" {
+		t.Errorf("Capabilities.features = %v, want [runtime_manager]", features)
 	}
 }
 

@@ -101,32 +101,51 @@ func TestFeatureNamesMatchesRegistry(t *testing.T) {
 	}
 }
 
-func TestActiveFeaturesIsIntersection(t *testing.T) {
-	got := ActiveFeatures([]string{"runtime_manager", "unknown_future"})
-	if len(got) != 1 || got[0] != "runtime_manager" {
-		t.Fatalf("got %v", got)
-	}
-	if len(ActiveFeatures(nil)) != 0 {
-		t.Fatal("empty gateway set must disable everything")
-	}
-	if len(ActiveFeatures([]string{"unknown_future"})) != 0 {
-		t.Fatal("a gateway set with no overlap must disable everything")
-	}
-}
-
+// TestCapabilitiesJSONShape pins the wire shape: exactly one key,
+// "features", carrying the registry names. agent_version must NOT appear --
+// it is reported once, as the sample's own top-level field, so a version
+// bump has a single place to touch.
 func TestCapabilitiesJSONShape(t *testing.T) {
 	raw := capabilitiesJSON()
 	if raw == nil {
 		t.Fatal("capabilitiesJSON() returned nil, want a valid JSON object")
 	}
-	var v struct {
-		Features     []string `json:"features"`
-		AgentVersion string   `json:"agent_version"`
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("capabilitiesJSON() is not a JSON object: %v (raw=%s)", err, raw)
 	}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		t.Fatal(err)
+	if _, dup := keys["agent_version"]; dup {
+		t.Errorf("capabilitiesJSON() carries agent_version (%s); the version belongs on the sample's top-level agent_version field only", raw)
 	}
-	if v.AgentVersion != Version || len(v.Features) == 0 {
-		t.Fatalf("%+v", v)
+	if len(keys) != 1 {
+		t.Errorf("capabilitiesJSON() has %d keys (%s), want exactly one (features)", len(keys), raw)
+	}
+	var features []string
+	if err := json.Unmarshal(keys["features"], &features); err != nil {
+		t.Fatalf("capabilitiesJSON().features is not a string array: %v (raw=%s)", err, raw)
+	}
+	if len(features) != len(Features) {
+		t.Fatalf("capabilitiesJSON().features = %v, want the %d registry names", features, len(Features))
+	}
+	for i, f := range Features {
+		if features[i] != f.Name {
+			t.Errorf("capabilitiesJSON().features[%d] = %q, want %q", i, features[i], f.Name)
+		}
+	}
+}
+
+// TestCapabilitiesJSONReturnsAFreshSliceEachCall is the aliasing guard:
+// capabilitiesJSON hands out a copy of a package-level template, so a
+// caller that ever wrote through the json.RawMessage it received must not
+// be able to corrupt every later sample's capabilities -- the same class of
+// bug sample.EmptyCapabilities exists as a function to prevent.
+func TestCapabilitiesJSONReturnsAFreshSliceEachCall(t *testing.T) {
+	first := capabilitiesJSON()
+	want := string(first)
+	for i := range first {
+		first[i] = 'X'
+	}
+	if got := string(capabilitiesJSON()); got != want {
+		t.Fatalf("after overwriting a returned capabilities slice, the next call returned %q, want %q -- capabilitiesJSON must copy, never alias the package-level template", got, want)
 	}
 }
