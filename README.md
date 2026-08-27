@@ -79,6 +79,26 @@ Operators manage servers, models, users, and policies in a bilingual
   edge and mesh TLS certificates issued and rotated by the gateway, including
   a TLS-terminating agent proxy in front of the AI server.
 
+**Agent-managed model runtime** (replaces llama-swap)
+
+- Model server **processes** are started and stopped on demand by the agent: a
+  request for a model that is not loaded starts it, waits for it to become
+  healthy, and proxies — behind **one** router port per AI server, with the
+  child processes bound to loopback.
+- Launch specifications (binary, arguments, environment, working directory,
+  timeouts) are maintained in the portal, while the AI server's own operator
+  keeps a **binary allowlist** that decides what may execute at all. Model
+  secrets never enter the gateway: a spec's environment values are
+  `${AGENT_ENV:NAME}` references resolved on the AI server.
+- **Admission control before every start:** a pairwise co-residency matrix, a
+  per-server process limit, and per-GPU **VRAM budgets** with measured usage fed
+  back from the agent — so co-locating models does not become GPU OOM. Drain-first
+  eviction never aborts an in-flight response.
+- Live per-model status in the portal (state, PID, port, in-flight, restarts, and
+  the last load error with a stderr tail), start/stop/restart as desired-state
+  overrides, and an optional **local-file mode** where the AI server's operator
+  owns the configuration and the portal is read-only.
+
 **Operations**
 
 - Three storage drivers: in-memory (dev), **SQLite**, **PostgreSQL** —
@@ -228,8 +248,9 @@ make test-e2e    # Playwright end-to-end suite (real gateway + built portal)
 make lint        # golangci-lint across both Go modules (make fmt to format)
 ```
 
-Scenario e2e suites (certificates, capture, TOTP, SMTP, limits, …) live in
-`gateway/e2e` as npm scripts. Architecture tests (frozen dependency rules for
+Scenario e2e suites (certificates, capture, TOTP, SMTP, limits, the
+agent-managed model runtime, …) live in `gateway/e2e` as npm scripts and are
+local-only gates — CI runs the Go and frontend jobs, not Playwright. Architecture tests (frozen dependency rules for
 both Go modules and the frontend) run inside the normal test suites, and a
 local, headless **SonarQube quality gate** is available via `make sonar-up` /
 `make sonar-gate`. The full tooling reference is
@@ -248,7 +269,7 @@ Everything is configured through `OP_AI_GATEWAY_*` environment variables
 |---|---|---|
 | **Gateway** | `gateway/backend/` (Go module `op-ai-gateway`) | Terminates client/inference APIs, routes and dispatches inference, serves portal/system/agent APIs, runs background reconcilers. |
 | **Portal** | `gateway/frontend/` (React + TypeScript + Vite + MUI) | Administration, server/model management, analytics, and a streaming chat playground. Served under `/portal/`. |
-| **Server-Agent** | `server-agent/` (Go module `op-ai-server-agent`) | Standalone binary installed next to an AI server; reports host/GPU/power/temperature/hardware telemetry and can terminate mesh TLS in front of the local server. See [`server-agent/README.md`](server-agent/README.md). |
+| **Server-Agent** | `server-agent/` (Go module `op-ai-server-agent`) | Standalone binary installed next to an AI server; reports host/GPU/power/temperature/hardware telemetry, can terminate mesh TLS in front of the local server, and can start/stop the local model server processes on demand. See [`server-agent/README.md`](server-agent/README.md). |
 | **Deploy** | `gateway/deploy/` | Dockerfiles, `docker-compose*.yml`, `k8s/`, `nginx/`, deployable `themes/`, and operator runbooks. See [`gateway/deploy/README.md`](gateway/deploy/README.md). |
 | **Docs** | `docs/architecture/` | arc42 architecture documentation — the reference for how the system is built and why. |
 
@@ -258,6 +279,7 @@ Everything is configured through `OP_AI_GATEWAY_*` environment variables
   constraints, building blocks, runtime views, deployment, ADRs)
 - [Security, Authentication & Authorization](docs/architecture/cross-cutting/security-auth-rbac.md)
 - [Routing & Model Selection](docs/architecture/cross-cutting/routing-and-model-selection.md)
+- [Agent-Managed Model Runtime](docs/architecture/cross-cutting/agent-runtime-manager.md)
 - [Persistence](docs/architecture/cross-cutting/persistence.md) ·
   [Networking & Mesh](docs/architecture/cross-cutting/networking-mesh.md) ·
   [Certificates & TLS](docs/architecture/cross-cutting/certificates-tls.md)

@@ -111,6 +111,7 @@ ones:
 | Auth, sessions, CSRF, RBAC/roles, payload capture & redaction | `docs/architecture/cross-cutting/security-auth-rbac.md` |
 | Persistence: three drivers, dialect seam, migrations, conformance | `docs/architecture/cross-cutting/persistence.md` |
 | Routing, scoring, mappings, affinity | `docs/architecture/cross-cutting/routing-and-model-selection.md` |
+| Agent-managed model runtime (launch specs, admission, router, feature flags) | `docs/architecture/cross-cutting/agent-runtime-manager.md` |
 | Telemetry, usage analytics, SSE, observability | `docs/architecture/cross-cutting/telemetry-usage-observability.md` |
 | NetBird mesh, gateway-managed PAT + rotation | `docs/architecture/cross-cutting/networking-mesh.md` |
 | Certificates & TLS (edge + mesh, agent proxy) | `docs/architecture/cross-cutting/certificates-tls.md` |
@@ -146,8 +147,60 @@ Always-on engineering rules (details in the documents above):
   MPL-2.0); review the real, effective license including bundled code.
 - Portal localization: add translation keys in German and English together
   (`i18n.ts`; the type-checked build enforces parity).
+- Bump the ServerAgent version when you change the agent — see the rule below.
 - Avoid broad refactors unrelated to the current task; deliberate
   kept-as-is structures are catalogued in §11.4 — do not "fix" them ad hoc.
+
+## ServerAgent Version Rule
+
+The gateway and the agent ship and upgrade independently, and the gateway
+negotiates agent capabilities by **named feature flags, never by comparing
+version numbers** (ADR-025). The reported version is therefore not a gate — it
+is the diagnostic an operator reads in the portal's agent panel to know *which
+build is in the field*. A stale version number makes that diagnosis a lie.
+
+**The single place to edit is `const Version` in
+`server-agent/internal/agent/agent.go`.** Nothing else declares the agent
+version: it rides on every telemetry sample as the top-level `agent_version`
+field, and that field is what the gateway persists and the portal renders. Do
+not add a second copy — a nested `capabilities.agent_version` existed once and
+was removed precisely because the gateway ignores it while reviewers assume it
+is honoured.
+
+**Bump it whenever a change alters the agent's behaviour or its wire contract.**
+Concretely, a bump is required for:
+
+- a new or removed entry in `agent.Features` (`internal/agent/features.go`);
+- any change to what the agent sends or accepts — a telemetry sample field, a
+  WebSocket frame type or payload, a request the agent makes to
+  `/api/agent/v1/*`, or how it interprets a response;
+- a change in observable runtime behaviour: lifecycle states, error codes,
+  timings and cadences, retry or backoff discipline, redaction, the router's
+  routes or its routing rule, the local security policy;
+- a change to how the agent reads its own configuration (a new setting, a
+  changed default or precedence);
+- a bugfix that changes what an operator or the gateway observes.
+
+No bump is needed for a change with no observable effect: refactors, comments,
+tests, tooling, or a fix to code no shipped path reaches.
+
+**Which digit.** MINOR when `agent.Features` gains a flag (that is a new
+capability the fleet can negotiate); PATCH otherwise. MAJOR is reserved for
+dropping support for a gateway the agent previously worked against.
+
+**A bump is per shipped change, not per commit.** One feature branch is one
+bump, however many commits it contains: bump once, early, and leave it alone for
+the rest of the branch — a second bump inside the same branch is churn, and
+bumping per commit makes the number meaningless. (The agent-runtime-manager
+branch is the worked example: `Version` went to `0.2.0` with the first agent
+commit and that one bump covers the whole feature.)
+
+**What is and is not enforced.** A guard test asserts that every
+`agent.Features` entry carries a valid SemVer `Since` no greater than `Version`,
+unique and snake_case — so adding a flag without the MINOR bump fails a test. A
+forgotten **PATCH** bump after a plain bugfix is not machine-detectable: the
+test has no signal for what changed. That half is this rule plus the pull-request
+checklist, and nothing else.
 
 ## Required Working Style
 
