@@ -795,6 +795,9 @@ func (m *MemoryStore) CreateApplication(_ context.Context, app Application) erro
 	if m.applicationPortTakenLocked(app.ServerID, app.Port, "") {
 		return storeerr.ErrConflict
 	}
+	if app.Type == ProviderServerAgent && m.serverAgentApplicationExistsLocked(app.ServerID, "") {
+		return storeerr.ErrConflict
+	}
 	m.applications[app.ID] = copyApplication(app)
 	return nil
 }
@@ -811,8 +814,42 @@ func (m *MemoryStore) UpdateApplication(_ context.Context, app Application) erro
 	if m.applicationPortTakenLocked(app.ServerID, app.Port, app.ID) {
 		return storeerr.ErrConflict
 	}
+	if app.Type == ProviderServerAgent && m.serverAgentApplicationExistsLocked(app.ServerID, app.ID) {
+		return storeerr.ErrConflict
+	}
 	m.applications[app.ID] = copyApplication(app)
 	return nil
+}
+
+// serverAgentApplicationExistsLocked reports whether serverID already has a
+// ProviderServerAgent application other than excludeID (pass "" on the create
+// path, the written application's own id on the update path so an in-place
+// edit of the server's own server_agent application is not a self-collision).
+//
+// This mirrors migration 68's partial unique index on
+// applications(server_id) where type = 'server_agent' -- SQL side ->
+// ErrConflict, so MemoryStore must reject it the same way. Shape copied from
+// applicationPortTakenLocked above, with one deliberate difference: the port
+// gate has no SQL constraint behind it at all, while this one does, so a
+// memory/SQL divergence here is observable through the API.
+//
+// This is the BACKSTOP, not the primary gate: portal.Service checks the same
+// condition before it writes (returning the honest
+// ErrServerAgentApplicationExists sentinel), but that check reads, releases
+// the lock and then calls CreateApplication in no transaction, so two
+// concurrent creates can both pass it. Catching the loser here is exactly
+// this guard's job -- do not read the service-level gate as race-free.
+// Callers must hold m.mu for writing.
+func (m *MemoryStore) serverAgentApplicationExistsLocked(serverID, excludeID string) bool {
+	for id, existing := range m.applications {
+		if id == excludeID {
+			continue
+		}
+		if existing.ServerID == serverID && existing.Type == ProviderServerAgent {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MemoryStore) applicationPortTakenLocked(serverID string, port int, excludeID string) bool {

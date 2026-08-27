@@ -952,3 +952,106 @@ func TestRoutingStoreServerRuntimeReports(t *testing.T) {
 		}
 	})
 }
+
+// TestRoutingStoreSingleServerAgentApplication is the memory/SQL parity case
+// for the "at most one server_agent application per AI server" invariant.
+//
+// Migration 68 gives the SQL side a partial unique index on
+// applications(server_id) where type = 'server_agent'; before this case
+// existed, routing.MemoryStore guarded only duplicate id, missing server and
+// applicationPortTakenLocked, so it accepted a second server_agent
+// application (and a retype into one) with a nil error where every SQL
+// dialect returned ErrConflict. Memory is the dev/Playwright driver, so that
+// divergence let the e2e suite reach a state the product cannot hold.
+//
+// Both write paths are covered because retyping an existing application is
+// the easy way past a create-only guard, and both the create and the retype
+// use a FREE port, so a passing ErrConflict cannot be the port gate firing by
+// accident. The negative half (a second NON-server_agent application, and a
+// no-op retype of the server's own server_agent application) is asserted too:
+// a guard that rejects those would be strictly stronger than the SQL index
+// and would make ordinary edits impossible.
+func TestRoutingStoreSingleServerAgentApplication(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_sa", Name: "SA", Domain: "sa.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://sa", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		app := func(id, appType string, port int) routing.Application {
+			return routing.Application{
+				ID: id, ServerID: "srv_sa", Type: appType, Port: port, Scheme: "http",
+				APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+				TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+				HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+
+		if err := s.CreateApplication(ctx, app("app_sa_first", routing.ProviderServerAgent, 8081)); err != nil {
+			t.Fatalf("first server_agent application: %v", err)
+		}
+
+		// A SECOND server_agent application on the same server, on a free
+		// port -> ErrConflict on both backends.
+		if err := s.CreateApplication(ctx, app("app_sa_second", routing.ProviderServerAgent, 8082)); err != ErrConflict {
+			t.Fatalf("second server_agent create: want ErrConflict, got %v", err)
+		}
+
+		// A non-server_agent application on the same server is unaffected --
+		// the index's WHERE clause excludes it.
+		plain := app("app_sa_plain", routing.ProviderVLLM, 8083)
+		if err := s.CreateApplication(ctx, plain); err != nil {
+			t.Fatalf("plain application on the same server: %v", err)
+		}
+
+		// RETYPING that one to server_agent is the second mapped path and must
+		// be refused identically.
+		retyped := plain
+		retyped.Type = routing.ProviderServerAgent
+		if err := s.UpdateApplication(ctx, retyped); err != ErrConflict {
+			t.Fatalf("retype to server_agent: want ErrConflict, got %v", err)
+		}
+
+		// An in-place edit of the server's OWN server_agent application is not
+		// a self-collision (the row already satisfies the index).
+		edited := app("app_sa_first", routing.ProviderServerAgent, 8091)
+		if err := s.UpdateApplication(ctx, edited); err != nil {
+			t.Fatalf("edit the server's own server_agent application: %v", err)
+		}
+
+		// End state on both backends: exactly one server_agent application.
+		apps, err := s.ApplicationsByServer(ctx, "srv_sa")
+		if err != nil {
+			t.Fatalf("ApplicationsByServer: %v", err)
+		}
+		agents := 0
+		for _, got := range apps {
+			if got.Type == routing.ProviderServerAgent {
+				agents++
+			}
+		}
+		if len(apps) != 2 || agents != 1 {
+			t.Fatalf("end state: %d applications (%d server_agent), want 2 (1 server_agent): %+v", len(apps), agents, apps)
+		}
+
+		// A second server_agent application on a DIFFERENT server is legal:
+		// the constraint is per-server, not global.
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_sa2", Name: "SA2", Domain: "sa2.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://sa2", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create second server: %v", err)
+		}
+		other := app("app_sa_other", routing.ProviderServerAgent, 8081)
+		other.ServerID = "srv_sa2"
+		if err := s.CreateApplication(ctx, other); err != nil {
+			t.Fatalf("server_agent application on a second server: %v", err)
+		}
+	})
+}

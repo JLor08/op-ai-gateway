@@ -921,6 +921,15 @@ func (s *Service) proxyListenPortTakenOnServer(ctx context.Context, serverID str
 // the extra read only happens for a write that actually targets
 // server_agent. See ErrServerAgentApplicationExists for why the invariant
 // matters.
+//
+// NOT race-free, by construction: this reads, returns, and the caller then
+// calls Create/UpdateApplication in no transaction, so two concurrent POSTs
+// can both pass it. This is the gate that produces the HONEST error code, not
+// the one that guarantees the invariant -- that is the store's job (migration
+// 68's partial unique index on SQL, MemoryStore's
+// serverAgentApplicationExistsLocked on memory), and the loser of the race
+// gets its ErrConflict classified back into the honest sentinel by
+// classifyApplicationWriteConflict.
 func (s *Service) serverAgentApplicationExistsOnServer(ctx context.Context, serverID, excludeAppID string) (bool, error) {
 	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
 	if err != nil {
