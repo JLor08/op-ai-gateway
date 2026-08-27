@@ -3015,6 +3015,155 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
   });
 });
 
+// F1: C2 gave the READ a snapshot, but of the ISSUE counter -- which only sees
+// writes STARTED after the read started. So it caught exactly one of the two
+// orderings this GET has with an override write, and the OTHER one is reached
+// by the same two ordinary clicks, no watchdog and no fake timers needed: the
+// write goes first, so `issued` has ALREADY moved when the read snapshots it,
+// the write commits inside the read's window, and the returning snapshot still
+// compares equal and goes in over it. Snapshotting the COMMIT counter refuses
+// that -- and, being advanced only by writes that actually wrote, it also stops
+// a write that committed NOTHING from discarding a read.
+describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2, F1)', () => {
+  it('refuses an Edit GET issued while an override write was already in flight', async () => {
+    let landPut: (updated: RuntimeSpec) => void = () => {};
+    const put = new Promise<RuntimeSpec>((resolve) => {
+      landPut = resolve;
+    });
+    let landGet: (spec: RuntimeSpec) => void = () => {};
+    const slowGet = new Promise<RuntimeSpec>((resolve) => {
+      landGet = resolve;
+    });
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // 1. Force stop. Its ticket is ISSUED and the PUT is outstanding, so
+    //    `overrideBusy` locks the status table -- and only the status table.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => put);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // 2. The tab strip is never disabled, so the operator goes back to the
+    //    specs tab and hits Edit (`rowActions` gates only on `loadingEditFor`).
+    //    This read starts AFTER the write's ticket was issued -- the ordering
+    //    an issue-order snapshot cannot see.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    fakeApi.runtimeSpec.mockImplementationOnce(() => slowGet);
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // 3. The PUT resolves FIRST: the server has stored force_stopped and the
+    //    cache now says so.
+    await act(async () => {
+      landPut(fullSpec({ admin_state: 'force_stopped' }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // 4. ...and only NOW the GET lands, carrying its pre-PUT snapshot.
+    await act(async () => {
+      landGet(fullSpec({ admin_state: '' }));
+      await Promise.resolve();
+    });
+
+    // The FORM still hydrates from that snapshot -- it is the document this
+    // form would PUT back, which C2's own comment insists on. Back out of it;
+    // nothing re-fetches on the way (`loadedIdsRef` blocks the lazy loader), so
+    // whatever the cache holds now is what it holds for the rest of the mount.
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+
+    // The CACHE must still hold what the server acknowledged. Otherwise the row
+    // offers Force stop on an already-force-stopped model and denies the Clear
+    // override that is the only way out of it.
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+  });
+
+  // The other half of the same one-word change, and the mirror of C1 for
+  // READS: a write that FAILED wrote nothing, so it must not cost the mapping
+  // its single lazy read either. The reachable route needs no override at all,
+  // because the row that has not loaded its spec yet is exactly the row whose
+  // Delete means "delete the MAPPING" -- so the operator's click issues a
+  // write ticket on the mapping whose read is still in flight.
+  it('keeps a lazy read that a FAILED mapping delete overlapped', async () => {
+    let landLazyGet: (spec: RuntimeSpec) => void = () => {};
+    const lazyGet = new Promise<RuntimeSpec>((resolve) => {
+      landLazyGet = resolve;
+    });
+    const { fakeApi, stream, deletedMappingIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    // Held open BEFORE the fan-out can issue it: `mappings` is `mappingsData ??
+    // []`, so the lazy loader's effect finds nothing to load on the first
+    // render and only fires once the mappings GET resolves -- which is a
+    // microtask, i.e. strictly after this synchronous line.
+    fakeApi.runtimeSpec.mockImplementationOnce(() => lazyGet);
+    stream.setStatus('open');
+    await screen.findByText('gw-model');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Nothing is cached for the row yet, so its Delete is the MAPPING delete --
+    // and that branch takes a write ticket (fix round 1, M5). It fails, so it
+    // commits nothing and the mapping stays in the list.
+    fakeApi.deleteMapping.mockImplementationOnce(() => Promise.reject(new Error('delete failed')));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingDelete }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(deletedMappingIds).toEqual([]);
+    // A failed delete leaves the confirm dialog open (`setConfirmingDeleteId('')`
+    // is only reached on success), and an open modal aria-hides the tab strip.
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingCancel }),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // ...and only now does the mapping's ONE spec GET land.
+    await act(async () => {
+      landLazyGet(fullSpec());
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // It has to be kept. Discarded, it is discarded for good -- `loadedIdsRef`
+    // already holds this id and never retries -- and all three of these go
+    // wrong at once.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    // The row resolves against the stream instead of being marked unmatched...
+    expect(screen.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
+    // ...it offers its overrides instead of a blank actions cell...
+    expect(screen.getByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    // ...and its Delete is the SPEC delete again. Left downgraded, the next
+    // click on it destroys the mapping the operator only meant to unconfigure.
+    expect(await screen.findByRole('button', { name: t.runtimeSpecDelete })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.mappingDelete })).not.toBeInTheDocument();
+  });
+});
+
 // C3: `submitCreate` pre-seeds `loadedIdsRef` so the new mapping is not
 // re-fetched, but nothing ever added it to `specLoadSettled` -- whose only
 // writer is the lazy loader's `finally`, which the pre-seed skips. So

@@ -756,9 +756,11 @@ export function RuntimeAdminSection({
    * operator was already told had been given up on -- so the row offers the
    * inverse of the actions that apply.
    *
-   * Two counters, because writes and reads need OPPOSITE tests (fix round 1,
-   * C1/C2 -- the first version had one counter and used the write test for
-   * both):
+   * Two counters -- an ISSUE order and a COMMIT order -- because a write must
+   * be tested against what has already been COMMITTED, never against what has
+   * merely been issued (fix round 1, C1/C2; the first version had one counter
+   * and used it for both roles). Both tests fall out of ONE rule: writes
+   * advance the commit order, and reads must not observe it advancing.
    *
    *  - a WRITE's payload is what the server acknowledged storing, so it may
    *    become the cache entry unless a LATER write has already COMMITTED one.
@@ -774,15 +776,29 @@ export function RuntimeAdminSection({
    *    override the row denies exists. A failure must NOT retire its ticket by
    *    decrementing the counter either -- that races a third write.
    *  - a READ's payload is only a snapshot, so it may become the cache entry
-   *    only while NO write has been issued for that mapping since the read
-   *    started. `openEdit`'s GET is issued from the specs tab, which
-   *    `overrideBusy` does not lock (`rowActions` gates only on
-   *    `loadingEditFor`), so a slow one landed after a successful Force stop
-   *    and overwrote it with its pre-PUT snapshot -- and nothing re-fetches on
-   *    the way back (`loadedIdsRef` blocks the lazy loader), so that poison was
-   *    permanent. A read never advances the committed counter: an older write
-   *    still in flight is more authoritative than a snapshot that may have been
-   *    served before that write applied.
+   *    only while the COMMIT order has not moved since the read started.
+   *    `openEdit`'s GET is issued from the specs tab, which `overrideBusy`
+   *    does not lock (`rowActions` gates only on `loadingEditFor`) and whose
+   *    tab strip is never disabled, so it overlaps an override write in BOTH
+   *    directions -- and nothing re-fetches on the way back (`loadedIdsRef`
+   *    blocks the lazy loader), so whichever way the poison lands it is
+   *    permanent:
+   *      * GET issued first, lands last: the write commits inside the read's
+   *        window, so the counter has moved and the snapshot is refused;
+   *      * write issued first, lands first (fix round 2, F1 -- the ordering the
+   *        first version of this guard MISSED): the read began after that
+   *        write's ticket was ISSUED, so an issue-order snapshot still matched
+   *        on the way back and the pre-PUT document went in over
+   *        `force_stopped`. A commit-order snapshot does not match, because
+   *        the commit happened inside the window.
+   *    Testing the commit order also stops punishing a write that wrote
+   *    NOTHING: a FAILED write never advances it, so it no longer discards the
+   *    single lazy read a mapping gets (`loadedIdsRef` never retries), which
+   *    used to leave a false `Unmatched` chip, no override actions at all, and
+   *    a Delete silently downgraded from delete-spec to delete-MAPPING.
+   *    A read never advances the commit order itself: an older write still in
+   *    flight is more authoritative than a snapshot that may have been served
+   *    before that write applied.
    *
    * Every write path takes a ticket, deliberately including the create/edit
    * form and both delete branches: a hung override write resolving after a form
@@ -817,15 +833,24 @@ export function RuntimeAdminSection({
     });
   }
   /**
-   * Snapshots the write counter for a READ. Deliberately does not increment:
-   * a GET issues no write, so it must not stop a write that is already in
-   * flight from committing.
+   * Snapshots the COMMIT counter for a READ -- not the issue counter (fix
+   * round 2, F1). Deliberately does not increment: a GET issues no write, so
+   * it must not stop a write that is already in flight from committing.
+   *
+   * The issue counter only catches writes STARTED after the read started, and
+   * a write already in flight when the read starts is invisible to it -- the
+   * mirror image of C2, and the same poison: Force stop takes ticket 1, the
+   * operator switches tab (never disabled) and hits Edit, the PUT commits
+   * `force_stopped`, and the GET lands with `issued(1) === seen(1)` and writes
+   * its pre-PUT snapshot over it. Snapshotting `committed` refuses that: the
+   * counter is monotone, so "unchanged" means "nothing committed inside my
+   * window" no matter when the write was issued.
    */
   function beginSpecRead(mappingId: string): number {
-    return specWriteSeqRef.current.get(mappingId) ?? 0;
+    return specCommittedSeqRef.current.get(mappingId) ?? 0;
   }
   function commitSpecRead(mappingId: string, seen: number, spec: RuntimeSpec) {
-    if ((specWriteSeqRef.current.get(mappingId) ?? 0) !== seen) return;
+    if ((specCommittedSeqRef.current.get(mappingId) ?? 0) !== seen) return;
     setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
   }
 
