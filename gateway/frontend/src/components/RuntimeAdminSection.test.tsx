@@ -1039,6 +1039,20 @@ async function openStatusTab() {
   fireEvent.click(await screen.findByRole('tab', { name: t.runtimeLiveStatus }));
 }
 
+/**
+ * Scopes queries to the table row carrying `text`. Needed as soon as a test
+ * has more than one status row: every row renders the same action labels, so
+ * an unscoped `getByRole('button', { name: t.runtimeRestart })` would throw
+ * on the multiple match rather than tell us anything about a specific row.
+ */
+function inRowWith(text: string) {
+  const rows = screen.getAllByRole('row').filter((r) => r.textContent?.includes(text));
+  if (rows.length !== 1) {
+    throw new Error(`expected exactly one table row containing ${text}, found ${rows.length}`);
+  }
+  return within(rows[0]);
+}
+
 describe('RuntimeAdminSection live status list', () => {
   it('renders one row per reported process with its state, since, pid, port, in-flight and restarts', async () => {
     const { stream } = renderSection({
@@ -1720,5 +1734,160 @@ describe('RuntimeAdminSection feature-mismatch banner (spec §9)', () => {
     });
     await screen.findByText('gw-model');
     expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 22 fix round 1. Three production-reachable paths that had no test at
+// all -- and they are exactly the ones that were broken -- plus the bounded
+// writes, the stronger unmount observation, and the gateway/upstream name
+// pair.
+// ---------------------------------------------------------------------------
+
+describe('RuntimeAdminSection restart-state gate (fix round 1, I1)', () => {
+  // A restart is force_stopped -> await `stopped` -> clear. On the agent side
+  // that middle step can only ever arrive for a spec that has something to
+  // stop or a resting state applyConfig resets:
+  //   - force_stopped with no live process is a no-op
+  //     (server-agent/internal/runtime/manager.go:724-728), and
+  //   - applyConfig's changed-spec reset deliberately EXCLUDES
+  //     StateNotPermitted and StatePendingVRAMUnknown (:676-698, the "I6"
+  //     comment) while it does reset start_failed/crashed/backoff.
+  // So on `stopped`, `pending_vram_unknown` and `not_permitted` the wait can
+  // never be satisfied: the UI would spin for the full bound, report a
+  // timeout, and leave force_stopped in place -- which makes the model
+  // admission-blocked (manager.go ErrAdmissionBlocked) until a human clears
+  // it by hand. A UI action would have made a model unavailable and reported
+  // it as a timeout.
+  function fourStates() {
+    const rows: { specId: string; mappingId: string; gw: string; model: string; state: string }[] =
+      [
+        {
+          specId: 'spec_run',
+          mappingId: 'map_run',
+          gw: 'Gw-Run',
+          model: 'up-run',
+          state: 'running',
+        },
+        {
+          specId: 'spec_stop',
+          mappingId: 'map_stop',
+          gw: 'Gw-Stop',
+          model: 'up-stop',
+          state: 'stopped',
+        },
+        {
+          specId: 'spec_vram',
+          mappingId: 'map_vram',
+          gw: 'Gw-Vram',
+          model: 'up-vram',
+          state: 'pending_vram_unknown',
+        },
+        {
+          specId: 'spec_perm',
+          mappingId: 'map_perm',
+          gw: 'Gw-Perm',
+          model: 'up-perm',
+          state: 'not_permitted',
+        },
+      ];
+    return renderSection({
+      mappings: rows.map((r) => makeMapping({ id: r.mappingId, gateway_model_name: r.gw })),
+      specsByMappingId: Object.fromEntries(
+        rows.map((r) => [r.mappingId, fullSpec({ id: r.specId, mapping_id: r.mappingId })]),
+      ),
+      statusRows: rows.map((r) =>
+        makeStatus({ spec_id: r.specId, model: r.model, state: r.state }),
+      ),
+    });
+  }
+
+  it('offers Restart only where a `stopped` frame can actually follow the force_stopped write', async () => {
+    const { stream } = fourStates();
+    stream.setStatus('open');
+    await openStatusTab();
+    // Wait for the per-mapping spec GETs to settle: only a resolved row has
+    // any actions at all, so this is the barrier that matters here.
+    expect(await screen.findAllByRole('button', { name: t.runtimeRestart })).toHaveLength(4);
+
+    // There IS a process to stop here.
+    expect(inRowWith('up-run').getByRole('button', { name: t.runtimeRestart })).toBeEnabled();
+
+    // These three cannot report the transition the sequence waits for. The
+    // action stays VISIBLE (hiding it would make an operator wonder whether
+    // the portal forgot it, and the row's own state is the explanation) but
+    // disabled, so the sequence can never be started from here.
+    for (const model of ['up-stop', 'up-vram', 'up-perm']) {
+      const row = inRowWith(model);
+      expect(row.getByRole('button', { name: t.runtimeRestart })).toBeDisabled();
+      // "Force start" is the action that does something on all three.
+      expect(row.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+    }
+  });
+
+  it('sends nothing when the disabled Restart on a pending_vram_unknown row is clicked', async () => {
+    const { fakeApi, stream } = fourStates();
+    stream.setStatus('open');
+    await openStatusTab();
+    expect(await screen.findAllByRole('button', { name: t.runtimeRestart })).toHaveLength(4);
+
+    fireEvent.click(inRowWith('up-vram').getByRole('button', { name: t.runtimeRestart }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+    expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection restart stream watermark (fix round 1, I2)', () => {
+  // The sequence confirmed a STATE, never a TRANSITION: the moment the phase
+  // flipped to `waiting` it tested whatever the last frame happened to say --
+  // possibly a frame received before its own force_stopped PUT even landed.
+  // Then it "completed", cleared the override, and reported success while
+  // nothing had been restarted.
+  it('does not complete off a `stopped` frame that predates its own force_stopped write', async () => {
+    const spec = fullSpec();
+    let landWrite: (updated: RuntimeSpec) => void = () => {};
+    const write = new Promise<RuntimeSpec>((resolve) => {
+      landWrite = resolve;
+    });
+    const { fakeApi, putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    // Only the FIRST put is held open; the clear PUT (if it ever comes) goes
+    // through the recording default implementation.
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => write);
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1));
+
+    // A `stopped` frame arriving while the write is still in flight cannot be
+    // a consequence of it -- the process is resting for some other reason
+    // (a drain that was already running, an idle timeout).
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+
+    await act(async () => {
+      landWrite(fullSpec({ admin_state: 'force_stopped' }));
+      // Two macrotask turns: enough for the awaited write's continuation, the
+      // render it triggers, and the stream effect that runs after it. If the
+      // sequence completes off the stale frame it has done so by now.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1);
+    expect(putSpecs).toHaveLength(0);
+    // ...and the sequence is still alive, still waiting.
+    expect(screen.getByText(t.runtimeRestartStopping)).toBeInTheDocument();
+
+    // Only a frame from strictly AFTER the write completes the sequence.
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await waitFor(() => expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(2));
+    expect(putSpecs).toHaveLength(1);
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, ''));
   });
 });

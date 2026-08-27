@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useMemo, useRef, useState, type SubmitEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type SubmitEvent } from 'react';
 import {
   Alert,
   Box,
@@ -170,6 +170,41 @@ function runtimeStateBadge(state: string): BadgeStatus {
   return 'standby';
 }
 
+/**
+ * The states a restart sequence can actually complete from.
+ *
+ * A restart is force_stopped -> await `stopped` -> clear the override, and on
+ * the agent side that middle step only ever arrives when there is either a
+ * live process to drain or a resting state `applyConfig` resets:
+ *
+ *  - `force_stopped` on a spec with no live process does NOTHING
+ *    (server-agent/internal/runtime/manager.go:724-728: `if st.proc != nil {
+ *    beginDrain } ; continue`), and
+ *  - `applyConfig`'s changed-spec reset covers `start_failed`, `crashed` and
+ *    `backoff` -- but DELIBERATELY excludes `not_permitted` and
+ *    `pending_vram_unknown` (manager.go:676-698, the "I6" comment).
+ *
+ * So on `stopped`, `pending_vram_unknown` and `not_permitted` the wait can
+ * never be satisfied: the UI would spin for the full RESTART_STOP_TIMEOUT_MS,
+ * report a timeout, and leave force_stopped in force -- which leaves the model
+ * admission-blocked (manager.go's ErrAdmissionBlocked) until a human clears it
+ * by hand. A UI action would have made a model unavailable and reported it as
+ * a timeout. `force_running` is the action that does something on those three,
+ * and it is offered there.
+ *
+ * An UNKNOWN state (a newer agent than this portal build) is treated as
+ * non-restartable for the same reason: it may well be another one the reset
+ * excludes, and the cost of being wrong is asymmetric.
+ */
+const restartableStates = new Set([
+  'running',
+  'starting',
+  'draining',
+  'backoff',
+  'start_failed',
+  'crashed',
+]);
+
 // One restart sequence. There is no restart endpoint (design §10.1: every
 // action is state-shaped), so a restart is a three-step UI sequence:
 //   stopping -> the force_stopped PUT is in flight
@@ -182,6 +217,16 @@ type RestartFlow = {
   mappingId: string;
   phase: 'stopping' | 'waiting' | 'clearing';
   deadline: number;
+  /**
+   * Stream frame counter as of the moment the force_stopped write LANDED.
+   * Only a `stopped` observation from a strictly LATER frame can complete the
+   * sequence: `stopped` in a frame that predates our own write is a STATE the
+   * process was already in for some unrelated reason (an idle stop, a drain
+   * that was already running), never the TRANSITION this step waits for.
+   * Without the watermark the sequence confirms a state and can therefore
+   * "succeed" having started nothing at all.
+   */
+  waitFrom: number;
 };
 
 // One launch spec as read back from a file-mode agent's report. This is the
@@ -799,13 +844,25 @@ export function RuntimeAdminSection({
   // here -- `onStatus` only ever reports 'open' | 'error'.
   const [statusRows, setStatusRows] = useState<RuntimeStatus[]>([]);
   const [streamStatus, setStreamStatus] = useState<'open' | 'error' | 'loading'>('loading');
+  // Monotonic count of frames received on the CURRENT subscription. The
+  // restart sequence needs to tell "this spec IS stopped" (a state, possibly
+  // reported before its own write even landed) apart from "this spec reported
+  // stopped AFTER our write landed" (the transition it actually waits for) --
+  // see RestartFlow.waitFrom. A ref, not state: the counter must not itself
+  // trigger a render or re-arm an effect.
+  const frameSeqRef = useRef(0);
+  const onStatusFrame = useCallback((rows: RuntimeStatus[]) => {
+    frameSeqRef.current += 1;
+    setStatusRows(rows);
+  }, []);
   useEffect(() => {
     // A server switch must not leave the previous server's processes on
     // screen while the new stream connects.
     setStatusRows([]);
     setStreamStatus('loading');
-    return api.subscribeRuntimeStatus(server.id, setStatusRows, setStreamStatus);
-  }, [api, server.id]);
+    frameSeqRef.current = 0;
+    return api.subscribeRuntimeStatus(server.id, onStatusFrame, setStreamStatus);
+  }, [api, server.id, onStatusFrame]);
 
   // ---- File mode + feature negotiation (spec §9, §10.2) -------------------
   const {
@@ -926,7 +983,15 @@ export function RuntimeAdminSection({
       return;
     }
     absentSinceRef.current = null;
-    if (row.state === 'stopped') void finishRestart(restart);
+    // A TRANSITION, not a state: this effect re-runs the moment the phase
+    // flips to `waiting`, and the frame it then sees may well predate the
+    // force_stopped write it is supposed to be observing the effect of. The
+    // watermark accepts only a strictly later frame -- without it a restart
+    // of an already-resting spec fires both PUTs back to back, starts
+    // nothing, and reports success.
+    if (row.state === 'stopped' && frameSeqRef.current > restart.waitFrom) {
+      void finishRestart(restart);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusRows, restart]);
 
@@ -961,6 +1026,7 @@ export function RuntimeAdminSection({
       mappingId: spec.mapping_id,
       phase: 'stopping',
       deadline: Date.now() + RESTART_STOP_TIMEOUT_MS,
+      waitFrom: frameSeqRef.current,
     });
     try {
       const updated = await api.putRuntimeSpec(
@@ -968,8 +1034,13 @@ export function RuntimeAdminSection({
         specBodyWithAdminState(spec, 'force_stopped'),
       );
       if (!mountedRef.current) return;
+      // Read the watermark HERE, not inside the updater below: the updater may
+      // run a render later, by which time another frame could have arrived and
+      // a legitimate `stopped` transition would be skipped. What we want is
+      // "frames from after this write landed", which is exactly now.
+      const waitFrom = frameSeqRef.current;
       setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
-      setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting' } : cur));
+      setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting', waitFrom } : cur));
     } catch (err) {
       if (!mountedRef.current) return;
       showError(formatPortalError(err, t));
@@ -1520,7 +1591,16 @@ export function RuntimeAdminSection({
         key: 'restart',
         label: t.runtimeRestart,
         icon: <ReplayIcon fontSize="small" />,
-        disabled: overridesLocked,
+        // The state gate (see restartableStates): on `stopped`,
+        // `pending_vram_unknown` and `not_permitted` the agent can never
+        // report the `stopped` transition this sequence waits for, so
+        // clicking here would spin for two minutes, report a timeout, and
+        // leave the model admission-blocked behind a force_stopped override.
+        // Kept VISIBLE rather than hidden -- the row's own state is the
+        // explanation, and an action that silently comes and goes reads like
+        // a portal bug -- but never clickable there. `force_running`, offered
+        // above, is the action that does something on those three.
+        disabled: overridesLocked || !restartableStates.has(row.state),
         onClick: () => void startRestart(row.spec_id, spec),
       });
     }
