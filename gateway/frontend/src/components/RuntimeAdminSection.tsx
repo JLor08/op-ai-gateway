@@ -993,7 +993,9 @@ export function RuntimeAdminSection({
   type BudgetRow = { index: number; budgetMb: number; expectedUuid: string; expectedName: string };
   const [budgetRows, setBudgetRows] = useState<BudgetRow[]>([]);
   // Whether the operator has touched the rows since the last seed. Only the
-  // three mutators below set it; the seed and a successful save clear it.
+  // three mutators below set it, and only a successful save clears it -- the
+  // seed does NOT: it early-returns while the flag is up and leaves it alone,
+  // so the draft survives every later re-GET too, not just the first.
   const budgetRowsDirtyRef = useRef(false);
   // Re-seeds the editable rows whenever gpuBudgetsData gets a genuinely NEW
   // value. That has THREE triggers, not one (fix round 1, M9 -- this comment

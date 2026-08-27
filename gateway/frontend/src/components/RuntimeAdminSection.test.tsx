@@ -363,7 +363,20 @@ function renderSection(
     }),
     putGpuBudgets: vi.fn(async (_serverId: string, body: { budgets: GPUBudget[] }) => {
       putBudgets.push(body.budgets);
-      return { budgets: body.budgets };
+      // The authoritative post-save list is NOT the request body echoed back:
+      // expected_uuid/expected_name are a drift detector the BACKEND snapshots
+      // from telemetry the first time a budget row is created, so a row saved
+      // without them comes back carrying them. Echoing the body verbatim made
+      // "kept the draft" and "re-seeded from the server's answer" produce
+      // byte-identical DOM -- which is why the M9 re-seed test could not fail
+      // when the dirty-flag reset its own comment guards was deleted.
+      return {
+        budgets: body.budgets.map((b) => ({
+          ...b,
+          expected_uuid: b.expected_uuid || `GPU-${b.index}-UUID`,
+          expected_name: b.expected_name || `card-at-${b.index}`,
+        })),
+      };
     }),
     runtimeReport: vi.fn(() => {
       reportCalls += 1;
@@ -3487,6 +3500,16 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
 
     rerenderWithLocale(en);
     await waitFor(() => expect(fakeApi.gpuBudgets).toHaveBeenCalledTimes(2));
+    // `gpuBudgets` having been CALLED twice only means the re-GET was ISSUED.
+    // Its payload -- and the re-seed effect that is what would clobber the
+    // draft -- lands microtasks later, so without this flush the assertion
+    // below can read the field BEFORE the clobber and pass for the wrong
+    // reason. It made this test a 3-in-5 barrier against removing the guard.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
     // The draft is still the operator's, and Save still writes the complete
     // list they can actually see.
@@ -3509,9 +3532,17 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
     fireEvent.change(budgetField, { target: { value: '32000' } });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putBudgets).toHaveLength(1));
+    // Saved without a drift snapshot -- the loaded list had none.
+    expect(putBudgets[0]).toEqual([
+      { index: 0, budget_mb: 32000, expected_uuid: '', expected_name: '' },
+    ]);
 
     // The dirty flag must not survive the save, or the post-save list (which
     // carries the expected_* snapshots the backend takes) would never land.
+    // Asserting only the visible budget cannot see that: the draft and the
+    // server's answer agree about 32000 and differ ONLY in the expected_*
+    // fields, which this form does not render -- so the next Save's BODY is
+    // where "we re-seeded" and "we kept the draft" finally part company.
     await waitFor(() =>
       expect((screen.getByLabelText(t.runtimeGpuBudget) as HTMLInputElement).value).toBe('32000'),
     );
@@ -3519,7 +3550,12 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putBudgets).toHaveLength(2));
     expect(putBudgets[1]).toEqual([
-      { index: 0, budget_mb: 16000, expected_uuid: '', expected_name: '' },
+      {
+        index: 0,
+        budget_mb: 16000,
+        expected_uuid: 'GPU-0-UUID',
+        expected_name: 'card-at-0',
+      },
     ]);
   });
 });
