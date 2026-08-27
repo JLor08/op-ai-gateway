@@ -378,7 +378,7 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	}
 	if err := s.routes.CreateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			return ApplicationDTO{}, ErrApplicationConflict
+			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, "")
 		}
 		return ApplicationDTO{}, err
 	}
@@ -615,7 +615,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	app.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			return ApplicationDTO{}, ErrApplicationConflict
+			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, app.ID)
 		}
 		return ApplicationDTO{}, err
 	}
@@ -944,6 +944,55 @@ func (s *Service) serverAgentApplicationExistsOnServer(ctx context.Context, serv
 		}
 	}
 	return false, nil
+}
+
+// classifyApplicationWriteConflict turns the store's opaque ErrConflict from
+// Create/UpdateApplication into the sentinel that names the condition which
+// actually holds. `app` is the application as it was written (Type/Port/
+// ServerID post-mutation on the update path); excludeAppID is "" on create
+// and the application's own id on update.
+//
+// Two constraints on `applications` can produce ErrConflict, and they mean
+// completely different things to an operator: unique(server_id, port), and
+// migration 68's partial unique index on (server_id) where type =
+// 'server_agent' (MemoryStore.serverAgentApplicationExistsLocked on the
+// memory driver). Reporting the port code for the second one told the
+// operator "application port already in use" on a request where no port
+// collided.
+//
+// Classified by RE-READING the server's applications rather than by parsing
+// the driver's error text: sqlite, postgres and memory all surface the same
+// bare store.ErrConflict with no constraint name, and the text that does
+// exist is dialect-specific. The read is only paid on a request that has
+// already failed.
+//
+// Port first, deliberately: it is the constraint MemoryStore checks first,
+// SQL leaves the order undefined when both hold, and a request that really
+// does collide on a port must keep hearing so. When neither condition is
+// visible (a duplicate id -- unreachable with 32 hex of randomness -- or a
+// read failure) the answer stays ErrApplicationConflict, the behaviour before
+// this classification existed.
+func (s *Service) classifyApplicationWriteConflict(ctx context.Context, app routing.Application, excludeAppID string) error {
+	apps, err := s.routes.ApplicationsByServer(ctx, app.ServerID)
+	if err != nil {
+		return ErrApplicationConflict
+	}
+	serverAgentTaken := false
+	for _, existing := range apps {
+		if existing.ID == excludeAppID {
+			continue
+		}
+		if existing.Port == app.Port {
+			return ErrApplicationConflict
+		}
+		if existing.Type == routing.ProviderServerAgent {
+			serverAgentTaken = true
+		}
+	}
+	if app.Type == routing.ProviderServerAgent && serverAgentTaken {
+		return ErrServerAgentApplicationExists
+	}
+	return ErrApplicationConflict
 }
 
 func normalizeApplicationFlavors(raw []string) ([]string, error) {

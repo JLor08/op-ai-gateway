@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"op-ai-gateway/internal/routing"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -135,4 +136,123 @@ func TestAgentRuntimeConfigDeterminismRestsOnUniqueness(t *testing.T) {
 	if cfg.RouterListen != first.Port {
 		t.Fatalf("cfg.RouterListen = %d, want %d (the single server_agent application's port)", cfg.RouterListen, first.Port)
 	}
+}
+
+// raceWindowRoutingStore reproduces the TOCTOU window
+// serverAgentApplicationExistsOnServer's own doc comment describes: the
+// service gate reads, releases, and only then writes, so a concurrent writer
+// can land a server_agent application in between. Reads hide the server's
+// existing server_agent applications until a write is attempted -- exactly
+// what the LOSING request of that race observes -- while the store underneath
+// keeps enforcing the invariant, so the write fails with store.ErrConflict.
+//
+// One shape covers every driver: memory rejects the write through
+// MemoryStore.serverAgentApplicationExistsLocked, sqlite/postgres through
+// migration 68's partial unique index, and all three surface the identical
+// opaque store.ErrConflict -- which is why the portal's classification of it
+// cannot depend on the driver, and why testing it over the memory store is
+// not a memory-only assertion.
+type raceWindowRoutingStore struct {
+	routing.Store
+	hideServerAgent atomic.Bool
+}
+
+func (r *raceWindowRoutingStore) ApplicationsByServer(ctx context.Context, serverID string) ([]routing.Application, error) {
+	apps, err := r.Store.ApplicationsByServer(ctx, serverID)
+	if err != nil || !r.hideServerAgent.Load() {
+		return apps, err
+	}
+	visible := make([]routing.Application, 0, len(apps))
+	for _, app := range apps {
+		if app.Type != routing.ProviderServerAgent {
+			visible = append(visible, app)
+		}
+	}
+	return visible, nil
+}
+
+// CreateApplication and UpdateApplication close the window: by the time the
+// losing request reaches the store, the racing writer has committed, so every
+// read after that point -- the classification read included -- sees the truth.
+func (r *raceWindowRoutingStore) CreateApplication(ctx context.Context, app routing.Application) error {
+	r.hideServerAgent.Store(false)
+	return r.Store.CreateApplication(ctx, app)
+}
+
+func (r *raceWindowRoutingStore) UpdateApplication(ctx context.Context, app routing.Application) error {
+	r.hideServerAgent.Store(false)
+	return r.Store.UpdateApplication(ctx, app)
+}
+
+// openRaceWindow swaps svc's routing store for one that hides the server's
+// existing server_agent applications from the service-level gate, and returns
+// the wrapper so a test can re-open the window.
+func openRaceWindow(svc *Service, routeStore routing.Store) *raceWindowRoutingStore {
+	race := &raceWindowRoutingStore{Store: routeStore}
+	race.hideServerAgent.Store(true)
+	svc.routes = race
+	return race
+}
+
+// TestServerAgentWriteConflictReportsTheHonestCode is M7: when the invariant
+// is enforced by the STORE rather than by the service gate -- the race the
+// gate cannot close, on any of the three drivers -- the portal must still
+// name the condition that actually holds. Before this was classified, both
+// paths answered ErrApplicationConflict ("application.port_conflict":
+// "application port already in use") on a request where no port collided.
+//
+// The third subtest is the guard against over-classifying: when the request
+// really does collide on a port, the port code must still win, even though
+// the server_agent condition holds as well.
+func TestServerAgentWriteConflictReportsTheHonestCode(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	t.Run("create", func(t *testing.T) {
+		svc, routeStore := newServerTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		seedServerAgentApplication(t, routeStore, server.ID, now)
+		openRaceWindow(svc, routeStore)
+
+		// Port 9001, while the hidden server_agent application holds 9000: no
+		// port collides, so a port_conflict answer here is simply false.
+		_, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+			Type: routing.ProviderServerAgent, Port: 9001, Scheme: "http",
+		})
+		if !errors.Is(err, ErrServerAgentApplicationExists) {
+			t.Fatalf("create that lost the race: err = %v, want ErrServerAgentApplicationExists", err)
+		}
+	})
+
+	t.Run("retype", func(t *testing.T) {
+		svc, routeStore := newServerTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		seedServerAgentApplication(t, routeStore, server.ID, now)
+		plain, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+			Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+		})
+		if err != nil {
+			t.Fatalf("CreateApplication(vllm): %v", err)
+		}
+		openRaceWindow(svc, routeStore)
+
+		retype := routing.ProviderServerAgent
+		if _, err := svc.UpdateApplication(ctx, ownerToken(), plain.ID, UpdateApplicationRequest{Type: &retype}); !errors.Is(err, ErrServerAgentApplicationExists) {
+			t.Fatalf("retype that lost the race: err = %v, want ErrServerAgentApplicationExists", err)
+		}
+	})
+
+	t.Run("a real port collision still reports the port", func(t *testing.T) {
+		svc, routeStore := newServerTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+		openRaceWindow(svc, routeStore)
+
+		_, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+			Type: routing.ProviderServerAgent, Port: agent.Port, Scheme: "http",
+		})
+		if !errors.Is(err, ErrApplicationConflict) {
+			t.Fatalf("create colliding on port %d: err = %v, want ErrApplicationConflict", agent.Port, err)
+		}
+	})
 }

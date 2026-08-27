@@ -2983,11 +2983,14 @@ func migration67Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // PostgreSQL ≥ 9.5), so no dialect branch is needed. The index name is
 // lower-case and unquoted, so PostgreSQL's identifier folding is a non-issue.
 //
-// NOTE: if the index ever does fire, the SQL store classifies it as
-// ErrConflict, which the portal maps to "application.port_conflict" — a
-// misleading code. That is accepted: the service-layer gate returns the
-// honest sentinel on every reachable path, and distinguishing WHICH unique
-// constraint failed would mean parsing dialect-specific error text.
+// NOTE: when the index does fire, the SQL store can only surface the bare
+// ErrConflict — this index and unique(server_id, port) are indistinguishable
+// at that layer without parsing dialect-specific error text. The portal does
+// not parse it: portal.classifyApplicationWriteConflict re-reads the server's
+// applications and answers with the honest
+// "application.server_agent_exists", not the misleading
+// "application.port_conflict". See that function for why the port condition
+// is checked first.
 func migration68Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	row := tx.QueryRowContext(ctx, dl.rebind(`
 		select count(*) from (

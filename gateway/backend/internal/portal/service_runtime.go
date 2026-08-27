@@ -802,15 +802,34 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
-	// First match wins. That is DETERMINISTIC only because of the "at most one
-	// server_agent application per AI server" invariant enforced by
-	// CreateApplication/UpdateApplication (ErrServerAgentApplicationExists)
-	// and backed by the partial unique index from migration 68 -- it is not
-	// an arbitrary pick. Without that invariant this loop would silently
-	// choose by id ordering (ids are random hex, and the store orders by id),
-	// so runtime configuration edited under the other application would
-	// persist and never reach the agent. Do not relax the invariant without
-	// giving this lookup a real tie-break.
+	// First match wins. That is not an arbitrary pick: it is DETERMINISTIC
+	// only because of the "at most one server_agent application per AI
+	// server" invariant. Without it this loop would silently choose by id
+	// ordering (ids are random hex, and the store orders by id), so runtime
+	// configuration edited under the other application would persist and
+	// never reach the agent. Do not relax the invariant without giving this
+	// lookup a real tie-break.
+	//
+	// What actually backs that invariant, per driver -- stated precisely
+	// because it is NOT two layers everywhere:
+	//
+	//   - All three drivers: the portal gate on both write paths
+	//     (CreateApplication/UpdateApplication ->
+	//     ErrServerAgentApplicationExists). This is the only layer a future
+	//     write path that bypasses the portal service escapes, and it is not
+	//     race-free -- it reads, releases, then writes (see
+	//     serverAgentApplicationExistsOnServer).
+	//   - memory: MemoryStore.serverAgentApplicationExistsLocked, always.
+	//   - sqlite/postgres: migration 68's partial unique index, but ONLY on a
+	//     database that held no duplicates when migration 68 ran. The
+	//     migration deliberately SKIPS index creation when duplicates already
+	//     exist, and records version 68 anyway, so the skip is never retried.
+	//     Such a database has the portal gate alone -- the same single-layer
+	//     posture as a store with no constraint at all -- and this lookup IS
+	//     order-dependent there until the operator deletes the extra
+	//     application. That state is only reachable on a pre-invariant
+	//     development database of this branch, because 'server_agent' is not
+	//     writable in any released version; no request can create it now.
 	var agentApp *routing.Application
 	for i := range apps {
 		if apps[i].Type == routing.ProviderServerAgent {
