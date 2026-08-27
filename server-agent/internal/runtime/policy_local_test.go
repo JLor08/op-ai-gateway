@@ -4,7 +4,10 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -12,21 +15,81 @@ import (
 // TestPermitEmptyAllowlistRejectsEverything pins spec decision 2: an operator
 // who has configured no allowed binaries at all gets a hard refusal for
 // EVERY spec, not a permissive default. The error must name the allowlist
-// (so the operator understands WHY, not just THAT it failed) and must not
-// depend on WorkDir/AllowedDirs at all -- the binary check comes first.
+// (so the operator understands WHY, not just THAT it failed) and must name
+// the refused binary.
+//
+// A TABLE, not one spec: "rejects everything" is a claim about the whole
+// input space, and a single well-formed spec cannot support it. The rows
+// below vary every field that any OTHER branch of Permit looks at -- binary
+// shape (absolute, relative, empty, one that would be allowed under a
+// configured list), work_dir (set, empty, traversal-shaped), and the
+// AllowedDirs half of the policy -- so a future edit that accidentally lets
+// any of them reach a permit decision before the empty-allowlist gate fails
+// here instead of shipping.
 func TestPermitEmptyAllowlistRejectsEverything(t *testing.T) {
-	p := LocalPolicy{}
-	spec := Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: "/srv/models"}
+	cases := []struct {
+		name string
+		p    LocalPolicy
+		spec Spec
+	}{
+		{"absolute binary, work_dir set", LocalPolicy{}, Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: "/srv/models"}},
+		{"absolute binary, no work_dir", LocalPolicy{}, Spec{ID: "s2", Binary: "/usr/bin/ollama"}},
+		{"relative binary", LocalPolicy{}, Spec{ID: "s3", Binary: "ollama"}},
+		{"empty binary", LocalPolicy{}, Spec{ID: "s4", Binary: ""}},
+		{"traversal-shaped work_dir", LocalPolicy{}, Spec{ID: "s5", Binary: "/usr/bin/ollama", WorkDir: "/srv/models/../../etc"}},
+		{"AllowedDirs configured but AllowedBinaries empty", LocalPolicy{AllowedDirs: []string{"/srv/models"}}, Spec{ID: "s6", Binary: "/usr/bin/ollama", WorkDir: "/srv/models"}},
+		{"nil AllowedBinaries slice, work_dir inside an allowed dir", LocalPolicy{AllowedBinaries: nil, AllowedDirs: []string{"/srv/models"}}, Spec{ID: "s7", Binary: "/usr/bin/vllm", WorkDir: "/srv/models/llama3"}},
+		{"pinned, force_running spec", LocalPolicy{}, Spec{ID: "s8", Binary: "/usr/bin/ollama", WorkDir: "/srv/models", Pinned: true, AdminState: "force_running"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.p.Permit(tc.spec)
+			if err == nil {
+				t.Fatalf("Permit(%+v) with an empty allowlist = nil, want a refusal", tc.spec)
+			}
+			if !strings.Contains(err.Error(), "allowlist") {
+				t.Errorf("Permit error = %q, want it to mention the allowlist (the operator needs to know WHY, not just THAT)", err.Error())
+			}
+			if !strings.Contains(err.Error(), tc.spec.Binary) {
+				t.Errorf("Permit error = %q, want it to name the refused binary %q", err.Error(), tc.spec.Binary)
+			}
+			if !strings.Contains(err.Error(), "OP_AGENT_RUNTIME_ALLOWED_BINARIES") {
+				t.Errorf("Permit error = %q, want it to name the setting an operator must configure", err.Error())
+			}
+		})
+	}
+}
 
-	err := p.Permit(spec)
+// TestPermitEmptyWorkDirHasItsOwnMessage pins the improved diagnostic: an
+// absent work_dir under a configured AllowedDirs must say so, not render as
+// `work_dir "" is not within any allowed directory` (which reads like a
+// containment near-miss). This text is the only explanation an operator
+// gets -- it surfaces verbatim as Status.LastError.Message next to
+// StateNotPermitted -- so it must name the agent-side setting, and must NOT
+// leak the configured directory VALUES upward to the gateway.
+func TestPermitEmptyWorkDirHasItsOwnMessage(t *testing.T) {
+	p := LocalPolicy{
+		AllowedBinaries: []string{"/usr/bin/ollama"},
+		AllowedDirs:     []string{"/srv/models", "/data/weights"},
+	}
+	err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: ""})
 	if err == nil {
-		t.Fatal("Permit with an empty allowlist should refuse every spec")
+		t.Fatal("Permit with an empty work_dir under a configured AllowedDirs = nil, want a refusal")
 	}
-	if !strings.Contains(err.Error(), "allowlist") {
-		t.Errorf("Permit error = %q, want it to mention the allowlist", err.Error())
+	msg := err.Error()
+	if !strings.Contains(msg, "no work_dir") {
+		t.Errorf("Permit error = %q, want it to state plainly that the spec sets no work_dir", msg)
 	}
-	if !strings.Contains(err.Error(), spec.Binary) {
-		t.Errorf("Permit error = %q, want it to name the binary %q", err.Error(), spec.Binary)
+	if !strings.Contains(msg, "OP_AGENT_RUNTIME_ALLOWED_DIRS") {
+		t.Errorf("Permit error = %q, want it to name the agent-side setting that caused the restriction", msg)
+	}
+	for _, dir := range p.AllowedDirs {
+		if strings.Contains(msg, dir) {
+			t.Errorf("Permit error = %q leaks the configured allowed directory %q; this message travels to the gateway", msg, dir)
+		}
+	}
+	if strings.Contains(msg, `work_dir "" is not within`) {
+		t.Errorf("Permit error = %q is still the generic containment wording", msg)
 	}
 }
 
@@ -132,6 +195,36 @@ func TestPermitWorkDirContainment(t *testing.T) {
 				t.Errorf("Permit(work_dir=%q) = nil, want an error (not permitted)", tc.workDir)
 			}
 		})
+	}
+}
+
+// TestPermitDoesNotResolveSymlinksAcceptedResidualRisk pins the DELIBERATE
+// gap withinDir documents: containment is a lexical check, so a symlink
+// under an allowed dir that points outside it is permitted. This test exists
+// so the acceptance is visible in the suite rather than only in a comment --
+// anyone who "fixes" it by adding filepath.EvalSymlinks fails here and is
+// sent to withinDir's doc comment, which explains why that fix would trade
+// an honest lexical check for a TOCTOU window that merely LOOKS enforced.
+func TestPermitDoesNotResolveSymlinksAcceptedResidualRisk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows; the lexical check itself is platform-independent")
+	}
+	root := t.TempDir()
+	allowed := filepath.Join(root, "allowed")
+	outside := filepath.Join(root, "outside")
+	for _, d := range []string{allowed, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	escape := filepath.Join(allowed, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("symlinks unavailable in this environment: %v", err)
+	}
+
+	p := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{allowed}}
+	if err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: escape}); err != nil {
+		t.Fatalf("Permit(work_dir=%q, a symlink out of the allowed dir) = %v, want nil -- containment is lexical BY DESIGN (see withinDir's doc comment: EvalSymlinks would introduce a TOCTOU window, and AllowedBinaries, not work_dir, is the boundary). If this failure is intentional, update withinDir's comment and §11.4 together with it.", escape, err)
 	}
 }
 

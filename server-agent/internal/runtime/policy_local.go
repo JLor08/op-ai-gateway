@@ -72,6 +72,22 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	if len(p.AllowedDirs) == 0 {
 		return nil
 	}
+	// An empty work_dir gets its own message. It falls out of withinDir as
+	// "not contained" (correctly -- the child would inherit the AGENT's
+	// working directory, which is typically "/" for a service and is
+	// certainly not inside a permitted model directory), but the generic
+	// wording rendered as `work_dir "" is not within any allowed
+	// directory`, which reads like a containment near-miss rather than
+	// "the spec never set one". This message surfaces verbatim in the
+	// portal as Status.LastError.Message next to StateNotPermitted, so it
+	// is the only explanation an operator gets. It names the agent-side
+	// setting (as the empty-allowlist message above already does) but
+	// deliberately NOT the configured directory VALUES: the allowlist is
+	// the agent operator's local filesystem layout, and this text travels
+	// upward to the gateway.
+	if spec.WorkDir == "" {
+		return fmt.Errorf("runtime: spec sets no work_dir, but this agent restricts work directories to %d configured path(s) (runtime_allowed_dirs / OP_AGENT_RUNTIME_ALLOWED_DIRS); set the spec's work_dir to a path inside one of them", len(p.AllowedDirs))
+	}
 	for _, dir := range p.AllowedDirs {
 		if withinDir(spec.WorkDir, dir) {
 			return nil
@@ -86,6 +102,39 @@ func (p LocalPolicy) Permit(spec Spec) error {
 // path-separator boundary rather than a bare string prefix -- otherwise
 // "/srv/models-evil" would read as inside "/srv/models" merely because the
 // raw strings share a prefix.
+//
+// SYMLINKS ARE DELIBERATELY NOT RESOLVED -- accepted residual risk, recorded
+// here so the next reader does not have to rediscover the reasoning (Task 13
+// decision; catalogued in docs/architecture/11-risks-and-technical-debt.md
+// §11.4 alongside the other deliberate acceptances).
+//
+// The gap: a symlink at, or under, an allowed dir can point outside it, so a
+// spec whose work_dir passes this lexical check can still give the child a
+// working directory elsewhere on the filesystem.
+//
+// Why not filepath.EvalSymlinks: that call resolves the path as it exists AT
+// CHECK TIME, and os/exec applies cmd.Dir at START time. Anything that can
+// rewrite the symlink between those two moments defeats the check while
+// making it LOOK enforced -- a textbook TOCTOU window, and a strictly worse
+// position than the honest lexical check, because it would invite treating
+// containment as a security boundary rather than the operator-convenience
+// guard it is. (It would also break the legitimate case of an allowed dir
+// that is itself a symlink to a mounted volume, which the lexical check
+// accepts as written.)
+//
+// Why that is acceptable: work_dir containment is defense in depth, not the
+// boundary. The boundary is AllowedBinaries -- an exact, absolute-path match
+// against a list that comes ONLY from the agent's own local config, never
+// from the gateway (LocalPolicy's doc comment). A gateway-supplied spec
+// cannot choose WHAT executes; work_dir only influences where an
+// already-allowlisted binary resolves relative paths. An attacker who can
+// plant symlinks under the operator's model directory already has local
+// write access there.
+//
+// The non-TOCTOU fix would be openat/O_NOFOLLOW-based resolution plus fchdir
+// in the child, which os/exec's cmd.Dir cannot express portably; it is a
+// platform-specific change well beyond this guard's value. If containment
+// ever needs to BE a boundary, that is the direction -- not EvalSymlinks.
 func withinDir(candidate, dir string) bool {
 	if candidate == "" || dir == "" {
 		return false
