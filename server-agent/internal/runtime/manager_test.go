@@ -1873,3 +1873,224 @@ func TestManagerDeletesARemovedSpecWhoseChildDiesUnintentionally(t *testing.T) {
 		return statusFor(m, "spec-a") == nil
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 2.
+// ---------------------------------------------------------------------------
+
+// TestManagerHealthyGenerationDrainedAfterItsOwnExitIsStillACrash is fix round
+// 2's G1: the test the round-1 M6 fix was landed WITHOUT, on the argument that
+// the interleaving it guards is unreachable. It is reachable, and this is the
+// interleaving.
+//
+// The claim was that a discarded ok start result implies beginDrain terminated
+// the generation at once and therefore set intentionalStop, so onProcExited
+// never reads wasHealthy. terminateNow breaks it: its already-exited early
+// return (M2, part 1 -- do not signal a PID the OS may have recycled) returns
+// WITHOUT setting intentionalStop. So a generation whose child is already gone
+// when the drain command finally runs lands on the NON-intentional branch,
+// which classifies by proc.everHealthy.
+//
+// FIFO orders the command queue, not wall-clock events. m.cmds is unbuffered,
+// so anything that stalls the owner parks every event behind it -- and
+// buildSnapshot's measurer call sits INSIDE admitAndStart, ahead of the same
+// call's Evict/beginDrain, so one command can stall, let the child become
+// healthy AND die, and only then drain it. In production the stall is any slow
+// measurer (nvidia-smi), a concurrent exec, or a long applyConfig; the child
+// needs only to answer /health and then die, e.g. an OOM after load.
+//
+// Without the line the spec is reported as start_failed ("exited before
+// becoming healthy") for a generation that demonstrably passed a health probe,
+// and its queued request is failed with ErrStartFailed -- a 503 -- instead of
+// surviving the backoff and succeeding on the restart. That is the exact
+// inversion I4 exists to prevent
+// (TestManagerCrashDuringDrainIsClassifiedAsCrashNotStartFailure is the same
+// invariant reached through the drainGrace path instead).
+//
+// Vehicle: two matrix-incompatible specs, so admitting B evicts an idle A
+// (Admit rule 1) from inside the very admitAndStart the measurer stalls.
+func TestManagerHealthyGenerationDrainedAfterItsOwnExitIsStillACrash(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	// Wide enough that the post-exit classification is observable: with
+	// shrinkTimings' 60ms base, the retry would clear st.lastError (the ok
+	// branch of handleStartResult) before any assertion could read it.
+	setBackoffWindow(t, 1500*time.Millisecond)
+	m := newTestManager(t, allowlistPolicy())
+
+	specA := baseSpec("spec-a", "model-a")
+	// Healthy at ~250ms, exits on its own at ~700ms. The 450ms gap is what
+	// orders the two parked events: the manager's own health poll runs on a
+	// 20ms cadence (shrinkTimings), so its ok result is provably posted --
+	// and parked -- well before the child dies and proc.exited closes.
+	specA.Args = stubArgs(250*time.Millisecond, 700*time.Millisecond, 9, "")
+	specB := baseSpec("spec-b", "model-b")
+	// No coresident pair -> A and B are matrix-incompatible.
+	m.Apply(Config{Specs: []Spec{specA, specB}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Request model-a: starts the child and leaves the request QUEUED. spec-a
+	// is Starting, not Running, so nothing increments InFlight -- which is
+	// what keeps spec-a evictable when B's admission arrives.
+	aResult := make(chan error, 1)
+	go func() {
+		_, _, err := m.EnsureRunning(ctx, "model-a")
+		aResult <- err
+	}()
+	waitUntil(t, 3*time.Second, "spec-a's child is Starting", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStarting && st.Port != 0
+	})
+	endpointA := endpointFor(statusFor(m, "spec-a").Port)
+
+	// Stall the owner inside admitAndStart. Installed only now: the measurer
+	// is an atomic swap needing no owner round-trip, and buildSnapshot is
+	// reached ONLY from admitAndStart -- whose st.proc != nil / wantUp early
+	// returns precede it -- so the first call is B's admission below.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered AFTER newTestManager's t.Cleanup(m.Close): cleanups run LIFO,
+	// so a t.Fatal anywhere below still frees the owner before Close waits on
+	// it. Without this, one failing assertion would hang the test binary.
+	t.Cleanup(releaseOwner)
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return nil
+	})
+
+	bResult := make(chan error, 1)
+	go func() {
+		_, releaseB, err := m.EnsureRunning(ctx, "model-b")
+		if releaseB != nil {
+			// Idle at once, so spec-a's own retry can evict B straight back.
+			releaseB()
+		}
+		bResult <- err
+	}()
+	<-entered
+
+	// The owner is now stalled mid-admission. Watch spec-a's child directly --
+	// Status() is answered ON the owner goroutine and would block here.
+	waitUntil(t, 3*time.Second, "spec-a's child is answering /health (its ok start result is parked)", func() bool {
+		return httpGetOK(endpointA, "/health")
+	})
+	waitUntil(t, 3*time.Second, "spec-a's child has exited (proc.exited is closed, its exit report parked behind the ok result)", func() bool {
+		return !httpGetOK(endpointA, "/health")
+	})
+	releaseOwner()
+
+	// Now: Admit evicts spec-a -> beginDrain -> terminateNow returns early on
+	// the closed proc.exited without setting intentionalStop -> the parked ok
+	// result is discarded for a draining spec -> the parked exit is classified.
+	waitUntil(t, 4*time.Second, "spec-a's exit is classified", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.LastError != nil
+	})
+	st := statusFor(m, "spec-a")
+	if st.LastError.ExitCode != 9 {
+		t.Fatalf("Status()[spec-a].LastError = %+v, want ExitCode=9 (the scripted crash) -- the observed exit is not the one this test set up", st.LastError)
+	}
+	if !strings.Contains(st.LastError.Message, "unexpectedly") {
+		t.Fatalf("Status()[spec-a].LastError.Message = %q, want it to report a crash -- BUG G1/M6: the ok start result is discarded for a draining generation WITHOUT first recording proc.everHealthy, so a child that passed a health probe and then died is reported as never having become healthy", st.LastError.Message)
+	}
+	if st.State != StateCrashed && st.State != StateBackoff {
+		t.Errorf("Status()[spec-a].State = %v, want crashed (or backoff, immediately after), not start_failed", st.State)
+	}
+
+	// Sanity, true in either tree: the eviction this interleaving is built on
+	// actually completed and B was admitted once A's process was gone.
+	select {
+	case err := <-bResult:
+		if err != nil {
+			t.Fatalf("EnsureRunning(model-b) = %v, want it admitted once the eviction completed -- the drain this test relies on did not happen", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("EnsureRunning(model-b) never resolved -- the eviction this test relies on did not happen")
+	}
+
+	// The user-visible half: the queued request must survive the backoff and
+	// be answered by the restart, not failed with a 503 by failPending on the
+	// start_failed branch.
+	select {
+	case err := <-aResult:
+		if errors.Is(err, ErrStartFailed) {
+			t.Fatalf("EnsureRunning(model-a) = %v -- BUG G1/M6: the misclassification routes the queued request through failPending(ErrStartFailed), so a request whose model was healthy seconds ago gets a 503 instead of the restart", err)
+		}
+	case <-time.After(4 * time.Second):
+		// Still queued is also correct: the point is that it was not failed.
+	}
+}
+
+// TestManagerCloseDoesNotWaitOutTheBackoffOfADeletedSpec is fix round 2's G2,
+// and it is PRE-EXISTING (not a defect of this batch). It is
+// TestManagerCloseDoesNotWaitOutACrashBackoff's sibling, one door further
+// along: a backoff timer must never outlive its spec, and there are two ways
+// for a spec to stop existing.
+//
+// enterBackoff's closing guard covers the first (the agent is shutting down).
+// The second is the operator deleting the spec: applyConfig's removal loop
+// drops a spec with proc == nil straight out of o.specs, and handleClose only
+// cancels the backoff timers of specs still IN o.specs. The orphaned timer is
+// registered in m.wg, which Close() ends by waiting on -- so deleting a
+// crash-looping spec in the portal and then stopping the agent makes shutdown
+// hang for the rest of the backoff delay (up to backoffCap, 60s with
+// production defaults) with nothing left to retry.
+func TestManagerCloseDoesNotWaitOutTheBackoffOfADeletedSpec(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setBackoffWindow(t, 4*time.Second) // an observable hang if Close waits it out
+
+	// Not newTestManager: this test measures Close() itself, so it owns when
+	// Close runs (and the defer below runs before shrinkTimings' restore).
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }})
+	closed := false
+	defer func() {
+		if !closed {
+			m.Close()
+		}
+	}()
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 150*time.Millisecond, 9, "") // healthy at once, crashes at ~150ms
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	release() // InFlight back to zero, so the crash is the only event left
+
+	waitUntil(t, 4*time.Second, "spec-a is waiting out its crash-backoff", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateBackoff
+	})
+
+	m.Apply(Config{}) // the operator deletes the crash-looping spec
+	waitUntil(t, 2*time.Second, "spec-a is gone from Status()", func() bool {
+		return statusFor(m, "spec-a") == nil
+	})
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		m.Close()
+		done <- time.Since(start)
+	}()
+
+	select {
+	case took := <-done:
+		closed = true
+		if took > 2*time.Second {
+			t.Fatalf("Close() took %s -- BUG: applyConfig's removal loop deletes a spec without cancelling its backoff timer, and handleClose can no longer reach that timer, so Close's wg.Wait() waits out the whole remaining delay (backoffCap, 60s by default) for a spec that no longer exists", took)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() has blocked for over 2s -- BUG: applyConfig's removal loop deletes a spec without cancelling its backoff timer, and handleClose only cancels the timers of specs still in o.specs, so Close's wg.Wait() waits out the whole remaining delay for a spec that no longer exists")
+	}
+}

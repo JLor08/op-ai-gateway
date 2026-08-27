@@ -714,6 +714,25 @@ func (o *owner) applyConfig(cfg Config) {
 			st.removed = true
 			o.beginDrain(id)
 		} else {
+			// G2 fix (fix round 2, and PRE-EXISTING rather than a defect of
+			// this batch): A BACKOFF TIMER MUST NEVER OUTLIVE ITS SPEC. It is
+			// registered in m.wg, which Close() ends by waiting on, and
+			// handleClose can only cancel the timers of specs still IN
+			// o.specs -- so deleting a spec that is waiting out a crash
+			// backoff (proc == nil, StateBackoff) orphaned its retry timer and
+			// made the NEXT Close block for the whole remaining delay (up to
+			// backoffCap, 60s with production defaults) with nothing left to
+			// retry: delete a crash-looping spec in the portal, then stop the
+			// agent, and shutdown hangs for a minute. Sibling of
+			// enterBackoff's own closing guard -- same invariant, the other
+			// way for a spec to stop existing.
+			//
+			// Only this deletion site needs it. onProcExited's removed branch
+			// deletes a spec whose proc was live, and a spec with a live proc
+			// never has a backoff timer (enterBackoff defers to backoffOnExit
+			// while st.proc != nil, and handleBackoffFire clears the timer
+			// before admitAndStart can start anything).
+			cancelTimer(o.m, &st.backoffTimer)
 			// C2 fix: resolve any queued waiter before dropping the spec --
 			// otherwise it (and even its own admission_wait_timeout, since
 			// handleWaiterTimeout is itself a no-op once the spec is gone)
@@ -1314,14 +1333,31 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// it too would leave a generation that WAS healthy classified, on a
 		// non-intentional exit, as "exited before becoming healthy".
 		//
-		// No reachable behavior depends on this today, and no test can
-		// therefore fail on it: a discarded ok result implies the generation
-		// never reached StateRunning, hence st.inFlight == 0 (only the Running
-		// fast path and succeedPending increment it), hence beginDrain
-		// terminated it at once and set intentionalStop -- and wasHealthy is
-		// only ever read on the NON-intentional branch. That is a chain of
-		// four other invariants; the field is cheaper to keep honest than the
-		// chain is to keep verified.
+		// LOAD-BEARING, and this comment used to claim the exact opposite
+		// (fix round 2, G1): that no reachable behavior depends on the line
+		// and no test can therefore fail on it -- an invitation to delete a
+		// guard a test now covers
+		// (TestManagerHealthyGenerationDrainedAfterItsOwnExitIsStillACrash).
+		//
+		// The argument was that a discarded ok result implies st.inFlight == 0,
+		// hence that beginDrain terminated the generation at once and set
+		// intentionalStop, and that wasHealthy is only read on the
+		// NON-intentional branch. It breaks at terminateNow: its
+		// already-exited early return (M2, part 1) returns WITHOUT setting
+		// intentionalStop, so a generation whose child is ALREADY GONE when
+		// the drain runs lands on exactly that non-intentional branch.
+		//
+		// FIFO orders the command queue, not wall-clock events. m.cmds is
+		// unbuffered, so anything that stalls the owner parks every event
+		// behind it -- and buildSnapshot's measurer call sits inside
+		// admitAndStart, ahead of the same call's Evict/beginDrain, so ONE
+		// command can stall, let the child pass its health probe and then die,
+		// and only then drain it. In production that stall is any slow
+		// measurer (nvidia-smi), a concurrent exec, or a long applyConfig; the
+		// child needs only to answer /health and then die, e.g. an OOM after
+		// load. Without this line that child is reported as start_failed and
+		// its queued request is failed with ErrStartFailed (a 503) instead of
+		// surviving the backoff -- the exact inversion I4 exists to prevent.
 		c.proc.everHealthy = true
 	}
 	if st.state == StateDraining {
@@ -1516,6 +1552,13 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 // drains via the drainGrace path, which does not set intentionalStop (only
 // terminateNow does, and it has not run yet), so a child that crashes in
 // that window lands as a NON-intentional exit -> StateCrashed -> here.
+//
+// The general rule both halves serve (see also applyConfig's removal loop,
+// fix round 2's G2): a backoff timer must never outlive its spec. It is
+// tracked in m.wg, and handleClose can only reach the timers of specs still
+// in o.specs -- so whether the spec stops existing because the agent is
+// shutting down or because the operator deleted it, the timer has to be
+// refused or cancelled at that moment, not left to fire into nothing.
 //
 // proc != nil: StateBackoff means "nothing of this spec is running, waiting
 // to retry". handleStartResult's start-timeout path used to enter backoff
