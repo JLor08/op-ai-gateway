@@ -105,7 +105,35 @@ export const RESTART_VANISH_GRACE_MS = 8_000;
  */
 export const OVERRIDE_WRITE_TIMEOUT_MS = 30_000;
 
-type GpuRow = { index: number; vramEstimateMb: number; vramMeasuredMb: number };
+/**
+ * A render-only identity for one row of the two editable row lists (a spec's
+ * GPU rows and a server's GPU budgets).
+ *
+ * Both lists support MID-LIST removal (`rows.filter((_, i) => i !== idx)`), and
+ * an array index is not an identity there: deleting row n shifts every later
+ * row down, so a `key={idx}` makes React reconcile row n+1's data onto row n's
+ * element and destroy the LAST element rather than the deleted one. Everything
+ * the DOM node owns rather than the props then lands on the wrong row -- focus
+ * and caret above all, which is what an operator mid-edit actually notices
+ * (Sonar typescript:S6479). The `index` field cannot serve as the key either:
+ * it is operator-editable and deliberately allowed to collide while two rows
+ * are being swapped (see `updateGpuRow`).
+ *
+ * Process-local and never sent anywhere: the PUT bodies carry `index` /
+ * `budget_mb` only, so this counter has no meaning outside one page load.
+ */
+let nextRowKey = 0;
+function makeRowKey(): string {
+  nextRowKey += 1;
+  return `row-${nextRowKey}`;
+}
+
+type GpuRow = {
+  rowKey: string;
+  index: number;
+  vramEstimateMb: number;
+  vramMeasuredMb: number;
+};
 
 // The sole warning code RuntimeWarnings emits today (see
 // gateway/backend/internal/portal/service_runtime.go); an unmapped future
@@ -1004,7 +1032,13 @@ export function RuntimeAdminSection({
     (gpuBudgetsData ?? []).map((b) => [b.index, b.budget_mb]),
   );
 
-  type BudgetRow = { index: number; budgetMb: number; expectedUuid: string; expectedName: string };
+  type BudgetRow = {
+    rowKey: string;
+    index: number;
+    budgetMb: number;
+    expectedUuid: string;
+    expectedName: string;
+  };
   const [budgetRows, setBudgetRows] = useState<BudgetRow[]>([]);
   // Whether the operator has touched the rows since the last seed. Only the
   // three mutators below set it, and only a successful save clears it -- the
@@ -1033,6 +1067,7 @@ export function RuntimeAdminSection({
     if (budgetRowsDirtyRef.current) return;
     setBudgetRows(
       gpuBudgetsData.map((b) => ({
+        rowKey: makeRowKey(),
         index: b.index,
         budgetMb: b.budget_mb,
         expectedUuid: b.expected_uuid,
@@ -1056,6 +1091,7 @@ export function RuntimeAdminSection({
         return [
           ...rows,
           {
+            rowKey: makeRowKey(),
             index: fromTelemetry.index,
             budgetMb: Math.round(fromTelemetry.memory_total_bytes / (1024 * 1024)),
             expectedUuid: '',
@@ -1065,7 +1101,10 @@ export function RuntimeAdminSection({
       }
       let index = 0;
       while (used.has(index)) index++;
-      return [...rows, { index, budgetMb: 0, expectedUuid: '', expectedName: '' }];
+      return [
+        ...rows,
+        { rowKey: makeRowKey(), index, budgetMb: 0, expectedUuid: '', expectedName: '' },
+      ];
     });
   }
   function removeBudgetRow(idx: number) {
@@ -1617,6 +1656,7 @@ export function RuntimeAdminSection({
     setVramLocked(spec.vram_locked);
     setGpuRows(
       spec.gpus.map((g) => ({
+        rowKey: makeRowKey(),
         index: g.index,
         vramEstimateMb: g.vram_estimate_mb,
         vramMeasuredMb: g.vram_measured_mb,
@@ -1680,7 +1720,7 @@ export function RuntimeAdminSection({
       const used = new Set(rows.map((r) => r.index));
       let index = 0;
       while (used.has(index)) index++;
-      return [...rows, { index, vramEstimateMb: 0, vramMeasuredMb: 0 }];
+      return [...rows, { rowKey: makeRowKey(), index, vramEstimateMb: 0, vramMeasuredMb: 0 }];
     });
   }
   function removeGpuRow(idx: number) {
@@ -2498,7 +2538,7 @@ export function RuntimeAdminSection({
               </Typography>
               {gpuRows.map((row, idx) => (
                 <Box
-                  key={idx}
+                  key={row.rowKey}
                   sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                 >
                   <Field
@@ -2927,7 +2967,7 @@ export function RuntimeAdminSection({
                   const live = driftFor(row);
                   return (
                     <Box
-                      key={idx}
+                      key={row.rowKey}
                       sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                     >
                       <Field

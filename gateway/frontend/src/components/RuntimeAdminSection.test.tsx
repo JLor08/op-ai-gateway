@@ -3778,3 +3778,85 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     expect(deletedMappingIds).toEqual(['map_1']);
   });
 });
+
+// Sonar typescript:S6479 (task 24e §4.2): both editable row lists were keyed by
+// their ARRAY INDEX while supporting mid-list removal (`rows.filter((_, i) => i
+// !== idx)`). An index is not an identity there: deleting row n shifts every
+// later row down, so React reconciles row n+1's data onto row n's element and
+// DESTROYS the last element instead of the deleted one. Everything the DOM node
+// owns rather than the props -- focus, caret, selection -- therefore lands on
+// the wrong row, or nowhere, exactly when the operator is mid-edit.
+//
+// Both tests below assert the surviving rows' VALUES (which a controlled input
+// renders correctly either way) AND the node identity (which is what the index
+// key actually broke): the node the operator was typing into must still be in
+// the document, still hold its own row, and still have focus.
+describe('RuntimeAdminSection row identity across a mid-list delete (Sonar S6479)', () => {
+  it('keeps every surviving GPU row on its own values and its own DOM node', async () => {
+    renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    for (let i = 0; i < 3; i += 1) {
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    }
+    // addGpuRow proposes indices 0/1/2; give each row a distinct VRAM so a
+    // misbinding is visible in the values and not just in the row count.
+    ['1000', '2000', '3000'].forEach((mb, i) => {
+      fireEvent.change(
+        screen.getByLabelText(t.runtimeSpecVram, { selector: `#runtime-spec-gpu-vram-${i}` }),
+        { target: { value: mb } },
+      );
+    });
+
+    // The operator is editing the LAST row when they remove the middle one.
+    const editing = screen.getByLabelText(t.runtimeSpecVram, {
+      selector: '#runtime-spec-gpu-vram-2',
+    }) as HTMLInputElement;
+    editing.focus();
+    expect(document.activeElement).toBe(editing);
+
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecGpuRemove })[1]);
+
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecGpuIndex) as HTMLInputElement[]).map((el) => el.value),
+    ).toEqual(['0', '2']);
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecVram) as HTMLInputElement[]).map((el) => el.value),
+    ).toEqual(['1000', '3000']);
+    // The node the operator was in survived the delete, still carries its own
+    // row, and kept the caret. With an index key React removes THIS node and
+    // rebinds row 2's values onto row 1's node instead.
+    expect(editing.isConnected).toBe(true);
+    expect(editing.value).toBe('3000');
+    expect(document.activeElement).toBe(editing);
+  });
+
+  it('keeps every surviving GPU-budget row on its own values and its own DOM node', async () => {
+    renderSection({
+      gpuBudgets: [
+        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
+        { index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
+        { index: 2, budget_mb: 30000, expected_uuid: '', expected_name: '' },
+      ],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    const editing = (await screen.findByLabelText(t.runtimeGpuBudget, {
+      selector: '#runtime-budget-mb-2',
+    })) as HTMLInputElement;
+    editing.focus();
+    expect(document.activeElement).toBe(editing);
+
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecGpuRemove })[1]);
+
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecGpuIndex) as HTMLInputElement[]).map((el) => el.value),
+    ).toEqual(['0', '2']);
+    expect(
+      (screen.getAllByLabelText(t.runtimeGpuBudget) as HTMLInputElement[]).map((el) => el.value),
+    ).toEqual(['10000', '30000']);
+    expect(editing.isConnected).toBe(true);
+    expect(editing.value).toBe('30000');
+    expect(document.activeElement).toBe(editing);
+  });
+});
