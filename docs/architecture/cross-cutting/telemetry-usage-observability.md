@@ -210,6 +210,64 @@ negative values are rejected outright for required scalars, and silently coerced
 `CPUTempC`) — a single bad sensor reading degrades gracefully rather than
 poisoning the persisted series.
 
+The sample also carries two **additive** keys for the
+[agent-managed model runtime](agent-runtime-manager.md), both recorded only
+*after* every store write in the ingest has succeeded — a report is evidence, and
+evidence is not stamped on a failed write:
+
+- **`capabilities`** — parsed tolerantly as `{"features":[…]}`. Anything
+  malformed, wrongly shaped or absent yields an empty feature set and never
+  rejects the sample; every other key is ignored, so a new capability key is a
+  backward-compatible addition. `AgentFeatures.Set` is a **full-snapshot
+  replace**, never a merge. Do not add a version here: the agent version rides on
+  the sample's top-level `agent_version`, which is what is persisted and
+  rendered.
+- **`runtimes`** — one entry per managed spec: `spec_id`, `model`, `state`,
+  `since`, `pid`/`port` (omitted when there is no live process), `in_flight`,
+  `restarts`, `gpus[]` of `{index, vram_measured_mb}` (omitted when nothing was
+  measured this cycle, and explicitly sorted by index because it is built from a
+  Go map), and `last_error` of `{message, at, exit_code, failures, stderr_tail}`.
+  When a runtime driver is active it **also overrides `loaded_models`** to
+  contain only specs in state `running` — `starting` deliberately does not count,
+  because prefer-loaded routing must never send traffic to a model that cannot
+  answer yet.
+
+Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
+
+1. With **no** runtime driver the sample is byte-identical to the pre-feature
+   shape — the key is absent entirely, not `null` and not `[]`. That is the
+   compatibility guarantee for every agent that never negotiates the feature, and
+   it is pinned by a test asserting the marshalled JSON never contains the
+   substring `"runtimes"`.
+2. For an agent that *does* support the feature, **every sample must carry the
+   full current snapshot.** Omitting the key is additive at the schema level but
+   *replaces* the gateway's per-server status snapshot with empty at the
+   behaviour level — there is no "leave it as it was" option, which is why the SSE
+   `snapshot` and `update` frames carry the identical shape. A bandwidth
+   optimisation that sends `runtimes` "only when changed" makes the portal's live
+   runtime table visibly flicker empty between ~1 s samples, and looks like a
+   portal bug.
+
+The gateway-side runtime status this feeds is held in a **volatile in-RAM
+registry and never persisted** (a stderr tail can carry prompt fragments, which
+the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
+on ingest, and the status DTO deliberately has no GPU field — measured VRAM
+reaches the UI through the spec's `vram_measured_mb` after the agent's write-back.
+
+> **A recurring wire-shape trap, worth stating once.** A nil Go collection and a
+> nil `json.RawMessage` marshal as `null`, not `{}`/`[]`, and the TypeScript
+> portal treats `null` as a crash-class value. The countermeasures are structural
+> and must be preserved: one canonical `sample.EmptyCapabilities()` shared by
+> both `Sample.Normalize()` and the agent's `capabilitiesJSON()` so both
+> producers emit identical bytes; the runtime config parser normalising every
+> collection; the report builder re-applying that normalisation so a zero-value
+> config (the parse-error case) still marshals `[]`/`{}`; and a custom marshaller
+> mapping a nil measured-VRAM map to `{}`. Anything handing out a
+> `json.RawMessage` must return a **fresh copy per call** — it is a `[]byte`, so a
+> package-level literal shared by reference lets any future write through one
+> sample's field corrupt the value for every other sample. Any path that builds a
+> wire struct without going through the normaliser can reintroduce `null`.
+
 ### 8.3.3 Hardware inventory sanitization
 
 `sanitizeSystemReport` (`agent_ingest.go`) enforces `maxHardwareGPUs=64`,
@@ -257,6 +315,15 @@ contiguous same-state runs always preserves state transitions and gap boundaries
 `availabilityPointDTO`; the frontend paints the interval leading into a
 `gap_before=true` point as *unknown* rather than incorrectly holding the prior
 state forward.
+
+> **`reachable` alone cannot distinguish "confirmed up" from "never checked".**
+> The portal's application DTO defaults to `reachable: true` with
+> `last_checked_at: null` for a never-probed application — and whenever the
+> health-registry reader is nil — because the cold-start default is deliberately
+> lenient; only a real probe stamps the timestamp (`enrichReachability`). So any
+> alert, UI signal or test assertion that means "a probe has confirmed this" must
+> require a **non-null `last_checked_at`**. Without that check, an assertion on
+> `reachable: true` cannot fail.
 
 ## 8.4 Usage & activity analytics
 
@@ -517,3 +584,6 @@ log line and its mirrored trace span can be correlated.
   everything in this chapter): the capture chapter.
 - TLS certificate distribution fields carried alongside telemetry
   (`CertFingerprint`/`CertMode`/`ProxyRoutes`): the certificates & mTLS chapter.
+- The `capabilities` and `runtimes` sample keys in context — what fills them,
+  the volatile status registry they feed, and the live SSE stream on top:
+  [Agent-Managed Model Runtime](agent-runtime-manager.md).

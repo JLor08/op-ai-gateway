@@ -22,7 +22,7 @@ erDiagram
         string health_status "unknown/healthy/degraded/unhealthy"
     }
     APPLICATION {
-        string type "ollama/vllm/llama_cpp/llama_swap/litellm/mock"
+        string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/mock"
         int port
         string scheme "http/https"
         int priority
@@ -79,7 +79,22 @@ provider dispatch mapping (`cmd/gateway/main.go: providerClients`):
 |---|---|
 | `mock` | `provider.NewMockWithDelay` (dev/test) |
 | `ollama` | `provider.NewOllamaClient` |
-| `vllm`, `llama_cpp`, `llama_swap`, `litellm` | `provider.NewOpenAICompatibleClient` (shared — all four speak the OpenAI HTTP dialect) |
+| `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent` | `provider.NewOpenAICompatibleClient` (shared — all five speak the OpenAI HTTP dialect) |
+
+`server_agent` is a **full application type**, not a special case: it is
+creatable through the portal (`normalizeApplicationType`) and dispatches to that
+same shared client, because the agent's model-runtime router port speaks the
+OpenAI-compatible dialect. Routing itself is unchanged for it — the resolver sees
+an ordinary application with ordinary mappings, and resolver changes were an
+explicit non-goal of that feature. Two places must both name a new application
+type: this dispatch table and the type list; a missing dispatch entry produces a
+**runtime** error (`provider.unavailable: no model lister for provider
+"server_agent"`), not a compile failure. What the type does bring is one
+deliberate default exception — `timeout_ms` 600000 instead of 30000, because the
+first request for a cold managed model waits for that model process to start —
+and an authoritative loaded-model list reported by the agent, which is what
+prefer-loaded routing and model groups' `loaded_only` consume for such a server.
+See [Agent-Managed Model Runtime](agent-runtime-manager.md).
 
 `ModelGroup` also carries five selection-setting columns, added append-only by
 migration `62`: `loaded_only`, `member_order`, `climb_speed_margin_percent`,

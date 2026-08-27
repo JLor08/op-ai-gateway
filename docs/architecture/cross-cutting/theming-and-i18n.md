@@ -178,8 +178,84 @@ The portal ships German and English as first-class, always-shipped-together lang
 - A signed-in user can override it per-account (`User.PreferredLanguage`, `gateway/backend/internal/portal/service.go`) via `PUT /api/portal/language`; an anonymous/pre-auth viewer gets the system default.
 - `portal.KnownLanguages()` / `IsKnownLanguage()` (`gateway/backend/internal/portal/service_system_settings.go`) are the single source of truth for valid language ids on the backend, mirroring the frontend's `Locale` union.
 
+## 9. Status colours: there are exactly three
+
+The token list in §3 is the whole palette a status badge can draw on: the theme
+bridge exposes `--success-*`, `--watch-*` and `--standby-*` pairs **and nothing
+else**. `components/shared/status.ts` accordingly resolves its seven badge keys
+onto just three classes — `active` (drawing the `--success-*` pair) takes
+`active` and `success`; `watch` takes `watch`; and `standby` takes `standby`,
+`disabled`, `expired` **and `error`**. **There is no red anywhere in the
+portal**, and adding a danger token is a portal-wide design change, not a single
+screen's call.
+
+The practical consequence bites every new status surface, and it is silent in
+both the UI and the tests: a status map that reads perfectly naturally —
+`crashed → error`, `stopped → disabled` — renders every one of those states as
+the *same grey chip*, and a test that asserts the colour cannot see the mistake,
+because both keys resolve to `standby`. So **colour can only ever carry coarse
+facts.** Any finer distinction must be carried by the **label**, and the labels
+must be verified mutually distinct **in both locales**, since a duplicated
+translation silently merges two facts back into one.
+
+The [agent-managed model runtime](agent-runtime-manager.md) is the concrete
+instance: its nine lifecycle states map onto the three classes as
+`running → active`; `starting` and `pending_vram_unknown → watch` (both mean
+"waiting to be loaded", the operator-visible "currently loading"); and everything
+else — `stopped`, `draining`, `backoff`, `start_failed`, `crashed`,
+`not_permitted` — `→ standby`. An **unrecognised** state value from a newer agent
+renders its raw wire string rather than a misleading label, which is the
+forward-compatibility convention for every opaque wire enum in the portal. Note
+the naming trap that a state → label table invites: the wire value is
+`pending_vram_unknown` while the display key is `runtimeStatePendingVram`, so the
+table must key on the **full enum value** — a table keyed on `pending_vram`
+compiles, passes type checks, and shows a raw wire string to operators.
+
+Two portal behaviours on that screen are **advisory by design and must never
+block a write**: the co-residency matrix's per-cell VRAM tooltip (the agent's own
+arithmetic is the veto, so the portal must not pre-empt it) and the GPU
+UUID-drift warning. Its launch-spec form's client-side placeholder validation is
+different in kind — it mirrors the agent's real expansion rule exactly and is a
+convenience preview of a rule enforced agent-side, **not** a second source of
+truth. Turning either advisory into a hard client-side block makes the portal
+refuse configurations the agent would accept; duplicating the placeholder rule
+loosely lets the two drift.
+
+## 10. Backend error codes in the portal
+
+Rendering a backend error code as translated text is a **three-edit, two-file
+change**, and the type checker catches two of the three:
+
+1. an entry in `errorLabelByCode` (`src/components/shared/format.ts`) mapping the
+   wire code to a `MessageKey`;
+2. the key in `de` (`src/i18n.ts`);
+3. the key in `en`.
+
+`MessageKey` is derived from the `de` object and `Translation` is
+`(typeof messages)['de']`, so a `format.ts`-only entry fails the build on the map
+value (`TS2322`) and a `de`-only key fails it on the `en` object (`TS2741`). **If
+the map entry is missing entirely, nothing fails to compile:**
+`formatPortalError` falls back to rendering the backend's raw English `message`,
+so a German UI silently shows English text for that one code. That silent
+fallback is why the omission is invisible in tests and CI.
+
+`errorLabelByCode` is deliberately covered by **whole-map invariants rather than
+a table of expected labels.** An expected-label table would be a second copy of
+the same data, edited in the same commit by whoever edits the map, and it would
+faithfully copy the one defect that is actually plausible in a hand-maintained
+map of ~96 entries: a new code pointed at its neighbour's label by copy-paste.
+The five invariants are: every entry resolves to a non-empty label in **de and
+en**; every code matches the backend sentinel convention
+`^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$`; every label key is an `error*`-prefixed key
+(a code pointed at a warning or a field name renders a plausible sentence in the
+wrong register); a label is shared by two codes only where an explicit
+`documentedSharedLabels` allowlist says so — **this is the copy-paste catcher**;
+and the map is not empty. The consequence is that a new conforming error code
+needs **no test edit**, and only a convention breach or a reused label fails.
+
 ## See also
 
 - [Security, Authentication & Authorization](security-auth-rbac.md) — the session/CSRF model that the theme endpoints deliberately sit outside of (they are public and pre-auth by design).
 - [Configuration](configuration.md) and [Configuration & Environment Variables](../reference/config-env.md) — `OP_AI_GATEWAY_THEMES_DIR`, `OP_AI_GATEWAY_DEFAULT_LANGUAGE`.
 - [Licensing & Third-Party Notices](licensing.md) — why operator-branded external themes are gitignored rather than committed.
+- [Agent-Managed Model Runtime](agent-runtime-manager.md) — the screen whose nine-state badges, advisory tooltips and error codes §9 and §10 use as their worked example.

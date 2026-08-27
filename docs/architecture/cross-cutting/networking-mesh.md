@@ -332,6 +332,23 @@ built by `server-agent/internal/client/ws.go`'s `WSSender` and served by
   blankings plus `X-OP-Edge-Scheme`) verbatim — see
   `gateway/deploy/nginx/locations.conf`.
 
+**One registration table, two muxes.** Every agent endpoint — including the
+three the [agent-managed model runtime](agent-runtime-manager.md) adds
+(`GET /api/agent/v1/features`, `GET /api/agent/v1/runtime-config`,
+`POST /api/agent/v1/runtime-report`) — is declared in the gateway's single
+`agentRoutes` table, which is what serves each of them on *both* listeners: on
+the public mux behind the runtime `netbird_only` gate (§6.1), and on the
+dedicated agent mux ungated. The dual-mux-plus-gate arrangement is invisible from
+a handler's own file, so an endpoint registered directly on one mux is either
+unreachable by agents or unexpectedly public.
+
+That runtime feature also puts one *new* listening port on the AI-server side of
+the mesh: the agent's model-runtime router. It **authenticates nothing**, the
+gateway supplies only its port, and its shipped default binds all interfaces —
+so on a mesh deployment `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND`
+should be set to the server's own mesh IP (or `127.0.0.1`). See
+[Agent-Managed Model Runtime §4.6](agent-runtime-manager.md).
+
 ## 11. Configuration reference
 
 | Env var | Default | Governs |

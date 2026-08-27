@@ -106,10 +106,48 @@ The ServerAgent (`op-ai-server-agent`, one process per monitored AI server) is c
 - **Proxy routes** (`cert_proxy_routes`, `cert_proxy_routes_mode`): configuration-file-only settings (no env-var form) that seed local TLS proxy routes used when `cert_mode` is `proxy`. `cert_proxy_routes_mode` is `fallback` (default — a local route only fills a listen port the gateway did not provide) or `override` (a local route wins over a gateway-provided one on the same listen port).
 - **Telemetry sourcing**: `metrics_url` (optional inference `/metrics` scrape), `model_status_url` + `model_status_format` (poll a loaded-models endpoint in `openai`/`llama_swap`/`llama_cpp`/`litellm`/auto form), `lhm_url` (optional LibreHardwareMonitor `/data.json` URL for Windows CPU/system power).
 - **TLS trust**: `ca_file` (operator-managed PEM the agent only reads), `ca_cache_file` (agent-managed cache written atomically), `ca_pem` (inline bootstrap CA from a generated config), `tls_insecure` (skip verification — development only).
+- **Managed model runtime** (`runtime_source`, `runtime_config`, `runtime_allowed_binaries`, `runtime_allowed_dirs`, `runtime_cache`, `runtime_router_bind`): whether launch specifications come from the gateway or a local file, and the agent-operator boundary on what may actually execute. Two of these are settings whose *empty* value is load-bearing rather than merely unset — an empty binary allowlist starts nothing, and a non-empty directory allowlist makes `work_dir` mandatory on every spec. See [Agent-Managed Model Runtime §3 and §14](agent-runtime-manager.md).
 
 See [Configuration & Environment Variables (Reference)](../reference/config-env.md) for the full `OP_AGENT_*` table with every default and floor/clamp rule.
+
+That reference **opens by claiming an exhaustive listing** of every environment
+variable, which makes adding the row a required part of adding a setting — in the
+same branch as the behaviour, per the repository's documentation rule. Its agent
+section additionally asserts that every row has a matching CLI flag and JSON
+config-file key with precedence flag > env > file > default, and that claim
+carries its three real exceptions:
+`OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are
+list-valued with **no flag form** (env, comma-separated, > file > default), and
+`OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key** —
+necessarily, since it names the file to read. An unqualified exhaustiveness or
+parity claim silently becomes false with the next setting; stating that the claim
+is load-bearing is what keeps it true.
+
+## 8. The generated ServerAgent config document exists in four copies
+
+The portal offers a ready-made annotated JSONC config for a new agent, and that
+document is produced by **four** independent pieces of code — of which the drift
+guard covers two:
+
+| Copy | Role | Guarded? |
+|---|---|---|
+| `internal/gateway/agent_binaries.go` (`buildAgentConfigJSON`) | The generator behind the `curl` endpoint. | — |
+| `internal/gateway/agent_binaries_test.go` | Exhaustive key-set guard over the generator. | **yes** |
+| `server-agent/internal/config/config_test.go` (`agentConfigJSONCFixture`) | A byte-for-byte replica which, because the two Go modules cannot import each other, is the only thing proving the generated document actually *loads* in the agent. | **yes** |
+| `gateway/frontend/src/components/AgentTokenSection.tsx` (`buildServerAgentConfig`) | The portal's **download button**. | **no exhaustive key set** |
+
+Anyone adding a config key will update the generator and its guard and believe
+they are done; the exposure is the untested fourth copy, where nothing fails when
+the frontend lags and the download button and the `curl` endpoint silently
+produce different documents. `runtime_router_bind` happened to be harmless to
+omit — it loads into a plain `string` with no pointer or presence map, so an
+absent key and `""` behave identically — but a future key need not be
+presence-insensitive. It is also this template's `cert_mode: "off"` and empty
+`cert_dir` that make the runtime router's all-interfaces fallback the shipped
+default (see [Agent-Managed Model Runtime §4.6](agent-runtime-manager.md)).
 
 ## See also
 
 - [Configuration & Environment Variables (Reference)](../reference/config-env.md) — exhaustive variable tables.
 - [HTTP API Surface (Reference)](../reference/api-surface.md) — how auth (session/CSRF/bearer/agent-token) is wired to each route group.
+- [Agent-Managed Model Runtime](agent-runtime-manager.md) — the `runtime_*` agent settings in context, and the two configuration *sources* (gateway document vs local file) they select between.
