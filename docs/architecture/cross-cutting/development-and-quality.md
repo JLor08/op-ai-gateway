@@ -337,12 +337,24 @@ Semantics and policy:
   **new** violations and new-code coverage below the threshold do. The first
   scan after a purge establishes the baseline.
 - The triage policy is **versioned in `sonar-project.properties`**, never in
-  the server database, so it survives purges and is reviewable in diffs:
-  cognitive-complexity (S3776) and too-many-parameters (S107) are ignored in
-  **test files only** (table-driven tests legitimately grow long, flat
-  bodies; production code stays fully gated), and the pseudorandom warning
-  (S2245) is ignored for the purely decorative Matrix-rain theme animation.
-  Deliberately accepted production findings are the structures documented in
+  the server database, so it survives purges and is reviewable in diffs.
+  Every entry is justified individually in that file's own comment; the whole
+  policy is: the Go rules for cognitive complexity (S3776) and too many
+  parameters (S107) are ignored in **non-production Go** — `*_test.go` by
+  name, plus anything under a `testdata/` directory for S3776, since a Go
+  fixture compiled as its own program carries no `_test` in its name
+  (table-driven tests legitimately grow long, flat bodies; production code
+  stays fully gated, and the TypeScript S3776 rule is not excluded anywhere);
+  the pseudorandom warning (S2245) is ignored for the purely decorative
+  Matrix-rain theme animation; and empty-function-body (S1186) is ignored in
+  the two agent files where an empty body **is** the implementation —
+  `internal/runtime/manager.go`'s fourteen sealed-interface marker methods
+  (`func (cmdX) isCommand() {}`) and `internal/runtime/proc_windows.go`'s
+  `setProcGroup`, a documented Windows no-op. File scope is the finest
+  granularity Sonar's exclusion mechanism offers, so those last two hide the
+  rule for their whole file; why each is a false positive is written out next
+  to the entry, to be re-checked rather than trusted. Deliberately accepted
+  production findings are the structures documented in
   [§11.4 Deliberate design acceptances](../11-risks-and-technical-debt.md).
 - Coverage import: `sonar.go.coverage.reportPaths` (both Go modules) +
   `sonar.javascript.lcov.reportPaths` (frontend lcov). The frontend report
