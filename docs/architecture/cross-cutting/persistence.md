@@ -435,6 +435,24 @@ spec, a duplicate `gpu_index` for one server, a duplicate
 mapping. The first two originally returned a raw wrapped driver error on SQL and
 **silently stored two rows in memory**.
 
+**Classify a write conflict by re-reading, not by parsing driver error text.**
+SQLite, PostgreSQL and the memory store all surface the same bare `ErrConflict`
+with no constraint name, so when a table has more than one uniqueness constraint
+the service cannot tell which one fired. `classifyApplicationWriteConflict` is
+the pattern to copy: on the already-failed request it re-reads the server's
+applications **once** and decides, in this order — (1) another application
+(excluding the updated one's own id) holds the requested port →
+`application.port_conflict`; (2) else the request carries `type=server_agent` and
+another such application exists → `application.server_agent_exists`; (3) else
+(duplicate id, or the re-read itself failed) → `application.port_conflict`, the
+pre-existing behaviour. **Port-first is deliberate and load-bearing:** the memory
+store checks its port guard before its `server_agent` guard, SQL leaves the order
+undefined when both constraints are violated, and a pre-invariant SQL database
+can legitimately fail a *port* edit on one of two `server_agent` rows — so
+reversing the order produces a second misleading code. Only the create and update
+service methods map `ErrConflict` onto an operator-visible code; the narrow
+single-purpose writers cannot reach it by construction.
+
 **A removal operation must never be gated by the same check that guards
 creation.** `PutRuntimeSpec` refuses a mapping whose owning application is not
 `server_agent`; `GetRuntimeSpec` is deliberately permissive; and
