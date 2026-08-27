@@ -4,8 +4,8 @@
 // Package runtime is the agent-side vocabulary for the agent-managed model
 // runtime: the wire mirror of the gateway's runtime-config document
 // (design doc docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md
-// §11; captured field-for-field in
-// .superpowers/sdd/2026-08-25-agent-runtime-manager/task-7-report.md), the
+// §11; the shipped, field-by-field description of the same document is
+// docs/architecture/reference/api-surface.md §5.1), the
 // per-spec visible-load-lifecycle state machine (design doc §7), and the
 // admission policy (design doc §5) as pure functions over snapshots -- no
 // clocks, no I/O, no goroutines. Task 14 owns starting processes, opening

@@ -16,9 +16,10 @@ import (
 )
 
 // capturedRuntimeConfigJSON is the exact wire document captured from a live
-// Service.AgentRuntimeConfig call and recorded field-for-field in
-// .superpowers/sdd/2026-08-25-agent-runtime-manager/task-7-report.md (spec
-// §11). ParseConfig must accept it byte-for-byte.
+// Service.AgentRuntimeConfig call (spec §11; the shipped, field-by-field
+// description of the same document is
+// docs/architecture/reference/api-surface.md §5.1). ParseConfig must accept
+// it byte-for-byte.
 const capturedRuntimeConfigJSON = `{
   "router_listen": 9000,
   "max_processes": 3,

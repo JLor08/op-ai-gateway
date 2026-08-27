@@ -2,13 +2,12 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // This file builds the agent's upward, file-mode report (design doc
-// docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md §10.2,
-// wire contract captured field-for-field in
-// .superpowers/sdd/2026-08-25-agent-runtime-manager/task-9-report.md's
-// "Agent-side (Tasks 17/18) wire contract" section) -- what Task 18's file
-// mode driver sends to the gateway over POST /api/agent/v1/runtime-report
-// and the WS "runtime_report" frame, both via the sender interfaces added
-// to internal/client in this same task.
+// docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md §10.2;
+// the shipped description of the same contract is
+// docs/architecture/cross-cutting/agent-runtime-manager.md §8.3) -- what the
+// file-mode driver sends to the gateway over POST
+// /api/agent/v1/runtime-report and the WS "runtime_report" frame, both via
+// the sender interfaces in internal/client.
 //
 // REDACTION HAPPENS HERE, AND IT IS THE POINT OF THIS FILE. In file mode the
 // agent reads a local config the SERVER OPERATOR owns, which may legitimately
@@ -16,10 +15,23 @@
 // ${AGENT_ENV:NAME} placeholder the way the gateway-sourced document always
 // does. BuildReport replaces every env VALUE with a fixed mask before
 // marshaling; keys survive so an operator (or the portal report view) can
-// still see WHICH variables a spec sets, but no value ever reaches the wire.
-// The gateway re-masks on ingest as defense in depth (task-9-report.md,
-// sanitizeRuntimeReportConfig) -- that does not excuse this file: this
-// redaction is what makes the wire clean in the first place.
+// still see WHICH variables a spec sets. The gateway re-masks on ingest as
+// defense in depth (sanitizeRuntimeReportConfig) -- that does not excuse this
+// file: this redaction is what makes the ENV half of the wire clean in the
+// first place.
+//
+// SCOPE, stated exactly, because the obvious stronger reading is wrong: the
+// contract covers env VALUES. It does NOT cover `args`, which are reported
+// verbatim even though ${AGENT_ENV:NAME} placeholders are expanded in them
+// too -- so a secret placed in an argument reaches the gateway in plaintext.
+// That was reviewed and upheld as spec-correct, and the operator guidance
+// ("secrets go in env, never in args") is in server-agent/README.md and in
+// the risk register. Nor is this the only upward channel: LastError's stderr
+// tail carries the child's own output, and a model server that prints its
+// command line at startup puts the resolved values there. "No env value ever
+// reaches the wire in a report" is true; "no secret ever reaches the wire" is
+// not, and a comment here claiming the latter would make the gap invisible
+// to exactly the reader best placed to close it.
 package runtime
 
 import (
