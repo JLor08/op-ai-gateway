@@ -340,7 +340,9 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
 
     // The mapping WAS created; the toast says so rather than leaving the
     // operator guessing which half landed.
-    expect(await screen.findByText(new RegExp(t.runtimeSpecPartialFailure))).toBeInTheDocument();
+    expect(
+      await screen.findByText(t.runtimeSpecPartialFailure, { exact: false }),
+    ).toBeInTheDocument();
     expect(fakeApi.createMapping).toHaveBeenCalledTimes(1);
   });
 });
@@ -404,5 +406,150 @@ describe('RuntimeAdminSection edit + delete', () => {
 
     await waitFor(() => expect(deletedMappingIds).toEqual(['map_1']));
     expect(deletedSpecIds).toHaveLength(0);
+  });
+});
+
+// Review round 2, Important 1/2/3: the agent's ExpandPlaceholders classifies
+// ${...} occurrences in BOTH args and env values with the exact same rule
+// (server-agent/internal/runtime/policy_local.go); the portal form has to
+// match it precisely -- neither stricter (would block a legitimate model-
+// server templating token) nor looser (would let a spec save that can never
+// start). These tests pin both directions, in both fields.
+describe('RuntimeAdminSection placeholder validation (mirrors the agent policy)', () => {
+  async function openCreateAndFillBase() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+  }
+
+  it('accepts ${PORT} and ${AGENT_ENV:NAME} exactly, in args and env alike', async () => {
+    const { putSpecs } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--port\n${PORT}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'TOKEN=${AGENT_ENV:MY_TOKEN}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['--port', '${PORT}']);
+    expect(putSpecs[0].body.env).toEqual({ TOKEN: '${AGENT_ENV:MY_TOKEN}' });
+  });
+
+  it('accepts ${TRANSPORT} -- a substring/Contains check would wrongly refuse this', async () => {
+    const { created, putSpecs } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--endpoint\n${TRANSPORT}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['--endpoint', '${TRANSPORT}']);
+  });
+
+  it('accepts ${EXPORT_DIR} and ${MY_AGENT_ENVIRONMENT} in env values', async () => {
+    const { putSpecs } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'A=${EXPORT_DIR}\nB=${MY_AGENT_ENVIRONMENT}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.env).toEqual({ A: '${EXPORT_DIR}', B: '${MY_AGENT_ENVIRONMENT}' });
+  });
+
+  it('rejects ${PORTX} in an argument as a malformed near-miss', async () => {
+    const { created, putSpecs } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--port\n${PORTX}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(t.runtimeSpecPlaceholderInvalid, { exact: false }),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('rejects the lowercase ${port} near-miss in an argument', async () => {
+    const { created } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), { target: { value: '${port}' } });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(t.runtimeSpecPlaceholderInvalid, { exact: false }),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+  });
+
+  it('rejects the empty-name ${AGENT_ENV:} near-miss in an env value', async () => {
+    const { created } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'A=${AGENT_ENV:}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(t.runtimeSpecPlaceholderInvalid, { exact: false }),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+  });
+
+  it('rejects ${AGENT_ENV:OP_AGENT_*} used in an ARGUMENT, not only in env', async () => {
+    const { created, putSpecs } = renderSection();
+    await openCreateAndFillBase();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--token=${AGENT_ENV:OP_AGENT_TOKEN}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(await screen.findByText(t.runtimeSpecEnvReserved)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+});
+
+// Review round 2, Important 2/3: a load -> open edit -> save WITHOUT any
+// change must be a no-op on the wire. Filtering "blank-looking" arg lines or
+// trimming env values would silently rewrite the spec on every untouched
+// save -- this pins the fix and would fail against the prior filtering
+// behaviour.
+describe('RuntimeAdminSection edit-without-changes round trip', () => {
+  it('preserves a blank arg line, an indented arg, and trailing whitespace in an env value unchanged', async () => {
+    const originalArgs = ['--foo', '', '--bar', '  --indented'];
+    const originalEnv = { SOME_VAR: 'value with trailing space   ', OTHER: 'plain' };
+    const spec = makeSpec({
+      configured: true,
+      mapping_id: 'map_1',
+      binary: '/usr/bin/llama-server',
+      args: originalArgs,
+      env: originalEnv,
+    });
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    // No edits at all -- just re-save exactly what was loaded.
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(originalArgs);
+    expect(putSpecs[0].body.env).toEqual(originalEnv);
   });
 });

@@ -775,7 +775,7 @@ describe('ApplicationSection server_agent drill-down + managed_runtime_only', ()
     expect(screen.getAllByRole('button', { name: t.mappingManage })).toHaveLength(2);
   });
 
-  it('shows create (defaulted to server_agent) and no banner when managed_runtime_only has no app yet', async () => {
+  it('shows create (defaulted to server_agent) and the banner when managed_runtime_only has no app yet', async () => {
     renderSection({ server: { ...server, managed_runtime_only: true }, apps: [] });
 
     await screen.findByText(t.runtimeManagedOnlyBanner);

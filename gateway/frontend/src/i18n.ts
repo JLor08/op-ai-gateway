@@ -517,6 +517,8 @@ const de = {
     'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt. PATH, HOME und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
     'PATH, HOME und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
+  runtimeSpecPlaceholderInvalid:
+    'Ungültiger Platzhalter (gemeint ist vermutlich ${PORT} oder ${AGENT_ENV:NAME})',
   runtimeSpecPartialFailure:
     'Die Modell-Zuordnung wurde gespeichert, die Spezifikation jedoch nicht',
   runtimeAreaPlaceholder: 'Dieser Bereich wird in einem folgenden Ausbauschritt ergänzt.',
@@ -2248,6 +2250,8 @@ const en: PortalMessages = {
     "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port. PATH, HOME, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
     'PATH, HOME, and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
+  runtimeSpecPlaceholderInvalid:
+    'Invalid placeholder (likely meant to be ${PORT} or ${AGENT_ENV:NAME})',
   runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
   runtimeAreaPlaceholder: 'This area will be added in a later rollout step.',
   runtimeStatusUnknown: 'Unknown',

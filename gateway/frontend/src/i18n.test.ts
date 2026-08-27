@@ -1899,6 +1899,7 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
       'runtimeSpecGpuRemove',
       'runtimeSpecEnvHint',
       'runtimeSpecEnvReserved',
+      'runtimeSpecPlaceholderInvalid',
       'runtimeSpecPartialFailure',
       'runtimeAreaPlaceholder',
       'runtimeStatusUnknown',

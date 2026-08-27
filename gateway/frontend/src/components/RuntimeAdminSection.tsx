@@ -104,42 +104,112 @@ function renderBoolChip(active: boolean, label: string) {
   return active ? <Chip size="small" variant="outlined" label={label} /> : '–';
 }
 
-// One argument/line -- splitting on spaces would corrupt any argument that
+// One argument per line. Splitting on spaces would corrupt any argument that
 // legitimately contains one (model server command lines routinely have
-// these), so a textarea line IS the argument, trimmed of stray whitespace.
+// these), so a textarea line IS the argument. Lines are preserved verbatim
+// -- including an internally blank line and one carrying only whitespace --
+// because this form's whole job is faithfully representing a command line:
+// filtering "empty-looking" lines would make a load -> edit(no-op) -> save
+// round trip silently rewrite the spec's args. The ONE exception is a
+// single trailing blank line, which is a textarea artifact (the user's
+// cursor sitting on a fresh last line, or a copy-pasted trailing newline),
+// not a deliberate trailing empty argument.
 function parseArgsText(text: string): string[] {
-  return text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '');
+  if (text === '') return [];
+  const lines = text.split('\n').map((line) => line.replace(/\r$/, ''));
+  if (lines.length > 1 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  return lines;
 }
 
 function formatArgsText(args: string[]): string {
   return args.join('\n');
 }
 
-// KEY=value per line. Rejects the two failure modes the agent itself would
-// otherwise only discover at process-start time (invisible to this task's
-// UI, which has no live-status view yet -- that is Task 22): PATH/HOME
-// (reserved by the launcher) and any ${AGENT_ENV:OP_AGENT_*} reference (the
-// agent's own credential namespace). A malformed (no "=") line is reported
-// via the existing runtime_spec.env_invalid label so it reads the same way
-// a backend rejection would.
+// A "${...}" occurrence's classification, ported line-for-line from
+// server-agent/internal/runtime/policy_local.go's ExpandPlaceholders -- see
+// that file for the full rationale. Both an argument string and an env
+// value pass through the SAME agent-side check at process-start time (this
+// task's UI has no live-status view yet to surface a failure there -- see
+// the task-20 report's Deviation 2), so the portal form must refuse
+// everything the agent would refuse and accept everything it would accept:
+//   - "${PORT}" (exact) -> valid, becomes the assigned port at start.
+//   - "${AGENT_ENV:NAME}" with a non-empty NAME -> valid, UNLESS NAME starts
+//     with "OP_AGENT_" (the agent's own credential namespace) -> reserved.
+//   - anything else whose upper-cased inner text STARTS WITH "PORT" or
+//     "AGENT_ENV" -> a malformed near-miss (a typo of one of the two forms
+//     above): "${PORTX}", "${port}", "${AGENT_ENV:}", "${AGENT_ENVV:x}".
+//   - everything else -- arbitrary "${...}" text a model server's own
+//     templating syntax might use, e.g. "${TRANSPORT}", "${EXPORT_DIR}",
+//     "${MY_AGENT_ENVIRONMENT}" -- passes through untouched.
+// This MUST be a prefix match, never a substring/Contains check, or those
+// last three examples would be wrongly refused (see the Go source's doc
+// comment for the full explanation of that prior mistake).
+const placeholderPattern = /\$\{[^}]*\}/g;
+const agentEnvPrefix = 'AGENT_ENV:';
+const agentOwnEnvPrefix = 'OP_AGENT_';
+
+function findPlaceholderViolation(
+  text: string,
+): { kind: 'reserved' | 'malformed'; match: string } | null {
+  const matches = text.match(placeholderPattern);
+  if (!matches) return null;
+  for (const match of matches) {
+    const inner = match.slice(2, -1); // strip "${" and "}"
+    if (inner === 'PORT') continue;
+    if (inner.startsWith(agentEnvPrefix) && inner.length > agentEnvPrefix.length) {
+      const name = inner.slice(agentEnvPrefix.length);
+      if (name.startsWith(agentOwnEnvPrefix)) return { kind: 'reserved', match };
+      continue;
+    }
+    const upper = inner.toUpperCase();
+    if (upper.startsWith('PORT') || upper.startsWith('AGENT_ENV')) {
+      return { kind: 'malformed', match };
+    }
+  }
+  return null;
+}
+
+// Runs findPlaceholderViolation over every arg AND every env value (never
+// env keys -- those have their own PATH/HOME check in parseEnvText below).
+function validatePlaceholders(values: string[], t: Translation): string | undefined {
+  for (const value of values) {
+    const violation = findPlaceholderViolation(value);
+    if (!violation) continue;
+    return violation.kind === 'reserved'
+      ? t.runtimeSpecEnvReserved
+      : `${t.runtimeSpecPlaceholderInvalid}: ${violation.match}`;
+  }
+  return undefined;
+}
+
+// KEY=value per line, one env var per line. Blank/whitespace-only lines are
+// skipped; a malformed (no "=") line is reported via the existing
+// runtime_spec.env_invalid label so it reads the same way a backend
+// rejection would. Only the KEY portion is trimmed (stray leading
+// indentation from a paste) -- the VALUE is preserved byte-for-byte after
+// the first "=" (a value may legitimately contain "=" itself, and trimming
+// the whole line before splitting would silently eat meaningful leading/
+// trailing whitespace IN the value). PATH/HOME keys are refused outright
+// (reserved by the agent's own base environment); the ${AGENT_ENV:OP_AGENT_*}
+// / malformed-placeholder checks run separately, over both args and env
+// values together, via validatePlaceholders.
 function parseEnvText(
   text: string,
   t: Translation,
 ): { env: Record<string, string>; error?: string } {
   const env: Record<string, string> = {};
   for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (line === '') continue;
+    const line = raw.replace(/\r$/, '');
+    if (line.trim() === '') continue;
     const eq = line.indexOf('=');
     if (eq <= 0) {
       return { env: {}, error: t.errorRuntimeSpecEnvInvalid };
     }
     const key = line.slice(0, eq).trim();
     const value = line.slice(eq + 1);
-    if (key === 'PATH' || key === 'HOME' || value.includes('${AGENT_ENV:OP_AGENT_')) {
+    if (key === 'PATH' || key === 'HOME') {
       return { env: {}, error: t.runtimeSpecEnvReserved };
     }
     env[key] = value;
@@ -342,7 +412,16 @@ export function RuntimeAdminSection({
   }
 
   function addGpuRow() {
-    setGpuRows((rows) => [...rows, { index: rows.length, vramEstimateMb: 0, vramMeasuredMb: 0 }]);
+    setGpuRows((rows) => {
+      // rows.length collides with an existing index once a row has been
+      // removed (e.g. remove row 0 of two -> the survivor already holds
+      // index 1, but rows.length is now 1 too) -- propose the lowest index
+      // not already in use instead.
+      const used = new Set(rows.map((r) => r.index));
+      let index = 0;
+      while (used.has(index)) index++;
+      return [...rows, { index, vramEstimateMb: 0, vramMeasuredMb: 0 }];
+    });
   }
   function removeGpuRow(idx: number) {
     setGpuRows((rows) => rows.filter((_, i) => i !== idx));
@@ -351,11 +430,11 @@ export function RuntimeAdminSection({
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }
 
-  function buildSpecBody(env: Record<string, string>): PutRuntimeSpecRequest {
+  function buildSpecBody(args: string[], env: Record<string, string>): PutRuntimeSpecRequest {
     return {
       enabled,
       binary: binary.trim(),
-      args: parseArgsText(argsText),
+      args,
       env,
       work_dir: workDir.trim(),
       listen_port: listenPort,
@@ -377,9 +456,15 @@ export function RuntimeAdminSection({
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
-    const parsed = parseEnvText(envText, t);
-    if (parsed.error) {
-      showError(parsed.error);
+    const args = parseArgsText(argsText);
+    const parsedEnv = parseEnvText(envText, t);
+    if (parsedEnv.error) {
+      showError(parsedEnv.error);
+      return;
+    }
+    const placeholderError = validatePlaceholders([...args, ...Object.values(parsedEnv.env)], t);
+    if (placeholderError) {
+      showError(placeholderError);
       return;
     }
     setBusy(true);
@@ -401,7 +486,7 @@ export function RuntimeAdminSection({
     // from here on is reported as a partial failure, never silently, so the
     // operator knows the spec (not the mapping) needs another attempt.
     try {
-      const spec = await api.putRuntimeSpec(mapping.id, buildSpecBody(parsed.env));
+      const spec = await api.putRuntimeSpec(mapping.id, buildSpecBody(args, parsedEnv.env));
       setSpecsById((cur) => ({ ...cur, [mapping.id]: spec }));
       void reloadWarnings();
       setSpecMode('list');
@@ -417,9 +502,15 @@ export function RuntimeAdminSection({
     event.preventDefault();
     if (typeof specMode === 'string' || specMode.kind !== 'edit') return;
     const id = specMode.mapping.id;
-    const parsed = parseEnvText(envText, t);
-    if (parsed.error) {
-      showError(parsed.error);
+    const args = parseArgsText(argsText);
+    const parsedEnv = parseEnvText(envText, t);
+    if (parsedEnv.error) {
+      showError(parsedEnv.error);
+      return;
+    }
+    const placeholderError = validatePlaceholders([...args, ...Object.values(parsedEnv.env)], t);
+    if (placeholderError) {
+      showError(placeholderError);
       return;
     }
     setBusy(true);
@@ -436,7 +527,7 @@ export function RuntimeAdminSection({
       return;
     }
     try {
-      const spec = await api.putRuntimeSpec(id, buildSpecBody(parsed.env));
+      const spec = await api.putRuntimeSpec(id, buildSpecBody(args, parsedEnv.env));
       setSpecsById((cur) => ({ ...cur, [id]: spec }));
       void reloadWarnings();
       setSpecMode('list');
