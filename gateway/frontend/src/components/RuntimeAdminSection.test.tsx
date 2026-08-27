@@ -225,6 +225,11 @@ function renderSection(
     // resolves, so a single test can drive both the failure render and the
     // retry that recovers from it.
     reportFailing?: boolean;
+    // Fix round 2: the OTHER failure shape -- a GET that fails while `data`
+    // still holds an earlier payload (`useResource` never clears it), which on
+    // this screen is reachable by switching servers, since `server.id` is a
+    // loader dep. 1-based call index.
+    reportFailsOnCall?: number;
     // Pushed synchronously from inside the subscribe call, i.e. exactly like
     // the stream's `snapshot` frame arriving on connect.
     statusRows?: RuntimeStatus[];
@@ -308,6 +313,9 @@ function renderSection(
       reportCalls += 1;
       if (opts.reportPending) return new Promise<RuntimeReport>(() => {});
       if (opts.reportFailing && reportCalls === 1) {
+        return Promise.reject(new Error('report unavailable'));
+      }
+      if (opts.reportFailsOnCall === reportCalls) {
         return Promise.reject(new Error('report unavailable'));
       }
       return Promise.resolve(opts.report ?? makeReport());
@@ -1978,6 +1986,38 @@ describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
     expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+
+  // Fix round 2, the forward-looking half of I3: the OTHER failure shape.
+  // `useResource` never clears `data` on a failed fetch, so a report GET that
+  // fails AFTER one succeeded leaves the previous payload in hand -- and
+  // `data !== null` used to be tested before the error, reporting that as
+  // `ready`. On this screen it is reachable by switching servers (`server.id`
+  // is a loader dep), and the stale payload is the WRONG server's runtime
+  // mode, so it must not decide whether this screen is writable.
+  it('treats a report GET that fails after a server switch as a failure, not as the old server’s mode', async () => {
+    const { stream, rerenderWithServer } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      reportFailsOnCall: 2,
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    // The first server resolved: writable, no banner.
+    expect(await screen.findByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeModeUnknown)).not.toBeInTheDocument();
+
+    rerenderWithServer('srv_other');
+    await act(async () => {
+      await Promise.resolve();
+    });
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'running' })]);
+
+    expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    // And it must not read as "still loading" either.
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
   });
 });
 

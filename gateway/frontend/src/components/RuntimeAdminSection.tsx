@@ -915,20 +915,31 @@ export function RuntimeAdminSection({
     loading: reportLoading,
     reload: reloadReport,
   } = useResource(() => api.runtimeReport(server.id), [api, server.id, t], t);
-  // THREE states, not two. `!loading && data !== null` collapsed "the GET is
-  // still in flight" and "the GET failed" (useResource sets `error` and leaves
-  // `data` at null) into one value -- so a failed report GET made this WHOLE
-  // screen permanently read-only while every tab claimed to be loading, with
-  // the only signal a toast that scrolls away. The failure now has its own
-  // rendering and a retry, and it deliberately does NOT also raise a toast:
-  // a permanent banner replaces a transient one.
+  // NOT two states. `!loading && data !== null` collapsed "the GET is still in
+  // flight" and "the GET failed" (useResource sets `error` and leaves `data`
+  // untouched) into one value -- so a failed report GET made this WHOLE screen
+  // permanently read-only while every tab claimed to be loading, with the only
+  // signal a toast that scrolls away. The failure now has its own rendering and
+  // a retry, and it deliberately does NOT also raise a toast: a permanent
+  // banner replaces a transient one.
   const reportStatus = resourceState({
     loading: reportLoading,
     error: reportError,
     data: reportData,
   });
+  // `stale-error` is a FAILED report GET that left an earlier payload behind --
+  // reachable here because a server switch re-runs the loader (deps include
+  // `server.id`) while `data` keeps the PREVIOUS server's report. On most
+  // screens the last known values are worth showing; here they are not, because
+  // "which runtime mode is this server in" is exactly the fact that would be
+  // about the wrong server. So both failures get the same treatment: read-only,
+  // say so, offer the retry.
+  const reportFailed = reportStatus === 'error' || reportStatus === 'stale-error';
   // `source` lives on the NESTED report object; RuntimeReport itself has none.
-  const reportContent = reportData?.available ? reportData.report : undefined;
+  // Gated on `ready` for the same reason: a stale payload must not decide
+  // whether THIS server is in file mode.
+  const reportContent =
+    reportStatus === 'ready' && reportData?.available ? reportData.report : undefined;
   const fileMode = reportContent?.source === 'file';
   // The agent telling us it could not parse its own config file. In that state
   // `config` is whatever survived (possibly the zero value), so it must not be
@@ -2129,20 +2140,19 @@ export function RuntimeAdminSection({
       {/* Screen-wide facts, deliberately above the tab strip: which mode this
           server is in, and why a configured runtime might be doing nothing.
           Both are true on every tab, so neither may hide behind one. */}
-      {(fileMode || featureMismatch || agentNeverReported || reportStatus === 'error') && (
+      {(fileMode || featureMismatch || agentNeverReported || reportFailed) && (
         <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
           {/* The runtime mode decides whether this whole screen is writable,
               so a failed report GET is a screen-wide fact and belongs here --
               with a retry, because "keep everything read-only forever" is not
               an acceptable resting place for one failed request. */}
-          {reportStatus === 'error' && (
+          {reportFailed && (
             <ResourceFallback
-              state="error"
+              state={reportStatus}
               loadingLabel={t.loading}
               errorLabel={t.runtimeModeUnknown}
               errorDetail={reportError}
-              retryLabel={t.resourceRetry}
-              onRetry={() => void reloadReport()}
+              retry={{ label: t.resourceRetry, onRetry: () => void reloadReport() }}
             />
           )}
           {fileMode && (
@@ -2298,7 +2308,7 @@ export function RuntimeAdminSection({
             // read as "loading" -- the screen-wide banner above carries the
             // explanation and the retry.
             <ResourceFallback
-              state={reportStatus === 'error' ? 'error' : 'loading'}
+              state={reportFailed ? reportStatus : 'loading'}
               loadingLabel={t.loading}
               errorLabel={t.runtimeModeUnknownShort}
             />
@@ -2366,7 +2376,7 @@ export function RuntimeAdminSection({
             // write. A FAILED report GET says so instead of claiming to still
             // be loading.
             <ResourceFallback
-              state={reportStatus === 'error' ? 'error' : 'loading'}
+              state={reportFailed ? reportStatus : 'loading'}
               loadingLabel={t.loading}
               errorLabel={t.runtimeModeUnknownShort}
             />
