@@ -39,6 +39,12 @@ import { Alert, Box, Button, Typography } from '@mui/material';
  * read as a guarantee it does not give). A call site whose payload is genuinely
  * nullable must therefore wrap it — resolve `{ value: T | null }` — rather than
  * hand it in raw.
+ *
+ * Re-examined when this was widened from one call site to four (task 22b, C1):
+ * no better encoding appeared. `resourceState` takes `data: unknown` and has no
+ * `T` of its own to constrain, and the constraint that matters belongs to
+ * `useResource<T>`, whose 15 unrelated call sites a bound would churn for a
+ * guarantee it cannot actually give. Still a comment, deliberately.
  */
 export type ResourceState = 'loading' | 'error' | 'stale-error' | 'ready';
 

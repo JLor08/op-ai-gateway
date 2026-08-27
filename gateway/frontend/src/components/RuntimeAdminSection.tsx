@@ -498,6 +498,30 @@ function validatePlaceholders(values: string[], t: Translation): string | undefi
   return undefined;
 }
 
+/**
+ * The first GPU index that appears more than once, or `null`.
+ *
+ * Both server-side writes that carry per-GPU rows REFUSE a repeated index
+ * outright -- `validateRuntimeSpecGPUs` and `SetServerGPUBudgets`, each
+ * returning its own sentinel (backend `internal/portal/service_runtime.go`).
+ * Checked, not assumed: neither dedupes, so a row the operator filled in is
+ * never silently discarded, which is the outcome that would have been worse
+ * than a message. What they do produce is a generic "invalid GPU
+ * configuration" / "invalid GPU budget" AFTER the round trip, naming neither
+ * the field nor the reason -- and both forms let an operator type a colliding
+ * index by hand (`addGpuRow`/`addBudgetRow` only keep the auto-PROPOSED value
+ * clear of collisions). So the collision is named here, before the write, in
+ * the same validate-on-submit idiom the env and placeholder checks use.
+ */
+function duplicateGpuIndex(indices: number[]): number | null {
+  const seen = new Set<number>();
+  for (const index of indices) {
+    if (seen.has(index)) return index;
+    seen.add(index);
+  }
+  return null;
+}
+
 // KEY=value per line, one env var per line. Blank/whitespace-only lines are
 // skipped; a malformed (no "=") line is reported via the existing
 // runtime_spec.env_invalid label so it reads the same way a backend
@@ -588,12 +612,32 @@ export function RuntimeAdminSection({
     setData: setMappings,
     error: mappingsError,
     loading: mappingsLoading,
+    reload: reloadMappings,
   } = useResource(
     () => api.mappings(application.id).then((r) => r.data),
     [api, application.id, t],
     t,
   );
   const mappings = mappingsData ?? [];
+  // FOUR states, not two (shared/ResourceFallback.tsx). `mappingsLoading ||
+  // mappingsData === null` -- the convention every other resource on this
+  // screen copied from here -- reports a FAILED GET as "still loading", and
+  // `useResource` leaves `data` null on a first failure, so that is forever:
+  // the list claims to be loading indefinitely, and `specsSettled` below can
+  // never become true either, which leaves EVERY live-status row unresolvable,
+  // its actions cell blank and its `Unmatched` chip suppressed -- the silent
+  // blank the chip exists to prevent.
+  //
+  // This resource feeds all four tabs (the list, the matrix's spec set, the
+  // status table's spec_id -> mapping join and with it every override action),
+  // so its failure is a screen-wide fact and its banner sits above the tab
+  // strip rather than in one tab.
+  const mappingsStatus = resourceState({
+    loading: mappingsLoading,
+    error: mappingsError,
+    data: mappingsData,
+  });
+  const mappingsFailed = mappingsStatus === 'error' || mappingsStatus === 'stale-error';
   useEffect(() => {
     if (mappingsError) showError(mappingsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -653,8 +697,53 @@ export function RuntimeAdminSection({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappings, api]);
+  // `ready`, not `!loading && data !== null`: with a stale mapping list in hand
+  // (a failed reload) we cannot claim a status row is unmatched -- we only know
+  // we failed to refresh the list it would be matched against. The screen-wide
+  // banner says that instead.
   const specsSettled =
-    !mappingsLoading && mappingsData !== null && mappings.every((m) => specLoadSettled.has(m.id));
+    mappingsStatus === 'ready' && mappings.every((m) => specLoadSettled.has(m.id));
+
+  /**
+   * Per-mapping write ticket, and the only way `specsById` is written from a
+   * response.
+   *
+   * `specsById` is a cache of server truth, and the three override/restart
+   * writes deliberately update it ABOVE their run token (fix round 2, N1) so a
+   * write abandoned by its watchdog that later succeeds still corrects the row.
+   * That left ARRIVAL ORDER deciding what the cache holds when two writes to
+   * the SAME mapping overlap: `RuntimeSpec` carries no version/etag, so a late
+   * response is indistinguishable from a current one. The sequence that hurts
+   * is reachable: an override PUT hangs past the 30 s watchdog, the row
+   * unlocks, a second write on the same mapping resolves, and then the first
+   * finally resolves and overwrites the cache with the outcome of the write the
+   * operator was already told had been given up on -- so the row offers the
+   * inverse of the actions that apply.
+   *
+   * A monotonic per-mapping ticket restores the ordering the payload cannot
+   * carry: only the most recently ISSUED write for a mapping may write that
+   * mapping's cache entry. It does NOT re-tighten N1 -- an abandoned write that
+   * is still the latest one issued applies exactly as before.
+   *
+   * Every write path that puts a response (or a delete's zero value) into the
+   * cache takes a ticket, deliberately including the create/edit form: a hung
+   * override write resolving after a form save is the same bug with only ONE
+   * hang, and the form is reachable while an override write is outstanding (the
+   * specs tab's Edit action is not covered by `overridesLocked`). `openEdit`'s
+   * GET stays plain: it is a read, and a read-modify-write against a spec whose
+   * PUT is still in flight server-side is an etag problem this cache cannot
+   * solve.
+   */
+  const specWriteSeqRef = useRef<Map<string, number>>(new Map());
+  function beginSpecWrite(mappingId: string): number {
+    const ticket = (specWriteSeqRef.current.get(mappingId) ?? 0) + 1;
+    specWriteSeqRef.current.set(mappingId, ticket);
+    return ticket;
+  }
+  function commitSpecCache(mappingId: string, ticket: number, spec: RuntimeSpec) {
+    if (specWriteSeqRef.current.get(mappingId) !== ticket) return;
+    setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
+  }
 
   // ---- Area 2: co-residency matrix --------------------------------------
   // Canonicalisation (which of the two mapping ids sorts first) is entirely
@@ -670,6 +759,7 @@ export function RuntimeAdminSection({
     setData: setCoresidencyData,
     error: coresidencyError,
     loading: coresidencyLoading,
+    reload: reloadCoresidency,
   } = useResource(
     () => api.runtimeCoresidency(application.id).then((r) => r.pairs),
     [api, application.id, t],
@@ -680,10 +770,24 @@ export function RuntimeAdminSection({
   // that lands before the GET settles compute its full-replace PUT from an
   // empty list, wiping every pair a previous admin already saved. `ready`
   // gates both rendering (a loading message instead of the matrix) and
-  // writing (see the missing-loading-state fix, task-21 review round 1) on
-  // the SAME `data !== null` signal the specs list already uses
-  // (`mappingsLoading || mappingsData === null`, above).
-  const coresidencyReady = !coresidencyLoading && coresidencyData !== null;
+  // writing (see the missing-loading-state fix, task-21 review round 1).
+  //
+  // It is `resourceState`'s `ready` rather than the old
+  // `!loading && data !== null`, which is STRICTLY LOOSER: that test reports a
+  // failed RELOAD over an existing payload as ready
+  // (shared/ResourceFallback.tsx), and this loader's deps include `t`, so a
+  // language switch whose re-GET fails reaches exactly that state with the
+  // component still mounted. The matrix would then render, clickable, off
+  // pairs we just failed to refresh -- and a toggle PUTs the FULL replacement
+  // list, so a pair another admin added meanwhile would be silently deleted.
+  // That is task-21's Critical reached through a different door, so this gate
+  // gets tighter here, never looser.
+  const coresidencyStatus = resourceState({
+    loading: coresidencyLoading,
+    error: coresidencyError,
+    data: coresidencyData,
+  });
+  const coresidencyReady = coresidencyStatus === 'ready';
   const coresidencyPairs = coresidencyData ?? [];
   useEffect(() => {
     if (coresidencyError) showError(coresidencyError);
@@ -744,6 +848,7 @@ export function RuntimeAdminSection({
     setData: setGpuBudgetsData,
     error: gpuBudgetsError,
     loading: gpuBudgetsLoading,
+    reload: reloadGpuBudgets,
   } = useResource(() => api.gpuBudgets(server.id).then((r) => r.budgets), [api, server.id, t], t);
   // Same "null (not loaded) vs. [] (loaded, empty)" distinction as the
   // co-residency matrix above: `budgetRows` starts `[]` and would look
@@ -751,7 +856,19 @@ export function RuntimeAdminSection({
   // GET settles -- and Save PUTs whatever `budgetRows` holds as the FULL
   // replacement set, so that would erase every previously configured
   // per-GPU budget on a single premature click.
-  const gpuBudgetsReady = !gpuBudgetsLoading && gpuBudgetsData !== null;
+  //
+  // And the same reason for `resourceState`'s `ready` over the old
+  // `!loading && data !== null`, one degree worse here: on a failed reload
+  // `budgetRows` still holds the payload from BEFORE it (the re-seed effect
+  // below returns early while `data` is unchanged), so the looser test showed a
+  // filled-in form whose Save would write values we had just failed to
+  // re-read, as the full replacement set, with the failure invisible.
+  const gpuBudgetsStatus = resourceState({
+    loading: gpuBudgetsLoading,
+    error: gpuBudgetsError,
+    data: gpuBudgetsData,
+  });
+  const gpuBudgetsReady = gpuBudgetsStatus === 'ready';
   useEffect(() => {
     if (gpuBudgetsError) showError(gpuBudgetsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -845,6 +962,14 @@ export function RuntimeAdminSection({
   }
 
   async function saveLimits() {
+    // Same collision check as the spec form's GPU rows, same reason: an index
+    // retyped onto another row's collides, the backend refuses the whole PUT
+    // with a message that names neither row, and this Save is a FULL replace.
+    const duplicateGpu = duplicateGpuIndex(budgetRows.map((r) => r.index));
+    if (duplicateGpu !== null) {
+      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      return;
+    }
     setLimitsBusy(true);
     try {
       const body: { budgets: GPUBudget[] } = {
@@ -959,8 +1084,18 @@ export function RuntimeAdminSection({
   // Both derived once: `agent_features` is pinned non-nil by the backend
   // today, but the two places that read it must not disagree about whether
   // that is guaranteed.
-  const agentFeatures = reportData?.agent_features ?? [];
-  const agentVersion = reportData?.agent_version ?? '';
+  //
+  // Gated on `ready` at the SOURCE, like `reportContent` above. Ungated they
+  // hold the PREVIOUS server's (or the pre-failure) values during
+  // `stale-error`, which is safe only for as long as their single render site
+  // stays behind `featureMismatch`/`agentNeverReported` -- both of which
+  // require `reportStatus === 'ready'` themselves. That is one edit away from
+  // reintroducing the cross-server bug fixed elsewhere on this screen, and the
+  // gate costs nothing: no reachable render changes, because every reader is
+  // already behind the same condition.
+  const reportReady = reportStatus === 'ready';
+  const agentFeatures = reportReady ? (reportData?.agent_features ?? []) : [];
+  const agentVersion = reportReady ? (reportData?.agent_version ?? '') : '';
   // Spec §9's visible half: gateway-side specs exist and the agent reports no
   // managed process at all. Without a banner here an operator configures specs
   // and watches nothing happen, with no clue why.
@@ -1122,6 +1257,7 @@ export function RuntimeAdminSection({
     // restart or a server switch.
     setRestartNotice(null);
     const run = ++overrideRunRef.current;
+    const ticket = beginSpecWrite(spec.mapping_id);
     setOverrideBusy(true);
     // Bounds the lock. `overrideBusy` disables EVERY action on EVERY row, and
     // nothing else in the stack ever gives up on the request (no
@@ -1149,7 +1285,10 @@ export function RuntimeAdminSection({
       // operator to clear an override by hand that the row denied existed.
       // The toast and the lock release below stay behind the token: those
       // ARE user-visible, and an abandoned flow must not resurrect them.
-      setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      // The per-mapping TICKET is a different guard from the run token: it
+      // drops this payload only when a LATER write to the same mapping has
+      // already been issued, i.e. only when it is genuinely stale.
+      commitSpecCache(spec.mapping_id, ticket, updated);
       if (overrideRunRef.current !== run) return;
       showSuccess(t.systemSaved);
     } catch (err) {
@@ -1174,6 +1313,7 @@ export function RuntimeAdminSection({
     const live = statusRowsRef.current.find((r) => r.spec_id === specId);
     if (live === undefined || !restartableStates.has(live.state)) return;
     const run = ++restartRunRef.current;
+    const ticket = beginSpecWrite(spec.mapping_id);
     absentSinceRef.current = null;
     setRestartNotice(null);
     setRestart({
@@ -1198,7 +1338,7 @@ export function RuntimeAdminSection({
       // the cache must not stay stale just because the sequence this write
       // belonged to was abandoned. Everything below IS user-visible and stays
       // behind the token.
-      setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      commitSpecCache(spec.mapping_id, ticket, updated);
       if (restartRunRef.current !== run) return;
       setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting', waitFrom } : cur));
     } catch (err) {
@@ -1226,6 +1366,7 @@ export function RuntimeAdminSection({
       phase: 'clearing',
       deadline: Date.now() + OVERRIDE_WRITE_TIMEOUT_MS,
     });
+    const ticket = beginSpecWrite(flow.mappingId);
     try {
       const updated = await api.putRuntimeSpec(flow.mappingId, specBodyWithAdminState(spec, ''));
       if (!mountedRef.current) return;
@@ -1233,7 +1374,7 @@ export function RuntimeAdminSection({
       // then succeeds must still refresh the cache, or the row goes on
       // offering a Clear override that is already cleared and hiding the
       // Restart that is now available again.
-      setSpecsById((cur) => ({ ...cur, [flow.mappingId]: updated }));
+      commitSpecCache(flow.mappingId, ticket, updated);
       if (restartRunRef.current !== run) return;
       showSuccess(t.systemSaved);
     } catch (err) {
@@ -1349,6 +1490,11 @@ export function RuntimeAdminSection({
   function removeGpuRow(idx: number) {
     setGpuRows((rows) => rows.filter((_, i) => i !== idx));
   }
+  // Deliberately does NOT reject a collision as it is typed: an operator
+  // swapping two rows' indices has to pass through a colliding intermediate
+  // state, and refusing the keystroke would make that edit impossible. The
+  // collision is caught at submit instead (duplicateGpuIndex), which is also
+  // where the backend's own refusal would land.
   function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }
@@ -1390,6 +1536,11 @@ export function RuntimeAdminSection({
       showError(placeholderError);
       return;
     }
+    const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
+    if (duplicateGpu !== null) {
+      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      return;
+    }
     setBusy(true);
     let mapping: PortalModelMapping;
     try {
@@ -1408,9 +1559,10 @@ export function RuntimeAdminSection({
     // The mapping now exists regardless of what happens next -- a failure
     // from here on is reported as a partial failure, never silently, so the
     // operator knows the spec (not the mapping) needs another attempt.
+    const ticket = beginSpecWrite(mapping.id);
     try {
       const spec = await api.putRuntimeSpec(mapping.id, buildSpecBody(args, parsedEnv.env));
-      setSpecsById((cur) => ({ ...cur, [mapping.id]: spec }));
+      commitSpecCache(mapping.id, ticket, spec);
       void reloadWarnings();
       setSpecMode('list');
     } catch (err) {
@@ -1436,6 +1588,11 @@ export function RuntimeAdminSection({
       showError(placeholderError);
       return;
     }
+    const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
+    if (duplicateGpu !== null) {
+      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      return;
+    }
     setBusy(true);
     try {
       const updated = await api.updateMapping(id, {
@@ -1449,9 +1606,10 @@ export function RuntimeAdminSection({
       setBusy(false);
       return;
     }
+    const ticket = beginSpecWrite(id);
     try {
       const spec = await api.putRuntimeSpec(id, buildSpecBody(args, parsedEnv.env));
-      setSpecsById((cur) => ({ ...cur, [id]: spec }));
+      commitSpecCache(id, ticket, spec);
       void reloadWarnings();
       setSpecMode('list');
     } catch (err) {
@@ -1470,8 +1628,12 @@ export function RuntimeAdminSection({
     if (!id) return;
     try {
       if (confirmIsSpecDelete) {
+        // A delete is a write to the same cache entry, so it takes a ticket
+        // too: an override PUT still in flight for this mapping must not
+        // resurrect the spec that has just been deleted.
+        const ticket = beginSpecWrite(id);
         await api.deleteRuntimeSpec(id);
-        setSpecsById((cur) => ({ ...cur, [id]: emptySpec(id) }));
+        commitSpecCache(id, ticket, emptySpec(id));
         void reloadWarnings();
       } else {
         await api.deleteMapping(id);
@@ -2138,9 +2300,15 @@ export function RuntimeAdminSection({
         items={[...trail, { label: application.endpoint }]}
       />
       {/* Screen-wide facts, deliberately above the tab strip: which mode this
-          server is in, and why a configured runtime might be doing nothing.
-          Both are true on every tab, so neither may hide behind one. */}
-      {(fileMode || featureMismatch || agentNeverReported || reportFailed) && (
+          server is in, why a configured runtime might be doing nothing, and
+          how a restart sequence ended. All are true on every tab, so none may
+          hide behind one. */}
+      {(fileMode ||
+        featureMismatch ||
+        agentNeverReported ||
+        reportFailed ||
+        mappingsFailed ||
+        restartNotice !== null) && (
         <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
           {/* The runtime mode decides whether this whole screen is writable,
               so a failed report GET is a screen-wide fact and belongs here --
@@ -2153,6 +2321,20 @@ export function RuntimeAdminSection({
               errorLabel={t.runtimeModeUnknown}
               errorDetail={reportError}
               retry={{ label: t.resourceRetry, onRetry: () => void reloadReport() }}
+            />
+          )}
+          {/* Also screen-wide: the mappings are what every tab joins against
+              (the list itself, the matrix's spec set, and the status table's
+              spec_id -> mapping resolution, without which no row can be
+              named or overridden). Left as the old two-state test this said
+              "loading" forever and every status row went quietly blank. */}
+          {mappingsFailed && (
+            <ResourceFallback
+              state={mappingsStatus}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeMappingsUnavailable}
+              errorDetail={mappingsError}
+              retry={{ label: t.resourceRetry, onRetry: () => void reloadMappings() }}
             />
           )}
           {fileMode && (
@@ -2189,6 +2371,27 @@ export function RuntimeAdminSection({
                 </Typography>
               </Box>
             </Alert>
+          )}
+          {/* The restart sequence's three terminal problems get their own
+              banner rather than a chip: each leaves an override in place that
+              the operator now has to decide about, and the advice they carry
+              points at ANOTHER tab ("check the Runtime specs tab and clear it
+              by hand"). They used to render inside the status tab only, which
+              made them invisible to an operator who switched tabs during a
+              sequence that is bounded at 120 s -- likely rather than exotic,
+              and the one notice you must not miss is the one saying a model is
+              still admission-blocked. Kept LAST in this stack so the standing
+              facts above (mode, agent) are not pushed down by a transient one.
+              Cleared the same way as before: by the next override action, the
+              next restart, or a server switch. */}
+          {restartNotice === 'timeout' && (
+            <Alert severity="warning">{t.runtimeRestartTimeout}</Alert>
+          )}
+          {restartNotice === 'clear-timeout' && (
+            <Alert severity="warning">{t.runtimeRestartClearTimeout}</Alert>
+          )}
+          {restartNotice === 'vanished' && (
+            <Alert severity="warning">{t.runtimeRestartVanished}</Alert>
           )}
         </Box>
       )}
@@ -2259,7 +2462,13 @@ export function RuntimeAdminSection({
                 storageKey="op.runtimeSpecs"
                 minWidth={900}
                 labels={listTableLabels(t)}
-                loading={mappingsLoading || mappingsData === null}
+                // Only a GET that is genuinely in flight. `mappingsLoading ||
+                // mappingsData === null` also caught the FAILED GET, which
+                // left this table saying "loading" for as long as the page
+                // stayed open; the screen-wide banner names that state and
+                // offers the retry, and the table falls back to its ordinary
+                // empty text.
+                loading={mappingsStatus === 'loading'}
               />
             </>
           )}
@@ -2299,18 +2508,32 @@ export function RuntimeAdminSection({
                 />
               </Box>
             )
-          ) : reportStatus !== 'ready' || !coresidencyReady ? (
-            // Deliberately NOT the matrix with an empty pair list: neither the
-            // pairs GET (task-21 review's Critical finding) nor the report GET
-            // (which decides whether this screen is writable at all) has
-            // settled, so there is nothing to render or toggle from. A FAILED
-            // report GET is a different fact from a pending one and must not
-            // read as "loading" -- the screen-wide banner above carries the
+          ) : reportStatus !== 'ready' ? (
+            // Deliberately NOT the matrix with an empty pair list: the report
+            // GET (which decides whether this screen is writable at all) has
+            // not settled, so there is nothing to toggle from. A FAILED report
+            // GET is a different fact from a pending one and must not read as
+            // "loading" -- the screen-wide banner above carries the
             // explanation and the retry.
             <ResourceFallback
               state={reportFailed ? reportStatus : 'loading'}
               loadingLabel={t.loading}
               errorLabel={t.runtimeModeUnknownShort}
+            />
+          ) : !coresidencyReady ? (
+            // The pairs GET itself (task-21 review's Critical finding), now
+            // with its failures named instead of shown as an endless
+            // "loading…": on a hard failure there is nothing to render, on a
+            // failed reload there is a payload we could not refresh and a
+            // toggle would PUT the full replacement list computed from it.
+            // Neither may be clicked, and both get the retry this tab never
+            // had -- the resource's `reload()` was not even destructured.
+            <ResourceFallback
+              state={coresidencyStatus}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeCoresidencyUnavailable}
+              errorDetail={coresidencyError}
+              retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
             />
           ) : (
             <RuntimeMatrix
@@ -2366,19 +2589,31 @@ export function RuntimeAdminSection({
                 )}
               </Box>
             )
-          ) : reportStatus !== 'ready' || !gpuBudgetsReady ? (
-            // Neither GET has settled yet. `budgetRows` is still its initial
-            // `[]`, indistinguishable from "no budgets configured", and Save
-            // PUTs it as the FULL replacement -- so a premature click would
-            // erase every previously configured budget (task-21 review's
-            // Critical finding). And until the report resolves we do not know
-            // whether this form should exist at all. No form, no click, no
-            // write. A FAILED report GET says so instead of claiming to still
-            // be loading.
+          ) : reportStatus !== 'ready' ? (
+            // Until the report resolves we do not know whether this form should
+            // exist at all. No form, no click, no write. A FAILED report GET
+            // says so instead of claiming to still be loading.
             <ResourceFallback
               state={reportFailed ? reportStatus : 'loading'}
               loadingLabel={t.loading}
               errorLabel={t.runtimeModeUnknownShort}
+            />
+          ) : !gpuBudgetsReady ? (
+            // The budgets GET itself. While it is in flight `budgetRows` is
+            // still its initial `[]`, indistinguishable from "no budgets
+            // configured", and Save PUTs it as the FULL replacement -- so a
+            // premature click would erase every previously configured budget
+            // (task-21 review's Critical finding). A FAILED GET is the same
+            // hazard with a worse disguise: on a failed RELOAD `budgetRows`
+            // still holds the pre-failure values, so the form would look
+            // perfectly normal and Save would write values we had just failed
+            // to re-read. Both states get the message and the retry instead.
+            <ResourceFallback
+              state={gpuBudgetsStatus}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeBudgetsUnavailable}
+              errorDetail={gpuBudgetsError}
+              retry={{ label: t.resourceRetry, onRetry: () => void reloadGpuBudgets() }}
             />
           ) : (
             <Box sx={{ display: 'grid', gap: 2.5 }}>
@@ -2494,18 +2729,11 @@ export function RuntimeAdminSection({
           actions={<StatusChip status={streamChip.status} label={streamChip.label} />}
         >
           <Box sx={{ display: 'grid', gap: 1.5 }}>
-            {/* The restart sequence's two terminal problems get their own
-                banner rather than a chip: both leave an override in place
-                that the operator now has to decide about. */}
-            {restartNotice === 'timeout' && (
-              <Alert severity="warning">{t.runtimeRestartTimeout}</Alert>
-            )}
-            {restartNotice === 'clear-timeout' && (
-              <Alert severity="warning">{t.runtimeRestartClearTimeout}</Alert>
-            )}
-            {restartNotice === 'vanished' && (
-              <Alert severity="warning">{t.runtimeRestartVanished}</Alert>
-            )}
+            {/* The restart notices used to render here. They are screen-wide
+                facts now (see the banner stack above the tab strip): the
+                sequence runs for up to 120 s and its notices tell the operator
+                to go and clear an override on a DIFFERENT tab, so they must not
+                disappear the moment they do. */}
             <ListTable
               rows={statusRows}
               columns={statusColumns}

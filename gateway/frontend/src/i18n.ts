@@ -578,6 +578,19 @@ const de = {
   runtimeModeUnknown:
     'Der Betriebsmodus dieses Servers konnte nicht ermittelt werden (die Abfrage ist fehlgeschlagen). Solange das so ist, bleibt dieser Bildschirm vollständig schreibgeschützt — es ist unbekannt, ob Änderungen hier überhaupt wirksam würden.',
   runtimeModeUnknownShort: 'Nicht verfügbar, solange der Betriebsmodus unbekannt ist.',
+  // Task 22b (Batch C, C1): die drei uebrigen Ressourcen dieses Bildschirms
+  // hatten fuer eine fehlgeschlagene Abfrage keinen eigenen Zustand -- sie
+  // meldeten dauerhaft „Laden…“. Jede Meldung nennt die Folge, nicht nur den
+  // Fehler: alle drei Schreibvorgaenge ersetzen die VOLLSTAENDIGE Liste.
+  runtimeMappingsUnavailable:
+    'Die Modell-Zuordnungen dieser Anwendung konnten nicht geladen werden. Solange das so ist, lässt sich kein gemeldeter Prozess einem Modell zuordnen, und im Reiter „Live-Status“ stehen keine Übersteuerungen zur Verfügung.',
+  runtimeCoresidencyUnavailable:
+    'Die Co-Residency-Regeln konnten nicht geladen werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Paare löschen.',
+  runtimeBudgetsUnavailable:
+    'Die GPU-Budgets konnten nicht geladen werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Budgets löschen.',
+  // Task 22b (Batch C, C5): das Backend weist einen doppelten GPU-Index ab,
+  // ohne zu sagen, welcher es ist -- hier wird er benannt, vor dem Schreiben.
+  runtimeGpuIndexDuplicate: 'Ein GPU-Index ist mehrfach vergeben',
   runtimeStatusUpstream: 'Vom Agenten gemeldet',
   runtimeStatusNameMismatch:
     'Der Agent meldet einen anderen Modellnamen als die Gateway-Zuordnung.',
@@ -2378,6 +2391,19 @@ const en: PortalMessages = {
   runtimeModeUnknown:
     'The runtime mode of this server could not be determined (the request failed). Until it succeeds this screen stays entirely read-only — it is unknown whether changes made here would take effect at all.',
   runtimeModeUnknownShort: 'Unavailable while the runtime mode is unknown.',
+  // Task 22b (Batch C, C1): the three remaining resources on this screen had
+  // no state of their own for a failed GET -- they said "Loading…" forever.
+  // Each message names the CONSEQUENCE, not just the failure: all three writes
+  // replace the COMPLETE list.
+  runtimeMappingsUnavailable:
+    'The model mappings of this application could not be loaded. Until they do, no reported process can be matched to a model and no override actions are available on the "Live status" tab.',
+  runtimeCoresidencyUnavailable:
+    'The co-residency rules could not be loaded, so the matrix stays hidden: a toggle writes the complete pair list, and computing it from a list we could not load would delete pairs that are already saved.',
+  runtimeBudgetsUnavailable:
+    'The GPU budgets could not be loaded, so the form stays hidden: saving writes the complete budget list, and computing it from a list we could not load would delete budgets that are already saved.',
+  // Task 22b (Batch C, C5): the backend refuses a duplicate GPU index without
+  // saying which one it is -- named here, before the write.
+  runtimeGpuIndexDuplicate: 'A GPU index is used more than once',
   runtimeStatusUpstream: 'Reported by the agent',
   runtimeStatusNameMismatch: 'The agent reports a different model name than the gateway mapping.',
   runtimeStatusUnresolvedShort: 'Unmatched',

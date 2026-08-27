@@ -214,6 +214,17 @@ function renderSection(
     coresidencyPending?: boolean;
     gpuBudgets?: GPUBudget[];
     gpuBudgetsPending?: boolean;
+    // Task 22b / C1: the two OTHER failure shapes, for the three resources
+    // that only ever had "pending". `*Failing` rejects the FIRST call (a hard
+    // failure with nothing in hand, `error`); `*FailsOnCall` rejects the
+    // given 1-based call so an earlier one can succeed first, which is the
+    // failed-RELOAD-over-an-existing-payload state (`stale-error`). Both are
+    // the same options the report resource already had.
+    mappingsFailing?: boolean;
+    coresidencyFailing?: boolean;
+    coresidencyFailsOnCall?: number;
+    gpuBudgetsFailing?: boolean;
+    gpuBudgetsFailsOnCall?: number;
     hardware?: HardwareResponse;
     runtimeMaxProcesses?: number;
     // Task 22: the file-mode/feature-negotiation report, and the live SSE.
@@ -255,10 +266,19 @@ function renderSection(
   let onStatusCb: ((status: 'open' | 'error') => void) | null = null;
   let unsubscribeCount = 0;
   let reportCalls = 0;
+  let mappingsCalls = 0;
+  let coresidencyCalls = 0;
+  let gpuBudgetsCalls = 0;
   const subscribedServerIds: string[] = [];
 
   const fakeApi = {
-    mappings: vi.fn(async () => ({ data: mappings })),
+    mappings: vi.fn(() => {
+      mappingsCalls += 1;
+      if (opts.mappingsFailing && mappingsCalls === 1) {
+        return Promise.reject(new Error('mappings unavailable'));
+      }
+      return Promise.resolve({ data: mappings });
+    }),
     createMapping: vi.fn(async (_aid: string, body: CreateMappingRequest) => {
       created.push(body);
       return makeMapping({ id: 'map_created', ...(body as Partial<PortalModelMapping>) });
@@ -290,21 +310,33 @@ function renderSection(
       deletedSpecIds.push(id);
       return { ok: true };
     }),
-    runtimeCoresidency: vi.fn(() =>
-      opts.coresidencyPending
-        ? new Promise<{ pairs: [string, string][] }>(() => {})
-        : Promise.resolve({ pairs: opts.coresidencyPairs ?? [] }),
-    ),
+    runtimeCoresidency: vi.fn(() => {
+      coresidencyCalls += 1;
+      if (opts.coresidencyPending) return new Promise<{ pairs: [string, string][] }>(() => {});
+      if (
+        (opts.coresidencyFailing && coresidencyCalls === 1) ||
+        opts.coresidencyFailsOnCall === coresidencyCalls
+      ) {
+        return Promise.reject(new Error('coresidency unavailable'));
+      }
+      return Promise.resolve({ pairs: opts.coresidencyPairs ?? [] });
+    }),
     putRuntimeCoresidency: vi.fn(async (_appId: string, body: { pairs: [string, string][] }) => {
       putCoresidencyBodies.push(body.pairs);
       return { pairs: body.pairs };
     }),
     runtimeWarnings: vi.fn(async () => ({ warnings: opts.warnings ?? [] })),
-    gpuBudgets: vi.fn(() =>
-      opts.gpuBudgetsPending
-        ? new Promise<{ budgets: GPUBudget[] }>(() => {})
-        : Promise.resolve({ budgets: opts.gpuBudgets ?? [] }),
-    ),
+    gpuBudgets: vi.fn(() => {
+      gpuBudgetsCalls += 1;
+      if (opts.gpuBudgetsPending) return new Promise<{ budgets: GPUBudget[] }>(() => {});
+      if (
+        (opts.gpuBudgetsFailing && gpuBudgetsCalls === 1) ||
+        opts.gpuBudgetsFailsOnCall === gpuBudgetsCalls
+      ) {
+        return Promise.reject(new Error('budgets unavailable'));
+      }
+      return Promise.resolve({ budgets: opts.gpuBudgets ?? [] });
+    }),
     putGpuBudgets: vi.fn(async (_serverId: string, body: { budgets: GPUBudget[] }) => {
       putBudgets.push(body.budgets);
       return { budgets: body.budgets };
@@ -394,6 +426,30 @@ function renderSection(
             t={t}
             api={fakeApi}
             server={{ ...serverForTest, id }}
+            application={application}
+          />
+        </ToastProvider>,
+      ),
+    /**
+     * Re-renders with another locale's translation table, i.e. the language
+     * menu being used (App.tsx holds `locale` in state and reads
+     * `messages[locale]`, so the tree re-renders rather than remounting).
+     *
+     * That is the deps change that reaches `stale-error` on this screen while
+     * the component STAYS MOUNTED: `t` is a dep of every `useResource` here,
+     * so a switch re-runs all of them, and `useResource` leaves the previous
+     * payload in `data` if the re-run fails. `server.id` is a dep too, but a
+     * real server switch remounts (`ApplicationSection` is rendered with
+     * `key={`app-${server.id}`}` in ServerList.tsx), so the language switch is
+     * the reachable one.
+     */
+    rerenderWithLocale: (next: typeof t) =>
+      view.rerender(
+        <ToastProvider>
+          <RuntimeAdminSection
+            t={next}
+            api={fakeApi}
+            server={serverForTest}
             application={application}
           />
         </ToastProvider>,
@@ -2321,5 +2377,409 @@ describe('RuntimeAdminSection feature-mismatch vs. never-reported (fix round 1, 
 
     expect(await screen.findByText(t.runtimeAgentNeverReported)).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+});
+
+// ===========================================================================
+// Task 22b, Batch C -- the deferred items.
+// ===========================================================================
+
+// C1: the co-residency resource had only "pending". A permanently failed pairs
+// GET left the tab saying "Laden…" for as long as the page stayed open, with
+// no retry (the resource's `reload()` was not even destructured) and no way to
+// tell it from a slow one.
+describe('RuntimeAdminSection failing co-residency GET (task 22b, C1)', () => {
+  function threeMappings() {
+    return [
+      makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' }),
+      makeMapping({ id: 'map_2', gateway_model_name: 'Bravo' }),
+      makeMapping({ id: 'map_3', gateway_model_name: 'Charlie' }),
+    ];
+  }
+
+  it('names the failure, writes nothing, and offers a retry that recovers', async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      coresidencyFailing: true,
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    expect(await screen.findByText(t.runtimeCoresidencyUnavailable)).toBeInTheDocument();
+    // Not "still loading" -- that was the whole defect.
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+    // And the write gating is untouched: nothing clickable, so nothing can PUT
+    // a full-replace list built from pairs we never loaded.
+    expect(
+      screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+    ).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
+    await waitFor(() => expect(fakeApi.runtimeCoresidency).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeCoresidencyUnavailable)).not.toBeInTheDocument();
+  });
+
+  // The OTHER failure shape, and the one that is a write hazard rather than
+  // only a rendering one: `!loading && data !== null` reports a failed RELOAD
+  // as ready, so the matrix stayed rendered and CLICKABLE off pairs we had
+  // just failed to refresh -- and a toggle PUTs the complete replacement list,
+  // silently deleting whatever another admin added meanwhile. Reachable with
+  // the component mounted through the language switch, since `t` is a dep of
+  // every loader here.
+  it('stops accepting toggles when a RELOAD fails over an existing pair list', async () => {
+    const en = messages.en;
+    const { fakeApi, rerenderWithLocale } = renderSection({
+      mappings: threeMappings(),
+      coresidencyPairs: [['map_1', 'map_2']],
+      coresidencyFailsOnCall: 2,
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    // Loaded and live to begin with.
+    expect(
+      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+    ).toBeInTheDocument();
+
+    rerenderWithLocale(en);
+    await waitFor(() => expect(fakeApi.runtimeCoresidency).toHaveBeenCalledTimes(2));
+
+    expect(await screen.findByText(en.runtimeCoresidencyUnavailable)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: `${en.runtimeMatrixCell}: Charlie + Alpha` }),
+    ).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
+  });
+});
+
+// C1: the GPU-budgets resource, same two shapes.
+describe('RuntimeAdminSection failing GPU-budgets GET (task 22b, C1)', () => {
+  it('names the failure, offers no Save, and offers a retry that recovers', async () => {
+    const { fakeApi } = renderSection({ gpuBudgetsFailing: true });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    expect(await screen.findByText(t.runtimeBudgetsUnavailable)).toBeInTheDocument();
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+    // Task 21's Critical stays closed: no form at all, so no write.
+    expect(screen.queryByRole('button', { name: t.save })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeMaxProcesses)).not.toBeInTheDocument();
+    expect(fakeApi.putGpuBudgets).not.toHaveBeenCalled();
+    expect(fakeApi.updateServer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
+    await waitFor(() => expect(fakeApi.gpuBudgets).toHaveBeenCalledTimes(2));
+    expect(await screen.findByLabelText(t.runtimeMaxProcesses)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeBudgetsUnavailable)).not.toBeInTheDocument();
+  });
+
+  // The write hazard, one degree worse than the co-residency one: on a failed
+  // RELOAD `budgetRows` still holds the values from BEFORE it (the re-seed
+  // effect returns early while `data` is unchanged), so the looser gate left a
+  // fully populated form on screen whose Save would have PUT those values as
+  // the COMPLETE replacement set, with the failure invisible.
+  it('hides the Save form when a RELOAD fails over an existing budget list', async () => {
+    const en = messages.en;
+    const { fakeApi, rerenderWithLocale } = renderSection({
+      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgetsFailsOnCall: 2,
+      runtimeMaxProcesses: 2,
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    const budgetField = await screen.findByLabelText(t.runtimeGpuBudget);
+    expect((budgetField as HTMLInputElement).value).toBe('40000');
+
+    rerenderWithLocale(en);
+    await waitFor(() => expect(fakeApi.gpuBudgets).toHaveBeenCalledTimes(2));
+
+    expect(await screen.findByText(en.runtimeBudgetsUnavailable)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en.save })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(en.runtimeGpuBudget)).not.toBeInTheDocument();
+    expect(fakeApi.putGpuBudgets).not.toHaveBeenCalled();
+  });
+});
+
+// C1 / task 22's N3: `specsSettled` required `mappingsData !== null`, so a
+// failed mappings GET left it false forever -- every live-status row
+// unresolvable, its actions cell blank AND its `Unmatched` chip suppressed,
+// which is the silent blank the chip exists to prevent, reached through a
+// different failed GET. The mappings feed all four tabs, so the state is named
+// screen-wide.
+describe('RuntimeAdminSection failing mappings GET (task 22b, C1 / N3)', () => {
+  it('names the failure above the tab strip instead of blanking the status rows', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      mappingsFailing: true,
+    });
+    stream.setStatus('open');
+
+    expect(await screen.findByText(t.runtimeMappingsUnavailable)).toBeInTheDocument();
+    // The specs list no longer claims to be loading either.
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+
+    // Still named on the status tab -- the tab where the consequence lands.
+    await openStatusTab();
+    expect(screen.getByText(t.runtimeMappingsUnavailable)).toBeInTheDocument();
+
+    // The retry recovers the whole join: the row resolves to its gateway model
+    // name and its overrides come back.
+    fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
+    await waitFor(() => expect(fakeApi.mappings).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('gw-model')).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeMappingsUnavailable)).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+  });
+});
+
+// C7: the restart notices rendered inside the status tab only. The sequence is
+// bounded at 120 s and every notice tells the operator to go and clear an
+// override on ANOTHER tab, so switching tabs mid-sequence -- likely, not
+// exotic -- made the one message you must not miss disappear.
+describe('RuntimeAdminSection restart notices are screen-wide (task 22b, C7)', () => {
+  it('keeps a restart timeout notice visible after switching tabs', async () => {
+    vi.useFakeTimers();
+    try {
+      const { stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // The awaited `stopped` never arrives.
+      await act(async () => {
+        vi.advanceTimersByTime(RESTART_STOP_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
+
+      // The notice says to check the "Runtime specs" tab -- so it has to still
+      // be there once the operator does exactly that.
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+      expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+      expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// C6, first item: hoisting `setSpecsById` above the run token (fix round 2, N1)
+// was right -- the bug it fixed was reachable on EVERY timeout -- but it left
+// ARRIVAL ORDER deciding the cache when two writes to the same mapping
+// overlap, because `RuntimeSpec` carries no version/etag.
+describe('RuntimeAdminSection overlapping writes to one mapping (task 22b, C6)', () => {
+  it('ignores an abandoned write that resolves after a later write to the same mapping', async () => {
+    vi.useFakeTimers();
+    try {
+      let landFirst: (updated: RuntimeSpec) => void = () => {};
+      const first = new Promise<RuntimeSpec>((resolve) => {
+        landFirst = resolve;
+      });
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+
+      // Write A: force_stopped, and it hangs past its watchdog.
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
+
+      // Write B on the SAME mapping, issued after A was given up on, and it
+      // resolves normally. The server now holds force_running.
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStart }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+
+      // ...and only THEN does A land. Its payload is older than B's and must
+      // not become the cache: the row would offer Force start (a write that
+      // undoes B) and hide Force stop (the write that was already abandoned).
+      await act(async () => {
+        landFirst(fullSpec({ admin_state: 'force_stopped' }));
+        await Promise.resolve();
+      });
+
+      expect(screen.getByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// C6, third item: `finishRestart` got the same N1 hoist as its two siblings but
+// no dedicated red/green pair -- it was justified by verified code-shape
+// symmetry alone. This is that pair.
+describe('RuntimeAdminSection abandoned clear write refreshes the cache (task 22b, C6)', () => {
+  it('refreshes the row after an abandoned restart-clear write later succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      let landClear: (updated: RuntimeSpec) => void = () => {};
+      const clearWrite = new Promise<RuntimeSpec>((resolve) => {
+        landClear = resolve;
+      });
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // The CLEAR half is the one that hangs.
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => clearWrite);
+      stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartClearTimeout)).toBeInTheDocument();
+
+      // ...and then it lands: the server holds admin_state '' again.
+      await act(async () => {
+        landClear(fullSpec({ admin_state: '' }));
+        await Promise.resolve();
+      });
+
+      // The cache has to follow, or the row keeps offering a Clear override
+      // that is already cleared and keeps hiding the Restart that is available
+      // again -- while the notice tells the operator to go and clear it by hand.
+      expect(
+        screen.queryByRole('button', { name: t.runtimeClearOverride }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.runtimeRestart })).toBeInTheDocument();
+      // The user-visible half stays abandoned.
+      expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// C5 (PRE-EXISTING): `addGpuRow`/`addBudgetRow` keep the auto-PROPOSED index
+// clear of collisions, but an operator can retype a row's index onto another
+// row's. Both backend writes refuse a duplicate outright (checked in
+// portal/service_runtime.go -- neither dedupes, so no filled-in row is ever
+// silently discarded), but with a message that names neither the field nor the
+// reason, after a round trip.
+describe('RuntimeAdminSection duplicate GPU index (task 22b, C5)', () => {
+  it('refuses a spec whose two GPU rows share an index, naming the index, before any write', async () => {
+    const { putSpecs, created } = renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    // addGpuRow proposed 0 and 1; retype the second onto the first.
+    fireEvent.change(
+      screen.getByLabelText(`${t.runtimeSpecGpuIndex}`, { selector: '#runtime-spec-gpu-index-1' }),
+      {
+        target: { value: '0' },
+      },
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(await screen.findByText(`${t.runtimeGpuIndexDuplicate}: GPU 0`)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses a GPU-budget save whose two rows share an index, before any write', async () => {
+    const { fakeApi, putBudgets } = renderSection({
+      gpuBudgets: [
+        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
+        { index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
+      ],
+    });
+
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    await screen.findByLabelText(`${t.runtimeSpecGpuIndex}`, {
+      selector: '#runtime-budget-index-0',
+    });
+    fireEvent.change(
+      screen.getByLabelText(`${t.runtimeSpecGpuIndex}`, {
+        selector: '#runtime-budget-index-1',
+      }),
+      { target: { value: '0' } },
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    expect(await screen.findByText(`${t.runtimeGpuIndexDuplicate}: GPU 0`)).toBeInTheDocument();
+    expect(putBudgets).toHaveLength(0);
+    expect(fakeApi.putGpuBudgets).not.toHaveBeenCalled();
+    expect(fakeApi.updateServer).not.toHaveBeenCalled();
+  });
+});
+
+// C4: `parseArgsText` pops ONE trailing blank line so an accidental Enter is
+// not saved as a new empty argument -- a trade-off a task-20 finding asked
+// for, and the right one. The cost is that a genuinely empty TRAILING argument
+// collapses on a no-op re-save, and that branch had no test, which made a
+// deliberate trade-off look like a bug waiting to be "fixed".
+describe('RuntimeAdminSection trailing empty argument (task 22b, C4)', () => {
+  it('drops a trailing empty argument on a no-op re-save, while keeping an internal one', async () => {
+    const spec = makeSpec({
+      configured: true,
+      mapping_id: 'map_1',
+      binary: '/usr/bin/llama-server',
+      // One empty arg in the MIDDLE (preserved) and one at the END (collapsed).
+      args: ['--foo', '', '--bar', ''],
+    });
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    // The internal blank survives; the trailing one is indistinguishable from
+    // the textarea artifact the pop exists to swallow, so it does not.
+    expect(putSpecs[0].body.args).toEqual(['--foo', '', '--bar']);
   });
 });

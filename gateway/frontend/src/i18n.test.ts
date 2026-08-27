@@ -2015,3 +2015,23 @@ describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
     }
   });
 });
+
+describe('agent-managed runtime i18n keys (task 22b, batch C)', () => {
+  it('defines the failed-resource and duplicate-GPU-index keys in de and en', () => {
+    const keys = [
+      // C1: the three resources that had no state of their own for a failed
+      // GET and said "loading" forever.
+      'runtimeMappingsUnavailable',
+      'runtimeCoresidencyUnavailable',
+      'runtimeBudgetsUnavailable',
+      // C5: the collision the backend refuses without naming it.
+      'runtimeGpuIndexDuplicate',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
