@@ -1455,3 +1455,63 @@ func TestServerRuntimeReportViewForeignUserForbidden(t *testing.T) {
 		t.Fatalf("err = %v, want ErrServerNotFound", err)
 	}
 }
+
+// failAIServerByIDStore injects an AIServerByID failure onto an otherwise-real
+// routing.Store, mirroring service_agent_proxy_routes_test.go's
+// failApplicationsByServerStore.
+type failAIServerByIDStore struct {
+	routing.Store
+	err error
+}
+
+func (s *failAIServerByIDStore) AIServerByID(context.Context, string) (routing.AIServer, error) {
+	return routing.AIServer{}, s.err
+}
+
+// TestAgentRuntimeConfigPropagatesTransientServerReadFailure is C1's covering
+// test. A TRANSIENT store failure on the AIServer read -- a dropped Postgres
+// connection, a SQLite contention window, or the context.DeadlineExceeded
+// PushRuntimeConfig's own 5s bound produces -- must surface as an error, NOT
+// as the empty document with err == nil.
+//
+// The empty-document-with-nil-error answer is not merely imprecise, it is the
+// most destructive value this function can return: the agent parses it
+// happily, overwrites its on-disk cache with it, tears down its bound router
+// listener and drains every running spec. And because it comes back with
+// err == nil, it also walks straight through gateway.PushRuntimeConfig's
+// never-push-on-error guard, so the WS path pushes the teardown with no HTTP
+// status involved at all. See AgentRuntimeConfig's own doc comment.
+func TestAgentRuntimeConfigPropagatesTransientServerReadFailure(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	transient := errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"connection failure", transient},
+		// The PushRuntimeConfig trigger specifically: that method bounds this
+		// call with pushRuntimeConfigTimeout, so a slow store surfaces here as
+		// a deadline, not as a store-shaped error.
+		{"context deadline", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore := newServerTestService(t, now)
+			server := createTestServer(t, svc, "S", "s.example.test")
+			seedServerAgentApplication(t, routeStore, server.ID, now)
+
+			failing := NewService(ServiceDeps{
+				Users:  svc.users,
+				Groups: svc.groups,
+				Routes: &failAIServerByIDStore{Store: routeStore, err: tc.err},
+				Clock:  func() time.Time { return now },
+			})
+			dto, err := failing.AgentRuntimeConfig(context.Background(), server.ID)
+			if err == nil {
+				t.Fatalf("AgentRuntimeConfig returned dto = %#v with a nil error; a transient store failure must be propagated, never collapsed into the empty document", dto)
+			}
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v, want it to wrap %v", err, tc.err)
+			}
+		})
+	}
+}

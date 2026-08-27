@@ -11,6 +11,7 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 	"regexp"
 	"strings"
 	"time"
@@ -914,20 +915,50 @@ type AgentRuntimeConfigDTO struct {
 // Per-GPU VRAMMB: the measured value when known (non-zero), else the
 // operator's estimate -- see agentRuntimeSpecDTO. 0 means unknown either way.
 //
-// A missing/unreadable server, or a store failure reading it, resolves to
-// the same safe empty default (never an error) -- an agent must never see a
-// raw 500 for a token whose server row briefly failed to read. Once we know
-// the server HAS a server_agent application, a genuine store failure
-// reading its OWN configured state is propagated as a real error (mirrors
-// AgentProxyRoutes' "reads never fail" vs. "a real failure surfaces"
-// split).
+// The empty document means exactly one thing: "this server is genuinely not
+// running anything managed" -- an empty serverID, no such AIServer row
+// (store.ErrNotFound), or no server_agent application. EVERY OTHER store
+// error is propagated, exactly as the ApplicationsByServer read three lines
+// below already does.
+//
+// That split is the C1 fix from the final review round, and the reasoning is
+// worth keeping because the earlier shape looked safer than it was. This
+// used to collapse ANY AIServerByID error -- a dropped Postgres connection, a
+// SQLite contention window, a context deadline -- into the SAME value the
+// genuinely-empty case returns, WITH err == nil, on the stated rationale that
+// "an agent must never see a raw 500 for a token whose server row briefly
+// failed to read". The consumer needs the exact opposite:
+//
+//   - On the HTTP path, a fabricated 200 + empty document is well-formed and
+//     carries a valid, DIFFERENT ETag, so the agent's GatewaySource.Load
+//     takes its StatusOK branch, overwrites its on-disk cache with the empty
+//     document, tears down the bound router listener (StartRouter(0)) and
+//     drains EVERY running spec. A 500 is the safe answer: Load's default
+//     branch keeps the last known-good config, so a blip costs one skipped
+//     poll instead of every model on the server.
+//   - On the WS push path it is worse: PushRuntimeConfig bounds this call
+//     with pushRuntimeConfigTimeout, so a slow store yielded
+//     context.DeadlineExceeded -> the empty document -> err == nil, which
+//     walked straight through that function's own never-push-on-error guard
+//     and marshalled the teardown onto the wire with no HTTP status involved
+//     at all.
+//
+// store.ErrNotFound is a reliable discriminator: scanAIServer maps
+// sql.ErrNoRows to it and MemoryStore.AIServerByID returns it directly, so
+// "no such server" is never confused with "the read failed".
 func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (AgentRuntimeConfigDTO, error) {
 	if serverID == "" || s.routes == nil {
 		return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
 	}
 	server, err := s.routes.AIServerByID(ctx, serverID)
 	if err != nil {
-		return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
+		if errors.Is(err, store.ErrNotFound) {
+			// The genuinely-empty case: no such server row. Same safe empty
+			// document as "no server_agent application", and the same
+			// err == nil.
+			return agentRuntimeConfigDTO(nil, nil, nil, 0, 0), nil
+		}
+		return AgentRuntimeConfigDTO{}, err
 	}
 	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
 	if err != nil {

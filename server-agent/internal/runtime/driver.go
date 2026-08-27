@@ -136,6 +136,26 @@ type Driver struct {
 	// be applied at all. Cleared by stopAll so the next active Sync
 	// (recovering from a drain) also re-applies unconditionally.
 	applied bool
+	// appliedSpecCount is how many specs the LAST applied config carried,
+	// kept for one thing only: logging the non-empty -> empty transition
+	// below at Warn.
+	//
+	// This is deliberately a LOG, not a refusal. The gateway-side C1 fix
+	// (portal.Service.AgentRuntimeConfig) is what stops a transient store
+	// failure from ever being SERVED as an empty document; a second,
+	// independent "refuse a document that removes everything" guard here
+	// would have to guess which empty documents are legitimate, and the
+	// legitimate ones are ordinary operator actions -- disabling the last
+	// spec, deleting the server_agent application, taking a server out of
+	// managed-runtime mode. A guard that silently kept models running
+	// against one of those would be a worse failure than the one it
+	// prevents, and two guards that disagree about which empty document is
+	// real are their own defect class. What the operator actually lacked
+	// during the C1 post-mortem was a timestamped line saying the runtime
+	// went to zero and where the document came from, so that is exactly
+	// what this provides -- diagnosis, with no second opinion about
+	// whether to obey.
+	appliedSpecCount int
 	// active is the CURRENT feature-negotiation outcome (Sync step 1),
 	// read from a different goroutine (Active, called from
 	// internal/agent.collectOnce on whatever goroutine is building a
@@ -241,8 +261,13 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 		return
 	}
 
+	if len(cfg.Specs) == 0 && d.applied && d.appliedSpecCount > 0 {
+		slog.Warn("runtime: the desired config now contains NO specs; every managed model will be drained and the router will unbind",
+			"previous_specs", d.appliedSpecCount, "router_listen", cfg.RouterListen, "etag", cfg.ETag, "source", fmt.Sprintf("%T", d.src))
+	}
 	d.mgr.Apply(cfg)
 	d.applied = true
+	d.appliedSpecCount = len(cfg.Specs)
 
 	if _, isFile := d.src.(*FileSource); isFile {
 		d.sendReport(ctx, cfg)
@@ -290,6 +315,7 @@ func (d *Driver) featureActive(ctx context.Context) bool {
 func (d *Driver) stopAll() {
 	d.mgr.Apply(emptyConfig())
 	d.applied = false
+	d.appliedSpecCount = 0
 	if err := d.StartRouter(0); err != nil {
 		slog.Debug("runtime: router stop failed", "error", err)
 	}
@@ -339,7 +365,7 @@ func (d *Driver) sendReport(ctx context.Context, cfg Config) {
 	if d.reporter == nil {
 		return
 	}
-	var parseErr string
+	var parseErr ParseErrorCode
 	if fs, ok := d.src.(*FileSource); ok {
 		parseErr, _ = fs.LastParseError()
 	}
