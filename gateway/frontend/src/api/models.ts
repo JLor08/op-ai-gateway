@@ -3,7 +3,11 @@
 
 import { type Fetcher, request, subscribeSSE } from './transport';
 
-export type ApplicationType = 'ollama' | 'vllm' | 'llama_cpp' | 'llama_swap' | 'litellm';
+// 'server_agent' (agent-runtime-manager feature): the gateway routes to a
+// server-agent-managed router instead of a directly-configured upstream --
+// see api/runtime.ts for the per-mapping launch specs this type unlocks.
+export type ApplicationType =
+  'ollama' | 'vllm' | 'llama_cpp' | 'llama_swap' | 'litellm' | 'server_agent';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 

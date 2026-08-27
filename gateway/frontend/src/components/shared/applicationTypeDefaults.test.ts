@@ -18,6 +18,7 @@ describe('applicationTypeDefaults', () => {
       loadedModelsPath: '/running',
       loadedModelsFormat: 'llama_swap',
       contextProbePath: '/upstream/{model}/props',
+      timeoutMs: 30000,
     });
   });
 
@@ -30,6 +31,24 @@ describe('applicationTypeDefaults', () => {
       loadedModelsPath: '/api/ps',
       loadedModelsFormat: 'auto',
       contextProbePath: '',
+      timeoutMs: 30000,
+    });
+  });
+
+  // server_agent's timeout default is 600000 (10 minutes), not the usual
+  // 30000: it becomes a TOTAL request deadline that must cover a cold model
+  // load, and 30s would fail every first request reproducibly (see the
+  // backend default in portal service_applications.go / the task-19 brief).
+  it('server_agent defaults llama-swap-shaped loaded models plus a 10-minute timeout', () => {
+    expect(applicationTypeDefaults.server_agent).toEqual({
+      port: 8081,
+      scheme: 'http',
+      nativeResponses: false,
+      nativeMessages: false,
+      loadedModelsPath: '/running',
+      loadedModelsFormat: 'llama_swap',
+      contextProbePath: '',
+      timeoutMs: 600000,
     });
   });
 
@@ -46,5 +65,21 @@ describe('applicationTypeDefaults', () => {
     expect(patch.loadedModelsPath).toBe('/v1/models'); // untouched → migrated
     expect(patch.loadedModelsFormat).toBe('openai');
     expect(patch.nativeResponses).toBe(true);
+  });
+
+  // The preservation contract (migrateTypeFields' whole reason to exist)
+  // applies to timeoutMs exactly like every other field: a value still at
+  // the OLD type's default follows the new type, but a value the operator
+  // customized survives the switch untouched.
+  it('migrates timeoutMs to the new type default when untouched', () => {
+    const current = { ...applicationTypeDefaults.ollama };
+    const patch = migrateTypeFields('ollama', 'server_agent', current);
+    expect(patch.timeoutMs).toBe(600000);
+  });
+
+  it('preserves a customized timeoutMs across a type switch', () => {
+    const current: TypeDefaults = { ...applicationTypeDefaults.ollama, timeoutMs: 45000 };
+    const patch = migrateTypeFields('ollama', 'server_agent', current);
+    expect(patch.timeoutMs).toBeUndefined(); // customized → kept, never clobbered to 600000
   });
 });

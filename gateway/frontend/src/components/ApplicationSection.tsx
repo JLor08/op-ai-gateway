@@ -40,6 +40,7 @@ const applicationTypeOptions: ApplicationType[] = [
   'llama_cpp',
   'llama_swap',
   'litellm',
+  'server_agent',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 const applicationFlavorOptions = ['openai', 'anthropic'];
@@ -51,7 +52,6 @@ function isProxied(app: PortalApplication): boolean {
   return app.scheme === 'https' && app.proxy_listen_port !== 0;
 }
 
-const defaultApplicationTimeoutMs = 30000;
 const defaultApplicationAffinityTtlSeconds = 1800;
 const defaultApplicationAdmissionQueueTimeoutSeconds = 0;
 const defaultApplicationHealthPath = '/v1/health';
@@ -146,7 +146,7 @@ export function ApplicationSection({
   const [status, setStatus] = useState<ApplicationStatus>('active');
   const [priority, setPriority] = useState(0);
   const [weight, setWeight] = useState(0);
-  const [timeoutMs, setTimeoutMs] = useState(defaultApplicationTimeoutMs);
+  const [timeoutMs, setTimeoutMs] = useState(applicationTypeDefaults.ollama.timeoutMs);
   const [affinityTtl, setAffinityTtl] = useState(defaultApplicationAffinityTtlSeconds);
   const [admissionQueueTimeout, setAdmissionQueueTimeout] = useState(
     defaultApplicationAdmissionQueueTimeoutSeconds,
@@ -202,7 +202,7 @@ export function ApplicationSection({
     setStatus('active');
     setPriority(0);
     setWeight(0);
-    setTimeoutMs(defaultApplicationTimeoutMs);
+    setTimeoutMs(applicationTypeDefaults.ollama.timeoutMs);
     setAffinityTtl(defaultApplicationAffinityTtlSeconds);
     setAdmissionQueueTimeout(defaultApplicationAdmissionQueueTimeoutSeconds);
     setHealthMode(defaultApplicationHealthMode);
@@ -233,6 +233,7 @@ export function ApplicationSection({
       loadedModelsPath,
       loadedModelsFormat,
       contextProbePath,
+      timeoutMs,
     });
     if (patch.port !== undefined) setPort(patch.port);
     if (patch.scheme !== undefined) setScheme(patch.scheme);
@@ -241,6 +242,7 @@ export function ApplicationSection({
     if (patch.loadedModelsPath !== undefined) setLoadedModelsPath(patch.loadedModelsPath);
     if (patch.loadedModelsFormat !== undefined) setLoadedModelsFormat(patch.loadedModelsFormat);
     if (patch.contextProbePath !== undefined) setContextProbePath(patch.contextProbePath);
+    if (patch.timeoutMs !== undefined) setTimeoutMs(patch.timeoutMs);
     setType(newType);
   }
 

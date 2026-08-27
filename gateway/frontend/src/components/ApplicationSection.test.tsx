@@ -384,6 +384,35 @@ describe('ApplicationSection type prefill', () => {
   });
 });
 
+describe('ApplicationSection server_agent type', () => {
+  it('offers server_agent in the application-type dropdown', async () => {
+    renderSection();
+    openCreate();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+    expect(await screen.findByRole('option', { name: 'server_agent' })).toBeInTheDocument();
+  });
+
+  // The backend defaults a server_agent application's timeout_ms to 600000
+  // (10 minutes, a TOTAL request deadline covering a cold model load) instead
+  // of the usual 30000 -- migrateTypeFields must carry that default the same
+  // way it carries every other type-specific field.
+  it('migrates the timeout to 600000 when switching to server_agent with an untouched timeout', async () => {
+    renderSection();
+    openCreate();
+    await selectType('server_agent');
+    expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe('600000');
+  });
+
+  it('preserves a customized timeout across a switch to server_agent', async () => {
+    renderSection();
+    openCreate();
+    const timeoutField = screen.getByLabelText(t.applicationTimeout) as HTMLInputElement;
+    fireEvent.change(timeoutField, { target: { value: '45000' } });
+    await selectType('server_agent');
+    expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe('45000');
+  });
+});
+
 describe('ApplicationSection reachability indicator', () => {
   it('shows a reachable chip with the last-checked timestamp in a tooltip', async () => {
     renderSection({

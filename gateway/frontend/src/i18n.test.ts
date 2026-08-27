@@ -1803,3 +1803,75 @@ describe('certificates i18n keys', () => {
     }
   });
 });
+
+describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
+  it('defines every runtime admin/spec/matrix/limits/status key in de and en', () => {
+    const keys = [
+      'runtimeAdmin',
+      'runtimeSpecs',
+      'runtimeSpecEdit',
+      'runtimeSpecBinary',
+      'runtimeSpecArgs',
+      'runtimeSpecEnv',
+      'runtimeSpecWorkDir',
+      'runtimeSpecGpus',
+      'runtimeSpecVram',
+      'runtimeSpecIdleTimeout',
+      'runtimeSpecStartupTimeout',
+      'runtimeSpecPinned',
+      'runtimeSpecEnabled',
+      'runtimeMatrix',
+      'runtimeMatrixHint',
+      'runtimeLimits',
+      'runtimeGpuBudget',
+      'runtimeMaxProcesses',
+      'runtimeLiveStatus',
+      'runtimeStateStopped',
+      'runtimeStateStarting',
+      'runtimeStateRunning',
+      'runtimeStateDraining',
+      'runtimeStateBackoff',
+      'runtimeStateStartFailed',
+      'runtimeStateCrashed',
+      'runtimeStatePendingVram',
+      'runtimeStateNotPermitted',
+      'runtimeLastError',
+      'runtimeForceStart',
+      'runtimeForceStop',
+      'runtimeClearOverride',
+      'runtimeManagedLocally',
+      'runtimeManagedOnlyBanner',
+      'runtimeIneffectiveSpecs',
+      'runtimeTimeoutWarning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines an errorLabelByCode-backed key for every new runtime backend error code in de and en', () => {
+    const keys = [
+      'errorRuntimeSpecNotFound',
+      'errorRuntimeSpecBinaryRequired',
+      'errorRuntimeSpecArgsInvalid',
+      'errorRuntimeSpecEnvInvalid',
+      'errorRuntimeSpecGpuInvalid',
+      'errorRuntimeSpecTuningInvalid',
+      'errorRuntimeSpecAdminStateInvalid',
+      'errorRuntimeSpecApplicationNotServerAgent',
+      'errorRuntimeCoresidencyPairInvalid',
+      'errorServerGpuBudgetInvalid',
+      'errorServerRuntimeLimitInvalid',
+      'errorApplicationManagedRuntimeOnly',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
