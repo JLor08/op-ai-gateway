@@ -405,7 +405,12 @@ exclusively on string-equal feature names, never on version comparison
 reserves `runtime_logs`. One flag per shipped capability, not per plan.
 
 - **Agent → gateway:** the sample's existing (today always empty)
-  `capabilities` object: `{"features":["runtime_manager"],"agent_version":"0.2.0"}`.
+  `capabilities` object: `{"features":["runtime_manager"]}`. (Fix round 1, M9:
+  an `agent_version` key inside `capabilities` was specified here and REMOVED
+  during implementation (B4) -- the version already rides on every sample as
+  the top-level `agent_version` field, which is what the gateway persists and
+  the portal renders, and the gateway's capabilities parser reads nothing but
+  `features`. Do not reintroduce it.)
   No wire change; both transports carry it already; the gateway already
   persists it (`server_telemetry.capabilities`).
 - **Gateway → agent:** `GET /api/agent/v1/features`, ETag-conditional (the

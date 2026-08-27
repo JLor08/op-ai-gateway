@@ -56,7 +56,7 @@ Every setting can be given three ways. Precedence, highest first:
 | `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
-| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive — the agent's own mesh identity first, otherwise **all interfaces**, with a warning in the agent log. Set it explicitly (mesh IP, or `127.0.0.1`) to decide that yourself. |
+| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — so the derivation only yields an address when `cert_mode` is not `off` **and** a certificate has actually been installed. Otherwise **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
 
 ### Config file
@@ -67,9 +67,10 @@ looks for **`server-agent.json` next to the binary**; override the path with
 the same setting overrides the file. A missing default file is fine; an explicitly
 requested file that is missing or malformed is a startup error.
 
-Relative `ca_file` and `ca_cache_file` values are resolved beside the actually
-selected config file (after flag/environment/file precedence), not against the
-process working directory. Absolute paths stay unchanged.
+Relative `ca_file`, `ca_cache_file`, `runtime_config` and `runtime_cache`
+values are resolved beside the actually selected config file (after
+flag/environment/file precedence), not against the process working directory.
+Absolute paths stay unchanged.
 
 Whole-line `//` comments are tolerated (the file is JSONC-lenient — only lines whose
 first non-whitespace characters are `//` are stripped, so a `//` inside a value such
@@ -150,8 +151,12 @@ from this local config — never from the gateway:
   decides *whether it may run at all*.
 - **`runtime_router_bind`** — where the router port listens. Leaving it empty
   means the agent picks: its own mesh identity if it has one, otherwise **all
-  interfaces**, which it warns about at startup. On a host that is not
-  mesh-only, set this explicitly.
+  interfaces**, which it warns about at startup. "If it has one" is narrow:
+  the identity is read from the installed mesh leaf in `cert_dir`, so it
+  requires `cert_mode` other than `off` *and* an already-installed
+  certificate — and the portal's generated config ships `cert_mode: "off"`
+  with an empty `cert_dir`, which means the shipped default binds all
+  interfaces. On a host that is not mesh-only, set this explicitly.
 
 `runtime_allowed_dirs` additionally restricts a spec's `work_dir`; it is
 convenience/defence-in-depth, not a boundary (containment is a lexical

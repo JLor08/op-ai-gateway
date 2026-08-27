@@ -144,7 +144,7 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 
 ## Agent (`OP_AGENT_*`)
 
-Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) and JSON config-file key (snake_case, e.g. `gateway_url`), all with the same precedence: flag > env > file > default.
+Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) and JSON config-file key (snake_case, e.g. `gateway_url`), all with the same precedence: flag > env > file > default. Two exceptions, marked in the table: `OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are list-valued and have no flag form (env, comma-separated, > file > default).
 
 | Variable | Type | Purpose | Default |
 |---|---|---|---|
@@ -165,6 +165,12 @@ Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) a
 | `OP_AGENT_CA_FILE` | string | Optional operator-managed PEM trust bundle (agent only reads it) | `` |
 | `OP_AGENT_CA_CACHE_FILE` | string | Optional public PEM cache the agent manages atomically | `` |
 | `OP_AGENT_CA_PEM` | string | Optional inline bootstrap CA bundle (from a generated config) | `` |
+| `OP_AGENT_RUNTIME_SOURCE` | string enum | Where the agent-managed model runtime's launch specs come from: `gateway` (fetched from `GET /api/agent/v1/runtime-config`, portal-maintained) or `file` (read locally from `RUNTIME_CONFIG` and reported upward read-only) | `gateway` |
+| `OP_AGENT_RUNTIME_CONFIG` | string | Path to the local runtime-config JSON file; required when `RUNTIME_SOURCE=file`, ignored otherwise. A relative value resolves beside the selected config file | `` |
+| `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | string list (comma-separated; **no flag form**) | Absolute paths a launch spec's `binary` must match exactly to be permitted. **Empty means nothing may start** — a deliberate hard refusal; this local list, never the gateway, decides whether a model process may run at all | `` (nothing permitted) |
+| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | string list (comma-separated; **no flag form**) | Permitted `work_dir` prefixes for launch specs; **empty means any `work_dir`**. Lexical path-boundary containment — symlinks are not resolved (defence in depth, not the boundary) | `` (any) |
+| `OP_AGENT_RUNTIME_CACHE` | string | Where the last known-good runtime-config document is cached, so managed processes can start before the first successful gateway contact. A relative value resolves beside the selected config file | `server-agent-runtime.cache.json` next to the binary |
+| `OP_AGENT_RUNTIME_ROUTER_BIND` | string | Bind host for the managed runtime's router port (the gateway supplies the router **port**, never the bind host). Empty derives the agent's mesh identity from the installed leaf in `CERT_DIR` — which requires `CERT_MODE` other than `off` and an installed certificate — else binds **all interfaces**, logged at Warn | `` (derive) |
 | `OP_AGENT_TLS_INSECURE` | bool | Skip TLS certificate verification (development only) | `false` |
 | `OP_AGENT_VERBOSE` | bool | Emit detailed debug logs to the console (alias of `-v`/`-verbose`) | `false` |
 

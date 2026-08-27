@@ -1030,7 +1030,7 @@ func (s *Server) PushRuntimeConfig(serverID string) // goroutine-safe, best-effo
 ```
 
 - `PushRuntimeConfig`: `go func(){ if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) { return }; dto, err := s.Portal.AgentRuntimeConfig(context.Background(), serverID); if err != nil { slog.Debug(...); return }; b, _ := json.Marshal(dto); s.AgentStreams.NotifyRuntimeConfig(serverID, b) }()` — asynchronous because the portal hook contract is "synchronous but guaranteed fast" (it is called under certMu-like write paths).
-- Capabilities parse in `ingestTelemetrySample` AFTER store writes succeed (the registry-update convention): parse `req.Capabilities` as `{"features":[...],"agent_version":"..."}` tolerantly (bad JSON → empty), `s.AgentFeatures.Set(serverID, features)`.
+- Capabilities parse in `ingestTelemetrySample` AFTER store writes succeed (the registry-update convention): parse `req.Capabilities` as `{"features":[...]}` tolerantly (bad JSON → empty; an `agent_version` key inside `capabilities` was dropped in B4 — see M9), `s.AgentFeatures.Set(serverID, features)`.
 - main.go wiring: the hook cannot be a `ServiceDeps` field value here, because `PushRuntimeConfig` needs the gateway `Server` and the portal service is constructed BEFORE it. The cert precedent (`OnCertificateIssued: agentStreams.NotifyCertUpdate`) works only because it points at a registry, not at the Server. So: construct the portal service with the hook left nil, build the gateway `Server`, then wire it late via the exported setter Task 5 already added — `portalService.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)` — placed after `gateway.New` in each of the three driver wirings. Check how `cmd/gateway` builds its per-driver deps (`sqlDeps`/`memoryDeps`) and follow that structure.
 
 **Steps:**
@@ -1159,7 +1159,9 @@ func FeatureNames() []string
 // ActiveFeatures returns the intersection with the gateway's declared set.
 func ActiveFeatures(gateway []string) []string
 // capabilitiesJSON builds the sample's capabilities object:
-// {"features":[...],"agent_version":Version}
+// {"features":[...]} -- fix round 1, M9: the agent_version key this plan
+// originally specified was removed in B4 (the version rides on the sample's
+// own top-level agent_version field); do not reintroduce it.
 func capabilitiesJSON() json.RawMessage
 ```
 
@@ -1192,11 +1194,10 @@ func TestActiveFeaturesIsIntersection(t *testing.T) {
 }
 func TestCapabilitiesJSONShape(t *testing.T) {
 	var v struct {
-		Features     []string `json:"features"`
-		AgentVersion string   `json:"agent_version"`
+		Features []string `json:"features"`
 	}
 	if err := json.Unmarshal(capabilitiesJSON(), &v); err != nil { t.Fatal(err) }
-	if v.AgentVersion != Version || len(v.Features) == 0 { t.Fatalf("%+v", v) }
+	if len(v.Features) == 0 { t.Fatalf("%+v", v) }
 }
 ```
 
