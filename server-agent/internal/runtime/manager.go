@@ -547,6 +547,14 @@ type specState struct {
 
 	backoffTimer *time.Timer // pending "backoff elapsed, try again" callback
 
+	// backoffOnExit records an enterBackoff call that arrived while this
+	// spec's process was still alive (the start-timeout path: terminateNow
+	// has signalled it, but the exit is reported later). onProcExited
+	// consumes it and enters the backoff then, so StateBackoff never
+	// coexists with a live process and the delay is measured from the moment
+	// the spec actually has nothing running -- see enterBackoff.
+	backoffOnExit bool
+
 	// intentionalStop is set immediately before this generation's process is
 	// signalled to exit for a reason the owner already knows about (drain,
 	// idle-unload, force_stopped, startup timeout) so the eventual exit
@@ -841,9 +849,50 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 	}
 }
 
+// handleWaiterTimeout resolves the queued waiter whose admission-wait timer
+// just fired with ErrAdmissionBlocked -- unless this spec already has a live
+// process, in which case the wait is no longer an ADMISSION wait at all.
+//
+// B6 fix, and it closes a wider hole than the "nanosecond-scale Stop() race"
+// it was deferred as. I3 established the rule (startProcess cancels the
+// admission-wait timers of the waiters queued on a spec the moment its
+// process starts: "an admission-wait timer exists to bound how long a
+// request waits for a SLOT to free up; once the target has actually started,
+// the request is waiting on startup, which has its own bound"). But it only
+// ever covered the waiters that existed AT startProcess TIME:
+//
+//   - the narrow case originally recorded: cancelTimer's Stop() loses to a
+//     callback already running, and the queued cmdWaiterTimeout then fails a
+//     waiter whose model is seconds from healthy;
+//   - the wide case, with no race at all: every request arriving AFTER the
+//     spec entered StateStarting gets a FRESH timer from handleEnsure (the
+//     state is Starting, not Running, so it queues) that nothing ever
+//     cancels. So the second and later concurrent requests for a cold model
+//     whose load outlasts admission_wait_timeout_seconds get exactly the
+//     misleading ErrAdmissionBlocked I3 exists to prevent -- deterministic,
+//     on ordinary traffic.
+//
+// st.proc != nil is the honest expression of the rule for both: a spec with
+// a live process has already been admitted, and startup_timeout_seconds
+// (enforced by pollHealth, reported through handleStartResult's
+// failPending(ErrStartTimeout)) is the bound that applies. The timer is left
+// alone rather than cleared: whichever of succeedPending/failPending later
+// resolves this waiter calls cancelTimer, whose Stop() correctly returns
+// false for an already-fired timer, so the wg accounting stays balanced.
+//
+// Known, accepted consequence: a waiter that survives a failed generation
+// and re-queues behind a fresh admission decision no longer carries an
+// admission-wait bound (its timer is spent). That hole is not new -- I3's own
+// cancellation already produced it for the first-generation waiters -- and
+// the caller's request context still bounds the wait, which is exactly what
+// admission_wait_timeout_seconds == 0 means per design spec §4.1.
 func (o *owner) handleWaiterTimeout(c cmdWaiterTimeout) {
 	st := o.specs[c.specID]
 	if st == nil {
+		return
+	}
+	if st.proc != nil {
+		slog.Debug("runtime: admission-wait timeout ignored; the spec's process is already up", "spec", c.specID, "state", string(st.state))
 		return
 	}
 	for i, w := range st.pending {
@@ -1210,6 +1259,41 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	if st == nil || st.proc != c.proc {
 		return // superseded generation
 	}
+	// B6 fix: a generation that is already being torn down is superseded just
+	// as surely as one whose map entry was replaced -- the pointer identity
+	// check above cannot see it, because a drain does not swap st.proc, it
+	// signals the process and waits for the exit. Before this, BOTH branches
+	// below overwrote beginDrain's deliberate StateDraining with an
+	// unconditional setState:
+	//
+	//   - ok: StateRunning for a process that has already been SIGTERM'd,
+	//     which puts the spec back into LoadedModels() -- i.e. into the
+	//     AUTHORITATIVE loaded_models telemetry field and the router's
+	//     /running -- so the gateway routes fresh requests at a process the
+	//     agent is shutting down; succeedPending hands queued waiters that
+	//     same endpoint; and it does not end with the process, because
+	//     onProcExited's intentional branch only advances Draining->Stopped,
+	//     leaving the spec stuck in StateRunning with proc == nil (observed:
+	//     `State:running PID:0 Port:0`), advertising a model that is not
+	//     loaded until some later request happens to start it again. Nothing
+	//     self-heals it: scanIdle skips proc == nil and handleEnsure starts a
+	//     fresh generation without correcting the state.
+	//   - err: StateStartFailed + a spurious failures++ + backoff for a spec
+	//     that was deliberately stopped (force_stopped, removed, or evicted
+	//     as an admission victim) -- and, during Close, a backoff timer
+	//     scheduled after handleClose already ran, which m.wg then makes
+	//     Close wait out (see enterBackoff's own closing guard).
+	//
+	// Returning is safe and complete: the drain already owns this
+	// generation's teardown (terminateNow's SIGTERM plus the killGrace
+	// escalation), so the exit is reported and classified by onProcExited
+	// exactly as the drain intends. Queued waiters stay queued and are woken
+	// by wakeAllPendingWaiters once the process is gone -- a drain-then-start,
+	// which is what a request for a spec being drained should get.
+	if st.state == StateDraining {
+		slog.Debug("runtime: discarding start result for a draining generation", "spec", c.specID, "ok", c.ok)
+		return
+	}
 	if c.ok {
 		if st.hasRunBefore {
 			st.restarts++
@@ -1281,6 +1365,13 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
+	// A backoff deferred by enterBackoff because this generation was still
+	// alive. Cleared unconditionally: the non-intentional branch below
+	// records its own failure and calls enterBackoff itself (with st.proc
+	// now nil, so it takes effect immediately), and leaving the flag set
+	// would schedule a second, redundant backoff timer for the same failure.
+	deferredBackoff := st.backoffOnExit
+	st.backoffOnExit = false
 	removed := st.removed
 	// I4 fix: classify by whether THIS GENERATION ever passed a health
 	// probe, not by the current display state. A healthy, serving process
@@ -1300,6 +1391,16 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 			// would never be resolved at all.
 			o.failPending(st, ErrModelNotManaged)
 			delete(o.specs, st.spec.ID)
+			o.wakeAllPendingWaiters()
+			return
+		}
+		if deferredBackoff {
+			// The failure was already recorded (handleStartResult's
+			// start-timeout path); this generation was merely still alive
+			// then. Now that it is gone, start the crash-loop wait -- so the
+			// delay bounds the interval between ATTEMPTS, which is what a
+			// rate limit has to mean.
+			o.enterBackoff(st)
 			o.wakeAllPendingWaiters()
 			return
 		}
@@ -1333,7 +1434,43 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	o.wakeAllPendingWaiters()
 }
 
+// enterBackoff puts st into the crash-loop wait and schedules the retry.
+//
+// Two preconditions it enforces rather than assumes, both B6 fixes:
+//
+// closing: nothing will ever be retried once shutdown has begun, and the
+// timer scheduled here is registered in m.wg -- which Close() ends by
+// waiting on. handleClose cancels the backoff timers that exist WHEN it
+// runs, but a backoff entered afterwards made Close block for the whole
+// delay (backoffCap, 60s by default) with nothing left to retry. Reachable
+// without any exotic timing: a Running spec with a request still in flight
+// drains via the drainGrace path, which does not set intentionalStop (only
+// terminateNow does, and it has not run yet), so a child that crashes in
+// that window lands as a NON-intentional exit -> StateCrashed -> here.
+//
+// proc != nil: StateBackoff means "nothing of this spec is running, waiting
+// to retry". handleStartResult's start-timeout path used to enter backoff
+// straight after terminateNow, which only SIGTERMs and schedules the SIGKILL
+// escalation -- the process is still alive and still holding its VRAM. That
+// produced a status contradicting itself (backoff, or Stopped once the delay
+// elapsed, next to a live PID -- now visible in the portal's live status
+// table) AND silently dropped the retry: handleBackoffFire clears the timer,
+// sets StateStopped and calls admitAndStart, which returns immediately on
+// st.proc != nil. Whenever the delay was shorter than the child's
+// time-to-die (the first two failures against any child that does not die
+// instantly on SIGTERM) the escalating backoff was defeated -- the restart
+// happened whenever the process finally exited instead. Deferring to
+// onProcExited keeps the spec in the honest StateStartFailed until the
+// process is genuinely gone, then starts the delay from there.
 func (o *owner) enterBackoff(st *specState) {
+	if o.closing {
+		o.setState(st, StateStopped)
+		return
+	}
+	if st.proc != nil {
+		st.backoffOnExit = true
+		return
+	}
 	o.setState(st, StateBackoff)
 	delay := backoffDelayFor(st.failures)
 	specID := st.spec.ID

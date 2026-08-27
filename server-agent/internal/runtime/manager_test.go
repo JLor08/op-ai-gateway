@@ -1313,3 +1313,356 @@ func TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange(t *testing.T) {
 		t.Fatalf("spec-a State = %v after an Apply that only touched spec-b, want it to still be backoff -- BUG M1: any config Apply resets every spec's backoff, letting a crash-looping spec skip its wait after an unrelated edit", st.State)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// B6: Task 14's deferred concurrency residue, re-derived. Each test below
+// fails against the pre-fix manager; the pasted failures are in
+// task-22b-batch-b-report.md.
+//
+// stubArgsStubborn is stubArgs plus -ignore-sigterm: the child keeps serving
+// /health after being signalled, so a test can actually look at manager state
+// during the window between "this generation was told to die" and "this
+// generation is gone". A cooperative child closes that window in
+// microseconds, which is precisely why these three defects were only ever
+// reasoned about rather than reproduced.
+// ---------------------------------------------------------------------------
+
+func stubArgsStubborn(healthDelay time.Duration) []string {
+	return append(stubArgs(healthDelay, 0, 0, ""), "-ignore-sigterm")
+}
+
+// setKillGrace overrides killGrace AFTER shrinkTimings (whose t.Cleanup
+// restores the original) and BEFORE the Manager is created, per
+// shrinkTimings' documented ordering rule. Used to widen the
+// SIGTERM->SIGKILL window so a stubborn child stays observably alive.
+func setKillGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := killGrace
+	killGrace = d
+	t.Cleanup(func() { killGrace = orig })
+}
+
+// waitUntilChildIsServing blocks until specID's child answers its health
+// endpoint with ANY HTTP status (503 included: the stub answers 503 until its
+// -health-delay elapses). Reaching that point proves the child got as far as
+// http.ListenAndServe, which in stubchild's main() is strictly AFTER
+// signal.Ignore(SIGTERM).
+//
+// This is load-bearing, not defensive. Without it these tests were vacuous:
+// a spec is observably StateStarting within microseconds of cmd.Start(), long
+// before the freshly exec'd child has finished Go runtime init and installed
+// its SIGTERM disposition -- so a drain triggered "as soon as it is Starting"
+// killed the child outright with SIGTERM's DEFAULT action, pollHealth
+// returned on proc.exited without ever posting a result, and the very race
+// the test names could not occur. It passed against the unfixed manager.
+func waitUntilChildIsServing(t *testing.T, m *Manager, specID string) {
+	t.Helper()
+	waitUntil(t, 5*time.Second, "spec "+specID+"'s child is listening (so it has installed its SIGTERM disposition)", func() bool {
+		st := statusFor(m, specID)
+		if st == nil || st.Port == 0 {
+			return false
+		}
+		resp, err := http.Get(endpointFor(st.Port) + "/health")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return true
+	})
+}
+
+// TestManagerLateHealthResultDoesNotResurrectADrainingSpec is B6's third
+// item, the PRE-EXISTING one: handleStartResult's setState was unconditional,
+// so a health probe that lands after beginDrain already moved the spec to
+// StateDraining overwrites that deliberate transition.
+//
+// The ok=true branch is the damaging one, and it is worse than a transient
+// wrong status:
+//
+//   - StateRunning puts the spec back into LoadedModels(), which the router
+//     serves as /running and the agent reports as the AUTHORITATIVE
+//     loaded_models telemetry field (design spec §7: "the flat loaded_models
+//     list carries only truly loaded models"). The gateway then routes fresh
+//     requests to a process it has just been told to shut down.
+//   - succeedPending hands queued waiters that same dying process's endpoint.
+//   - and it does not end when the process does: onProcExited's intentional
+//     branch only advances Draining->Stopped, so a spec left in StateRunning
+//     stays StateRunning with proc == nil after the exit. Nothing self-heals
+//     it -- scanIdle skips proc == nil, and handleEnsure starts a fresh
+//     generation without correcting the state -- so /running and
+//     loaded_models keep advertising a model that is not loaded until the
+//     next request for it happens to arrive.
+//
+// force_stopped (not removal) is the vehicle: a removed spec gets deleted on
+// exit, which would mask the persistent half of the bug.
+func TestManagerLateHealthResultDoesNotResurrectADrainingSpec(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setKillGrace(t, 2*time.Second) // wide enough that the child is still serving when health goes green
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true // starts on Apply, no request needed
+	spec.Args = stubArgsStubborn(400 * time.Millisecond)
+	spec.StartupTimeoutSeconds = 5
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 3*time.Second, "spec-a is Starting", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStarting
+	})
+	waitUntilChildIsServing(t, m, "spec-a")
+
+	forced := spec
+	forced.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{forced}})
+
+	waitUntil(t, 2*time.Second, "spec-a is Draining", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateDraining
+	})
+
+	// The child ignores SIGTERM and answers /health at ~400ms, so the late
+	// cmdStartResult{ok:true} arrives here, well inside the drain window.
+	// Poll across it: the spec must never be advertised as loaded, and must
+	// never report StateRunning.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, name := range m.LoadedModels() {
+			if name == "model-a" {
+				t.Fatalf("LoadedModels() advertised model-a while its spec was force_stopped and draining -- BUG: handleStartResult's unconditional setState(StateRunning) overwrites beginDrain's StateDraining, so the gateway routes to a process the agent is shutting down")
+			}
+		}
+		if st := statusFor(m, "spec-a"); st != nil && st.State == StateRunning {
+			t.Fatalf("Status()[spec-a].State = running while force_stopped and draining -- BUG: a late health result resurrects a deliberately drained generation")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// And after SIGKILL actually ends it: a force_stopped spec must rest in a
+	// stopped-shaped state with no process, never in StateRunning.
+	waitUntil(t, 4*time.Second, "spec-a's process is gone", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.PID == 0
+	})
+	st := statusFor(m, "spec-a")
+	if st.State == StateRunning {
+		t.Fatalf("Status()[spec-a] = %+v after the process exited -- BUG: the spec is stuck in StateRunning with no process, so /running and the authoritative loaded_models telemetry keep advertising a model that is not loaded", st)
+	}
+	for _, name := range m.LoadedModels() {
+		if name == "model-a" {
+			t.Fatalf("LoadedModels() still advertises model-a after its process exited (state = %v)", st.State)
+		}
+	}
+}
+
+// TestManagerNeverReportsBackoffWhileItsProcessIsStillAlive is B6's first
+// item: handleStartResult's start-timeout path called enterBackoff while
+// st.proc was still non-nil (terminateNow only SIGTERMs and schedules the
+// SIGKILL escalation; the exit is reported later).
+//
+// Two consequences, neither cosmetic now that the portal has a live status
+// table:
+//
+//   - the reported state contradicts the reported PID: "backoff" (design spec
+//     §7: crash-loop WAIT) or, once the backoff elapses, "stopped", for a spec
+//     whose process is still running and still holding its VRAM;
+//   - the retry is silently dropped. handleBackoffFire clears the timer, sets
+//     StateStopped and calls admitAndStart, which returns immediately on
+//     st.proc != nil. Whenever the backoff delay is shorter than the child's
+//     time-to-die (the first two failures, at backoffBase and 2*backoffBase,
+//     against any child that does not die instantly on SIGTERM), the
+//     escalating backoff is defeated: the actual restart happens whenever the
+//     process finally exits instead.
+//
+// The invariant asserted: StateBackoff and StateStopped both mean "nothing of
+// this spec is running", so neither may ever be reported together with a live
+// PID.
+func TestManagerNeverReportsBackoffWhileItsProcessIsStillAlive(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setKillGrace(t, 1500*time.Millisecond) // the observation window
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	// Deliberately NOT pinned: a pinned spec is restarted after its backoff
+	// with a fresh pid, so "the timed-out generation is gone" would never be
+	// observable as PID == 0 and this test could not tell the window it is
+	// about from a restart.
+	spec.Args = stubArgsStubborn(30 * time.Second) // health never arrives -> start timeout
+	spec.StartupTimeoutSeconds = 1
+	spec.AdmissionWaitTimeoutSeconds = 0 // wait on ctx only; the start timeout is what must resolve this
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	// One request triggers the start and then reports the start timeout.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, _ := m.EnsureRunning(ctx, "model-a")
+		if release != nil {
+			release()
+		}
+	}()
+	waitUntilChildIsServing(t, m, "spec-a")
+
+	var violations []string
+	sawFailure, sawProcGone := false, false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st := statusFor(m, "spec-a")
+		if st != nil {
+			if st.LastError != nil {
+				sawFailure = true
+			}
+			if st.PID != 0 && (st.State == StateBackoff || st.State == StateStopped) {
+				violations = append(violations, fmt.Sprintf("state=%s pid=%d", st.State, st.PID))
+			}
+			if sawFailure && st.PID == 0 {
+				sawProcGone = true
+				break
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !sawFailure {
+		t.Fatal("never observed the start timeout being recorded; the test did not reach the window it is about")
+	}
+	if !sawProcGone {
+		t.Fatal("the timed-out generation never went away; the test did not complete the window it is about")
+	}
+	if len(violations) > 0 {
+		t.Fatalf("observed %d snapshot(s) reporting a resting state together with a LIVE pid (first: %s) -- BUG: handleStartResult's start-timeout path enters backoff while st.proc is still non-nil, so the portal shows %q for a process that is still running and the backoff retry is dropped by admitAndStart's st.proc != nil guard", len(violations), violations[0], violations[0])
+	}
+}
+
+// TestManagerAdmissionWaitDoesNotFireForARequestQueuedDuringStartup is B6's
+// second item, re-derived. It was recorded as a "nanosecond-scale Stop()
+// race" in I3's timer cancellation -- cancelTimer losing to a timer callback
+// that then fails the waiter with ErrAdmissionBlocked despite the process
+// having started. That race is real but astronomically narrow.
+//
+// Re-deriving it exposed a MUCH wider instance of the identical defect, with
+// no race at all: I3 cancels the admission-wait timers of the waiters that
+// exist AT startProcess TIME. Every request that arrives AFTER the spec
+// entered StateStarting gets a fresh admission-wait timer from handleEnsure
+// (state is Starting, not Running, so it queues), and nothing ever cancels
+// that one. So the SECOND and later concurrent requests for a cold model
+// whose load outlasts admission_wait_timeout_seconds get exactly the
+// misleading ErrAdmissionBlocked that I3 exists to prevent -- deterministic,
+// on ordinary traffic, not a nanosecond window.
+//
+// The design-spec meaning is the same in both cases: admission_wait_timeout
+// bounds "how long a request may queue when blocked by busy/pinned
+// processes" (§4.1). Once THIS spec's own process exists, the request is not
+// blocked by anything -- it is waiting on startup, which
+// startup_timeout_seconds already bounds.
+func TestManagerAdmissionWaitDoesNotFireForARequestQueuedDuringStartup(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(2*time.Second, 0, 0, "") // healthy at ~2s
+	spec.StartupTimeoutSeconds = 5
+	spec.AdmissionWaitTimeoutSeconds = 1 // shorter than the time-to-healthy
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	// Request A triggers the start; I3 cancels ITS timer.
+	firstDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if release != nil {
+			release()
+		}
+		firstDone <- err
+	}()
+
+	waitUntil(t, 3*time.Second, "spec-a is Starting", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStarting
+	})
+
+	// Request B arrives with the process ALREADY starting: handleEnsure gives
+	// it a brand new admission-wait timer that startProcess has long since
+	// stopped being able to cancel.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	start := time.Now()
+	endpoint, release, err := m.EnsureRunning(ctx, "model-a")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("second EnsureRunning (issued while spec-a was already Starting) = %v after %s -- BUG: the admission-wait timer of a request queued DURING startup is never cancelled, so it fires ErrAdmissionBlocked for a model that was about to become healthy. I3 only covers the waiters that existed when startProcess ran.", err, elapsed)
+	}
+	release()
+	if endpoint == "" {
+		t.Fatal("second EnsureRunning returned an empty endpoint")
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first EnsureRunning = %v, want nil", err)
+	}
+}
+
+// TestManagerCloseDoesNotWaitOutACrashBackoff is NOT one of B6's three
+// items; it surfaced while re-deriving them and is the same shape.
+//
+// enterBackoff schedules its retry timer through Manager.scheduleAfter, which
+// registers it in m.wg -- and Close() ends with m.wg.Wait(). handleClose
+// cancels the backoff timers that exist when it runs, but nothing stops a NEW
+// one from being scheduled afterwards, so a backoff entered during shutdown
+// makes Close block for the whole backoff delay (up to backoffCap, 60s by
+// default) with nothing left to retry.
+//
+// Reached deterministically: a Running spec with a request still in flight
+// drains on Close via the drainGrace path, which does NOT set intentionalStop
+// (only terminateNow does, and that has not run yet). The scripted crash
+// then lands as a NON-intentional exit -> StateCrashed -> enterBackoff, after
+// closing is already true.
+func TestManagerCloseDoesNotWaitOutACrashBackoff(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	origDrain, origBase, origCap := drainGrace, backoffBase, backoffCap
+	drainGrace = 3 * time.Second  // long enough that the scripted crash lands first
+	backoffBase = 4 * time.Second // an observable hang if Close waits it out
+	backoffCap = 8 * time.Second
+	t.Cleanup(func() { drainGrace, backoffBase, backoffCap = origDrain, origBase, origCap })
+
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }})
+	closed := false
+	defer func() {
+		if !closed {
+			m.Close()
+		}
+	}()
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 700*time.Millisecond, 9, "") // healthy at once, crashes at ~700ms
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := m.EnsureRunning(ctx, "model-a"); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	// Deliberately NOT released: InFlight stays 1, so Close's beginDrain waits
+	// out drainGrace instead of terminating immediately -- and therefore never
+	// marks intentionalStop before the scripted crash arrives.
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		m.Close()
+		done <- time.Since(start)
+	}()
+
+	select {
+	case took := <-done:
+		closed = true
+		if took > 3*time.Second {
+			t.Fatalf("Close() took %s -- BUG: a crash-backoff entered while closing schedules a timer through m.wg, and Close's wg.Wait() then blocks for the whole backoff delay (backoffCap is 60s by default) with nothing left to retry", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close() has blocked for over 3s -- BUG: a crash-backoff entered while closing schedules a retry timer through m.wg, and Close's wg.Wait() waits it out")
+	}
+}

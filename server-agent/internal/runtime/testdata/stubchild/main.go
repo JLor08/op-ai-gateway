@@ -22,7 +22,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -32,7 +34,19 @@ func main() {
 	crashAfter := flag.Duration("crash-after", 0, "if > 0, exit with -exit-code this long after start")
 	exitCode := flag.Int("exit-code", 1, "process exit code used by -crash-after")
 	invocationLog := flag.String("invocation-log", "", "if set, append one line (this PID) per invocation -- proves how many times the binary was actually exec'd, independent of the manager's own bookkeeping")
+	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	flag.Parse()
+
+	// -ignore-sigterm exists so a test can observe manager state while a
+	// generation has been signalled but is NOT gone yet. A cooperative child
+	// dies on SIGTERM within microseconds, which closes that window before
+	// any assertion can look into it; a stubborn one keeps serving until
+	// killGrace elapses and SIGKILL (which cannot be ignored) arrives. Real
+	// model servers do behave this way -- a graceful shutdown that finishes
+	// in-flight generations can easily outlast a SIGTERM by seconds.
+	if *ignoreSigterm {
+		signal.Ignore(syscall.SIGTERM)
+	}
 
 	start := time.Now()
 
