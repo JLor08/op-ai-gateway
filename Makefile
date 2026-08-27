@@ -41,8 +41,12 @@ lint-fix:
 hooks:
 	git config core.hooksPath scripts/git-hooks
 
+# Both Go modules, mirroring CI, which tests them in separate steps. The
+# name says `go`, not `backend`: a target that silently skipped server-agent
+# gave a local run false confidence about the module CI does cover.
 test-go:
 	cd gateway/backend && go test ./...
+	cd server-agent && go test ./...
 
 test-ui:
 	cd gateway/frontend && npm test
