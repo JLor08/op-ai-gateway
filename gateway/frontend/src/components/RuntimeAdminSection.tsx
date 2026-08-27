@@ -39,6 +39,7 @@ import type {
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
+import { ResourceFallback, resourceState } from './shared/ResourceFallback';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
 import { Panel } from './shared/Panel';
@@ -72,9 +73,13 @@ type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping 
  * `runtimePollInterval` (60 s, server-agent/internal/agent/agent.go), then
  * the manager's drain-stop is bounded by `drainGrace` (10 s) + `killGrace`
  * (5 s) (server-agent/internal/runtime/manager.go), then the new state
- * reaches us on the 1 s sample. 90 s of that, rounded up to 120 s so an
- * ordinary slow stop is never reported as a failure. A WS-connected agent
- * gets the push immediately and normally finishes in a couple of seconds.
+ * reaches us on the 1 s sample: 76 s. Rounded up to 120 s so an ordinary
+ * slow stop is never reported as a failure -- and 120 s is also exactly what
+ * the OTHER slow legitimate path needs: a `backoff` row's own crash-backoff
+ * timer is capped at `backoffCap` (60 s, same file) and only then does the
+ * poll interval's 60 s apply, i.e. 60 + 60 lands precisely on this bound. A
+ * WS-connected agent gets the push immediately and normally finishes in a
+ * couple of seconds.
  */
 export const RESTART_STOP_TIMEOUT_MS = 120_000;
 
@@ -86,6 +91,19 @@ export const RESTART_STOP_TIMEOUT_MS = 120_000;
  * sustained absence means the spec is genuinely gone.
  */
 export const RESTART_VANISH_GRACE_MS = 8_000;
+
+/**
+ * Upper bound on a SINGLE admin_state PUT settling. `request()` in
+ * api/transport.ts has no AbortController, so nothing else ever gives up on a
+ * request: a PUT that never settles would otherwise leave `overrideBusy` (or
+ * the restart sequence's `clearing` phase) set for the life of the page,
+ * disabling every action on every row with no escape but a reload.
+ *
+ * Deliberately much shorter than RESTART_STOP_TIMEOUT_MS: that one bounds an
+ * agent-side process lifecycle, this one bounds a gateway HTTP round trip
+ * writing one document.
+ */
+export const OVERRIDE_WRITE_TIMEOUT_MS = 30_000;
 
 type GpuRow = { index: number; vramEstimateMb: number; vramMeasuredMb: number };
 
@@ -601,6 +619,14 @@ export function RuntimeAdminSection({
   // not exist, so the list view fans out one GET per row.
   const [specsById, setSpecsById] = useState<Record<string, RuntimeSpec>>({});
   const loadedIdsRef = useRef<Set<string>>(new Set());
+  // Which mapping ids' spec GET has SETTLED -- success or failure. A failed
+  // GET never lands in `specsById`, so "specsById has no entry" cannot stand
+  // in for "settled", and the live-status table needs the difference: "no
+  // spec matches this row's spec_id" is only a fact once every one of these
+  // one-GET-per-mapping requests is done. Before that it is indistinguishable
+  // from "not loaded yet" -- and rendering the unresolved marker in that
+  // window would make every perfectly normal row flash "Unmatched".
+  const [specLoadSettled, setSpecLoadSettled] = useState<ReadonlySet<string>>(new Set());
   useEffect(() => {
     const toLoad = mappings.filter((m) => !loadedIdsRef.current.has(m.id));
     if (toLoad.length === 0) return undefined;
@@ -613,6 +639,12 @@ export function RuntimeAdminSection({
           if (!cancelled) setSpecsById((cur) => ({ ...cur, [m.id]: spec }));
         } catch (err) {
           if (!cancelled) showError(formatPortalError(err, t));
+        } finally {
+          // Deliberately NOT guarded by `cancelled`: this records that the
+          // request is over, which stays true across the deps change that
+          // cancelled it (loadedIdsRef means it is never retried, so a
+          // skipped record would wedge `specsSettled` at false forever).
+          setSpecLoadSettled((cur) => new Set(cur).add(m.id));
         }
       }
     })();
@@ -621,6 +653,8 @@ export function RuntimeAdminSection({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappings, api]);
+  const specsSettled =
+    !mappingsLoading && mappingsData !== null && mappings.every((m) => specLoadSettled.has(m.id));
 
   // ---- Area 2: co-residency matrix --------------------------------------
   // Canonicalisation (which of the two mapping ids sorts first) is entirely
@@ -869,12 +903,20 @@ export function RuntimeAdminSection({
     data: reportData,
     error: reportError,
     loading: reportLoading,
+    reload: reloadReport,
   } = useResource(() => api.runtimeReport(server.id), [api, server.id, t], t);
-  useEffect(() => {
-    if (reportError) showError(reportError);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reportError]);
-  const reportReady = !reportLoading && reportData !== null;
+  // THREE states, not two. `!loading && data !== null` collapsed "the GET is
+  // still in flight" and "the GET failed" (useResource sets `error` and leaves
+  // `data` at null) into one value -- so a failed report GET made this WHOLE
+  // screen permanently read-only while every tab claimed to be loading, with
+  // the only signal a toast that scrolls away. The failure now has its own
+  // rendering and a retry, and it deliberately does NOT also raise a toast:
+  // a permanent banner replaces a transient one.
+  const reportStatus = resourceState({
+    loading: reportLoading,
+    error: reportError,
+    data: reportData,
+  });
   // `source` lives on the NESTED report object; RuntimeReport itself has none.
   const reportContent = reportData?.available ? reportData.report : undefined;
   const fileMode = reportContent?.source === 'file';
@@ -890,19 +932,34 @@ export function RuntimeAdminSection({
   // Same discipline as areas 2/3, one step further out: until the report GET
   // has settled we do not know whether this whole screen is read-only, so no
   // writable affordance is presented at all. Gated on BOTH signals.
-  const writesAllowed = reportReady && !fileMode;
+  const writesAllowed = reportStatus === 'ready' && !fileMode;
 
   const configuredSpecCount = mappings.filter((m) => specsById[m.id]?.configured).length;
-  // Spec §9's visible half: gateway-side specs exist, the agent reports no
-  // managed process at all, and it never declared `runtime_manager`. Without
-  // this banner an operator configures specs against an old agent and watches
-  // nothing happen, with no clue why -- so the banner names the reported
-  // version and feature list, i.e. what to upgrade.
+  // Both derived once: `agent_features` is pinned non-nil by the backend
+  // today, but the two places that read it must not disagree about whether
+  // that is guaranteed.
+  const agentFeatures = reportData?.agent_features ?? [];
+  const agentVersion = reportData?.agent_version ?? '';
+  // Spec §9's visible half: gateway-side specs exist and the agent reports no
+  // managed process at all. Without a banner here an operator configures specs
+  // and watches nothing happen, with no clue why.
+  //
+  // But that silence has TWO causes, and they need different advice. The
+  // backend yields `[]` features when there is no telemetry ROW at all, so the
+  // single old banner told a server whose agent has never connected to
+  // "update its agent", under an "Agent version: —". `server.agent_status`
+  // separates the facts and was already in props: 'unconfigured'/'inactive'
+  // plus an empty version and feature list is "no agent has ever reported",
+  // not "the agent is too old".
+  const runtimeSilent =
+    reportStatus === 'ready' && configuredSpecCount > 0 && statusRows.length === 0;
+  const agentNeverReported =
+    runtimeSilent &&
+    agentVersion === '' &&
+    agentFeatures.length === 0 &&
+    server.agent_status !== 'active';
   const featureMismatch =
-    reportReady &&
-    configuredSpecCount > 0 &&
-    statusRows.length === 0 &&
-    !(reportData?.agent_features ?? []).includes('runtime_manager');
+    runtimeSilent && !agentNeverReported && !agentFeatures.includes('runtime_manager');
 
   // ---- Row overrides + the restart sequence ------------------------------
   // The live stream keys rows by SPEC id; every write is keyed by MAPPING id.
@@ -913,20 +970,53 @@ export function RuntimeAdminSection({
   for (const spec of Object.values(specsById)) {
     if (spec.configured && spec.id) specByRuntimeId.set(spec.id, spec);
   }
+  const mappingById = new Map<string, PortalModelMapping>(mappings.map((m) => [m.id, m]));
+
+  /**
+   * The model mapping behind a live status row, resolved BACKWARDS through
+   * the spec that the stream's `spec_id` keys: spec_id -> RuntimeSpec ->
+   * mapping_id -> mapping. `undefined` means the row cannot be resolved to a
+   * mapping of THIS application -- a fact the status table renders
+   * explicitly, see the model column.
+   */
+  function mappingForStatus(row: RuntimeStatus): PortalModelMapping | undefined {
+    const spec = specByRuntimeId.get(row.spec_id);
+    if (spec === undefined) return undefined;
+    return mappingById.get(spec.mapping_id);
+  }
+
+  function gatewayNameFor(row: RuntimeStatus): string {
+    return mappingForStatus(row)?.gateway_model_name ?? '';
+  }
 
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
-  const [restartNotice, setRestartNotice] = useState<'timeout' | 'vanished' | null>(null);
+  const [restartNotice, setRestartNotice] = useState<
+    'timeout' | 'clear-timeout' | 'vanished' | null
+  >(null);
   // How long the awaited spec has been missing from the stream. A ref, not
   // state, so tracking it never re-arms the timeout effect below.
   const absentSinceRef = useRef<number | null>(null);
+  // Run tokens for the two write flows. Bumping one ABANDONS its flow: a
+  // response landing after the flow was given up on (its watchdog fired) must
+  // not toast success, must not re-lock the UI, and must not resurrect a
+  // sequence the operator has already been told is over.
+  const overrideRunRef = useRef(0);
+  const restartRunRef = useRef(0);
   const mountedRef = useRef(true);
-  useEffect(
-    () => () => {
+  // Set in the effect BODY as well as its cleanup -- matching
+  // MappingSection/ModelServersSection/GroupServersSection, which all do the
+  // same for exactly this reason. Under StrictMode's mount/unmount/remount
+  // the cleanup runs before the second mount, so a ref only ever set to
+  // `false` would stay false for the component's whole life and turn every
+  // guarded setState into a permanent no-op -- one override click would then
+  // lock the UI for good.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   // Any admin_state write while a restart runs would fight the sequence, so
   // ALL override actions lock, not just the restart one (the visibly-disabled
   // idiom areas 2/3 already use for coresidencyBusy/limitsBusy).
@@ -944,15 +1034,24 @@ export function RuntimeAdminSection({
   // so this callback can only fire while the flow it captured is still the
   // current one -- no stale notice. `deadline` being absolute keeps the
   // overall bound honest across the phase change that re-arms the timer.
+  // `clearing` used to be EXEMPT from this bound, which made it unbounded:
+  // api/transport.ts has no AbortController, so a clear PUT that never
+  // settled kept `restart !== null` -- and with it `overridesLocked` --
+  // forever, disabling every action on every row behind a "clearing…" chip
+  // with no escape but a page reload. It is bounded here too now; finishRestart
+  // gives that phase its own, much shorter deadline.
   useEffect(() => {
-    if (restart === null || restart.phase === 'clearing') return undefined;
-    const specId = restart.specId;
+    if (restart === null) return undefined;
+    const { specId, phase } = restart;
     const timer = setTimeout(
       () => {
         if (!mountedRef.current) return;
         absentSinceRef.current = null;
+        // Give the flow up: a response arriving later must not toast success
+        // or reset state behind this notice.
+        restartRunRef.current += 1;
         setRestart((cur) => (cur?.specId === specId ? null : cur));
-        setRestartNotice('timeout');
+        setRestartNotice(phase === 'clearing' ? 'clear-timeout' : 'timeout');
       },
       Math.max(0, restart.deadline - Date.now()),
     );
@@ -1001,24 +1100,38 @@ export function RuntimeAdminSection({
     // news, so it is cleared here rather than lingering until the next
     // restart or a server switch.
     setRestartNotice(null);
+    const run = ++overrideRunRef.current;
     setOverrideBusy(true);
+    // Bounds the lock. `overrideBusy` disables EVERY action on EVERY row, and
+    // nothing else in the stack ever gives up on the request (no
+    // AbortController in api/transport.ts), so without this a single PUT that
+    // never settles freezes the whole table until the page is reloaded.
+    const watchdog = setTimeout(() => {
+      if (!mountedRef.current || overrideRunRef.current !== run) return;
+      overrideRunRef.current += 1; // abandon: a late response must stay silent
+      setOverrideBusy(false);
+      showError(t.runtimeWriteTimeout);
+    }, OVERRIDE_WRITE_TIMEOUT_MS);
     try {
       const updated = await api.putRuntimeSpec(
         spec.mapping_id,
         specBodyWithAdminState(spec, adminState),
       );
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || overrideRunRef.current !== run) return;
       setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
       showSuccess(t.systemSaved);
     } catch (err) {
-      if (mountedRef.current) showError(formatPortalError(err, t));
+      if (mountedRef.current && overrideRunRef.current === run)
+        showError(formatPortalError(err, t));
     } finally {
-      if (mountedRef.current) setOverrideBusy(false);
+      clearTimeout(watchdog);
+      if (mountedRef.current && overrideRunRef.current === run) setOverrideBusy(false);
     }
   }
 
   async function startRestart(specId: string, spec: RuntimeSpec) {
     if (restart !== null) return;
+    const run = ++restartRunRef.current;
     absentSinceRef.current = null;
     setRestartNotice(null);
     setRestart({
@@ -1033,7 +1146,7 @@ export function RuntimeAdminSection({
         spec.mapping_id,
         specBodyWithAdminState(spec, 'force_stopped'),
       );
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || restartRunRef.current !== run) return;
       // Read the watermark HERE, not inside the updater below: the updater may
       // run a render later, by which time another frame could have arrived and
       // a legitimate `stopped` transition would be skipped. What we want is
@@ -1042,14 +1155,14 @@ export function RuntimeAdminSection({
       setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
       setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting', waitFrom } : cur));
     } catch (err) {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || restartRunRef.current !== run) return;
       showError(formatPortalError(err, t));
       setRestart((cur) => (cur?.specId === specId ? null : cur));
     }
   }
 
   async function finishRestart(flow: RestartFlow) {
-    setRestart({ ...flow, phase: 'clearing' });
+    const run = restartRunRef.current;
     // Re-read the spec by MAPPING id (captured when the flow started), not by
     // the stream's spec id: the clear PUT must not depend on the spec-id join
     // still resolving, and it must still be the actual stored document.
@@ -1059,15 +1172,22 @@ export function RuntimeAdminSection({
       setRestartNotice('vanished');
       return;
     }
+    // Its own, much shorter deadline: from here the sequence waits on one
+    // HTTP round trip writing one document, not on a process lifecycle.
+    setRestart({
+      ...flow,
+      phase: 'clearing',
+      deadline: Date.now() + OVERRIDE_WRITE_TIMEOUT_MS,
+    });
     try {
       const updated = await api.putRuntimeSpec(flow.mappingId, specBodyWithAdminState(spec, ''));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || restartRunRef.current !== run) return;
       setSpecsById((cur) => ({ ...cur, [flow.mappingId]: updated }));
       showSuccess(t.systemSaved);
     } catch (err) {
-      if (mountedRef.current) showError(formatPortalError(err, t));
+      if (mountedRef.current && restartRunRef.current === run) showError(formatPortalError(err, t));
     } finally {
-      if (mountedRef.current) setRestart(null);
+      if (mountedRef.current && restartRunRef.current === run) setRestart(null);
     }
   }
 
@@ -1467,11 +1587,71 @@ export function RuntimeAdminSection({
     {
       id: 'model',
       label: t.tableModel,
-      // What the AGENT reports (the spec's upstream model name), not a
-      // gateway-side name joined in: this column's job is showing what the
-      // live stream actually says.
-      value: (row) => row.model || row.spec_id,
+      // The GATEWAY model name is the primary label, resolved backwards
+      // through the spec the stream's spec_id keys (spec_id ->
+      // RuntimeSpec.mapping_id -> mapping.gateway_model_name -- no extra
+      // fetch, both halves are already loaded for area 1). It is the only name
+      // that appears anywhere else in the portal, and area 1 of THIS screen
+      // labels its rows with it while joining to this table by spec_id: two
+      // tabs naming the same process differently, with no visible bridge, is
+      // worse than the disagreement that showing only the agent's name would
+      // expose. So both are shown -- gateway name on top, the agent's own
+      // upstream name beneath it -- with an explicit marker when they differ.
+      //
+      // The fallback is REACHABLE, not theoretical: this stream is
+      // SERVER-scoped while the spec/mapping join is APPLICATION-scoped, and
+      // nothing in the backend stops a server from carrying a second
+      // `server_agent` application (the only relevant constraint is
+      // `unique(server_id, port)`; AgentRuntimeConfig just takes the first
+      // match). On such a server most rows land here, and since they get no
+      // override actions either, the row SAYS so rather than showing a blank
+      // actions cell.
+      //
+      // Search/sort key carries every name a searching operator might type.
+      value: (row) => [gatewayNameFor(row), row.model, row.spec_id].filter(Boolean).join(' '),
       filter: 'text',
+      render: (row) => {
+        const mapping = mappingForStatus(row);
+        const reported = row.model || row.spec_id;
+        if (mapping === undefined) {
+          return (
+            <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+              <Typography variant="body2">{reported}</Typography>
+              {/* Only once every per-mapping spec GET has settled is this a
+                  FACT rather than "not loaded yet" -- two states that would
+                  otherwise look identical, with the marker flashing on every
+                  ordinary row during the initial fan-out. */}
+              {specsSettled && (
+                <Tooltip title={t.runtimeStatusUnresolved}>
+                  <Chip size="small" variant="outlined" label={t.runtimeStatusUnresolvedShort} />
+                </Tooltip>
+              )}
+            </Box>
+          );
+        }
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25 }}>
+            <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+              <Typography variant="body2">{mapping.gateway_model_name}</Typography>
+              {/* The agent reports the UPSTREAM model name, so the meaningful
+                  comparison is against the mapping's own app_model_name --
+                  not against the gateway name, which is a different name by
+                  design. A disagreement here means the spec launches a
+                  different model than the mapping routes to. */}
+              {row.model !== '' && row.model !== mapping.app_model_name && (
+                <WarningAmberIcon
+                  fontSize="small"
+                  color="warning"
+                  titleAccess={t.runtimeStatusNameMismatch}
+                />
+              )}
+            </Box>
+            <Typography variant="caption" color="text.secondary">
+              {t.runtimeStatusUpstream}: {reported}
+            </Typography>
+          </Box>
+        );
+      },
     },
     {
       id: 'state',
@@ -1899,8 +2079,22 @@ export function RuntimeAdminSection({
       {/* Screen-wide facts, deliberately above the tab strip: which mode this
           server is in, and why a configured runtime might be doing nothing.
           Both are true on every tab, so neither may hide behind one. */}
-      {(fileMode || featureMismatch) && (
+      {(fileMode || featureMismatch || agentNeverReported || reportStatus === 'error') && (
         <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+          {/* The runtime mode decides whether this whole screen is writable,
+              so a failed report GET is a screen-wide fact and belongs here --
+              with a retry, because "keep everything read-only forever" is not
+              an acceptable resting place for one failed request. */}
+          {reportStatus === 'error' && (
+            <ResourceFallback
+              state="error"
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeModeUnknown}
+              errorDetail={reportError}
+              retryLabel={t.resourceRetry}
+              onRetry={() => void reloadReport()}
+            />
+          )}
           {fileMode && (
             <Alert severity="info">
               <Box sx={{ display: 'grid', gap: 0.25 }}>
@@ -1919,16 +2113,19 @@ export function RuntimeAdminSection({
           {fileMode && configuredSpecCount > 0 && (
             <Alert severity="warning">{t.runtimeIneffectiveSpecs}</Alert>
           )}
+          {/* No version/feature list here: there is no telemetry row to
+              report one from, and printing "Agent version: —" is what made
+              the old single banner misdiagnose this case as "too old". */}
+          {agentNeverReported && <Alert severity="warning">{t.runtimeAgentNeverReported}</Alert>}
           {featureMismatch && (
             <Alert severity="warning">
               <Box sx={{ display: 'grid', gap: 0.25 }}>
                 <span>{t.runtimeFeatureMismatch}</span>
                 <Typography variant="caption">
-                  {t.runtimeAgentVersion}: {reportData?.agent_version || '—'}
+                  {t.runtimeAgentVersion}: {agentVersion || '—'}
                 </Typography>
                 <Typography variant="caption">
-                  {t.runtimeAgentFeatures}:{' '}
-                  {reportData?.agent_features.length ? reportData.agent_features.join(', ') : '—'}
+                  {t.runtimeAgentFeatures}: {agentFeatures.length ? agentFeatures.join(', ') : '—'}
                 </Typography>
               </Box>
             </Alert>
@@ -2042,12 +2239,19 @@ export function RuntimeAdminSection({
                 />
               </Box>
             )
-          ) : !reportReady || !coresidencyReady ? (
+          ) : reportStatus !== 'ready' || !coresidencyReady ? (
             // Deliberately NOT the matrix with an empty pair list: neither the
             // pairs GET (task-21 review's Critical finding) nor the report GET
             // (which decides whether this screen is writable at all) has
-            // settled, so there is nothing to render or toggle from.
-            <Typography color="text.secondary">{t.loading}</Typography>
+            // settled, so there is nothing to render or toggle from. A FAILED
+            // report GET is a different fact from a pending one and must not
+            // read as "loading" -- the screen-wide banner above carries the
+            // explanation and the retry.
+            <ResourceFallback
+              state={reportStatus === 'error' ? 'error' : 'loading'}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeModeUnknownShort}
+            />
           ) : (
             <RuntimeMatrix
               t={t}
@@ -2102,15 +2306,20 @@ export function RuntimeAdminSection({
                 )}
               </Box>
             )
-          ) : !reportReady || !gpuBudgetsReady ? (
+          ) : reportStatus !== 'ready' || !gpuBudgetsReady ? (
             // Neither GET has settled yet. `budgetRows` is still its initial
             // `[]`, indistinguishable from "no budgets configured", and Save
             // PUTs it as the FULL replacement -- so a premature click would
             // erase every previously configured budget (task-21 review's
             // Critical finding). And until the report resolves we do not know
             // whether this form should exist at all. No form, no click, no
-            // write.
-            <Typography color="text.secondary">{t.loading}</Typography>
+            // write. A FAILED report GET says so instead of claiming to still
+            // be loading.
+            <ResourceFallback
+              state={reportStatus === 'error' ? 'error' : 'loading'}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeModeUnknownShort}
+            />
           ) : (
             <Box sx={{ display: 'grid', gap: 2.5 }}>
               <Box sx={{ display: 'grid', gap: 1 }}>
@@ -2230,6 +2439,9 @@ export function RuntimeAdminSection({
                 that the operator now has to decide about. */}
             {restartNotice === 'timeout' && (
               <Alert severity="warning">{t.runtimeRestartTimeout}</Alert>
+            )}
+            {restartNotice === 'clear-timeout' && (
+              <Alert severity="warning">{t.runtimeRestartClearTimeout}</Alert>
             )}
             {restartNotice === 'vanished' && (
               <Alert severity="warning">{t.runtimeRestartVanished}</Alert>

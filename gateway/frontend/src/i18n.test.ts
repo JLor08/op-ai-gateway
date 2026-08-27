@@ -1942,6 +1942,19 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
       'runtimeAgentVersion',
       'runtimeAgentFeatures',
       'runtimeReportCollectedAt',
+      // Fix round 1: the restart-state gate, the bounded writes, the
+      // report-failed third state, the gateway/upstream name pair and the
+      // "agent never reported" half of the feature-mismatch banner.
+      'runtimeRestartClearTimeout',
+      'runtimeWriteTimeout',
+      'runtimeModeUnknown',
+      'runtimeModeUnknownShort',
+      'runtimeStatusUpstream',
+      'runtimeStatusNameMismatch',
+      'runtimeStatusUnresolvedShort',
+      'runtimeStatusUnresolved',
+      'runtimeAgentNeverReported',
+      'resourceRetry',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');

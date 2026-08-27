@@ -4,6 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  OVERRIDE_WRITE_TIMEOUT_MS,
   RESTART_STOP_TIMEOUT_MS,
   RESTART_VANISH_GRACE_MS,
   RuntimeAdminSection,
@@ -218,6 +219,12 @@ function renderSection(
     // Task 22: the file-mode/feature-negotiation report, and the live SSE.
     report?: RuntimeReport;
     reportPending?: boolean;
+    // Fix round 1, I3: `useResource` on error sets `error` and leaves
+    // `data === null`, so a FAILED report GET is a THIRD fact, not the same
+    // one as a pending GET. The FIRST call rejects and every later one
+    // resolves, so a single test can drive both the failure render and the
+    // retry that recovers from it.
+    reportFailing?: boolean;
     // Pushed synchronously from inside the subscribe call, i.e. exactly like
     // the stream's `snapshot` frame arriving on connect.
     statusRows?: RuntimeStatus[];
@@ -242,6 +249,7 @@ function renderSection(
   let onDataCb: ((rows: RuntimeStatus[]) => void) | null = null;
   let onStatusCb: ((status: 'open' | 'error') => void) | null = null;
   let unsubscribeCount = 0;
+  let reportCalls = 0;
   const subscribedServerIds: string[] = [];
 
   const fakeApi = {
@@ -296,11 +304,14 @@ function renderSection(
       putBudgets.push(body.budgets);
       return { budgets: body.budgets };
     }),
-    runtimeReport: vi.fn(() =>
-      opts.reportPending
-        ? new Promise<RuntimeReport>(() => {})
-        : Promise.resolve(opts.report ?? makeReport()),
-    ),
+    runtimeReport: vi.fn(() => {
+      reportCalls += 1;
+      if (opts.reportPending) return new Promise<RuntimeReport>(() => {});
+      if (opts.reportFailing && reportCalls === 1) {
+        return Promise.reject(new Error('report unavailable'));
+      }
+      return Promise.resolve(opts.report ?? makeReport());
+    }),
     subscribeRuntimeStatus: vi.fn(
       (
         _serverId: string,
@@ -350,6 +361,14 @@ function renderSection(
       unsubscribes: () => unsubscribeCount,
       subscribedServerIds,
     },
+    /**
+     * Unmounts ONLY RuntimeAdminSection, leaving the ToastProvider mounted
+     * above it. `view.unmount()` tears the provider down too, so a toast
+     * pushed after unmount has nowhere to render and the assertion passes
+     * for the wrong reason; this one observes the component's own
+     * mounted-guard directly.
+     */
+    detachSection: () => view.rerender(<ToastProvider>{null}</ToastProvider>),
     /** Re-renders with a different server, to exercise a mid-flow switch. */
     rerenderWithServer: (id: string) =>
       view.rerender(
@@ -1308,7 +1327,16 @@ describe('RuntimeAdminSection admin overrides', () => {
     stream.setStatus('open');
     await openStatusTab();
 
-    expect(await screen.findByText('app-model')).toBeInTheDocument();
+    // Fix round 1: this row IS resolvable to a mapping, so the agent-reported
+    // name now renders as the subordinate line ("Reported by the agent:
+    // app-model") beneath the gateway name -- hence the substring match. The
+    // assertion's point is unchanged: the row renders, its actions do not.
+    // The row renders -- only its ACTIONS are withheld. Waiting on the
+    // GATEWAY name specifically: the per-mapping spec GETs settle after the
+    // first paint, so asserting on the agent-reported name alone can match
+    // the pre-resolution node that the resolved re-render then replaces.
+    expect(await screen.findByText('gw-model')).toBeInTheDocument();
+    expect(screen.getByText('app-model', { exact: false })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
   });
@@ -1889,5 +1917,249 @@ describe('RuntimeAdminSection restart stream watermark (fix round 1, I2)', () =>
     await waitFor(() => expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(2));
     expect(putSpecs).toHaveLength(1);
     expect(putSpecs[0].body).toEqual(expectedBody(spec, ''));
+  });
+});
+
+describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
+  // `reportReady = !reportLoading && reportData !== null` collapsed two
+  // different facts: useResource on error sets `error` and leaves
+  // `data === null`, so a failed GET looked exactly like a pending one --
+  // forever. Every write affordance on the WHOLE screen disappeared and the
+  // matrix/limits tabs claimed to be loading indefinitely, with the only
+  // signal a toast that scrolls away.
+  it('names the third state, keeps writes off, and offers a retry that recovers', async () => {
+    const { fakeApi } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      reportFailing: true,
+    });
+
+    expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
+    // Writes stay disabled -- that half was always right; it just has to say why.
+    expect(screen.queryByRole('button', { name: t.runtimeSpecCreate })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
+
+    // And no tab pretends to still be loading.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
+    expect(await screen.findByText(t.runtimeModeUnknownShort)).toBeInTheDocument();
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    expect(await screen.findByText(t.runtimeModeUnknownShort)).toBeInTheDocument();
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.save })).not.toBeInTheDocument();
+
+    // The retry re-runs the GET, and the screen comes back.
+    fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
+    await waitFor(() => expect(fakeApi.runtimeReport).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    expect(await screen.findByRole('button', { name: t.runtimeSpecCreate })).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeModeUnknown)).not.toBeInTheDocument();
+  });
+
+  it('offers no override actions on the status tab while the mode is unknown', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1' })],
+      reportFailing: true,
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+});
+
+describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => {
+  // api/transport.ts has no AbortController, so a PUT that never settles used
+  // to leave `overrideBusy` / the restart's `clearing` phase set forever --
+  // every action on every row disabled behind a "clearing…" chip, with no
+  // escape but a page reload.
+  it('releases the lock when an override PUT never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => new Promise<RuntimeSpec>(() => {}));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeDisabled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases the lock when the restart sequence’s clear PUT never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const { fakeApi, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: fullSpec() },
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+      });
+      stream.setStatus('open');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // The clear PUT is the one that hangs.
+      fakeApi.putRuntimeSpec.mockImplementationOnce(() => new Promise<RuntimeSpec>(() => {}));
+      stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartClearing)).toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartClearTimeout)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeRestartClearing)).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('RuntimeAdminSection unmount guard (fix round 1)', () => {
+  // The existing unmount test tears the ToastProvider down along with the
+  // section, so "no success toast" would pass even with the guard removed.
+  // Hoisting the provider ABOVE the unmounted subtree observes the component's
+  // own mounted-guard directly.
+  it('pushes no success toast when the override PUT resolves after the section alone unmounts', async () => {
+    let landWrite: (updated: RuntimeSpec) => void = () => {};
+    const write = new Promise<RuntimeSpec>((resolve) => {
+      landWrite = resolve;
+    });
+    const { fakeApi, stream, detachSection } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => write);
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+    await waitFor(() => expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1));
+
+    detachSection();
+    await act(async () => {
+      landWrite(fullSpec({ admin_state: 'force_stopped' }));
+      await Promise.resolve();
+    });
+    // The ToastProvider is still mounted and would happily render this.
+    expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection status row identity (fix round 1, accepted design change)', () => {
+  // The gateway model name is the only name that appears anywhere else in the
+  // portal -- and area 1 of this same screen joins to this table by spec_id
+  // while labelling its rows with it. So the gateway name is the primary
+  // label here too; the agent-reported upstream name stays visible beneath it
+  // rather than being replaced, because a disagreement between the two is a
+  // genuine fact worth seeing.
+  it('shows the gateway model name first, with the agent-reported name beneath it', async () => {
+    const { stream } = renderSection({
+      mappings: [
+        makeMapping({
+          id: 'map_1',
+          gateway_model_name: 'Gateway-Alpha',
+          app_model_name: 'up-alpha',
+        }),
+      ],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'up-alpha' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('Gateway-Alpha')).toBeInTheDocument();
+    expect(screen.getByText('up-alpha', { exact: false })).toBeInTheDocument();
+    // Same name on both sides -> nothing to warn about.
+    expect(screen.queryByTitle(t.runtimeStatusNameMismatch)).not.toBeInTheDocument();
+  });
+
+  it('marks a row where the agent reports a different model name than the mapping', async () => {
+    const { stream } = renderSection({
+      mappings: [
+        makeMapping({
+          id: 'map_1',
+          gateway_model_name: 'Gateway-Alpha',
+          app_model_name: 'up-alpha',
+        }),
+      ],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'something-else' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('Gateway-Alpha')).toBeInTheDocument();
+    expect(screen.getByTitle(t.runtimeStatusNameMismatch)).toBeInTheDocument();
+  });
+
+  // The status stream is SERVER-scoped while the spec/mapping join is
+  // APPLICATION-scoped, and nothing in the backend stops a server from
+  // carrying a second `server_agent` application (only `unique(server_id,
+  // port)` exists). On such a server most rows hit this fallback, and an
+  // empty actions cell with no explanation would make the override feature
+  // look broken.
+  it('says so when a row cannot be resolved to a mapping of this application', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Gateway-Alpha' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_from_another_app', model: 'orphan' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.runtimeStatusUnresolvedShort)).toBeInTheDocument();
+    expect(screen.getByText('orphan')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection feature-mismatch vs. never-reported (fix round 1, M8)', () => {
+  // The backend yields `[]` features when there is no telemetry row at all,
+  // so a server whose agent has never connected was told to UPDATE its agent,
+  // with "Agent version: —". `server.agent_status` separates the two facts and
+  // was already in props.
+  it('tells a server whose agent never reported to install/connect it, not to update it', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      report: makeReport({ agent_version: '', agent_features: [] }),
+    });
+
+    expect(await screen.findByText(t.runtimeAgentNeverReported)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
   });
 });

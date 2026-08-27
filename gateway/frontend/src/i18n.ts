@@ -33,6 +33,10 @@ const de = {
   gatewayCheck: 'Gateway prüfen',
   gatewayToken: 'Gateway-Token',
   loading: 'Laden...',
+  // Generic retry label for ResourceFallback: "failed to load" is a THIRD
+  // state next to "loading" and "loaded", and it needs an action, not just a
+  // toast that scrolls away.
+  resourceRetry: 'Erneut versuchen',
   portalError: 'Portal API Fehler',
   connectionLostTitle: 'Verbindung verloren',
   connectionLostBody: 'Verbindung zum Server verloren. Wiederverbindung läuft…',
@@ -506,7 +510,7 @@ const de = {
   runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
   runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
   runtimeIneffectiveSpecs:
-    'Diese Runtime-Spezifikationen haben keine Wirkung, solange der Server im Datei-Modus läuft.',
+    'Diese Runtime-Spezifikationen liegen im Gateway (Reiter „Runtime-Spezifikationen“ dieser Anwendung) und haben keine Wirkung, solange der Agent seine Prozesse aus seiner eigenen lokalen Datei verwaltet. Sie werden nicht gelöscht und greifen wieder, sobald die Konfigurationsquelle des Agenten zurück auf „Gateway“ gestellt wird. Im Datei-Modus sind sie hier weder einsehbar noch bearbeitbar.',
   runtimeTimeoutWarning:
     'Das Anwendungs-Timeout ist kürzer als der längste Start-Timeout einer aktivierten Spezifikation; ein kalter Modellstart schlägt dadurch fehl.',
   runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
@@ -560,7 +564,23 @@ const de = {
   runtimeRestartTimeout:
     'Neustart-Zeitüberschreitung: Der Prozess hat sich nicht innerhalb der Wartezeit gestoppt. Die Übersteuerung „Stopp erzwingen“ ist weiterhin aktiv und muss von Hand aufgehoben werden.',
   runtimeRestartVanished:
-    'Neustart abgebrochen: Der Prozess wird nicht mehr gemeldet (Spezifikation gelöscht?). Die Übersteuerung wurde nicht aufgehoben.',
+    'Neustart abgebrochen: Der Prozess wird nicht mehr gemeldet (Spezifikation gelöscht?). Die Übersteuerung „Stopp erzwingen“ wurde nicht aufgehoben — im Reiter „Runtime-Spezifikationen“ prüfen und dort von Hand aufheben, falls die Spezifikation noch existiert.',
+  // Task 22, Fix-Runde 1.
+  runtimeRestartClearTimeout:
+    'Neustart: Das Aufheben der Übersteuerung wurde nicht innerhalb der Zeitgrenze abgeschlossen. „Stopp erzwingen“ kann weiterhin aktiv sein — im Reiter „Runtime-Spezifikationen“ prüfen und dort von Hand aufheben.',
+  runtimeWriteTimeout:
+    'Die Anfrage wurde nicht innerhalb der Zeitgrenze abgeschlossen. Ob die Übersteuerung übernommen wurde, ist unbekannt — die Seite neu laden, um den aktuellen Stand zu sehen.',
+  runtimeModeUnknown:
+    'Der Betriebsmodus dieses Servers konnte nicht ermittelt werden (die Abfrage ist fehlgeschlagen). Solange das so ist, bleibt dieser Bildschirm vollständig schreibgeschützt — es ist unbekannt, ob Änderungen hier überhaupt wirksam würden.',
+  runtimeModeUnknownShort: 'Nicht verfügbar, solange der Betriebsmodus unbekannt ist.',
+  runtimeStatusUpstream: 'Vom Agenten gemeldet',
+  runtimeStatusNameMismatch:
+    'Der Agent meldet einen anderen Modellnamen als die Gateway-Zuordnung.',
+  runtimeStatusUnresolvedShort: 'Nicht zuordenbar',
+  runtimeStatusUnresolved:
+    'Dieser Prozess lässt sich keiner Modell-Zuordnung dieser Anwendung zuordnen (der Datenstrom gilt für den ganzen Server, die Zuordnungen nur für diese Anwendung). Deshalb sind hier keine Übersteuerungen möglich.',
+  runtimeAgentNeverReported:
+    'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber es liegt noch keine Agent-Telemetrie vor: Der Agent hat sich noch nie gemeldet. Die Spezifikationen bleiben wirkungslos, bis der Agent auf diesem Server installiert und verbunden ist.',
   runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht auswerten.',
   runtimeConfigUnavailable: 'Die gemeldete Konfiguration ist deshalb nicht verfügbar.',
   runtimeConfigUnrecognised:
@@ -1820,6 +1840,7 @@ const en: PortalMessages = {
   gatewayCheck: 'Check gateway',
   gatewayToken: 'Gateway token',
   loading: 'Loading...',
+  resourceRetry: 'Try again',
   portalError: 'Portal API error',
   connectionLostTitle: 'Connection lost',
   connectionLostBody: 'Lost connection to the server. Reconnecting…',
@@ -2285,7 +2306,8 @@ const en: PortalMessages = {
   runtimeClearOverride: 'Clear override',
   runtimeManagedLocally: 'Managed locally by the agent (file mode)',
   runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
-  runtimeIneffectiveSpecs: 'These runtime specs have no effect while the server runs in file mode.',
+  runtimeIneffectiveSpecs:
+    'These runtime specs live in the gateway (the "Runtime specs" tab of this application) and have no effect while the agent manages its processes from its own local file. They are not deleted, and they take effect again as soon as the agent\'s configuration source is switched back to "gateway". While file mode is active they can neither be viewed nor edited here.',
   runtimeTimeoutWarning:
     'The application timeout is shorter than the longest startup timeout among the enabled specs; a cold model start will fail as a result.',
   runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
@@ -2337,7 +2359,22 @@ const en: PortalMessages = {
   runtimeRestartTimeout:
     'Restart timed out: the process did not report itself stopped within the wait. The "force stop" override is still in effect and has to be cleared by hand.',
   runtimeRestartVanished:
-    'Restart aborted: the process is no longer reported (spec deleted?). The override was not cleared.',
+    'Restart aborted: the process is no longer reported (spec deleted?). The "force stop" override was not cleared — check the "Runtime specs" tab and clear it by hand there if the spec still exists.',
+  // Task 22, fix round 1.
+  runtimeRestartClearTimeout:
+    'Restart: clearing the override did not complete within the time limit. "Force stop" may still be in effect — check the "Runtime specs" tab and clear it by hand there.',
+  runtimeWriteTimeout:
+    'The request did not complete within the time limit. Whether the override was applied is unknown — reload the page to see the current state.',
+  runtimeModeUnknown:
+    'The runtime mode of this server could not be determined (the request failed). Until it succeeds this screen stays entirely read-only — it is unknown whether changes made here would take effect at all.',
+  runtimeModeUnknownShort: 'Unavailable while the runtime mode is unknown.',
+  runtimeStatusUpstream: 'Reported by the agent',
+  runtimeStatusNameMismatch: 'The agent reports a different model name than the gateway mapping.',
+  runtimeStatusUnresolvedShort: 'Unmatched',
+  runtimeStatusUnresolved:
+    'This process cannot be matched to a model mapping of this application (the stream covers the whole server, the mappings only this application). No override actions are available here.',
+  runtimeAgentNeverReported:
+    'This server has runtime specs configured, but no agent telemetry exists yet: the agent has never reported. The specs stay ineffective until the agent is installed on this server and connected.',
   runtimeParseError: 'The agent could not parse its local configuration file.',
   runtimeConfigUnavailable: 'The reported configuration is therefore unavailable.',
   runtimeConfigUnrecognised:
