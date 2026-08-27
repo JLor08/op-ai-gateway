@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+// nvidiaSMI is the CLI every collector and measurer in this file shells out
+// to -- both the LookPath availability probes and the invocations themselves,
+// so an environment that renames or wraps it has exactly one name to change.
+const nvidiaSMI = "nvidia-smi"
+
+// nvidiaCSVFormat is the --format every invocation uses: bare CSV rows, no
+// header line and no unit suffixes. Every parse* function in this file
+// assumes exactly that shape, so the flag and the parsers must move together.
+const nvidiaCSVFormat = "--format=csv,noheader,nounits"
+
 // nvidiaQueryFields is the ordered --query-gpu field list the collector requests
 // from nvidia-smi. parseNvidiaCSV assumes exactly this column order.
 const nvidiaQueryFields = "index,name,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,driver_version"
@@ -29,15 +39,15 @@ func (c *nvidiaCollector) Name() string { return "nvidia" }
 
 // Available reports whether nvidia-smi is on PATH.
 func (c *nvidiaCollector) Available() bool {
-	_, err := exec.LookPath("nvidia-smi")
+	_, err := exec.LookPath(nvidiaSMI)
 	return err == nil
 }
 
 // Collect runs nvidia-smi and parses its CSV output into GPUs.
 func (c *nvidiaCollector) Collect(ctx context.Context) ([]sample.GPU, error) {
-	cmd := exec.CommandContext(ctx, "nvidia-smi",
+	cmd := exec.CommandContext(ctx, nvidiaSMI,
 		"--query-gpu="+nvidiaQueryFields,
-		"--format=csv,noheader,nounits",
+		nvidiaCSVFormat,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -141,7 +151,7 @@ var nvidiaMeasureTimeout = 2 * time.Second
 // all) simply has no measurer installed, and the manager falls back to each
 // spec's operator-entered VRAM estimate exactly as it already does today.
 func NewNvidiaComputeApps() func(pids []int) map[int]map[int]int {
-	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+	if _, err := exec.LookPath(nvidiaSMI); err != nil {
 		return nil
 	}
 	m := &nvidiaComputeAppsMeasurer{}
@@ -194,9 +204,9 @@ func (m *nvidiaComputeAppsMeasurer) measure(pids []int) map[int]map[int]int {
 	ctx, cancel := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
 	defer cancel()
 
-	appsOut, err := exec.CommandContext(ctx, "nvidia-smi",
+	appsOut, err := exec.CommandContext(ctx, nvidiaSMI,
 		"--query-compute-apps="+nvidiaComputeAppsFields,
-		"--format=csv,noheader,nounits",
+		nvidiaCSVFormat,
 	).Output()
 	if err != nil {
 		return nil
@@ -215,9 +225,9 @@ func (m *nvidiaComputeAppsMeasurer) measure(pids []int) map[int]map[int]int {
 		// compute-apps call above rather than a second independent
 		// timeout, so two subprocess spawns in the worst case still cost
 		// at most ONE nvidiaMeasureTimeout in total, not two.
-		idxOut, err := exec.CommandContext(ctx, "nvidia-smi",
+		idxOut, err := exec.CommandContext(ctx, nvidiaSMI,
 			"--query-gpu="+nvidiaGPUIndexFields,
-			"--format=csv,noheader,nounits",
+			nvidiaCSVFormat,
 		).Output()
 		if err == nil {
 			uuidToIndex = parseNvidiaGPUIndexCSV(idxOut)

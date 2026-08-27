@@ -1789,19 +1789,12 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 // sort last -- nobody is waiting on them, and they will be retried by the
 // next event either way.
 func (o *owner) wakeAdmissionCandidates() {
-	type candidate struct {
-		id       string
-		queuedAt time.Time
-	}
-	candidates := make([]candidate, 0, len(o.specs))
+	candidates := make([]wakeCandidate, 0, len(o.specs))
 	for id, st := range o.specs {
-		if st.proc != nil || st.state == StateBackoff {
+		if !wantsWake(st) {
 			continue
 		}
-		if len(st.pending) == 0 && !st.spec.Pinned && st.spec.AdminState != "force_running" {
-			continue
-		}
-		c := candidate{id: id}
+		c := wakeCandidate{id: id}
 		for _, w := range st.pending {
 			if c.queuedAt.IsZero() || w.queuedAt.Before(c.queuedAt) {
 				c.queuedAt = w.queuedAt
@@ -1810,18 +1803,51 @@ func (o *owner) wakeAdmissionCandidates() {
 		candidates = append(candidates, c)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		a, b := candidates[i], candidates[j]
-		if a.queuedAt.IsZero() != b.queuedAt.IsZero() {
-			return b.queuedAt.IsZero() // a real queue time sorts before "no waiter"
-		}
-		if !a.queuedAt.Equal(b.queuedAt) {
-			return a.queuedAt.Before(b.queuedAt)
-		}
-		return a.id < b.id // total order: never leave a tie to map iteration
+		return lessByQueueAge(candidates[i], candidates[j])
 	})
 	for _, c := range candidates {
 		o.admitAndStart(c.id)
 	}
+}
+
+// wakeCandidate is one spec wakeAdmissionCandidates has selected for a
+// retry, carried alongside the queue time of its OLDEST waiter -- the zero
+// time when it has none, which is the pinned/force_running case.
+type wakeCandidate struct {
+	id       string
+	queuedAt time.Time
+}
+
+// wantsWake is wakeAdmissionCandidates' selection rule, and it is exactly
+// admitAndStart's own two early returns read as one predicate: idle (no live
+// process, not in a crash-backoff wait) AND wantUp (a queued request, or
+// pinned, or force_running).
+//
+// It is deliberately only a PRE-FILTER: admitAndStart re-checks both
+// conditions itself and returns early, so a spec this predicate lets through
+// is not thereby started. What the predicate decides is which specs take part
+// in the ordering below -- so keeping it in step with admitAndStart's rule is
+// what makes the wake fair, not what makes it correct.
+func wantsWake(st *specState) bool {
+	if st.proc != nil || st.state == StateBackoff {
+		return false
+	}
+	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
+}
+
+// lessByQueueAge is wakeAdmissionCandidates' wake order: oldest queued
+// request first, specs with no waiter at all last, and the spec ID as a final
+// tiebreak so the order is total. That last clause is load-bearing rather
+// than tidiness -- leaving equal keys to fall back on Go's randomized map
+// iteration is what the ordering exists to eliminate.
+func lessByQueueAge(a, b wakeCandidate) bool {
+	if a.queuedAt.IsZero() != b.queuedAt.IsZero() {
+		return b.queuedAt.IsZero() // a real queue time sorts before "no waiter"
+	}
+	if !a.queuedAt.Equal(b.queuedAt) {
+		return a.queuedAt.Before(b.queuedAt)
+	}
+	return a.id < b.id // total order: never leave a tie to map iteration
 }
 
 // appendUnique appends v to list unless it is already present. The lists it
