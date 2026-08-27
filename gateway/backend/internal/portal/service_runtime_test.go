@@ -527,6 +527,19 @@ func TestSetCoResidencyRejectsDuplicateAfterNormalization(t *testing.T) {
 	if !errors.Is(err, ErrCoResidencyPairInvalid) {
 		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
 	}
+
+	// The EXACT duplicate (same pair, same order) must be rejected by the same
+	// validation. Asserted explicitly rather than assumed from the reversed
+	// case above: the store layer now also rejects it (the composite primary
+	// key on the SQL side, a matching guard in MemoryStore), and this is the
+	// portal-level half of that pair of guards -- the one an operator
+	// actually sees, with the honest 400 code instead of a store conflict.
+	_, err = svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
+		Pairs: [][2]string{{m1.ID, m2.ID}, {m1.ID, m2.ID}},
+	})
+	if !errors.Is(err, ErrCoResidencyPairInvalid) {
+		t.Fatalf("exact duplicate pair: err = %v, want ErrCoResidencyPairInvalid", err)
+	}
 }
 
 func TestSetCoResidencyRejectsSameMappingTwice(t *testing.T) {

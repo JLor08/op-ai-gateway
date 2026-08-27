@@ -2285,6 +2285,17 @@ func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules
 	if _, ok := m.applications[appID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	// An exact-duplicate (MappingAID, MappingBID) pair within rules would hit
+	// the composite primary key (application_id, mapping_a_id, mapping_b_id)
+	// on the SQL side — reject it here too so both backends agree (mirrors
+	// SetRuntimeSpecGPUs/SetServerGPUBudgets' duplicate-index checks, and
+	// sqlite_runtime.go's isUniqueViolation classification for the same
+	// insert). The portal validates pairs before calling this, so this is not
+	// the only guard in production — but a store-level divergence that only
+	// the portal's validation hides is exactly the kind that surfaces the
+	// first time another caller appears.
+	type pairKey struct{ a, b string }
+	seen := make(map[pairKey]struct{}, len(rules))
 	stored := make([]CoResidencyRule, 0, len(rules))
 	for _, r := range rules {
 		if _, ok := m.mappings[r.MappingAID]; !ok {
@@ -2293,6 +2304,11 @@ func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules
 		if _, ok := m.mappings[r.MappingBID]; !ok {
 			return storeerr.ErrNotFound
 		}
+		key := pairKey{a: r.MappingAID, b: r.MappingBID}
+		if _, dup := seen[key]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[key] = struct{}{}
 		r.ApplicationID = appID
 		stored = append(stored, r)
 	}

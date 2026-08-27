@@ -554,9 +554,53 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("overwrite must keep created_at, got %+v", got)
 		}
 
+		// A spec id reused for a DIFFERENT mapping is the primary-key
+		// collision the SQL insert raises: the upsert's conflict target is
+		// mapping_id ALONE, so a colliding id is never absorbed by the
+		// do-update branch. MemoryStore's hand-rolled guard must classify it
+		// identically -- parity that had been claimed in a report but never
+		// machine-checked. map_rt2_b deliberately has NO spec of its own yet,
+		// so the id primary key is the only constraint the insert can
+		// violate; targeting a mapping that already had a spec would make
+		// WHICH constraint fires first ambiguous, and that ambiguity is not
+		// what this asserts.
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_rt2_b", ApplicationID: "app_rt2", GatewayModelName: "map-rt2b-model",
+			AppModelName: "map-rt2b-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create second mapping: %v", err)
+		}
+		reusedID := spec
+		reusedID.MappingID = "map_rt2_b"
+		if err := s.UpsertRuntimeSpec(ctx, reusedID); err != ErrConflict {
+			t.Fatalf("spec id reused for another mapping: want ErrConflict, got %v", err)
+		}
+		if _, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2_b"); err != nil || ok {
+			t.Fatalf("rejected id-reuse upsert must not have written anything: ok=%v err=%v", ok, err)
+		}
+
+		// RuntimeSpecsByApplication is documented as ordered by spec id
+		// (`order by s.id` on the SQL side, an explicit sort in MemoryStore).
+		// Asserting that needs at least TWO rows written in the WRONG order:
+		// against a single row a broken ORDER BY or sort comparator still
+		// passes. "rspec_aaa" sorts BEFORE the already-written "rspec_rt2"
+		// and is written second.
+		second := spec
+		second.ID, second.MappingID = "rspec_aaa", "map_rt2_b"
+		if err := s.UpsertRuntimeSpec(ctx, second); err != nil {
+			t.Fatalf("upsert second spec: %v", err)
+		}
 		specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt2")
-		if err != nil || len(specs) != 1 {
-			t.Fatalf("by application: %v %d", err, len(specs))
+		if err != nil || len(specs) != 2 {
+			t.Fatalf("by application: err=%v n=%d, want 2", err, len(specs))
+		}
+		if specs[0].ID != "rspec_aaa" || specs[1].ID != "rspec_rt2" {
+			t.Fatalf("specs must read ordered by id, got [%s %s]", specs[0].ID, specs[1].ID)
+		}
+		// Leave only rspec_rt2 behind, so the GPU-row and delete assertions
+		// below still describe a single-spec application.
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_aaa"); err != nil {
+			t.Fatalf("delete second spec: %v", err)
 		}
 
 		// A spec that has never had SetRuntimeSpecGPUs called for it must read
@@ -669,7 +713,7 @@ func TestRoutingStoreCoResidencyRules(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		for _, mid := range []string{"map_cr", "map_cr2"} {
+		for _, mid := range []string{"map_cr", "map_cr2", "map_cr3"} {
 			if err := s.CreateMapping(ctx, routing.ModelMapping{
 				ID: mid, ApplicationID: "app_cr", GatewayModelName: mid + "-model",
 				AppModelName: mid + "-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
@@ -684,16 +728,62 @@ func TestRoutingStoreCoResidencyRules(t *testing.T) {
 			t.Fatalf("default must be non-nil empty: err=%v rules=%#v", err, rules)
 		}
 
-		// Set + ordered read
+		// Set + ordered read. THREE pairs, submitted in fully reversed order,
+		// so both halves of the documented `order by mapping_a_id,
+		// mapping_b_id` are actually exercised: the two (map_cr, *) pairs pin
+		// the mapping_b_id tie-break, and (map_cr2, map_cr3) pins the primary
+		// key. A single-pair assertion here could not fail against a broken
+		// ORDER BY or sort comparator at all.
 		want := []routing.CoResidencyRule{
+			{ApplicationID: "app_cr", MappingAID: "map_cr2", MappingBID: "map_cr3", CreatedAt: now},
+			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr3", CreatedAt: now},
 			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr2", CreatedAt: now},
 		}
 		if err := s.SetCoResidencyRules(ctx, "app_cr", want); err != nil {
 			t.Fatalf("set: %v", err)
 		}
 		rules, err = s.CoResidencyRulesByApplication(ctx, "app_cr")
-		if err != nil || len(rules) != 1 || rules[0].MappingAID != "map_cr" || rules[0].MappingBID != "map_cr2" {
-			t.Fatalf("read back: %v %+v", err, rules)
+		if err != nil || len(rules) != 3 {
+			t.Fatalf("read back: err=%v rules=%+v, want 3", err, rules)
+		}
+		wantOrder := [][2]string{{"map_cr", "map_cr2"}, {"map_cr", "map_cr3"}, {"map_cr2", "map_cr3"}}
+		for i, w := range wantOrder {
+			if rules[i].MappingAID != w[0] || rules[i].MappingBID != w[1] {
+				t.Fatalf("position %d = (%s, %s), want (%s, %s); full read: %+v",
+					i, rules[i].MappingAID, rules[i].MappingBID, w[0], w[1], rules)
+			}
+		}
+
+		// An EXACT duplicate pair within one set hits the composite primary
+		// key (application_id, mapping_a_id, mapping_b_id) on the SQL side ->
+		// ErrConflict; MemoryStore must reject it the same way (it did not
+		// until this was added -- a real memory-vs-SQL divergence that only
+		// the portal's own pair validation was hiding). The rejected set must
+		// not partially apply either: the previous three pairs stay.
+		dupPairs := []routing.CoResidencyRule{
+			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr2", CreatedAt: now},
+			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_cr", dupPairs); err != ErrConflict {
+			t.Fatalf("exact duplicate pair: want ErrConflict, got %v", err)
+		}
+		if rules, err = s.CoResidencyRulesByApplication(ctx, "app_cr"); err != nil || len(rules) != 3 {
+			t.Fatalf("failed duplicate-pair set must not partially apply: err=%v rules=%+v", err, rules)
+		}
+		// The reversed pair (b, a) is NOT a duplicate at the store layer --
+		// canonical ordering is portal-level validation, and the composite PK
+		// treats the two as distinct rows. Pinning this keeps the new
+		// duplicate check from being tightened into store-level canonicalization
+		// by accident.
+		reversedOK := []routing.CoResidencyRule{
+			{ApplicationID: "app_cr", MappingAID: "map_cr", MappingBID: "map_cr2", CreatedAt: now},
+			{ApplicationID: "app_cr", MappingAID: "map_cr2", MappingBID: "map_cr", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_cr", reversedOK); err != nil {
+			t.Fatalf("reversed pair must not be treated as a duplicate by the store: %v", err)
+		}
+		if rules, err = s.CoResidencyRulesByApplication(ctx, "app_cr"); err != nil || len(rules) != 2 {
+			t.Fatalf("reversed pair set: err=%v rules=%+v, want 2", err, rules)
 		}
 
 		// Full replace with empty clears, still non-nil

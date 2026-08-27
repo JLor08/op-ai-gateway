@@ -7630,10 +7630,43 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("overwrite must keep created_at, got %+v", got)
 		}
-		// List by application
+		// A spec id reused for a DIFFERENT mapping is a primary-key
+		// collision: the upsert's conflict target is mapping_id ALONE, so a
+		// colliding id is never absorbed by the do-update branch. map_rt2
+		// (seeded by seedRuntimeParents) deliberately has no spec of its own
+		// yet, so the id primary key is the only constraint this insert can
+		// violate -- targeting a mapping that already had a spec would make
+		// WHICH constraint fires first ambiguous between the dialects, and
+		// that ambiguity is not what this asserts.
+		reusedID := spec
+		reusedID.MappingID = "map_rt2"
+		if err := s.UpsertRuntimeSpec(ctx, reusedID); err != ErrConflict {
+			t.Fatalf("spec id reused for another mapping: want ErrConflict, got %v", err)
+		}
+		if _, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2"); err != nil || ok {
+			t.Fatalf("rejected id-reuse upsert must not have written anything: ok=%v err=%v", ok, err)
+		}
+
+		// List by application, ordered by spec id. Asserting the order needs
+		// at least TWO rows written in the WRONG order: against a single row
+		// a broken ORDER BY still passes. "rspec_0" sorts BEFORE the
+		// already-written "rspec_1" and is written second.
+		second := spec
+		second.ID, second.MappingID = "rspec_0", "map_rt2"
+		if err := s.UpsertRuntimeSpec(ctx, second); err != nil {
+			t.Fatalf("upsert second spec: %v", err)
+		}
 		specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt")
-		if err != nil || len(specs) != 1 {
-			t.Fatalf("by application: %v %d", err, len(specs))
+		if err != nil || len(specs) != 2 {
+			t.Fatalf("by application: err=%v n=%d, want 2", err, len(specs))
+		}
+		if specs[0].ID != "rspec_0" || specs[1].ID != "rspec_1" {
+			t.Fatalf("specs must read ordered by id, got [%s %s]", specs[0].ID, specs[1].ID)
+		}
+		// Leave only rspec_1 behind, so the GPU-row and delete assertions
+		// below still describe a single-spec application.
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_0"); err != nil {
+			t.Fatalf("delete second spec: %v", err)
 		}
 		// GPU rows: atomic replace + ordered read
 		gpus := []routing.RuntimeSpecGPU{
@@ -7716,16 +7749,62 @@ func TestConformanceCoResidencyRules(t *testing.T) {
 		if rules == nil {
 			t.Fatal("default must be non-nil, empty")
 		}
-		// Set + ordered read (order by mapping_a_id, mapping_b_id)
+		// Set + ordered read (order by mapping_a_id, mapping_b_id). THREE
+		// pairs, submitted in fully reversed order, so both halves of the
+		// ORDER BY are actually exercised: the two (map_rt, *) pairs pin the
+		// mapping_b_id tie-break and (map_rt2, map_rt3) pins the primary key.
+		// A single-pair assertion could not fail against a broken ORDER BY at
+		// all.
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_rt3", ApplicationID: "app_rt", GatewayModelName: "map_rt3-model",
+			AppModelName: "map_rt3-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed third mapping: %v", err)
+		}
 		want := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt2", MappingBID: "map_rt3", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt3", CreatedAt: now},
 			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
 		}
 		if err := s.SetCoResidencyRules(ctx, "app_rt", want); err != nil {
 			t.Fatalf("set: %v", err)
 		}
 		rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt")
-		if len(rules) != 1 || rules[0].MappingAID != "map_rt" || rules[0].MappingBID != "map_rt2" {
-			t.Fatalf("read back: %+v", rules)
+		if len(rules) != 3 {
+			t.Fatalf("read back: %+v, want 3", rules)
+		}
+		for i, w := range [][2]string{{"map_rt", "map_rt2"}, {"map_rt", "map_rt3"}, {"map_rt2", "map_rt3"}} {
+			if rules[i].MappingAID != w[0] || rules[i].MappingBID != w[1] {
+				t.Fatalf("position %d = (%s, %s), want (%s, %s); full read: %+v",
+					i, rules[i].MappingAID, rules[i].MappingBID, w[0], w[1], rules)
+			}
+		}
+
+		// An EXACT duplicate pair within one set hits the composite primary
+		// key (application_id, mapping_a_id, mapping_b_id) -> ErrConflict, and
+		// the failed transaction must leave the previous three pairs intact.
+		dupPairs := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", dupPairs); err != ErrConflict {
+			t.Fatalf("exact duplicate pair: want ErrConflict, got %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 3 {
+			t.Fatalf("failed duplicate-pair set must not partially apply: %+v", rules)
+		}
+		// The reversed pair (b, a) is a DISTINCT row for the composite PK --
+		// the store neither enforces nor rewrites the canonical ordering
+		// (that is portal-level validation), so this must be accepted.
+		reversedOK := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt2", MappingBID: "map_rt", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", reversedOK); err != nil {
+			t.Fatalf("reversed pair must not be treated as a duplicate by the store: %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 2 {
+			t.Fatalf("reversed pair set: %+v, want 2", rules)
 		}
 		// Full replace with empty clears
 		if err := s.SetCoResidencyRules(ctx, "app_rt", nil); err != nil {
