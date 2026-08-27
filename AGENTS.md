@@ -287,11 +287,19 @@ cd gateway/frontend
 npm run build
 ```
 
-Go lint/format (both modules; pre-commit hook via `make hooks`):
+Lint (Go on both modules + the docs consistency check; pre-commit hook via
+`make hooks`). `make lint-go` and `make lint-docs` run the halves separately:
 
 ```bash
 make lint
 ```
+
+The docs half (`scripts/check-docs.sh`) enforces that intra-repo markdown links
+and `#anchors` resolve, that every file under `docs/architecture/` is reachable
+from its `README.md` index, and that `openapi.yaml` reads with no dangling
+`$ref`. Its own failure modes are pinned by `scripts/check-docs.test.sh`. See
+[`docs/architecture/cross-cutting/development-and-quality.md`](docs/architecture/cross-cutting/development-and-quality.md)
+§4.1.
 
 Security/audit check for portal dependencies:
 

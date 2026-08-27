@@ -47,7 +47,10 @@ screenshots in the same branch.
 | `make test-go` | `go test ./...` in `gateway/backend` |
 | `make test-ui` | `vitest run` in `gateway/frontend` |
 | `make test-e2e` | The base Playwright suite in `gateway/e2e` |
-| `make fmt` / `make lint` / `make lint-fix` | `golangci-lint fmt` / `run` / `run --fix` across both Go modules |
+| `make fmt` / `make lint-fix` | `golangci-lint fmt` / `run --fix` across both Go modules |
+| `make lint` | `lint-go` + `lint-docs` — everything lintable |
+| `make lint-go` | `golangci-lint run` across both Go modules |
+| `make lint-docs` | The docs consistency check — see [§4.1](#41-documentation-consistency-make-lint-docs) |
 | `make lint-install` | Installs the pinned golangci-lint |
 | `make hooks` | `git config core.hooksPath scripts/git-hooks` (enables the pre-commit hook) |
 | `make dev` | Local full-stack dev run (gateway in memory mode + `vite dev`, health-gated) via `scripts/dev.sh` |
@@ -68,9 +71,12 @@ screenshots in the same branch.
   frontend tooling ignores `.worktrees/` (ESLint ignores, Vitest excludes,
   `.prettierignore`) so linked git worktrees under the repo root never leak
   into lint/test runs.
+- **Docs**: `scripts/check-docs.sh` (`make lint-docs`, part of `make lint`) —
+  see [§4.1](#41-documentation-consistency-make-lint-docs).
 - **Pre-commit hook** (`scripts/git-hooks/pre-commit`, enabled by
-  `make hooks`): when Go files are staged, runs format-check + lint on both
-  modules; skip a single commit with `--no-verify`.
+  `make hooks`): when markdown or a `docs/architecture/` YAML file is staged,
+  runs the docs check; when Go files are staged, format-check + lint on both
+  modules. Skip a single commit with `--no-verify`.
 - **Frontend bundle layout** (`gateway/frontend/vite.config.ts`): the
   production build splits the always-loaded vendor libraries (`mui`,
   `vendor`) from the app chunk via `manualChunks` for browser-cache
@@ -80,12 +86,57 @@ screenshots in the same branch.
   again, a chunk outgrew the decoder; treat it as a regression instead of
   raising the limit.
 
+### 4.1 Documentation consistency (`make lint-docs`)
+
+`scripts/check-docs.sh` — bash + git + awk, no dependencies, ~0.2 s. Three
+things this repository's conventions require and nothing else enforces:
+
+1. **Every intra-repo markdown link resolves** — the file, and where the link
+   carries a `#anchor`, the anchor too. Anchors are **derived** from the target
+   document's own headings using GitHub's slug rules (lowercase, drop
+   punctuation, each space becomes a hyphen — runs are *not* collapsed, so
+   `## 12. Delegated & resource-scoped …` really does anchor as
+   `#12-delegated--resource-scoped-…`, and an ADR heading's em dash leaves a
+   double hyphen the same way). The generated ADR anchors are therefore
+   checked, not trusted.
+2. **Every file under `docs/architecture/` is reachable from
+   `docs/architecture/README.md`**, directly or transitively. A document no
+   index path reaches is invisible; the arc42 index rule is stated in
+   `AGENTS.md` and this is what enforces it.
+3. **`docs/architecture/reference/openapi.yaml` reads end to end and every
+   `$ref` resolves.** The reader covers the YAML subset the spec is written in
+   (block mappings and sequences, single-line flow collections, block scalars)
+   and *fails* on anything outside it rather than skipping it, so a silent pass
+   cannot mean "did not understand". It also catches tabs in indentation,
+   indentation that lands between levels, and duplicate keys in one mapping.
+
+Deliberately **out of scope**: `http(s)` links (they fail for reasons that have
+nothing to do with the repository and would make the gate flaky); prose style,
+spelling and line length (this is not a markdown linter); and
+`docs/superpowers/` + `docs/implementation-status.md` as link *sources* — they
+are branch-local working documents that never reach `main`, so gating CI on
+them would gate it on scratch. Their headings are still collected, so links
+pointing *into* them are verified.
+
+`scripts/check-docs.test.sh` pins it: a miniature corpus in a throwaway git
+repository, one case per failure mode (broken link, wrong anchor, wrong
+duplicate-heading suffix, unindexed architecture file, severed reachability
+path, dangling `$ref`, non-local `$ref`, duplicate key, bad indent, tab,
+unparsable line, multi-line flow) **and** one case per thing it must stay quiet
+about (links and headings inside fenced code blocks, links inside inline code,
+external URLs, branch-local scratch documents). CI runs the pins before the
+check, because a docs checker that reports success on a broken corpus is worse
+than no checker.
+
 ## 5. Continuous integration
 
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 - **Go job** (backend + server-agent, each in its own working directory):
   `golangci-lint fmt --diff`, `golangci-lint run`, `go test ./...`.
+- **Docs job**: `sh scripts/check-docs.test.sh` then `./scripts/check-docs.sh`
+  ([§4.1](#41-documentation-consistency-make-lint-docs)). No toolchain setup —
+  it needs only the checkout.
 - **Frontend job**: `npm ci`, `npm run format:check`, `npm run lint`,
   `npm run build` (the type-checked build is the i18n de/en parity guard —
   `en: PortalMessages` fails to compile on a missing or excess key), and

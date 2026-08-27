@@ -65,6 +65,19 @@ jobs:
           golangci-lint run
           go test ./...
 
+  docs:
+    name: Docs (links, index, openapi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The checker resolves link targets from `git ls-files`, so it needs the
+      # repository, not a shallow export -- checkout@v4 gives it that. No Go,
+      # no Node, no dependency install: bash + git + awk.
+      - name: Pin the checker (its negative cases must still fail)
+        run: sh scripts/check-docs.test.sh
+      - name: Docs consistency
+        run: ./scripts/check-docs.sh
+
   frontend:
     name: Frontend (portal)
     runs-on: ubuntu-latest

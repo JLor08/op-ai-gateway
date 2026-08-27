@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
-.PHONY: test test-go test-ui test-e2e dev run-gateway fmt lint lint-fix lint-install hooks \
+.PHONY: test test-go test-ui test-e2e dev run-gateway fmt lint lint-go lint-docs lint-fix \
+	lint-install hooks \
 	sonar-up sonar-coverage sonar-scan sonar-gate sonar-findings sonar-branch-findings sonar-down
 
 test: test-go test-ui
@@ -17,10 +18,19 @@ fmt:
 	cd gateway/backend && golangci-lint fmt
 	cd server-agent && golangci-lint fmt
 
+# Everything lintable: both Go modules, then the documentation corpus.
+lint: lint-go lint-docs
+
 # Lint both Go modules against .golangci.yml.
-lint:
+lint-go:
 	cd gateway/backend && golangci-lint run
 	cd server-agent && golangci-lint run
+
+# Docs consistency: intra-repo markdown links and anchors, the
+# docs/architecture index, and the OpenAPI refs. bash + git + awk only;
+# its own failure modes are pinned by scripts/check-docs.test.sh.
+lint-docs:
+	./scripts/check-docs.sh
 
 # Lint with autofix for the fixable findings.
 lint-fix:
