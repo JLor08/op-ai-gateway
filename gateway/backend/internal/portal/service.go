@@ -2646,6 +2646,34 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	if err := s.routes.UpdateAIServer(ctx, server); err != nil {
 		return ServerDTO{}, err
 	}
+	// Best-effort, immediately after the successful row write and long before
+	// the NetBird round trip below: the AI SERVER row is row 1 of THE RULE's
+	// list on notifyRuntimeChanged -- RuntimeMaxProcesses is the document's
+	// max_processes -- and UpdateServer is the only path that writes it.
+	//
+	// UNCONDITIONAL for this server, deliberately, on both counts:
+	//
+	//   - Not gated on req.RuntimeMaxProcesses != nil. That is precisely the
+	//     "relevant fields" allow-list THE RULE rejects: a second, uncompiled
+	//     copy of AgentRuntimeConfig's derivation that rots the day the
+	//     document reads a second server column.
+	//   - Not gated on the server actually HAVING a server_agent application
+	//     either, even though most servers do not. Such a gate would need an
+	//     ApplicationsByServer read on every server edit, it would be a second
+	//     copy of AgentRuntimeConfig's own server_agent lookup (the same rot),
+	//     and it would be racy against a concurrent application create. It
+	//     would also buy nothing: gateway.Server.PushRuntimeConfig already
+	//     fail-closes on "no runtime_manager agent connected for this server"
+	//     with a map lookup, before it reads any row -- a cheaper and strictly
+	//     more accurate version of the same test, at the point of delivery. A
+	//     server that does have a connected agent but no server_agent
+	//     application pushes the empty document, whose ETag is unchanged, and
+	//     the agent's driver no-ops.
+	//
+	// Placed before the SetServerOwners write below rather than after it: the
+	// row change has already landed, and owners are no part of the document, so
+	// a failing owner write must not swallow the announcement.
+	s.notifyRuntimeChanged(server.ID)
 	if req.OwnerIDs != nil {
 		if err := s.routes.SetServerOwners(ctx, server.ID, ownerIDs); err != nil {
 			return ServerDTO{}, err

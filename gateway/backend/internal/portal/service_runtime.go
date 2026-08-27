@@ -688,8 +688,62 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 
 // notifyRuntimeChanged best-effort notifies the runtime-config-changed hook
 // (ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook) after a
-// successful runtime-spec write. nil-safe: unset in every test that doesn't
-// care, and in any driver that predates Task 8's real push wiring.
+// successful write. nil-safe: unset in every test that doesn't care, and in
+// any driver that predates Task 8's real push wiring.
+//
+// THE RULE, stated once, for every notification in this service:
+//
+//	Any successful write that CAN change a server's runtime-config document
+//	notifies that server's agent -- and what decides it is the write path's
+//	own SCOPE (which row it writes, and for an application-owned row whether
+//	that application is the server's server_agent one), never which field the
+//	request happened to change.
+//
+// A new write path can be checked against that one sentence, because
+// AgentRuntimeConfig (below) derives the whole document from exactly six
+// kinds of row. A path needs a notification if and only if it writes one of
+// them:
+//
+//  1. the AI server row        -> max_processes (AIServer.RuntimeMaxProcesses)
+//  2. its server_agent APPLICATION row -> router_listen (Application.Port);
+//     that application's id is also the key for rows 3-5
+//  3. that application's MAPPINGS -> each spec's model / upstream_model
+//     (gateway_model_name / app_model_name -- the agent has no other source)
+//  4. those mappings' RUNTIME SPECS and per-spec GPU rows -> specs[]
+//  5. that application's CO-RESIDENCY rules -> coresident[]
+//  6. the server's per-GPU VRAM BUDGETS -> gpu_budgets[]
+//
+// Call sites, by row: (1) UpdateServer; (2) CreateApplication /
+// UpdateApplication / DeleteApplication, via
+// notifyRuntimeChangedForApplication; (3) CreateMapping / UpdateMapping /
+// DeleteMapping / reconcileApplicationModels, via
+// notifyRuntimeChangedForMapping; (4) PutRuntimeSpec / DeleteRuntimeSpec;
+// (5) SetCoResidency; (6) SetServerGPUBudgets.
+//
+// The "never which field" half is the load-bearing half. A "relevant fields"
+// allow-list inside a write path would be a second, uncompiled copy of
+// AgentRuntimeConfig's derivation, and it would rot the moment that
+// derivation grows a field -- while over-notifying is cheap and idempotent
+// (one goroutine, and gateway.Server.PushRuntimeConfig fail-closes on "no
+// runtime_manager agent connected for this server" before it reads anything;
+// the agent then re-fetches and its driver applies only on a real ETag
+// change). Under-notifying is the actual bug.
+//
+// Only two kinds of write to rows 1-6 deliberately do NOT notify, and both
+// are exemptions of a whole write PATH rather than of a field:
+//
+//   - A writer whose own signature confines it to columns OUTSIDE the
+//     document, so there is no field inspection that could rot:
+//     persistApplicationSchemeSwitch (Scheme only), AgentProxyRoutes' port
+//     assignment (ProxyListenPort only, and itself an agent poll read path),
+//     SetServerEnergyConfig (the five energy columns only) and the gateway's
+//     telemetry ingest (LastSeenAt/UpdatedAt only).
+//   - The agent's OWN writeback: gateway.Server.writeBackRuntimeVRAM ->
+//     UpdateRuntimeSpecGPUMeasured. That one genuinely does change the
+//     document (a measured VRAM value wins over the operator's estimate), but
+//     it changes it FROM the agent, so a push would echo the agent its own
+//     measurement -- once per telemetry sample, for a value that keeps
+//     moving. The agent already has it; its poll reconciles the rest.
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -716,19 +770,58 @@ func (s *Service) notifyRuntimeChanged(serverID string) {
 // server_agent, which is precisely when the agent must be told to tear its
 // router down and stop managing specs it no longer owns.
 //
-// Deliberately does NOT try to decide whether the write touched a
-// runtime-RELEVANT field: every successful write to a server_agent
-// application notifies, including one that only changes, say, its weight.
-// Over-notifying is cheap and idempotent (the hook is one goroutine; the
-// agent re-fetches and its driver applies only on a real ETag change),
-// whereas a "relevant fields" allow-list is a second copy of
-// AgentRuntimeConfig's derivation that would silently rot the moment that
-// derivation grows a field -- and under-notifying is the actual bug.
+// Per THE RULE on notifyRuntimeChanged it deliberately does NOT ask whether
+// the write touched a runtime-RELEVANT field: an edit that only changes, say,
+// the application's weight notifies too.
 //
 // Best-effort like every other notifyRuntimeChanged call site: it returns no
 // error and must never turn a successful write into a failed request.
 func (s *Service) notifyRuntimeChangedForApplication(serverID, previousType, currentType string) {
 	if previousType != routing.ProviderServerAgent && currentType != routing.ProviderServerAgent {
+		return
+	}
+	s.notifyRuntimeChanged(serverID)
+}
+
+// notifyRuntimeChangedForMapping is notifyRuntimeChanged for the MAPPING
+// write paths (CreateMapping / UpdateMapping / DeleteMapping and the
+// reconcileApplicationModels sync in service_applications.go) -- row 3 of THE
+// RULE's list on notifyRuntimeChanged. A mapping is a runtime-config input
+// through its owning application's specs: AgentRuntimeSpecDTO's
+// Model/UpstreamModel ARE the mapping's gateway_model_name/app_model_name,
+// and the agent has no other source for them. So renaming a mapping rewrites
+// the agent's document, and until this existed nothing said so: inference
+// under the new model name 404s at the agent's router for up to a minute
+// (the 60 s runtimePollInterval backstop) while the old name still routes.
+// Deleting a mapping cascades its spec, its GPU rows and its co-residency
+// pairs at the store layer, so it removes a whole spec from the document.
+//
+// owningApplicationType is the type of the application the mapping belongs
+// to; only routing.ProviderServerAgent notifies. A mapping write on an
+// ordinary upstream application is no part of any runtime-config document and
+// must not push one.
+//
+// ONE type, not the previous/current pair notifyRuntimeChangedForApplication
+// needs, because the retype/move mirror of that case is not expressible: a
+// mapping has no type of its own, and UpdateMappingRequest has no
+// application_id -- no portal path reassigns ModelMapping.ApplicationID, so a
+// mapping cannot move between applications (and therefore never leaves a
+// server_agent application behind). Should a move ever be added, it becomes
+// exactly the retype-away case and needs BOTH sides here, for the same
+// reason: the losing application's agent must be told too.
+//
+// Per THE RULE it deliberately does not ask whether the write touched
+// gateway_model_name/app_model_name specifically, nor whether the mapping
+// currently HAS a spec (which is what decides whether the document really
+// changes today -- CreateMapping and the sync's create/disable writes provably
+// cannot change it, since a brand-new mapping has no spec row and the document
+// never reads mapping.Status). Both of those are the same second copy of
+// AgentRuntimeConfig's derivation the field allow-list would be, so the gate
+// stays on the row and its application's type alone.
+//
+// Best-effort like every other notifyRuntimeChanged call site.
+func (s *Service) notifyRuntimeChangedForMapping(serverID, owningApplicationType string) {
+	if owningApplicationType != routing.ProviderServerAgent {
 		return
 	}
 	s.notifyRuntimeChanged(serverID)

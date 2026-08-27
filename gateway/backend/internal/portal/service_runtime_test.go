@@ -418,10 +418,10 @@ func TestPutRuntimeSpecFiresRuntimeChangedHook(t *testing.T) {
 
 	server := createTestServer(t, svc, "S", "s.example.test")
 	app := seedServerAgentApplication(t, routeStore, server.ID, now)
-	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
-	if err != nil {
-		t.Fatalf("CreateMapping: %v", err)
-	}
+	// Store-seeded: going through svc.CreateMapping would fire the hook too
+	// (see notifyRuntimeChangedForMapping), and this test is about the SPEC
+	// write paths alone.
+	mapping := seedMapping(t, routeStore, app.ID, "m", now)
 
 	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{Binary: "/bin/x"}); err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
@@ -446,22 +446,40 @@ func TestPutRuntimeSpecFiresRuntimeChangedHook(t *testing.T) {
 
 // --- Task 6: co-residency matrix -------------------------------------------
 
+// seedMapping writes one ACTIVE mapping straight to the store, exactly as
+// CreateMapping would for a request carrying no metrics (no MetricsSource
+// stamp, status defaulted to active, IsMTP derived from the name). Used
+// wherever a test needs a mapping to EXIST rather than to exercise the
+// create path -- notably in the runtime-config-changed hook tests, where
+// going through svc.CreateMapping would itself fire the hook (a mapping
+// under the server_agent application is a runtime-config input; see
+// notifyRuntimeChangedForMapping) and blur what the assertion is about.
+// Mirrors seedServerAgentApplication, which exists for the same reason.
+func seedMapping(t *testing.T, routeStore *routing.MemoryStore, appID, name string, now time.Time) ModelMappingDTO {
+	t.Helper()
+	mapping := routing.ModelMapping{
+		ID:               "map_" + compactRandomHex(16),
+		ApplicationID:    appID,
+		GatewayModelName: name,
+		AppModelName:     name,
+		Status:           routing.ServerStatusActive,
+		IsMTP:            routing.IsMTPModelName(name),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := routeStore.CreateMapping(context.Background(), mapping); err != nil {
+		t.Fatalf("seed mapping %q: %v", name, err)
+	}
+	return mappingDTO(mapping)
+}
+
 // seedTwoMappings creates a server_agent application on server and two
 // mappings on it, for co-residency tests that need a pair of mapping ids
 // belonging to the SAME application.
-func seedTwoMappings(t *testing.T, svc *Service, routeStore *routing.MemoryStore, serverID string, now time.Time) (routing.Application, ModelMappingDTO, ModelMappingDTO) {
+func seedTwoMappings(t *testing.T, routeStore *routing.MemoryStore, serverID string, now time.Time) (routing.Application, ModelMappingDTO, ModelMappingDTO) {
 	t.Helper()
-	ctx := context.Background()
 	app := seedServerAgentApplication(t, routeStore, serverID, now)
-	m1, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m1", AppModelName: "m1"})
-	if err != nil {
-		t.Fatalf("CreateMapping m1: %v", err)
-	}
-	m2, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m2", AppModelName: "m2"})
-	if err != nil {
-		t.Fatalf("CreateMapping m2: %v", err)
-	}
-	return app, m1, m2
+	return app, seedMapping(t, routeStore, app.ID, "m1", now), seedMapping(t, routeStore, app.ID, "m2", now)
 }
 
 func TestSetCoResidencyCanonicalizesPair(t *testing.T) {
@@ -469,7 +487,7 @@ func TestSetCoResidencyCanonicalizesPair(t *testing.T) {
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
-	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+	app, m1, m2 := seedTwoMappings(t, routeStore, server.ID, now)
 
 	// Submit the pair with the higher id first -- SetCoResidency must sort it
 	// server-side so the client never has to care about ordering.
@@ -519,7 +537,7 @@ func TestSetCoResidencyRejectsDuplicateAfterNormalization(t *testing.T) {
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
-	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+	app, m1, m2 := seedTwoMappings(t, routeStore, server.ID, now)
 
 	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
 		Pairs: [][2]string{{m1.ID, m2.ID}, {m2.ID, m1.ID}},
@@ -547,7 +565,7 @@ func TestSetCoResidencyRejectsSameMappingTwice(t *testing.T) {
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
-	app, m1, _ := seedTwoMappings(t, svc, routeStore, server.ID, now)
+	app, m1, _ := seedTwoMappings(t, routeStore, server.ID, now)
 
 	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
 		Pairs: [][2]string{{m1.ID, m1.ID}},
@@ -565,7 +583,7 @@ func TestSetCoResidencyRejectsForeignMapping(t *testing.T) {
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
-	app, m1, _ := seedTwoMappings(t, svc, routeStore, server.ID, now)
+	app, m1, _ := seedTwoMappings(t, routeStore, server.ID, now)
 
 	// A separate server (seedServerAgentApplication hardcodes port 9000, so a
 	// second application on the SAME server would collide on port instead)
@@ -609,7 +627,7 @@ func TestSetCoResidencyFiresRuntimeChangedHookAndClearsOnEmpty(t *testing.T) {
 		},
 	})
 	server := createTestServer(t, svc, "S", "s.example.test")
-	app, m1, m2 := seedTwoMappings(t, svc, routeStore, server.ID, now)
+	app, m1, m2 := seedTwoMappings(t, routeStore, server.ID, now)
 
 	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: [][2]string{{m1.ID, m2.ID}}}); err != nil {
 		t.Fatalf("SetCoResidency: %v", err)

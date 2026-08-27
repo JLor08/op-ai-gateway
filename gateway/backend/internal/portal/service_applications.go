@@ -1257,12 +1257,18 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
+	// Best-effort, after the successful store write: a mapping under the
+	// server_agent application is a runtime-config input (its two model-name
+	// fields are a spec's model/upstream_model). See
+	// notifyRuntimeChangedForMapping -- the gate is the owning application's
+	// type, not which field this request set.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
 	return mappingDTO(mapping), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
 func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappingID string, req UpdateMappingRequest) (ModelMappingDTO, error) {
-	mapping, _, server, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
@@ -1381,16 +1387,34 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
+	// Best-effort, after the successful store write: renaming a mapping under
+	// the server_agent application rewrites its spec's model/upstream_model in
+	// the agent's document, and without this the new gateway model name 404s at
+	// the agent's router for up to a minute while the old one still routes. See
+	// notifyRuntimeChangedForMapping.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
 	return mappingDTO(mapping), nil
 }
 
 // DeleteMapping removes the mapping.
 func (s *Service) DeleteMapping(ctx context.Context, principal auth.Token, mappingID string) error {
-	mapping, _, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	// app and server are captured here, BEFORE the delete: the notification
+	// below needs the owning application's type to gate on, and after the row
+	// is gone there is nothing left to resolve it from (authorizeMapping walks
+	// mapping -> application -> server).
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return err
 	}
-	return s.routes.DeleteMapping(ctx, mapping.ID)
+	if err := s.routes.DeleteMapping(ctx, mapping.ID); err != nil {
+		return err
+	}
+	// Best-effort, after the successful store write: the store cascades the
+	// mapping's runtime spec, its GPU rows and its co-residency pairs, so
+	// deleting a mapping under the server_agent application removes a whole
+	// spec from the agent's document. See notifyRuntimeChangedForMapping.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
+	return nil
 }
 
 // SyncApplicationModels calls the ModelLister for appID's upstream and
@@ -1449,6 +1473,22 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		deduped = append(deduped, name)
 	}
 	upstream = deduped
+	// Best-effort runtime notification for the FOURTH mapping write path (the
+	// manual "Sync models" button and the background model_sync probe loop both
+	// land here). Registered BEFORE the lock below so LIFO defer order runs it
+	// AFTER reconcileMu is released, and deferred rather than tail-placed so a
+	// reconcile that fails halfway still announces the writes it DID make --
+	// under-notifying is the bug this whole rule exists to prevent. Gated on
+	// having written anything at all: Added and Conflicted each mean one
+	// CreateMapping, Disabled one UpdateMapping, Unchanged no write. See
+	// notifyRuntimeChangedForMapping (including why this notifies even though
+	// neither of the two writes this path makes can change the document today).
+	var result SyncResultDTO
+	defer func() {
+		if result.Added+result.Conflicted+result.Disabled > 0 {
+			s.notifyRuntimeChangedForMapping(server.ID, app.Type)
+		}
+	}()
 	// Serialize the store-mutating critical section: the per-server gateway-name
 	// uniqueness check below (gatewayNameTakenOnServer -> CreateMapping) is a
 	// check-then-act with no DB constraint behind it, and the background
@@ -1471,7 +1511,6 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		upstreamSet[model] = struct{}{}
 	}
 
-	var result SyncResultDTO
 	now := s.clock().UTC()
 	for _, model := range upstream {
 		if _, ok := existingByAppName[model]; ok {

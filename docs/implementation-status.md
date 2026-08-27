@@ -397,29 +397,47 @@ E2E phase:
 
 Durable facts found while writing Task 23 (for Task 24's docs):
 
-- The runtime-config-changed hook fires from seven call sites (all of
-  `notifyRuntimeChanged`): `PutRuntimeSpec`, `DeleteRuntimeSpec`,
-  `SetCoResidency` and `SetServerGPUBudgets` in
-  `portal/service_runtime.go`, plus `CreateApplication`,
-  `UpdateApplication` and `DeleteApplication` in
-  `portal/service_applications.go` — the last three via
-  `notifyRuntimeChangedForApplication(serverID, previousType, currentType)`,
-  which fires when EITHER side of the write is `server_agent` (so retyping an
-  application AWAY from `server_agent` notifies too) and deliberately does not
-  filter on whether the write touched a runtime-relevant field. The
-  application call sites were the Task-23b fix: before them, creating the
-  `server_agent` APPLICATION — the row `router_listen` is derived from — did
-  not notify, so a new application or a changed router port waited for the
-  agent's 60 s `runtimePollInterval` backstop, operator-visible as "the router
-  takes up to a minute to come up" (the app-health probe does not
-  special-case `server_agent`, so the application reads unhealthy for that
-  whole minute). Report:
-  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-23b-notify-report.md`.
-  Still NOT notified, and left for Task 24 to judge: `CreateMapping`/
-  `UpdateMapping`/`DeleteMapping` on a `server_agent` application (a mapping's
-  `gateway_model_name`/`app_model_name` are a spec's `model`/`upstream_model`
-  in the document) and `UpdateServer`'s `RuntimeMaxProcesses` (the document's
-  `max_processes`).
+- The runtime-config-changed hook obeys ONE rule, stated in full on
+  `notifyRuntimeChanged` (`portal/service_runtime.go`) — **any successful write
+  that CAN change a server's runtime-config document notifies that server's
+  agent, and what decides it is the write path's own SCOPE (which row, and for
+  an application-owned row whether that application is the server's
+  `server_agent` one), never which field the request happened to change.**
+  That doc comment enumerates the six kinds of row `AgentRuntimeConfig`
+  derives the document from, maps each to its call sites, and lists the
+  deliberate non-notifiers; check any new write path against it. Twelve call
+  sites today:
+  - the AI server row (`max_processes`): `UpdateServer` — unconditional for
+    the server, gated on neither the field nor the server having a
+    `server_agent` application (`PushRuntimeConfig` already fail-closes on "no
+    `runtime_manager` agent connected" with a map lookup, before any read).
+  - the `server_agent` application row (`router_listen`): `CreateApplication`,
+    `UpdateApplication`, `DeleteApplication`, via
+    `notifyRuntimeChangedForApplication(serverID, previousType, currentType)`,
+    which fires when EITHER side of the write is `server_agent` (so retyping
+    an application AWAY from it notifies too).
+  - its mappings (a spec's `model`/`upstream_model`): `CreateMapping`,
+    `UpdateMapping`, `DeleteMapping` and `reconcileApplicationModels` (the
+    "Sync models" button + the background `model_sync` loop; one push per
+    reconcile, and only when it wrote something), via
+    `notifyRuntimeChangedForMapping(serverID, owningApplicationType)`. ONE
+    type, not a pair: a mapping has no type and `UpdateMappingRequest` has no
+    `application_id`, so a mapping cannot move between applications.
+  - specs, co-residency, GPU budgets: `PutRuntimeSpec`, `DeleteRuntimeSpec`,
+    `SetCoResidency`, `SetServerGPUBudgets` (the four original sites).
+
+  Deliberate non-notifiers, all exemptions of a whole write PATH rather than
+  of a field: writers whose signature confines them to columns outside the
+  document (`persistApplicationSchemeSwitch`, `AgentProxyRoutes`' port
+  assignment, `SetServerEnergyConfig`, the gateway's telemetry ingest), and
+  the agent's own `UpdateRuntimeSpecGPUMeasured` writeback, which does change
+  the document but changes it FROM the agent. Reports:
+  `.superpowers/sdd/2026-08-25-agent-runtime-manager/task-23b-notify-report.md`
+  (Task 23b closed the application row; its follow-up round closed the mapping
+  rows and the server row, which had been the two known-open gaps — a mapping
+  rename used to 404 at the agent's router under the new model name for up to
+  a minute while the old name still routed, and `RuntimeMaxProcesses` reached
+  the agent only on its 60 s `runtimePollInterval` backstop).
 - With `OP_AGENT_RUNTIME_ALLOWED_DIRS` set, a spec with an EMPTY `work_dir` is
   refused outright (`LocalPolicy.Permit`). Configuring the agent's permitted
   directories therefore makes `work_dir` mandatory on every spec.

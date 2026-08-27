@@ -29,6 +29,15 @@ import (
 func newRuntimeNotifyTestService(t *testing.T, now time.Time) (*Service, *routing.MemoryStore, func() []string) {
 	t.Helper()
 	svc, routeStore := newServerTestService(t, now)
+	return svc, routeStore, recordRuntimeChanged(svc)
+}
+
+// recordRuntimeChanged installs the recording hook on an ALREADY-built
+// service and returns the snapshot accessor. Split out of
+// newRuntimeNotifyTestService so the model-sync case, which needs
+// newServerTestServiceWithLister's ModelLister, can record the same way
+// without a second fixture constructor.
+func recordRuntimeChanged(svc *Service) func() []string {
 	var mu sync.Mutex
 	var calls []string
 	svc.SetRuntimeConfigChangedHook(func(serverID string) {
@@ -36,7 +45,7 @@ func newRuntimeNotifyTestService(t *testing.T, now time.Time) (*Service, *routin
 		defer mu.Unlock()
 		calls = append(calls, serverID)
 	})
-	return svc, routeStore, func() []string {
+	return func() []string {
 		mu.Lock()
 		defer mu.Unlock()
 		return append([]string(nil), calls...)
@@ -219,4 +228,336 @@ func TestDeleteApplicationServerAgentFiresRuntimeChangedHook(t *testing.T) {
 	if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
 		t.Fatalf("calls after deleting the server_agent application = %#v, want exactly [%q]", got, server.ID)
 	}
+}
+
+// --- Mapping write paths (row 3 of THE RULE) ---------------------------------
+
+// TestCreateMappingFiresRuntimeChangedHookForServerAgent: a mapping under the
+// server_agent application is a runtime-config input (its two model-name
+// fields are a spec's model/upstream_model), so its write paths notify. The
+// gate is the OWNING APPLICATION's type -- a mapping write on an ordinary
+// upstream application is no part of any runtime-config document.
+func TestCreateMappingFiresRuntimeChangedHookForServerAgent(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	// Seeded at the store layer so the application create itself does not fire
+	// the hook: every assertion below is then about the MAPPING write alone.
+	agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+	plain, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication(vllm): %v", err)
+	}
+
+	if _, err := svc.CreateMapping(ctx, ownerToken(), agent.ID, CreateMappingRequest{
+		GatewayModelName: "qwen", AppModelName: "qwen",
+	}); err != nil {
+		t.Fatalf("CreateMapping(server_agent app): %v", err)
+	}
+	if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+		t.Fatalf("calls after a mapping create on the server_agent application = %#v, want exactly [%q]", got, server.ID)
+	}
+
+	if _, err := svc.CreateMapping(ctx, ownerToken(), plain.ID, CreateMappingRequest{
+		GatewayModelName: "llama", AppModelName: "llama",
+	}); err != nil {
+		t.Fatalf("CreateMapping(vllm app): %v", err)
+	}
+	if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+		t.Fatalf("calls after also creating a mapping on the vllm application = %#v, want still exactly [%q]", got, server.ID)
+	}
+}
+
+// TestUpdateMappingFiresRuntimeChangedHookForServerAgent covers the
+// operator-visible case that motivated this fix (a rename rewrites the spec's
+// model/upstream_model, and until the agent hears about it the new gateway
+// model name 404s at its router while the old one still routes), the
+// deliberate over-notify, and the two negatives.
+func TestUpdateMappingFiresRuntimeChangedHookForServerAgent(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	// The 404-for-a-minute case: gateway_model_name IS the document's
+	// specs[].model.
+	t.Run("gateway model rename", func(t *testing.T) {
+		svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), agent.ID, CreateMappingRequest{
+			GatewayModelName: "qwen", AppModelName: "qwen",
+		})
+		if err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+
+		renamed := "qwen-32b"
+		if _, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{GatewayModelName: &renamed}); err != nil {
+			t.Fatalf("rename the gateway model: %v", err)
+		}
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID, server.ID}) {
+			t.Fatalf("calls after create+rename = %#v, want exactly two pushes for %q", got, server.ID)
+		}
+	})
+
+	// The deliberate over-notify, mirroring the application row's weight-only
+	// edit: metrics_locked is no part of AgentRuntimeConfig, and this still
+	// notifies -- a "relevant fields" allow-list would be a second copy of the
+	// derivation that rots the moment it grows a field.
+	t.Run("edit that touches no runtime-relevant field", func(t *testing.T) {
+		svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), agent.ID, CreateMappingRequest{
+			GatewayModelName: "qwen", AppModelName: "qwen",
+		})
+		if err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+
+		locked := true
+		if _, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{MetricsLocked: &locked}); err != nil {
+			t.Fatalf("metrics_locked edit: %v", err)
+		}
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID, server.ID}) {
+			t.Fatalf("calls after create+metrics_locked edit = %#v, want exactly two pushes for %q", got, server.ID)
+		}
+	})
+
+	t.Run("mapping on an ordinary application", func(t *testing.T) {
+		svc, _, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		plain, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+			Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+		})
+		if err != nil {
+			t.Fatalf("CreateApplication(vllm): %v", err)
+		}
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), plain.ID, CreateMappingRequest{
+			GatewayModelName: "qwen", AppModelName: "qwen",
+		})
+		if err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+
+		renamed := "qwen-32b"
+		if _, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{GatewayModelName: &renamed}); err != nil {
+			t.Fatalf("rename the gateway model: %v", err)
+		}
+		if got := calls(); len(got) != 0 {
+			t.Fatalf("calls after mapping create+rename on a vllm application = %#v, want none", got)
+		}
+	})
+
+	// A write that never happened must not announce a change: the gateway-name
+	// conflict returns before the store write, and the notification sits after
+	// it.
+	t.Run("rejected rename does not notify", func(t *testing.T) {
+		svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+		// Store-seeded so the two creates do not fire the hook: the assertion
+		// below is then "a rejected update fires NOTHING", with no baseline to
+		// subtract.
+		mapping := seedMapping(t, routeStore, agent.ID, "qwen", now)
+		seedMapping(t, routeStore, agent.ID, "llama", now)
+
+		taken := "llama"
+		if _, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{GatewayModelName: &taken}); !errors.Is(err, ErrMappingGatewayNameConflict) {
+			t.Fatalf("rename onto a taken gateway name: err = %v, want ErrMappingGatewayNameConflict", err)
+		}
+		if got := calls(); len(got) != 0 {
+			t.Fatalf("calls after a rejected rename = %#v, want none", got)
+		}
+	})
+}
+
+// TestDeleteMappingFiresRuntimeChangedHookForServerAgent: the store cascades a
+// deleted mapping's runtime spec, its GPU rows and its co-residency pairs, so
+// deleting a mapping under the server_agent application removes a whole spec
+// from the document. DeleteMapping must therefore resolve the owning
+// application's type BEFORE the row is gone.
+func TestDeleteMappingFiresRuntimeChangedHookForServerAgent(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+	plain, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication(vllm): %v", err)
+	}
+	plainMapping, err := svc.CreateMapping(ctx, ownerToken(), plain.ID, CreateMappingRequest{
+		GatewayModelName: "llama", AppModelName: "llama",
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping(vllm app): %v", err)
+	}
+	agentMapping, err := svc.CreateMapping(ctx, ownerToken(), agent.ID, CreateMappingRequest{
+		GatewayModelName: "qwen", AppModelName: "qwen",
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping(server_agent app): %v", err)
+	}
+	// A real enabled spec, so the delete really does drop a specs[] entry
+	// rather than only exercising the gate. PutRuntimeSpec notifies itself
+	// (pre-existing call site), hence the running count below.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), agentMapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Args: []string{"--model", "/models/q.gguf"},
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if got := calls(); !reflect.DeepEqual(got, []string{server.ID, server.ID}) {
+		t.Fatalf("calls after the mapping create + spec put = %#v, want exactly two pushes for %q", got, server.ID)
+	}
+
+	if err := svc.DeleteMapping(ctx, ownerToken(), plainMapping.ID); err != nil {
+		t.Fatalf("DeleteMapping(vllm app): %v", err)
+	}
+	if got := calls(); !reflect.DeepEqual(got, []string{server.ID, server.ID}) {
+		t.Fatalf("calls after deleting a vllm application's mapping = %#v, want still exactly two", got)
+	}
+
+	if err := svc.DeleteMapping(ctx, ownerToken(), agentMapping.ID); err != nil {
+		t.Fatalf("DeleteMapping(server_agent app): %v", err)
+	}
+	if got := calls(); !reflect.DeepEqual(got, []string{server.ID, server.ID, server.ID}) {
+		t.Fatalf("calls after deleting the server_agent application's mapping = %#v, want exactly three pushes for %q", got, server.ID)
+	}
+}
+
+// TestSyncApplicationModelsFiresRuntimeChangedHookForServerAgent covers the
+// FOURTH mapping write path -- the manual "Sync models" button and the
+// background model_sync probe loop both reach reconcileApplicationModels,
+// which creates and disables mappings under whatever application it is given,
+// server_agent included. Notified for the same reason as the three explicit
+// paths, and gated the same way (owning application type), plus the negative
+// that a reconcile which wrote NOTHING announces nothing.
+func TestSyncApplicationModelsFiresRuntimeChangedHookForServerAgent(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	t.Run("sync that writes on the server_agent application", func(t *testing.T) {
+		lister := &fakeLister{models: []string{"qwen", "llama"}}
+		svc, routeStore := newServerTestServiceWithLister(t, now, lister)
+		calls := recordRuntimeChanged(svc)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		agent := seedServerAgentApplication(t, routeStore, server.ID, now)
+
+		result, err := svc.SyncApplicationModels(ctx, ownerToken(), agent.ID)
+		if err != nil {
+			t.Fatalf("SyncApplicationModels: %v", err)
+		}
+		if result.Added != 2 {
+			t.Fatalf("result = %#v, want Added:2", result)
+		}
+		// ONE push for the whole reconcile, not one per created mapping.
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+			t.Fatalf("calls after a sync that added two mappings = %#v, want exactly [%q]", got, server.ID)
+		}
+
+		// Nothing written -> nothing announced. This is not a field gate: it is
+		// the same "after the successful store write" discipline as every other
+		// call site, applied to a path that may make no write at all.
+		result, err = svc.SyncApplicationModels(ctx, ownerToken(), agent.ID)
+		if err != nil {
+			t.Fatalf("second SyncApplicationModels: %v", err)
+		}
+		if result.Added != 0 || result.Disabled != 0 || result.Conflicted != 0 || result.Unchanged != 2 {
+			t.Fatalf("second result = %#v, want Unchanged:2 only", result)
+		}
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+			t.Fatalf("calls after a no-op re-sync = %#v, want still exactly [%q]", got, server.ID)
+		}
+	})
+
+	t.Run("sync on an ordinary application", func(t *testing.T) {
+		lister := &fakeLister{models: []string{"qwen", "llama"}}
+		svc, _ := newServerTestServiceWithLister(t, now, lister)
+		calls := recordRuntimeChanged(svc)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		plain, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+			Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+		})
+		if err != nil {
+			t.Fatalf("CreateApplication(vllm): %v", err)
+		}
+
+		result, err := svc.SyncApplicationModels(ctx, ownerToken(), plain.ID)
+		if err != nil {
+			t.Fatalf("SyncApplicationModels: %v", err)
+		}
+		if result.Added != 2 {
+			t.Fatalf("result = %#v, want Added:2", result)
+		}
+		if got := calls(); len(got) != 0 {
+			t.Fatalf("calls after syncing a vllm application = %#v, want none", got)
+		}
+	})
+}
+
+// --- The AI server row (row 1 of THE RULE) -----------------------------------
+
+// TestUpdateServerFiresRuntimeChangedHook: RuntimeMaxProcesses is the
+// document's max_processes and UpdateServer is the only path that writes it.
+// The notification is UNCONDITIONAL for the server -- neither gated on
+// req.RuntimeMaxProcesses being set (that is the rejected "relevant fields"
+// allow-list) nor on the server actually having a server_agent application
+// (PushRuntimeConfig already fail-closes on "no runtime_manager agent
+// connected" more cheaply and more accurately). Both of those deliberate
+// choices are asserted here, so a later attempt to add either gate fails a
+// test instead of silently narrowing the rule.
+func TestUpdateServerFiresRuntimeChangedHook(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	t.Run("runtime max processes", func(t *testing.T) {
+		svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		seedServerAgentApplication(t, routeStore, server.ID, now)
+
+		limit := 3
+		if _, err := svc.UpdateServer(ctx, adminToken(), server.ID, UpdateServerRequest{RuntimeMaxProcesses: &limit}); err != nil {
+			t.Fatalf("UpdateServer(runtime_max_processes): %v", err)
+		}
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+			t.Fatalf("calls after a runtime_max_processes edit = %#v, want exactly [%q]", got, server.ID)
+		}
+	})
+
+	// The deliberate over-notify on the server row: a rename is no part of the
+	// document and still notifies. Also the deliberate NON-gate on having a
+	// server_agent application -- this server has none.
+	t.Run("unrelated field on a server with no server_agent application", func(t *testing.T) {
+		svc, _, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+
+		name := "S renamed"
+		if _, err := svc.UpdateServer(ctx, adminToken(), server.ID, UpdateServerRequest{Name: &name}); err != nil {
+			t.Fatalf("UpdateServer(name): %v", err)
+		}
+		if got := calls(); !reflect.DeepEqual(got, []string{server.ID}) {
+			t.Fatalf("calls after a rename = %#v, want exactly [%q]", got, server.ID)
+		}
+	})
+
+	// A rejected write never announces a change: the limit validation returns
+	// before UpdateAIServer, and the notification sits after it.
+	t.Run("rejected update does not notify", func(t *testing.T) {
+		svc, routeStore, calls := newRuntimeNotifyTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		seedServerAgentApplication(t, routeStore, server.ID, now)
+
+		bad := -1
+		if _, err := svc.UpdateServer(ctx, adminToken(), server.ID, UpdateServerRequest{RuntimeMaxProcesses: &bad}); !errors.Is(err, ErrServerRuntimeLimitInvalid) {
+			t.Fatalf("negative runtime_max_processes: err = %v, want ErrServerRuntimeLimitInvalid", err)
+		}
+		if got := calls(); len(got) != 0 {
+			t.Fatalf("calls after a rejected server update = %#v, want none", got)
+		}
+	})
 }
