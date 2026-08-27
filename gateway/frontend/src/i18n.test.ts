@@ -1913,6 +1913,69 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
   });
 });
 
+describe('agent-managed runtime i18n keys (task 22 live status + file mode)', () => {
+  it('defines every live-status, override, restart-sequence and file-mode key in de and en', () => {
+    const keys = [
+      'runtimeStreamConnecting',
+      'runtimeStreamOpen',
+      'runtimeStreamOffline',
+      'runtimeStreamError',
+      'runtimeStatusEmpty',
+      'runtimeStatusSince',
+      'runtimeStatusPid',
+      'runtimeStatusPort',
+      'runtimeStatusInFlight',
+      'runtimeStatusRestarts',
+      'runtimeLastErrorAt',
+      'runtimeLastErrorExitCode',
+      'runtimeLastErrorFailures',
+      'runtimeLastErrorStderr',
+      'runtimeRestart',
+      'runtimeRestartStopping',
+      'runtimeRestartClearing',
+      'runtimeRestartTimeout',
+      'runtimeRestartVanished',
+      'runtimeParseError',
+      'runtimeConfigUnavailable',
+      'runtimeConfigUnrecognised',
+      'runtimeFeatureMismatch',
+      'runtimeAgentVersion',
+      'runtimeAgentFeatures',
+      'runtimeReportCollectedAt',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The nine RuntimeState wire values (server-agent/internal/runtime/
+  // types.go) each need a DISTINCT label: the portal has exactly three
+  // status colours (theme/ThemeRoot.tsx -- success/watch/standby, no red),
+  // so the label is the only thing that can tell "crashed" apart from
+  // "stopped" or "not permitted". A duplicated label would silently merge
+  // two different facts into one visual.
+  it('gives all nine runtime lifecycle states a distinct label in de and en', () => {
+    const stateKeys = [
+      'runtimeStateStopped',
+      'runtimeStateStarting',
+      'runtimeStateRunning',
+      'runtimeStateDraining',
+      'runtimeStateBackoff',
+      'runtimeStateStartFailed',
+      'runtimeStateCrashed',
+      'runtimeStatePendingVram',
+      'runtimeStateNotPermitted',
+    ] as const;
+    for (const locale of ['de', 'en'] as const) {
+      const labels = stateKeys.map((k) => messages[locale][k]);
+      expect(new Set(labels).size).toBe(stateKeys.length);
+    }
+  });
+});
+
 describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
   it('defines every co-residency-matrix and server-limits key in de and en', () => {
     const keys = [

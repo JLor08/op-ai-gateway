@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useRef, useState, type SubmitEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type SubmitEvent } from 'react';
 import {
   Alert,
   Box,
@@ -19,6 +19,10 @@ import AddIcon from '@mui/icons-material/Add';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import StopIcon from '@mui/icons-material/Stop';
+import ClearIcon from '@mui/icons-material/Clear';
+import ReplayIcon from '@mui/icons-material/Replay';
 import type {
   ApplicationStatus,
   GPUBudget,
@@ -27,11 +31,13 @@ import type {
   PortalModelMapping,
   PortalServer,
   PutRuntimeSpecRequest,
+  RuntimeError,
   RuntimeSpec,
   RuntimeSpecGPU,
+  RuntimeStatus,
 } from '../api';
-import type { Translation, PortalApi, MessageKey } from './shared/types';
-import { formatPortalError, formatMetric } from './shared/format';
+import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
+import { formatPortalError, formatMetric, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
@@ -53,6 +59,33 @@ import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 type Tab = 'specs' | 'matrix' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
+
+/**
+ * Upper bound on the restart sequence's "wait for this spec to report
+ * `stopped`" step. There is no restart endpoint (design §10.1: every action
+ * is state-shaped), so a restart is force_stopped -> await `stopped` ->
+ * clear the override; a wedged child that never stops must surface a
+ * timeout instead of spinning forever.
+ *
+ * Derived from the SLOWEST legitimate path, not guessed: a POST-transport
+ * agent picks the changed desired state up on its own
+ * `runtimePollInterval` (60 s, server-agent/internal/agent/agent.go), then
+ * the manager's drain-stop is bounded by `drainGrace` (10 s) + `killGrace`
+ * (5 s) (server-agent/internal/runtime/manager.go), then the new state
+ * reaches us on the 1 s sample. 90 s of that, rounded up to 120 s so an
+ * ordinary slow stop is never reported as a failure. A WS-connected agent
+ * gets the push immediately and normally finishes in a couple of seconds.
+ */
+export const RESTART_STOP_TIMEOUT_MS = 120_000;
+
+/**
+ * How long the awaited spec may be ABSENT from the status stream before the
+ * restart sequence treats it as deleted. Absence is not immediately fatal:
+ * the gateway keeps runtime status in volatile RAM (design §7), so a gateway
+ * restart empties the list and the next sample (<= 1 s) refills it. Only a
+ * sustained absence means the spec is genuinely gone.
+ */
+export const RESTART_VANISH_GRACE_MS = 8_000;
 
 type GpuRow = { index: number; vramEstimateMb: number; vramMeasuredMb: number };
 
@@ -95,6 +128,216 @@ function emptySpec(mappingId: string): RuntimeSpec {
     vram_locked: false,
     gpus: [],
   };
+}
+
+// The nine RuntimeState wire values (server-agent/internal/runtime/types.go)
+// mapped to their labels. NOTE the deliberate name/value mismatch on
+// `pending_vram_unknown`: the enum value is the long one, the i18n key is the
+// shorter `runtimeStatePendingVram`. Neither is renamed here -- this map is
+// exactly the place where the two vocabularies meet.
+const runtimeStateLabelByValue: Record<string, MessageKey> = {
+  stopped: 'runtimeStateStopped',
+  starting: 'runtimeStateStarting',
+  running: 'runtimeStateRunning',
+  draining: 'runtimeStateDraining',
+  backoff: 'runtimeStateBackoff',
+  start_failed: 'runtimeStateStartFailed',
+  crashed: 'runtimeStateCrashed',
+  pending_vram_unknown: 'runtimeStatePendingVram',
+  not_permitted: 'runtimeStateNotPermitted',
+};
+
+// A state this portal build does not know (a newer agent) renders its raw wire
+// value rather than a misleading label -- the same forward-compat fallback
+// runtimeWarningLabelByCode above uses.
+function runtimeStateLabel(state: string, t: Translation): string {
+  const key = runtimeStateLabelByValue[state];
+  return key ? t[key] : state;
+}
+
+// The portal has exactly THREE status colours: the theme defines
+// success/watch/standby pairs and nothing else (theme/ThemeRoot.tsx), and
+// statusClassByKey collapses `error`/`disabled`/`expired` onto standby
+// (components/shared/status.ts) -- there is no red anywhere in the portal, and
+// adding one is a portal-wide design change, not this screen's call. So the
+// colour can only carry the three coarse facts it genuinely has (loaded /
+// on its way / neither), and the LABEL carries the rest. `last_error` -- "the
+// last load attempt failed" -- is not a state at all and gets its own column.
+function runtimeStateBadge(state: string): BadgeStatus {
+  if (state === 'running') return 'active';
+  // Both are "waiting to be loaded", the user-visible "currently loading".
+  if (state === 'starting' || state === 'pending_vram_unknown') return 'watch';
+  return 'standby';
+}
+
+// One restart sequence. There is no restart endpoint (design §10.1: every
+// action is state-shaped), so a restart is a three-step UI sequence:
+//   stopping -> the force_stopped PUT is in flight
+//   waiting  -> the stream has to report this spec `stopped`
+//   clearing -> the admin_state="" PUT is in flight
+// `deadline` is absolute so the overall wait stays bounded even though the
+// timer is re-armed on each phase change.
+type RestartFlow = {
+  specId: string;
+  mappingId: string;
+  phase: 'stopping' | 'waiting' | 'clearing';
+  deadline: number;
+};
+
+// One launch spec as read back from a file-mode agent's report. This is the
+// defensively narrowed form of RuntimeReportContent.config, which is typed
+// `unknown` on purpose: it is whatever the agent's local file contained.
+type ReportSpec = {
+  id: string;
+  model: string;
+  binary: string;
+  args: string[];
+  gpus: { index: number; vramMb: number }[];
+  pinned: boolean;
+  idleTimeoutSeconds: number;
+};
+
+type ReportConfig = {
+  maxProcesses: number | null;
+  budgets: { index: number; budgetMb: number }[];
+  specs: ReportSpec[];
+  coresident: [string, string][];
+  /** Something, at some level, did not have the shape we expected. */
+  unrecognised: boolean;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// A spec entry with no usable identity cannot be rendered as a row at all
+// (it would collide with every other identity-less entry as a React key and
+// could not be addressed in the co-residency matrix) -- those are reported as
+// unrecognised by the caller. Everything else degrades field by field.
+function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): ReportSpec | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.id !== 'string' || value.id === '') return null;
+  const gpus: { index: number; vramMb: number }[] = [];
+  if (Array.isArray(value.gpus)) {
+    for (const gpu of value.gpus) {
+      if (isRecord(gpu) && typeof gpu.index === 'number') {
+        gpus.push({ index: gpu.index, vramMb: typeof gpu.vram_mb === 'number' ? gpu.vram_mb : 0 });
+      } else {
+        flag.unrecognised = true;
+      }
+    }
+  } else if (value.gpus !== undefined && value.gpus !== null) {
+    flag.unrecognised = true;
+  }
+  const args: string[] = [];
+  if (Array.isArray(value.args)) {
+    for (const arg of value.args) {
+      if (typeof arg === 'string') args.push(arg);
+      else flag.unrecognised = true;
+    }
+  } else if (value.args !== undefined && value.args !== null) {
+    flag.unrecognised = true;
+  }
+  return {
+    id: value.id,
+    model: typeof value.model === 'string' && value.model !== '' ? value.model : value.id,
+    binary: typeof value.binary === 'string' ? value.binary : '',
+    args,
+    gpus,
+    pinned: value.pinned === true,
+    idleTimeoutSeconds:
+      typeof value.idle_timeout_seconds === 'number' ? value.idle_timeout_seconds : 0,
+  };
+}
+
+/**
+ * Narrows an agent-reported runtime config (`unknown` by design) into
+ * something renderable, checking `typeof`/`Array.isArray` at every level and
+ * recording whether anything had to be dropped. A malformed agent-supplied
+ * config must never blank or crash the admin screen, and must never be cast
+ * into shape either: what parses is rendered, what does not is reported as
+ * "unrecognised shape".
+ *
+ * A null/absent config is an EMPTY document, not a malformed one (the gateway
+ * stores `{}` when the agent's config failed to sanitize at all -- see
+ * sanitizeRuntimeReportConfig).
+ */
+function narrowReportConfig(config: unknown): ReportConfig {
+  const out: ReportConfig = {
+    maxProcesses: null,
+    budgets: [],
+    specs: [],
+    coresident: [],
+    unrecognised: false,
+  };
+  if (!isRecord(config)) {
+    out.unrecognised = config !== undefined && config !== null;
+    return out;
+  }
+  const maxProcesses = config.max_processes;
+  if (typeof maxProcesses === 'number' && Number.isFinite(maxProcesses)) {
+    out.maxProcesses = maxProcesses;
+  } else if (maxProcesses !== undefined && maxProcesses !== null) {
+    out.unrecognised = true;
+  }
+  const budgets = config.gpu_budgets;
+  if (Array.isArray(budgets)) {
+    for (const entry of budgets) {
+      if (
+        isRecord(entry) &&
+        typeof entry.index === 'number' &&
+        typeof entry.budget_mb === 'number'
+      ) {
+        out.budgets.push({ index: entry.index, budgetMb: entry.budget_mb });
+      } else {
+        out.unrecognised = true;
+      }
+    }
+  } else if (budgets !== undefined && budgets !== null) {
+    out.unrecognised = true;
+  }
+  const specs = config.specs;
+  if (Array.isArray(specs)) {
+    for (const entry of specs) {
+      const spec = narrowReportSpec(entry, out);
+      if (spec) out.specs.push(spec);
+      else out.unrecognised = true;
+    }
+  } else if (specs !== undefined && specs !== null) {
+    out.unrecognised = true;
+  }
+  const coresident = config.coresident;
+  if (Array.isArray(coresident)) {
+    for (const entry of coresident) {
+      if (
+        Array.isArray(entry) &&
+        entry.length === 2 &&
+        typeof entry[0] === 'string' &&
+        typeof entry[1] === 'string'
+      ) {
+        out.coresident.push([entry[0], entry[1]]);
+      } else {
+        out.unrecognised = true;
+      }
+    }
+  } else if (coresident !== undefined && coresident !== null) {
+    out.unrecognised = true;
+  }
+  return out;
+}
+
+// The override actions' PUT body. putRuntimeSpec takes the ENTIRE spec
+// (Omit<RuntimeSpec, 'configured' | 'id' | 'mapping_id'>), never a patch, so
+// the body is built by spreading the ACTUAL loaded spec and replacing exactly
+// one field. A synthesized or defaulted body would silently overwrite the
+// operator's configured binary/args/env/gpus/timeouts on a single override
+// click -- the same full-replace hazard as the co-residency and GPU-budget
+// writes (task-21 review). The rest-spread is deliberate over an explicit
+// field list: a field added to RuntimeSpec later carries through by itself
+// instead of being silently dropped here.
+function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
+  const { configured, id, mapping_id, ...rest } = spec;
+  return { ...rest, admin_state: adminState };
 }
 
 function basename(path: string): string {
@@ -547,6 +790,216 @@ export function RuntimeAdminSection({
     }
   }
 
+  // ---- Area 4: live status stream ----------------------------------------
+  // Mirrors PerformanceSection's SSE effect: keyed on [api, server.id] only,
+  // returning the unsubscribe. Both `snapshot` and `update` frames are FULL
+  // replacements of the server's whole managed-process list (the api layer
+  // already unwraps `{runtimes: [...]}` and swallows a malformed frame), so
+  // `setStatusRows` replaces and never appends. The 'loading' value is owned
+  // here -- `onStatus` only ever reports 'open' | 'error'.
+  const [statusRows, setStatusRows] = useState<RuntimeStatus[]>([]);
+  const [streamStatus, setStreamStatus] = useState<'open' | 'error' | 'loading'>('loading');
+  useEffect(() => {
+    // A server switch must not leave the previous server's processes on
+    // screen while the new stream connects.
+    setStatusRows([]);
+    setStreamStatus('loading');
+    return api.subscribeRuntimeStatus(server.id, setStatusRows, setStreamStatus);
+  }, [api, server.id]);
+
+  // ---- File mode + feature negotiation (spec §9, §10.2) -------------------
+  const {
+    data: reportData,
+    error: reportError,
+    loading: reportLoading,
+  } = useResource(() => api.runtimeReport(server.id), [api, server.id, t], t);
+  useEffect(() => {
+    if (reportError) showError(reportError);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reportError]);
+  const reportReady = !reportLoading && reportData !== null;
+  // `source` lives on the NESTED report object; RuntimeReport itself has none.
+  const reportContent = reportData?.available ? reportData.report : undefined;
+  const fileMode = reportContent?.source === 'file';
+  // The agent telling us it could not parse its own config file. In that state
+  // `config` is whatever survived (possibly the zero value), so it must not be
+  // rendered at all -- and this, not a missing tooltip, is what the operator
+  // needs to see.
+  const parseError = reportContent?.parse_error ?? '';
+  const reportConfig = useMemo(
+    () => (fileMode && !parseError ? narrowReportConfig(reportContent?.config) : null),
+    [fileMode, parseError, reportContent],
+  );
+  // Same discipline as areas 2/3, one step further out: until the report GET
+  // has settled we do not know whether this whole screen is read-only, so no
+  // writable affordance is presented at all. Gated on BOTH signals.
+  const writesAllowed = reportReady && !fileMode;
+
+  const configuredSpecCount = mappings.filter((m) => specsById[m.id]?.configured).length;
+  // Spec §9's visible half: gateway-side specs exist, the agent reports no
+  // managed process at all, and it never declared `runtime_manager`. Without
+  // this banner an operator configures specs against an old agent and watches
+  // nothing happen, with no clue why -- so the banner names the reported
+  // version and feature list, i.e. what to upgrade.
+  const featureMismatch =
+    reportReady &&
+    configuredSpecCount > 0 &&
+    statusRows.length === 0 &&
+    !(reportData?.agent_features ?? []).includes('runtime_manager');
+
+  // ---- Row overrides + the restart sequence ------------------------------
+  // The live stream keys rows by SPEC id; every write is keyed by MAPPING id.
+  // Only a CONFIGURED spec has an id, and only a loaded one can be re-sent
+  // verbatim, so this map is also the "may this row offer overrides at all"
+  // test.
+  const specByRuntimeId = new Map<string, RuntimeSpec>();
+  for (const spec of Object.values(specsById)) {
+    if (spec.configured && spec.id) specByRuntimeId.set(spec.id, spec);
+  }
+
+  const [overrideBusy, setOverrideBusy] = useState(false);
+  const [restart, setRestart] = useState<RestartFlow | null>(null);
+  const [restartNotice, setRestartNotice] = useState<'timeout' | 'vanished' | null>(null);
+  // How long the awaited spec has been missing from the stream. A ref, not
+  // state, so tracking it never re-arms the timeout effect below.
+  const absentSinceRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
+  // Any admin_state write while a restart runs would fight the sequence, so
+  // ALL override actions lock, not just the restart one (the visibly-disabled
+  // idiom areas 2/3 already use for coresidencyBusy/limitsBusy).
+  const overridesLocked = restart !== null || overrideBusy;
+
+  useEffect(() => {
+    // A server switch abandons any in-flight restart: its remaining step only
+    // means anything while we are still watching THAT server's stream.
+    setRestart(null);
+    setRestartNotice(null);
+    absentSinceRef.current = null;
+  }, [server.id]);
+
+  // Bounds the wait. The cleanup clears the timer whenever `restart` changes,
+  // so this callback can only fire while the flow it captured is still the
+  // current one -- no stale notice. `deadline` being absolute keeps the
+  // overall bound honest across the phase change that re-arms the timer.
+  useEffect(() => {
+    if (restart === null || restart.phase === 'clearing') return undefined;
+    const specId = restart.specId;
+    const timer = setTimeout(
+      () => {
+        if (!mountedRef.current) return;
+        absentSinceRef.current = null;
+        setRestart((cur) => (cur?.specId === specId ? null : cur));
+        setRestartNotice('timeout');
+      },
+      Math.max(0, restart.deadline - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [restart]);
+
+  // Advances the sequence from the live stream: a `stopped` frame for THIS
+  // spec is the only signal that force_stopped actually took effect.
+  useEffect(() => {
+    if (restart === null || restart.phase !== 'waiting') return;
+    const row = statusRows.find((r) => r.spec_id === restart.specId);
+    if (row === undefined) {
+      // Absence is not immediately "deleted": the gateway holds runtime
+      // status in volatile RAM (spec §7), so a gateway restart empties the
+      // list and the next sample (<= 1 s) refills it. Only a SUSTAINED
+      // absence is terminal. Re-evaluated per frame, which is enough --
+      // frames arrive ~1/s while the stream is up, and if they stop entirely
+      // the deadline above catches it.
+      const now = Date.now();
+      if (absentSinceRef.current === null) {
+        absentSinceRef.current = now;
+        return;
+      }
+      if (now - absentSinceRef.current < RESTART_VANISH_GRACE_MS) return;
+      absentSinceRef.current = null;
+      setRestart(null);
+      setRestartNotice('vanished');
+      return;
+    }
+    absentSinceRef.current = null;
+    if (row.state === 'stopped') void finishRestart(restart);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusRows, restart]);
+
+  async function setOverride(spec: RuntimeSpec, adminState: string) {
+    // A timeout/aborted notice tells the operator an override was left in
+    // place; acting on any override is exactly the moment it stops being
+    // news, so it is cleared here rather than lingering until the next
+    // restart or a server switch.
+    setRestartNotice(null);
+    setOverrideBusy(true);
+    try {
+      const updated = await api.putRuntimeSpec(
+        spec.mapping_id,
+        specBodyWithAdminState(spec, adminState),
+      );
+      if (!mountedRef.current) return;
+      setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      showSuccess(t.systemSaved);
+    } catch (err) {
+      if (mountedRef.current) showError(formatPortalError(err, t));
+    } finally {
+      if (mountedRef.current) setOverrideBusy(false);
+    }
+  }
+
+  async function startRestart(specId: string, spec: RuntimeSpec) {
+    if (restart !== null) return;
+    absentSinceRef.current = null;
+    setRestartNotice(null);
+    setRestart({
+      specId,
+      mappingId: spec.mapping_id,
+      phase: 'stopping',
+      deadline: Date.now() + RESTART_STOP_TIMEOUT_MS,
+    });
+    try {
+      const updated = await api.putRuntimeSpec(
+        spec.mapping_id,
+        specBodyWithAdminState(spec, 'force_stopped'),
+      );
+      if (!mountedRef.current) return;
+      setSpecsById((cur) => ({ ...cur, [spec.mapping_id]: updated }));
+      setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting' } : cur));
+    } catch (err) {
+      if (!mountedRef.current) return;
+      showError(formatPortalError(err, t));
+      setRestart((cur) => (cur?.specId === specId ? null : cur));
+    }
+  }
+
+  async function finishRestart(flow: RestartFlow) {
+    setRestart({ ...flow, phase: 'clearing' });
+    // Re-read the spec by MAPPING id (captured when the flow started), not by
+    // the stream's spec id: the clear PUT must not depend on the spec-id join
+    // still resolving, and it must still be the actual stored document.
+    const spec = specsById[flow.mappingId];
+    if (spec === undefined) {
+      setRestart(null);
+      setRestartNotice('vanished');
+      return;
+    }
+    try {
+      const updated = await api.putRuntimeSpec(flow.mappingId, specBodyWithAdminState(spec, ''));
+      if (!mountedRef.current) return;
+      setSpecsById((cur) => ({ ...cur, [flow.mappingId]: updated }));
+      showSuccess(t.systemSaved);
+    } catch (err) {
+      if (mountedRef.current) showError(formatPortalError(err, t));
+    } finally {
+      if (mountedRef.current) setRestart(null);
+    }
+  }
+
   // ---- create/edit form state -----------------------------------------
   const [gatewayName, setGatewayName] = useState('');
   const [appName, setAppName] = useState('');
@@ -793,6 +1246,16 @@ export function RuntimeAdminSection({
     }
   }
 
+  const statusBySpecId = new Map(statusRows.map((row) => [row.spec_id, row]));
+  function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
+    const specId = specsById[m.id]?.id;
+    return specId ? statusBySpecId.get(specId) : undefined;
+  }
+  function statusLabelForMapping(m: PortalModelMapping): string {
+    const live = statusForMapping(m);
+    return live ? runtimeStateLabel(live.state, t) : t.runtimeStatusUnknown;
+  }
+
   const columns: ListColumn<PortalModelMapping>[] = [
     {
       id: 'gateway',
@@ -840,14 +1303,27 @@ export function RuntimeAdminSection({
       numeric: true,
     },
     {
-      // Filled by Task 22's live-status map; today this column is a
-      // placeholder so the section's final shape is visible/testable.
+      // Area 4's live state joined back into area 1's list by SPEC id -- the
+      // stream's own key. A mapping with no configured spec, or a configured
+      // spec the agent has never reported, is "unknown": deliberately NOT
+      // "stopped", which would be a claim we cannot make.
       id: 'live_status',
       label: t.tableStatus,
-      value: () => 'unknown',
+      value: (m) => statusLabelForMapping(m),
+      filter: 'enum',
       sortable: false,
       searchable: false,
-      render: () => <StatusChip status="standby" label={t.runtimeStatusUnknown} />,
+      render: (m) => {
+        const live = statusForMapping(m);
+        return live ? (
+          <StatusChip
+            status={runtimeStateBadge(live.state)}
+            label={runtimeStateLabel(live.state, t)}
+          />
+        ) : (
+          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+        );
+      },
     },
   ];
 
@@ -872,6 +1348,219 @@ export function RuntimeAdminSection({
       },
     ];
   };
+
+  // `last_error` is cleared ONLY by the next successful start, never by a
+  // state change (server-agent/internal/runtime/types.go) -- so a `stopped`
+  // spec can still carry "last attempt failed yesterday 14:32, exit code 1".
+  // That makes "last load failed" a fact no state chip can ever convey, hence
+  // its own column, always visible (the message inline, the details in the
+  // tooltip), on every state including stopped.
+  function renderLastError(err: RuntimeError | undefined) {
+    if (!err) return '–';
+    return (
+      <Tooltip
+        title={
+          <Box sx={{ display: 'grid', gap: 0.25 }}>
+            <Typography variant="caption">
+              {t.runtimeLastErrorAt}: {formatDate(err.at, '—')}
+            </Typography>
+            <Typography variant="caption">
+              {t.runtimeLastErrorExitCode}: {err.exit_code}
+            </Typography>
+            <Typography variant="caption">
+              {t.runtimeLastErrorFailures}: {err.failures}
+            </Typography>
+            {err.stderr_tail ? (
+              <>
+                <Typography variant="caption">{t.runtimeLastErrorStderr}:</Typography>
+                <Box
+                  component="pre"
+                  sx={{ m: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: 12 }}
+                >
+                  {err.stderr_tail}
+                </Box>
+              </>
+            ) : null}
+          </Box>
+        }
+      >
+        <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+          <WarningAmberIcon fontSize="small" color="warning" />
+          <Typography variant="body2">{err.message}</Typography>
+        </Box>
+      </Tooltip>
+    );
+  }
+
+  const statusColumns: ListColumn<RuntimeStatus>[] = [
+    {
+      id: 'model',
+      label: t.tableModel,
+      // What the AGENT reports (the spec's upstream model name), not a
+      // gateway-side name joined in: this column's job is showing what the
+      // live stream actually says.
+      value: (row) => row.model || row.spec_id,
+      filter: 'text',
+    },
+    {
+      id: 'state',
+      label: t.tableStatus,
+      value: (row) => runtimeStateLabel(row.state, t),
+      filter: 'enum',
+      searchable: false,
+      render: (row) => (
+        <Box sx={{ display: 'flex', gap: 0.75, alignItems: 'center', flexWrap: 'wrap' }}>
+          <StatusChip
+            status={runtimeStateBadge(row.state)}
+            label={runtimeStateLabel(row.state, t)}
+          />
+          {restart?.specId === row.spec_id && (
+            <Chip
+              size="small"
+              variant="outlined"
+              label={
+                restart.phase === 'clearing' ? t.runtimeRestartClearing : t.runtimeRestartStopping
+              }
+            />
+          )}
+        </Box>
+      ),
+    },
+    {
+      id: 'since',
+      label: t.runtimeStatusSince,
+      value: (row) => formatDate(row.since, '–'),
+      searchable: false,
+    },
+    {
+      id: 'pid',
+      label: t.runtimeStatusPid,
+      value: (row) => (row.pid ? String(row.pid) : '–'),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'port',
+      label: t.runtimeStatusPort,
+      value: (row) => (row.port ? String(row.port) : '–'),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'in_flight',
+      label: t.runtimeStatusInFlight,
+      value: (row) => String(row.in_flight),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'restarts',
+      label: t.runtimeStatusRestarts,
+      value: (row) => String(row.restarts),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'last_error',
+      label: t.runtimeLastError,
+      value: (row) => row.last_error?.message ?? '',
+      sortable: false,
+      searchable: false,
+      render: (row) => renderLastError(row.last_error),
+    },
+  ];
+
+  function statusActions(row: RuntimeStatus): RowAction[] {
+    // File mode has no admin override at all (the override lives in the
+    // gateway document, which a file-mode agent never consumes -- spec §10.2:
+    // "a dead button is worse than none"), and before the report GET settles
+    // we do not yet know which mode this is.
+    if (!writesAllowed) return [];
+    const spec = specByRuntimeId.get(row.spec_id);
+    // No loaded spec for this spec_id (a spec created after the list loaded, a
+    // spec belonging to another application, a file-mode leftover): render NO
+    // buttons rather than synthesizing a full-document body that would
+    // overwrite the operator's command line.
+    if (spec === undefined) return [];
+    const actions: RowAction[] = [];
+    if (spec.admin_state !== 'force_running') {
+      actions.push({
+        key: 'force-start',
+        label: t.runtimeForceStart,
+        icon: <PlayArrowIcon fontSize="small" />,
+        disabled: overridesLocked,
+        onClick: () => void setOverride(spec, 'force_running'),
+      });
+    }
+    if (spec.admin_state !== 'force_stopped') {
+      actions.push({
+        key: 'force-stop',
+        label: t.runtimeForceStop,
+        icon: <StopIcon fontSize="small" />,
+        disabled: overridesLocked,
+        onClick: () => void setOverride(spec, 'force_stopped'),
+      });
+    }
+    if (spec.admin_state !== '') {
+      actions.push({
+        key: 'clear-override',
+        label: t.runtimeClearOverride,
+        icon: <ClearIcon fontSize="small" />,
+        disabled: overridesLocked,
+        onClick: () => void setOverride(spec, ''),
+      });
+    }
+    // A restart ENDS with no override (force_stopped -> clear), so offering it
+    // on a row that already carries one would silently drop that override --
+    // the operator asked for a restart, not for their force_running to be
+    // forgotten. While this row's own sequence runs the action stays visible
+    // but disabled, so it is obvious why nothing else responds.
+    if (spec.admin_state === '' || restart?.specId === row.spec_id) {
+      actions.push({
+        key: 'restart',
+        label: t.runtimeRestart,
+        icon: <ReplayIcon fontSize="small" />,
+        disabled: overridesLocked,
+        onClick: () => void startRestart(row.spec_id, spec),
+      });
+    }
+    return actions;
+  }
+
+  // File-mode read-only spec list: rendered from the agent's report instead of
+  // the gateway CRUD data, and never editable.
+  const reportSpecColumns: ListColumn<ReportSpec>[] = [
+    { id: 'model', label: t.tableModel, value: (s) => s.model, filter: 'text' },
+    { id: 'binary', label: t.runtimeSpecBinary, value: (s) => basename(s.binary), filter: 'text' },
+    {
+      id: 'gpus',
+      label: t.runtimeSpecGpus,
+      value: (s) =>
+        s.gpus.length === 0 ? '—' : s.gpus.map((g) => `${g.index}: ${g.vramMb} MB`).join(', '),
+      searchable: false,
+    },
+    {
+      id: 'pinned',
+      label: t.runtimeSpecPinned,
+      value: (s) => (s.pinned ? 'yes' : 'no'),
+      searchable: false,
+      render: (s) => renderBoolChip(s.pinned, t.runtimeSpecPinned),
+    },
+    {
+      id: 'idle_timeout',
+      label: t.runtimeSpecIdleTimeout,
+      value: (s) => formatMetric(s.idleTimeoutSeconds, 0),
+      numeric: true,
+      searchable: false,
+    },
+  ];
+
+  const streamChip: { status: BadgeStatus; label: string } =
+    streamStatus === 'open'
+      ? { status: 'active', label: t.runtimeStreamOpen }
+      : streamStatus === 'error'
+        ? { status: 'standby', label: t.runtimeStreamOffline }
+        : { status: 'watch', label: t.runtimeStreamConnecting };
 
   // Create / edit sub-view (input mask) -- replaces the tabbed view entirely,
   // matching the rest of the portal's drill-down/sub-view convention.
@@ -1127,6 +1816,45 @@ export function RuntimeAdminSection({
         backLabel={t.back}
         items={[...trail, { label: application.endpoint }]}
       />
+      {/* Screen-wide facts, deliberately above the tab strip: which mode this
+          server is in, and why a configured runtime might be doing nothing.
+          Both are true on every tab, so neither may hide behind one. */}
+      {(fileMode || featureMismatch) && (
+        <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+          {fileMode && (
+            <Alert severity="info">
+              <Box sx={{ display: 'grid', gap: 0.25 }}>
+                <span>{t.runtimeManagedLocally}</span>
+                {reportContent?.collected_at && (
+                  <Typography variant="caption">
+                    {t.runtimeReportCollectedAt}: {formatDate(reportContent.collected_at, '—')}
+                  </Typography>
+                )}
+              </Box>
+            </Alert>
+          )}
+          {fileMode && parseError && (
+            <Alert severity="warning">{`${t.runtimeParseError} (${parseError})`}</Alert>
+          )}
+          {fileMode && configuredSpecCount > 0 && (
+            <Alert severity="warning">{t.runtimeIneffectiveSpecs}</Alert>
+          )}
+          {featureMismatch && (
+            <Alert severity="warning">
+              <Box sx={{ display: 'grid', gap: 0.25 }}>
+                <span>{t.runtimeFeatureMismatch}</span>
+                <Typography variant="caption">
+                  {t.runtimeAgentVersion}: {reportData?.agent_version || '—'}
+                </Typography>
+                <Typography variant="caption">
+                  {t.runtimeAgentFeatures}:{' '}
+                  {reportData?.agent_features.length ? reportData.agent_features.join(', ') : '—'}
+                </Typography>
+              </Box>
+            </Alert>
+          )}
+        </Box>
+      )}
       <Tabs
         value={tab}
         onChange={(_e, v: Tab) => setTab(v)}
@@ -1144,31 +1872,60 @@ export function RuntimeAdminSection({
           titleId="runtime-specs-heading"
           title={t.runtimeSpecs}
           subtitle={t.runtimeSpecsIntro}
+          // No create button until we know this screen is writable -- and
+          // never in file mode.
           actions={
-            <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-              {t.runtimeSpecCreate}
-            </Button>
+            writesAllowed ? (
+              <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+                {t.runtimeSpecCreate}
+              </Button>
+            ) : undefined
           }
         >
-          {warnings.length > 0 && (
-            <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
-              {warnings.map((code) => (
-                <Alert key={code} severity="warning">
-                  {runtimeWarningLabelByCode[code] ? t[runtimeWarningLabelByCode[code]] : code}
-                </Alert>
-              ))}
-            </Box>
+          {fileMode ? (
+            parseError ? (
+              // The agent could not read its own file: `config` is unusable,
+              // so nothing is rendered from it. The parse error itself is
+              // already surfaced above the tabs.
+              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
+            ) : (
+              <Box sx={{ display: 'grid', gap: 1.5 }}>
+                {reportConfig?.unrecognised && (
+                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
+                )}
+                <ListTable
+                  rows={reportConfig?.specs ?? []}
+                  columns={reportSpecColumns}
+                  rowKey={(s) => s.id}
+                  storageKey="op.runtimeReportSpecs"
+                  minWidth={780}
+                  labels={listTableLabels(t)}
+                />
+              </Box>
+            )
+          ) : (
+            <>
+              {warnings.length > 0 && (
+                <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+                  {warnings.map((code) => (
+                    <Alert key={code} severity="warning">
+                      {runtimeWarningLabelByCode[code] ? t[runtimeWarningLabelByCode[code]] : code}
+                    </Alert>
+                  ))}
+                </Box>
+              )}
+              <ListTable
+                rows={mappings}
+                columns={columns}
+                rowKey={(m) => m.id}
+                actions={writesAllowed ? rowActions : undefined}
+                storageKey="op.runtimeSpecs"
+                minWidth={900}
+                labels={listTableLabels(t)}
+                loading={mappingsLoading || mappingsData === null}
+              />
+            </>
           )}
-          <ListTable
-            rows={mappings}
-            columns={columns}
-            rowKey={(m) => m.id}
-            actions={rowActions}
-            storageKey="op.runtimeSpecs"
-            minWidth={900}
-            labels={listTableLabels(t)}
-            loading={mappingsLoading || mappingsData === null}
-          />
         </Panel>
       )}
       {tab === 'matrix' && (
@@ -1177,7 +1934,41 @@ export function RuntimeAdminSection({
           title={t.runtimeMatrix}
           subtitle={t.runtimeMatrixHint}
         >
-          {coresidencyReady ? (
+          {fileMode ? (
+            parseError ? (
+              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
+            ) : (
+              <Box sx={{ display: 'grid', gap: 1.5 }}>
+                {reportConfig?.unrecognised && (
+                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
+                )}
+                {/* Task 21 built and tested `disabled` but deliberately left
+                    it unwired: this is the signal it was waiting for. The
+                    onToggle can never fire, but a no-op stays honest about
+                    the prop's contract. */}
+                <RuntimeMatrix
+                  t={t}
+                  specs={(reportConfig?.specs ?? []).map((s) => ({
+                    id: s.id,
+                    model: s.model,
+                    gpus: s.gpus,
+                  }))}
+                  pairs={reportConfig?.coresident ?? []}
+                  onToggle={() => {}}
+                  budgets={Object.fromEntries(
+                    (reportConfig?.budgets ?? []).map((b) => [b.index, b.budgetMb]),
+                  )}
+                  disabled
+                />
+              </Box>
+            )
+          ) : !reportReady || !coresidencyReady ? (
+            // Deliberately NOT the matrix with an empty pair list: neither the
+            // pairs GET (task-21 review's Critical finding) nor the report GET
+            // (which decides whether this screen is writable at all) has
+            // settled, so there is nothing to render or toggle from.
+            <Typography color="text.secondary">{t.loading}</Typography>
+          ) : (
             <RuntimeMatrix
               t={t}
               specs={matrixSpecs}
@@ -1186,11 +1977,6 @@ export function RuntimeAdminSection({
               budgets={savedBudgetsByGpuIndex}
               disabled={coresidencyBusy}
             />
-          ) : (
-            // Deliberately NOT the matrix with an empty pair list: the GET
-            // hasn't settled yet, so there is no "current pairs" to render
-            // or toggle from -- see the task-21 review's Critical finding.
-            <Typography color="text.secondary">{t.loading}</Typography>
           )}
         </Panel>
       )}
@@ -1200,13 +1986,50 @@ export function RuntimeAdminSection({
           title={t.runtimeLimits}
           subtitle={t.runtimeLimitsIntro}
         >
-          {!gpuBudgetsReady ? (
-            // The GET hasn't settled yet -- `budgetRows` is still its
-            // initial `[]`, indistinguishable from "no budgets configured".
-            // Rendering the form (and its Save button) here would let a
-            // premature click PUT that empty list as the full replacement,
-            // erasing every previously configured budget (task-21 review's
-            // Critical finding). No form, no click, no write.
+          {fileMode ? (
+            parseError ? (
+              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
+            ) : (
+              // Read-only: the limits live in the agent's local file, and the
+              // gateway document file mode ignores is not what is in force.
+              <Box sx={{ display: 'grid', gap: 1 }}>
+                {reportConfig?.unrecognised && (
+                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
+                )}
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  <Typography variant="body2" color="text.secondary">
+                    {t.runtimeMaxProcesses}
+                  </Typography>
+                  <Typography variant="body2">
+                    {reportConfig?.maxProcesses === null || reportConfig === null
+                      ? '—'
+                      : String(reportConfig.maxProcesses)}
+                  </Typography>
+                </Box>
+                <Typography variant="subtitle2" component="h3">
+                  {t.runtimeGpuBudget}
+                </Typography>
+                {(reportConfig?.budgets ?? []).length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">
+                    —
+                  </Typography>
+                ) : (
+                  (reportConfig?.budgets ?? []).map((b) => (
+                    <Typography key={b.index} variant="body2">
+                      {`GPU ${b.index}: ${b.budgetMb} MB`}
+                    </Typography>
+                  ))
+                )}
+              </Box>
+            )
+          ) : !reportReady || !gpuBudgetsReady ? (
+            // Neither GET has settled yet. `budgetRows` is still its initial
+            // `[]`, indistinguishable from "no budgets configured", and Save
+            // PUTs it as the FULL replacement -- so a premature click would
+            // erase every previously configured budget (task-21 review's
+            // Critical finding). And until the report resolves we do not know
+            // whether this form should exist at all. No form, no click, no
+            // write.
             <Typography color="text.secondary">{t.loading}</Typography>
           ) : (
             <Box sx={{ display: 'grid', gap: 2.5 }}>
@@ -1316,8 +2139,38 @@ export function RuntimeAdminSection({
         </Panel>
       )}
       {tab === 'status' && (
-        <Panel titleId="runtime-status-heading" title={t.runtimeLiveStatus}>
-          <Typography color="text.secondary">{t.runtimeAreaPlaceholder}</Typography>
+        <Panel
+          titleId="runtime-status-heading"
+          title={t.runtimeLiveStatus}
+          actions={<StatusChip status={streamChip.status} label={streamChip.label} />}
+        >
+          <Box sx={{ display: 'grid', gap: 1.5 }}>
+            {/* The restart sequence's two terminal problems get their own
+                banner rather than a chip: both leave an override in place
+                that the operator now has to decide about. */}
+            {restartNotice === 'timeout' && (
+              <Alert severity="warning">{t.runtimeRestartTimeout}</Alert>
+            )}
+            {restartNotice === 'vanished' && (
+              <Alert severity="warning">{t.runtimeRestartVanished}</Alert>
+            )}
+            <ListTable
+              rows={statusRows}
+              columns={statusColumns}
+              rowKey={(row) => row.spec_id}
+              actions={statusActions}
+              storageKey="op.runtimeStatus"
+              minWidth={980}
+              // "Nothing is running" and "we cannot see what is running" are
+              // different facts and must not read alike: the empty cell says
+              // which one it is, and the panel's chip says it again.
+              labels={listTableLabels(t, {
+                empty: streamStatus === 'error' ? t.runtimeStreamError : t.runtimeStatusEmpty,
+                loading: t.runtimeStreamConnecting,
+              })}
+              loading={streamStatus === 'loading' && statusRows.length === 0}
+            />
+          </Box>
         </Panel>
       )}
 

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RuntimeAdminSection } from './RuntimeAdminSection';
+import {
+  RESTART_STOP_TIMEOUT_MS,
+  RESTART_VANISH_GRACE_MS,
+  RuntimeAdminSection,
+} from './RuntimeAdminSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages } from '../i18n';
 import type {
@@ -15,7 +19,10 @@ import type {
   PortalModelMapping,
   PortalServer,
   PutRuntimeSpecRequest,
+  RuntimeReport,
+  RuntimeReportContent,
   RuntimeSpec,
+  RuntimeStatus,
   UpdateMappingRequest,
   UpdateServerRequest,
 } from '../api';
@@ -157,6 +164,44 @@ function makeHardware(gpus: HardwareGPU[]): HardwareResponse {
   };
 }
 
+function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
+  return {
+    spec_id: 'spec_1',
+    model: 'app-model',
+    state: 'running',
+    since: '2026-07-16T12:00:00Z',
+    in_flight: 0,
+    restarts: 0,
+    ...overrides,
+  };
+}
+
+// The default (gateway-source) runtime report: nothing ever reported, so the
+// screen stays writable. agent_version/agent_features are always present on
+// this DTO (they come from the latest telemetry row, not the report).
+function makeReport(overrides: Partial<RuntimeReport> = {}): RuntimeReport {
+  return { available: false, agent_version: '', agent_features: [], ...overrides };
+}
+
+// A file-mode report: `source: 'file'` on the NESTED report object (the
+// RuntimeReport itself has no `source` field), which is the whole read-only
+// trigger for this screen.
+function fileModeReport(
+  config: unknown,
+  extra: Partial<RuntimeReportContent> = {},
+  reportOverrides: Partial<RuntimeReport> = {},
+): RuntimeReport {
+  return {
+    available: true,
+    collected_at: '2026-07-16T12:00:00Z',
+    updated_at: '2026-07-16T12:00:00Z',
+    agent_version: '0.2.0',
+    agent_features: ['runtime_manager'],
+    report: { source: 'file', collected_at: '2026-07-16T12:00:00Z', config, ...extra },
+    ...reportOverrides,
+  };
+}
+
 function renderSection(
   opts: {
     mappings?: PortalModelMapping[];
@@ -170,6 +215,12 @@ function renderSection(
     gpuBudgetsPending?: boolean;
     hardware?: HardwareResponse;
     runtimeMaxProcesses?: number;
+    // Task 22: the file-mode/feature-negotiation report, and the live SSE.
+    report?: RuntimeReport;
+    reportPending?: boolean;
+    // Pushed synchronously from inside the subscribe call, i.e. exactly like
+    // the stream's `snapshot` frame arriving on connect.
+    statusRows?: RuntimeStatus[];
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
@@ -186,6 +237,12 @@ function renderSection(
     ...server,
     runtime_max_processes: opts.runtimeMaxProcesses,
   };
+  // Captured from the subscribe call so a test can drive the live stream
+  // frame by frame (both `snapshot` and `update` are full replacements).
+  let onDataCb: ((rows: RuntimeStatus[]) => void) | null = null;
+  let onStatusCb: ((status: 'open' | 'error') => void) | null = null;
+  let unsubscribeCount = 0;
+  const subscribedServerIds: string[] = [];
 
   const fakeApi = {
     mappings: vi.fn(async () => ({ data: mappings })),
@@ -207,7 +264,14 @@ function renderSection(
     ),
     putRuntimeSpec: vi.fn(async (mappingId: string, body: PutRuntimeSpecRequest) => {
       putSpecs.push({ mappingId, body });
-      return makeSpec({ configured: true, mapping_id: mappingId, ...body });
+      // `id` (the SPEC id, the join key against the live status stream) is
+      // preserved exactly as the backend does -- a PUT never re-keys the row.
+      return makeSpec({
+        configured: true,
+        mapping_id: mappingId,
+        id: specsByMappingId[mappingId]?.id,
+        ...body,
+      });
     }),
     deleteRuntimeSpec: vi.fn(async (id: string) => {
       deletedSpecIds.push(id);
@@ -232,8 +296,26 @@ function renderSection(
       putBudgets.push(body.budgets);
       return { budgets: body.budgets };
     }),
-    runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
-    subscribeRuntimeStatus: vi.fn(() => () => {}),
+    runtimeReport: vi.fn(() =>
+      opts.reportPending
+        ? new Promise<RuntimeReport>(() => {})
+        : Promise.resolve(opts.report ?? makeReport()),
+    ),
+    subscribeRuntimeStatus: vi.fn(
+      (
+        _serverId: string,
+        onData: (rows: RuntimeStatus[]) => void,
+        onStatus?: (status: 'open' | 'error') => void,
+      ) => {
+        onDataCb = onData;
+        onStatusCb = onStatus ?? null;
+        subscribedServerIds.push(_serverId);
+        if (opts.statusRows) onData(opts.statusRows);
+        return () => {
+          unsubscribeCount++;
+        };
+      },
+    ),
     updateServer: vi.fn(async (id: string, body: UpdateServerRequest) => {
       updatedServers.push({ id, body });
       // Only runtime_max_processes matters to Area 3's own round trip; the
@@ -245,7 +327,7 @@ function renderSection(
     serverHardware: vi.fn(async () => opts.hardware ?? ({ available: false } as HardwareResponse)),
   };
 
-  render(
+  const view = render(
     <ToastProvider>
       <RuntimeAdminSection t={t} api={fakeApi} server={serverForTest} application={application} />
     </ToastProvider>,
@@ -260,14 +342,34 @@ function renderSection(
     putCoresidencyBodies,
     putBudgets,
     updatedServers,
+    unmount: view.unmount,
+    stream: {
+      /** One full-replacement frame (`snapshot` or `update` -- same shape). */
+      push: (rows: RuntimeStatus[]) => act(() => onDataCb?.(rows)),
+      setStatus: (status: 'open' | 'error') => act(() => onStatusCb?.(status)),
+      unsubscribes: () => unsubscribeCount,
+      subscribedServerIds,
+    },
+    /** Re-renders with a different server, to exercise a mid-flow switch. */
+    rerenderWithServer: (id: string) =>
+      view.rerender(
+        <ToastProvider>
+          <RuntimeAdminSection
+            t={t}
+            api={fakeApi}
+            server={{ ...serverForTest, id }}
+            application={application}
+          />
+        </ToastProvider>,
+      ),
   };
 }
 
 afterEach(cleanup);
 
 describe('RuntimeAdminSection tab strip', () => {
-  it('renders the specs/matrix/limits/status tabs; matrix + limits are now real, status stays a Task-22 stub', async () => {
-    renderSection();
+  it('renders the specs/matrix/limits/status tabs, all four wired to real data', async () => {
+    const { stream } = renderSection();
     // "specs" is the active tab, so its Tab label AND its Panel title render
     // at once (both say "Runtime-Spezifikationen") -- scope to the tab role.
     expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
@@ -286,9 +388,12 @@ describe('RuntimeAdminSection tab strip', () => {
     fireEvent.click(screen.getByText(t.runtimeLimits));
     expect(await screen.findByLabelText(t.runtimeMaxProcesses)).toBeInTheDocument();
 
-    // Status is Task 22's remaining stub.
+    // Status: the live table renders its own empty state (the stream is open
+    // and reports nothing), no longer the generic area placeholder.
+    stream.setStatus('open');
     fireEvent.click(screen.getByText(t.runtimeLiveStatus));
-    expect(screen.getByText(t.runtimeAreaPlaceholder)).toBeInTheDocument();
+    expect(await screen.findByText(t.runtimeStatusEmpty)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeAreaPlaceholder)).not.toBeInTheDocument();
   });
 });
 
@@ -873,5 +978,747 @@ describe('RuntimeAdminSection server limits wiring', () => {
     ]);
     await waitFor(() => expect(updatedServers).toHaveLength(1));
     expect(updatedServers[0].body.runtime_max_processes).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 22: live status, admin overrides, the restart sequence, file mode and
+// the feature-mismatch banner.
+// ---------------------------------------------------------------------------
+
+// A fully populated, deliberately NON-default spec: every field carries a
+// value that a synthesized/defaulted PUT body would get wrong. Used by the
+// override tests, which compare the PUT body field by field.
+function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+  return makeSpec({
+    configured: true,
+    id: 'spec_1',
+    mapping_id: 'map_1',
+    enabled: true,
+    binary: '/usr/local/bin/llama-server',
+    args: ['--model', '/models/a model.gguf', '--port', '${PORT}'],
+    env: { CUDA_VISIBLE_DEVICES: '0', HF_HOME: '/data/hf' },
+    work_dir: '/opt/models',
+    listen_port: 8099,
+    health_path: '/healthz',
+    health_timeout_seconds: 7,
+    startup_timeout_seconds: 300,
+    idle_timeout_seconds: 600,
+    admission_wait_timeout_seconds: 45,
+    pinned: true,
+    admin_state: '',
+    vram_locked: true,
+    gpus: [{ index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
+    ...overrides,
+  });
+}
+
+// The PUT body the override actions MUST send: the loaded spec verbatim,
+// minus the three server-owned fields, with only admin_state replaced.
+function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
+  return {
+    enabled: spec.enabled,
+    binary: spec.binary,
+    args: spec.args,
+    env: spec.env,
+    work_dir: spec.work_dir,
+    listen_port: spec.listen_port,
+    health_path: spec.health_path,
+    health_timeout_seconds: spec.health_timeout_seconds,
+    startup_timeout_seconds: spec.startup_timeout_seconds,
+    idle_timeout_seconds: spec.idle_timeout_seconds,
+    admission_wait_timeout_seconds: spec.admission_wait_timeout_seconds,
+    pinned: spec.pinned,
+    admin_state: adminState,
+    vram_locked: spec.vram_locked,
+    gpus: spec.gpus,
+  };
+}
+
+async function openStatusTab() {
+  fireEvent.click(await screen.findByRole('tab', { name: t.runtimeLiveStatus }));
+}
+
+describe('RuntimeAdminSection live status list', () => {
+  it('renders one row per reported process with its state, since, pid, port, in-flight and restarts', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          spec_id: 'spec_1',
+          model: 'app-model',
+          state: 'running',
+          pid: 4242,
+          port: 8099,
+          in_flight: 3,
+          restarts: 2,
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('app-model')).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeStateRunning)).toHaveAttribute('data-status', 'active');
+    expect(screen.getByText('4242')).toBeInTheDocument();
+    expect(screen.getByText('8099')).toBeInTheDocument();
+    expect(screen.getByText('3')).toBeInTheDocument();
+    expect(screen.getByText('2')).toBeInTheDocument();
+  });
+
+  // Correction 3: the portal has exactly THREE status colours (success/watch/
+  // standby; theme/ThemeRoot.tsx) and statusClassByKey collapses
+  // error/disabled/expired onto standby, so a badge map naming 'error' or
+  // 'disabled' renders the same grey chip as 'standby'. The colour therefore
+  // cannot carry the state; the LABEL has to. This pins both halves: the
+  // three colours that DO differ, and nine distinct labels.
+  it('uses only the three real colours and lets the label carry every state distinction', async () => {
+    const states = [
+      'running',
+      'starting',
+      'pending_vram_unknown',
+      'stopped',
+      'draining',
+      'backoff',
+      'crashed',
+      'start_failed',
+      'not_permitted',
+    ];
+    const { stream } = renderSection({
+      statusRows: states.map((state, i) =>
+        makeStatus({ spec_id: `spec_${i}`, model: `m-${state}`, state }),
+      ),
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    await screen.findByText('m-running');
+    expect(screen.getByText(t.runtimeStateRunning)).toHaveAttribute('data-status', 'active');
+    expect(screen.getByText(t.runtimeStateStarting)).toHaveAttribute('data-status', 'watch');
+    expect(screen.getByText(t.runtimeStatePendingVram)).toHaveAttribute('data-status', 'watch');
+    expect(screen.getByText(t.runtimeStateStopped)).toHaveAttribute('data-status', 'standby');
+    expect(screen.getByText(t.runtimeStateDraining)).toHaveAttribute('data-status', 'standby');
+    expect(screen.getByText(t.runtimeStateBackoff)).toHaveAttribute('data-status', 'standby');
+    expect(screen.getByText(t.runtimeStateCrashed)).toHaveAttribute('data-status', 'standby');
+    expect(screen.getByText(t.runtimeStateStartFailed)).toHaveAttribute('data-status', 'standby');
+    expect(screen.getByText(t.runtimeStateNotPermitted)).toHaveAttribute('data-status', 'standby');
+  });
+
+  it('falls back to the raw wire value for a state this portal build does not know', async () => {
+    const { stream } = renderSection({
+      statusRows: [makeStatus({ state: 'quantum_superposition' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    expect(await screen.findByText('quantum_superposition')).toBeInTheDocument();
+  });
+
+  // Two facts, one view: "nothing is running" and "we cannot see what is
+  // running" must not look alike. An implementation that only ever renders
+  // the generic list-empty text fails this.
+  it('tells "no process reported" apart from "the stream is down"', async () => {
+    const { stream } = renderSection();
+    stream.setStatus('error');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.runtimeStreamError)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStatusEmpty)).not.toBeInTheDocument();
+
+    stream.setStatus('open');
+    expect(await screen.findByText(t.runtimeStatusEmpty)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStreamError)).not.toBeInTheDocument();
+  });
+
+  // THE crux of this task (brief, "The failure signal"): last_error is
+  // cleared only by the next SUCCESSFUL start, never by a state change, so a
+  // spec can be `stopped` and still carry "last attempt failed". "Last load
+  // failed" is therefore not a state, and no state chip can convey it -- it
+  // needs its own always-visible affordance. An implementation that shows
+  // last_error only for crashed/start_failed rows fails this.
+  it('shows the last error on a STOPPED row, because last_error survives state changes', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          state: 'stopped',
+          last_error: {
+            message: 'CUDA error: out of memory',
+            at: '2026-07-15T14:32:00Z',
+            exit_code: 1,
+            failures: 3,
+            stderr_tail: 'ggml_cuda_host_malloc: failed to allocate',
+          },
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.runtimeStateStopped)).toHaveAttribute(
+      'data-status',
+      'standby',
+    );
+    // Visible in the row itself, not hidden behind a hover-only tooltip.
+    expect(screen.getByText('CUDA error: out of memory')).toBeInTheDocument();
+  });
+
+  it('replaces the row set on every frame instead of appending', async () => {
+    const { stream } = renderSection();
+    stream.setStatus('open');
+    await openStatusTab();
+
+    stream.push([
+      makeStatus({ spec_id: 'spec_1', model: 'model-a' }),
+      makeStatus({ spec_id: 'spec_2', model: 'model-b' }),
+    ]);
+    expect(await screen.findByText('model-a')).toBeInTheDocument();
+    expect(screen.getByText('model-b')).toBeInTheDocument();
+
+    stream.push([makeStatus({ spec_id: 'spec_1', model: 'model-a' })]);
+    await waitFor(() => expect(screen.queryByText('model-b')).not.toBeInTheDocument());
+    expect(screen.getByText('model-a')).toBeInTheDocument();
+  });
+
+  it('unsubscribes from the stream on unmount', async () => {
+    const { stream, unmount } = renderSection();
+    await openStatusTab();
+    expect(stream.unsubscribes()).toBe(0);
+    unmount();
+    expect(stream.unsubscribes()).toBe(1);
+  });
+
+  it('joins the live state into the launch-specs list by spec_id', async () => {
+    const { stream } = renderSection({
+      mappings: [
+        makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' }),
+        makeMapping({ id: 'map_2', gateway_model_name: 'Bravo' }),
+      ],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+        map_2: makeSpec({ configured: true, id: 'spec_2', mapping_id: 'map_2' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'starting' })],
+    });
+    stream.setStatus('open');
+
+    // Specs tab is the default one.
+    await screen.findByText('Alpha');
+    // Alpha's spec is reported starting; Bravo's spec has no live status.
+    expect(await screen.findByText(t.runtimeStateStarting)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeStatusUnknown)).toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection admin overrides', () => {
+  // The plan's third full-replace hazard: putRuntimeSpec's body is the ENTIRE
+  // spec, so a synthesized or defaulted body silently overwrites the
+  // operator's configured command line. Comparing the whole body field by
+  // field is the only assertion that can see that; checking admin_state alone
+  // cannot.
+  it('force-stop PUTs the loaded spec verbatim with ONLY admin_state changed', async () => {
+    const spec = fullSpec();
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_1' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].mappingId).toBe('map_1');
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+  });
+
+  it('clear-override PUTs the loaded spec verbatim with admin_state emptied', async () => {
+    const spec = fullSpec({ admin_state: 'force_stopped' });
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'stopped' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeClearOverride }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, ''));
+  });
+
+  it('shows the override actions the current admin_state allows, and only those', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec({ admin_state: 'force_stopped' }) },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'stopped' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByRole('button', { name: t.runtimeForceStart })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    // Already force_stopped -- forcing it again is a no-op, and a restart
+    // would silently end with a DIFFERENT override than it started with.
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
+  });
+
+  // Brief: "If no loaded spec matches the row's spec_id ... render NO
+  // override buttons for that row rather than falling back to a synthesized
+  // body." A synthesized body would wipe the operator's command line.
+  it('renders no override actions for a row whose spec is not loaded', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [],
+      statusRows: [makeStatus({ spec_id: 'spec_from_nowhere', model: 'orphan' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('orphan')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+
+  // Same gating discipline as areas 2/3: until the runtime-report GET has
+  // settled we do not know whether this screen is about to become read-only,
+  // so nothing writable may be presented.
+  it('presents no override actions while the runtime-report GET is still pending', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1' })],
+      reportPending: true,
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('app-model')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+});
+
+describe('RuntimeAdminSection restart sequence', () => {
+  function setupRestart(rowState = 'running') {
+    const spec = fullSpec();
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: rowState })],
+    });
+    handles.stream.setStatus('open');
+    return { spec, ...handles };
+  }
+
+  it('runs force_stopped -> await stopped -> clear override, preserving every other spec field', async () => {
+    const { spec, putSpecs, stream } = setupRestart();
+    await openStatusTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+    // Visible progress while the sequence waits for the stream.
+    expect(await screen.findByText(t.runtimeRestartStopping)).toBeInTheDocument();
+
+    // Still running -> nothing further happens.
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'draining' })]);
+    expect(putSpecs).toHaveLength(1);
+
+    // The `stopped` frame is the only signal that force_stopped took effect.
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body).toEqual(expectedBody(spec, ''));
+    await waitFor(() =>
+      expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument(),
+    );
+  });
+
+  // The likeliest case in practice, and the one a happy-path-only test leaves
+  // unproven: the child never reports `stopped`. The wait MUST be bounded and
+  // the clear PUT must NOT be sent (the override is still in effect, and the
+  // operator has to decide what to do).
+  it('bounds the wait: a wedged child surfaces a timeout and never sends the clear', async () => {
+    vi.useFakeTimers();
+    try {
+      const { putSpecs, stream } = setupRestart();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(putSpecs).toHaveLength(1);
+
+      // Frames keep arriving; the child just never stops.
+      for (let i = 0; i < 5; i++) {
+        stream.push([makeStatus({ spec_id: 'spec_1', state: 'draining' })]);
+        await act(async () => {
+          vi.advanceTimersByTime(1000);
+          await Promise.resolve();
+        });
+      }
+      expect(putSpecs).toHaveLength(1);
+      expect(screen.queryByText(t.runtimeRestartTimeout)).not.toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(RESTART_STOP_TIMEOUT_MS);
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
+      // The override was deliberately NOT cleared behind the operator's back.
+      expect(putSpecs).toHaveLength(1);
+      expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('abandons the sequence on unmount without a further write', async () => {
+    const { putSpecs, stream, unmount } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    await screen.findByText(t.runtimeRestartStopping);
+
+    unmount();
+    expect(stream.unsubscribes()).toBe(1);
+    // The `stopped` frame arrives after the component is gone: no clear PUT,
+    // and no state update on an unmounted tree.
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  it('abandons the sequence when the server changes mid-flight', async () => {
+    const { putSpecs, stream, rerenderWithServer } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    await screen.findByText(t.runtimeRestartStopping);
+
+    rerenderWithServer('srv_2');
+    await waitFor(() =>
+      expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument(),
+    );
+    expect(stream.subscribedServerIds).toEqual(['srv_1', 'srv_2']);
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // The remaining step only means anything while we watch THAT server.
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  it('aborts (without clearing the override) when the row disappears for good', async () => {
+    vi.useFakeTimers();
+    try {
+      const { putSpecs, stream } = setupRestart();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(putSpecs).toHaveLength(1);
+
+      // Row gone. Not yet terminal: the gateway keeps status in volatile RAM,
+      // so a restart there empties the list for well under a second.
+      stream.push([]);
+      expect(screen.queryByText(t.runtimeRestartVanished)).not.toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(RESTART_VANISH_GRACE_MS + 1000);
+        await Promise.resolve();
+      });
+      stream.push([]);
+
+      expect(screen.getByText(t.runtimeRestartVanished)).toBeInTheDocument();
+      // PUTting a spec whose mapping may be gone would either 404 or
+      // resurrect a spec the operator just deleted.
+      expect(putSpecs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not abort on a transient empty frame: the row coming back resumes the sequence', async () => {
+    const { spec, putSpecs, stream } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+
+    // A gateway restart: one empty frame, then the next sample refills it.
+    stream.push([]);
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'draining' })]);
+    expect(screen.queryByText(t.runtimeRestartVanished)).not.toBeInTheDocument();
+    expect(await screen.findByText(t.runtimeRestartStopping)).toBeInTheDocument();
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body).toEqual(expectedBody(spec, ''));
+  });
+
+  it('refuses a second restart while one is in flight', async () => {
+    const { putSpecs, stream } = setupRestart();
+    await openStatusTab();
+    const restartButton = await screen.findByRole('button', { name: t.runtimeRestart });
+    fireEvent.click(restartButton);
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+
+    const busyButton = screen.getByRole('button', { name: t.runtimeRestart });
+    expect(busyButton).toBeDisabled();
+    fireEvent.click(busyButton);
+    // Every other override write is locked too: any admin_state change
+    // during the sequence would fight it.
+    expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeDisabled();
+    expect(putSpecs).toHaveLength(1);
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+  });
+});
+
+describe('RuntimeAdminSection file mode (spec §10.2)', () => {
+  const fileConfig = {
+    router_listen: 9000,
+    max_processes: 3,
+    gpu_budgets: [{ index: 0, budget_mb: 46000 }],
+    specs: [
+      {
+        id: 'rs1',
+        model: 'File-Alpha',
+        upstream_model: 'file-alpha',
+        binary: '/opt/llama/llama-server',
+        args: ['--model', '/models/alpha.gguf'],
+        env: { HF_TOKEN: '***' },
+        gpus: [{ index: 0, vram_mb: 20000 }],
+        listen_port: 0,
+        idle_timeout_seconds: 900,
+        pinned: true,
+        admin_state: '',
+      },
+      {
+        id: 'rs2',
+        model: 'File-Bravo',
+        upstream_model: 'file-bravo',
+        binary: '/opt/vllm/vllm',
+        args: [],
+        env: {},
+        gpus: [{ index: 0, vram_mb: 21000 }],
+        listen_port: 0,
+        idle_timeout_seconds: 0,
+        pinned: false,
+        admin_state: '',
+      },
+    ],
+    coresident: [['rs1', 'rs2']],
+    etag: 'abc123',
+  };
+
+  function renderFileMode(config: unknown = fileConfig, extra: Partial<RuntimeReportContent> = {}) {
+    return renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Gateway-Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'rs1', model: 'file-alpha' })],
+      report: fileModeReport(config, extra),
+    });
+  }
+
+  it('announces file mode and marks the gateway-side specs as ineffective', async () => {
+    renderFileMode();
+    expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
+  });
+
+  it('turns every edit affordance off: no spec form, a disabled matrix, no budget form, no overrides', async () => {
+    const { stream } = renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+
+    // Specs: no create, no row actions.
+    expect(screen.queryByRole('button', { name: t.runtimeSpecCreate })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeSpecDelete })).not.toBeInTheDocument();
+
+    // Matrix: rendered (from the report) but every cell disabled -- this is
+    // exactly the `disabled` prop Task 21 built and deliberately left unwired.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
+    const cell = await screen.findByRole('button', {
+      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
+    });
+    expect(cell).toBeDisabled();
+
+    // Limits: read-only, no Save, no fields.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    await screen.findByText(t.runtimeMaxProcesses, { exact: false });
+    expect(screen.queryByRole('button', { name: t.save })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeMaxProcesses)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeGpuBudget)).not.toBeInTheDocument();
+
+    // Status: live rows still work (they ride the sample), overrides do not
+    // (the admin override lives in the gateway document file mode ignores).
+    stream.setStatus('open');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    expect(await screen.findByText('file-alpha')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
+  });
+
+  it('renders specs and the matrix from the report config, not from the gateway CRUD data', async () => {
+    renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+
+    expect(await screen.findByText('File-Alpha')).toBeInTheDocument();
+    expect(screen.getByText('File-Bravo')).toBeInTheDocument();
+    // The gateway-side mapping is NOT what file mode shows.
+    expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
+    const cell = await screen.findByRole('button', {
+      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
+    });
+    // The reported coresident pair renders as set.
+    expect(cell).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    expect(await screen.findByText('3')).toBeInTheDocument();
+    expect(screen.getByText('46000', { exact: false })).toBeInTheDocument();
+  });
+
+  // Correction 5: parse_error is the agent saying it could not read its own
+  // config file. In that state `config` is unusable, so it must not be shown.
+  it('surfaces parse_error prominently and stops rendering config', async () => {
+    renderFileMode(fileConfig, { parse_error: 'yaml' });
+    expect(await screen.findByText(t.runtimeParseError, { exact: false })).toBeInTheDocument();
+    expect(screen.getByText('yaml', { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha` }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  // Correction 6: `config` is typed `unknown` on purpose -- it is whatever
+  // the agent's file contained. A malformed agent-supplied config must never
+  // blank or crash the admin screen.
+  it('survives a structurally malformed config: renders what parses, flags what does not', async () => {
+    renderFileMode({
+      max_processes: 'three',
+      gpu_budgets: 'nope',
+      specs: [
+        {
+          id: 'rs1',
+          model: 'File-Alpha',
+          binary: '/opt/llama/llama-server',
+          gpus: [{ index: 0, vram_mb: 20000 }],
+        },
+        'garbage',
+        { id: 42 },
+      ],
+      coresident: [['rs1', 'rs2'], 'not-a-pair'],
+    });
+
+    expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
+    expect(await screen.findByText('File-Alpha')).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeConfigUnrecognised)).toBeInTheDocument();
+  });
+
+  it('survives a config that is not an object at all', async () => {
+    renderFileMode('not-an-object');
+    expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeConfigUnrecognised)).toBeInTheDocument();
+  });
+
+  it('presents no writable UI while the report GET is still pending', async () => {
+    const { fakeApi } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      reportPending: true,
+      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      coresidencyPairs: [],
+    });
+
+    await screen.findByText('gw-model');
+    expect(screen.queryByRole('button', { name: t.runtimeSpecCreate })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    await screen.findByText(t.loading);
+    expect(screen.queryByRole('button', { name: t.save })).not.toBeInTheDocument();
+    expect(fakeApi.putGpuBudgets).not.toHaveBeenCalled();
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+
+  it('stays writable for a gateway-source report', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      report: makeReport({
+        available: true,
+        agent_version: '0.2.0',
+        agent_features: ['runtime_manager'],
+        report: { source: 'gateway', collected_at: '2026-07-16T12:00:00Z', config: {} },
+      }),
+    });
+
+    expect(await screen.findByRole('button', { name: t.runtimeSpecCreate })).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeManagedLocally)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection feature-mismatch banner (spec §9)', () => {
+  function renderWithFeatures(features: string[], statusRows: RuntimeStatus[] = []) {
+    return renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows,
+      report: makeReport({ agent_version: '0.1.4', agent_features: features }),
+    });
+  }
+
+  it('explains the silence when specs exist, nothing is reported, and the agent lacks runtime_manager', async () => {
+    renderWithFeatures(['proxy_status']);
+    expect(await screen.findByText(t.runtimeFeatureMismatch)).toBeInTheDocument();
+    // Naming the reported version is the point: it says WHAT to upgrade.
+    expect(screen.getByText('0.1.4', { exact: false })).toBeInTheDocument();
+  });
+
+  it('stays quiet when the agent does declare runtime_manager', async () => {
+    renderWithFeatures(['runtime_manager']);
+    await screen.findByText('gw-model');
+    expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+
+  it('stays quiet when the stream is reporting processes anyway', async () => {
+    const { stream } = renderWithFeatures([], [makeStatus({ spec_id: 'spec_1' })]);
+    stream.setStatus('open');
+    await screen.findByText('gw-model');
+    expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+
+  it('stays quiet when no spec is configured at all', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      report: makeReport({ agent_version: '0.1.4', agent_features: [] }),
+    });
+    await screen.findByText('gw-model');
+    expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
   });
 });
