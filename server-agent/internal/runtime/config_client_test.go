@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -524,5 +525,180 @@ func TestFileSourceParseErrorKeepsLastGood(t *testing.T) {
 	}
 	if msg, at := s.LastParseError(); msg != "" || !at.IsZero() {
 		t.Fatalf("LastParseError after a subsequent success = (%q, %v), want (\"\", zero)", msg, at)
+	}
+}
+
+// countingHandler is a slog.Handler that counts records by message. The
+// certinstall recordingHandler pattern (internal/certinstall/testutil_test.go),
+// reduced to the one thing the dedup assertion below needs: how many times a
+// specific line was emitted. Guarded by a mutex because a Manager owner
+// goroutine from an unrelated test may still be logging while this handler is
+// installed as the default.
+type countingHandler struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.counts == nil {
+		h.counts = make(map[string]int)
+	}
+	h.counts[r.Message]++
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *countingHandler) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.counts[msg]
+}
+
+// withCountedLogs installs a countingHandler as the default slog handler for
+// the duration of the test, restoring the previous default afterward.
+func withCountedLogs(t *testing.T) *countingHandler {
+	t.Helper()
+	h := &countingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// runtimeConfigMissingLogMsg is warnMissingOnce's exact message. Duplicated
+// here on purpose: a test that matched loosely (a substring, or "any Debug
+// record") would keep passing if the dedup broke and some OTHER line started
+// appearing instead.
+const runtimeConfigMissingLogMsg = "runtime: gateway runtime-config endpoint not found (older gateway build?); keeping current config"
+
+// TestGatewaySource404LogsExactlyOncePerStreak is B8: the 404 BEHAVIOUR (the
+// running set survives, changed=false, nil error) is already covered across
+// three calls by TestGatewaySource404KeepsCurrent -- what was missing is the
+// dedup claim itself. "Logged at Debug, and only once per consecutive streak
+// of 404s" (Load's own comment) is an EXACTLY-once claim, and an at-least-once
+// assertion cannot tell it from the un-deduped version that logs on every
+// poll: at a 5s cadence that is ~17k lines a day from a gateway that is
+// merely older than this agent.
+//
+// The assertion discriminates in BOTH directions, which is the part the
+// at-least-once shape gets wrong:
+//   - exactly 1 after a streak of 5 (a per-call log gives 5; that is the
+//     regression this test exists to catch);
+//   - still exactly 1 after MORE 404s in the same streak (a counter that
+//     resets on every call would tick up again);
+//   - exactly 2 after a 200 resets the streak and a fresh 404 follows (a
+//     latch that never clears would stay at 1 and permanently silence the
+//     line for the process's whole lifetime -- the opposite failure, and the
+//     reason clearMissingFlag exists at all).
+func TestGatewaySource404LogsExactlyOncePerStreak(t *testing.T) {
+	var mode atomic.Int32 // 0 = ok, 1 = 404
+	var etag atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mode.Load() == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(minimalConfigJSON(9000, "e"+strconv.Itoa(int(etag.Load())))))
+	}))
+	defer srv.Close()
+
+	h := withCountedLogs(t)
+	s := NewGatewaySource(srv.URL, "tok", srv.Client(), filepath.Join(t.TempDir(), "cache.json"))
+
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("first (200) Load: %v", err)
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 0 {
+		t.Fatalf("after a 200 Load the missing-endpoint line was logged %d times, want 0", got)
+	}
+
+	mode.Store(1)
+	for i := 0; i < 5; i++ {
+		if _, _, err := s.Load(context.Background()); err != nil {
+			t.Fatalf("Load on 404 (iter %d): %v", i, err)
+		}
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 1 {
+		t.Fatalf("after a streak of 5 consecutive 404s the missing-endpoint line was logged %d times, want EXACTLY 1 -- the dedup is what keeps an older gateway from producing one line per poll forever", got)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, _, err := s.Load(context.Background()); err != nil {
+			t.Fatalf("Load on 404 (continued streak, iter %d): %v", i, err)
+		}
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 1 {
+		t.Fatalf("after 10 consecutive 404s the missing-endpoint line was logged %d times, want STILL exactly 1", got)
+	}
+
+	// A 200 must clear the latch: the same condition recurring after the
+	// gateway was seen working again is news, and deserves the line again.
+	mode.Store(0)
+	etag.Store(1)
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("recovery (200) Load: %v", err)
+	}
+	mode.Store(1)
+	for i := 0; i < 3; i++ {
+		if _, _, err := s.Load(context.Background()); err != nil {
+			t.Fatalf("Load on the second 404 streak (iter %d): %v", i, err)
+		}
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 2 {
+		t.Fatalf("after a 200 reset followed by a fresh streak of 3 404s the missing-endpoint line was logged %d times, want exactly 2 -- a latch that never clears silences this line for the rest of the process's life", got)
+	}
+}
+
+// TestGatewaySource304AlsoClearsTheMissingLatch pins the other reset path:
+// Load calls clearMissingFlag on 304 as well as 200, so an agent whose etag
+// happens to still match after a gateway downgrade+upgrade cycle is not left
+// permanently silenced either.
+func TestGatewaySource304AlsoClearsTheMissingLatch(t *testing.T) {
+	var mode atomic.Int32 // 0 = 200/304 by etag, 1 = 404
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mode.Load() == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(minimalConfigJSON(9000, "e1")))
+	}))
+	defer srv.Close()
+
+	h := withCountedLogs(t)
+	s := NewGatewaySource(srv.URL, "tok", srv.Client(), filepath.Join(t.TempDir(), "cache.json"))
+	if _, _, err := s.Load(context.Background()); err != nil { // 200, seeds the etag
+		t.Fatalf("first Load: %v", err)
+	}
+
+	mode.Store(1)
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("404 Load: %v", err)
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 1 {
+		t.Fatalf("missing-endpoint line logged %d times after the first 404, want 1", got)
+	}
+
+	mode.Store(0)
+	if _, _, err := s.Load(context.Background()); err != nil { // 304
+		t.Fatalf("304 Load: %v", err)
+	}
+	mode.Store(1)
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("second-streak 404 Load: %v", err)
+	}
+	if got := h.count(runtimeConfigMissingLogMsg); got != 2 {
+		t.Fatalf("missing-endpoint line logged %d times after a 304 reset and a fresh 404, want 2 -- a 304 must clear the latch just like a 200", got)
 	}
 }
