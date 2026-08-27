@@ -439,12 +439,21 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	// would be abandoned mid-protocol -- and on ReverseProxy's non-Hijacker
 	// path the upstream 101's body, i.e. the raw child connection, is never
 	// closed, leaking it until the child or the OS gives up. Not offering the
-	// switch means no child ever gets into that state. It does NOT replace
-	// deadlineWriter.Hijack's refusal: a 101 no client asked for still reaches
-	// handleUpgradeResponse, and one whose Upgrade token is absent matches the
-	// (now empty) requested type, so the refusal is what stops the hijack
-	// there. Also the same posture as the streaming path, which strips both
-	// headers via hopByHopHeaders.
+	// switch means no child ever gets into that state. Also the same posture
+	// as the streaming path, which strips both headers via hopByHopHeaders.
+	//
+	// With this in place ReverseProxy can no longer reach a hijack through its
+	// 101 path at all, and the two halves of the fix should not be mistaken
+	// for each other: a 101 whose body the Transport will hand over as a raw
+	// connection ALWAYS carries a non-empty Upgrade token (net/http's
+	// isProtocolSwitchHeader), which can no longer match the now-empty
+	// requested type, so handleUpgradeResponse exits through ErrorHandler; a
+	// 101 without that token exits one branch earlier, on the non-writable
+	// body, exactly as it already did before either fix (verified out of
+	// tree). deadlineWriter.Hijack's refusal is kept because it is a property
+	// of the WRAPPER rather than of this one call site: it holds for any
+	// future router path, and it means this Del pair is not the only thing
+	// standing between a promoted http.Hijacker and a pinned release().
 	outReq.Header.Del("Connection")
 	outReq.Header.Del("Upgrade")
 	// I5: wrap w so a downstream client that stops reading cannot pin

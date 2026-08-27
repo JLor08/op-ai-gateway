@@ -1229,6 +1229,13 @@ func upgradingUpstream(t *testing.T) *httptest.Server {
 // What must happen instead: the upgrade is not offered to the child at all,
 // any 101 that still arrives falls into ErrorHandler, the client gets the
 // pre-batch 502, and release() runs promptly and exactly once.
+//
+// This test asserts that OUTCOME; it does not isolate which half of the fix
+// produced it. Measured in a variant tree: with only servePlainProxy's
+// Connection/Upgrade strip and no deadlineWriter.Hijack, this test passes and
+// TestDeadlineWriterRefusesHijack still fails. The refusal is therefore pinned
+// by that test -- the wrapper's own property, independent of any call site --
+// and this one covers the router's behavior end to end.
 func TestRouterPlainProxyDoesNotHijackAnUpgradeResponse(t *testing.T) {
 	upstream := upgradingUpstream(t)
 	cm := &countingManager{inner: fixedEndpointManager{endpoint: upstream.URL}}
