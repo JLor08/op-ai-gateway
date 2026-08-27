@@ -508,6 +508,24 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("absent spec: ok=%v err=%v", ok, err)
 		}
 
+		// The empty case of the list read, asserted for NILNESS and not only
+		// for length -- the assertion RuntimeSpecGPUs, CoResidencyRules and
+		// GPUBudgets each already carry, and the one this method was missing.
+		// The RuntimeStore contract says "Always non-nil, empty when none"
+		// (store.go), and both backends reach it differently: the SQL store
+		// via `make(..., 0)` before the row loop, MemoryStore via `make` plus
+		// a filtering loop. Either is one edit from a bare `var out []T`,
+		// which still passes every length-only assertion while marshalling as
+		// JSON `null` instead of `[]` in the agent-facing config payload.
+		// Both an application with no specs yet and an application id that
+		// does not exist at all must answer the same way.
+		if specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt2"); err != nil || specs == nil || len(specs) != 0 {
+			t.Fatalf("specs for an application with no specs yet must be non-nil and empty: err=%v specs=%#v", err, specs)
+		}
+		if specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt2_missing"); err != nil || specs == nil || len(specs) != 0 {
+			t.Fatalf("specs for an unknown application must be non-nil and empty: err=%v specs=%#v", err, specs)
+		}
+
 		spec := routing.RuntimeSpec{
 			ID: "rspec_rt2", MappingID: "map_rt2", Enabled: true,
 			Binary: "/usr/bin/llama-server", Args: `["--port","${PORT}"]`,
