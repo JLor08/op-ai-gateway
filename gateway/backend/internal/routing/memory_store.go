@@ -362,11 +362,27 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 	if _, ok := m.servers[id]; !ok {
 		return storeerr.ErrNotFound
 	}
+	// Every table with a `server_id ... references ai_servers(id) on delete
+	// cascade` FK must lose its rows here, plus everything that cascades
+	// TRANSITIVELY through applications and model_mappings — see
+	// deleteApplicationLocked / deleteMappingLocked below, which own the
+	// transitive half so DeleteApplication and DeleteMapping get the same
+	// cascade. The SQL FK graph (grep `references ai_servers(id)` in
+	// store/migrate.go) is the checklist; a per-server map missing from this
+	// method leaks a dangling row that no SQL driver ever returns, which the
+	// memory-mode dev/e2e driver then serves as if the server still existed.
 	m.deleteApplicationsForServerLocked(id)
 	delete(m.servers, id)
-	delete(m.owners, id)
-	delete(m.agentTokens, id)
-	delete(m.serverAdminGroups, id)
+	delete(m.owners, id)                  // server_owners
+	delete(m.agentTokens, id)             // agent_tokens (keyed by ServerID)
+	delete(m.serverAdminGroups, id)       // server_admin_groups
+	delete(m.telemetry, id)               // server_telemetry
+	delete(m.hardware, id)                // server_hardware
+	delete(m.samples, id)                 // server_telemetry_samples
+	delete(m.availSamples, id)            // server_availability_samples
+	delete(m.gpuBudgets, id)              // ai_server_gpu_budgets
+	delete(m.runtimeReports, id)          // server_runtime_reports
+	m.deleteAffinitiesForServerLocked(id) // route_affinity.server_id
 	// resourceGroupServers is keyed resourceGroupID -> serverID (the REVERSE
 	// direction from serverAdminGroups' serverID -> groupID), so cascading a
 	// server delete needs to drop id from EVERY resource group's server set —
@@ -382,6 +398,19 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 		}
 	}
 	return nil
+}
+
+// deleteAffinitiesForServerLocked drops every route_affinity row pinned to
+// serverID. affinities is keyed by AffinityKey (api token + model + flavor +
+// session), not by server, so the cascade is a scan over the values — the
+// same shape as the certificates loop above. Callers must hold m.mu for
+// writing.
+func (m *MemoryStore) deleteAffinitiesForServerLocked(serverID string) {
+	for key, aff := range m.affinities {
+		if aff.ServerID == serverID {
+			delete(m.affinities, key)
+		}
+	}
 }
 
 func (m *MemoryStore) SetServerOwners(_ context.Context, serverID string, userIDs []string) error {
@@ -831,28 +860,78 @@ func (m *MemoryStore) DeleteApplication(_ context.Context, id string) error {
 	if _, ok := m.applications[id]; !ok {
 		return storeerr.ErrNotFound
 	}
-	m.deleteMappingsForApplicationLocked(id)
-	delete(m.applications, id)
+	m.deleteApplicationLocked(id)
 	return nil
 }
 
 // deleteApplicationsForServerLocked removes every application owned by
-// serverID (and their mappings). Callers must hold m.mu for writing.
+// serverID, with the full cascade. Callers must hold m.mu for writing.
 func (m *MemoryStore) deleteApplicationsForServerLocked(serverID string) {
 	for id, app := range m.applications {
 		if app.ServerID == serverID {
-			m.deleteMappingsForApplicationLocked(id)
-			delete(m.applications, id)
+			m.deleteApplicationLocked(id)
+		}
+	}
+}
+
+// deleteApplicationLocked removes one application plus everything the SQL FK
+// graph cascades from `applications`: its mappings (and, through
+// deleteMappingLocked, everything under them), its co-residency matrix
+// (agent_coresidency_rules.application_id) and its route affinities
+// (route_affinity.application_id). Callers must hold m.mu for writing.
+//
+// Sharing this between DeleteApplication and the server-delete path is what
+// keeps the two cascades identical; before it existed both stopped at
+// `mappings` and left the rest of the per-application state dangling.
+func (m *MemoryStore) deleteApplicationLocked(applicationID string) {
+	m.deleteMappingsForApplicationLocked(applicationID)
+	delete(m.applications, applicationID)
+	delete(m.coresidency, applicationID)
+	for key, aff := range m.affinities {
+		if aff.ApplicationID == applicationID {
+			delete(m.affinities, key)
 		}
 	}
 }
 
 // deleteMappingsForApplicationLocked removes every mapping owned by
-// applicationID. Callers must hold m.mu for writing.
+// applicationID, with the full cascade. Callers must hold m.mu for writing.
 func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 	for id, mapping := range m.mappings {
 		if mapping.ApplicationID == applicationID {
-			delete(m.mappings, id)
+			m.deleteMappingLocked(id)
+		}
+	}
+}
+
+// deleteMappingLocked removes one mapping plus everything the SQL FK graph
+// cascades from `model_mappings`: its benchmark runs
+// (model_mapping_benchmarks.mapping_id), its runtime spec
+// (agent_runtime_specs.mapping_id) and that spec's per-GPU rows
+// (agent_runtime_spec_gpus.spec_id, a second hop), and any co-residency pair
+// naming it on EITHER side (agent_coresidency_rules.mapping_a_id /
+// mapping_b_id — a partial removal from the owning application's set, unlike
+// the whole-set delete in deleteApplicationLocked). Callers must hold m.mu
+// for writing.
+func (m *MemoryStore) deleteMappingLocked(mappingID string) {
+	delete(m.mappings, mappingID)
+	delete(m.benchmarks, mappingID)
+	for specID, spec := range m.runtimeSpecs {
+		if spec.MappingID == mappingID {
+			delete(m.runtimeSpecs, specID)
+			delete(m.runtimeSpecGPUs, specID)
+		}
+	}
+	for appID, rules := range m.coresidency {
+		kept := make([]CoResidencyRule, 0, len(rules))
+		for _, r := range rules {
+			if r.MappingAID == mappingID || r.MappingBID == mappingID {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if len(kept) != len(rules) {
+			m.coresidency[appID] = kept
 		}
 	}
 }
@@ -1100,7 +1179,7 @@ func (m *MemoryStore) DeleteMapping(_ context.Context, id string) error {
 	if _, ok := m.mappings[id]; !ok {
 		return storeerr.ErrNotFound
 	}
-	delete(m.mappings, id)
+	m.deleteMappingLocked(id)
 	return nil
 }
 
