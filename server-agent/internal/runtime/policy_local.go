@@ -660,19 +660,91 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //
 // Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
 // still passes through untouched; this function owns only these four tokens.
+// Provenance is recorded, not reconstructed. expandSpec below returns, beside
+// the argv and environment the child actually receives, the exact byte spans
+// of each result string that came from an ${AGENT_ENV:NAME} substitution --
+// which is the one thing only this function can know, because it is the code
+// that performed the substitution. command.go turns that into the masked,
+// reportable ResolvedCommand; see its doc for why span-level provenance is
+// the only honest basis for masking a resolved command.
 func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, getenv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ex.args, ex.env, nil
+}
+
+// secretSpan is one byte range inside ONE expanded string that came from an
+// ${AGENT_ENV:NAME} substitution, together with the variable name that
+// supplied it.
+//
+// It exists so that masking can be a statement about PROVENANCE rather than
+// about content. The alternative -- searching a resolved string for the
+// secret's value -- is not merely less precise, it is actively wrong: a
+// one-character secret would mask every occurrence of that character in
+// "--port 54331", and a secret that happens to equal a substring of a
+// legitimate value would silently swallow it. Recording the span at the moment
+// of substitution is exact by construction and costs one integer pair.
+//
+// Offsets are into the EXPANDED string, and for an env entry they are into the
+// final "KEY=value" form (expandSpec shifts them by len(key)+1), so a consumer
+// never needs to know how the string was assembled.
+type secretSpan struct {
+	start int
+	end   int
+	name  string
+}
+
+// expandedSpec is expandSpec's full result: what the child receives, plus the
+// provenance a reportable view of it needs.
+//
+// argSpans/envSpans are index-aligned with args/env (one entry per string,
+// possibly nil). envFromSpec is index-aligned with env and marks the entries
+// whose VALUE came from spec.Env, as opposed to the agent-provided base block
+// (baseEnvNames) and the agent-computed GPU visibility variable. That
+// distinction is not cosmetic: it is exactly the line the upward report draws
+// when it masks env values, and ResolvedCommand reuses it rather than
+// inventing a second, drifting rule.
+type expandedSpec struct {
+	args        []string
+	env         []string
+	argSpans    [][]secretSpan
+	envSpans    [][]secretSpan
+	envFromSpec []bool
+}
+
+// expandSpec is ExpandPlaceholders' worker. Everything in ExpandPlaceholders'
+// doc comment describes this function; the exported wrapper exists only
+// because most callers want nothing but the argv and environment.
+//
+// The single pass over the ORIGINAL text, and the classification order inside
+// it, are unchanged from the version that used ReplaceAllStringFunc -- both
+// properties are load-bearing fixes from prior rounds (see the doc comment).
+// The rewrite to an index walk is what makes the substitution's byte offsets
+// observable; it changes no classification and no error. A failing match
+// returns immediately rather than setting a first-error and walking on, which
+// yields the identical error because the walk was, and is, left to right.
+func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
 
-	expand := func(s string) (string, error) {
-		var firstErr error
-		result := placeholderPattern.ReplaceAllStringFunc(s, func(match string) string {
-			if firstErr != nil {
-				return match
-			}
+	expand := func(s string) (string, []secretSpan, error) {
+		matches := placeholderPattern.FindAllStringIndex(s, -1)
+		if len(matches) == 0 {
+			return s, nil, nil
+		}
+		var b strings.Builder
+		var spans []secretSpan
+		copied := 0
+		for _, m := range matches {
+			b.WriteString(s[copied:m[0]])
+			copied = m[1]
+			match := s[m[0]:m[1]]
 			inner := match[2 : len(match)-1] // strip "${" and "}"
 
 			if inner == "PORT" {
-				return strconv.Itoa(port)
+				b.WriteString(strconv.Itoa(port))
+				continue
 			}
 
 			// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
@@ -680,20 +752,20 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 			// deliberately does not extend here.
 			if inner == "MODEL" {
 				if spec.UpstreamModel == "" {
-					firstErr = fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
-					return match
+					return "", nil, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
 				}
-				return spec.UpstreamModel
+				b.WriteString(spec.UpstreamModel)
+				continue
 			}
 
 			// EXACT match only, same reasoning as ${MODEL} above. HOST, not
 			// child, indices -- the name says so because the digits do not.
 			if inner == "HOST_GPU_IDS" {
 				if gpuIDs == "" {
-					firstErr = fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
-					return match
+					return "", nil, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
 				}
-				return gpuIDs
+				b.WriteString(gpuIDs)
+				continue
 			}
 
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
@@ -721,15 +793,18 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 				// already upper-cases before comparing -- the asymmetry was
 				// visible inside this one function.
 				if strings.HasPrefix(strings.ToUpper(name), agentOwnEnvPrefix) {
-					firstErr = fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
-					return match
+					return "", nil, fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
 				}
 				val := getenv(name)
 				if val == "" {
-					firstErr = fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
-					return match
+					return "", nil, fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
 				}
-				return val
+				// The ONE place a secret enters a resolved string, and
+				// therefore the one place its extent can be recorded exactly.
+				start := b.Len()
+				b.WriteString(val)
+				spans = append(spans, secretSpan{start: start, end: b.Len(), name: name})
+				continue
 			}
 
 			// Not a valid ${PORT} or ${AGENT_ENV:NAME}. Near-miss iff the
@@ -741,24 +816,23 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 			// must be a prefix match, not Contains.
 			upper := strings.ToUpper(inner)
 			if strings.HasPrefix(upper, "PORT") || strings.HasPrefix(upper, "AGENT_ENV") {
-				firstErr = fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", match)
-				return match
+				return "", nil, fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", match)
 			}
-			return match
-		})
-		if firstErr != nil {
-			return "", firstErr
+			b.WriteString(match)
 		}
-		return result, nil
+		b.WriteString(s[copied:])
+		return b.String(), spans, nil
 	}
 
 	expandedArgs := make([]string, len(spec.Args))
+	argSpans := make([][]secretSpan, len(spec.Args))
 	for i, a := range spec.Args {
-		v, expandErr := expand(a)
+		v, spans, expandErr := expand(a)
 		if expandErr != nil {
-			return nil, nil, fmt.Errorf("runtime: expand arg %d: %w", i, expandErr)
+			return expandedSpec{}, fmt.Errorf("runtime: expand arg %d: %w", i, expandErr)
 		}
 		expandedArgs[i] = v
+		argSpans[i] = spans
 	}
 
 	envKeys := make([]string, 0, len(spec.Env))
@@ -790,7 +864,7 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 		// the class this reservation exists to close, and an unfolded
 		// comparison against "SYSTEMROOT" would wave it through.
 		if slices.Contains(baseEnvNames, strings.ToUpper(k)) {
-			return nil, nil, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
+			return expandedSpec{}, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
 		}
 	}
 
@@ -802,11 +876,11 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 	if spec.SetVisibleDevices {
 		for _, k := range envKeys {
 			if slices.Contains(visibleDevicesOwnedVars, strings.ToUpper(k)) {
-				return nil, nil, fmt.Errorf("runtime: spec env %q conflicts with set_visible_devices: this spec both asks the agent to set the gpu visibility variable and sets one by hand, and the two cannot be resolved into a single unambiguous answer -- turn set_visible_devices off, or remove the env entry", k)
+				return expandedSpec{}, fmt.Errorf("runtime: spec env %q conflicts with set_visible_devices: this spec both asks the agent to set the gpu visibility variable and sets one by hand, and the two cannot be resolved into a single unambiguous answer -- turn set_visible_devices off, or remove the env entry", k)
 			}
 		}
 		if gpuIDs == "" {
-			return nil, nil, fmt.Errorf("runtime: set_visible_devices is on but this spec declares no gpus: an empty visible-devices value means NO device is visible, not every device, so the child would see no gpu at all -- add the gpu rows this model runs on, or turn set_visible_devices off")
+			return expandedSpec{}, fmt.Errorf("runtime: set_visible_devices is on but this spec declares no gpus: an empty visible-devices value means NO device is visible, not every device, so the child would see no gpu at all -- add the gpu rows this model runs on, or turn set_visible_devices off")
 		}
 	}
 
@@ -815,9 +889,16 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 	// environment (see doc comment above). Which of them exist is what makes
 	// this list correct on both platform families; see baseEnvNames.
 	resultEnv := make([]string, 0, len(envKeys)+len(baseEnvNames)+1)
+	// Index-aligned with resultEnv throughout: every append below appends to
+	// all three, so a later reader can never be off by one between a value
+	// and its provenance.
+	resultSpans := make([][]secretSpan, 0, cap(resultEnv))
+	fromSpec := make([]bool, 0, cap(resultEnv))
 	for _, name := range baseEnvNames {
 		if v := getenv(name); v != "" {
 			resultEnv = append(resultEnv, name+"="+v)
+			resultSpans = append(resultSpans, nil)
+			fromSpec = append(fromSpec, false)
 		}
 	}
 	// The agent-owned visibility variable joins the agent-provided base block,
@@ -830,15 +911,33 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 	if spec.SetVisibleDevices {
 		if name := VisibleDevicesVar(vendor); name != "" {
 			resultEnv = append(resultEnv, name+"="+gpuIDs)
+			resultSpans = append(resultSpans, nil)
+			fromSpec = append(fromSpec, false)
 		}
 	}
 	for _, k := range envKeys {
-		v, expandErr := expand(spec.Env[k])
+		v, spans, expandErr := expand(spec.Env[k])
 		if expandErr != nil {
-			return nil, nil, fmt.Errorf("runtime: expand env %s: %w", k, expandErr)
+			return expandedSpec{}, fmt.Errorf("runtime: expand env %s: %w", k, expandErr)
+		}
+		// Shift into the final "KEY=value" form so every offset in
+		// expandedSpec means the same thing: a range of the string as it
+		// appears in env.
+		shift := len(k) + 1
+		for i := range spans {
+			spans[i].start += shift
+			spans[i].end += shift
 		}
 		resultEnv = append(resultEnv, k+"="+v)
+		resultSpans = append(resultSpans, spans)
+		fromSpec = append(fromSpec, true)
 	}
 
-	return expandedArgs, resultEnv, nil
+	return expandedSpec{
+		args:        expandedArgs,
+		env:         resultEnv,
+		argSpans:    argSpans,
+		envSpans:    resultSpans,
+		envFromSpec: fromSpec,
+	}, nil
 }

@@ -168,6 +168,14 @@ func main() {
 		// the gateway can never raise it. Zero means the documented default.
 		LogBufferBytes:      cfg.RuntimeLogBufferBytes,
 		LogBufferTotalBytes: cfg.RuntimeLogBufferTotalBytes,
+		// Whose document the launch specs are, which decides one thing only:
+		// whether the resolved launch command the log stream reports masks the
+		// spec's env VALUES. In file mode they are the operator's own and the
+		// upward report already withholds them from the gateway, so the
+		// reported command withholds them too. The same source that selects
+		// the Source below selects this, read here rather than derived from
+		// the Source object so the two can never disagree.
+		SpecsFromLocalFile: cfg.RuntimeSource == config.RuntimeSourceFile,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()

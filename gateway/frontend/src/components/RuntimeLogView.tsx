@@ -6,13 +6,14 @@ import {
   Alert,
   Box,
   Button,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
   Typography,
 } from '@mui/material';
-import type { RuntimeLogBatch, RuntimeLogEntry, RuntimeLogState } from '../api';
+import type { RuntimeLogBatch, RuntimeLogCommand, RuntimeLogEntry, RuntimeLogState } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 
 /**
@@ -39,6 +40,20 @@ import type { PortalApi, Translation } from './shared/types';
  *     appears, and this component's own display cap produces the same kind of
  *     marker when it trims. A gap shown as silence would be a lie about what
  *     the process printed.
+ *
+ * Inside the output, attached to each generation's start marker, sits the
+ * **resolved command** the agent actually executed -- see `InlineCommand`. It
+ * answers the question the output alone cannot: the operator wrote a template,
+ * and `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and `${AGENT_ENV:NAME}` were all
+ * resolved at launch, so the gap between what they typed and what ran is exactly
+ * where the bug tends to be.
+ *
+ * It lives WITH the marker rather than in a panel of its own, and that is the
+ * fourth rule about not lying to the reader: a panel would have to claim which
+ * generation it describes, while the marker already IS that generation's
+ * boundary and carries its pid. In a crash loop the operator then reads each
+ * attempt's own command beside its own output -- including that `${PORT}`
+ * differed between attempts, which a single "latest command" view cannot show.
  */
 
 /**
@@ -49,7 +64,10 @@ import type { PortalApi, Translation } from './shared/types';
  */
 const maxRenderedEntries = 4000;
 
-/** One rendered line: process output, a boundary marker, or a gap notice. */
+/**
+ * One rendered line: process output, or a boundary marker together with the
+ * resolved command it carries, or a gap notice.
+ */
 function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation }>) {
   const gap =
     entry.dropped_bytes && entry.dropped_bytes > 0 ? (
@@ -61,19 +79,29 @@ function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation
   // A boundary between two runs of the same spec. The wording is OURS: the
   // backend allow-lists the event kind to a closed set precisely so that what
   // an operator reads as a portal statement cannot be text an agent chose.
-  if (entry.event === 'started' || entry.event === 'exited') {
-    const label =
-      entry.event === 'started'
-        ? t.runtimeLogsProcessStarted(entry.pid ?? 0)
-        : t.runtimeLogsProcessExited(entry.exit_code ?? 0);
+  if (entry.event === 'started' || entry.event === 'exited' || entry.event === 'start_failed') {
+    let label: string;
+    if (entry.event === 'started') label = t.runtimeLogsProcessStarted(entry.pid ?? 0);
+    else if (entry.event === 'exited') label = t.runtimeLogsProcessExited(entry.exit_code ?? 0);
+    // No pid, and there never will be one: the exec itself failed.
+    else label = t.runtimeLogsProcessStartFailed;
     return (
       <>
         {gap}
-        <Box
-          component="span"
-          sx={{ color: 'text.secondary', fontStyle: 'italic', display: 'block', my: 0.5 }}
-        >
-          {`── ${label} ──`}
+        <Box sx={{ my: 0.5 }}>
+          <Box
+            component="span"
+            sx={{ color: 'text.secondary', fontStyle: 'italic', display: 'block' }}
+          >
+            {`── ${label} ──`}
+          </Box>
+          {entry.command && (
+            <InlineCommand
+              command={entry.command}
+              startFailed={entry.event === 'start_failed'}
+              t={t}
+            />
+          )}
         </Box>
       </>
     );
@@ -84,6 +112,162 @@ function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation
       {entry.text}
     </>
   );
+}
+
+/**
+ * One labelled block of the resolved command, rendered as monospace lines.
+ *
+ * `lines` is always a list, even for the single-valued fields, because that is
+ * what makes an argument list readable: one argument per line, never joined
+ * with spaces. Joining would be actively misleading here -- `--system-prompt`
+ * followed by a sentence containing spaces is ONE argument, and a
+ * space-separated rendering of it is a different command from the one that ran.
+ * It is also the same shape the spec editor demands on input (one per line), so
+ * the operator reads back what they wrote.
+ */
+function CommandField({
+  label,
+  lines,
+  empty,
+}: Readonly<{ label: string; lines: readonly string[]; empty?: string }>) {
+  return (
+    <Box sx={{ mb: 1 }}>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+        {label}
+      </Typography>
+      {lines.length === 0 && empty !== undefined ? (
+        <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
+          {empty}
+        </Typography>
+      ) : (
+        <Box
+          sx={{
+            fontFamily: 'monospace',
+            fontSize: '0.8rem',
+            whiteSpace: 'pre',
+            // Long paths and long arguments scroll inside their own block
+            // rather than widening the dialog.
+            overflowX: 'auto',
+          }}
+        >
+          {lines.map((line, i) => (
+            // Append-only, never reordered, and replaced wholesale when a new
+            // command arrives -- the index is a legitimate key.
+            <Box component="div" key={i}>
+              {line}
+            </Box>
+          ))}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+/**
+ * The resolved command of ONE generation, rendered inside that generation's
+ * start-marker block.
+ *
+ * **Collapsed by default, and that is load-bearing rather than tidiness.** A
+ * real command is thirty-odd lines once one-argument-per-line is respected, and
+ * in a crash loop there is one per attempt -- rendered flat they would bury the
+ * output, which is the very thing this view exists to show. The one exception
+ * earns itself: a `start_failed` generation produced NO output at all, so its
+ * command is the entire content there is and it opens expanded.
+ *
+ * Three further rules it must not break, each a way of lying to the operator:
+ *
+ *  1. **Masked values are unmistakable.** A value resolved from
+ *     `${AGENT_ENV:NAME}` is shown as that placeholder, not as bullets and
+ *     never as the value: it cannot be mistaken for real text, and it names the
+ *     variable the operator needs to check on the host. When anything is
+ *     masked, the block says so in words too.
+ *  2. **A truncated list says it is truncated**, on the same reasoning as
+ *     `dropped_bytes` in the output.
+ *  3. **There is no copy button, deliberately.** Even fully unmasked this is
+ *     not a runnable command line: `env` REPLACES the environment rather than
+ *     adding to it, the port was ephemeral and is stale by now, and a
+ *     `set_visible_devices` child renumbers its GPUs from zero. A copy button
+ *     would promise reproduction and hand over a broken paste. The text is
+ *     plain and selectable instead, which promises nothing.
+ */
+function InlineCommand({
+  command,
+  startFailed,
+  t,
+}: Readonly<{ command: RuntimeLogCommand; startFailed: boolean; t: Translation }>) {
+  const [open, setOpen] = useState(startFailed);
+  return (
+    <Box sx={{ ml: 2, mb: 0.5 }}>
+      <Button
+        size="small"
+        onClick={() => setOpen((v) => !v)}
+        sx={{ textTransform: 'none', minWidth: 0, p: 0, fontSize: '0.75rem' }}
+      >
+        {`${open ? '▾' : '▸'} ${t.runtimeCommandTitle}`}
+      </Button>
+      <Collapse in={open} timeout={0} unmountOnExit>
+        <Box sx={{ mt: 0.5 }}>
+          {startFailed && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {t.runtimeCommandStartFailedHint}
+            </Alert>
+          )}
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            {t.runtimeCommandIntro}
+          </Typography>
+          {command.masked && (
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {t.runtimeCommandMasked}
+            </Alert>
+          )}
+          {command.truncated && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {t.runtimeCommandTruncated}
+            </Alert>
+          )}
+          <CommandField
+            label={t.runtimeCommandBinary}
+            lines={command.binary ? [command.binary] : []}
+            empty={t.runtimeCommandUnknown}
+          />
+          <CommandField
+            label={t.runtimeCommandArgs}
+            lines={command.args ?? []}
+            empty={t.runtimeCommandArgsNone}
+          />
+          <CommandField
+            label={t.runtimeCommandWorkDir}
+            lines={command.work_dir ? [command.work_dir] : []}
+            empty={t.runtimeCommandWorkDirInherited}
+          />
+          <CommandField
+            label={t.runtimeCommandEnv}
+            lines={command.env ?? []}
+            empty={t.runtimeCommandEnvNone}
+          />
+        </Box>
+      </Collapse>
+    </Box>
+  );
+}
+
+/**
+ * Whether the visible history begins with OUTPUT rather than with a generation's
+ * opening marker -- which means that generation's marker, and with it the only
+ * copy of its resolved command, has been evicted from the agent's bounded
+ * buffer (or trimmed by this view's own display cap).
+ *
+ * It has to be stated rather than left blank, for the same reason
+ * `dropped_bytes` does: missing information must never read as "there was
+ * none". An operator who sees no command anywhere would otherwise conclude the
+ * agent does not report one.
+ */
+function opensWithoutACommand(entries: readonly RuntimeLogEntry[]): boolean {
+  const firstOpening = entries.findIndex(
+    (e) => e.event === 'started' || e.event === 'start_failed',
+  );
+  const firstOutput = entries.findIndex((e) => (e.text ?? '') !== '');
+  return firstOutput >= 0 && (firstOpening < 0 || firstOpening > firstOutput);
 }
 
 export function RuntimeLogView({
@@ -162,6 +346,7 @@ export function RuntimeLogView({
   }, [entries]);
 
   const hasOutput = entries.length > 0;
+  const commandGap = opensWithoutACommand(entries);
   const notice = (() => {
     if (connectionError) return { severity: 'warning' as const, text: t.runtimeLogsDisconnected };
     if (state === 'offline') return { severity: 'warning' as const, text: t.runtimeLogsOffline };
@@ -191,6 +376,11 @@ export function RuntimeLogView({
         {trimmedBytes > 0 && (
           <Alert severity="warning" sx={{ mb: 1 }}>
             {t.runtimeLogsTrimmed(trimmedBytes)}
+          </Alert>
+        )}
+        {commandGap && (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            {t.runtimeCommandNotRetained}
           </Alert>
         )}
         <Box

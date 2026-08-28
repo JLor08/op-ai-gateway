@@ -84,10 +84,10 @@ func TestDrainLogFramesMarshalsOneFramePerSpec(t *testing.T) {
 	}
 
 	a := d.logs.newProc("spec-a")
-	a.Started(1)
+	a.Started(1, ResolvedCommand{})
 	a.Write([]byte("from a\n"))
 	b := d.logs.newProc("spec-b")
-	b.Started(2)
+	b.Started(2, ResolvedCommand{})
 	b.Write([]byte("from b\n"))
 
 	d.SetLogWatch(json.RawMessage(`{"spec_ids":["spec-a","spec-b"]}`))
@@ -125,5 +125,45 @@ func TestLogSurfaceIsANoOpWithoutARealManager(t *testing.T) {
 	d.SetLogWatch(json.RawMessage(`{"spec_ids":["spec-a"]}`))
 	if got := d.DrainLogFrames(); got != nil {
 		t.Fatalf("DrainLogFrames on a manager-less driver = %v, want nil", got)
+	}
+}
+
+// TestDrainLogFramesCarriesTheResolvedCommandOnTheWire asserts the agent->gateway
+// wire contract on the MARSHALLED bytes, naming no new field at all.
+//
+// That is deliberate. Every other test of this feature reads the Go struct, so
+// all of them would keep passing if the command were retained but never
+// serialized -- an `omitempty` on the wrong field, a batch built without it, a
+// frame assembled from a different value. Only the bytes the WebSocket writer
+// actually hands over can catch that, and a version of this agent without the
+// field produces exactly the frame this test rejects.
+func TestDrainLogFramesCarriesTheResolvedCommandOnTheWire(t *testing.T) {
+	d := newLogDriver(t)
+
+	p := d.logs.newProc("spec-a")
+	p.Started(4711, ResolvedCommand{
+		Binary: "/opt/llama/llama-server",
+		Args:   []string{"--port", "54331"},
+		Env:    []string{"CUDA_VISIBLE_DEVICES=2,3"},
+	})
+	p.Write([]byte("loading weights\n"))
+
+	d.SetLogWatch(json.RawMessage(`{"spec_ids":["spec-a"]}`))
+	frames := d.DrainLogFrames()
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1", len(frames))
+	}
+	raw := string(frames[0])
+	for _, want := range []string{
+		`"event":"started"`,
+		`"pid":4711`,
+		`"command"`,
+		`"binary":"/opt/llama/llama-server"`,
+		`"54331"`,
+		`"CUDA_VISIBLE_DEVICES=2,3"`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("the frame handed to the WebSocket writer does not contain %s -- the resolved command never reaches the gateway.\nframe: %s", want, raw)
+		}
 	}
 }

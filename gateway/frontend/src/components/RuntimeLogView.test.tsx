@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { RuntimeLogView } from './RuntimeLogView';
 import { messages } from '../i18n';
 import type { RuntimeLogBatch, RuntimeLogState } from '../api';
@@ -169,5 +169,194 @@ describe('RuntimeLogView', () => {
     h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'output\n' }] });
     expect(screen.queryByText(t.runtimeLogsEmptyBuffer)).not.toBeInTheDocument();
     expect(screen.queryByText(t.runtimeLogsWaiting)).not.toBeInTheDocument();
+  });
+  // --- the resolved command, inline with its generation's marker -----------
+
+  it("shows the command the agent executed, attached to that generation's start marker", () => {
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'started',
+          pid: 4711,
+          command: {
+            binary: '/opt/llama/llama-server',
+            args: ['--port', '54331', '--ctx-size', '262144'],
+            work_dir: '/srv/models',
+            env: ['PATH=/usr/bin', 'CUDA_VISIBLE_DEVICES=2,3'],
+          },
+        },
+        { text: 'loading weights\n' },
+      ],
+    });
+
+    // The marker and the command live in the same block, inside the log body:
+    // the operator reads them where they are already looking, and no rule is
+    // needed to say which generation the command belongs to.
+    const log = screen.getByRole('log');
+    expect(log).toHaveTextContent(t.runtimeLogsProcessStarted(4711));
+    expect(log).toHaveTextContent(t.runtimeCommandTitle);
+
+    // Collapsed by default: a real command is thirty-odd lines, and burying the
+    // output would defeat the view.
+    expect(screen.queryByText('54331')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText('54331')).toBeInTheDocument();
+    expect(screen.getByText('--ctx-size')).toBeInTheDocument();
+    expect(screen.getByText('/srv/models')).toBeInTheDocument();
+    expect(screen.getByText('CUDA_VISIBLE_DEVICES=2,3')).toBeInTheDocument();
+    // Nothing was masked, so the block must not claim anything was.
+    expect(screen.queryByText(t.runtimeCommandMasked)).not.toBeInTheDocument();
+  });
+
+  it('gives every generation in a crash loop its own command, not just the latest', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    // Three attempts, each with its own resolved ${PORT}. A single "latest
+    // command" view could not show that they differed -- which is exactly the
+    // kind of thing an operator is hunting for.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        { event: 'started', pid: 101, command: { binary: '/opt/a', args: ['--port', '40001'] } },
+        { text: 'attempt one\n' },
+        { event: 'exited', exit_code: 1 },
+        { event: 'started', pid: 202, command: { binary: '/opt/a', args: ['--port', '40002'] } },
+        { text: 'attempt two\n' },
+        { event: 'exited', exit_code: 1 },
+        { event: 'started', pid: 303, command: { binary: '/opt/a', args: ['--port', '40003'] } },
+      ],
+    });
+
+    const log = screen.getByRole('log');
+    expect(log).toHaveTextContent(t.runtimeLogsProcessStarted(101));
+    expect(log).toHaveTextContent(t.runtimeLogsProcessStarted(303));
+
+    const toggles = screen.getAllByRole('button', { name: `▸ ${t.runtimeCommandTitle}` });
+    expect(toggles).toHaveLength(3);
+    // Each one expands its OWN generation's command.
+    toggles.forEach((toggle) => fireEvent.click(toggle));
+    expect(screen.getByText('40001')).toBeInTheDocument();
+    expect(screen.getByText('40002')).toBeInTheDocument();
+    expect(screen.getByText('40003')).toBeInTheDocument();
+  });
+
+  it('renders a masked value as its own placeholder, says so in words, and offers no copy button', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'started',
+          pid: 4711,
+          command: {
+            binary: '/opt/vllm/vllm',
+            args: ['--api-key', '${AGENT_ENV:HF_TOKEN}', '--port', '54331'],
+            env: ['HF_TOKEN=${AGENT_ENV:HF_TOKEN}'],
+            masked: true,
+          },
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+
+    // The mask IS the placeholder: unmistakably not a value, and it names the
+    // variable the operator needs to check on the host.
+    expect(screen.getByText('${AGENT_ENV:HF_TOKEN}')).toBeInTheDocument();
+    expect(screen.getByText('HF_TOKEN=${AGENT_ENV:HF_TOKEN}')).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCommandMasked)).toBeInTheDocument();
+    // The useful half survives the mask.
+    expect(screen.getByText('54331')).toBeInTheDocument();
+
+    // No copy affordance, deliberately: even unmasked this is not a runnable
+    // command line, so a copy button would promise reproduction and hand over
+    // a broken paste.
+    const buttons = screen.getAllByRole('button').map((b) => b.textContent ?? '');
+    expect(buttons.some((label) => /kopier|copy/i.test(label))).toBe(false);
+  });
+
+  it('opens expanded for a generation that never started, because then the command is all there is', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'start_failed',
+          command: { binary: '/opt/not-installed', args: ['--port', '54331'] },
+        },
+      ],
+    });
+
+    // Its own marker kind, with no pid: a pid-0 "started" would claim output
+    // begins here.
+    expect(screen.getByRole('log')).toHaveTextContent(t.runtimeLogsProcessStartFailed);
+    // Expanded without being asked: there is no output to bury, and nothing
+    // else to look at.
+    expect(screen.getByText(t.runtimeCommandStartFailedHint)).toBeInTheDocument();
+    expect(screen.getByText('/opt/not-installed')).toBeInTheDocument();
+  });
+
+  it('states that a generation is missing its command rather than letting it read as "there was none"', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    // A long-running process whose opening marker has been evicted from the
+    // agent's bounded buffer: output with no marker before it. The accepted cost
+    // of attaching the command to a record inside the ring -- and it must be
+    // said out loud, exactly like a dropped-bytes gap.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [{ text: '…already running\n', dropped_bytes: 4096 }, { text: 'more output\n' }],
+    });
+    expect(screen.getByText(t.runtimeCommandNotRetained)).toBeInTheDocument();
+
+    // A later generation carries its own command again, and the notice goes.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [{ event: 'started', pid: 9, command: { binary: '/opt/a', args: [] } }],
+    });
+    expect(screen.queryByText(t.runtimeCommandNotRetained)).not.toBeInTheDocument();
+  });
+
+  it('states that arguments or env entries are missing rather than showing a short list as a complete one', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'started',
+          pid: 1,
+          command: { binary: '/opt/a', args: ['--port'], truncated: true },
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText(t.runtimeCommandTruncated)).toBeInTheDocument();
+  });
+
+  it('reports a work_dir the agent did not set as inherited, not as blank', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [{ event: 'started', pid: 1, command: { binary: '/opt/a', args: [], env: [] } }],
+    });
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText(t.runtimeCommandWorkDirInherited)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCommandArgsNone)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCommandEnvNone)).toBeInTheDocument();
   });
 });

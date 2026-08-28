@@ -48,6 +48,16 @@ import (
 //   - Streaming is ON DEMAND. Collection above is unconditional; the live
 //     fan-out below does nothing at all until the gateway names a spec in
 //     SetWatch, so an unwatched fleet produces no log traffic.
+//
+// AND WHAT THIS FILE GAINED SINCE: the RESOLVED LAUNCH COMMAND (command.go).
+// Output alone answers "what did it print", not "what did it print THIS
+// from" -- and every interesting value in a spec (${PORT}, ${MODEL},
+// ${HOST_GPU_IDS}, ${AGENT_ENV:NAME}) is resolved at launch and was, until
+// then, dropped immediately after exec.Command consumed it. The masked command
+// is a typed FIELD ON THE GENERATION'S OPENING MARKER, so it travels with the
+// boundary that already carries the pid and needs no attribution rule of its
+// own -- see ResolvedCommand for why that placement, and what it costs when a
+// marker is evicted.
 
 const (
 	// DefaultLogBufferBytes is the per-spec retention default: 1 MiB.
@@ -122,6 +132,17 @@ const (
 const (
 	logEventStarted = "started"
 	logEventExited  = "exited"
+	// logEventStartFailed opens a generation that never became a process: the
+	// exec itself failed (a missing binary, an unusable work_dir), so there is
+	// no pid, there will be no output, and there is no exit code to come.
+	//
+	// It exists because the resolved command hangs on an OPENING marker, and
+	// this outcome has to have one: a spec that cannot start prints nothing at
+	// all, which makes the command the entire content of the log view and this
+	// exactly the case an operator opens it for. Reusing logEventStarted with
+	// pid 0 was the alternative and it would have been a lie -- that marker
+	// means "output begins here, from this pid".
+	logEventStartFailed = "start_failed"
 )
 
 // logRecord is one retained unit of a spec's output history. Text-carrying
@@ -133,13 +154,20 @@ type logRecord struct {
 	pid      int
 	at       time.Time
 	text     string
-	event    string // "" for process output; logEventStarted/logEventExited
+	event    string // "" for process output; one of the logEvent* constants
 	exitCode int
+	// command is set ONLY on an opening marker (logEventStarted /
+	// logEventStartFailed): the masked launch command of the generation this
+	// marker opens. Attaching it here rather than keeping it per spec is what
+	// makes attribution structural -- see ResolvedCommand's doc.
+	command *ResolvedCommand
 }
 
-// size is the record's weight against a buffer capacity: its text plus a
-// fixed per-record charge (see logRecordOverhead).
-func (r logRecord) size() int { return len(r.text) + logRecordOverhead }
+// size is the record's weight against a buffer capacity: its text, any command
+// it carries, plus a fixed per-record charge (see logRecordOverhead). Charging
+// the command is what keeps the per-spec capacity an honest bound now that a
+// marker is no longer necessarily tiny.
+func (r logRecord) size() int { return len(r.text) + r.command.bytes() + logRecordOverhead }
 
 // LogEntry is the wire shape of one unit of managed-process output, carried
 // inside a runtime_log frame's LogBatch.
@@ -154,13 +182,18 @@ func (r logRecord) size() int { return len(r.text) + logRecordOverhead }
 // only needs the one fact. A gap that renders as silence would be a lie
 // about what the process printed, and silence is exactly what an operator is
 // trying to interpret.
+// Command is present only on an opening marker ("started"/"start_failed") and
+// carries that generation's resolved, masked launch command (command.go). A
+// reader renders it as part of the marker block it belongs to: it describes the
+// process whose output follows, and only that one.
 type LogEntry struct {
-	PID          int       `json:"pid,omitempty"`
-	At           time.Time `json:"at"`
-	Text         string    `json:"text,omitempty"`
-	DroppedBytes int64     `json:"dropped_bytes,omitempty"`
-	Event        string    `json:"event,omitempty"`
-	ExitCode     int       `json:"exit_code,omitempty"`
+	PID          int              `json:"pid,omitempty"`
+	At           time.Time        `json:"at"`
+	Text         string           `json:"text,omitempty"`
+	DroppedBytes int64            `json:"dropped_bytes,omitempty"`
+	Event        string           `json:"event,omitempty"`
+	ExitCode     int              `json:"exit_code,omitempty"`
+	Command      *ResolvedCommand `json:"command,omitempty"`
 }
 
 // LogBatch is the payload of one agent->gateway runtime_log frame: the
@@ -173,6 +206,12 @@ type LogEntry struct {
 // batch is itself the answer to a question the operator would otherwise have
 // to guess at: "the retained buffer is empty" -- which is what an agent
 // restart leaves behind -- as opposed to "nothing has arrived yet".
+//
+// The resolved launch command travels INSIDE the entries, on each generation's
+// opening marker (LogEntry.Command), not as a field here. A batch is a
+// time-slice of one spec's output and can span two generations; a command
+// belongs to exactly one, so a batch-level field would need a rule to say which
+// -- and the marker already answers that question by construction.
 type LogBatch struct {
 	SpecID     string     `json:"spec_id"`
 	Scrollback bool       `json:"scrollback,omitempty"`
@@ -180,10 +219,11 @@ type LogBatch struct {
 }
 
 // specLog is one spec's retained history: a byte-bounded record ring that
-// spans every generation of that spec's process.
+// spans every generation of that spec's process, opening markers and their
+// resolved commands included.
 type specLog struct {
 	recs      []logRecord
-	bytes     int   // sum of every record's size(), i.e. text PLUS overhead
+	bytes     int   // sum of every record's size(), i.e. text and commands PLUS overhead
 	dropped   int64 // text bytes evicted from the front since this log began
 	lastWrite time.Time
 }
@@ -206,7 +246,10 @@ type specLog struct {
 // hold a live queue of at most logPendingBytes (256 KiB), plus -- for one
 // flush interval after a subscribe -- a scrollback snapshot, which is a
 // shallow copy that shares its strings with the retention buffer and so adds
-// only record headers unless the buffer churns underneath it. With the
+// only record headers unless the buffer churns underneath it. A generation's
+// opening marker also carries its masked launch command, capped at
+// maxResolvedCommandBytes (16 KiB) and charged against the same per-spec
+// capacity as the text (logRecord.size), so it widens no bound. With the
 // defaults (1 MiB / 16 MiB) and the one or two specs an operator actually
 // watches at a time, that is 16 MiB steady-state and under 17 MiB while
 // watching.
@@ -326,27 +369,40 @@ func (s *LogStore) write(specID string, gen uint64, pid int, p []byte) {
 // mark records a lifecycle marker (a generation boundary) in the same
 // history and live queue the output flows through, so its position relative
 // to the surrounding output is exact.
-func (s *LogStore) mark(specID string, gen uint64, pid int, event string, exitCode int) {
+//
+// cmd is non-nil only for an OPENING marker, and it is the masked launch
+// command of the generation that marker opens (see ResolvedCommand). It is
+// carried on the record, so it is retained for exactly as long as that record
+// is and is delivered wherever that record is -- scrollback and live alike --
+// with no separate bookkeeping.
+func (s *LogStore) mark(specID string, gen uint64, pid int, event string, exitCode int, cmd *ResolvedCommand) {
 	if s == nil || specID == "" {
 		return
 	}
-	rec := logRecord{gen: gen, pid: pid, at: s.now(), event: event, exitCode: exitCode}
+	rec := logRecord{gen: gen, pid: pid, at: s.now(), event: event, exitCode: exitCode, command: cmd}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.appendLocked(specID, rec)
 	s.queueLocked(specID, rec)
 }
 
-// appendLocked adds rec to specID's retained history, coalescing consecutive
-// same-generation output and evicting from the front to stay within the
-// per-spec capacity.
-func (s *LogStore) appendLocked(specID string, rec logRecord) {
+// logForLocked returns specID's buffer, creating it (and enforcing the total
+// ceiling) on first use.
+func (s *LogStore) logForLocked(specID string) *specLog {
 	l := s.logs[specID]
 	if l == nil {
 		l = &specLog{}
 		s.logs[specID] = l
 		s.evictLocked(specID)
 	}
+	return l
+}
+
+// appendLocked adds rec to specID's retained history, coalescing consecutive
+// same-generation output and evicting from the front to stay within the
+// per-spec capacity.
+func (s *LogStore) appendLocked(specID string, rec logRecord) {
+	l := s.logForLocked(specID)
 	l.lastWrite = rec.at
 	if rec.event == "" && len(l.recs) > 0 {
 		last := &l.recs[len(l.recs)-1]
@@ -623,7 +679,11 @@ func (s *LogStore) Drain() []LogBatch {
 func entriesFrom(recs []logRecord, dropped int64) []LogEntry {
 	out := make([]LogEntry, 0, len(recs)+1)
 	for _, r := range recs {
-		out = append(out, LogEntry{PID: r.pid, At: r.at, Text: r.text, Event: r.event, ExitCode: r.exitCode})
+		// r.command is shared, not copied: it is built once by startProcess and
+		// never written again, exactly like the immutable strings beside it, so
+		// the same reasoning that makes SetWatch's shallow scrollback snapshot
+		// safe applies here.
+		out = append(out, LogEntry{PID: r.pid, At: r.at, Text: r.text, Event: r.event, ExitCode: r.exitCode, Command: r.command})
 	}
 	if dropped > 0 {
 		if len(out) == 0 {
@@ -688,11 +748,26 @@ func (p *procLog) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// Started records the generation boundary that opens this process's output.
-func (p *procLog) Started(pid int) {
+// Started records the generation boundary that opens this process's output,
+// together with the resolved command it was launched with (already masked --
+// see command.go). The two are recorded in one call because they are one fact:
+// "this pid, running this command, from here on".
+func (p *procLog) Started(pid int, cmd ResolvedCommand) {
 	p.pid.Store(int64(pid))
 	if p.store != nil {
-		p.store.mark(p.specID, p.gen, pid, logEventStarted, 0)
+		p.store.mark(p.specID, p.gen, pid, logEventStarted, 0, &cmd)
+	}
+}
+
+// StartFailed records the opening marker of a generation that never became a
+// process: the exec itself failed, so there is no pid and there will be no
+// output -- the command it carries is the whole content of the log view for a
+// spec that cannot start, which is the case an operator opens it for most
+// often. Deliberately its own event kind rather than a pid-0 "started", which
+// would claim output begins here; see logEventStartFailed.
+func (p *procLog) StartFailed(cmd ResolvedCommand) {
+	if p.store != nil {
+		p.store.mark(p.specID, p.gen, 0, logEventStartFailed, 0, &cmd)
 	}
 }
 
@@ -701,7 +776,7 @@ func (p *procLog) Started(pid int) {
 // several attempts, with the exit code of each one in its right place.
 func (p *procLog) Exited(exitCode int) {
 	if p.store != nil {
-		p.store.mark(p.specID, p.gen, int(p.pid.Load()), logEventExited, exitCode)
+		p.store.mark(p.specID, p.gen, int(p.pid.Load()), logEventExited, exitCode, nil)
 	}
 }
 

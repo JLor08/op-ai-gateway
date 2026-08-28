@@ -144,6 +144,21 @@ type ManagerOptions struct {
 	// test) still gets a working store.
 	LogBufferBytes      int
 	LogBufferTotalBytes int
+	// SpecsFromLocalFile states that this agent's launch specs come from a
+	// LOCAL FILE (OP_AGENT_RUNTIME_SOURCE=file) rather than from the gateway.
+	// It is fixed for the process lifetime -- the source is resolved once at
+	// startup by main.go and cannot change without a restart -- which is why
+	// it is a Manager option rather than something read off a Config.
+	//
+	// It has exactly ONE consumer: the masking of the resolved launch command
+	// the log stream reports (command.go). In file mode a spec's env VALUES
+	// are the one thing the agent deliberately withholds from the gateway
+	// (report.go's redactConfigEnv), because a local document is the
+	// operator's own and may hold a plaintext secret; the reported command
+	// masks them for the same reason and by the same rule. Its zero value,
+	// false, is the gateway-sourced case, where the gateway already holds
+	// every literal in the document.
+	SpecsFromLocalFile bool
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -199,13 +214,14 @@ func NewManager(opts ManagerOptions) *Manager {
 		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
 	o := &owner{
-		m:            m,
-		policy:       opts.Policy,
-		getenv:       getenv,
-		gpuVendor:    opts.GPUVendor,
-		specs:        make(map[string]*specState),
-		allowedPairs: map[[2]string]bool{},
-		logs:         m.logs,
+		m:                  m,
+		policy:             opts.Policy,
+		getenv:             getenv,
+		gpuVendor:          opts.GPUVendor,
+		specsFromLocalFile: opts.SpecsFromLocalFile,
+		specs:              make(map[string]*specState),
+		allowedPairs:       map[[2]string]bool{},
+		logs:               m.logs,
 	}
 	m.wg.Add(1)
 	go func() {
@@ -702,6 +718,11 @@ type owner struct {
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
 	gpuVendor GPUVendor
+	// specsFromLocalFile is ManagerOptions.SpecsFromLocalFile -- fixed for
+	// the process lifetime, so a plain field like gpuVendor above. Its only
+	// use is the masking rule for the reported launch command; see the option's
+	// own doc.
+	specsFromLocalFile bool
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -1475,7 +1496,7 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	args, env, err := ExpandPlaceholders(spec, port, o.gpuVendor, o.getenv)
+	ex, err := expandSpec(spec, port, o.gpuVendor, o.getenv)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
@@ -1483,6 +1504,13 @@ func (o *owner) startProcess(st *specState) {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
+	args, env := ex.args, ex.env
+	// The reportable form of this exact launch, built from the SAME expansion
+	// (never a second one that could disagree with it) and masked here, at the
+	// point of substitution, so no plaintext resolved command is ever retained
+	// anywhere. See command.go for the masking rule and what it does and does
+	// not protect.
+	resolved := ex.resolvedCommand(spec, o.specsFromLocalFile)
 
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and
 	// sharing the writer means the interleaving an operator reads back is
@@ -1500,6 +1528,11 @@ func (o *owner) startProcess(st *specState) {
 	setProcGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
+		// The command is retained even though nothing ran: a spec whose exec
+		// fails prints nothing at all, so this is the only thing an operator
+		// opening the log view can be shown -- and "the binary/work_dir it
+		// actually tried" is usually the answer.
+		plog.StartFailed(resolved)
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, fmt.Sprintf("runtime: exec %s: %s", spec.Binary, err.Error()), 0, "")
 		o.failPending(st, ErrStartFailed)
@@ -1509,8 +1542,10 @@ func (o *owner) startProcess(st *specState) {
 
 	// Records the generation boundary in the spec's own history, in place,
 	// so a crash loop reads as a sequence of attempts rather than one
-	// undifferentiated wall of output.
-	plog.Started(cmd.Process.Pid)
+	// undifferentiated wall of output -- and, with it, the command THIS
+	// generation was launched with, so the panel above the output can never
+	// describe a different attempt than the one being read.
+	plog.Started(cmd.Process.Pid, resolved)
 
 	proc := &runningProc{
 		specID:    spec.ID,

@@ -152,9 +152,13 @@ server, so the system-wide no-plaintext-secrets rule needs no new exception:
 nothing here gives the gateway a model secret to store. The accepted cost,
 stated plainly: the secret must already exist on the AI server, and the portal
 cannot set it. Two channels can still carry a **resolved** value upward, both
-arising on the agent side and both stated in §8.3: a secret written into `args`
-rather than `env`, and a child that prints its own argv or environment into the
-output that `last_error.stderr_tail` samples.
+arising on the agent side and both stated in §8.3: a **literal** secret written
+into `args` rather than referenced as `${AGENT_ENV:NAME}`, and a child that
+prints its own argv or environment into the output that
+`last_error.stderr_tail` samples. The third place a resolved value could have
+travelled — the launch command the log stream reports — masks every
+placeholder-derived value by recorded provenance instead
+([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
 Exactly four placeholders are resolved, in both `args` and `env` values:
@@ -1476,11 +1480,28 @@ depth, not as a substitute; correspondingly, the redaction *test* lives
 agent-side, because a gateway-side test would assert on values that arrive
 already masked.
 
-> **Limitation — `args` are not masked.** The wire contract scopes redaction to
-> `env` values, and `args` are deliberately outside it. But placeholder
-> expansion resolves `${AGENT_ENV:NAME}` in `args` too, so **a secret placed in
-> an argument reaches the gateway unmasked.** This was reviewed and upheld as
-> spec-correct. **Operator guidance: put secrets in `env`, never in `args`.**
+> **Limitation — `args` are not masked *in this report*.** The report's wire
+> contract scopes redaction to `env` values, and `args` are deliberately outside
+> it, so **a literal secret typed into an argument of a local `runtime.json`
+> reaches the gateway unmasked.** This was reviewed and upheld as spec-correct.
+> **Operator guidance is unchanged: put secrets in `env`, never in `args` — and
+> reference them as `${AGENT_ENV:NAME}` rather than writing the value.**
+>
+> **Narrowed, not closed.** The half of this limitation about *resolved
+> placeholder* values is now closed on the channel that would otherwise have
+> widened it. The reported launch command
+> ([§14.7](#147-the-resolved-command-what-actually-ran)) masks every
+> `${AGENT_ENV:NAME}`-derived value **in `args` as well as in `env`**, precisely,
+> by recorded provenance — so the one new upward channel this branch adds is born
+> masked in both fields rather than inheriting the asymmetry. What remains
+> genuinely open is narrower and worth stating exactly:
+>
+> - a **literal** secret typed into an `args` entry (either mode) or into an
+>   `env` value of a **gateway-authored** spec is shown, because the gateway
+>   already holds that text — in its own database, and the portal's spec editor
+>   renders it back to the same admins. The exposure is the plaintext spec, not
+>   this view of it;
+> - the **child's own output**, below.
 >
 > **The report is not the only upward channel, either.** `last_error.stderr_tail`
 > carries the tail of the child's own combined output (§6), and the child was
@@ -1492,8 +1513,10 @@ already masked.
 > mechanical around it is deliberate and correct — volatile registry, never
 > persisted, clamped on ingest (see
 > [Telemetry & Observability](telemetry-usage-observability.md)) — but the scope
-> of the redaction claim is `env` values **in the report**, not "no secret ever
-> reaches the wire".
+> of the redaction claim is `env` values **in the report** plus every
+> placeholder-derived value **in the reported command**, not "no secret ever
+> reaches the wire". Nothing agent-side can mask a value the child chose to
+> print.
 
 `parse_error` is a first-class case, not an edge case: the agent may
 legitimately report an empty `config` alongside a non-empty `parse_error` — a
@@ -2246,9 +2269,14 @@ operator meets first:
   GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for
   the agent to resolve.
-- **A secret in `args` reaches the gateway unmasked**, and a resolved secret of
-  either kind can also reach it inside `last_error.stderr_tail` (§8.3). Put
-  secrets in `env`.
+- **A *literal* secret written into a spec reaches the gateway unmasked** — in
+  `args` in either mode, or in an `env` value of a gateway-authored spec, where
+  the gateway holds the plaintext document anyway. A resolved secret of either
+  kind can also reach it inside `last_error.stderr_tail`, which no masking can
+  reach (§8.3). Reference secrets as `${AGENT_ENV:NAME}` and keep them in `env`:
+  a placeholder-derived value is masked in the report's `env` and in the reported
+  launch command's `args` and `env` alike
+  ([§14.7](#147-the-resolved-command-what-actually-ran)).
 - **The router authenticates nothing and its shipped default binds all
   interfaces** (§4.6).
 - **A pairwise matrix plus per-GPU arithmetic cannot express every co-residency
@@ -2363,7 +2391,14 @@ time, that is 16 MiB steady-state and under 17 MiB while watching.
 | Frame | Direction | Payload |
 |---|---|---|
 | `runtime_log_config` | gateway → agent | `{"spec_ids":[…]}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing. Re-sent on **every** new agent connection, including the empty set, so a watch set can never outlive the connection it was issued on. |
-| `runtime_log` | agent → gateway | One spec's entries since the previous flush: `{"spec_id", "scrollback", "entries":[{"pid","at","text","dropped_bytes","event","exit_code"}]}`. |
+| `runtime_log` | agent → gateway | One spec's entries since the previous flush: `{"spec_id", "scrollback", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command"}]}`. `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). |
+
+The markers are **typed records carrying no text** — `event` plus `pid`/
+`exit_code`/`command`, with the `── … ──` line written by the portal. That is
+deliberate: text an agent emits is indistinguishable from output the process
+printed, and therefore forgeable — a model server printing a convincing marker
+line would be read as a portal statement. The same rule is why the resolved
+command is a typed field rather than a rendered command line in the stream.
 
 A list of spec ids is deliberately the entire expressive power of the command.
 The ids name specs the gateway itself supplied in the runtime-config document,
@@ -2401,11 +2436,17 @@ therefore held in memory, bounded, and **never** written to disk, never stored
 in the gateway's database, and never put into a log line on either side — not
 even truncated, not even at debug level. That rule is the reason this feature
 needs no data-retention decision at all: there is nothing retained to decide
-about. Two tests assert it rather than arguing it: one walks the agent's
-sandboxed working tree after a real child process has printed and crashed, and
-one attaches a real SQLite store to the gateway, relays fifty frames carrying a
-needle, closes the store so the WAL is checkpointed, and searches every byte of
-the directory.
+about. Four tests assert it rather than arguing it, in two mirrored pairs: one
+walks the agent's sandboxed working tree after a real child process has printed
+and crashed, and one attaches a real SQLite store to the gateway, relays fifty
+frames carrying a needle, closes the store so the WAL is checkpointed, and
+searches every byte of the directory — and each has a twin doing the same for the
+resolved command ([§14.7](#147-the-resolved-command-what-actually-ran)), whose
+argv and environment are not prompt-bearing but are closer to user data than
+status ever was, and have no more business on disk. The agent-side twin plants
+two needles, one in a plain argument and one behind `${AGENT_ENV:…}`: finding the
+first would mean it was persisted, finding the second would mean the masking was
+bypassed.
 
 The portal's authorization boundary is the ordinary one — server
 ownership/admin-group via the same `authorizeServer` path as the live-status
@@ -2413,7 +2454,125 @@ stream, with the 404-no-leak collapse — deliberately not a laxer path because 
 is "just logs". `spec_id` needs no separate check: fan-out is keyed by (server,
 spec) and an agent only ever reports its own server's specs.
 
-### 14.7 The accepted boundary
+### 14.7 The resolved command: what actually ran
+
+Attached to each generation's **start marker**, inline in the output and
+collapsed by default, the portal shows the command the agent **actually
+executed**. An operator debugging a spec that will not start is otherwise
+looking at a template: `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and
+`${AGENT_ENV:NAME}` are all resolved at launch (§3.2), the binary came from the
+agent-local allowlist (§3.1), and the working directory may not be what they
+assume. The gap between what was typed and what ran is where the bug tends to
+be. Binary, argv, working directory and the **complete** effective environment
+are reported; nothing was retained before this existed, because
+`ExpandPlaceholders` built the resolved form, `exec.Command` consumed it, and it
+was dropped.
+
+**On the marker, and that is the design.** `${PORT}` is resolved afresh on every
+start, so across a crash loop the command *differs* between attempts. Because it
+is a typed field on the record that already marks the generation boundary and
+already carries the pid, attribution holds **structurally** rather than by a
+rule: the command cannot drift onto the wrong attempt, and the operator reads
+each attempt's own command beside its own output — including the fact that the
+port differed, which a single "latest command" panel could not show. There is no
+second channel, no per-spec slot, and nothing to keep in sync with which
+generation is being read.
+
+**A typed field, never text in the stream.** This is the same rule the markers
+themselves follow (§14.4) and for the same reason: synthesized text is
+indistinguishable from what the process printed, and therefore forgeable. The
+gateway allow-lists the command exactly as it allow-lists the event kind —
+stripped from any entry that is not an opening marker, so it can never appear
+attached to a line of output, where it would describe nothing.
+
+**A generation that never became a process** gets its own marker kind,
+`start_failed`: the exec itself failed (a missing binary, an unusable
+`work_dir`), so there is no pid, no output, and no exit code coming. Reusing
+`started` with pid 0 was the alternative and it would have been a lie — that
+marker means "output begins here, from this pid". It is not an edge case: a spec
+that cannot start prints nothing, so the command is the entire content of the log
+view, which is why the portal opens *that* block expanded while every other one
+starts collapsed. (A real command is thirty-odd lines with one argument per line;
+rendered flat before every attempt of a crash loop it would bury the output this
+view exists to show.)
+
+**Masking is provenance-based, not blanket**, and the rule is one sentence:
+
+> A value is shown only if the gateway already has it, or the agent itself
+> computed it.
+
+Which resolves to exactly two masking cases:
+
+1. **Every `${AGENT_ENV:NAME}`-derived span, wherever it landed** — in an
+   argument as much as in an env value — is replaced by *its own placeholder*,
+   e.g. `--api-key ${AGENT_ENV:HF_TOKEN}`. This is the one class of value the
+   gateway is never given (ADR-027), so a resolved copy must not travel upward
+   just because a view wants to be helpful. The agent can be exact about it
+   because it is the code that performed the substitution: it records the byte
+   span at the moment of substitution, so masking is never a search for the
+   secret's *value* — a one-character secret would otherwise mask every
+   occurrence of that character in `--port 54331`.
+2. **On a file-mode agent only, every spec-supplied `env` value**, masked in
+   full with keys intact. That is not a new rule: it is precisely the line the
+   upward report already draws (§8.3), because a local `runtime.json` is the
+   operator's own document and may legitimately hold a plaintext secret. The
+   view inherits the report's decision rather than inventing a second one that
+   could drift from it.
+
+And, equally deliberately, what is **not** masked, because masking it would cost
+the feature its whole reason for existing while protecting nothing: the resolved
+`${PORT}`/`${MODEL}`/`${HOST_GPU_IDS}`, the agent-provided base environment, the
+GPU visibility variable a `set_visible_devices` spec receives ("the variable was
+actually set, to *these* cards" is among the most useful things this can say),
+and literal text from the spec — binary, args, `work_dir`, env keys in both
+modes, env values in gateway mode. In gateway mode that text is in the gateway's
+own database and the portal's spec editor renders it back to the same admins; in
+file mode the report already sends binary/args/`work_dir`/env keys verbatim. Either
+way, showing it exports nothing the gateway does not already hold.
+
+The mask **is** the placeholder rather than a row of bullets, and that does two
+jobs: it is unmistakably not a value (so the block cannot be misread as leaking
+one, including on a screen-share), and it names the variable, so the operator
+knows exactly what to go and check on the host. It reveals nothing new — the
+placeholder is the operator's own template text, which the spec editor already
+shows them.
+
+**There is deliberately no copy affordance, and adding one would be a
+regression.** Even completely unmasked this is not a runnable command line: the
+reported environment *replaces* the process environment rather than adding to it,
+the port was ephemeral and is stale (or taken) by the time anyone reads it, and a
+`set_visible_devices` child renumbers its GPUs from zero, so any device-numbering
+argument means something else outside that environment. A copy button would
+promise reproduction and hand over a broken paste. The fields are rendered as
+plain selectable monospace text — argv **one argument per line**, the same shape
+the spec editor demands on input — which promises nothing.
+
+**What is retained is already masked.** Masking happens where the substitution
+happens, so the plaintext resolved command exists only as the local variables
+`exec.Command` is handed; the record, the frame and the gateway never hold it.
+The gateway therefore does **not** re-mask — it cannot, having no provenance, and
+its only options would be to mask everything (destroying the field) or to guess
+by pattern (worse than not masking, because it looks like a guarantee). It clamps
+sizes instead, dropping over-long entries **whole** and setting `truncated`, and
+relays the rest verbatim. A command is capped at 16 KiB and **charged against the
+per-spec buffer capacity** like the output text, so §14.3's memory bound stays
+true with no new number in it.
+
+**The accepted cost, stated as a decision.** Living on a record inside the
+bounded ring means a marker can be **evicted**: a generation that prints more
+than the per-spec capacity loses its own opening marker, and with it the only
+copy of its command. That is a real loss in the tail-a-busy-model case, accepted
+in exchange for exact per-generation attribution — and it must never read as
+"there was no command". The portal detects it structurally (the visible history
+begins with output rather than with a marker) and says so, the same discipline as
+the dropped-bytes markers and the empty-buffer notice. Later generations still
+carry theirs.
+
+No new feature flag: `runtime_logs` already gates this frame, and both halves
+ship in the same agent version, so an agent that declares the name necessarily
+reports the command.
+
+### 14.8 The accepted boundary
 
 Retention lives in the agent's memory, so **it does not survive an agent
 restart**, and there is nothing to show for a server whose agent is down.

@@ -27,6 +27,12 @@ import (
 // The nearest precedent in this package is runtimeStatusRegistry, which keeps
 // LastError.StderrTail in RAM only for the same reason.
 //
+// The same rule covers the RESOLVED COMMAND an opening marker can carry
+// (RuntimeLogCommandDTO). It is not process output, so it cannot contain prompt
+// text -- but it is a resolved argv and environment, which is closer to user
+// data than status ever was, and it has no more reason to be persisted than
+// output does. Volatile, relayed, forgotten: one rule for the whole frame.
+//
 // THE SUBSCRIPTION MODEL. Streaming happens only while someone is watching. A
 // portal log view subscribes here; if it is the first subscriber for that
 // (server, spec) the registry tells the agent, over its open WebSocket, the
@@ -97,16 +103,64 @@ const (
 // what the process printed, and silence is exactly what the operator is trying
 // to interpret.
 //
-// Event is a CLOSED set ("started"/"exited"), allow-listed on ingest. The
-// portal renders these as localized boundary markers, so an agent must not be
-// able to put free text where an operator reads a gateway-authored sentence.
+// Event is a CLOSED set ("started"/"exited"/"start_failed"), allow-listed on
+// ingest. The portal renders these as localized boundary markers, so an agent
+// must not be able to put free text where an operator reads a gateway-authored
+// sentence.
+//
+// Command rides on an OPENING marker ("started"/"start_failed") and carries that
+// generation's resolved launch command. It is allow-listed the same way the event
+// kind is -- stripped from any entry that is not an opening marker -- so a
+// command can never appear attached to a line of process output, where it would
+// describe nothing and could only mislead.
 type RuntimeLogEntryDTO struct {
-	PID          int    `json:"pid,omitempty"`
-	At           string `json:"at,omitempty"`
-	Text         string `json:"text,omitempty"`
-	DroppedBytes int64  `json:"dropped_bytes,omitempty"`
-	Event        string `json:"event,omitempty"`
-	ExitCode     int    `json:"exit_code,omitempty"`
+	PID          int                   `json:"pid,omitempty"`
+	At           string                `json:"at,omitempty"`
+	Text         string                `json:"text,omitempty"`
+	DroppedBytes int64                 `json:"dropped_bytes,omitempty"`
+	Event        string                `json:"event,omitempty"`
+	ExitCode     int                   `json:"exit_code,omitempty"`
+	Command      *RuntimeLogCommandDTO `json:"command,omitempty"`
+}
+
+// RuntimeLogCommandDTO is the RESOLVED launch command of ONE generation: what
+// the agent actually exec'd, after every
+// ${PORT}/${MODEL}/${HOST_GPU_IDS}/${AGENT_ENV:NAME} placeholder was resolved.
+// Mirrors the agent's runtime.ResolvedCommand field-for-field
+// (server-agent/internal/runtime/command.go), which is also where the masking
+// rule and its limits are documented.
+//
+// It arrives as a TYPED FIELD on that generation's opening marker entry, never
+// as text in the stream, and it carries no pid of its own -- the marker it hangs
+// on has one. That placement is what makes attribution structural: the marker IS
+// the generation boundary, so the command cannot end up describing a different
+// attempt than the output around it, and a crash loop shows each attempt's own.
+// Text would have been forgeable by a model server printing a convincing line;
+// a typed field cannot be.
+//
+// THE GATEWAY DOES NOT RE-MASK THIS, and that is a decision rather than an
+// omission. Masking a resolved command correctly requires knowing which BYTES
+// of which string came from which placeholder, and only the agent -- the party
+// that performed the substitution -- can know that. The gateway's options
+// would be to mask everything (which would destroy the field's entire reason
+// for existing: `--port 54331`, `--ctx-size 262144` and
+// `CUDA_VISIBLE_DEVICES=2,3` are what an operator opened the panel to see) or
+// to guess by pattern, which is worse than not masking because it looks like a
+// guarantee. So the gateway clamps sizes -- it never trusts an agent's
+// lengths or counts -- and relays the rest verbatim.
+//
+// Masked says at least one value was replaced by its ${AGENT_ENV:NAME}
+// placeholder. Truncated says entries are missing -- set by the agent when the
+// command exceeded its own cap, and by sanitizeRuntimeLogCommand when it
+// exceeded the gateway's. Args and Env are agent/operator-authored strings:
+// render them as text, never as HTML.
+type RuntimeLogCommandDTO struct {
+	Binary    string   `json:"binary,omitempty"`
+	Args      []string `json:"args,omitempty"`
+	WorkDir   string   `json:"work_dir,omitempty"`
+	Env       []string `json:"env,omitempty"`
+	Masked    bool     `json:"masked,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
 }
 
 // RuntimeLogBatchDTO is one SSE `log` frame: the entries an agent flushed for
@@ -118,6 +172,16 @@ type RuntimeLogEntryDTO struct {
 // EMPTY scrollback batch is itself an answer -- "the agent's retained buffer
 // is empty", which is what an agent restart leaves behind -- as distinct from
 // "nothing has arrived yet".
+//
+// The resolved launch command travels inside the entries, on each generation's
+// opening marker (RuntimeLogEntryDTO.Command), not as a field here: a batch is a
+// time-slice that can span two generations, and a command belongs to exactly
+// one. It rides this frame rather than a channel of its own because it describes
+// the very process whose output follows, it is wanted only while a log view is
+// open, and this frame's subscription -- and therefore its authorization
+// boundary -- already exists. That boundary is not laxer for carrying argv:
+// handleRuntimeLogEvents checks server ownership/admin-group before the first
+// stream byte, exactly as it does for output.
 type RuntimeLogBatchDTO struct {
 	SpecID     string               `json:"spec_id"`
 	Scrollback bool                 `json:"scrollback,omitempty"`
@@ -148,7 +212,9 @@ func (s *runtimeLogSub) take(batch RuntimeLogBatchDTO) RuntimeLogBatchDTO {
 	// Copy before stamping: the batch value is shared by every subscriber of
 	// this spec (publish fans out one snapshot), and each of them has its own
 	// drop count. Mutating in place would give one subscriber's gap marker to
-	// all of them.
+	// all of them. The per-entry Command pointers inside are shared and need no
+	// deep copy: once sanitizeRuntimeLogCommand has run on ingest, nothing
+	// writes them again.
 	entries := make([]RuntimeLogEntryDTO, len(batch.Entries))
 	copy(entries, batch.Entries)
 	entries[0].DroppedBytes += dropped
@@ -320,18 +386,78 @@ func (r *runtimeLogRegistry) publish(serverID string, batch RuntimeLogBatchDTO) 
 
 // runtimeLogEvents is the ALLOW-LIST of boundary markers an agent may report.
 // The portal renders each of these as its own localized sentence ("process
-// started, pid N" / "process exited, code N"), which is only safe as long as
+// started, pid N" / "process exited, code N" / "process did not start"), which
+// is only safe as long as
 // the set is closed: an agent -- buggy, outdated, or compromised -- must not
 // be able to put a value here that becomes gateway-authored-looking text in
 // front of an operator. Anything else degrades to an ordinary entry with no
 // marker, which is safe and honest. Same technique, and the same reasoning, as
 // runtimeReportParseErrorCodes in agent_runtime.go.
-var runtimeLogEvents = map[string]bool{"started": true, "exited": true}
+var runtimeLogEvents = map[string]bool{"started": true, "exited": true, "start_failed": true}
+
+// runtimeLogOpeningEvents are the markers that OPEN a generation, and therefore
+// the only entries a resolved launch command may be attached to. A command on an
+// output line, or on an "exited" marker, describes nothing -- so it is stripped
+// rather than relayed, on the same closed-set reasoning as the event kind
+// itself.
+var runtimeLogOpeningEvents = map[string]bool{"started": true, "start_failed": true}
 
 // runtimeLogMaxAtLen clamps a reported timestamp string. It is passed through
 // verbatim (the gateway has no reason to re-serialize the agent's clock), so
 // it gets the same length discipline as every other agent-chosen string.
 const runtimeLogMaxAtLen = 64
+
+const (
+	// runtimeLogMaxCommandFieldLen clamps the two single-string command fields
+	// (binary, work_dir). Both are absolute filesystem paths.
+	runtimeLogMaxCommandFieldLen = 4 << 10
+	// runtimeLogMaxCommandEntries clamps the argv length and the env entry
+	// count, each. Far above any real model server's command line, so it
+	// guards against a malformed or hostile agent rather than limiting an
+	// operator.
+	runtimeLogMaxCommandEntries = 512
+	// runtimeLogMaxCommandBytes clamps args PLUS env together, which is the
+	// number that actually bounds the fan-out: a per-entry cap alone would let
+	// 512 entries of 4 KiB through. Deliberately larger than the agent's own
+	// 16 KiB budget (server-agent/internal/runtime/command.go), so a
+	// well-behaved agent is never re-truncated here and this clamp only ever
+	// fires on an agent that ignored its own bound.
+	runtimeLogMaxCommandBytes = 32 << 10
+)
+
+// sanitizeRuntimeLogCommand bounds every agent-chosen length and count in a
+// reported command, and reports whether it dropped anything so Truncated stays
+// honest. It does NOT re-mask -- see RuntimeLogCommandDTO for why that is the
+// agent's job and cannot be the gateway's.
+//
+// Entries are dropped whole, never shortened: half an argument is a value that
+// looks real and is not, which is the one outcome worse than a missing one.
+func sanitizeRuntimeLogCommand(cmd *RuntimeLogCommandDTO) {
+	if cmd == nil {
+		return
+	}
+	cmd.Binary = clampString(cmd.Binary, runtimeLogMaxCommandFieldLen)
+	cmd.WorkDir = clampString(cmd.WorkDir, runtimeLogMaxCommandFieldLen)
+	budget := runtimeLogMaxCommandBytes
+	keep := func(in []string) []string {
+		if len(in) > runtimeLogMaxCommandEntries {
+			in = in[:runtimeLogMaxCommandEntries]
+			cmd.Truncated = true
+		}
+		out := in[:0:0]
+		for _, s := range in {
+			if len(s) > runtimeLogMaxCommandFieldLen || len(s) > budget {
+				cmd.Truncated = true
+				continue
+			}
+			budget -= len(s)
+			out = append(out, s)
+		}
+		return out
+	}
+	cmd.Args = keep(cmd.Args)
+	cmd.Env = keep(cmd.Env)
+}
 
 // ingestRuntimeLog parses one agent runtime_log frame and hands it to whoever
 // is watching that spec. It is the ONLY path managed-process output takes
@@ -378,6 +504,10 @@ func (s *Server) ingestRuntimeLog(serverID string, raw json.RawMessage) {
 		if batch.Entries[i].DroppedBytes < 0 {
 			batch.Entries[i].DroppedBytes = 0
 		}
+		if !runtimeLogOpeningEvents[batch.Entries[i].Event] {
+			batch.Entries[i].Command = nil
+		}
+		sanitizeRuntimeLogCommand(batch.Entries[i].Command)
 	}
 	if batch.Entries == nil {
 		batch.Entries = []RuntimeLogEntryDTO{}

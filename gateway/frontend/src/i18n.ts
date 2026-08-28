@@ -670,6 +670,31 @@ const de = {
   runtimeLogsDropped: (bytes: number) => `[${bytes} Byte Ausgabe fehlen hier]`,
   runtimeLogsTrimmed: (bytes: number) =>
     `Ältere Ausgabe wird in dieser Ansicht nicht mehr angezeigt (${bytes} Byte). Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf wieder vollständig zu laden.`,
+  runtimeLogsProcessStartFailed: 'Prozess nicht gestartet',
+  // Der tatsächlich ausgeführte Befehl, direkt an der Startmarkierung der
+  // jeweiligen Generation. Der Betreiber hat eine Vorlage geschrieben; ${PORT},
+  // ${MODEL}, ${HOST_GPU_IDS} und ${AGENT_ENV:NAME} werden erst beim Start
+  // aufgelöst -- genau in dieser Lücke sitzt der Fehler meistens.
+  runtimeCommandTitle: 'Ausgeführter Befehl',
+  runtimeCommandIntro:
+    'Genau das hat der Agent für diesen Prozess gestartet, mit allen beim Start aufgelösten Platzhaltern. Die aufgeführten Umgebungsvariablen sind die vollständige Umgebung des Prozesses — sie ersetzt die des Agenten, sie ergänzt sie nicht. Bewusst ohne „Kopieren“-Schaltfläche: der Port war kurzlebig und ist inzwischen veraltet, und in einer Shell eingefügt wäre dies nicht derselbe Befehl.',
+  runtimeCommandStartFailedHint:
+    'Dieser Versuch hat keinen Prozess erzeugt: der Aufruf selbst ist gescheitert. Es gibt daher keine Ausgabe — der Befehl hier ist alles, was vorliegt. Binärdatei und Arbeitsverzeichnis zuerst prüfen.',
+  runtimeCommandNotRetained:
+    'Die angezeigte Ausgabe beginnt ohne Startmarkierung: der Agent hält sie nicht mehr vor. Für diese Generation ist daher auch der ausgeführte Befehl nicht mehr verfügbar — das heißt nicht, dass keiner gemeldet wurde. Späteren Generationen liegt ihr Befehl weiterhin bei.',
+  runtimeCommandMasked:
+    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert: sie liegen ausschließlich auf dem AI-Server und erreichen das Gateway nicht. Der Platzhalter nennt die Variable, die nachzusehen ist.',
+  runtimeCommandTruncated:
+    'Der Befehl war zu lang, um vollständig gemeldet zu werden: einzelne Argumente oder Umgebungsvariablen fehlen hier.',
+  runtimeCommandBinary: 'Binärdatei',
+  runtimeCommandArgs: 'Argumente (eines pro Zeile)',
+  runtimeCommandArgsNone: 'keine',
+  runtimeCommandWorkDir: 'Arbeitsverzeichnis',
+  runtimeCommandWorkDirInherited:
+    'nicht gesetzt — der Prozess übernimmt das Arbeitsverzeichnis des Agenten',
+  runtimeCommandEnv: 'Umgebung (vollständig)',
+  runtimeCommandEnvNone: 'leer',
+  runtimeCommandUnknown: 'unbekannt',
   runtimeAgentVersion: 'Agent-Version',
   runtimeAgentFeatures: 'Gemeldete Funktionen',
   runtimeReportCollectedAt: 'Gemeldet am',
@@ -2552,6 +2577,31 @@ const en: PortalMessages = {
   runtimeLogsDropped: (bytes: number) => `[${bytes} bytes of output are missing here]`,
   runtimeLogsTrimmed: (bytes: number) =>
     `Older output is no longer shown in this view (${bytes} bytes). Reopen the window to reload the agent's retained history in full.`,
+  runtimeLogsProcessStartFailed: 'Process did not start',
+  // The command the agent actually executed, attached to that generation's own
+  // start marker. The operator wrote a template; ${PORT}, ${MODEL},
+  // ${HOST_GPU_IDS} and ${AGENT_ENV:NAME} are resolved only at launch -- and
+  // that gap is where the bug usually is.
+  runtimeCommandTitle: 'Executed command',
+  runtimeCommandIntro:
+    'Exactly what the agent launched for this process, with every placeholder resolved at launch time. The environment listed is the process\'s complete environment — it REPLACES the agent\'s rather than adding to it. Deliberately no "copy" button: the port was ephemeral and is stale by now, so pasted into a shell this would not be the same command.',
+  runtimeCommandStartFailedHint:
+    'This attempt produced no process: the exec itself failed. That is also why there is no output — this command is all there is. Check the binary and the working directory first.',
+  runtimeCommandNotRetained:
+    'The output shown begins without a start marker: the agent no longer retains it. The executed command for that generation is therefore gone too — which does not mean none was reported. Later generations still carry theirs.',
+  runtimeCommandMasked:
+    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value: they live only on the AI server and do not reach the gateway. The placeholder names the variable to go and check.',
+  runtimeCommandTruncated:
+    'The command was too long to report in full: some arguments or environment entries are missing here.',
+  runtimeCommandBinary: 'Binary',
+  runtimeCommandArgs: 'Arguments (one per line)',
+  runtimeCommandArgsNone: 'none',
+  runtimeCommandWorkDir: 'Working directory',
+  runtimeCommandWorkDirInherited:
+    "not set — the process inherits the agent's own working directory",
+  runtimeCommandEnv: 'Environment (complete)',
+  runtimeCommandEnvNone: 'empty',
+  runtimeCommandUnknown: 'unknown',
   runtimeAgentVersion: 'Agent version',
   runtimeAgentFeatures: 'Declared features',
   runtimeReportCollectedAt: 'Reported at',

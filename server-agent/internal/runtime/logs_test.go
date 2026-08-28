@@ -81,7 +81,7 @@ func TestLogCapacityClamping(t *testing.T) {
 func TestLogCollectionIsUnconditionalButStreamingIsNot(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
-	p.Started(4711)
+	p.Started(4711, ResolvedCommand{})
 	p.Write([]byte("loading weights\n"))
 
 	if got := s.Drain(); got != nil {
@@ -109,7 +109,7 @@ func TestLogCollectionIsUnconditionalButStreamingIsNot(t *testing.T) {
 func TestLogRetentionSurvivesTheProcess(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
-	p.Started(4711)
+	p.Started(4711, ResolvedCommand{})
 	p.Write([]byte("CUDA error: out of memory\n"))
 	p.Exited(1)
 	// The generation is over and its procLog is gone as far as the manager is
@@ -134,12 +134,12 @@ func TestLogGenerationsAppendWithBoundaryMarkers(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 
 	first := s.newProc("spec-a")
-	first.Started(101)
+	first.Started(101, ResolvedCommand{})
 	first.Write([]byte("attempt one\n"))
 	first.Exited(1)
 
 	second := s.newProc("spec-a")
-	second.Started(202)
+	second.Started(202, ResolvedCommand{})
 	second.Write([]byte("attempt two\n"))
 
 	s.SetWatch([]string{"spec-a"})
@@ -188,7 +188,7 @@ func TestLogGenerationsAppendWithBoundaryMarkers(t *testing.T) {
 func TestLogScrollbackThenLive(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 	p.Write([]byte("before-subscribe\n"))
 
 	s.SetWatch([]string{"spec-a"})
@@ -215,7 +215,7 @@ func TestLogScrollbackThenLive(t *testing.T) {
 func TestLogStdoutAndStderrShareOneStream(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 	s.SetWatch([]string{"spec-a"})
 
 	// os/exec assigns the SAME writer to Stdout and Stderr (startProcess), so
@@ -262,7 +262,7 @@ func TestLogEvictionReportsDroppedBytes(t *testing.T) {
 	const cap = minLogBufferBytes
 	s := newTestLogStore(t, cap, cap)
 	p := s.newProc("spec-a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 
 	chunk := strings.Repeat("a", 4096)
 	const writes = 40 // 160 KiB into a 64 KiB buffer
@@ -302,7 +302,7 @@ func TestLogEvictionReportsDroppedBytes(t *testing.T) {
 func TestLogPendingOverflowReportsDroppedBytes(t *testing.T) {
 	s := newTestLogStore(t, 1<<20, 1<<20)
 	p := s.newProc("spec-a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 	s.SetWatch([]string{"spec-a"})
 	s.Drain() // consume the (empty) scrollback
 
@@ -340,12 +340,12 @@ func TestLogTotalCeilingEvictsSpecBuffers(t *testing.T) {
 
 	for _, id := range []string{"old", "mid"} {
 		p := s.newProc(id)
-		p.Started(1)
+		p.Started(1, ResolvedCommand{})
 		p.Write([]byte(id + "-output"))
 	}
 	// A third spec must push the least-recently-written one out.
 	third := s.newProc("new")
-	third.Started(1)
+	third.Started(1, ResolvedCommand{})
 	third.Write([]byte("new-output"))
 
 	s.SetWatch([]string{"old", "mid", "new"})
@@ -371,7 +371,7 @@ func TestLogRetainDropsRemovedSpecs(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes*4)
 	for _, id := range []string{"keep", "drop"} {
 		p := s.newProc(id)
-		p.Started(1)
+		p.Started(1, ResolvedCommand{})
 		p.Write([]byte(id + "-output"))
 	}
 	s.Retain([]string{"keep"})
@@ -394,7 +394,7 @@ func TestLogRetainDropsRemovedSpecs(t *testing.T) {
 func TestLogUnwatchStopsQueueing(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 	s.SetWatch([]string{"spec-a"})
 	p.Write([]byte("watched\n"))
 
@@ -434,7 +434,7 @@ func TestLogWatchIsFullSetNotDelta(t *testing.T) {
 	// "b" was already watched, so it must NOT get a second scrollback replay.
 	s.Drain() // first scrollbacks for a, b
 	pa := s.newProc("b")
-	pa.Started(1)
+	pa.Started(1, ResolvedCommand{})
 	pa.Write([]byte("live"))
 	for _, b := range batchesFor(s.Drain(), "b") {
 		if b.Scrollback {
@@ -452,7 +452,7 @@ func TestLogDrainBudgetIsFairAcrossSpecs(t *testing.T) {
 	procs := map[string]*procLog{}
 	for _, id := range ids {
 		p := s.newProc(id)
-		p.Started(1)
+		p.Started(1, ResolvedCommand{})
 		procs[id] = p
 	}
 	s.SetWatch(ids)
@@ -491,12 +491,12 @@ func TestLogDrainBudgetIsFairAcrossSpecs(t *testing.T) {
 func TestLogTailIsGenerationScoped(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	first := s.newProc("spec-a")
-	first.Started(1)
+	first.Started(1, ResolvedCommand{})
 	first.Write([]byte("FIRST-GENERATION\n"))
 	first.Exited(1)
 
 	second := s.newProc("spec-a")
-	second.Started(2)
+	second.Started(2, ResolvedCommand{})
 	second.Write([]byte("SECOND-GENERATION\n"))
 
 	if tail := second.Tail(4096); strings.Contains(tail, "FIRST-GENERATION") {
@@ -527,7 +527,7 @@ func TestLogConcurrentWritersAreRaceSafe(t *testing.T) {
 
 	for g := range 4 {
 		p := s.newProc("spec-" + string(rune('a'+g)))
-		p.Started(1000 + g)
+		p.Started(1000+g, ResolvedCommand{})
 		for range 2 { // stdout and stderr, exactly as os/exec drives them
 			producers.Add(1)
 			go func() {
@@ -597,12 +597,235 @@ func TestLogNilStoreIsSafe(t *testing.T) {
 		t.Errorf("nil Capacity = (%d,%d)", per, total)
 	}
 	p := s.newProc("a")
-	p.Started(1)
+	p.Started(1, ResolvedCommand{})
 	if n, err := p.Write([]byte("x")); n != 1 || err != nil {
 		t.Errorf("nil-store Write = (%d, %v), want (1, nil)", n, err)
 	}
 	p.Exited(0)
 	if got := p.Tail(10); got != "" {
 		t.Errorf("nil-store Tail = %q", got)
+	}
+}
+
+// --- the resolved launch command ------------------------------------------
+
+// testCommand builds a ResolvedCommand distinguishable per generation, so a
+// test can tell WHICH generation's command a marker carried.
+func testCommand(binary string, port string) ResolvedCommand {
+	return ResolvedCommand{Binary: binary, Args: []string{"--port", port}, Env: []string{"PATH=/bin"}}
+}
+
+// commandsOf returns the (entry index, command) pairs in a snapshot, so a test
+// can assert both WHAT was reported and WHERE.
+func commandsOf(b LogBatch) []LogEntry {
+	var out []LogEntry
+	for _, e := range b.Entries {
+		if e.Command != nil {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestLogCommandRidesTheStartedMarker is the placement decision, pinned: the
+// resolved command is a typed field on the generation's OPENING MARKER, not a
+// per-spec value and not text in the stream.
+//
+// Both halves matter. On the marker, because the marker is the generation
+// boundary and already carries the pid, so "this pid, running this command" is
+// one record and cannot drift onto another attempt. TYPED, because synthesized
+// text is indistinguishable from output the process printed -- and therefore
+// forgeable by a model server printing a convincing marker line.
+func TestLogCommandRidesTheStartedMarker(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p := s.newProc("spec-a")
+	p.Started(4711, testCommand("/opt/llama/llama-server", "54331"))
+	p.Write([]byte("loading weights\n"))
+
+	s.SetWatch([]string{"spec-a"})
+	batches := s.Drain()
+	if len(batches) != 1 || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch", batches)
+	}
+	carriers := commandsOf(batches[0])
+	if len(carriers) != 1 {
+		t.Fatalf("%d entries carry a command, want exactly 1 (the opening marker)", len(carriers))
+	}
+	if carriers[0].Event != logEventStarted {
+		t.Errorf("the command is attached to a %q entry, want the opening marker", carriers[0].Event)
+	}
+	if carriers[0].PID != 4711 {
+		t.Errorf("marker pid = %d, want 4711 -- the pid it is keyed to lives on the same record", carriers[0].PID)
+	}
+	if carriers[0].Command.Binary != "/opt/llama/llama-server" || strings.Join(carriers[0].Command.Args, " ") != "--port 54331" {
+		t.Errorf("command = %+v, want the recorded binary and argv", carriers[0].Command)
+	}
+	// Structure only: a marker never carries text, so nothing the portal
+	// renders as a marker can be forged by the process.
+	if carriers[0].Text != "" {
+		t.Errorf("the marker carries text %q; the command must be a typed field, never text in the stream", carriers[0].Text)
+	}
+	// And no other entry carries one: the command describes one generation.
+	for _, e := range batches[0].Entries {
+		if e.Event == "" && e.Command != nil {
+			t.Errorf("an output entry carries a command: %+v", e)
+		}
+	}
+}
+
+// TestLogCommandTravelsWithEachGenerationsOwnMarker is what the marker
+// placement buys, and it is strictly more than a single "latest command" could
+// show: across a crash loop EVERY attempt's own command sits with its own
+// output, so the operator can see that ${PORT} differed between attempts --
+// which is exactly the kind of difference a one-command view makes invisible.
+func TestLogCommandTravelsWithEachGenerationsOwnMarker(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+
+	for i, port := range []string{"40001", "40002", "40003"} {
+		p := s.newProc("spec-a")
+		p.Started(101+i, testCommand("/opt/a", port))
+		p.Write([]byte("attempt " + port + "\n"))
+		if i < 2 {
+			p.Exited(1)
+		}
+	}
+
+	s.SetWatch([]string{"spec-a"})
+	batches := s.Drain()
+	if len(batches) != 1 || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch", batches)
+	}
+	carriers := commandsOf(batches[0])
+	if len(carriers) != 3 {
+		t.Fatalf("%d entries carry a command, want one per generation (3)", len(carriers))
+	}
+	wantPorts := []string{"40001", "40002", "40003"}
+	wantPIDs := []int{101, 102, 103}
+	for i, e := range carriers {
+		if e.PID != wantPIDs[i] {
+			t.Errorf("carrier %d pid = %d, want %d", i, e.PID, wantPIDs[i])
+		}
+		if got := strings.Join(e.Command.Args, " "); got != "--port "+wantPorts[i] {
+			t.Errorf("carrier %d args = %q, want the port THAT attempt resolved (%s)", i, got, wantPorts[i])
+		}
+	}
+	// Each command precedes its own generation's output, in order.
+	text := batchText(batches[0])
+	if strings.Index(text, "attempt 40001") > strings.Index(text, "attempt 40003") {
+		t.Fatalf("generations are out of order: %q", text)
+	}
+}
+
+// TestLogStartFailedMarkerCarriesTheCommandAndNoPID: an exec that failed
+// produced no process and no output, so the command is the ENTIRE content of the
+// log view -- the case an operator opens it for most often. It gets its own
+// event kind rather than a pid-0 "started", which would claim that output begins
+// there.
+func TestLogStartFailedMarkerCarriesTheCommandAndNoPID(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p := s.newProc("spec-a")
+	p.StartFailed(testCommand("/opt/does-not-exist", "54331"))
+
+	s.SetWatch([]string{"spec-a"})
+	batches := s.Drain()
+	if len(batches) != 1 || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch", batches)
+	}
+	if len(batches[0].Entries) != 1 {
+		t.Fatalf("entries = %+v, want exactly the failed-start marker", batches[0].Entries)
+	}
+	e := batches[0].Entries[0]
+	if e.Event != logEventStartFailed {
+		t.Errorf("event = %q, want %q -- never a pid-0 %q, which would claim output begins here", e.Event, logEventStartFailed, logEventStarted)
+	}
+	if e.PID != 0 {
+		t.Errorf("pid = %d, want 0: no process ever existed", e.PID)
+	}
+	if e.Command == nil || e.Command.Binary != "/opt/does-not-exist" {
+		t.Fatalf("command = %+v, want the binary the failed exec attempted", e.Command)
+	}
+}
+
+// TestLogCommandIsEvictedWithItsMarker is the ACCEPTED COST of putting the
+// command on a record inside the bounded ring, asserted rather than assumed so
+// that it stays a decision.
+//
+// The ring trims from the front, so a generation that prints more than the
+// per-spec capacity loses its own opening marker -- and with it the only copy of
+// its command. What must never happen is that this reads as "there was no
+// command": the retained history then begins with OUTPUT rather than with a
+// marker, which is precisely the condition the portal turns into a stated
+// notice, exactly like a dropped-bytes gap.
+func TestLogCommandIsEvictedWithItsMarker(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p := s.newProc("spec-a")
+	p.Started(4711, testCommand("/opt/llama/llama-server", "54331"))
+	line := strings.Repeat("y", 4096) + "\n"
+	for range (minLogBufferBytes / len(line)) * 3 {
+		p.Write([]byte(line))
+	}
+
+	s.SetWatch([]string{"spec-a"})
+	batches := s.Drain()
+	if len(batches) != 1 || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch", batches)
+	}
+	if hasEvent(batches[0], logEventStarted) {
+		t.Fatal("the opening marker was NOT evicted, so this test is not exercising what it claims")
+	}
+	if len(commandsOf(batches[0])) != 0 {
+		t.Fatal("a command survived its own marker's eviction; nothing outside the ring retains one")
+	}
+	// The detectable condition: the history begins with output, so the reader
+	// knows a generation's opening is missing rather than assuming there was
+	// none. The dropped-byte count says the same thing about the text.
+	if batches[0].Entries[0].Event != "" || batches[0].Entries[0].Text == "" {
+		t.Fatalf("first entry = %+v, want output -- that is what tells a reader the opening marker is gone", batches[0].Entries[0])
+	}
+	if batches[0].Entries[0].DroppedBytes == 0 {
+		t.Error("the evicted output was not reported as a gap")
+	}
+}
+
+// TestLogCommandIsChargedAgainstTheBufferCapacity: a marker is no longer
+// necessarily tiny, so the per-spec capacity has to count what it carries.
+// Otherwise a crash loop of command-bearing markers would grow the buffer past
+// the operator's setting -- silently, since none of it is text.
+func TestLogCommandIsChargedAgainstTheBufferCapacity(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	big := ResolvedCommand{Binary: "/opt/a", Args: []string{strings.Repeat("x", 8<<10)}, Env: []string{strings.Repeat("y", 8<<10)}}
+	for i := range 40 {
+		p := s.newProc("spec-a")
+		p.Started(1000+i, big)
+		p.Exited(1)
+	}
+
+	s.mu.Lock()
+	got := s.logs["spec-a"].bytes
+	s.mu.Unlock()
+	if got > s.perSpec {
+		t.Fatalf("retained bytes = %d, want at most the per-spec capacity %d -- a command must be charged like text", got, s.perSpec)
+	}
+}
+
+// TestLogCommandIsReleasedWithTheSpec: a spec removed from the desired config
+// has no row left to open a log view on, so its commands go with its output --
+// released by the same call, not left behind as a leak the output tests could
+// not see.
+func TestLogCommandIsReleasedWithTheSpec(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p := s.newProc("spec-a")
+	p.Started(4711, testCommand("/opt/a", "1"))
+	p.Write([]byte("hello\n"))
+
+	s.Retain([]string{"other-spec"})
+
+	s.SetWatch([]string{"spec-a"})
+	batches := s.Drain()
+	if len(batches) != 1 {
+		t.Fatalf("drain = %+v, want the (now empty) scrollback", batches)
+	}
+	if len(batches[0].Entries) != 0 {
+		t.Fatalf("a removed spec kept entries: %+v", batches[0].Entries)
 	}
 }

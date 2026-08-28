@@ -624,3 +624,314 @@ func TestAgentStreamRestatesAnEmptyWatchSetOnConnect(t *testing.T) {
 		t.Fatalf("payload = %s, want an explicit empty spec_ids array", f.Data)
 	}
 }
+
+// --- the resolved launch command -------------------------------------------
+
+// TestRuntimeLogCommandReachesTheOperator is the relay end to end, through the
+// real SSE handler: the agent reports what it actually executed, attached to the
+// generation's opening marker, and the operator watching that spec receives it
+// -- placeholders resolved, and the secret already masked by the agent as its
+// own placeholder.
+//
+// The gateway is deliberately NOT a masking layer here (only the agent knows
+// which bytes came from which placeholder), so this also pins that the useful
+// half arrives intact: the resolved port must not be swallowed by some
+// defensive scrub added later.
+func TestRuntimeLogCommandReachesTheOperator(t *testing.T) {
+	srv := newRuntimeEventsTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp := runtimeLogRequest(t, ts, runtimeEventsOwnerSecret, "?spec_id=spec-a")
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	if event, _ := readPerfSSEFrame(t, reader, 3*time.Second); event != "status" {
+		t.Fatalf("first event = %q, want status", event)
+	}
+
+	srv.ingestRuntimeLog(runtimeEventsServerID, json.RawMessage(`{
+		"spec_id":"spec-a","scrollback":true,
+		"entries":[{"event":"started","pid":4711,
+			"command":{"binary":"/opt/llama/llama-server",
+				"args":["--port","54331","--api-key","${AGENT_ENV:HF_TOKEN}"],
+				"work_dir":"/srv/models","env":["PATH=/usr/bin","CUDA_VISIBLE_DEVICES=2,3"],
+				"masked":true}},
+			{"text":"loading weights\n"}]}`))
+
+	event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+	if event != "log" {
+		t.Fatalf("event = %q, want log", event)
+	}
+	var batch RuntimeLogBatchDTO
+	if err := json.Unmarshal([]byte(data), &batch); err != nil {
+		t.Fatalf("unmarshal batch: %v (%s)", err, data)
+	}
+	if len(batch.Entries) != 2 {
+		t.Fatalf("entries = %+v, want the marker and the output", batch.Entries)
+	}
+	marker := batch.Entries[0]
+	if marker.Event != "started" || marker.PID != 4711 {
+		t.Fatalf("marker = %+v, want the started marker with its pid", marker)
+	}
+	if marker.Command == nil {
+		t.Fatal("the marker reached the operator without its command")
+	}
+	if marker.Command.Binary != "/opt/llama/llama-server" {
+		t.Errorf("binary = %q", marker.Command.Binary)
+	}
+	if got := strings.Join(marker.Command.Args, " "); got != "--port 54331 --api-key ${AGENT_ENV:HF_TOKEN}" {
+		t.Errorf("args = %q, want the resolved port AND the masked key, both verbatim: the gateway relays, it does not re-mask", got)
+	}
+	if marker.Command.WorkDir != "/srv/models" {
+		t.Errorf("work_dir = %q", marker.Command.WorkDir)
+	}
+	if len(marker.Command.Env) != 2 || marker.Command.Env[1] != "CUDA_VISIBLE_DEVICES=2,3" {
+		t.Errorf("env = %v, want the effective environment relayed intact", marker.Command.Env)
+	}
+	if !marker.Command.Masked {
+		t.Error("masked = false, want the agent's own flag relayed so the portal can say so in words")
+	}
+	// The output line beside it carries none: a command describes a generation,
+	// not a line.
+	if batch.Entries[1].Command != nil {
+		t.Errorf("an output entry carries a command: %+v", batch.Entries[1])
+	}
+}
+
+// TestRuntimeLogCommandOnlyRidesAnOpeningMarker is the allow-list, applied to
+// the command exactly as it is applied to the event kind. An agent -- buggy,
+// outdated or compromised -- must not be able to attach a command to a line of
+// process output or to an `exited` marker, where it would describe nothing and
+// could only mislead the reader about which process it belongs to.
+func TestRuntimeLogCommandOnlyRidesAnOpeningMarker(t *testing.T) {
+	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
+	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+
+	srv.ingestRuntimeLog("srv-1", json.RawMessage(`{"spec_id":"spec-a","entries":[
+		{"event":"started","pid":1,"command":{"binary":"/opt/keep"}},
+		{"event":"start_failed","command":{"binary":"/opt/keep-too"}},
+		{"event":"exited","exit_code":1,"command":{"binary":"/opt/strip"}},
+		{"text":"plain output\n","command":{"binary":"/opt/strip"}},
+		{"event":"not-a-real-event","command":{"binary":"/opt/strip"}}]}`))
+
+	var got RuntimeLogBatchDTO
+	select {
+	case got = <-sub.ch:
+	case <-time.After(time.Second):
+		t.Fatal("nothing delivered")
+	}
+	if len(got.Entries) != 5 {
+		t.Fatalf("entries = %d, want 5", len(got.Entries))
+	}
+	for i, want := range []bool{true, true, false, false, false} {
+		has := got.Entries[i].Command != nil
+		if has != want {
+			t.Errorf("entry %d (%+v): command present = %v, want %v", i, got.Entries[i], has, want)
+		}
+	}
+	// And the unknown event kind is still stripped to a plain entry.
+	if got.Entries[4].Event != "" {
+		t.Errorf("entry 4 event = %q, want it stripped to a plain entry", got.Entries[4].Event)
+	}
+}
+
+// TestRuntimeLogCommandIsClampedOnIngest: the gateway never trusts an agent's
+// lengths or counts. Entries past the cap are dropped WHOLE (half an argument
+// is a value that looks real and is not) and Truncated is set, so a shortened
+// list is never rendered as a complete one.
+func TestRuntimeLogCommandIsClampedOnIngest(t *testing.T) {
+	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
+	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+
+	args := make([]string, runtimeLogMaxCommandEntries+50)
+	for i := range args {
+		args[i] = "--flag"
+	}
+	frame, err := json.Marshal(RuntimeLogBatchDTO{
+		SpecID: "spec-a",
+		Entries: []RuntimeLogEntryDTO{{
+			Event: "started",
+			PID:   1,
+			Command: &RuntimeLogCommandDTO{
+				Binary:  strings.Repeat("b", runtimeLogMaxCommandFieldLen+10),
+				WorkDir: strings.Repeat("w", runtimeLogMaxCommandFieldLen+10),
+				Args:    args,
+				Env:     []string{strings.Repeat("e", runtimeLogMaxCommandFieldLen+1), "PATH=/bin"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	srv.ingestRuntimeLog("srv-1", frame)
+
+	var got RuntimeLogBatchDTO
+	select {
+	case got = <-sub.ch:
+	case <-time.After(time.Second):
+		t.Fatal("nothing delivered")
+	}
+	cmd := got.Entries[0].Command
+	if cmd == nil {
+		t.Fatal("command was dropped entirely; want it clamped, not discarded")
+	}
+	if len(cmd.Binary) != runtimeLogMaxCommandFieldLen || len(cmd.WorkDir) != runtimeLogMaxCommandFieldLen {
+		t.Errorf("binary/work_dir lengths = %d/%d, want both clamped to %d", len(cmd.Binary), len(cmd.WorkDir), runtimeLogMaxCommandFieldLen)
+	}
+	if len(cmd.Args) > runtimeLogMaxCommandEntries {
+		t.Errorf("args = %d entries, want at most %d", len(cmd.Args), runtimeLogMaxCommandEntries)
+	}
+	if !cmd.Truncated {
+		t.Error("truncated = false although entries were dropped -- a shortened list must say so")
+	}
+	// The oversized env entry is dropped whole; the ordinary one survives.
+	if len(cmd.Env) != 1 || cmd.Env[0] != "PATH=/bin" {
+		t.Errorf("env = %v, want the oversized entry dropped whole and the ordinary one kept", cmd.Env)
+	}
+	total := 0
+	for _, str := range append(append([]string{}, cmd.Args...), cmd.Env...) {
+		total += len(str)
+	}
+	if total > runtimeLogMaxCommandBytes {
+		t.Errorf("relayed command is %d bytes, want at most %d", total, runtimeLogMaxCommandBytes)
+	}
+}
+
+// TestRuntimeLogCommandAuthorization: the command is argv and environment,
+// which is closer to user data than status ever was -- so the boundary it
+// crosses must be the SAME one, not a laxer one. A non-owner is refused with the
+// 404-no-leak collapse before any stream byte, and never even starts an agent
+// stream.
+func TestRuntimeLogCommandAuthorization(t *testing.T) {
+	srv := newRuntimeEventsTestServer(t)
+
+	// A non-owner asking for the stream that carries the command.
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/servers/"+runtimeEventsServerID+"/runtime/logs?spec_id=spec-a", nil)
+	req.Header.Set("Authorization", "Bearer "+runtimeEventsOtherSecret)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for a non-owner", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "binary") {
+		t.Fatalf("the refusal body mentions command fields: %s", rec.Body.String())
+	}
+
+	// And the fan-out key is (server, spec): a command reported for one server
+	// can never reach a viewer watching another, even for the same spec id.
+	sub, unsub := srv.RuntimeLogs.subscribe("srv-other", "spec-a")
+	defer unsub()
+	srv.ingestRuntimeLog(runtimeEventsServerID, json.RawMessage(
+		`{"spec_id":"spec-a","entries":[{"event":"started","pid":1,"command":{"binary":"/opt/secret-binary"}}]}`))
+	select {
+	case got := <-sub.ch:
+		t.Fatalf("a command reported for %q reached a subscriber of another server: %+v", runtimeEventsServerID, got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestRuntimeLogCommandNeverReachesDiskOrDatabase mirrors
+// TestRuntimeLogRelayNeverReachesDiskOrDatabase for the command. Same shape,
+// same reasoning, different payload: a resolved argv and environment is not
+// prompt text, but it is closer to user data than status ever was and has no
+// more business in the database than output does.
+func TestRuntimeLogCommandNeverReachesDiskOrDatabase(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.OpenSQLite(filepath.Join(dir, "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	srv := &Server{Routes: st, RuntimeLogs: newRuntimeLogRegistry()}
+
+	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+
+	const needle = "OP-AI-GATEWAY-ARGV-NEEDLE-8d1e"
+	frame, err := json.Marshal(RuntimeLogBatchDTO{
+		SpecID:     "spec-a",
+		Scrollback: true,
+		Entries: []RuntimeLogEntryDTO{{
+			Event: "started",
+			PID:   42,
+			Command: &RuntimeLogCommandDTO{
+				Binary:  "/opt/" + needle + "/server",
+				Args:    []string{"--alias", needle},
+				WorkDir: "/srv/" + needle,
+				Env:     []string{"MODEL_DIR=/srv/" + needle},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal frame: %v", err)
+	}
+	for range 50 {
+		srv.ingestRuntimeLog("srv-1", frame)
+		select {
+		case <-sub.ch: // keep draining so nothing is merely dropped
+		default:
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var offenders []string
+	if err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil //nolint:nilerr // an unreadable entry is not evidence of a write
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil //nolint:nilerr // same
+		}
+		if strings.Contains(string(raw), needle) {
+			offenders = append(offenders, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(offenders) != 0 {
+		t.Fatalf("a relayed launch command was persisted to %v -- argv and environment are volatile, relayed, forgotten, exactly like the output", offenders)
+	}
+}
+
+// TestRuntimeLogCommandSurvivesTheWireVerbatim asserts the end-to-end wire
+// contract on the RAW SSE bytes, naming no Go type at all.
+//
+// That is the point of it: every other test here reads the DTO, so all of them
+// would keep passing if the gateway silently DROPPED the command on the way
+// through -- json.Unmarshal ignores a field the struct does not model, and the
+// re-marshalled frame would simply lose it, with no error anywhere. Reading the
+// bytes the browser actually receives is the only assertion that catches that,
+// and it is exactly what a version of this gateway without the field does.
+func TestRuntimeLogCommandSurvivesTheWireVerbatim(t *testing.T) {
+	srv := newRuntimeEventsTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp := runtimeLogRequest(t, ts, runtimeEventsOwnerSecret, "?spec_id=spec-a")
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	if event, _ := readPerfSSEFrame(t, reader, 3*time.Second); event != "status" {
+		t.Fatalf("first event = %q, want status", event)
+	}
+
+	srv.ingestRuntimeLog(runtimeEventsServerID, json.RawMessage(`{
+		"spec_id":"spec-a","scrollback":true,
+		"entries":[{"event":"started","pid":4711,
+			"command":{"binary":"/opt/llama/llama-server",
+				"args":["--port","54331"],"env":["CUDA_VISIBLE_DEVICES=2,3"]}}]}`))
+
+	event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+	if event != "log" {
+		t.Fatalf("event = %q, want log", event)
+	}
+	for _, want := range []string{`"event":"started"`, `"command"`, `"binary":"/opt/llama/llama-server"`, `"54331"`, `"CUDA_VISIBLE_DEVICES=2,3"`} {
+		if !strings.Contains(data, want) {
+			t.Fatalf("the SSE frame the browser receives does not contain %s -- the command was dropped in transit.\nframe: %s", want, data)
+		}
+	}
+}

@@ -6,6 +6,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -288,4 +289,356 @@ func TestManagerLastErrorStderrTailStillWorks(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// --- the resolved launch command, against a live process -------------------
+
+// waitForCommand polls the spec's retained history until the newest
+// command-carrying marker in a scrollback snapshot satisfies ok, then returns
+// that ENTRY -- marker and command together, since the pid the command belongs
+// to lives on the marker. Polling for the same reason waitForLog does: the
+// child, os/exec's copying goroutines and the manager's owner goroutine all move
+// on their own schedules.
+func waitForCommand(t *testing.T, m *Manager, specID, what string, ok func(LogEntry) bool) LogEntry {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last LogEntry
+	for {
+		m.Logs().SetWatch([]string{specID})
+		for _, b := range m.Logs().Drain() {
+			if b.SpecID != specID || !b.Scrollback {
+				continue
+			}
+			// The NEWEST opening marker: that is the generation whose output is
+			// at the tail, and the one a caller asking "what is running" means.
+			for _, e := range b.Entries {
+				if e.Command != nil {
+					last = e
+				}
+			}
+			if ok(last) {
+				return last
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spec %q never reported a command satisfying %s; last: %+v", specID, what, last)
+		}
+		m.Logs().SetWatch(nil)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestManagerReportsTheCommandItActuallyExecuted is the acceptance case: a real
+// child is launched from a spec written as a TEMPLATE, and what the operator
+// gets back is the resolved command -- the ephemeral ${PORT} as a number, and
+// the real pid of the process whose output sits underneath it.
+//
+// Against the commit this branch starts from nothing retained the resolved argv
+// at all: ExpandPlaceholders built it, exec.Command consumed it, and it was
+// dropped.
+func TestManagerReportsTheCommandItActuallyExecuted(t *testing.T) {
+	shrinkTimings(t)
+	// A getenv that actually defines PATH, so the reported environment is the
+	// real agent-provided base block rather than an empty one -- "the complete
+	// environment the child received" is one of the four things this reports,
+	// and an all-empty getenv would make that assertion vacuous.
+	m := NewManager(ManagerOptions{
+		Policy: allowlistPolicy(),
+		Getenv: func(k string) string {
+			if k == "PATH" {
+				return "/usr/bin:/bin"
+			}
+			return ""
+		},
+	})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-cmd", "cmd-model")
+	spec.Args = append(stubArgs(0, 0, 0, ""), "-alias", "${MODEL}")
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	marker := waitForCommand(t, m, "spec-cmd", "a started marker carrying a command", func(e LogEntry) bool {
+		return e.Command != nil && e.Event == logEventStarted && e.PID > 0
+	})
+	cmd := marker.Command
+
+	if cmd.Binary != stubchildPath {
+		t.Errorf("binary = %q, want %q", cmd.Binary, stubchildPath)
+	}
+	joined := strings.Join(cmd.Args, " ")
+	if strings.Contains(joined, "${PORT}") || strings.Contains(joined, "${MODEL}") {
+		t.Fatalf("args = %q still carry a template placeholder -- the operator would be reading what they typed, not what ran", joined)
+	}
+	if !strings.Contains(joined, "-alias cmd-model") {
+		t.Errorf("args = %q, want ${MODEL} resolved to the spec's upstream_model", joined)
+	}
+	// The port must be the one the process is actually listening on, which is
+	// also what the status row reports -- if these two ever disagree the panel
+	// is describing a different process.
+	st := statusFor(m, "spec-cmd")
+	if st == nil || st.Port == 0 {
+		t.Fatalf("status = %+v, want a running process with a port", st)
+	}
+	if !strings.Contains(joined, "-port "+strconv.Itoa(st.Port)) {
+		t.Errorf("args = %q, want the resolved port %d that the status row reports", joined, st.Port)
+	}
+	if marker.PID != st.PID {
+		t.Errorf("marker pid = %d, status pid = %d -- the command must belong to the generation whose output is being read", marker.PID, st.PID)
+	}
+	// The environment is the complete, agent-built block the child received.
+	if v, ok := envValue(cmd.Env, "PATH"); !ok || v != "/usr/bin:/bin" {
+		t.Errorf("env PATH = %q (present=%v), want the minimal base environment the child was actually given", v, ok)
+	}
+}
+
+// TestManagerReportsEachGenerationsOwnCommand: ${PORT} is resolved afresh on
+// every start, so across a crash loop the command DIFFERS between attempts. With
+// the command on each generation's opening marker, the buffer shows every
+// attempt's own -- attribution by construction rather than by a rule about which
+// one to display, and the per-attempt difference is visible instead of collapsed
+// into "the latest".
+func TestManagerReportsEachGenerationsOwnCommand(t *testing.T) {
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-loop", "loop-model")
+	spec.Args = stubArgs(0, 80*time.Millisecond, 3, "")
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	// Read the markers from ONE snapshot: two snapshots would let a restart
+	// slip between the reads.
+	var batch LogBatch
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		m.Logs().SetWatch([]string{"spec-loop"})
+		for _, b := range m.Logs().Drain() {
+			if b.SpecID != "spec-loop" || !b.Scrollback {
+				continue
+			}
+			if countEvents(b, logEventStarted) >= 2 {
+				batch = b
+			}
+		}
+		if batch.SpecID != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the crash loop never produced two generations in one snapshot")
+		}
+		m.Logs().SetWatch(nil)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var seenPorts, seenPIDs []string
+	for _, e := range batch.Entries {
+		if e.Event != logEventStarted {
+			continue
+		}
+		if e.Command == nil {
+			t.Fatalf("a started marker carries no command: %+v", e)
+		}
+		if e.PID <= 0 {
+			t.Errorf("started marker pid = %d, want the real child pid", e.PID)
+		}
+		args := strings.Join(e.Command.Args, " ")
+		if strings.Contains(args, "${PORT}") {
+			t.Fatalf("marker for pid %d reports the template, not the command: %q", e.PID, args)
+		}
+		seenPIDs = append(seenPIDs, strconv.Itoa(e.PID))
+		for i, a := range e.Command.Args {
+			if a == "-port" && i+1 < len(e.Command.Args) {
+				seenPorts = append(seenPorts, e.Command.Args[i+1])
+			}
+		}
+	}
+	if len(seenPorts) < 2 {
+		t.Fatalf("found %d per-generation commands, want one per attempt (ports %v)", len(seenPorts), seenPorts)
+	}
+	// Each attempt grabbed its own ephemeral port, so the commands must differ
+	// -- which is exactly what a single "latest command" view cannot show.
+	if seenPorts[0] == seenPorts[len(seenPorts)-1] {
+		t.Errorf("every attempt reports port %s; the resolved port should differ per generation (pids %v)", seenPorts[0], seenPIDs)
+	}
+}
+
+// TestManagerReportsTheCommandOfAFailedExec: a spec whose exec fails prints
+// nothing at all, so the resolved command is the ONLY content the log view has
+// -- and it is exactly the case where the difference between the template and
+// what ran is most likely to BE the bug (a binary or work_dir that is not what
+// the operator thinks).
+func TestManagerReportsTheCommandOfAFailedExec(t *testing.T) {
+	shrinkTimings(t)
+	missing := filepath.Join(t.TempDir(), "not-installed")
+	m := NewManager(ManagerOptions{
+		Policy: LocalPolicy{AllowedBinaries: []string{missing}},
+		Getenv: func(string) string { return "" },
+	})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-noexec", "noexec-model")
+	spec.Binary = missing
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	marker := waitForCommand(t, m, "spec-noexec", "the attempted command of a failed exec", func(e LogEntry) bool {
+		return e.Command != nil
+	})
+	if marker.Event != logEventStartFailed {
+		t.Errorf("event = %q, want %q: a marker claiming output begins here would be a lie", marker.Event, logEventStartFailed)
+	}
+	if marker.PID != 0 {
+		t.Errorf("marker pid = %d, want 0: the exec failed, so no process ever existed", marker.PID)
+	}
+	if marker.Command.Binary != missing {
+		t.Errorf("command binary = %q, want the binary the failed exec attempted (%q)", marker.Command.Binary, missing)
+	}
+}
+
+// TestManagerResolvedCommandMasksASecretButNotThePort is the security property
+// end to end, through the real launch path rather than against the masking
+// helper: a ${AGENT_ENV:NAME} secret placed in an ARGUMENT is masked in what the
+// agent retains, while the resolved port beside it stays visible.
+//
+// It also asserts the store never held the plaintext at all -- masking happens
+// where the substitution happens, so there is nothing for a later bug in the
+// store, the drain or the frame to leak.
+func TestManagerResolvedCommandMasksASecretButNotThePort(t *testing.T) {
+	shrinkTimings(t)
+	const secret = "op-ai-gateway-argv-secret-7c1a"
+	m := NewManager(ManagerOptions{
+		Policy: allowlistPolicy(),
+		Getenv: func(k string) string {
+			if k == "MODEL_TOKEN" {
+				return secret
+			}
+			return ""
+		},
+	})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-secret", "secret-model")
+	spec.Args = append(stubArgs(0, 0, 0, ""), "-alias", "${AGENT_ENV:MODEL_TOKEN}")
+	spec.Env = map[string]string{"MODEL_TOKEN": "${AGENT_ENV:MODEL_TOKEN}"}
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	cmd := waitForCommand(t, m, "spec-secret", "a started marker carrying a command", func(e LogEntry) bool {
+		return e.Command != nil && e.PID > 0
+	}).Command
+
+	joined := strings.Join(cmd.Args, " ") + " " + strings.Join(cmd.Env, " ")
+	if strings.Contains(joined, secret) {
+		t.Fatalf("the retained command carries the resolved secret: %q", joined)
+	}
+	if !strings.Contains(strings.Join(cmd.Args, " "), "-alias ${AGENT_ENV:MODEL_TOKEN}") {
+		t.Errorf("args = %v, want the masked argument to read as its own placeholder", cmd.Args)
+	}
+	if v, ok := envValue(cmd.Env, "MODEL_TOKEN"); !ok || v != "${AGENT_ENV:MODEL_TOKEN}" {
+		t.Errorf("env MODEL_TOKEN = %q (present=%v), want the placeholder, with the key intact", v, ok)
+	}
+	if !cmd.Masked {
+		t.Error("Masked = false although a secret was masked")
+	}
+	st := statusFor(m, "spec-secret")
+	if st == nil || st.Port == 0 {
+		t.Fatalf("status = %+v, want a running process", st)
+	}
+	if !strings.Contains(strings.Join(cmd.Args, " "), "-port "+strconv.Itoa(st.Port)) {
+		t.Errorf("args = %v, want the resolved port still visible beside the mask -- masking must not cost the panel its usefulness", cmd.Args)
+	}
+}
+
+// TestManagerResolvedCommandIsNotWrittenToDisk mirrors
+// TestManagerLogRetentionIsNotWrittenToDisk for the command: it is a resolved
+// argv and environment, which is closer to user data than status ever was, and
+// it has exactly as little business on disk as the output does.
+//
+// Two needles, because they fail differently: one in a plain ARGUMENT (which
+// the retained command shows, so a persisting bug would write it out verbatim)
+// and one behind ${AGENT_ENV:...} (which the retained command masks, so finding
+// it anywhere means the masking was bypassed rather than merely persisted).
+func TestManagerResolvedCommandIsNotWrittenToDisk(t *testing.T) {
+	shrinkTimings(t)
+
+	sandbox := t.TempDir()
+	t.Setenv("TMPDIR", sandbox)
+	t.Setenv("HOME", sandbox)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(sandbox); err != nil {
+		t.Fatalf("chdir sandbox: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	const argNeedle = "op-ai-gateway-argv-needle-2e8b"
+	const secretNeedle = "op-ai-gateway-secret-needle-5a4d"
+	m := NewManager(ManagerOptions{
+		Policy: allowlistPolicy(),
+		Getenv: func(k string) string {
+			if k == "MODEL_TOKEN" {
+				return secretNeedle
+			}
+			return ""
+		},
+	})
+	t.Cleanup(m.Close)
+
+	spec := baseSpec("spec-argv-needle", "argv-needle-model")
+	spec.Args = append(stubArgs(0, 0, 0, ""), "-alias", argNeedle)
+	spec.Env = map[string]string{"MODEL_TOKEN": "${AGENT_ENV:MODEL_TOKEN}"}
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	// Wait until the command has actually been retained, so this is not a race
+	// that passes because nothing happened yet.
+	cmd := waitForCommand(t, m, "spec-argv-needle", "the retained command", func(e LogEntry) bool {
+		return e.Command != nil && e.PID > 0
+	}).Command
+	if !strings.Contains(strings.Join(cmd.Args, " "), argNeedle) {
+		t.Fatalf("args = %v, want the argument needle: this test proves nothing if the value was never retained", cmd.Args)
+	}
+
+	var offenders []string
+	err = filepath.WalkDir(sandbox, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // an unreadable entry is not evidence of a write
+		}
+		for _, needle := range []string{argNeedle, secretNeedle} {
+			if strings.Contains(d.Name(), needle) {
+				offenders = append(offenders, path+" (filename)")
+				return nil
+			}
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil //nolint:nilerr // same
+		}
+		for _, needle := range []string{argNeedle, secretNeedle} {
+			if strings.Contains(string(raw), needle) {
+				offenders = append(offenders, path+" (contents)")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk sandbox: %v", err)
+	}
+	if len(offenders) != 0 {
+		t.Fatalf("the resolved launch command reached disk at %v -- argv and environment are never persisted, exactly like the output", offenders)
+	}
+}
+
+// countEvents counts markers of one kind in a snapshot.
+func countEvents(b LogBatch, event string) int {
+	n := 0
+	for _, e := range b.Entries {
+		if e.Event == event {
+			n++
+		}
+	}
+	return n
 }

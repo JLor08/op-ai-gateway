@@ -119,10 +119,17 @@ export interface RuntimeStatus {
 //  - `text` is verbatim process output (stdout and stderr interleaved as the
 //    process produced them). NEVER render it as HTML.
 //  - `event` is a structural boundary between two runs of the same spec, from
-//    a CLOSED set the backend allow-lists: 'started' (with `pid`) and
-//    'exited' (with `exit_code`). The portal owns the wording, which is why the
-//    set is closed -- an agent must not be able to put free text where the
-//    operator reads a portal-authored sentence.
+//    a CLOSED set the backend allow-lists: 'started' (with `pid`), 'exited'
+//    (with `exit_code`), and 'start_failed' -- a generation whose exec itself
+//    failed, so it has no pid, will produce no output, and has no exit code
+//    coming. The portal owns the wording, which is why the set is closed -- an
+//    agent must not be able to put free text where the operator reads a
+//    portal-authored sentence.
+//
+// `command` appears ONLY on an opening marker ('started' / 'start_failed') and
+// carries that generation's resolved launch command. Render it as part of that
+// marker's block: it describes the process whose output follows, and only that
+// one.
 //
 // `dropped_bytes` is the overflow marker: N bytes the process printed are
 // missing immediately BEFORE this entry. It is produced wherever output can be
@@ -138,6 +145,54 @@ export interface RuntimeLogEntry {
   dropped_bytes?: number;
   event?: string;
   exit_code?: number;
+  command?: RuntimeLogCommand;
+}
+
+// The RESOLVED launch command of ONE generation: what the agent actually
+// exec'd, with every `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and
+// `${AGENT_ENV:NAME}` already substituted. Mirrors RuntimeLogCommandDTO
+// (gateway/backend/internal/gateway/runtime_logs.go), which mirrors the agent's
+// runtime.ResolvedCommand — and that file
+// (server-agent/internal/runtime/command.go) is where the masking rule is
+// documented in full.
+//
+// It arrives on the generation's OPENING MARKER entry and carries no pid of its
+// own: the marker has one. That is what makes attribution structural rather
+// than a rule — a crash loop shows each attempt's own command beside its own
+// output, including the fact that `${PORT}` differed between attempts.
+//
+// What a renderer must get right, because each of these is a way to lie to the
+// operator:
+//
+//  - **Render it with its marker, never on its own.** A command detached from
+//    the marker it arrived on would be a claim about which generation it
+//    describes, and that claim is exactly what this design removed the need for.
+//  - `masked: true` means at least one value was replaced by its own
+//    `${AGENT_ENV:NAME}` placeholder. The placeholder IS the mask: it is
+//    unmistakably not a value, and it names the variable that supplied it. Say
+//    so rather than hoping the operator recognises the syntax.
+//  - `truncated: true` means arguments or env entries are MISSING. State it,
+//    on the same reasoning as `dropped_bytes`: a shortened list rendered as a
+//    complete one is a lie about what ran.
+//  - **An opening marker can be evicted** from the agent's bounded buffer, so
+//    output can arrive with no command anywhere before it. That must be stated,
+//    not left to read as "there was no command" — same rule as `dropped_bytes`.
+//  - There is deliberately NO copy affordance, and adding one would be a
+//    regression, not a feature. Even unmasked, this is not a runnable command
+//    line: `env` REPLACES the environment rather than adding to it, the port
+//    was ephemeral and is stale by the time anyone reads it, and a
+//    `set_visible_devices` child renumbers its GPUs from zero. A copy button
+//    would promise reproduction and deliver a broken paste.
+//
+// `binary`, `args`, `work_dir` and `env` are agent/operator-authored strings.
+// Render them as text; NEVER as HTML.
+export interface RuntimeLogCommand {
+  binary?: string;
+  args?: string[];
+  work_dir?: string;
+  env?: string[];
+  masked?: boolean;
+  truncated?: boolean;
 }
 
 // One `log` SSE frame: the entries an agent flushed for one spec.
@@ -148,6 +203,11 @@ export interface RuntimeLogEntry {
 // history. An EMPTY scrollback is itself an answer -- "the agent's buffer holds
 // nothing", which is what an agent restart leaves behind -- and must be
 // rendered as such rather than looking like "nothing has arrived yet".
+//
+// The resolved launch command travels inside `entries`, on each generation's
+// opening marker (`RuntimeLogEntry.command`), not as a field here: a batch is a
+// time-slice that can span two generations, and a command belongs to exactly
+// one.
 export interface RuntimeLogBatch {
   spec_id: string;
   scrollback?: boolean;
