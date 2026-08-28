@@ -661,6 +661,48 @@ thing that ever retries a bind that failed once, for example a port still held
 by a previous process at boot. Symmetrically, after `Close` a late in-flight
 sync must not resurrect the listener.
 
+### 4.7 The router has two ways in, and only one of them is a socket
+
+Under `cert_mode=proxy` the mesh listener above is *not* how the gateway
+reaches this router. The gateway publishes the agent's TLS-proxy route for the
+`server_agent` application with a hard-wired `http://127.0.0.1:<app.Port>`
+upstream, while §4.6's derivation binds the router on the agent's **mesh
+identity** instead — so the dial had nothing to reach and every proxied
+request was a `502`. The agent-side fix keeps the proxy terminating TLS exactly
+as before and hands the request to the router's `http.Handler` **in process**
+whenever the route's upstream is a loopback target on the router's currently
+published port. See
+[`certificates-tls.md` §6](certificates-tls.md#6-the-agent-side-tls-terminating-reverse-proxy-cert_modeproxy)
+for the proxy half and the predicate that guards it.
+
+Two properties of the publish site (`runtime.Driver.publishLocalRouter`,
+`local_router.go`) are load-bearing:
+
+- **One router instance serves both paths.** One `http.Transport`, one
+  connection pool to the managed children. Two instances would silently split
+  keep-alives and double the pool.
+- **The publish happens *before* `net.Listen`**, and a failed bind does not
+  retract it. This is a deliberate departure from "the router is up exactly
+  when its listener is up": the socket is one of two ways in, and the other
+  does not need it, so a mesh bind that fails still leaves the proxied path
+  serving. Consequently the clear lives in `Close` (and in `StartRouter(0)`,
+  which means *no `server_agent` application*), **not** in `stopRouterLocked`
+  — `StartRouter` calls that on every 60 s retry, where clearing would blink
+  the in-process path off once a minute for as long as a bind kept failing.
+  A retry also **reuses** the already-published handler rather than building a
+  fresh router, so the connection pool survives it.
+
+The port and the handler live in **one** reference swapped atomically, so a
+reader can never observe a fresh port beside a stale handler. `StartRouter(0)`
+clears it, which is what lets a disabled runtime fall back cleanly to the
+dialled upstream's pre-existing semantics.
+
+Note the consequence for `runtime_router_bind`: after this change a loopback
+override is no longer needed to make the *proxied* path work, and it is no
+longer free — it confines the router to loopback, so an application routed as
+plain `http` to that same port becomes unreachable from the gateway. The agent
+says so at Warn on startup when it sees that combination.
+
 ## 5. Admission control
 
 ### 5.1 The per-GPU data model

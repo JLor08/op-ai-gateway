@@ -246,8 +246,12 @@ type Manager struct {
 	// Purely observational (Status()/telemetry) -- reconcileLocked's
 	// keep-on-transient-error / stop-on-not-desired decisions never read it.
 	states map[int]RouteState
-	closed bool
-	wg     sync.WaitGroup // tracks serve goroutines for deterministic Close
+	// localUpstream resolves a LOOPBACK upstream port to an in-process
+	// handler, or nil to dial it as usual. nil (the default) disables the
+	// in-process path entirely. See SetLocalUpstream in local_upstream.go.
+	localUpstream func(port int) http.Handler
+	closed        bool
+	wg            sync.WaitGroup // tracks serve goroutines for deterministic Close
 }
 
 // New creates a Manager reading its leaf from certDir. host is the listener
@@ -406,7 +410,19 @@ func (m *Manager) startProxyLocked(r Route) {
 		upstream: r.Upstream,
 		ln:       ln,
 	}
-	rp.server = &http.Server{Handler: newReverseProxy(target)}
+	// The dialled reverse proxy is still what this route IS; the in-process
+	// hand-off only intercepts the one upstream shape that can name a handler
+	// living in this same process (see loopbackUpstreamPort's contract, which
+	// is deliberately narrow -- a rejection just dials, as before). Wrapping
+	// happens here, at listener start, but the RESOLUTION inside the wrapper
+	// happens per request; see localFirst.
+	var handler http.Handler = newReverseProxy(target)
+	if m.localUpstream != nil {
+		if port, ok := loopbackUpstreamPort(target); ok {
+			handler = &localFirst{resolve: m.localUpstream, port: port, fallback: handler}
+		}
+	}
+	rp.server = &http.Server{Handler: handler}
 	m.running[r.Listen] = rp
 	m.states[r.Listen] = StateActive
 

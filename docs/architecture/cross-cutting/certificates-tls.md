@@ -225,6 +225,30 @@ additionally runs its own TLS-terminating reverse proxy
   changed, or that is no longer desired, drains off-lock (bounded 3s grace)
   while the accept loop for a replacement can rebind the just-freed port
   immediately.
+- **The in-process upstream.** One upstream is *not* dialled: a route whose
+  upstream is a **loopback** target (`http://127.0.0.1:<port>`, no path, no
+  query) on the port the agent's **own runtime router** is currently published
+  on is handed to that router's `http.Handler` **in process**
+  (`proxy.Manager.SetLocalUpstream`, wired in `server-agent/main.go` to
+  `runtime.Driver.LocalRouter`). For that one route the upstream string stops
+  being an *address* and becomes a *route key* the agent resolves locally.
+  This exists because the two ends disagreed: the gateway hard-wires every
+  upstream to `http://127.0.0.1:<app.Port>`, while under `cert_mode=proxy` the
+  runtime router binds the agent's **mesh identity** (§4.6 of
+  [`agent-runtime-manager.md`](agent-runtime-manager.md)), so nothing listened
+  on that loopback address and every proxied request to a `server_agent`
+  application was a `502` — one that could never self-heal, because the proxy
+  listener itself *was* up, so the agent kept reporting `tls_active=true` and
+  the switch reconcile never reverted. The predicate
+  (`proxy.loopbackUpstreamPort`) is a **security boundary** and is deliberately
+  narrow — plaintext `http`, no opaque/userinfo/fragment, empty or `/` path, no
+  query, host exactly `localhost` or a loopback IP literal, an explicit port in
+  1..65535 — because a false positive diverts a request meant for another host
+  into this agent's router, while a false negative merely dials, as before.
+  The resolution happens **per request**, not once at listener start: the route
+  set arrives on the certificate cadence and the router port on the runtime
+  cadence, so a one-shot decision would freeze whichever won that race. No
+  gateway change, no wire-format change, no feature negotiation.
 - **Local override.** `cert_proxy_routes` + `cert_proxy_routes_mode`
   (`fallback`/`override`) let an operator add or override routes the gateway
   did not send, merged by listen port.
