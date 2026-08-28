@@ -251,8 +251,15 @@ func TestResolvedCommandFileModeMasksSpecEnvValues(t *testing.T) {
 	if v, _ := envValue(cmd.Env, "GGML_CUDA_FORCE_MMQ"); v != envRedactedMask {
 		t.Errorf("GGML_CUDA_FORCE_MMQ = %q, want the mask: in file mode the rule is the field, not a guess about which value looks secret", v)
 	}
-	if !cmd.Masked {
-		t.Error("Masked = false although file mode masked the spec's env values")
+	// EnvRedacted, and NOT Masked: the two flags are two different reasons for
+	// withholding, and the portal renders a different sentence for each. Raising
+	// Masked here would tell a file-mode operator to go and check an
+	// ${AGENT_ENV:NAME} variable that nothing in this spec ever named.
+	if !cmd.EnvRedacted {
+		t.Error("EnvRedacted = false although file mode withheld the spec's env values")
+	}
+	if cmd.Masked {
+		t.Error("Masked = true although nothing in this spec came from ${AGENT_ENV:...}: that flag is the placeholder rule, and this mask is not a placeholder")
 	}
 	// The keys, and everything the report already carries, stay visible.
 	if _, ok := envValue(cmd.Env, "HF_TOKEN"); !ok {
@@ -290,6 +297,39 @@ func TestResolvedCommandFileModeStillMasksASecretInAnArgument(t *testing.T) {
 		if got := joinArgs(cmd.Args); strings.Contains(got, "hf_secret") {
 			t.Fatalf("fromFile=%v: args = %q carry the resolved secret", fromFile, got)
 		}
+		if !cmd.Masked {
+			t.Errorf("fromFile=%v: Masked = false although an argument came from ${AGENT_ENV:HF_TOKEN}", fromFile)
+		}
+	}
+}
+
+// TestResolvedCommandReportsBothWithholdingReasonsAtOnce: Masked and
+// EnvRedacted are independent, and a file-mode spec that ALSO resolves a
+// placeholder into an argument raises both. One flag could not say that, and
+// the portal stacks one sentence per reason -- the operator has a host variable
+// to go and check AND a local document whose env values are being withheld.
+func TestResolvedCommandReportsBothWithholdingReasonsAtOnce(t *testing.T) {
+	spec := Spec{
+		Binary: "/opt/vllm/vllm",
+		Args:   []string{"--api-key", "${AGENT_ENV:HF_TOKEN}"},
+		Env:    map[string]string{"HF_HOME": "/srv/cache"},
+	}
+	getenv := func(k string) string {
+		if k == "HF_TOKEN" {
+			return "hf_secret"
+		}
+		return ""
+	}
+	cmd := commandFor(t, spec, 1, GPUVendorNone, getenv, true)
+
+	if !cmd.Masked {
+		t.Error("Masked = false although the argument came from ${AGENT_ENV:HF_TOKEN}")
+	}
+	if !cmd.EnvRedacted {
+		t.Error("EnvRedacted = false although file mode withheld the spec's own env value")
+	}
+	if v, ok := envValue(cmd.Env, "HF_HOME"); !ok || v != envRedactedMask {
+		t.Errorf("HF_HOME = %q (present=%v), want the report's own mask: the file-mode env rule is ADDITIONAL to the placeholder rule", v, ok)
 	}
 }
 

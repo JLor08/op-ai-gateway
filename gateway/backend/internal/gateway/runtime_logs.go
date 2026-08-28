@@ -180,18 +180,33 @@ type RuntimeLogEntryDTO struct {
 // guarantee. So the gateway clamps sizes -- it never trusts an agent's
 // lengths or counts -- and relays the rest verbatim.
 //
-// Masked says at least one value was replaced by its ${AGENT_ENV:NAME}
-// placeholder. Truncated says entries are missing -- set by the agent when the
+// Masked and EnvRedacted are the agent's two WITHHOLDING REASONS, one flag
+// each, relayed verbatim like everything else here. They are independent and
+// both can be set on the same command:
+//
+//   - Masked: at least one value was replaced by its own ${AGENT_ENV:NAME}
+//     placeholder, which names a variable on the AI server that the operator
+//     can go and check.
+//   - EnvRedacted: the agent takes its specs from a local file, so at least
+//     one spec-supplied env VALUE was withheld in full (key intact) -- the same
+//     line the upward report draws around a document the gateway does not own.
+//     There is no placeholder and nothing to look up.
+//
+// One flag for two reasons would leave the portal unable to say which mask an
+// operator is looking at, and it renders a different sentence for each.
+//
+// Truncated says entries are missing -- set by the agent when the
 // command exceeded its own cap, and by sanitizeRuntimeLogCommand when it
 // exceeded the gateway's. Args and Env are agent/operator-authored strings:
 // render them as text, never as HTML.
 type RuntimeLogCommandDTO struct {
-	Binary    string   `json:"binary,omitempty"`
-	Args      []string `json:"args,omitempty"`
-	WorkDir   string   `json:"work_dir,omitempty"`
-	Env       []string `json:"env,omitempty"`
-	Masked    bool     `json:"masked,omitempty"`
-	Truncated bool     `json:"truncated,omitempty"`
+	Binary      string   `json:"binary,omitempty"`
+	Args        []string `json:"args,omitempty"`
+	WorkDir     string   `json:"work_dir,omitempty"`
+	Env         []string `json:"env,omitempty"`
+	Masked      bool     `json:"masked,omitempty"`
+	EnvRedacted bool     `json:"env_redacted,omitempty"`
+	Truncated   bool     `json:"truncated,omitempty"`
 }
 
 // RuntimeLogBatchDTO is one SSE `log` frame: the entries an agent flushed for

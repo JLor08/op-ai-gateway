@@ -691,9 +691,13 @@ const de = {
   runtimeCommandStartFailedHint:
     'Dieser Versuch hat keinen Prozess erzeugt: der Aufruf selbst ist gescheitert. Es gibt daher keine Ausgabe — der Befehl hier ist alles, was vorliegt. Binärdatei und Arbeitsverzeichnis zuerst prüfen.',
   runtimeCommandNotRetained:
-    'Die angezeigte Ausgabe beginnt ohne Startmarkierung: der Agent hält sie nicht mehr vor. Für diese Generation ist daher auch der ausgeführte Befehl nicht mehr verfügbar — das heißt nicht, dass keiner gemeldet wurde. Späteren Generationen liegt ihr Befehl weiterhin bei.',
+    'Der Agent hat seinen vorgehaltenen Verlauf vollständig gesendet, und dieser beginnt ohne Startmarkierung: Er hält die Startmarkierung dieser Generation nicht mehr vor und damit auch nicht ihren ausgeführten Befehl — das heißt nicht, dass keiner gemeldet wurde. Erneutes Öffnen bringt ihn nicht zurück; späteren Generationen liegt ihr Befehl weiterhin bei.',
+  runtimeCommandTrimmedHere:
+    'Die angezeigte Ausgabe beginnt ohne Startmarkierung, weil diese Ansicht ihre eigenen ältesten Einträge entfernt hat — nicht, weil der Agent sie nicht mehr vorhält. Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf neu zu laden: Hält er die Startmarkierung dieser Generation noch, kommt ihr ausgeführter Befehl mit.',
   runtimeCommandMasked:
-    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert: sie liegen ausschließlich auf dem AI-Server und erreichen das Gateway nicht. Der Platzhalter nennt die Variable, die nachzusehen ist.',
+    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert — der Platzhalter nennt die Variable, die auf dem AI-Server nachzusehen ist. Diese Maskierung gilt für den hier gemeldeten Befehl und für nichts darüber hinaus: Ein Modellserver, der beim Start seine eigene Befehlszeile oder Umgebung ausgibt, schreibt den aufgelösten Wert in die Ausgabe unten und in den Fehlerauszug auf der Runtime-Seite. Was der Prozess selbst ausgibt, kann der Agent nicht maskieren — deshalb gehört ein Geheimnis als „${AGENT_ENV:NAME}“ nach „env“ und niemals als Klartext in ein Argument.',
+  runtimeCommandEnvRedacted:
+    'Dieser Agent bezieht seine Startspezifikationen aus einer lokalen Datei. Deshalb wird jeder Wert, den die Spezifikation selbst unter „env“ setzt, vollständig zurückgehalten: Der Schlüssel bleibt sichtbar, der Wert wird durch eine Maske ersetzt. Das ist dieselbe Grenze, die der Bericht des Agenten an das Gateway bereits zieht — eine lokale Datei ist das Dokument des Betreibers und darf einen Wert im Klartext enthalten. Es gibt hier keinen Platzhalter und nichts nachzuschlagen. Argumente fallen nicht darunter: Ein Argument wird so gemeldet, wie es geschrieben wurde.',
   runtimeCommandTruncated:
     'Der Befehl war zu lang, um vollständig gemeldet zu werden: einzelne Argumente oder Umgebungsvariablen fehlen hier.',
   runtimeCommandBinary: 'Binärdatei',
@@ -2605,9 +2609,13 @@ const en: PortalMessages = {
   runtimeCommandStartFailedHint:
     'This attempt produced no process: the exec itself failed. That is also why there is no output — this command is all there is. Check the binary and the working directory first.',
   runtimeCommandNotRetained:
-    'The output shown begins without a start marker: the agent no longer retains it. The executed command for that generation is therefore gone too — which does not mean none was reported. Later generations still carry theirs.',
+    "The agent sent its retained history in full and it begins without a start marker: the agent no longer holds that generation's marker, and with it its executed command — which does not mean none was reported. Reopening will not bring it back; later generations still carry theirs.",
+  runtimeCommandTrimmedHere:
+    "The output shown begins without a start marker because this view trimmed its own oldest entries, not because the agent stopped retaining them. Reopen the window to load the agent's retained history again — if it still holds that generation's marker, its executed command comes with it.",
   runtimeCommandMasked:
-    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value: they live only on the AI server and do not reach the gateway. The placeholder names the variable to go and check.',
+    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value — the placeholder names the variable to go and check on the AI server. That masking covers this reported command and nothing beyond it: a model server that prints its own command line or environment at startup writes the resolved value into the output below, and into the error tail on the runtime screen. Nothing the agent does can mask what the process itself prints — which is why a secret belongs in "env" as "${AGENT_ENV:NAME}" and never as plain text in an argument.',
+  runtimeCommandEnvRedacted:
+    'This agent takes its launch specs from a local file, so every value the spec itself sets in "env" is withheld in full: the key stays visible, the value is replaced by a mask. That is the same line the agent\'s report to the gateway already draws — a local file is the operator\'s own document and may legitimately hold a plain-text value. There is no placeholder here and nothing to look up. Arguments are not covered: an argument is reported exactly as it was written.',
   runtimeCommandTruncated:
     'The command was too long to report in full: some arguments or environment entries are missing here.',
   runtimeCommandBinary: 'Binary',

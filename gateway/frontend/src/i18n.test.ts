@@ -2102,3 +2102,60 @@ describe('runtime-spec arguments-field i18n keys', () => {
     }
   });
 });
+
+// The operator-facing strings of the resolved-command block are the ones an
+// operator ACTS on, so their scope has to match the scope the code actually
+// has. These are content assertions: they pin what the sentences claim, and
+// cannot verify that the claim is true -- that is what command.go's own tests
+// and §14.7 are for. They exist because this exact string once carried a
+// guarantee the dialog rendering it could not keep.
+describe('resolved-command masking strings state their own scope', () => {
+  it('never claims a masked value does not reach the gateway', () => {
+    // False in the very dialog that renders it: a spec with
+    // args: ["--api-key", "${AGENT_ENV:HF_TOKEN}"] runs a model server that
+    // prints its full argv at startup -- llama.cpp and vLLM both do -- and the
+    // agent captures that line into the same stream, ten lines below the alert.
+    // last_error.stderr_tail is a second route to the same screen. The scope is
+    // "the reported command", exactly as command.go, server-agent/README.md and
+    // the architecture doc's §8.3/§14.7 all state it.
+    expect(messages.en.runtimeCommandMasked).not.toMatch(/do not reach the gateway/i);
+    expect(messages.de.runtimeCommandMasked).not.toMatch(/erreichen das Gateway nicht/i);
+  });
+
+  it('scopes the masking to the reported command and names the route that carries a resolved value anyway', () => {
+    expect(messages.en.runtimeCommandMasked).toMatch(/this reported command/i);
+    expect(messages.en.runtimeCommandMasked).toMatch(/command line or environment at startup/i);
+    expect(messages.de.runtimeCommandMasked).toMatch(/hier gemeldeten Befehl/i);
+    expect(messages.de.runtimeCommandMasked).toMatch(/Befehlszeile oder Umgebung/i);
+  });
+
+  it('keeps the operator guidance that follows from the gap: env, never args', () => {
+    for (const m of [messages.en, messages.de]) {
+      expect(m.runtimeCommandMasked).toContain('${AGENT_ENV:NAME}');
+      expect(m.runtimeCommandMasked).toMatch(/argument/i);
+    }
+  });
+
+  it('gives the file-mode env redaction a sentence of its own, in both locales', () => {
+    // A different reason for withholding -- the agent's specs come from a local
+    // document the gateway does not own -- and a different mask. Selecting the
+    // placeholder sentence for it told a file-mode operator to go and check a
+    // ${AGENT_ENV:NAME} variable that does not exist.
+    for (const m of [messages.en, messages.de]) {
+      expect(typeof m.runtimeCommandEnvRedacted).toBe('string');
+      expect(m.runtimeCommandEnvRedacted.length).toBeGreaterThan(0);
+      expect(m.runtimeCommandEnvRedacted).not.toBe(m.runtimeCommandMasked);
+    }
+  });
+
+  it('words a locally trimmed head differently from one the agent no longer holds', () => {
+    // Rendered directly under runtimeLogsTrimmed, which says reopening reloads
+    // the agent's retained history in full. The two must not answer each other.
+    for (const m of [messages.en, messages.de]) {
+      expect(typeof m.runtimeCommandTrimmedHere).toBe('string');
+      expect(m.runtimeCommandTrimmedHere).not.toBe(m.runtimeCommandNotRetained);
+    }
+    expect(messages.en.runtimeCommandTrimmedHere).toMatch(/this view/i);
+    expect(messages.de.runtimeCommandTrimmedHere).toMatch(/diese Ansicht/i);
+  });
+});

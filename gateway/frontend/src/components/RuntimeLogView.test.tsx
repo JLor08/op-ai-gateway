@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { RuntimeLogView } from './RuntimeLogView';
+import { maxRenderedEntries, RuntimeLogView } from './RuntimeLogView';
 import { messages } from '../i18n';
 import type { RuntimeLogBatch, RuntimeLogState } from '../api';
 
@@ -358,5 +358,177 @@ describe('RuntimeLogView', () => {
     expect(screen.getByText(t.runtimeCommandWorkDirInherited)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeCommandArgsNone)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeCommandEnvNone)).toBeInTheDocument();
+  });
+
+  // --- what THIS view's own display cap discards, and in what unit ---------
+
+  // 'ü✓😀\n' is 5 UTF-16 code units and 10 UTF-8 bytes. The fixture has to make
+  // the two diverge: `text.length` and a real byte count agree on every ASCII
+  // string, so an ASCII fixture would pass under either and could not tell the
+  // view's counter apart from the agent's `dropped_bytes`, which is real bytes.
+  const wideLine = 'ü✓😀\n';
+  const wideLineBytes = 10;
+  const wideLineCodeUnits = 5;
+
+  it('counts the head a trimmed SCROLLBACK discards instead of reporting nothing', () => {
+    // The agent's retained buffer is operator-sized and can be far longer than
+    // this view renders. Slicing the tail off it and resetting the counter made
+    // the oldest entries vanish with no counter and no notice -- the one loss
+    // this view did not surface, against its own rule that every gap is stated.
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: Array.from({ length: maxRenderedEntries + 2 }, () => ({ text: wideLine })),
+    });
+    expect(screen.getByText(t.runtimeLogsTrimmed(2 * wideLineBytes))).toBeInTheDocument();
+  });
+
+  it('reports the trimmed head in BYTES -- the same unit as the agent dropped_bytes beside it', () => {
+    const h = renderLogView();
+    h.state('streaming');
+    // Exactly the cap: nothing is trimmed by this batch.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: Array.from({ length: maxRenderedEntries }, () => ({ text: wideLine })),
+    });
+    // Two more arrive, so the two OLDEST (wide) entries slide off the top.
+    h.batch({ spec_id: 'spec-a', entries: [{ text: 'ascii\n' }, { text: 'ascii\n' }] });
+
+    // The code-unit sum is the number the old `text.length` accumulator
+    // produced. Asserting it is absent is what makes this fixture discriminate
+    // between the two units at all.
+    expect(screen.queryByText(t.runtimeLogsTrimmed(2 * wideLineCodeUnits))).not.toBeInTheDocument();
+    expect(screen.getByText(t.runtimeLogsTrimmed(2 * wideLineBytes))).toBeInTheDocument();
+  });
+
+  it('distinguishes a marker lost UPSTREAM from one this view trimmed itself', () => {
+    const h = renderLogView();
+    h.state('streaming');
+
+    // (1) The agent sent its whole retained history and it begins with output:
+    // the marker really is gone, and reopening will not bring it back.
+    h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: '…already running\n' }] });
+    expect(screen.getByText(t.runtimeCommandNotRetained)).toBeInTheDocument();
+
+    // (2) A history longer than the display cap: THIS view cut the head, marker
+    // included, while the agent still holds it. The trimmed notice rendered
+    // directly above already says "reopen the window to reload the agent's
+    // retained history in full" -- an alert next to it must not answer that
+    // the agent no longer has it.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        { event: 'started', pid: 4711, command: { binary: '/opt/a', args: [] } },
+        ...Array.from({ length: maxRenderedEntries + 1 }, () => ({ text: wideLine })),
+      ],
+    });
+    expect(screen.queryByText(t.runtimeCommandNotRetained)).not.toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCommandTrimmedHere)).toBeInTheDocument();
+  });
+
+  it('names the file-mode env redaction as its own reason, not as the placeholder rule', () => {
+    // `masked` and `env_redacted` are two different facts: a ${AGENT_ENV:NAME}
+    // span replaced by its own placeholder, versus a file-mode agent
+    // withholding every value the spec's own env sets. They were one flag under
+    // one sentence, so a file-mode operator read HF_TOKEN=••• under an alert
+    // that explains only placeholders.
+    expect(typeof t.runtimeCommandEnvRedacted).toBe('string');
+
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'started',
+          pid: 4711,
+          command: {
+            binary: '/opt/a',
+            args: ['--port', '54331'],
+            env: ['HF_TOKEN=•••', 'PATH=/usr/bin'],
+            env_redacted: true,
+          },
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText(t.runtimeCommandEnvRedacted)).toBeInTheDocument();
+    // Nothing came from a placeholder here, so the placeholder sentence must
+    // not be the one the operator is asked to act on.
+    expect(screen.queryByText(t.runtimeCommandMasked)).not.toBeInTheDocument();
+  });
+
+  it('states BOTH reasons when a file-mode spec also resolved a placeholder into an argument', () => {
+    // The file-mode env rule is additional to the placeholder rule, never a
+    // replacement for it (server-agent command.go), so the two sentences stack.
+    const h = renderLogView();
+    h.state('streaming');
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        {
+          event: 'started',
+          pid: 4711,
+          command: {
+            binary: '/opt/vllm/vllm',
+            args: ['--api-key', '${AGENT_ENV:HF_TOKEN}'],
+            env: ['HF_TOKEN=•••'],
+            masked: true,
+            env_redacted: true,
+          },
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText(t.runtimeCommandMasked)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCommandEnvRedacted)).toBeInTheDocument();
+  });
+
+  it("does not open a new generation's command block because it landed on an expanded row's index", () => {
+    const h = renderLogView();
+    h.state('streaming');
+    // A FULL window whose last entry is a generation marker.
+    h.batch({
+      spec_id: 'spec-a',
+      scrollback: true,
+      entries: [
+        ...Array.from({ length: maxRenderedEntries - 1 }, () => ({ text: 'x\n' })),
+        {
+          event: 'started',
+          pid: 101,
+          at: '2026-08-25T10:00:00Z',
+          command: { binary: '/opt/a', args: ['--port', '40001'] },
+        },
+      ],
+    });
+    // The operator expands it.
+    fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
+    expect(screen.getByText('40001')).toBeInTheDocument();
+
+    // One more marker arrives, so the window slides by one and the NEW marker
+    // lands on the index the expanded one held.
+    h.batch({
+      spec_id: 'spec-a',
+      entries: [
+        {
+          event: 'started',
+          pid: 202,
+          at: '2026-08-25T10:00:05Z',
+          command: { binary: '/opt/a', args: ['--port', '40002'] },
+        },
+      ],
+    });
+
+    // The new generation must not inherit a toggle it never held. (The
+    // operator's own expansion is still lost to the slide: the row it moved to
+    // is a fresh mount. That is the index key's own cost, unchanged here --
+    // what this pins is that "expanded" never crosses BETWEEN generations.)
+    expect(screen.queryByText('40002')).not.toBeInTheDocument();
   });
 });

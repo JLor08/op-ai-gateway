@@ -2636,15 +2636,30 @@ per-subscriber queue overflowing.
 
 The fourth is the **browser's own display cap** (4,000 rendered entries), and it
 produces a *different* signal, because the bytes it drops were delivered and are
-still in the agent's buffer. Trimming the tail of a live stream raises a
-view-level notice — "older output is no longer shown in this view (N bytes);
-reopen the window to reload the agent's retained history in full" — not a
-`dropped_bytes` gap in the output. One path under that cap is genuinely silent:
-a **scrollback longer than the cap** is trimmed from the front with no signal at
-all. What partly covers it is the structural check in
-[§14.7](#147-the-resolved-command-what-actually-ran), which says so when the
-visible history begins with output instead of with an opening marker — and only
-then.
+still in the agent's buffer. It raises a view-level notice — "older output is no
+longer shown in this view (N bytes); reopen the window to reload the agent's
+retained history in full" — not a `dropped_bytes` gap in the output. **Both
+arrival paths raise it**: a live stream trimmed from the front as it grows, and
+a **scrollback longer than the cap**, which is trimmed from the front the moment
+it arrives. The scrollback path was silent once — it reset the counter to zero
+and sliced the tail — which is why the view now counts what it discards in one
+place that both paths go through, rather than once per path.
+
+The count is **UTF-8 bytes**, the same quantity `dropped_bytes` carries
+(`len(e.Text)` in Go). The browser's obvious `String.length` is UTF-16 code
+units and is *not* that number: the two agree only on ASCII and diverge by up to
+4× on German, Chinese or emoji, so the view encodes with `TextEncoder` rather
+than presenting two counts labelled bytes that mean different quantities.
+
+The structural check in
+[§14.7](#147-the-resolved-command-what-actually-ran) is separate and still
+applies: when the visible history begins with output instead of with an opening
+marker, the view says so — and it distinguishes the two causes, because they
+need opposite remedies. A marker lost **upstream** (the agent sent its retained
+history whole and it starts with output) is gone and reopening cannot recover
+it; a head trimmed **locally** by this cap is not, and reopening reloads it.
+Saying "the agent no longer retains it" for a local trim would contradict the
+trimmed notice rendered directly above it.
 
 The gateway's per-subscriber queue drops **text only, never a boundary marker**.
 Markers, and the resolved commands riding them, are rescued out of a batch that
@@ -2762,9 +2777,12 @@ view exists to show.)
 > A value is shown only if the gateway already has it, or the agent itself
 > computed it.
 
-Which resolves to exactly two masking cases:
+Which resolves to exactly two masking cases. They are two **different facts**
+about the same command and travel as two independent flags — `masked` and
+`env_redacted` — because the portal must tell an operator which mask they are
+looking at, and the two ask opposite things of them. Both can be set at once:
 
-1. **Every `${AGENT_ENV:NAME}`-derived span, wherever it landed** — in an
+1. `masked` — **Every `${AGENT_ENV:NAME}`-derived span, wherever it landed** — in an
    argument as much as in an env value — is replaced by *its own placeholder*,
    e.g. `--api-key ${AGENT_ENV:HF_TOKEN}`. This is the one class of value the
    gateway is never given (ADR-027), so a resolved copy must not travel upward
@@ -2773,12 +2791,27 @@ Which resolves to exactly two masking cases:
    span at the moment of substitution, so masking is never a search for the
    secret's *value* — a one-character secret would otherwise mask every
    occurrence of that character in `--port 54331`.
-2. **On a file-mode agent only, every spec-supplied `env` value**, masked in
-   full with keys intact. That is not a new rule: it is precisely the line the
-   upward report already draws (§8.3), because a local `runtime.json` is the
-   operator's own document and may legitimately hold a plaintext secret. The
-   view inherits the report's decision rather than inventing a second one that
-   could drift from it.
+2. `env_redacted` — **On a file-mode agent only, every spec-supplied `env`
+   value**, masked in full with keys intact. That is not a new rule: it is
+   precisely the line the upward report already draws (§8.3), because a local
+   `runtime.json` is the operator's own document and may legitimately hold a
+   plaintext secret. The view inherits the report's decision rather than
+   inventing a second one that could drift from it.
+
+The two flags were one flag once, and the cost was concrete: a file-mode
+operator read `HF_TOKEN=•••` under an alert that explained only
+`${AGENT_ENV:NAME}` placeholders — telling them to go and check a host variable
+that nothing in their spec had named. The mask that appears is not the same
+mask, and the remedy is not the same remedy: case 1 names a variable on the AI
+server; case 2 points at the operator's own file.
+
+**The masking claim is scoped to the reported command**, in the operator-facing
+string as much as here. A model server that prints its own argv or environment
+at startup — llama.cpp and vLLM both do — puts the resolved value into the very
+stream this command rides on, and `last_error.stderr_tail` is a second route to
+the same screen (§8.3). Nothing agent-side can mask what the child chose to
+print, so the alert says so and carries the guidance that follows: secrets go in
+`env` as `${AGENT_ENV:NAME}`, never as plain text in an argument.
 
 And, equally deliberately, what is **not** masked, because masking it would cost
 the feature its whole reason for existing while protecting nothing: the resolved

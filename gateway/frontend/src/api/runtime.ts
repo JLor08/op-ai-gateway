@@ -167,10 +167,23 @@ export interface RuntimeLogEntry {
 //  - **Render it with its marker, never on its own.** A command detached from
 //    the marker it arrived on would be a claim about which generation it
 //    describes, and that claim is exactly what this design removed the need for.
-//  - `masked: true` means at least one value was replaced by its own
-//    `${AGENT_ENV:NAME}` placeholder. The placeholder IS the mask: it is
-//    unmistakably not a value, and it names the variable that supplied it. Say
-//    so rather than hoping the operator recognises the syntax.
+//  - `masked` and `env_redacted` are two DIFFERENT reasons for withholding,
+//    one flag each, independent, and both can be set on the same command. Say
+//    each one in its own words rather than hoping the operator recognises a
+//    mask — and never say one when the other is what happened:
+//      - `masked: true` — at least one value was replaced by its own
+//        `${AGENT_ENV:NAME}` placeholder. The placeholder IS the mask: it is
+//        unmistakably not a value, and it names a variable on the AI server the
+//        operator can go and check.
+//      - `env_redacted: true` — the agent takes its specs from a local file, so
+//        at least one value the spec's own `env` sets was withheld in full (key
+//        intact, value replaced by a mask). There is no placeholder and nothing
+//        to look up: the value is in the operator's own document.
+//    The masking scope is **this reported command**, and nothing wider. A model
+//    server that prints its own argv or environment at startup puts the
+//    resolved value into the stream this command rides on, and into
+//    `last_error.stderr_tail`; nothing agent-side can mask what the child chose
+//    to print. Any wording here must keep that scope.
 //  - `truncated: true` means arguments or env entries are MISSING. State it,
 //    on the same reasoning as `dropped_bytes`: a shortened list rendered as a
 //    complete one is a lie about what ran.
@@ -192,6 +205,7 @@ export interface RuntimeLogCommand {
   work_dir?: string;
   env?: string[];
   masked?: boolean;
+  env_redacted?: boolean;
   truncated?: boolean;
 }
 

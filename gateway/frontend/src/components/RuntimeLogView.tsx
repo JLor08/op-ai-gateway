@@ -36,10 +36,13 @@ import type { PortalApi, Translation } from './shared/types';
  *     All four are rendered as sentences. An unexplained empty window is
  *     indistinguishable from "this model prints nothing", which is exactly the
  *     question the operator opened this to answer.
- *  3. **Every gap is visible.** `dropped_bytes` is rendered wherever it
- *     appears, and this component's own display cap produces the same kind of
- *     marker when it trims. A gap shown as silence would be a lie about what
- *     the process printed.
+ *  3. **Every gap is visible, in one unit.** `dropped_bytes` is rendered
+ *     wherever it appears, and this component's own display cap produces the
+ *     same kind of notice when it trims -- on BOTH arrival paths, live and
+ *     scrollback. A gap shown as silence would be a lie about what the process
+ *     printed. Both counts are UTF-8 bytes, because the agent's is
+ *     (`len(e.Text)` in Go) and two numbers on one screen that are both called
+ *     bytes have to be the same quantity -- see `utf8ByteLength`.
  *
  * Inside the output, attached to each generation's start marker, sits the
  * **resolved command** the agent actually executed -- see `InlineCommand`. It
@@ -60,9 +63,74 @@ import type { PortalApi, Translation } from './shared/types';
  * How many entries the browser keeps. The agent's own buffer is the history
  * (megabytes, operator-sized); this is only what the DOM holds, so it is sized
  * for rendering cost rather than for retention. Trimming past it is reported,
- * never silent -- see trimmedBytes.
+ * never silent -- see LogWindow.
+ *
+ * Exported so a test can name the cap instead of restating 4000, which would
+ * silently stop testing the boundary the day this changes.
  */
-const maxRenderedEntries = 4000;
+export const maxRenderedEntries = 4000;
+
+/**
+ * The UTF-8 byte length of a string, which is what `dropped_bytes` already
+ * means everywhere it appears: the agent produces it as Go's `len(e.Text)`,
+ * i.e. real bytes.
+ *
+ * `text.length` was the obvious thing to reach for and is NOT that number --
+ * it counts UTF-16 code units. The two agree on ASCII and diverge by up to 4x
+ * on anything else (`ü` is 1 unit and 2 bytes, `😀` is 2 units and 4 bytes), so
+ * a model printing German, Chinese or emoji made this view render two counts
+ * side by side, both labelled bytes, that did not mean the same quantity.
+ * `TextEncoder` is exact; nothing cheaper is.
+ */
+const utf8 = new TextEncoder();
+function utf8ByteLength(text: string): number {
+  return text === '' ? 0 : utf8.encode(text).length;
+}
+
+/**
+ * What the view currently holds, and what it had to throw away to hold it.
+ *
+ * The two live in ONE state value because the second is a fact about the
+ * first: the count is only correct if it was computed from the very slice that
+ * was discarded, and keeping them apart is what let the scrollback path reset
+ * the counter to zero while dropping a history's head. It also keeps the state
+ * updater pure -- it derives the whole next value from the previous one rather
+ * than calling a second setter from inside itself.
+ *
+ * `entries` is the loss in ENTRIES, `bytes` the loss in UTF-8 bytes. Both are
+ * needed and neither implies the other: a trimmed run of lifecycle markers
+ * carries no text at all, so `bytes` can legitimately be 0 while a start
+ * marker -- and with it a generation's only copy of its command -- is gone.
+ */
+type LogWindow = {
+  entries: RuntimeLogEntry[];
+  trimmedEntries: number;
+  trimmedBytes: number;
+};
+
+const emptyLogWindow: LogWindow = { entries: [], trimmedEntries: 0, trimmedBytes: 0 };
+
+/**
+ * Appends a batch and enforces the display cap, counting whatever the cap
+ * discards.
+ *
+ * Both arrival paths go through here, and that is the point rather than tidy
+ * reuse: a scrollback starts from `emptyLogWindow` (it REPLACES the view --
+ * a reconnect delivers a fresh history and appending would duplicate it),
+ * while a live batch continues from the previous window. What neither may do
+ * is drop entries without saying so, and there is now exactly one place that
+ * could.
+ */
+function appendBounded(prev: LogWindow, incoming: readonly RuntimeLogEntry[]): LogWindow {
+  const next = prev.entries.concat(incoming);
+  if (next.length <= maxRenderedEntries) return { ...prev, entries: next };
+  const cut = next.slice(0, next.length - maxRenderedEntries);
+  return {
+    entries: next.slice(-maxRenderedEntries),
+    trimmedEntries: prev.trimmedEntries + cut.length,
+    trimmedBytes: prev.trimmedBytes + cut.reduce((sum, e) => sum + utf8ByteLength(e.text ?? ''), 0),
+  };
+}
 
 /**
  * One rendered line: process output, or a boundary marker together with the
@@ -96,7 +164,20 @@ function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation
             {`── ${label} ──`}
           </Box>
           {entry.command && (
+            // Keyed on the MARKER, not on the row. `InlineCommand` holds the
+            // one piece of state in this subtree (its collapse toggle), and the
+            // rendered window SLIDES past maxRenderedEntries, so a new
+            // generation's marker can land on the row an operator had expanded
+            // and inherit "expanded" from it -- reproduced with a full window:
+            // the operator's block collapsed and the new generation's opened by
+            // itself. Changing the key here remounts the toggle whenever the
+            // generation beneath it changes, so "expanded or not" can no longer
+            // cross between generations. (The command TEXT never could: it is a
+            // prop of this marker.) A marker's identity is its timestamp and
+            // pid -- `start_failed` has no pid and never will, which is why the
+            // timestamp carries the pair.
             <InlineCommand
+              key={`${entry.at ?? ''}#${entry.pid ?? 0}`}
               command={entry.command}
               startFailed={entry.event === 'start_failed'}
               t={t}
@@ -182,11 +263,16 @@ function CommandField({
  *
  * Three further rules it must not break, each a way of lying to the operator:
  *
- *  1. **Masked values are unmistakable.** A value resolved from
- *     `${AGENT_ENV:NAME}` is shown as that placeholder, not as bullets and
- *     never as the value: it cannot be mistaken for real text, and it names the
- *     variable the operator needs to check on the host. When anything is
- *     masked, the block says so in words too.
+ *  1. **Withheld values are unmistakable, and the block says WHY in words.**
+ *     A value resolved from `${AGENT_ENV:NAME}` is shown as that placeholder,
+ *     not as bullets and never as the value: it cannot be mistaken for real
+ *     text, and it names the variable the operator needs to check on the host.
+ *     A file-mode agent additionally withholds every value its own spec sets in
+ *     `env`, key intact, and that is a DIFFERENT reason with a different
+ *     remedy -- `masked` and `env_redacted` are separate flags and get separate
+ *     sentences. The sentences state their own scope too: masking covers the
+ *     reported command, not the child's output, which streams into this very
+ *     window with every placeholder already resolved.
  *  2. **A truncated list says it is truncated**, on the same reasoning as
  *     `dropped_bytes` in the output.
  *  3. **There is no copy button, deliberately.** Even fully unmasked this is
@@ -221,9 +307,22 @@ function InlineCommand({
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
             {t.runtimeCommandIntro}
           </Typography>
+          {/* One sentence per withholding REASON, and both may apply at once.
+              `masked` is a ${AGENT_ENV:NAME} span replaced by its own
+              placeholder -- there is a host variable to go and check.
+              `env_redacted` is a file-mode agent withholding the values its
+              local document sets -- there is no placeholder and nothing to look
+              up. They were one flag under one sentence, and a file-mode
+              operator then read `HF_TOKEN=•••` under an explanation of
+              placeholder syntax. */}
           {command.masked && (
             <Alert severity="info" sx={{ mb: 1 }}>
               {t.runtimeCommandMasked}
+            </Alert>
+          )}
+          {command.env_redacted && (
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {t.runtimeCommandEnvRedacted}
             </Alert>
           )}
           {command.truncated && (
@@ -258,15 +357,22 @@ function InlineCommand({
 }
 
 /**
- * Whether the visible history begins with OUTPUT rather than with a generation's
- * opening marker -- which means that generation's marker, and with it the only
- * copy of its resolved command, has been evicted from the agent's bounded
- * buffer (or trimmed by this view's own display cap).
+ * Whether the visible history begins with OUTPUT rather than with a
+ * generation's opening marker -- which means that generation's marker, and with
+ * it the only copy of its resolved command, is not on screen.
  *
  * It has to be stated rather than left blank, for the same reason
  * `dropped_bytes` does: missing information must never read as "there was
  * none". An operator who sees no command anywhere would otherwise conclude the
  * agent does not report one.
+ *
+ * It says only THAT the marker is missing, never WHY, because two different
+ * things cause it and the caller is the one that knows which: the agent's own
+ * bounded buffer evicted it (gone -- reopening cannot bring it back), or this
+ * view's display cap trimmed the head (not gone -- the agent still holds it,
+ * and reopening reloads it). Those need opposite sentences, and rendering the
+ * "the agent no longer retains it" one for a local trim put it directly under
+ * the trimmed notice, which promises the opposite in the same breath.
  */
 function opensWithoutACommand(entries: readonly RuntimeLogEntry[]): boolean {
   const firstOpening = entries.findIndex(
@@ -296,8 +402,7 @@ export function RuntimeLogView({
   specId: string;
   title: string;
 }>) {
-  const [entries, setEntries] = useState<RuntimeLogEntry[]>([]);
-  const [trimmedBytes, setTrimmedBytes] = useState(0);
+  const [win, setWin] = useState<LogWindow>(emptyLogWindow);
   const [state, setState] = useState<RuntimeLogState | null>(null);
   // `scrollbackSeen` is what separates "the agent's buffer is empty" from
   // "nothing has arrived yet". The agent always sends a scrollback batch on
@@ -314,8 +419,7 @@ export function RuntimeLogView({
 
   useEffect(() => {
     if (!open) return undefined;
-    setEntries([]);
-    setTrimmedBytes(0);
+    setWin(emptyLogWindow);
     setState(null);
     setScrollbackSeen(false);
     setConnectionError(false);
@@ -324,20 +428,15 @@ export function RuntimeLogView({
     const onBatch = (batch: RuntimeLogBatch) => {
       if (batch.scrollback) {
         // REPLACE, never append: a reconnect delivers a fresh scrollback and
-        // appending it to what is on screen would duplicate the history.
+        // appending it to what is on screen would duplicate the history. The
+        // counter is replaced too, not zeroed -- a retained history longer than
+        // the display cap loses its head to that same slice, and this path used
+        // to drop it with no counter and no notice.
         setScrollbackSeen(true);
-        setTrimmedBytes(0);
-        setEntries(batch.entries.slice(-maxRenderedEntries));
+        setWin(appendBounded(emptyLogWindow, batch.entries));
         return;
       }
-      setEntries((prev) => {
-        const next = [...prev, ...batch.entries];
-        if (next.length <= maxRenderedEntries) return next;
-        const cut = next.slice(0, next.length - maxRenderedEntries);
-        const lost = cut.reduce((sum, e) => sum + (e.text?.length ?? 0), 0);
-        if (lost > 0) setTrimmedBytes((n) => n + lost);
-        return next.slice(-maxRenderedEntries);
-      });
+      setWin((prev) => appendBounded(prev, batch.entries));
     };
 
     return api.subscribeRuntimeLogs(serverId, specId, onBatch, setState, (status) =>
@@ -349,8 +448,9 @@ export function RuntimeLogView({
     if (!followRef.current) return;
     const el = boxRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [entries]);
+  }, [win.entries]);
 
+  const entries = win.entries;
   const hasOutput = entries.length > 0;
   const commandGap = opensWithoutACommand(entries);
   const notice = (() => {
@@ -379,14 +479,22 @@ export function RuntimeLogView({
             {notice.text}
           </Alert>
         )}
-        {trimmedBytes > 0 && (
+        {win.trimmedBytes > 0 && (
           <Alert severity="warning" sx={{ mb: 1 }}>
-            {t.runtimeLogsTrimmed(trimmedBytes)}
+            {t.runtimeLogsTrimmed(win.trimmedBytes)}
           </Alert>
         )}
         {commandGap && (
           <Alert severity="info" sx={{ mb: 1 }}>
-            {t.runtimeCommandNotRetained}
+            {/* Two causes, two sentences. A head lost UPSTREAM is gone: the
+                agent sent its retained history whole and it began with output,
+                so reopening cannot bring the marker back. A head trimmed HERE
+                is not: the agent still holds it, which is what the trimmed
+                notice directly above already promises ("reopen to reload the
+                agent's retained history in full"). Saying "the agent no longer
+                retains it" beside that promise put two alerts on screen that
+                answered each other. */}
+            {win.trimmedEntries > 0 ? t.runtimeCommandTrimmedHere : t.runtimeCommandNotRetained}
           </Alert>
         )}
         <Box
@@ -426,14 +534,16 @@ export function RuntimeLogView({
             // useState, no useRef, no input, no focus target -- so nothing the
             // operator typed, selected or focused can be misbound by a shift.
             //
-            // One consequence is real, known and cosmetic: `InlineCommand`
-            // DOES hold state (its collapse toggle), so a marker landing on an
-            // expanded row's index inherits that toggle. Reproduced with a
-            // full 4000-entry window, one operator-expanded command and one
-            // new generation: the new marker rendered expanded and the old one
-            // collapsed. The command TEXT always comes from that marker's own
-            // props, so no generation is ever shown another's command -- only
-            // "expanded or not" can be wrong.
+            // `InlineCommand` DOES hold state (its collapse toggle), and that
+            // is why it carries a key of its OWN, on the marker it describes --
+            // see LogLine. Without it, a marker landing on an expanded row's
+            // index inherited that toggle: reproduced with a full 4000-entry
+            // window, one operator-expanded command and one new generation, the
+            // new marker rendered expanded. What remains, and is accepted, is
+            // that the operator's own expansion does not survive the slide --
+            // the row it moves to is a fresh mount either way. The command TEXT
+            // always comes from that marker's own props, so no generation is
+            // ever shown another's command.
             //
             // So statelessness, not index stability, is the thing to check
             // before adding anything to a row. A per-row copy button, a

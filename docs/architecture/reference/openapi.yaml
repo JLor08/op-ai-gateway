@@ -769,11 +769,17 @@ paths:
         pid, no exit code, and no output will follow it.
         An OPENING marker ("started" or "start_failed") additionally carries
         "command": the launch command that generation actually ran, resolved --
-        {"binary","args","work_dir","env","masked","truncated"}. Every
-        ${AGENT_ENV:NAME}-derived value is replaced agent-side by its own
-        placeholder ("masked": true), the gateway drops over-long entries whole
-        ("truncated": true) and never re-masks, and the field is stripped from
-        any entry that is not an opening marker. On a spec that fails to start
+        {"binary","args","work_dir","env","masked","env_redacted","truncated"}.
+        Every ${AGENT_ENV:NAME}-derived value is replaced agent-side by its
+        own placeholder ("masked": true); on a file-mode agent every value
+        the spec sets in "env" is additionally withheld in full, keys intact
+        ("env_redacted": true). The two are independent reasons and both can
+        be set at once. The masking covers the REPORTED COMMAND only -- a
+        model server that prints its own argv at startup puts the resolved
+        value into this stream, and nothing agent-side can mask that. The
+        gateway drops over-long entries whole ("truncated": true) and never
+        re-masks, and the field is stripped from any entry that is not an
+        opening marker. On a spec that fails to start
         it is the entire content of this view. "dropped_bytes" on an entry means
         N bytes the process printed are missing immediately
         before it. Nothing on this path is persisted -- not to disk, not to the

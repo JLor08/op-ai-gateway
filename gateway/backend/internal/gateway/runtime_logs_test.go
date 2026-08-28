@@ -702,6 +702,12 @@ func TestRuntimeLogCommandReachesTheOperator(t *testing.T) {
 	if !marker.Command.Masked {
 		t.Error("masked = false, want the agent's own flag relayed so the portal can say so in words")
 	}
+	// The other withholding reason is a SEPARATE flag, and this gateway-mode
+	// command has none of it: relaying it as set would make the portal explain
+	// a file-mode redaction that never happened.
+	if marker.Command.EnvRedacted {
+		t.Error("env_redacted = true although the agent did not set it")
+	}
 	// The output line beside it carries none: a command describes a generation,
 	// not a line.
 	if batch.Entries[1].Command != nil {
@@ -744,6 +750,49 @@ func TestRuntimeLogCommandOnlyRidesAnOpeningMarker(t *testing.T) {
 	// And the unknown event kind is still stripped to a plain entry.
 	if got.Entries[4].Event != "" {
 		t.Errorf("entry 4 event = %q, want it stripped to a plain entry", got.Entries[4].Event)
+	}
+}
+
+// TestRuntimeLogCommandRelaysBothWithholdingReasons: masked and env_redacted
+// are two DIFFERENT facts -- a ${AGENT_ENV:NAME} span replaced by its own
+// placeholder, versus a file-mode agent withholding the values its local
+// document sets -- and the portal renders a different sentence for each. The
+// gateway relays them independently, exactly as it relays everything else in a
+// command: it has no provenance and cannot derive either one.
+func TestRuntimeLogCommandRelaysBothWithholdingReasons(t *testing.T) {
+	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+
+	// A file-mode agent that also resolved a placeholder into an argument: both
+	// reasons apply to the one command.
+	srv.ingestRuntimeLog("srv-1", json.RawMessage(`{"spec_id":"spec-a","entries":[
+		{"event":"started","pid":1,"command":{"binary":"/opt/vllm/vllm",
+			"args":["--api-key","${AGENT_ENV:HF_TOKEN}"],
+			"env":["HF_HOME=•••"],
+			"masked":true,"env_redacted":true}},
+		{"event":"started","pid":2,"command":{"binary":"/opt/a",
+			"env":["HF_HOME=•••"],"env_redacted":true}}]}`))
+
+	var got RuntimeLogBatchDTO
+	select {
+	case got = <-sub.ch:
+	case <-time.After(time.Second):
+		t.Fatal("nothing delivered")
+	}
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(got.Entries))
+	}
+	both := got.Entries[0].Command
+	if both == nil || !both.Masked || !both.EnvRedacted {
+		t.Errorf("command = %+v, want both reasons relayed: they are independent, not alternatives", both)
+	}
+	// The second carries only the file-mode reason. Relaying it as `masked`
+	// would tell the operator to go and check an ${AGENT_ENV:NAME} variable
+	// that nothing in the spec ever named.
+	only := got.Entries[1].Command
+	if only == nil || only.Masked || !only.EnvRedacted {
+		t.Errorf("command = %+v, want env_redacted alone", only)
 	}
 }
 

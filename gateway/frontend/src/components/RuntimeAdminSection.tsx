@@ -599,13 +599,15 @@ function blankDetailLine(arg: string, lineNumber: number): string {
 type ArgsWarning = { key: string; message: string; detail?: string };
 
 /**
- * The two argument shapes that are almost certainly a mistake, reported live
- * under the field as the operator types.
+ * The four argument shapes that are almost certainly a mistake, reported live
+ * under the field as the operator types: a whole command line pasted into one
+ * line, whitespace at an argument's edge, a line made only of whitespace, and a
+ * literal port while the agent owns the port.
  *
  * These WARN and never block the save, unlike the placeholder mirror below --
  * and the difference is the point, not an oversight. `findPlaceholderViolation`
  * restates a rule the AGENT itself enforces: a spec that trips it provably
- * cannot start, so refusing it in the form forecloses nothing. These two are
+ * cannot start, so refusing it in the form forecloses nothing. These four are
  * guesses about INTENT over a field whose legitimate contents are arbitrary
  * strings from a foreign program's CLI. A heuristic that refuses is a wall with
  * no way around it for the one operator whose legitimate value trips it (a

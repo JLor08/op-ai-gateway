@@ -40,22 +40,29 @@ import (
 //	A value is shown only if the gateway already has it, or the agent itself
 //	computed it. Everything else is masked.
 //
-// That resolves to exactly two masking cases, and no others:
+// That resolves to exactly two masking cases, and no others. They are two
+// DIFFERENT facts about the same command, so each has its own flag on the wire
+// (Masked / EnvRedacted) rather than sharing one -- a reader that had only a
+// single boolean could not tell the operator which mask they are looking at,
+// and the two need opposite things from them:
 //
-//  1. EVERY ${AGENT_ENV:NAME}-derived span, wherever it landed -- in an
-//     argument as much as in an env value -- is replaced by its own
+//  1. Masked -- EVERY ${AGENT_ENV:NAME}-derived span, wherever it landed -- in
+//     an argument as much as in an env value -- is replaced by its own
 //     "${AGENT_ENV:NAME}" placeholder. This is the one class of value the
 //     gateway is never given: it lives only in the AI server's own
 //     environment, by the whole design of ADR-027, and a resolved copy of it
-//     must not travel upward just because a panel wants to be helpful.
-//  2. On a FILE-MODE agent only, every spec-supplied env VALUE is masked in
-//     full. That is not a new rule -- it is precisely the one the upward
-//     report already draws (report.go's redactConfigEnv): a local
-//     runtime.json is the operator's own document and may legitimately hold a
-//     plaintext secret, and env values are the one thing the report withholds
-//     from the gateway. A panel that showed them would quietly undo that,
-//     which is why this file reuses the report's own line instead of
-//     inventing a second one that can drift from it.
+//     must not travel upward just because a panel wants to be helpful. The
+//     placeholder names the host variable to go and check.
+//  2. EnvRedacted -- on a FILE-MODE agent only, every spec-supplied env VALUE
+//     is masked in full, with envRedactedMask rather than with a placeholder.
+//     That is not a new rule -- it is precisely the one the upward report
+//     already draws (report.go's redactConfigEnv): a local runtime.json is the
+//     operator's own document and may legitimately hold a plaintext secret,
+//     and env values are the one thing the report withholds from the gateway.
+//     A panel that showed them would quietly undo that, which is why this file
+//     reuses the report's own line instead of inventing a second one that can
+//     drift from it. There is no variable to go and check here: the value is
+//     in the operator's own file.
 //
 // And, stated as plainly, what is deliberately NOT masked, because masking it
 // would cost the panel its entire reason for existing while protecting
@@ -128,18 +135,36 @@ import (
 // is that "this pid, from this moment, running this command" is ONE fact. Two
 // copies of the pid would be two things to keep in agreement.
 //
-// Masked reports whether anything in Args or Env was replaced, so a reader can
-// state that plainly rather than hoping the operator recognises a placeholder.
+// Masked and EnvRedacted report WHY something was withheld, one flag per
+// reason (see the two masking cases above), so a reader can state it plainly
+// rather than hoping the operator recognises a mask. They are independent and
+// both can be set at once -- a file-mode spec that also resolves a placeholder
+// into an argument raises both -- and neither implies the other:
+//
+//   - Masked: at least one ${AGENT_ENV:NAME}-derived span in Args or Env was
+//     replaced by its own placeholder. The placeholder names a variable that
+//     exists on this host and that the operator can go and check.
+//   - EnvRedacted: this is a file-mode agent, so at least one spec-supplied
+//     env VALUE was withheld in full (key intact, value replaced by
+//     envRedactedMask). There is no placeholder and nothing to look up: the
+//     value is in the operator's own runtime.json.
+//
+// Splitting them is not cosmetic. They were one flag once, and a file-mode
+// operator then read "HF_TOKEN=•••" under a sentence that explained only
+// ${AGENT_ENV:NAME} placeholders -- a sentence telling them to check a host
+// variable that need not exist.
+//
 // Truncated reports that the command exceeded maxResolvedCommandBytes and some
 // arguments or env entries are missing -- a gap stated, never a silent
 // shortening, on the same reasoning as LogEntry.DroppedBytes.
 type ResolvedCommand struct {
-	Binary    string   `json:"binary"`
-	Args      []string `json:"args"`
-	WorkDir   string   `json:"work_dir,omitempty"`
-	Env       []string `json:"env"`
-	Masked    bool     `json:"masked,omitempty"`
-	Truncated bool     `json:"truncated,omitempty"`
+	Binary      string   `json:"binary"`
+	Args        []string `json:"args"`
+	WorkDir     string   `json:"work_dir,omitempty"`
+	Env         []string `json:"env"`
+	Masked      bool     `json:"masked,omitempty"`
+	EnvRedacted bool     `json:"env_redacted,omitempty"`
+	Truncated   bool     `json:"truncated,omitempty"`
 }
 
 // bytes is the command's weight against a spec buffer's capacity: every string
@@ -218,7 +243,9 @@ func (ex expandedSpec) resolvedCommand(spec Spec, maskSpecEnv bool) ResolvedComm
 			// sets, and only the value is withheld.
 			key, _, _ := strings.Cut(e, "=")
 			masked = key + "=" + envRedactedMask
-			out.Masked = true
+			// EnvRedacted, never Masked: this mask is not a placeholder and
+			// names no variable to go and check.
+			out.EnvRedacted = true
 		default:
 			var changed bool
 			masked, changed = maskSecretSpans(e, ex.envSpans[i])
