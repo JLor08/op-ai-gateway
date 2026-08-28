@@ -81,6 +81,19 @@ const modelCollator = new Intl.Collator(undefined, { numeric: true });
 function compareSpecs(a: RuntimeMatrixSpec, b: RuntimeMatrixSpec): number {
   const byModel = modelCollator.compare(a.model, b.model);
   if (byModel !== 0) return byModel;
+  // A collator tie is not always a NAME tie. `numeric: true` parses digit runs
+  // as numbers, and 8 === 08 === 008, so the collator returns 0 for names that
+  // differ only by a leading zero: measured, compare('Qwen3-8B','Qwen3-08B')
+  // and compare('Llama-3.1-8B','Llama-3.01-8B') are both 0, where the bare
+  // house collator returns 1. Without this line those two DISTINCT names would
+  // fall through to the id tie-break below and be ordered by opaque hex --
+  // deterministic, but silently contradicting "ordered by model name" in the
+  // one place an operator could check it. Raw code units rather than a second
+  // collator: this only ever runs inside one collator-equal bucket, so all it
+  // has to be is a stable, total, name-derived order. Contrived (leading zeros
+  // in model names are rare) and cosmetic, but it costs one comparison that
+  // cannot fire for any name pair the collator already separates.
+  if (a.model !== b.model) return a.model < b.model ? -1 : 1;
   // The id tie-break is required, not decoration. Two specs may legally carry
   // the SAME model string in file mode: the agent's ParseConfig rejects
   // duplicate spec IDs and says nothing about Model, and the portal falls back
@@ -126,8 +139,10 @@ function canonicalPair(x: string, y: string): [string, string] {
  * builds of one model -- was exactly what got dropped. Measured, two real
  * sibling names both rendered as `Qwen3-Coder-30B-A3…`. Now that the specs are
  * name-sorted those siblings are adjacent columns, so the ellipsis had to go.
- * Wrapping spends the abundant axis (a second 16px line beside the first)
- * instead of characters; reading order survives, because after the 180° turn
+ * Wrapping spends the abundant axis (a second 24px-wide vertical line beside
+ * the first, measured: a one-line header column is 46px, a two-line one 56px,
+ * and the header row 168.5px) instead of characters; reading order survives,
+ * because after the 180° turn
  * line 1 is the LEFT vertical line and line 2 the right, i.e. ordinary reading
  * order once your head is tilted the way the rotation already assumes.
  * `overflow: hidden` is gone rather than kept "as a backstop": with wrapping
@@ -151,7 +166,20 @@ function ColumnHeader({ model }: Readonly<{ model: string }>) {
       {/* The header's tooltip is the model name and nothing else -- kept
           deliberately distinct from the cell tooltip below, which explains
           what a co-residency pair does. Conflating them would bury the
-          consequence sentence under a list of column labels. */}
+          consequence sentence under a list of column labels.
+
+          WHAT IT REVEALS IS THE ORIENTATION, NOT HIDDEN CHARACTERS -- and
+          that is the whole reason this axis has a tooltip while the row label
+          below deliberately has none. Since both axes wrap, neither hides
+          anything, so "reveal the truncated tail" is no longer a reason for
+          EITHER of them and the doc no longer claims it. What is left is that
+          this header is rotated 90 degrees and wrapped onto two vertical
+          lines, which is genuinely harder to read than running text; the
+          tooltip renders the same string horizontally on one line. A row
+          label is already horizontal, so a tooltip there would repeat
+          identical text in an identical orientation -- pure noise. Same
+          premise (nothing is hidden), different conclusions, because the two
+          axes differ in something else: only one of them is rotated. */}
       <Tooltip title={model}>
         <Box
           component="span"
@@ -164,7 +192,17 @@ function ColumnHeader({ model }: Readonly<{ model: string }>) {
             // horizontal row labels spend as `max-width`. Long names meet it
             // by wrapping onto a second 16px line, never by losing characters.
             whiteSpace: 'normal',
-            overflowWrap: 'anywhere',
+            // The SAME wrap mode as the row label, on purpose: one
+            // declaration means one thing in this component. On this axis the
+            // choice is measurably free -- `anywhere` and `break-word` give
+            // byte-identical geometry here (header row 168.5px, span 160px,
+            // widest header column 56px, 2 line boxes, at BOTH a 1100px and a
+            // 600px container), because nothing squeezes this axis: table
+            // layout distributes WIDTH, and the inline size of a
+            // `vertical-rl` box is its height. So the row label's reason to
+            // reject `anywhere` does not apply here, and there is no reason
+            // to keep the asymmetry either.
+            overflowWrap: 'break-word',
             maxHeight: `${LABEL_MAX_PX}px`,
             mx: 'auto',
           }}
@@ -362,17 +400,32 @@ export function RuntimeMatrix({
 
   return (
     <Box sx={{ overflowX: 'auto' }}>
-      {/* `width: auto` overrides MUI's `width: 100%`, and it is what makes the
-          row-label cap above VISIBLE rather than merely declared. Under
-          `table-layout: auto` a 100%-wide table hands its surplus width back
-          to the columns in proportion to their content, so the capped 160px
-          label still sat in a 491px cell (measured, 5 specs at a 1100px
-          viewport) with ~330px of empty gutter between the name and its own
-          first checkbox. Shrink-to-fit instead: measured, the label column is
-          then exactly 192px (160 + MUI's 2x16px small padding) and the grid
-          columns 46px, whatever the viewport -- and with 14 specs the table is
-          850px, so the wrapping enclosure's `overflowX: 'auto'` still absorbs
-          a matrix too wide for the page rather than widening the page. */}
+      {/* `width: auto` overrides MUI's `width: 100%`, and THIS -- not the wrap
+          mode -- is what makes the row-label cap above reach the COLUMN rather
+          than only the text. Under `table-layout: auto` a 100%-wide table
+          hands its surplus width back to the columns in proportion to their
+          content, so the capped 160px label still sat in a 491px cell
+          (measured, 5 specs at a 1100px viewport) with ~330px of empty gutter
+          between the name and its own first checkbox. Shrink-to-fit instead:
+          measured with 14 realistic specs, the label column is 192px (160 +
+          MUI's 2x16px small padding) and the grid columns 46px, and the table
+          is 870px wide / 828px tall.
+
+          Those numbers hold while the container can afford the table's
+          shrink-to-fit width -- here ~870px, i.e. any container at or above
+          it. BELOW that the table has to give something up, and auto layout
+          takes it from the widest column: measured, the label column is still
+          192px at 900px, 182px at 860px and 122px at 800px, with rows growing
+          taller as the name wraps onto more lines. That degradation is
+          lossless (no character is dropped) and bounded by `break-word` above,
+          which floors the column at the longest unbreakable run -- 109px for
+          these names, and 192px again as soon as one name has no hyphen at
+          all. It is NOT true that it only happens where the grid already
+          scrolls: at an 800px container the enclosure's scrollWidth equals its
+          width (800 = 800, measured), so nothing scrolls yet and the label has
+          already given up 70px. `overflowX: 'auto'` is what absorbs the rest,
+          and it does take over further down: at 600px the box is 600px around
+          a 787px table. */}
       <Table size="small" sx={{ width: 'auto' }}>
         <TableHead>
           <TableRow>
@@ -403,11 +456,19 @@ export function RuntimeMatrix({
                       rotation had just bought. Capped here to the same budget
                       the header spends on its own scarce axis, it is 192px.
 
-                      NO `text-overflow` and NO tooltip, deliberately: nothing
-                      is hidden, so there is nothing to reveal on hover, and an
-                      ellipsis at this width would render two sorted
-                      neighbours identically. A horizontal label can meet the
-                      cap by spending row height, which is the abundant axis.
+                      NO `text-overflow`: an ellipsis at this width would
+                      render two sorted neighbours identically. A horizontal
+                      label can meet the cap by spending row height, which is
+                      the abundant axis.
+
+                      NO tooltip either, and the reason is NOT "nothing is
+                      hidden" -- nothing is hidden on the column axis either,
+                      yet that one keeps its tooltip. The difference is
+                      orientation: the column header is rotated 90 degrees and
+                      its tooltip un-rotates it, while this label is already
+                      horizontal running text, so a tooltip would repeat the
+                      same characters in the same orientation. See the note at
+                      ColumnHeader's Tooltip.
                       The TableCell's own props stay bare so the <th> keeps its
                       `rowheader` role and its full accessible name. */}
                   <Box
@@ -420,13 +481,46 @@ export function RuntimeMatrix({
                       // the 2x16px of MUI size="small" cell padding).
                       display: 'block',
                       maxWidth: `${LABEL_MAX_PX}px`,
-                      // `anywhere`, not `break-word`: only `anywhere` lowers
-                      // the box's MIN-content size, which is what actually
-                      // forces the table column down to the cap under
-                      // `table-layout: auto`. Hyphens are natural soft-break
-                      // opportunities, so real model names break at '-' and
-                      // `anywhere` only fires for a hyphen-free monster.
-                      overflowWrap: 'anywhere',
+                      // `break-word`, and deliberately NOT `anywhere`. Both
+                      // wrap and neither drops a character; they differ only
+                      // in the MIN-content size the box reports to
+                      // `table-layout: auto`, and on that axis `anywhere` is
+                      // a defect. It makes min-content ONE CHARACTER, so auto
+                      // layout always prefers squeezing this column over
+                      // letting the table overflow -- which disarms the
+                      // enclosure's `overflowX: auto` instead of using it.
+                      // Measured in Chromium, 14 realistic specs, default MUI
+                      // theme, container width varied (label column / tallest
+                      // row / table height):
+                      //
+                      //   1100px   192 /  53 /   828    (both modes)
+                      //    800px   122 /  93 / 1,099    (both modes)
+                      //    600px   `anywhere`   43.8 / 734 / 6,703
+                      //            `break-word`  109 / 133 / 1,379
+                      //
+                      // At 600px under `anywhere` every label renders ONE
+                      // CHARACTER PER LINE (36 line boxes: "Q","w","e","n",
+                      // "3","-",...). The three sorted-adjacent Qwen siblings
+                      // are then identical for the first ~26 lines and differ
+                      // hundreds of pixels down a row taller than the
+                      // viewport, so no two of them can be seen together --
+                      // "two different facts drawn alike", the exact defect
+                      // this component exists to remove, relocated from the
+                      // ellipsis axis onto the viewport axis. It is reachable
+                      // on ordinary hardware: with the 264px NavSidebar and
+                      // App.tsx's `px: clamp(20px,4vw,54px)`, a 1280px window
+                      // leaves ~866px of content and a 1024px window ~630px.
+                      //
+                      // `break-word` reports the longest UNBREAKABLE run
+                      // instead. Hyphens are soft-break opportunities, so a
+                      // real model name floors at its longest hyphen-free
+                      // segment and the table overflows and scrolls as
+                      // designed. A hyphen-free name is still bounded, and by
+                      // `max-width` rather than by the wrap mode: max-width
+                      // clamps the box's min-content CONTRIBUTION, so a
+                      // 43-character hyphen-free name measured exactly 160px
+                      // at 1100px AND at 600px inside a 15-spec grid.
+                      overflowWrap: 'break-word',
                     }}
                   >
                     {rowSpec.model}

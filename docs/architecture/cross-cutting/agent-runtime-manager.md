@@ -2118,8 +2118,15 @@ stored or sent: a toggle still emits the pair canonicalised **by id**
 default locale with `numeric: true` — a deliberate deviation from the house's
 bare `localeCompare`, because model names are size and quantisation ladders and
 bare collation orders them `Llama-3.1-405B, Llama-3.1-70B, Llama-3.1-8B`, which
-an operator reads as broken. The id tie-break is required rather than
-decorative: two specs may legally carry the same `Model` string in file mode
+an operator reads as broken. That option has one cosmetic edge: `numeric: true`
+parses digit runs as numbers, so `8 === 08` and the collator reports *equal* for
+two distinct names that differ only by a leading zero — measured,
+`compare('Qwen3-8B', 'Qwen3-08B')` and `compare('Llama-3.1-8B',
+'Llama-3.01-8B')` are both `0`, where the bare house collator returns `1`. A
+raw-code-unit comparison of the names runs before the id tie-break for exactly
+that case, so two distinct names are never ordered by opaque hex; it cannot fire
+for any pair the collator already separates. The id tie-break is required rather
+than decorative: two specs may legally carry the same `Model` string in file mode
 (the agent rejects duplicate spec *IDs*, and says nothing about `Model`), and
 without it those rows fall back to the store's id order, so a re-fetch could
 swap them and move a checkbox under the operator's cursor. The sort lives in
@@ -2141,10 +2148,14 @@ data-table/chart-axis convention and it puts the *start* of the name next to the
 cells it labels. The rotation is
 CSS over intact text — never images or per-character markup — so the header's
 text content, its `scope="col"` association and the cells' own `aria-label`s are
-all unaffected; the full name stays reachable through the header's own tooltip,
-which carries the model name **and nothing else** so it cannot be confused with
-the cell tooltip below. Only the column headers rotate: the corner and the row
-labels stay horizontal.
+all unaffected. The header keeps a tooltip carrying the model name **and nothing
+else**, so it cannot be confused with the cell tooltip below — but what that
+tooltip reveals is the **orientation**, not hidden characters. Since both axes
+wrap (below), neither hides anything, and "reveal the truncated tail" is no
+longer a reason for either of them; what is left is that a rotated, two-line
+vertical label is harder to read than running text, and the tooltip renders the
+same string horizontally on one line. Only the column headers rotate: the corner
+and the row labels stay horizontal.
 
 **Long names on both axes are bounded by wrapping, never by an ellipsis**, and
 that corrects what shipped here first. One budget (160 px) governs both axes:
@@ -2164,13 +2175,52 @@ the 160 px cap, `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL` and
 `Qwen3-Coder-30B-A3B-Instruct-UD-Q8_0` both rendered as `Qwen3-Coder-30B-A3…` —
 two different facts drawn identically, in a grid whose only question is whether
 *these two* may run together. Wrapping removes that unconditionally, and it is
-cheap: measured, the grid column stays 46 px and the header row 168 px for a
-realistic 36–40 character name (the column is sized by the checkbox, not by the
-header), rising to 56 px only past ~41 characters. A wrapped label spends row
-height — 30 → 44 px at two lines, 60 px at three — which is the abundant axis.
+cheap: re-measured with fourteen realistic specs at a 1100 px container, a
+header column is 46 px while its name fits one vertical line (up to ~20
+characters at this budget: `Qwen3-Embedding-8B` is 144 px of the 160 px cap) and
+56 px once it wraps to two, and the header row is 168.5 px — the column is
+sized by the checkbox far more than by the header, and a vertical line box is
+24 px wide. (An earlier revision of this paragraph claimed 46 px for a "36–40
+character name, rising to 56 px only past ~41 characters"; that is not what the
+component measures — a 39-character name wraps to two lines and its column is
+56 px.) A wrapped label spends row
+height, the abundant axis: re-measured at a 1100 px container, the label element
+is 20 px at one line, 40 px at two and 60 px at three, and the row it sits in is
+47 px (the checkbox cell, not the label, sets that floor), 53 px and 73 px.
 `overflow: hidden` is gone rather than kept as a backstop: with wrapping the
 inline size cannot exceed the cap, so it could only ever hide something
-silently. The row labels carry no tooltip, because nothing about them is hidden.
+silently. The row labels carry no tooltip — not because nothing is hidden (that
+is equally true of the headers, which keep theirs) but because a row label is
+already horizontal running text, so a tooltip would repeat the same characters
+in the same orientation.
+
+**The wrap mode is `overflow-wrap: break-word` on both axes, and specifically
+not `anywhere`.** Both wrap and neither drops a character; they differ only in
+the min-content size the box reports, and on the horizontal axis that difference
+is a defect. `anywhere` lowers min-content to **one character**, and under
+`table-layout: auto` the algorithm then always prefers squeezing the label
+column over letting the table overflow — which disarms the `overflowX: auto`
+below instead of using it. Measured in Chromium (14 realistic specs, default MUI
+theme, label column / tallest row / table height): at a 1100 px container both
+modes give 192 / 53 / 828 px; at 600 px `anywhere` gives **43.8 / 734 / 6,703
+px**, with every label rendering **one character per line** (36 line boxes:
+`Q`,`w`,`e`,`n`,`3`,`-`, …), while `break-word` gives 109 / 133 / 1,379 px. The
+`anywhere` figure is the wrapping defect all over again on a different axis: the
+three sorted-adjacent `Qwen3-Coder-…` siblings become identical for their first
+~26 lines and differ hundreds of pixels down a row taller than the viewport, so
+no two of them can be seen together. It is reachable on ordinary hardware — with
+the 264 px sidebar and the page's `clamp(20px, 4vw, 54px)` padding, a 1280 px
+window leaves ~866 px of content and a 1024 px window ~630 px. `break-word`
+reports the longest **unbreakable** run instead, so a hyphenated model name
+floors at its longest hyphen-free segment; a name with no hyphen at all is still
+bounded, by `max-width` clamping the min-content *contribution* rather than by
+the wrap mode (measured: a 43-character hyphen-free name holds at exactly 160 px
+at both 1100 px and 600 px inside a 15-spec grid). On the **vertical** header
+axis the choice is measurably free — `anywhere` and `break-word` give identical
+geometry there (header row 168.5 px, span 160 px, widest header column 56 px,
+two line boxes, at both 1100 px and 600 px), because table layout distributes
+*width* and a `vertical-rl` box's inline size is its height. One declaration is
+used for both axes so the component teaches one rule.
 
 **The table shrinks to its content (`width: auto`)**, overriding MUI's
 `width: 100%`, and that is what makes the row-label cap reach the *column*
@@ -2179,13 +2229,23 @@ its surplus back to the columns in proportion to their content, so a capped
 160 px label still sat inside a 491 px cell — measured on the real component,
 five realistic names at a 1100 px viewport, against 725 px (66 % of the table)
 before the cap — leaving roughly 330 px of empty gutter between a name and its
-own first checkbox. Shrink-to-fit makes the label column exactly 192 px
-(160 + MUI's 2 × 16 px small padding) and the grid columns 46 px at any
-viewport. The enclosure's `overflowX: auto` is unchanged and still does its job:
-with fourteen specs the table measures 850 px and scrolls inside its own box
-rather than widening the page. At a viewport too narrow for the whole matrix the
-label column compresses further and the rows grow taller; that is lossless (no
-character is dropped) and only happens where the grid already has to scroll.
+own first checkbox. Shrink-to-fit makes the label column 192 px
+(160 + MUI's 2 × 16 px small padding) and the grid columns 46 px; with fourteen
+realistic specs the table then measures 870 px wide and 828 px tall.
+
+Those figures hold **while the container can afford that shrink-to-fit width** —
+here ~870 px. Below it the table has to give something up, and auto layout takes
+it from the widest column: measured with the same fourteen specs, the label
+column is still 192 px at a 900 px container, 182 px at 860 px and 122 px at
+800 px, with the rows growing taller as names wrap onto more lines. The
+degradation is lossless — no character is ever dropped — and `break-word` puts a
+floor under it (109 px for these names; 192 px again as soon as one name has no
+hyphen at all). It is **not** true that this only happens where the grid already
+scrolls: at an 800 px container the enclosure's `scrollWidth` equals its width
+(800 = 800, measured), so nothing is scrolling yet and the label has already
+given up 70 px. `overflowX: auto` is what absorbs the rest, and it does take
+over further down — at a 600 px container the box is 600 px around a 787 px
+table, which scrolls inside its own box rather than widening the page.
 
 **The cell is a checkbox, and its off state must not read as a prohibition.**
 This was a real defect: the cell rendered as an icon button whose off state was

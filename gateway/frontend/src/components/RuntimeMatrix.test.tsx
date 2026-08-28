@@ -461,7 +461,14 @@ describe('RuntimeMatrix rotated column headers', () => {
     const style = getComputedStyle(label);
     expect(style.maxHeight).toBe('160px');
     expect(style.whiteSpace).toBe('normal');
-    expect(style.overflowWrap).toBe('anywhere');
+    // The SAME wrap mode the row label uses -- one declaration, one meaning.
+    // Measured in Chromium, `anywhere` and `break-word` give byte-identical
+    // geometry on this axis (header row 168.5px, span 160px, widest header
+    // column 56px, 2 line boxes, at a 1100px AND a 600px container), because
+    // table layout distributes WIDTH and a `vertical-rl` box's inline size is
+    // its height. So there is nothing here to justify differing from the row
+    // label, where the choice is load-bearing.
+    expect(style.overflowWrap).toBe('break-word');
     expect(style.textOverflow).not.toBe('ellipsis');
     expect(style.overflow).not.toBe('hidden');
 
@@ -586,20 +593,33 @@ describe('RuntimeMatrix name ordering', () => {
     // Both call sites hand in a fresh `.map()` result today, so a
     // `specs.sort(...)` in the component would be a LATENT mutation bug --
     // exactly the kind that survives review. The `readonly` prop type is the
-    // first guard (it makes that a compile error); this is the runtime one,
-    // which still holds if the type is ever widened back: sorting a frozen
-    // array throws TypeError in strict mode, and ES modules are strict.
+    // first guard (it makes that a compile error); these are the runtime ones,
+    // which still hold if the type is ever widened back.
     const unsorted: RuntimeMatrixSpec[] = [
       { id: 'spec-z', model: 'Charlie', gpus: [{ index: 0, vramMb: 1000 }] },
       { id: 'spec-a', model: 'Alpha', gpus: [{ index: 0, vramMb: 1000 }] },
     ];
-    const frozen = Object.freeze([...unsorted]);
+
+    // Guard 1: an ORDINARY array, inspected after the render. `specs.sort()`
+    // reorders it in place and this fails.
+    const plain = [...unsorted];
     const { container } = render(
-      <RuntimeMatrix t={t} specs={frozen} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
+      <RuntimeMatrix t={t} specs={plain} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
     );
     expect(columnLabels(container)).toEqual(['Alpha']);
-    // The caller's array is still in its own order.
-    expect(frozen.map((sp) => sp.model)).toEqual(['Charlie', 'Alpha']);
+    expect(plain.map((sp) => sp.model)).toEqual(['Charlie', 'Alpha']);
+    cleanup();
+
+    // Guard 2: a FROZEN array. Sorting one throws TypeError in strict mode,
+    // and ES modules are strict, so the render itself is the assertion --
+    // there is deliberately no `expect(frozen.map(...)).toEqual([...])` here,
+    // because a frozen array cannot be reordered and that assertion could
+    // only ever pass.
+    const frozen = Object.freeze([...unsorted]);
+    const { container: frozenContainer } = render(
+      <RuntimeMatrix t={t} specs={frozen} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
+    );
+    expect(columnLabels(frozenContainer)).toEqual(['Alpha']);
   });
 
   it('breaks a duplicate-model tie by id, so a re-fetch cannot swap the two rows', () => {
@@ -622,6 +642,16 @@ describe('RuntimeMatrix name ordering', () => {
       <RuntimeMatrix t={t} specs={dup} pairs={[]} onToggle={onToggle} budgets={{}} />,
     );
     expect(columnLabels(container)).toEqual(['Alpha', 'Dup']);
+    // NOT a desired outcome -- this pins a KNOWN, PRE-EXISTING gap so the
+    // tie-break assertion below has something observable to stand on. Two
+    // identically-labelled rows (and a cell whose accessible name reads
+    // "Dup + Dup", in a grid documented irreflexive) is a real defect: file
+    // mode admits duplicate `model` strings because
+    // server-agent/internal/runtime/types.go rejects duplicate spec IDS only,
+    // and live mode is protected separately by gatewayNameTakenOnServer. It
+    // predates the name sort and is byte-identical without it; fixing it needs
+    // its own design (disambiguate the label, or reject the config), not a
+    // change to this comparator.
     expect(rowLabels(container)).toEqual(['Dup', 'Dup']);
 
     const firstRowCells = container.querySelectorAll('tbody tr')[0].querySelectorAll('input');
@@ -648,25 +678,60 @@ describe('RuntimeMatrix name ordering', () => {
     expect(rowLabels(container)).toEqual(['Llama-3.1-70B', 'Llama-3.1-405B']);
   });
 
+  it('orders a leading-zero pair by NAME, not by the opaque id tie-break', () => {
+    // `numeric: true` parses digit runs as numbers, and 8 === 08, so the
+    // collator returns 0 for these two DISTINCT names (measured:
+    // `new Intl.Collator(undefined, { numeric: true }).compare('Qwen3-8B',
+    // 'Qwen3-08B') === 0`, where the bare house collator returns 1). Without
+    // the name tie-break in compareSpecs they fall through to the id, and the
+    // grid's stated order -- by model name -- is silently decided by opaque
+    // hex. The ids here CONTRADICT the name order, so the assertion can only
+    // pass through the name tie-break: under the id alone, 'Qwen3-8B' wins.
+    const zeros: RuntimeMatrixSpec[] = [
+      { id: '0000', model: 'Qwen3-8B', gpus: [{ index: 0, vramMb: 1000 }] },
+      { id: 'ffff', model: 'Qwen3-08B', gpus: [{ index: 0, vramMb: 1000 }] },
+    ];
+    const { container } = render(
+      <RuntimeMatrix t={t} specs={zeros} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
+    );
+    expect(columnLabels(container)).toEqual(['Qwen3-08B']);
+    expect(rowLabels(container)).toEqual(['Qwen3-8B']);
+  });
+
   it('leaves the WIRE order alone: onToggle still emits the id-sorted pair', () => {
-    // The alphabetically-FIRST model carries the code-unit-GREATEST id, so
-    // display order and wire order genuinely disagree here. Catches anyone
-    // "helpfully" making canonicalPair follow the new display comparator --
-    // the backend stores and compares pairs by raw id (SetCoResidency).
-    // Passed in reverse display order too, so this fails on the ordering as
-    // well as guarding the wire format.
+    // THE IDS ARE THE TEST. `spec-a`/`spec-z` (what this used to use) order
+    // identically under raw `<` and under the display collator, so the guard
+    // this test names could not fire: replacing canonicalPair's `x < y` with
+    // `modelCollator.compare(x, y) <= 0` left the whole file green. These are
+    // shaped like the live id space -- random hex from the store -- and are
+    // chosen so the two comparators genuinely disagree: '7fff' sorts BEFORE
+    // '12de' under the collator (`numeric: true` reads 7 < 12) and AFTER it
+    // under raw code units ('1' < '7'). The backend stores and compares pairs
+    // by raw id (SetCoResidency), so raw `<` is the only correct answer.
     const crossed: RuntimeMatrixSpec[] = [
-      { id: 'spec-a', model: 'Bravo', gpus: [{ index: 0, vramMb: 1000 }] },
-      { id: 'spec-z', model: 'Alpha', gpus: [{ index: 0, vramMb: 1000 }] },
+      { id: '12de', model: 'Bravo', gpus: [{ index: 0, vramMb: 1000 }] },
+      { id: '9abc', model: 'Alpha', gpus: [{ index: 0, vramMb: 1000 }] },
+      { id: '7fff', model: 'Charlie', gpus: [{ index: 0, vramMb: 1000 }] },
     ];
     const onToggle = vi.fn();
     const { container } = render(
       <RuntimeMatrix t={t} specs={crossed} pairs={[]} onToggle={onToggle} budgets={{}} />,
     );
-    expect(columnLabels(container)).toEqual(['Alpha']);
-    expect(rowLabels(container)).toEqual(['Bravo']);
+    // Passed in a non-display order, so this also fails on the ordering.
+    expect(columnLabels(container)).toEqual(['Alpha', 'Bravo']);
+    expect(rowLabels(container)).toEqual(['Bravo', 'Charlie']);
+
+    // Cell (Charlie, Bravo) is the one that catches BOTH wrong answers: the
+    // emitted pair is neither (row, col) = ('7fff', '12de') -- what a
+    // pass-through implementation sends -- nor the collator's ('7fff',
+    // '12de'), but the raw-code-unit ('12de', '7fff').
+    fireEvent.click(cell('Charlie', 'Bravo'));
+    expect(onToggle).toHaveBeenLastCalledWith('12de', '7fff');
+
+    // And cell (Bravo, Alpha) is the one where wire order and DISPLAY order
+    // disagree: Alpha is drawn first, but its id sorts second.
     fireEvent.click(cell('Bravo', 'Alpha'));
-    expect(onToggle).toHaveBeenCalledWith('spec-a', 'spec-z');
+    expect(onToggle).toHaveBeenLastCalledWith('12de', '9abc');
   });
 });
 
@@ -719,9 +784,15 @@ describe('RuntimeMatrix row-label bounding', () => {
     // effect on an inline box (measured: the column stayed at its full width).
     expect(style.display).toBe('block');
     expect(style.maxWidth).toBe('160px');
-    // `anywhere`, not `break-word`: only `anywhere` lowers the box's
-    // min-content size, which is what forces the table column down to the cap.
-    expect(style.overflowWrap).toBe('anywhere');
+    // `break-word`, NOT `anywhere`. What forces the table column down to the
+    // cap is `width: auto` shrink-to-fit plus this `max-width` (see the test
+    // below) -- not the wrap mode. All `anywhere` adds is a ONE-CHARACTER
+    // min-content size, which measured in Chromium (14 realistic specs, 600px
+    // container) collapsed the label column to 43.8px and rendered every name
+    // one character per line in an 814px-tall row. `break-word` measured
+    // IDENTICAL at every width where the cap binds and floors the collapse at
+    // the longest unbreakable run below it.
+    expect(style.overflowWrap).toBe('break-word');
     // The two load-bearing negatives. An ellipsis here would render two sorted
     // neighbours identically -- see the collision test below.
     expect(style.textOverflow).not.toBe('ellipsis');
@@ -772,18 +843,33 @@ describe('RuntimeMatrix row-label bounding', () => {
     expect(getComputedStyle(table?.parentElement as HTMLElement).overflowX).toBe('auto');
   });
 
-  it('adds no tooltip and no hidden second copy to the row label', () => {
-    // Nothing is hidden, so a tooltip repeating fully-visible text is noise.
-    // This also guards the other tempting "fix": rendering a truncated visible
-    // copy next to a full hidden one, which would double the text count.
+  it('adds no tooltip and no hidden second copy to the row label', async () => {
+    // A row label is already horizontal running text, so a tooltip there would
+    // repeat the same characters in the same orientation -- noise. (The COLUMN
+    // header keeps its tooltip for a different reason: it is rotated 90
+    // degrees, and its tooltip un-rotates it.) This also guards the other
+    // tempting "fix": a truncated visible copy next to a full hidden one,
+    // which would double the text count.
     const { container } = render(
       <RuntimeMatrix t={t} specs={familySpecs} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
     );
     // family[1] (…Q8_0) collates last, so it is a ROW and never a column --
     // exactly one occurrence in the whole grid.
     expect(screen.getAllByText(family[1])).toHaveLength(1);
+
+    // WAITED, not synchronous. MUI's Tooltip has a ~100ms enter delay, so a
+    // `queryByRole('tooltip')` on the line after `mouseOver` returns null
+    // whether or not a Tooltip is there -- which is exactly what this
+    // assertion used to be, and it stayed green when the row label WAS
+    // wrapped in `<Tooltip title={rowSpec.model}>`.
     fireEvent.mouseOver(rowLabelSpan(container, 1));
-    expect(screen.queryByRole('tooltip')).toBeNull();
+    await expect(screen.findByRole('tooltip', undefined, { timeout: 600 })).rejects.toThrow();
+
+    // POSITIVE CONTROL, and the reason the wait above is known to be long
+    // enough: the same hover-then-wait on a CELL, which does have a tooltip,
+    // finds one. Without this the negative could pass by being blind.
+    fireEvent.mouseOver(cell(familyOrdered[2], familyOrdered[0]));
+    expect(await screen.findByRole('tooltip', undefined, { timeout: 600 })).toBeInTheDocument();
   });
 
   it('keeps the full name as the accessible name of both the row and the column header', () => {
