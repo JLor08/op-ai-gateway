@@ -437,8 +437,13 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	// EnergyBackfillWindow/EnergyIdleWindowSeconds deps set above), so — like the
 	// scheduler — it is started here rather than duplicated in each of the 3 DB
 	// driver builders (they all funnel through this one buildGatewayServer call).
-	energyCtx, cancelEnergy := context.WithCancel(context.Background())
-	go srv.StartEnergyReconciler(energyCtx, time.Duration(cfg.EnergyReconcileIntervalSeconds)*time.Second)
+	// Started through startCancellable like every other background loop here, so
+	// cancelEnergy() does not merely signal: it returns only once the reconciler
+	// goroutine is gone, i.e. before the cleanup chain below reaches the store's
+	// Close. See startCancellable's doc for why that ordering matters.
+	cancelEnergy := startCancellable(func(ctx context.Context) {
+		srv.StartEnergyReconciler(ctx, time.Duration(cfg.EnergyReconcileIntervalSeconds)*time.Second)
+	})
 	prevCleanup := cleanup
 	cleanup = func() error {
 		stopScheduler()

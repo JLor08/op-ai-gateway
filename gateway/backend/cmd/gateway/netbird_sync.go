@@ -348,12 +348,12 @@ func runNetbirdSyncLoop(ctx context.Context, deps netbirdSyncDeps, trigger <-cha
 // force an immediate extra pass (e.g. on a NetBird dns_domain change); pass nil
 // when no such trigger is needed.
 var startNetbirdSyncLoop = func(store serverStore, settings netbirdSettings, onOnline onlineEventFunc, intervals intervalReader, peerEnvFallback int, timeout time.Duration, trigger <-chan struct{}) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runNetbirdSyncLoop(ctx, netbirdSyncDeps{
-		store: store, settings: settings, intervals: intervals, peerEnvFallback: peerEnvFallback,
-		timeout: timeout, now: func() time.Time { return time.Now().UTC() }, onOnline: onOnline,
-	}, trigger)
-	return cancel
+	return startCancellable(func(ctx context.Context) {
+		runNetbirdSyncLoop(ctx, netbirdSyncDeps{
+			store: store, settings: settings, intervals: intervals, peerEnvFallback: peerEnvFallback,
+			timeout: timeout, now: func() time.Time { return time.Now().UTC() }, onOnline: onOnline,
+		}, trigger)
+	})
 }
 
 // runNetbirdReconcileOnce runs one group+policy fleet pass (Loop B's unit of
@@ -381,7 +381,7 @@ func runNetbirdReconcileLoop(ctx context.Context, reconciler netbirdReconciler, 
 // substitute a fake reconciler + fake interval reader and observe the goroutine
 // start/stop, mirroring startNetbirdSyncLoop.
 var startNetbirdReconcileLoop = func(reconciler netbirdReconciler, intervals intervalReader, peerEnvFallback int) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runNetbirdReconcileLoop(ctx, reconciler, intervals, peerEnvFallback)
-	return cancel
+	return startCancellable(func(ctx context.Context) {
+		runNetbirdReconcileLoop(ctx, reconciler, intervals, peerEnvFallback)
+	})
 }

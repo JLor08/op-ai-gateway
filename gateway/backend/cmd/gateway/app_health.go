@@ -289,9 +289,7 @@ func runAppHealthLoop(ctx context.Context, runner *appHealthRunner, serverTrigge
 // reaction channel — see appHealthRunner.runForServer; a nil channel is safe (a
 // `case <-nil` in the loop select never fires).
 var startAppHealthLoop = func(runner *appHealthRunner, serverTrigger <-chan string) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runAppHealthLoop(ctx, runner, serverTrigger)
-	return cancel
+	return startCancellable(func(ctx context.Context) { runAppHealthLoop(ctx, runner, serverTrigger) })
 }
 
 // appHealthInterval reads the probe cadence from settings, failing open to

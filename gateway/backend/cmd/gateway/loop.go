@@ -82,6 +82,46 @@ func runLoop(ctx context.Context, opts loopOpts) {
 	}
 }
 
+// startCancellable runs fn in a background goroutine against a fresh
+// cancellable context and returns a CancelFunc that cancels that context AND
+// WAITS for fn to return. Every start*Loop in this package goes through it, so
+// that one property holds for all of them at once.
+//
+// The wait is the load-bearing half. Every start*Loop cancel is folded into
+// buildGatewayServer's cleanup(), which cancels the loops and THEN closes the
+// store — so a cancel that merely signalled left a pass running against a store
+// being closed underneath it. That is not just untidy: database/sql's DB.conn
+// releases db.mu BEFORE it calls connector.Connect, and openNewConnection calls
+// Connect BEFORE it checks db.closed, so a query from a still-running pass can
+// be inside Connect after Close() has already returned — and sqlite's Connect
+// CREATES the database file. That recreated file reappeared inside a test's
+// t.TempDir() after its RemoveAll had already scanned the directory empty,
+// failing the final rmdir with "directory not empty" (a red CI job whose test
+// body passed). Waiting here makes "the loop is stopped" true by the time
+// cancel returns, which is what every caller already assumed it meant.
+//
+// The wait is deliberately unbounded. Every pass in this package derives its
+// context from the one cancelled here — runLoop and runAppHealthLoop both
+// return on ctx.Done(), and each pass's own deadline is a context.WithTimeout
+// of it — so a pass that outran cancellation would be a defect this wait must
+// surface, not paper over with a deadline that silently restores the race.
+//
+// The returned func is safe to call more than once and from several goroutines:
+// context cancellation is idempotent and a receive on a closed channel returns
+// immediately.
+func startCancellable(fn func(ctx context.Context)) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn(ctx)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 // startLoop runs runLoop in a background goroutine against a fresh
 // context.CancelFunc-controlled context and returns that cancel func. Every
 // start*Loop package var in this package that fits runLoop's shape is a thin
@@ -90,7 +130,5 @@ func runLoop(ctx context.Context, opts loopOpts) {
 // directly, so run*Loop stays independently callable/testable exactly as
 // before.
 func startLoop(opts loopOpts) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runLoop(ctx, opts)
-	return cancel
+	return startCancellable(func(ctx context.Context) { runLoop(ctx, opts) })
 }

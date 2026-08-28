@@ -79,8 +79,12 @@ func TestCertReconcileLoopRunsAnExtraPassOnTrigger(t *testing.T) {
 	trigger := make(chan struct{}, 1)
 	cancel := startCertReconcileLoop(b, time.Hour, trigger)
 	defer func() {
+		// Unpark first, cancel second. This reconciler blocks each pass until
+		// released and ignores ctx entirely, and cancel() now WAITS for the loop
+		// goroutine to return -- so cancelling before releasing would park the
+		// cleanup itself on a pass nobody would ever wake.
+		close(b.release)
 		cancel()
-		close(b.release) // let any parked pass finish so the goroutine exits
 	}()
 
 	// The loop's own immediate startup pass.
@@ -111,8 +115,8 @@ func TestCertReconcileTriggerNeverBlocksAndNeverOverlapsPasses(t *testing.T) {
 	fire := certReconcileTriggerFunc(trigger)
 	cancel := startCertReconcileLoop(b, time.Hour, trigger)
 	defer func() {
+		close(b.release) // unpark before cancelling -- see the sibling test
 		cancel()
-		close(b.release)
 	}()
 
 	// Park the startup pass: from here on a pass is in flight and the loop
