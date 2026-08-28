@@ -474,15 +474,25 @@ const de = {
   runtimeSpecEnabled: 'Aktiviert',
   runtimeMatrix: 'Koresidenz-Matrix',
   runtimeMatrixHint:
-    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen.',
+    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen.',
   runtimeMatrixCell: 'Koresidenz umschalten',
   runtimeMatrixNeedTwo:
     'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz-Matrix zu verwalten.',
+  // The lead line of every cell tooltip. It answers the question the operator
+  // actually has ("dürfen diese zwei zusammen laufen?") and names the rule
+  // that surprised a real one: the matrix is checked over the whole running
+  // set, GPUs do not enter into it.
+  runtimeMatrixConsequence:
+    'Erlaubt diesen beiden Modellen, gleichzeitig zu laufen. Die Matrix gilt unabhängig von den GPUs: Solange dieses Paar nicht angehakt ist, verdrängt der Start des einen das andere – auch auf getrennten Karten.',
   runtimeMatrixNoSharedGpu:
     'Keine gemeinsame GPU – diese beiden Modelle konkurrieren um kein VRAM.',
   runtimeMatrixAdvisory:
     'Nur ein Hinweis: Die endgültige Entscheidung trifft der Agent zur Laufzeit anhand der tatsächlich laufenden Prozesse.',
   runtimeMatrixOverBudget: 'über Budget',
+  runtimeMatrixDisabledFileMode:
+    'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
+  runtimeMatrixDisabledSaving:
+    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Matrix wieder Klicks an.',
   runtimeLimits: 'Runtime-Limits',
   runtimeLimitsIntro:
     'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
@@ -2387,13 +2397,20 @@ const en: PortalMessages = {
   runtimeSpecPinned: 'Pinned (never stop)',
   runtimeSpecEnabled: 'Enabled',
   runtimeMatrix: 'Co-residency matrix',
-  runtimeMatrixHint: 'Choose which model processes may run on the same server at the same time.',
+  runtimeMatrixHint:
+    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy.',
   runtimeMatrixCell: 'Toggle co-residency',
   runtimeMatrixNeedTwo: 'At least two launch specs are needed to manage the co-residency matrix.',
+  runtimeMatrixConsequence:
+    'Allows these two models to run at the same time. The matrix applies regardless of GPUs: while this pair is unticked, starting one evicts the other — even on separate cards.',
   runtimeMatrixNoSharedGpu: 'No shared GPU — these two models never compete for VRAM.',
   runtimeMatrixAdvisory:
     'Advisory only — the agent makes the final call at runtime based on the processes actually running.',
   runtimeMatrixOverBudget: 'over budget',
+  runtimeMatrixDisabledFileMode:
+    'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
+  runtimeMatrixDisabledSaving:
+    'The previous change is still saving — the matrix accepts clicks again in a moment.',
   runtimeLimits: 'Runtime limits',
   runtimeLimitsIntro:
     'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',

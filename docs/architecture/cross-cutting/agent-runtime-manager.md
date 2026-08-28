@@ -734,7 +734,15 @@ A spec `S` may start alongside the running set `R` only if **all three** hold:
 1. **Co-residency matrix** — a permitted pair exists for every `(S, r)`,
    `r ∈ R`. Row present means pair allowed; there is no `allowed` column, so
    "not co-resident" is the structural default (exactly llama-swap's behaviour
-   until an operator opens a cell).
+   until an operator opens a cell). **This rule is checked over every running
+   spec regardless of GPU overlap.** Two specs pinned to disjoint cards still
+   need their pair opened, and without it starting one evicts the other even
+   though they never share a GPU. Rule 3 below is the *only* rule that asks
+   which GPUs a spec touches; reading its "GPUs no common spec touches do not
+   compete" as a general exemption is the misreading this rule attracts, and a
+   real operator hit it — they concluded two models on separate GPUs needed no
+   permission and could not be granted one. The portal's cell tooltip now
+   states the consequence at the cell (§11.3).
 2. **Process limit** — `|R| + 1 ≤ runtime_max_processes` (`0` = unlimited).
 3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches *and that has a
    budget* (`budget(g) > 0`; an absent row or a `0` is unconstrained and not
@@ -746,8 +754,9 @@ A spec `S` may start alongside the running set `R` only if **all three** hold:
 
 **The matrix and the arithmetic are not redundant.** The matrix expresses
 operator *intent* and covers the non-VRAM constraints nobody can compute — PCIe
-bandwidth, system RAM, CPU contention. The arithmetic is the *veto*: the matrix
-alone cannot stop three pairwise-compatible models from jointly exceeding VRAM.
+bandwidth, system RAM, CPU contention — none of which is per-GPU, which is
+exactly why the matrix is not per-GPU either. The arithmetic is the *veto*: the
+matrix alone cannot stop three pairwise-compatible models from jointly exceeding VRAM.
 An open matrix cell is not a guarantee that the pair fits, and the portal's
 per-cell VRAM tooltip says so on every cell.
 
@@ -2098,6 +2107,50 @@ becomes a row and a column — including one with no spec configured, whose GPU
 list is then empty and which the tooltip renders as "no shared GPU"; that
 inclusion prevents a crash rather than being an oversight.
 
+**Column headers are rotated to read bottom-to-top**, because the column count
+grows with the spec count and a dozen model names side by side needs more width
+than any viewport has — scrolling past headers you cannot see while hunting for
+a cell is how the matrix stops being usable. The mechanism is
+`writing-mode: vertical-rl` plus `transform: rotate(180deg)`, deliberately not a
+bare `rotate(-90deg)`: the writing-mode form gives the label a genuinely
+vertical layout *box*, so ordinary table layout reserves the right footprint and
+each header stays over its own column. A bare transform leaves the box
+horizontal, which is what forces the explicit heights and absolute positioning
+that then drift a few pixels per column. Bottom-to-top is the Western
+data-table/chart-axis convention and it puts the *start* of the name next to the
+cells it labels, so the height cap truncates away from the grid. The rotation is
+CSS over intact text — never images or per-character markup — so the header's
+text content, its `scope="col"` association and the cells' own `aria-label`s are
+all unaffected; the full name stays reachable through the header's own tooltip,
+which carries the model name **and nothing else** so it cannot be confused with
+the cell tooltip below. Only the column headers rotate: the corner and the row
+labels stay horizontal.
+
+**The cell is a checkbox, and its off state must not read as a prohibition.**
+This was a real defect: the cell rendered as an icon button whose off state was
+a crossed-circle "block" glyph, and an operator who wanted two models co-resident
+on *different* GPUs read that plus a tooltip about disjoint GPUs as a refusal and
+stopped — reporting that no tick could be made. Nothing in the stack prevented
+them (`SetCoResidency` rejects only empty, identical, foreign and duplicate
+pairs, and says nothing about GPUs), so the one configuration the matrix exists
+to express was the one the UI discouraged hardest. Four renderings, because
+"off" and "not editable" are different facts that used to share a glyph:
+
+| | editable | disabled |
+|---|---|---|
+| allowed | ticked box (success) | filled circle-check |
+| not allowed | empty box | crossed circle |
+
+The **square** family means "a control you can operate", the **circle** family
+"a read-out you cannot". The old `CheckCircleIcon`/`BlockIcon` pair was not
+discarded, only moved to the read-only state it actually describes — a crossed
+circle finally means prohibition. Keeping the allowed/off distinction visible in
+*both* columns is required, not cosmetic: a single "disabled glyph" would render
+a disabled **allowed** pair as forbidden. The matrix is disabled in file mode and
+while a toggle PUT is in flight, and each carries its own reason on hover (same
+rule as `RowActionsCell`/`IconAction`) — a permanent "the agent owns its own
+config file" and a transient "still saving", which must not be interchanged.
+
 Pairs are canonically ordered (`a < b`) and **the portal enforces that on both
 sides even though the backend is already tolerant**: the service sorts every
 incoming pair, so a non-canonical write would survive silently. The portal sorts
@@ -2106,6 +2159,17 @@ order when deciding whether a cell shows as allowed, so a pair that ever arrived
 non-canonical still renders correctly rather than making the matrix lie. Note the
 trap: a naive pass-through `onToggle(rowId, colId)` emits *position* order for
 every below-diagonal cell.
+
+**The cell tooltip leads with what the cell controls, and the VRAM arithmetic is
+the secondary detail.** It used to open with "no shared GPU — these two models
+never compete for VRAM", which sitting next to the old prohibition glyph read as
+the *reason* the pair was forbidden rather than as the unrelated informational
+note it is. The lead line is now the consequence of leaving the pair off,
+including the property that surprised the operator: the matrix applies
+**regardless of GPUs** (§5.2 rule 1), so without the pair one model evicts the
+other even on separate cards. When the cell is disabled the reason why leads
+ahead of even that, because an operator who does not know the grid is read-only
+will keep clicking a control that will never respond.
 
 The per-cell VRAM tooltip is **advisory and says so on every cell**. It sums each
 **shared** GPU's estimate across the two specs and compares against the **saved**

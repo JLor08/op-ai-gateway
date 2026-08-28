@@ -3426,6 +3426,11 @@ export function RuntimeAdminSection({
                     (reportConfig?.budgets ?? []).map((b) => [b.index, b.budgetMb]),
                   )}
                   disabled
+                  // A disabled cell must say why (the RowActionsCell /
+                  // IconAction rule): "read-only" and "not allowed yet" look
+                  // alike otherwise, and this one is permanently disabled for
+                  // as long as the agent owns its own config file.
+                  disabledReason={t.runtimeMatrixDisabledFileMode}
                 />
               </Box>
             )
@@ -3469,6 +3474,11 @@ export function RuntimeAdminSection({
               onToggle={(a, b) => void toggleCoresidency(a, b)}
               budgets={savedBudgetsByGpuIndex}
               disabled={coresidencyBusy}
+              // Transient, unlike file mode above -- but for the few hundred
+              // milliseconds it lasts, an unexplained dead grid is the same
+              // defect. Undefined when not busy, so a live matrix never
+              // carries a reason it does not have.
+              disabledReason={coresidencyBusy ? t.runtimeMatrixDisabledSaving : undefined}
             />
           )}
         </Panel>

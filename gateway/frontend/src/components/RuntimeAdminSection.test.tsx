@@ -1207,7 +1207,7 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
 
     fireEvent.click(await screen.findByText(t.runtimeMatrix));
     fireEvent.click(
-      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
     );
 
     await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
@@ -1233,7 +1233,7 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
 
     fireEvent.click(await screen.findByText(t.runtimeMatrix));
     fireEvent.click(
-      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Bravo + Alpha` }),
+      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Bravo + Alpha` }),
     );
 
     await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
@@ -1259,7 +1259,7 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
     // is nothing that could PUT an empty replacement list.
     await screen.findByText(t.loading);
     expect(
-      screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+      screen.queryByLabelText(`${t.runtimeMatrixCell}: Charlie + Alpha`),
     ).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
   });
@@ -1282,20 +1282,34 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
     fakeApi.putRuntimeCoresidency.mockImplementationOnce(async () => firstPut);
 
     fireEvent.click(await screen.findByText(t.runtimeMatrix));
-    const firstCell = await screen.findByRole('button', {
+    const firstCell = await screen.findByRole('checkbox', {
       name: `${t.runtimeMatrixCell}: Bravo + Alpha`,
     });
     fireEvent.click(firstCell);
 
-    const secondCell = await screen.findByRole('button', {
+    const secondCell = await screen.findByRole('checkbox', {
       name: `${t.runtimeMatrixCell}: Charlie + Bravo`,
     });
     await waitFor(() => expect(secondCell).toBeDisabled());
     fireEvent.click(secondCell); // disabled -- must be a no-op
     expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(1);
+    // The busy window is short, but an unexplained dead grid is the same
+    // defect as an unexplained read-only one -- and it must NOT reuse the
+    // file-mode sentence, which would tell the operator the matrix is
+    // permanently read-only when it is about to accept clicks again.
+    fireEvent.mouseOver(secondCell);
+    const busyTip = await screen.findByRole('tooltip');
+    expect(busyTip).toHaveTextContent(t.runtimeMatrixDisabledSaving);
+    expect(busyTip).not.toHaveTextContent(t.runtimeMatrixDisabledFileMode);
+    fireEvent.mouseOut(secondCell);
 
     resolveFirst({ pairs: [['map_1', 'map_2']] });
     await waitFor(() => expect(secondCell).not.toBeDisabled());
+    // ...and the reason goes away with it: a live cell must not claim it is
+    // saving.
+    fireEvent.mouseOver(secondCell);
+    expect(await screen.findByRole('tooltip')).not.toHaveTextContent(t.runtimeMatrixDisabledSaving);
+    fireEvent.mouseOut(secondCell);
 
     fireEvent.click(secondCell);
     await waitFor(() => expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(2));
@@ -2067,10 +2081,16 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     // Matrix: rendered (from the report) but every cell disabled -- this is
     // exactly the `disabled` prop Task 21 built and deliberately left unwired.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
-    const cell = await screen.findByRole('button', {
+    const cell = await screen.findByRole('checkbox', {
       name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
     });
     expect(cell).toBeDisabled();
+    // ...and it says WHY it is disabled. "Read-only in file mode" and "pair
+    // not allowed yet" are different facts; a greyed cell with no explanation
+    // leaves the operator to guess which one they are looking at.
+    fireEvent.mouseOver(cell);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeMatrixDisabledFileMode);
+    fireEvent.mouseOut(cell);
 
     // Limits: read-only, no Save, no fields.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
@@ -2098,11 +2118,11 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
-    const cell = await screen.findByRole('button', {
+    const cell = await screen.findByRole('checkbox', {
       name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
     });
     // The reported coresident pair renders as set.
-    expect(cell).toHaveAttribute('aria-pressed', 'true');
+    expect(cell).toBeChecked();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
     expect(await screen.findByText('3')).toBeInTheDocument();
@@ -2130,7 +2150,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
     await waitFor(() =>
       expect(
-        screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha` }),
+        screen.queryByLabelText(`${t.runtimeMatrixCell}: File-Bravo + File-Alpha`),
       ).not.toBeInTheDocument(),
     );
   });
@@ -2864,14 +2884,14 @@ describe('RuntimeAdminSection failing co-residency GET (task 22b, C1)', () => {
     // And the write gating is untouched: nothing clickable, so nothing can PUT
     // a full-replace list built from pairs we never loaded.
     expect(
-      screen.queryByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+      screen.queryByLabelText(`${t.runtimeMatrixCell}: Charlie + Alpha`),
     ).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
     await waitFor(() => expect(fakeApi.runtimeCoresidency).toHaveBeenCalledTimes(2));
     expect(
-      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
     ).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeCoresidencyUnavailable)).not.toBeInTheDocument();
   });
@@ -2894,7 +2914,7 @@ describe('RuntimeAdminSection failing co-residency GET (task 22b, C1)', () => {
     fireEvent.click(await screen.findByText(t.runtimeMatrix));
     // Loaded and live to begin with.
     expect(
-      await screen.findByRole('button', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
+      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
     ).toBeInTheDocument();
 
     rerenderWithLocale(en);
@@ -2906,7 +2926,7 @@ describe('RuntimeAdminSection failing co-residency GET (task 22b, C1)', () => {
     expect(await screen.findByText(en.runtimeCoresidencyStale)).toBeInTheDocument();
     expect(screen.queryByText(en.runtimeCoresidencyUnavailable)).not.toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: `${en.runtimeMatrixCell}: Charlie + Alpha` }),
+      screen.queryByLabelText(`${en.runtimeMatrixCell}: Charlie + Alpha`),
     ).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
   });

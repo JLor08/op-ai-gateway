@@ -2011,9 +2011,12 @@ describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
     const keys = [
       'runtimeMatrixCell',
       'runtimeMatrixNeedTwo',
+      'runtimeMatrixConsequence',
       'runtimeMatrixNoSharedGpu',
       'runtimeMatrixAdvisory',
       'runtimeMatrixOverBudget',
+      'runtimeMatrixDisabledFileMode',
+      'runtimeMatrixDisabledSaving',
       'runtimeLimitsIntro',
       'runtimeGpuDriftWarning',
       'runtimeGpuDriftIconLabel',
