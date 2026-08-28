@@ -2107,6 +2107,26 @@ becomes a row and a column — including one with no spec configured, whose GPU
 list is then empty and which the tooltip renders as "no shared GPU"; that
 inclusion prevents a crash rather than being an oversight.
 
+**Both axes are ordered by model name**, with the spec id as tie-break, sorted
+once inside the component over the single array both slices are taken from.
+Sorting one slice alone is the one way to break "cell *k* sits under header
+*k*"; the triangle itself is permutation-invariant, so every unordered pair
+still appears exactly once for any order. Display order changes nothing that is
+stored or sent: a toggle still emits the pair canonicalised **by id**
+(`SetCoResidency` stores and compares pairs that way), and the backend's
+`order by id` is untouched. The comparator is an `Intl.Collator` at the runtime
+default locale with `numeric: true` — a deliberate deviation from the house's
+bare `localeCompare`, because model names are size and quantisation ladders and
+bare collation orders them `Llama-3.1-405B, Llama-3.1-70B, Llama-3.1-8B`, which
+an operator reads as broken. The id tie-break is required rather than
+decorative: two specs may legally carry the same `Model` string in file mode
+(the agent rejects duplicate spec *IDs*, and says nothing about `Model`), and
+without it those rows fall back to the store's id order, so a re-fetch could
+swap them and move a checkbox under the operator's cursor. The sort lives in
+the component and not at the callers because the same arrays also feed
+user-sortable list tables on that screen, whose order is the operator's own
+persisted choice.
+
 **Column headers are rotated to read bottom-to-top**, because the column count
 grows with the spec count and a dozen model names side by side needs more width
 than any viewport has — scrolling past headers you cannot see while hunting for
@@ -2118,13 +2138,54 @@ each header stays over its own column. A bare transform leaves the box
 horizontal, which is what forces the explicit heights and absolute positioning
 that then drift a few pixels per column. Bottom-to-top is the Western
 data-table/chart-axis convention and it puts the *start* of the name next to the
-cells it labels, so the height cap truncates away from the grid. The rotation is
+cells it labels. The rotation is
 CSS over intact text — never images or per-character markup — so the header's
 text content, its `scope="col"` association and the cells' own `aria-label`s are
 all unaffected; the full name stays reachable through the header's own tooltip,
 which carries the model name **and nothing else** so it cannot be confused with
 the cell tooltip below. Only the column headers rotate: the corner and the row
 labels stay horizontal.
+
+**Long names on both axes are bounded by wrapping, never by an ellipsis**, and
+that corrects what shipped here first. One budget (160 px) governs both axes:
+`max-width` on the horizontal row labels, `max-height` on the vertical column
+headers, because `writing-mode: vertical-rl` makes the *height* the inline size.
+A name that exceeds the budget wraps onto a second line; no character is ever
+dropped. This is load-bearing rather than a preference, and the reason is the
+name sort above. The first implementation elided the headers with
+`text-overflow: ellipsis`, and the earlier claim here that "the height cap
+truncates away from the grid" was true only of where the ellipsis *glyph* sits:
+the inline axis is vertical, so the clip fell at the inline end — the end of the
+string — and `rotate(180deg)` is a paint-time transform that selects no
+different characters. The characters dropped were therefore the quantisation or
+context suffix, which is the *only* difference between two builds of one model,
+and sorting by name guarantees those two are neighbours. Measured in Chromium at
+the 160 px cap, `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL` and
+`Qwen3-Coder-30B-A3B-Instruct-UD-Q8_0` both rendered as `Qwen3-Coder-30B-A3…` —
+two different facts drawn identically, in a grid whose only question is whether
+*these two* may run together. Wrapping removes that unconditionally, and it is
+cheap: measured, the grid column stays 46 px and the header row 168 px for a
+realistic 36–40 character name (the column is sized by the checkbox, not by the
+header), rising to 56 px only past ~41 characters. A wrapped label spends row
+height — 30 → 44 px at two lines, 60 px at three — which is the abundant axis.
+`overflow: hidden` is gone rather than kept as a backstop: with wrapping the
+inline size cannot exceed the cap, so it could only ever hide something
+silently. The row labels carry no tooltip, because nothing about them is hidden.
+
+**The table shrinks to its content (`width: auto`)**, overriding MUI's
+`width: 100%`, and that is what makes the row-label cap reach the *column*
+rather than only the text. Under `table-layout: auto` a full-width table hands
+its surplus back to the columns in proportion to their content, so a capped
+160 px label still sat inside a 491 px cell — measured on the real component,
+five realistic names at a 1100 px viewport, against 725 px (66 % of the table)
+before the cap — leaving roughly 330 px of empty gutter between a name and its
+own first checkbox. Shrink-to-fit makes the label column exactly 192 px
+(160 + MUI's 2 × 16 px small padding) and the grid columns 46 px at any
+viewport. The enclosure's `overflowX: auto` is unchanged and still does its job:
+with fourteen specs the table measures 850 px and scrolls inside its own box
+rather than widening the page. At a viewport too narrow for the whole matrix the
+label column compresses further and the rows grow taller; that is lossless (no
+character is dropped) and only happens where the grid already has to scroll.
 
 **The cell is a checkbox, and its off state must not read as a prohibition.**
 This was a real defect: the cell rendered as an icon button whose off state was

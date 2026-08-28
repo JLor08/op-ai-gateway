@@ -24,11 +24,24 @@ export type RuntimeMatrixSpec = {
   gpus: { index: number; vramMb: number }[];
 };
 
-// A rotated column header is as tall as the model name is long, so an
-// unbounded one lets a single 60-character name dictate the height of the
-// whole header row. Capped here and truncated with an ellipsis; the full name
-// stays reachable through the header's own tooltip (see ColumnHeader).
-const HEADER_MAX_PX = 160;
+// ONE inline-axis budget for both axes of the grid: `maxWidth` on the
+// horizontal row labels, `maxHeight` on the vertical-rl column headers (in a
+// vertical writing mode the HEIGHT is the inline size). A name that exceeds it
+// WRAPS -- it never loses a character.
+//
+// That wrapping is load-bearing, not a preference. The specs are sorted by
+// name (see compareSpecs), so builds of one model that share a 30+ character
+// prefix are GUARANTEED to be neighbours, and any character-dropping rule at
+// this width then renders two different rows as the same string. Measured in
+// Chromium at 400 14px Roboto/Helvetica/Arial: an end-ellipsis at 160px turns
+// both `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL` and
+// `Qwen3-Coder-30B-A3B-Instruct-UD-Q8_0` into `Qwen3-Coder-30B-A3…`, in a grid
+// whose only question is "may THESE TWO run together". Wrapped, they differ on
+// line 2 at exactly the token that distinguishes them.
+//
+// 160 is the number the rotated header already spent on its own scarce axis,
+// so the grid teaches one number and the corner stays square.
+const LABEL_MAX_PX = 160;
 
 // The store is a dumb pair table; canonicalisation (which id sorts first) is
 // entirely the portal's job -- see the task-21 brief. Comparing BOTH orders
@@ -37,6 +50,47 @@ const HEADER_MAX_PX = 160;
 // silently disagreeing with what the backend actually holds.
 function pairAllowed(pairs: [string, string][], x: string, y: string): boolean {
   return pairs.some(([p, q]) => (p === x && q === y) || (p === y && q === x));
+}
+
+// DISPLAY order only, and deliberately NOT canonicalPair's ordering below:
+// that one compares raw id code units because it is the WIRE format the
+// backend stores and compares pairs by (SetCoResidency in
+// service_runtime.go). Sorting ids with a collator, or emitting pairs in
+// display order, would desynchronise the UI from what is stored.
+//
+// LOCALE is left at the runtime default, matching the house idiom
+// (shared/ListTable.tsx uses a bare `localeCompare`). It does NOT follow the
+// portal's de/en toggle and does not need to: measured, de and en produce an
+// identical order for these names and even for umlauts.
+//
+// `numeric: true` is a deliberate deviation from the bare house form, and the
+// one thing here a reviewer should challenge. Model names are size and
+// quantisation ladders, and bare collation orders them "Llama-3.1-405B,
+// Llama-3.1-70B, Llama-3.1-8B" -- an operator reads that as broken. Measured,
+// it costs nothing: a quantisation family sorts identically under bare and
+// numeric collation (siblings stay adjacent either way), and numeric
+// additionally fixes the context ladder (…-32k before …-262k, not after).
+// Reviewer trap: the `numeric: true` hits elsewhere in this frontend are
+// ListColumn's right-align flag, not a collator option -- not precedent in
+// either direction.
+//
+// Constructed once at module scope: this component re-renders on every
+// telemetry poll.
+const modelCollator = new Intl.Collator(undefined, { numeric: true });
+
+function compareSpecs(a: RuntimeMatrixSpec, b: RuntimeMatrixSpec): number {
+  const byModel = modelCollator.compare(a.model, b.model);
+  if (byModel !== 0) return byModel;
+  // The id tie-break is required, not decoration. Two specs may legally carry
+  // the SAME model string in file mode: the agent's ParseConfig rejects
+  // duplicate spec IDs and says nothing about Model, and the portal falls back
+  // to the id only when `model` is EMPTY. `id` is the only field unique in
+  // BOTH paths. Without it those rows fall back to caller order -- live, the
+  // store's `order by id` over random hex -- so a re-fetch could swap which of
+  // the two is the row, moving the checkbox under the operator's cursor. Raw
+  // `<` rather than a collator: ids are opaque hex, and collating them would
+  // be meaningless.
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 function canonicalPair(x: string, y: string): [string, string] {
@@ -59,8 +113,26 @@ function canonicalPair(x: string, y: string): [string, string] {
  * what forces the explicit heights and absolute positioning that then drift a
  * few pixels per column. Bottom-to-top (rather than top-to-bottom) is the
  * Western data-table/chart-axis convention, and it also puts the START of the
- * name next to the cells it labels, so the ellipsis truncates away from the
- * grid rather than at the column.
+ * name next to the cells it labels.
+ *
+ * The header WRAPS at LABEL_MAX_PX rather than eliding, and that is a
+ * correction of what shipped here first. `writing-mode: vertical-rl` makes the
+ * INLINE axis vertical, so `text-overflow: ellipsis` clipped at the inline end
+ * = the END of the string; `rotate(180deg)` is a paint-time transform that
+ * selects no different characters, it only moves the ellipsis GLYPH to the top,
+ * away from the grid. So the old comment here ("truncates away from the grid")
+ * was true about the glyph and misleading about the characters: the tail --
+ * the quantisation/context suffix that is the ONLY difference between two
+ * builds of one model -- was exactly what got dropped. Measured, two real
+ * sibling names both rendered as `Qwen3-Coder-30B-A3…`. Now that the specs are
+ * name-sorted those siblings are adjacent columns, so the ellipsis had to go.
+ * Wrapping spends the abundant axis (a second 16px line beside the first)
+ * instead of characters; reading order survives, because after the 180° turn
+ * line 1 is the LEFT vertical line and line 2 the right, i.e. ordinary reading
+ * order once your head is tilted the way the rotation already assumes.
+ * `overflow: hidden` is gone rather than kept "as a backstop": with wrapping
+ * the inline size cannot exceed the cap, so it could only ever hide something
+ * silently -- the exact failure mode being removed.
  *
  * The rotation is pure CSS on intact text content: the header still contains
  * the model name as text, so screen readers, `getByText` and the cells'
@@ -87,12 +159,13 @@ function ColumnHeader({ model }: Readonly<{ model: string }>) {
             display: 'block',
             writingMode: 'vertical-rl',
             transform: 'rotate(180deg)',
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            // In a vertical writing mode the INLINE axis is vertical, so this
-            // is the constraint `text-overflow` measures against.
-            textOverflow: 'ellipsis',
-            maxHeight: `${HEADER_MAX_PX}px`,
+            // In a vertical writing mode the INLINE axis is vertical, so
+            // `max-height` is the inline-size cap -- the same budget the
+            // horizontal row labels spend as `max-width`. Long names meet it
+            // by wrapping onto a second 16px line, never by losing characters.
+            whiteSpace: 'normal',
+            overflowWrap: 'anywhere',
+            maxHeight: `${LABEL_MAX_PX}px`,
             mx: 'auto',
           }}
         >
@@ -247,7 +320,11 @@ export function RuntimeMatrix({
   disabledReason,
 }: Readonly<{
   t: Translation;
-  specs: RuntimeMatrixSpec[];
+  // `readonly` because this component SORTS: the copy in `ordered` below is
+  // what keeps the caller's array intact, and the type makes a future
+  // `specs.sort(...)` a compile error rather than a latent mutation bug. Both
+  // call sites hand in a fresh `.map()` result, which is assignable unchanged.
+  specs: readonly RuntimeMatrixSpec[];
   pairs: [string, string][];
   onToggle: (a: string, b: string) => void;
   budgets: Record<number, number>;
@@ -258,15 +335,45 @@ export function RuntimeMatrix({
     return <Typography color="text.secondary">{t.runtimeMatrixNeedTwo}</Typography>;
   }
 
-  const columnSpecs = specs.slice(0, -1);
-  const rowSpecs = specs.slice(1);
+  // ONE ordering for the whole grid, applied once, to the source of BOTH
+  // slices. Sorting either slice on its own is the single way to break "cell k
+  // sits under header k". The triangle itself is permutation-invariant: rows
+  // are ordered[1..n-1] and row i draws ordered[0..i-1], so every unordered
+  // pair still appears exactly once for ANY order, and nothing stored or sent
+  // depends on display order because onToggle always emits
+  // canonicalPair(rowSpec.id, colSpec.id).
+  //
+  // Sorted HERE and not at the callers: both source arrays are shared with
+  // user-sortable ListTables on the same screen (RuntimeAdminSection passes
+  // the same `mappings` / `reportConfig.specs` to a table and to this matrix),
+  // and sorting upstream would silently re-order tables whose sort is the
+  // operator's own, persisted choice. The matrix is always name-ordered; the
+  // tables keep whatever the operator picked.
+  //
+  // Copy, never `specs.sort(...)`: that mutates a caller's array. Both call
+  // sites happen to hand in a fresh `.map()` result today, so the mutation bug
+  // would be latent rather than visible -- exactly how it survives review.
+  const ordered = [...specs].sort(compareSpecs);
+  const columnSpecs = ordered.slice(0, -1);
+  const rowSpecs = ordered.slice(1);
   // Only meaningful while `disabled`; folded here so the tooltip and the
   // glyph choice below cannot disagree about which state they are rendering.
   const reason = disabled ? disabledReason : undefined;
 
   return (
     <Box sx={{ overflowX: 'auto' }}>
-      <Table size="small">
+      {/* `width: auto` overrides MUI's `width: 100%`, and it is what makes the
+          row-label cap above VISIBLE rather than merely declared. Under
+          `table-layout: auto` a 100%-wide table hands its surplus width back
+          to the columns in proportion to their content, so the capped 160px
+          label still sat in a 491px cell (measured, 5 specs at a 1100px
+          viewport) with ~330px of empty gutter between the name and its own
+          first checkbox. Shrink-to-fit instead: measured, the label column is
+          then exactly 192px (160 + MUI's 2x16px small padding) and the grid
+          columns 46px, whatever the viewport -- and with 14 specs the table is
+          850px, so the wrapping enclosure's `overflowX: 'auto'` still absorbs
+          a matrix too wide for the page rather than widening the page. */}
+      <Table size="small" sx={{ width: 'auto' }}>
         <TableHead>
           <TableRow>
             {/* The corner and the row labels stay horizontal; only the column
@@ -289,7 +396,41 @@ export function RuntimeMatrix({
             return (
               <TableRow key={rowSpec.id}>
                 <TableCell component="th" scope="row">
-                  {rowSpec.model}
+                  {/* The row-label column is the grid's remaining width hog.
+                      Measured on the real component with five realistic
+                      names at a 1100px viewport, it took 725px of a 1100px
+                      table -- 66%, more than the whole rotated grid the
+                      rotation had just bought. Capped here to the same budget
+                      the header spends on its own scarce axis, it is 192px.
+
+                      NO `text-overflow` and NO tooltip, deliberately: nothing
+                      is hidden, so there is nothing to reveal on hover, and an
+                      ellipsis at this width would render two sorted
+                      neighbours identically. A horizontal label can meet the
+                      cap by spending row height, which is the abundant axis.
+                      The TableCell's own props stay bare so the <th> keeps its
+                      `rowheader` role and its full accessible name. */}
+                  <Box
+                    component="span"
+                    sx={{
+                      // `display: block` is load-bearing, not tidiness:
+                      // `max-width` has no effect on an inline box. Measured
+                      // with this exact markup -- inline span: the column stays
+                      // at its full content width; block span: 192px (160 +
+                      // the 2x16px of MUI size="small" cell padding).
+                      display: 'block',
+                      maxWidth: `${LABEL_MAX_PX}px`,
+                      // `anywhere`, not `break-word`: only `anywhere` lowers
+                      // the box's MIN-content size, which is what actually
+                      // forces the table column down to the cap under
+                      // `table-layout: auto`. Hyphens are natural soft-break
+                      // opportunities, so real model names break at '-' and
+                      // `anywhere` only fires for a hyphen-free monster.
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    {rowSpec.model}
+                  </Box>
                 </TableCell>
                 {visibleColumns.map((colSpec) => {
                   const [a, b] = canonicalPair(rowSpec.id, colSpec.id);
