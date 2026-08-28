@@ -178,6 +178,42 @@ from this local config — never from the gateway:
 convenience/defence-in-depth, not a boundary (containment is a lexical
 path-prefix check and does not resolve symlinks).
 
+#### What environment a model process gets
+
+A child gets a **minimal, agent-built environment**, never the agent's own
+one — that would hand every model server the agent's gateway token and every
+other model's `${AGENT_ENV:…}` secret. It contains exactly:
+
+1. the spec's own `env`, with `${PORT}` and `${AGENT_ENV:NAME}` expanded, and
+2. a small **base** copied from the agent's own environment, and only the
+   variables the agent actually has (nothing is invented):
+
+| Variable | Copied when set | Why |
+|---|---|---|
+| `PATH` | always | binary and (on Windows) DLL resolution |
+| `HOME` | unix | home/config/cache root |
+| `USERPROFILE` | Windows | the Windows home root — `~` for the Hugging Face cache |
+| `LOCALAPPDATA` | Windows | per-user cache root; llama.cpp reads it directly |
+| `SYSTEMROOT` | Windows | system DLLs **and Winsock init** — a child without it cannot open a socket |
+| `WINDIR` | Windows | the same directory under its legacy name |
+
+The Windows entries are not decoration. Windows sets no `HOME`, so before they
+existed a Windows child received no home indicator at all and anything
+resolving a per-user cache failed — `llama-server` reports that as `failed to
+initialize router models: Failed to determine HF cache directory`.
+
+**Every name in that table is reserved: a spec `env` key matching one, in any
+capitalisation (`Path`, `SystemRoot`, `userprofile`), is refused** and the spec
+reports `not_permitted`. They are agent-owned — a gateway-supplied `PATH` or
+`SystemRoot` would choose where a permitted binary resolves its libraries,
+which is what the absolute-path allowlist exists to prevent.
+
+To point a model server somewhere else, set **its own** variable in the spec's
+`env` — `HF_HOME`, `HF_HUB_CACHE`, `XDG_CACHE_HOME`, `LLAMA_CACHE`, `TEMP`/`TMP`,
+or `HOMEDRIVE`+`HOMEPATH`. None of those is reserved, and they are deliberately
+left out of the base so they stay yours to set. Overriding `HOME` (or
+`USERPROFILE`) to achieve the same thing is the one route that does not work.
+
 #### What the router port serves
 
 Apart from three `GET` control paths — `/health` (and `/v1/health`), `/running`

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,134 @@ import (
 // endpoints), so without this refusal a gateway-supplied spec could read it
 // straight back out and impersonate the agent.
 const agentOwnEnvPrefix = "OP_AGENT_"
+
+// baseEnvNames is the complete set of variables the agent copies from its
+// OWN environment into a child's minimal base -- and, because the same list
+// drives the spec-env reservation in ExpandPlaceholders, the complete set of
+// names a spec may never set. ONE list with BOTH uses is deliberate: a name
+// added to the base but not reserved hands a gateway-supplied spec a
+// duplicate key, and os/exec resolves duplicates last-occurrence-wins (on
+// Windows case-insensitively), so the spec's value would WIN over the
+// agent's -- precisely the defect the PATH reservation exists to close.
+//
+// Every entry MUST be spelled in upper case: the reservation compares a
+// spec key upper-cased, and these spellings are emitted verbatim into the
+// child's environment. TestBaseEnvNamesAreUpperCase pins that invariant.
+// Emitting the upper-cased spelling of a name Windows writes as "SystemRoot"
+// or "windir" is safe for the same reason the reservation has to fold case
+// at all: Windows resolves environment names through GetEnvironmentVariableW,
+// which is case-INSENSITIVE, and so is the CRT's getenv there.
+//
+// The list is the UNION over the platforms the agent is built for, gated on
+// presence -- not a runtime.GOOS switch and not a _windows.go/_unix.go
+// split. Three reasons, in order of weight:
+//
+//  1. It stays observable. CI compiles nothing for Windows and runs no
+//     Windows job (docs/architecture/11-risks-and-technical-debt.md §11.1),
+//     so a GOOS-selected list would put the Windows half of this rule behind
+//     a branch no test on any CI host can enter -- the same blind spot that
+//     let two case-sensitivity defects ship. As a union it is exercised
+//     end-to-end from a Linux or macOS test host through the injected
+//     getenv seam.
+//  2. It is already correct per platform, because presence does the
+//     selecting. A Linux agent defines none of USERPROFILE, LOCALAPPDATA,
+//     SYSTEMROOT, WINDIR, so its children receive exactly the PATH/HOME they
+//     received before this list existed. A Windows agent normally defines no
+//     HOME, so its children receive the Windows four instead. Where a host
+//     genuinely defines both (Git-Bash/MSYS on Windows sets HOME; a Wine or
+//     WSL-interop shell on Linux may export a Windows name), copying both is
+//     the right answer anyway -- the value came from the agent's own
+//     environment, which is the operator's, not the gateway's.
+//  3. The reservation must be platform-independent regardless, on the
+//     precedent already set for the AGENT_ENV guard below: one rule on every
+//     platform is the only version a reader can check. Keeping the base
+//     platform-independent too means there is one list, not a list and an
+//     exception.
+//
+// Why each name is here -- the bar is "a normal process on that OS does not
+// work without it", NOT "it might be handy", because every name added is a
+// name an operator can no longer set through a spec:
+//
+//   - PATH -- where the child resolves helper binaries, and on Windows part
+//     of the DLL search order. Agent-owned since the first version of this
+//     function: a spec-supplied PATH would steer a permitted binary's dynamic
+//     linker and undo the absolute-path allowlist.
+//   - HOME -- the POSIX home indicator, from which config and cache
+//     directories are derived (~/.cache/huggingface, $HOME/.ollama).
+//   - USERPROFILE -- the Windows home indicator, and the one this list was
+//     grown for. Windows normally sets no HOME at all, so a child launched by
+//     the pre-union base got NO home indicator whatsoever and every per-user
+//     path resolution failed; llama-server reported it as
+//     "failed to initialize router models: Failed to determine HF cache
+//     directory", because the Hugging Face cache root is ~/.cache/huggingface
+//     and "~" on Windows IS %USERPROFILE% (Go's os.UserHomeDir, Python's
+//     ntpath.expanduser and Node's os.homedir all read this one variable).
+//   - LOCALAPPDATA -- the Windows per-user, machine-local cache/data root,
+//     i.e. the platform's answer to $XDG_CACHE_HOME. This is NOT redundant
+//     with USERPROFILE: llama.cpp's own fs_get_cache_directory() reads
+//     LOCALAPPDATA directly on _WIN32 (LLAMA_CACHE overrides it) and fails
+//     the same way when it is unset, one function over from the failure that
+//     produced this fix. Ollama's Windows paths sit under it too. Passing
+//     only USERPROFILE would have cured the reported symptom and left its
+//     twin live.
+//   - SYSTEMROOT -- do not delete this one as obviously unnecessary. Beyond
+//     being where Windows resolves system DLLs, it is required for WINSOCK
+//     INITIALISATION: a process whose environment block lacks SystemRoot
+//     fails in WSAStartup with 10107 ("a system call that should never fail
+//     has failed"), because ws2_32 reaches its provider catalog through that
+//     path. Every process this package launches is a network server, so
+//     omitting SystemRoot does not produce a missing-cache message -- it
+//     produces a model server that cannot open a socket, reported as an
+//     opaque startup crash. This is a well-known subprocess trap in other
+//     runtimes (Java since JDK 1.5, CPython) for exactly the reason it bit
+//     here: hand a child a hand-built environment and this is the variable
+//     you forget.
+//   - WINDIR -- the same directory under its legacy name, set on every
+//     Windows install. Kept because tooling that reads only %WINDIR% still
+//     exists and the value is a well-known constant path, so copying it adds
+//     no exposure the SYSTEMROOT entry has not already accepted.
+//
+// Deliberately NOT here, each because a normal Windows process still works
+// without it AND leaving it out keeps it available as an operator lever --
+// an unreserved key is one a spec may set:
+//
+//   - TEMP / TMP -- GetTempPath falls back to %USERPROFILE% and then the
+//     Windows directory, both of which the child can still resolve, so a
+//     temp path exists either way. Leaving these out is the ACTIVE choice:
+//     "put this model's scratch space on the big disk, not on C:" is a
+//     legitimate per-spec need on a machine that downloads multi-gigabyte
+//     weights, and reserving them would take that away.
+//   - LOCALAPPDATA's roaming sibling APPDATA -- the roaming CONFIG root. No
+//     model server keeps its caches there (roaming them across machines is
+//     the opposite of what a weights cache wants), and the two consumers
+//     checked read LOCALAPPDATA. Revisit if a real one is found; until then
+//     a spec can still set it.
+//   - PATHEXT -- only completes an EXTENSIONLESS command name. A spec's
+//     binary is an absolute path, and os/exec resolves it in the AGENT's
+//     process against the AGENT's environment, never against cmd.Env; both
+//     cmd.exe and Go's LookPath fall back to a built-in
+//     ".COM;.EXE;.BAT;.CMD" when it is unset.
+//   - COMSPEC -- needed only by a child that shells out through the CRT's
+//     system(), which falls back to finding cmd.exe on PATH, and the PATH we
+//     pass contains System32.
+//   - NUMBER_OF_PROCESSORS / PROCESSOR_ARCHITECTURE -- informational copies
+//     of what GetSystemInfo and GetNativeSystemInfo report directly. Nothing
+//     needs the environment copy to function.
+//   - HOMEDRIVE / HOMEPATH -- the pre-USERPROFILE pair, consulted only as a
+//     fallback when USERPROFILE is absent, which after this change it no
+//     longer is. Worth naming explicitly: because HOME is reserved in ANY
+//     spelling, this pair (or the tool's own variable -- HF_HOME,
+//     HF_HUB_CACHE, XDG_CACHE_HOME, LLAMA_CACHE, none of them reserved) is
+//     what a Windows operator has left to point a child at a different home
+//     or cache. The reservation must not close the last door.
+var baseEnvNames = []string{
+	"PATH",
+	"HOME",
+	"USERPROFILE",
+	"LOCALAPPDATA",
+	"SYSTEMROOT",
+	"WINDIR",
+}
 
 // LocalPolicy is the agent-operator-controlled counterweight to the
 // gateway-supplied Spec. The gateway decides WHEN and HOW a process runs
@@ -177,21 +306,30 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // produces a confusing downstream auth failure instead.
 //
 // The returned env is os/exec-shaped "KEY=value" strings containing ONLY the
-// expanded spec.Env entries plus PATH and HOME taken from the agent's own
-// environment (present only if the agent itself has them) -- never the
-// agent's full environment, which holds its gateway bearer token and every
-// ${AGENT_ENV:...} secret configured for OTHER models. spec.Env entries are
-// emitted in sorted-key order so the result is deterministic across calls
-// (spec.Env is a Go map with randomized iteration order).
+// expanded spec.Env entries plus the baseEnvNames variables taken from the
+// agent's own environment (each present only if the agent itself has it) --
+// never the agent's full environment, which holds its gateway bearer token
+// and every ${AGENT_ENV:...} secret configured for OTHER models. spec.Env
+// entries are emitted in sorted-key order so the result is deterministic
+// across calls (spec.Env is a Go map with randomized iteration order).
 //
-// A spec.Env key of PATH or HOME -- in ANY case spelling, since Windows
-// resolves and deduplicates environment names case-insensitively -- is
-// refused outright rather than allowed to override the agent-provided base:
-// these two are agent-owned, not spec-negotiable. A gateway-supplied PATH would let a spec choose where the
+// That base is OS-appropriate, not POSIX-only: it carries HOME on unix and
+// USERPROFILE/LOCALAPPDATA/SYSTEMROOT/WINDIR on Windows, which is what a
+// Windows child needs to resolve a per-user cache directory at all -- and,
+// for SYSTEMROOT, to initialise Winsock. baseEnvNames carries the full
+// justification, name by name, including what was left out and why.
+//
+// A spec.Env key matching any baseEnvNames entry -- in ANY case spelling,
+// since Windows resolves and deduplicates environment names
+// case-insensitively -- is refused outright rather than allowed to override
+// the agent-provided base: these are agent-owned, not spec-negotiable. A
+// gateway-supplied PATH (or SystemRoot) would let a spec choose where the
 // child resolves shared libraries and helper subprocesses -- the same class
 // of risk Permit's absolute-binary-path requirement exists to close -- so
 // this treats "minimal base" as agent-controlled rather than
-// spec-overridable.
+// spec-overridable. The operator lever that survives is the tool's own
+// variable (HF_HOME, HF_HUB_CACHE, XDG_CACHE_HOME, LLAMA_CACHE, HOMEDRIVE/
+// HOMEPATH): none of those is reserved.
 //
 // A near-miss placeholder -- text shaped like "${...}" that does not exactly
 // match ${PORT} or ${AGENT_ENV:NAME} (non-empty NAME), but whose inner text,
@@ -318,12 +456,14 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 	}
 	sort.Strings(envKeys)
 
-	// PATH and HOME are agent-owned, not spec-negotiable: refuse outright
-	// rather than let a spec silently override them (see the PATH/HOME
-	// decision in the Task 13 fix-round-1 report). This is checked
-	// unconditionally, even when the agent's own environment has neither,
-	// because the rule is about which party controls these keys, not about
-	// detecting an actual collision.
+	// Every baseEnvNames entry is agent-owned, not spec-negotiable: refuse
+	// outright rather than let a spec silently override one (see the
+	// PATH/HOME decision in the Task 13 fix-round-1 report, and baseEnvNames
+	// for why the reservation set IS the base set rather than a copy of it
+	// that can drift). This is checked unconditionally, even when the
+	// agent's own environment defines none of them, because the rule is
+	// about which party controls these keys, not about detecting an actual
+	// collision.
 	for _, k := range envKeys {
 		// Case-insensitive for the same reason as the AGENT_ENV guard above
 		// (S2): on Windows the native spelling is "Path", and os/exec
@@ -333,19 +473,25 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 		// exactly the control over library and helper-binary resolution
 		// this rule exists to keep agent-side. Refusing a lowercase "path"
 		// on unix, where it is a different variable, is the safe direction.
-		if upper := strings.ToUpper(k); upper == "PATH" || upper == "HOME" {
+		// The same fold is what makes the Windows names here meaningful at
+		// all: a spec key of "SystemRoot" -- the ONLY spelling a Windows
+		// operator would ever type -- is a DLL-resolution hijack of exactly
+		// the class this reservation exists to close, and an unfolded
+		// comparison against "SYSTEMROOT" would wave it through.
+		if slices.Contains(baseEnvNames, strings.ToUpper(k)) {
 			return nil, nil, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
 		}
 	}
 
-	// Minimal base: PATH/HOME from the agent's OWN environment, only if
-	// present. Never the agent's full environment -- see doc comment above.
-	resultEnv := make([]string, 0, len(envKeys)+2)
-	if v := getenv("PATH"); v != "" {
-		resultEnv = append(resultEnv, "PATH="+v)
-	}
-	if v := getenv("HOME"); v != "" {
-		resultEnv = append(resultEnv, "HOME="+v)
+	// Minimal base: baseEnvNames from the agent's OWN environment, each only
+	// if actually present -- never fabricated, and never the agent's full
+	// environment (see doc comment above). Which of them exist is what makes
+	// this list correct on both platform families; see baseEnvNames.
+	resultEnv := make([]string, 0, len(envKeys)+len(baseEnvNames))
+	for _, name := range baseEnvNames {
+		if v := getenv(name); v != "" {
+			resultEnv = append(resultEnv, name+"="+v)
+		}
 	}
 	for _, k := range envKeys {
 		v, expandErr := expand(spec.Env[k])

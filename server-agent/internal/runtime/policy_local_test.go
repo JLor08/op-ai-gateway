@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -529,6 +530,165 @@ func TestExpandPlaceholdersOmitsAbsentBase(t *testing.T) {
 	}
 }
 
+// TestBaseEnvNamesAreUpperCase pins the invariant the reservation depends
+// on. The refusal compares strings.ToUpper(specKey) against this list, so a
+// lower- or mixed-case entry would be a name that can NEVER match -- i.e. a
+// variable the agent copies into the child base while silently accepting a
+// spec-supplied override of it, which is the exact failure the shared list
+// exists to prevent. It is also the list's emitted spelling, so the check is
+// cheap insurance on both uses at once.
+func TestBaseEnvNamesAreUpperCase(t *testing.T) {
+	for _, name := range baseEnvNames {
+		if name != strings.ToUpper(name) {
+			t.Errorf("baseEnvNames entry %q is not upper-case; the reservation upper-cases the spec key before comparing, so this entry could never be refused", name)
+		}
+	}
+}
+
+// TestExpandPlaceholdersWindowsBaseEnvironment is the covering test for the
+// reported Windows failure: llama-server refusing to start with "failed to
+// initialize router models: Failed to determine HF cache directory".
+//
+// Windows normally defines no HOME, so a base of PATH+HOME handed a Windows
+// child NO home indicator at all and every per-user path resolution failed.
+// The environment here is Windows-shaped in both senses that matter -- the
+// native NAME SPELLINGS ("Path", "SystemRoot", "windir") and the
+// case-INSENSITIVE lookup os.Getenv performs there via
+// GetEnvironmentVariableW -- which is what makes the whole rule testable on a
+// Linux or macOS host, the same seam 68475cd used for the case-folding
+// guards. CI compiles nothing for Windows, so this seam is the only place
+// this behaviour is observable at all.
+func TestExpandPlaceholdersWindowsBaseEnvironment(t *testing.T) {
+	getenv := windowsStyleGetenv(map[string]string{
+		// Native Windows spellings, none of them upper-case.
+		"Path":         `C:\Windows\system32;C:\Windows`,
+		"SystemRoot":   `C:\Windows`,
+		"windir":       `C:\Windows`,
+		"USERPROFILE":  `C:\Users\agent`,
+		"LOCALAPPDATA": `C:\Users\agent\AppData\Local`,
+		// Deliberately NOT in the base: a Windows host defines these, and
+		// they must not reach the child (TEMP/TMP are an operator lever, and
+		// the rest are unnecessary) -- see baseEnvNames.
+		"TEMP":                   `C:\Users\agent\AppData\Local\Temp`,
+		"TMP":                    `C:\Users\agent\AppData\Local\Temp`,
+		"APPDATA":                `C:\Users\agent\AppData\Roaming`,
+		"ComSpec":                `C:\Windows\system32\cmd.exe`,
+		"PATHEXT":                ".COM;.EXE;.BAT;.CMD",
+		"NUMBER_OF_PROCESSORS":   "32",
+		"PROCESSOR_ARCHITECTURE": "AMD64",
+		// Agent-only, must never reach a child.
+		"OP_AGENT_TOKEN":      "gateway-bearer-secret",
+		"OTHER_MODEL_API_KEY": "some-other-models-secret",
+	})
+
+	spec := Spec{Env: map[string]string{"MODE": "production"}}
+	_, env, err := ExpandPlaceholders(spec, 9090, getenv)
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+
+	want := map[string]string{
+		"PATH":         `C:\Windows\system32;C:\Windows`,
+		"USERPROFILE":  `C:\Users\agent`,
+		"LOCALAPPDATA": `C:\Users\agent\AppData\Local`,
+		"SYSTEMROOT":   `C:\Windows`,
+		"WINDIR":       `C:\Windows`,
+		"MODE":         "production",
+	}
+	if !envContainsExactly(env, want) {
+		t.Errorf("child env = %#v, want exactly %#v", env, want)
+	}
+	// Named individually so a regression reports WHICH guarantee broke
+	// rather than only that a map comparison failed.
+	for name, why := range map[string]string{
+		"USERPROFILE":  "the Windows home indicator; without it the HF cache root (~/.cache/huggingface) cannot be resolved and llama-server fails to start",
+		"LOCALAPPDATA": "llama.cpp's fs_get_cache_directory() reads it directly on _WIN32",
+		"SYSTEMROOT":   "Winsock initialisation fails with WSAStartup 10107 without it, and every child here is a network server",
+	} {
+		if !slices.Contains(env, name+"="+want[name]) {
+			t.Errorf("child env is missing %s -- %s; env = %#v", name, why, env)
+		}
+	}
+	// HOME is absent from this environment and must not be invented.
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			t.Errorf("child env has %q, but this Windows-shaped environment defines no HOME", kv)
+		}
+		if strings.Contains(kv, "secret") {
+			t.Fatalf("child env leaked an agent-only secret: %q", kv)
+		}
+	}
+}
+
+// TestExpandPlaceholdersPosixBaseEnvironmentUnchanged is the
+// no-regression half of the OS-appropriate base: every deployment today is
+// Linux, and a POSIX-shaped agent environment must produce exactly the child
+// environment it produced before the Windows names joined the list. The
+// union list achieves that by presence alone -- a Linux host defines none of
+// USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR -- so this test is what
+// proves the union is not silently widening the unix contract.
+func TestExpandPlaceholdersPosixBaseEnvironmentUnchanged(t *testing.T) {
+	agentEnv := map[string]string{
+		"PATH": "/usr/local/bin:/usr/bin:/bin",
+		"HOME": "/home/agent",
+		// Ordinary unix noise a service inherits, none of it base material.
+		"TMPDIR":         "/tmp",
+		"LANG":           "en_US.UTF-8",
+		"XDG_CACHE_HOME": "/home/agent/.cache",
+		"SHELL":          "/bin/bash",
+		"OP_AGENT_TOKEN": "gateway-bearer-secret",
+	}
+	getenv := func(k string) string { return agentEnv[k] } // case-SENSITIVE, as on unix
+
+	spec := Spec{Env: map[string]string{"MODE": "production"}}
+	_, env, err := ExpandPlaceholders(spec, 9090, getenv)
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+
+	want := map[string]string{
+		"PATH": "/usr/local/bin:/usr/bin:/bin",
+		"HOME": "/home/agent",
+		"MODE": "production",
+	}
+	if !envContainsExactly(env, want) {
+		t.Errorf("child env = %#v, want exactly %#v (the unix base must be unchanged by the Windows names)", env, want)
+	}
+}
+
+// TestExpandPlaceholdersOmitsAbsentWindowsBase is the Windows half of
+// TestExpandPlaceholdersOmitsAbsentBase: a base variable the agent's own
+// environment does not define is simply not passed, never passed empty. An
+// empty LOCALAPPDATA= in the child is worse than an absent one -- a consumer
+// that checks only for presence would build a path from "" and write into
+// the child's working directory.
+func TestExpandPlaceholdersOmitsAbsentWindowsBase(t *testing.T) {
+	// A Windows service account with no LOCALAPPDATA and no WINDIR.
+	getenv := windowsStyleGetenv(map[string]string{
+		"Path":        `C:\Windows\system32`,
+		"SystemRoot":  `C:\Windows`,
+		"USERPROFILE": `C:\Users\agent`,
+	})
+
+	_, env, err := ExpandPlaceholders(Spec{}, 1234, getenv)
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	want := map[string]string{
+		"PATH":        `C:\Windows\system32`,
+		"SYSTEMROOT":  `C:\Windows`,
+		"USERPROFILE": `C:\Users\agent`,
+	}
+	if !envContainsExactly(env, want) {
+		t.Errorf("child env = %#v, want exactly %#v (absent base variables are omitted, not emitted empty)", env, want)
+	}
+	for _, kv := range env {
+		if strings.HasSuffix(kv, "=") {
+			t.Errorf("child env carries an empty entry %q; an absent base variable must be omitted", kv)
+		}
+	}
+}
+
 // TestExpandPlaceholdersNearMissErrors pins the corrected near-miss rule
 // from the Task 13 fix-round-2 findings: classification happens per
 // placeholder, on the ORIGINAL text, using a PREFIX match on the
@@ -610,15 +770,16 @@ func TestExpandPlaceholdersNearMissScanIgnoresResolvedSecretValue(t *testing.T) 
 	const secretValue = `postgres://user:pass@host/db?token=${AGENT_ENV:LOOKS_LIKE_A_NAME}&mode=${PORTX}`
 	spec := Spec{Args: []string{"${AGENT_ENV:CONN_STRING}"}}
 	getenv := func(k string) string {
-		switch k {
-		case "CONN_STRING":
+		if k == "CONN_STRING" {
 			return secretValue
-		case "PATH", "HOME":
-			return "" // ExpandPlaceholders always probes these for the base env
-		default:
-			t.Fatalf("getenv called with unexpected key %q -- the near-miss scan must not rescan/re-resolve the substituted result", k)
+		}
+		// ExpandPlaceholders always probes the base names; anything else is
+		// a second resolve pass over substituted output.
+		if slices.Contains(baseEnvNames, k) {
 			return ""
 		}
+		t.Fatalf("getenv called with unexpected key %q -- the near-miss scan must not rescan/re-resolve the substituted result", k)
+		return ""
 	}
 
 	args, _, err := ExpandPlaceholders(spec, 8080, getenv)
@@ -756,10 +917,32 @@ func TestExpandPlaceholdersAgentEnvRefusalIsCaseInsensitive(t *testing.T) {
 // against the agent-provided PATH -- handing a gateway-supplied spec control
 // over where the child resolves shared libraries and helper binaries, the
 // exact class of risk Permit's absolute-binary-path rule exists to close.
+//
+// Extended with every name the OS-appropriate base added, because the
+// reservation has to grow with the base or the new entries are override-able
+// by any spec. SystemRoot is the sharpest of them: it is spelled in mixed
+// case on every Windows host, it is part of the system DLL search path, and
+// a spec-supplied one is the same DLL-resolution hijack as a spec-supplied
+// Path. The table below is deliberately written in the spellings an operator
+// would actually type.
 func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
-	getenv := windowsStyleGetenv(map[string]string{"PATH": `C:\Windows\System32`, "HOME": `C:\Users\agent`})
+	getenv := windowsStyleGetenv(map[string]string{
+		"PATH":         `C:\Windows\System32`,
+		"HOME":         `C:\Users\agent`,
+		"USERPROFILE":  `C:\Users\agent`,
+		"LOCALAPPDATA": `C:\Users\agent\AppData\Local`,
+		"SystemRoot":   `C:\Windows`,
+		"windir":       `C:\Windows`,
+	})
 
-	for _, key := range []string{"PATH", "Path", "path", "pAtH", "HOME", "Home", "home", "hOmE"} {
+	for _, key := range []string{
+		"PATH", "Path", "path", "pAtH",
+		"HOME", "Home", "home", "hOmE",
+		"USERPROFILE", "UserProfile", "userprofile", "UsErPrOfIlE",
+		"LOCALAPPDATA", "LocalAppData", "localappdata", "lOcAlAppDaTa",
+		"SYSTEMROOT", "SystemRoot", "systemroot", "sYsTeMrOoT",
+		"WINDIR", "windir", "WinDir", "wInDiR",
+	} {
 		t.Run(key, func(t *testing.T) {
 			spec := Spec{Env: map[string]string{key: `C:\attacker\bin`}}
 			_, env, err := ExpandPlaceholders(spec, 8080, getenv)
@@ -772,11 +955,31 @@ func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
 		})
 	}
 
-	// The reservation is scoped to those two names, not to anything that
-	// merely resembles them: a spec may still set its own PATH-adjacent
-	// variables.
-	spec := Spec{Env: map[string]string{"LD_LIBRARY_PATH": "/opt/cuda/lib64", "HOMEBREW_PREFIX": "/opt/homebrew", "PATHOLOGY": "x"}}
+	// The reservation is scoped to those names, not to anything that merely
+	// resembles them: a spec may still set its own PATH-adjacent variables.
+	spec := Spec{Env: map[string]string{"LD_LIBRARY_PATH": "/opt/cuda/lib64", "HOMEBREW_PREFIX": "/opt/homebrew", "PATHOLOGY": "x", "USERPROFILE_BACKUP": "x", "SYSTEMROOTS": "x"}}
 	if _, _, err := ExpandPlaceholders(spec, 8080, getenv); err != nil {
 		t.Fatalf("ExpandPlaceholders refused a legitimate env key: %v", err)
+	}
+
+	// The operator lever the reservation must NOT close. Because HOME is
+	// reserved in every spelling, a Windows operator cannot redirect a
+	// child's home or cache that way -- so the variables deliberately left
+	// OUT of the base (baseEnvNames documents each) have to stay settable,
+	// or the reservation would take away the last workaround. Pinned as a
+	// contract, not left to the negative space of the list above.
+	lever := Spec{Env: map[string]string{
+		"HOMEDRIVE":      "D:",
+		"HOMEPATH":       `\models\home`,
+		"TEMP":           `D:\models\tmp`,
+		"TMP":            `D:\models\tmp`,
+		"APPDATA":        `D:\models\roaming`,
+		"HF_HOME":        `D:\models\huggingface`,
+		"HF_HUB_CACHE":   `D:\models\huggingface\hub`,
+		"LLAMA_CACHE":    `D:\models\llama.cpp`,
+		"XDG_CACHE_HOME": "/mnt/models/.cache",
+	}}
+	if _, _, err := ExpandPlaceholders(lever, 8080, getenv); err != nil {
+		t.Fatalf("ExpandPlaceholders refused a cache/home redirection an operator legitimately needs: %v", err)
 	}
 }

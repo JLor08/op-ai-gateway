@@ -260,9 +260,11 @@ a terminal `not_permitted` instead of a form error). Every tuning integer
 the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env
 **keys** must match `^[A-Z_][A-Z0-9_]*$`. **Env values are never validated** —
 that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`
-and `${PORT}` placeholder mechanism, and it means `PATH`, `HOME` and
-`${AGENT_ENV:OP_AGENT_*}` references are *accepted and persisted* here, with the
-real refusal happening agent-side at process start. Defaults applied on
+and `${PORT}` placeholder mechanism, and it means an env key naming an
+agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
+`SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
+and persisted* here, with the real refusal happening agent-side at process
+start. Defaults applied on
 zero/empty: `health_path` `/health`, `health_timeout_seconds` 5,
 `startup_timeout_seconds` 180. A duplicate GPU index is refused as a **whole-write
 failure, not deduped**, so no filled-in row is silently discarded.

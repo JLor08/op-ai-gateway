@@ -195,19 +195,57 @@ Two namespaces are refused rather than resolved:
   it a portal-authored spec could read `OP_AGENT_TOKEN`, the bearer token that
   authenticates the certificate endpoint which issues a private key, and the
   spawned child could then act as that agent.
-- **A spec `env` key of `PATH` or `HOME`** — refused unconditionally, even when
-  the agent's own environment defines neither. A gateway-supplied `PATH` would
-  undo the absolute-binary allowlist by steering a permitted binary's dynamic
-  linker or any helper it shells out to; `HOME` influences config and cache
-  discovery in the same class. A model server needing a non-default `PATH`/`HOME`
-  gets it from the agent's own process environment. Reversing this needs an
-  explicit opt-in, not a silent allow.
+- **A spec `env` key naming any base variable** (the six below), in **any**
+  capitalisation — refused unconditionally, even when the agent's own
+  environment defines none of them. A gateway-supplied `PATH` or `SystemRoot`
+  would undo the absolute-binary allowlist by steering a permitted binary's
+  dynamic linker, DLL search or any helper it shells out to; `HOME`,
+  `USERPROFILE` and `LOCALAPPDATA` influence config and cache discovery in the
+  same class. A model server needing a non-default base gets it from the
+  agent's own process environment. Reversing this needs an explicit opt-in, not
+  a silent allow.
 
-The child's environment is built **from scratch**: `PATH` and `HOME` copied from
-the agent's environment only if actually defined there (neither is fabricated),
+The child's environment is built **from scratch**: the base copied from the
+agent's environment only where actually defined there (nothing is fabricated),
 then the spec's expanded `env` in sorted-key order for determinism. Nothing
 else. `os.Environ()` as the base — the default habit in Go — would leak the
 agent's bearer token and every other model's secrets into every child.
+
+The base is **OS-appropriate**, and that is one list, not a `GOOS` switch:
+`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`, `SYSTEMROOT`, `WINDIR`, each
+copied only when the agent itself has it. Presence does the selecting — a Linux
+agent defines none of the four Windows names and its children see exactly the
+`PATH`/`HOME` they always did; a Windows agent defines no `HOME` and its
+children get the Windows four instead. A union rather than a per-platform list
+because **CI compiles nothing for Windows**
+([§11.1](../11-risks-and-technical-debt.md)), so a `GOOS`-selected list would
+hide the Windows half behind a branch no test on any CI host can enter — the
+same blind spot that let two case-sensitivity defects ship. As a union it is
+exercised end-to-end from a Linux runner through the injected `getenv` seam.
+
+`USERPROFILE` is what a Windows child actually needs and what a POSIX-shaped
+base denied it: Windows sets no `HOME`, so such a child received **no home
+indicator at all** and every per-user path resolution failed —
+`llama-server` reports it as `failed to initialize router models: Failed to
+determine HF cache directory`, since the Hugging Face cache root is
+`~/.cache/huggingface` and `~` on Windows *is* `%USERPROFILE%`. `LOCALAPPDATA`
+is the same failure one function over (llama.cpp's `fs_get_cache_directory()`
+reads it directly on `_WIN32`). **`SYSTEMROOT` is the one a reader will be
+tempted to delete as unnecessary and must not**: besides the system DLL search
+path, Winsock initialisation fails without it (`WSAStartup` → `10107`), so a
+child missing it is not a model server with a bad cache path but a network
+server that cannot open a socket — a far more confusing failure than the one
+that prompted the fix.
+
+Deliberately **outside** the base, and therefore still settable by a spec:
+`TEMP`/`TMP` (a legitimate per-spec lever on a host that downloads multi-gigabyte
+weights; `GetTempPath` still falls back to `%USERPROFILE%`), `APPDATA`,
+`PATHEXT`, `COMSPEC`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE` and
+`HOMEDRIVE`/`HOMEPATH`. That last one matters operationally: because `HOME` is
+reserved in every spelling, the pair — or the tool's own `HF_HOME`,
+`HF_HUB_CACHE`, `XDG_CACHE_HOME`, `LLAMA_CACHE` — is what a Windows operator has
+left to redirect a child's home or cache. The reservation must never close the
+last door, so the exclusion list is chosen as deliberately as the base is.
 
 Every placeholder-expansion failure maps to lifecycle state `not_permitted`,
 including a missing variable, because none of them resolve without an operator
@@ -1634,9 +1672,14 @@ survives; a trailing one does not.
 
 The form mirrors the agent's placeholder policy client-side at save time, and the
 mirror is **additive safety, not a backend contract** — the gateway's spec PUT
-validates env *keys* only, so `PATH`, `HOME` and `${AGENT_ENV:OP_AGENT_*}`
+validates env *keys* only, so a reserved base name and `${AGENT_ENV:OP_AGENT_*}`
 references are accepted and persisted, and the real rejection fires only when the
-agent tries to start the process, surfacing as a `last_error`. Two properties of
+agent tries to start the process, surfacing as a `last_error`. The mirror itself
+is narrower than the agent in two known ways, both accepted for the same reason:
+it compares the two original names (`PATH`, `HOME`) **case-sensitively** and does
+not know the four Windows base names, so `Path` and `USERPROFILE` are accepted
+client-side and refused agent-side. The authority is `ExpandPlaceholders`;
+widening the hint is a portal-side follow-up, not a contract change. Two properties of
 the mirror are load-bearing: it covers `args` as well as `env`, and it classifies
 by **prefix**, not substring, in both directions (a substring test on `PORT`
 wrongly rejects `${TRANSPORT}`; an `includes('${AGENT_ENV:OP_AGENT_')` test

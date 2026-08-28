@@ -340,13 +340,17 @@ theft or an allowlist bypass:
    argument or env value that a model process then echoes. The refusal names the
    variable but never a value, and applies identically to `args` and `env`.
 2. **The child's environment is built from scratch**: only the spec's expanded
-   env plus `PATH` and `HOME` copied from the agent's own environment *if
-   present*. Never the agent's full environment, which holds that bearer token
-   and every other model's secrets.
-3. **A spec `env` key of `PATH` or `HOME` is refused outright.** Permitting the
-   override would reopen the relative-binary resolution path the absolute-path
-   allowlist closes, by steering a permitted binary's dynamic linker or any
-   helper it shells out to.
+   env plus a small OS-appropriate base — `PATH`, `HOME`, `USERPROFILE`,
+   `LOCALAPPDATA`, `SYSTEMROOT`, `WINDIR` — copied from the agent's own
+   environment *where present*. Never the agent's full environment, which holds
+   that bearer token and every other model's secrets.
+3. **A spec `env` key naming one of those base variables is refused outright**,
+   in any capitalisation. Permitting the override would reopen the
+   relative-binary resolution path the absolute-path allowlist closes, by
+   steering a permitted binary's dynamic linker, its Windows DLL search
+   (`SystemRoot`) or any helper it shells out to. The reservation set *is* the
+   base set — one list in the code, so a name can never be copied into the base
+   while remaining spec-overridable.
 
 The hard boundary on *what may execute at all* is the agent-local allowlist, not
 the portal's RBAC: `LocalPolicy.Permit` refuses every spec when the binary
