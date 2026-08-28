@@ -230,11 +230,28 @@ func (s *Server) runtimeLogState(serverID string) string {
 // AUTHORIZATION is the same boundary as the rest of this feature, not a laxer
 // one because it is "just logs": ownership/admin-group via s.Portal.GetServer
 // BEFORE any stream byte, with the 404-no-leak collapse, exactly as
-// handleRuntimeEvents does. spec_id needs no separate check: fan-out is keyed
-// by (server, spec) and an agent only ever reports its OWN server's specs, so
-// a spec id belonging to another server can only ever receive nothing --
-// there is no id an authorized caller could name to reach output they are not
-// already entitled to.
+// handleRuntimeEvents does. spec_id needs no AUTHORIZATION check of its own:
+// fan-out is keyed by (server, spec) and an agent only ever reports its OWN
+// server's specs, so a spec id belonging to another server can only ever
+// receive nothing -- there is no id an authorized caller could name to reach
+// output they are not already entitled to.
+//
+// It does need a VALIDITY check, and that reasoning is why it did not have one.
+// The id is not only a fan-out key: it is a value the gateway SHIPS TO THE AGENT
+// inside the outbound runtime_log_config command, where every subscribed id for
+// the server is marshaled into one frame. MaxHeaderBytes is 1 MiB, so one
+// authorized caller holding two GETs with ~600 KiB of spec_id each produced a
+// ~1.2 MiB frame that failed the agent's own SetReadLimit -- and because a fresh
+// connection is answered with an unconditional restate, the agent's WebSocket
+// then flapped for as long as those requests were held open. The agent's
+// maxWatchedSpecs guard runs only after the frame has been read, so it never
+// got the chance.
+//
+// Both bounds REJECT rather than clamp. ingestRuntimeLog clamps a reported id to
+// runtimeLogMaxSpecIDLen, so a subscription on a longer one could never match a
+// published batch: clamping here would hand back a window guaranteed to stay
+// empty forever, which is the outcome this whole feature exists to eliminate. An
+// id that cannot match is an error, and is answered as one.
 //
 // SUBSCRIBING IS WHAT STARTS THE STREAM. The registry tells the agent the new
 // watch set on the first subscriber for a spec and again on the last
@@ -250,6 +267,10 @@ func (s *Server) handleRuntimeLogEvents(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusBadRequest, apierror.Response("runtime_logs.spec_required", "spec_id is required", ""))
 		return
 	}
+	if len(specID) > runtimeLogMaxSpecIDLen {
+		writeJSON(w, http.StatusBadRequest, apierror.Response("runtime_logs.spec_invalid", "spec_id is too long", ""))
+		return
+	}
 	if _, err := s.Portal.GetServer(r.Context(), token, serverID); err != nil {
 		writePortalServerError(w, err, "server.not_found")
 		return
@@ -259,6 +280,19 @@ func (s *Server) handleRuntimeLogEvents(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusInternalServerError, apierror.Response("usage.stream_unsupported", "streaming unsupported", ""))
 		return
 	}
+	// Subscribe BEFORE the 200: past the header there is no status left to
+	// answer a refusal with, and a refusal here has to be visible. The agent
+	// silently truncates a watch set past its own maxWatchedSpecs, so a
+	// subscription the gateway accepted past the same ceiling would be a window
+	// that streams nothing, forever, with nothing said.
+	sub, unsub, ok := s.RuntimeLogs.subscribe(serverID, specID)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, apierror.Response("runtime_logs.too_many_specs",
+			"too many specs are being streamed for this server", ""))
+		return
+	}
+	defer unsub()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -266,9 +300,6 @@ func (s *Server) handleRuntimeLogEvents(w http.ResponseWriter, r *http.Request, 
 	// Clear the server WriteTimeout for this long-lived response. An unsupported
 	// writer (httptest recorder) returns an error we intentionally ignore.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-
-	sub, unsub := s.RuntimeLogs.subscribe(serverID, specID)
-	defer unsub()
 
 	state := s.runtimeLogState(serverID)
 	if !writePerfEvent(w, flusher, "status", runtimeLogStatusEventDTO{State: state}) {
@@ -284,10 +315,18 @@ func (s *Server) handleRuntimeLogEvents(w http.ResponseWriter, r *http.Request, 
 		select {
 		case <-ctx.Done():
 			return
+		case <-sub.resync:
+			// This reader fell so far behind that the next thing lost would be
+			// a generation boundary. Ending the stream is the honest move: the
+			// browser's EventSource reconnects on its own, and a reconnect now
+			// re-snapshots, so it comes back with a complete history instead of
+			// a silently incomplete one.
+			return
 		case batch := <-sub.ch:
-			// take() stamps on any bytes this subscriber's own queue lost
-			// while it was behind, so the gap is reported where it happened
-			// rather than showing up as silence.
+			// take() stamps on the markers rescued from batches this
+			// subscriber's queue could not hold and on the bytes those batches
+			// were carrying, so the gap is reported where it happened rather
+			// than showing up as silence.
 			if !writePerfEvent(w, flusher, "log", sub.take(batch)) {
 				return
 			}

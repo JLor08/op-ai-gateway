@@ -224,11 +224,15 @@ const runtimePollInterval = 60 * time.Second
 // It is a var so a test can shrink it, and it is the feature's RATE LIMIT as
 // much as its latency budget. Batching over a window is what keeps a chatty
 // model server from turning into a frame per line on the single WebSocket
-// that telemetry also uses: at most one frame per watched spec per window,
-// and at most logDrainBudget bytes per window across all of them
-// (internal/runtime's Drain). 250 ms is below the threshold at which a human
-// reading a scrolling log perceives lag, and four wakeups a second on a loop
-// that already samples once a second is not a cost worth optimizing.
+// that telemetry also uses. What one window can actually produce, stated as
+// internal/runtime's Drain enforces it rather than as it was once claimed here:
+// at most ONE frame per watched spec, carrying at most logDrainBudget bytes of
+// live output across all of them, plus at most ONE history-replay chunk
+// fleet-wide -- each frame itself bounded by maxLogBatchBytes, which is derived
+// from the gateway's read limit rather than from the retention setting. 250 ms
+// is below the threshold at which a human reading a scrolling log perceives lag,
+// and four wakeups a second on a loop that already samples once a second is not
+// a cost worth optimizing.
 var runtimeLogFlushInterval = 250 * time.Millisecond
 
 // certPollIntervalWS/POST are the AUTOMATIC certificate-poll cadences (used
@@ -683,10 +687,28 @@ func (a *Agent) newRuntimeLogTicker() (*time.Ticker, <-chan time.Time) {
 //
 // A write failure is dropped, not retried and not logged with any content:
 // the frames carry managed-process output, which may include prompt text and
-// must never reach a log line. The connection's own reconnect logic reaps a
-// dead peer, and the gateway re-establishes the subscription (with a fresh
-// scrollback) on the next connect, so a lost frame costs the operator a
-// gap they will see marked rather than silence.
+// must never reach a log line.
+//
+// Dropping is affordable only because of what happens on the NEXT connection,
+// and that deserves stating precisely, because the previous statement of it was
+// true for one of the two cases and false for the other. DrainLogFrames has
+// already removed these records from the send queue by the time the write fails,
+// and their drop counters with them, so nothing downstream will ever emit a
+// gap marker for them. What repairs the hole is the gateway restating the watch
+// set on every fresh agent connection WITH A BUMPED SNAPSHOT EPOCH: the agent
+// then re-snapshots from its retention buffer -- which Drain never touches -- and
+// the operator gets the missing output back as a fresh scrollback, with anything
+// the buffer evicted meanwhile counted in that scrollback's dropped_bytes.
+// Before the epoch existed this held only when the AGENT had restarted (an empty
+// watch map re-snapshots by definition); across a plain WebSocket reconnect the
+// map survived, the restate named the same specs, and the agent skipped the
+// snapshot -- so the operator read the output before the drop and the output
+// after it as one contiguous run.
+//
+// Skipping the drain entirely while disconnected was the alternative, and it is
+// worse: the bytes would sit in the per-spec queue, overflow it, and be reported
+// as a gap the operator can see -- for output that is still perfectly intact in
+// the retention buffer and about to be replayed.
 func (a *Agent) flushRuntimeLogs(ctx context.Context) {
 	if a.runtimeLogPort == nil || a.runtimeLogPoster == nil {
 		return

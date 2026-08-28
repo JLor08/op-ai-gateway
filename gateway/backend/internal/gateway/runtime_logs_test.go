@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/store"
@@ -22,20 +23,30 @@ import (
 // whole command, so the recorded history is exactly the sequence of commands
 // the agent would have received.
 type notifySpy struct {
-	mu    sync.Mutex
-	calls [][]string
+	mu     sync.Mutex
+	calls  [][]string
+	epochs []map[string]uint64
 }
 
-func (n *notifySpy) fn(_ string, specIDs []string) {
+func (n *notifySpy) fn(_ string, specIDs []string, epochs map[string]uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.calls = append(n.calls, append([]string(nil), specIDs...))
+	n.epochs = append(n.epochs, maps.Clone(epochs))
 }
 
 func (n *notifySpy) snapshot() [][]string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return append([][]string(nil), n.calls...)
+}
+
+// epochsAt returns the snapshot epochs the i-th command carried -- the half of
+// the command that says a VIEWER ARRIVED, which the spec-id set alone cannot.
+func (n *notifySpy) epochsAt(i int) map[string]uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.epochs[i]
 }
 
 func newSpiedLogRegistry() (*runtimeLogRegistry, *notifySpy) {
@@ -51,8 +62,8 @@ func newSpiedLogRegistry() (*runtimeLogRegistry, *notifySpy) {
 func TestRuntimeLogSubscriptionDrivesTheAgent(t *testing.T) {
 	r, spy := newSpiedLogRegistry()
 
-	_, unsubA := r.subscribe("srv-1", "spec-a")
-	_, unsubB := r.subscribe("srv-1", "spec-b")
+	_, unsubA, _ := r.subscribe("srv-1", "spec-a")
+	_, unsubB, _ := r.subscribe("srv-1", "spec-b")
 	unsubB()
 	unsubA()
 
@@ -80,8 +91,8 @@ func TestRuntimeLogSubscriptionDrivesTheAgent(t *testing.T) {
 func TestRuntimeLogTwoViewersOneAgentStream(t *testing.T) {
 	r, spy := newSpiedLogRegistry()
 
-	first, unsubFirst := r.subscribe("srv-1", "spec-a")
-	second, unsubSecond := r.subscribe("srv-1", "spec-a")
+	first, unsubFirst, _ := r.subscribe("srv-1", "spec-a")
+	second, unsubSecond, _ := r.subscribe("srv-1", "spec-a")
 	defer unsubSecond()
 
 	for _, cmd := range spy.snapshot() {
@@ -126,7 +137,7 @@ func TestRuntimeLogPublishWithNoSubscriberIsANoOp(t *testing.T) {
 	r, _ := newSpiedLogRegistry()
 	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Text: "nobody is watching"}}})
 
-	sub, unsub := r.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := r.subscribe("srv-1", "spec-a")
 	defer unsub()
 	select {
 	case got := <-sub.ch:
@@ -141,7 +152,7 @@ func TestRuntimeLogPublishWithNoSubscriberIsANoOp(t *testing.T) {
 // the process printed.
 func TestRuntimeLogSlowSubscriberGetsAnExplicitGap(t *testing.T) {
 	r, _ := newSpiedLogRegistry()
-	sub, unsub := r.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := r.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	// Overrun the queue without reading. Each batch carries 10 bytes of text.
@@ -170,9 +181,9 @@ func TestRuntimeLogSlowSubscriberGetsAnExplicitGap(t *testing.T) {
 // that never dropped anything.
 func TestRuntimeLogGapIsPerSubscriber(t *testing.T) {
 	r, _ := newSpiedLogRegistry()
-	slow, unsubSlow := r.subscribe("srv-1", "spec-a")
+	slow, unsubSlow, _ := r.subscribe("srv-1", "spec-a")
 	defer unsubSlow()
-	fast, unsubFast := r.subscribe("srv-1", "spec-a")
+	fast, unsubFast, _ := r.subscribe("srv-1", "spec-a")
 	defer unsubFast()
 
 	for range runtimeLogSubBuffer + 3 {
@@ -206,7 +217,7 @@ func TestRuntimeLogGapIsPerSubscriber(t *testing.T) {
 // text an agent chose.
 func TestRuntimeLogIngestSanitizes(t *testing.T) {
 	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	raw := json.RawMessage(`{"spec_id":"spec-a","entries":[
@@ -240,7 +251,7 @@ func TestRuntimeLogIngestSanitizes(t *testing.T) {
 // connection.
 func TestRuntimeLogIngestRejectsUnusableFrames(t *testing.T) {
 	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	srv.ingestRuntimeLog("srv-1", nil)
@@ -266,7 +277,7 @@ func TestRuntimeLogIngestRejectsUnusableFrames(t *testing.T) {
 // absurdly many entries.
 func TestRuntimeLogIngestClampsEntryCount(t *testing.T) {
 	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	entries := make([]string, 0, runtimeLogMaxEntries+10)
@@ -489,7 +500,7 @@ func TestRuntimeLogRelayNeverReachesDiskOrDatabase(t *testing.T) {
 	}
 	srv := &Server{Routes: st, RuntimeLogs: newRuntimeLogRegistry()}
 
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	const needle = "OP-AI-GATEWAY-PROMPT-NEEDLE-4b7c"
@@ -553,7 +564,7 @@ func TestAgentStreamRestatesTheWatchSetOnConnect(t *testing.T) {
 	seedTestAgentToken(t, srv, "agt_logs", "mock-host-qwen", "agent-secret")
 
 	// An operator already has a log view open when the agent (re)connects.
-	_, unsub := srv.RuntimeLogs.subscribe("mock-host-qwen", "spec-open")
+	_, unsub, _ := srv.RuntimeLogs.subscribe("mock-host-qwen", "spec-open")
 	defer unsub()
 
 	ts := httptest.NewServer(srv)
@@ -705,7 +716,7 @@ func TestRuntimeLogCommandReachesTheOperator(t *testing.T) {
 // could only mislead the reader about which process it belongs to.
 func TestRuntimeLogCommandOnlyRidesAnOpeningMarker(t *testing.T) {
 	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	srv.ingestRuntimeLog("srv-1", json.RawMessage(`{"spec_id":"spec-a","entries":[
@@ -742,7 +753,7 @@ func TestRuntimeLogCommandOnlyRidesAnOpeningMarker(t *testing.T) {
 // list is never rendered as a complete one.
 func TestRuntimeLogCommandIsClampedOnIngest(t *testing.T) {
 	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	args := make([]string, runtimeLogMaxCommandEntries+50)
@@ -821,7 +832,7 @@ func TestRuntimeLogCommandAuthorization(t *testing.T) {
 
 	// And the fan-out key is (server, spec): a command reported for one server
 	// can never reach a viewer watching another, even for the same spec id.
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-other", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-other", "spec-a")
 	defer unsub()
 	srv.ingestRuntimeLog(runtimeEventsServerID, json.RawMessage(
 		`{"spec_id":"spec-a","entries":[{"event":"started","pid":1,"command":{"binary":"/opt/secret-binary"}}]}`))
@@ -845,7 +856,7 @@ func TestRuntimeLogCommandNeverReachesDiskOrDatabase(t *testing.T) {
 	}
 	srv := &Server{Routes: st, RuntimeLogs: newRuntimeLogRegistry()}
 
-	sub, unsub := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
 	defer unsub()
 
 	const needle = "OP-AI-GATEWAY-ARGV-NEEDLE-8d1e"

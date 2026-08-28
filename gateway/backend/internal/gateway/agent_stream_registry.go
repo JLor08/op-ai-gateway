@@ -324,14 +324,27 @@ func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.
 // last-one-wins and a dropped frame is harmless (the next subscribe or the
 // next agent connection restates it).
 //
-// A list of spec IDS is deliberately the whole expressive power of this frame.
-// The ids name specs the GATEWAY itself already sent in the runtime-config
-// document, so there is nothing here -- no path, no pattern, no command --
-// that could make the agent do something it was not already going to do. That
-// is the same boundary certUpdateFrame draws for its own direction: the
-// gateway must never be able to deliver an executable instruction to an agent.
+// A list of spec IDS plus a counter each is deliberately the whole expressive
+// power of this frame. The ids name specs the GATEWAY itself already sent in
+// the runtime-config document, so there is nothing here -- no path, no pattern,
+// no command -- that could make the agent do something it was not already going
+// to do. That is the same boundary certUpdateFrame draws for its own direction:
+// the gateway must never be able to deliver an executable instruction to an
+// agent.
+//
+// Epochs carries a snapshot epoch per watched spec. Watching is a SET, so "this
+// id is new to the set" is not the same fact as "a viewer arrived" -- the
+// second operator on the same spec, a dialog closed and reopened, an SSE
+// connection that reconnected before the old one was reaped, all leave the set
+// unchanged and all need a history replay. The epoch is what carries that fact:
+// the registry bumps a spec's epoch whenever a subscriber arrives for it, and
+// bumps every one of a server's specs when an agent connection is (re)opened,
+// and the agent re-snapshots any spec whose epoch differs from the one its last
+// snapshot was taken for. Every frame stays self-contained and idempotent --
+// re-sending an unchanged one changes nothing on the agent.
 type runtimeLogWatchFrame struct {
-	SpecIDs []string `json:"spec_ids"`
+	SpecIDs []string          `json:"spec_ids"`
+	Epochs  map[string]uint64 `json:"epochs,omitempty"`
 }
 
 // NotifyRuntimeLogWatch tells every open agent connection for serverID which
@@ -355,14 +368,14 @@ type runtimeLogWatchFrame struct {
 // Same shape as NotifyCertUpdate/NotifyRuntimeConfig: marshal (pure CPU) ->
 // snapshot the live connection set under the READ lock -> release -> enqueue
 // (non-blocking) outside it. Best-effort, no error return.
-func (r *AgentStreamRegistry) NotifyRuntimeLogWatch(serverID string, specIDs []string) {
+func (r *AgentStreamRegistry) NotifyRuntimeLogWatch(serverID string, specIDs []string, epochs map[string]uint64) {
 	if r == nil || serverID == "" {
 		return
 	}
 	if specIDs == nil {
 		specIDs = []string{}
 	}
-	b, err := marshalStreamFrame("runtime_log_config", runtimeLogWatchFrame{SpecIDs: specIDs})
+	b, err := marshalStreamFrame("runtime_log_config", runtimeLogWatchFrame{SpecIDs: specIDs, Epochs: epochs})
 	if err != nil {
 		slog.Debug("agent stream: runtime_log_config marshal failed", "server_id", serverID, "err", err)
 		return
