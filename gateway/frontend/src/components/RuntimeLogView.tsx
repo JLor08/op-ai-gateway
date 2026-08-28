@@ -151,8 +151,14 @@ function CommandField({
           }}
         >
           {lines.map((line, i) => (
-            // Append-only, never reordered, and replaced wholesale when a new
-            // command arrives -- the index is a legitimate key.
+            // The index is a legitimate key because each line is rendered as
+            // STATELESS text -- no input, no ref, no focus target -- so there
+            // is nothing an index shift could misbind. That, and NOT any
+            // claim about the list being stable, is what is being relied on
+            // here; it is also the property a future editor would break. Give
+            // a line anything stateful (a per-line copy button, an expand
+            // toggle, a selection) and the index stops being a valid key --
+            // key on the line's own identity then, not on its position.
             <Box component="div" key={i}>
               {line}
             </Box>
@@ -411,8 +417,30 @@ export function RuntimeLogView({
           }}
         >
           {entries.map((entry, i) => (
-            // The index is a legitimate key here: entries are append-only
-            // and never reordered, and a scrollback REPLACES the whole list.
+            // The index is a legitimate key for the row's CONTENT, and NOT
+            // because the indices are stable -- they are not. Past
+            // maxRenderedEntries the append path above trims from the FRONT,
+            // so the rendered window SLIDES and every surviving row's index
+            // moves (and a scrollback replaces the list outright). What makes
+            // the key safe is that `LogLine` holds no state of its own -- no
+            // useState, no useRef, no input, no focus target -- so nothing the
+            // operator typed, selected or focused can be misbound by a shift.
+            //
+            // One consequence is real, known and cosmetic: `InlineCommand`
+            // DOES hold state (its collapse toggle), so a marker landing on an
+            // expanded row's index inherits that toggle. Reproduced with a
+            // full 4000-entry window, one operator-expanded command and one
+            // new generation: the new marker rendered expanded and the old one
+            // collapsed. The command TEXT always comes from that marker's own
+            // props, so no generation is ever shown another's command -- only
+            // "expanded or not" can be wrong.
+            //
+            // So statelessness, not index stability, is the thing to check
+            // before adding anything to a row. A per-row copy button, a
+            // selection, or any focusable control makes the index key wrong in
+            // a way that is no longer cosmetic -- and RuntimeLogEntry carries
+            // no id, so keying on identity means MINTING one (a sequence
+            // number assigned in onBatch), not picking an existing field.
             <LogLine key={i} entry={entry} t={t} />
           ))}
         </Box>
