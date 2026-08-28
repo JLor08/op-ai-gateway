@@ -522,6 +522,47 @@ function renderSection(
   };
 }
 
+/**
+ * Waits for the button called `name` to be present AND ENABLED — the
+ * synchronisation point that an accessible name alone is not.
+ *
+ * Two controls on this screen are gated on a mapping's LAZY per-row spec GET
+ * (`useEffect` over `mappings` → `api.runtimeSpec`), and both look ready
+ * before it lands:
+ *
+ *  - The row's single **Delete**. `rowActions` labels it
+ *    `meaning === 'mapping' ? t.mappingDelete : t.runtimeSpecDelete`, so the
+ *    pre-GET `'unknown'` state carries the SAME name as the settled `'spec'`
+ *    state — and is `disabled` (`rowBusy || meaning === 'unknown'`). A query by
+ *    name therefore MATCHES the disabled control (Testing Library's role
+ *    queries do not filter on `disabled`), and React drops `onClick` on a
+ *    disabled `<button>`: the click is swallowed and no confirm dialog opens.
+ *  - The live-status row's **override actions** (Force stop / Force start /
+ *    Clear override / Restart). `statusActions` looks the row up in
+ *    `specByRuntimeId`, which is built from `specsById`, and returns only the
+ *    log view when there is no entry — so here the control is ABSENT rather
+ *    than disabled, and a synchronous query fails with "Unable to find". They
+ *    can additionally be disabled by `overridesLocked`.
+ *
+ * `toBeEnabled()` covers both shapes: `getByRole` inside `waitFor` retries
+ * through the absent phase, and the matcher rejects the disabled phase.
+ *
+ * Returns nothing on purpose, so the caller cannot keep what it waited on:
+ * `IconAction` wraps only the disabled variant in a `<span>` (to hang the
+ * tooltip on a non-interactive control), so the button's DOM node is REPLACED
+ * when the read lands. Every caller re-queries.
+ *
+ * Not a substitute for `findByRole('dialog')`: an enabled click yields its
+ * dialog synchronously inside `fireEvent`'s `act()` (measured), so the
+ * synchronous dialog queries in this file are correct as they stand and
+ * awaiting them would only trade an instant error for a timeout.
+ *
+ * Cannot be used inside `vi.useFakeTimers()` — see the C1 test below for why.
+ */
+async function waitForEnabledButton(name: string): Promise<void> {
+  await waitFor(() => expect(screen.getByRole('button', { name })).toBeEnabled());
+}
+
 afterEach(cleanup);
 
 describe('RuntimeAdminSection tab strip', () => {
@@ -809,18 +850,12 @@ describe('RuntimeAdminSection edit + delete', () => {
     });
 
     await screen.findByText('gw-model');
-    // The row's single Delete carries `t.runtimeSpecDelete` in BOTH the
-    // settled 'spec' state and the 'unknown' one that precedes this row's
-    // lazy spec GET (RuntimeAdminSection `deleteMeaning`), and it is DISABLED
-    // in 'unknown'. `findByRole` matches disabled buttons and React drops
-    // onClick on a disabled <button>, so awaiting the NAME alone can dispatch
-    // a click that does nothing and leaves no dialog to confirm -- an instant
-    // `role "dialog"` failure, seen in CI. Gate on the settled, ENABLED
-    // control instead, and re-query it: `IconAction` wraps only the disabled
-    // variant in a <span>, so the DOM node is replaced when the read lands.
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
-    );
+    // `findByText` answers for the mappings list, not for this row's lazy spec
+    // GET, and awaiting the Delete by NAME does not answer for it either -- the
+    // shared label matches the disabled 'unknown' state too, and the click is
+    // then swallowed (see `waitForEnabledButton`). Seen in CI as an instant
+    // `role "dialog"` failure.
+    await waitForEnabledButton(t.runtimeSpecDelete);
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
@@ -3312,23 +3347,37 @@ describe('RuntimeAdminSection trailing empty argument (task 22b, C4)', () => {
 // lenses found this independently.
 describe('RuntimeAdminSection ticket compares against the last COMMITTED write (fix round 1, C1)', () => {
   it('still lands an abandoned override write when the LATER write to the same mapping failed', async () => {
+    let landFirst: (updated: RuntimeSpec) => void = () => {};
+    const first = new Promise<RuntimeSpec>((resolve) => {
+      landFirst = resolve;
+    });
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    stream.setStatus('open');
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    // Wait for the row's override actions to exist (see `waitForEnabledButton`)
+    // BEFORE the fake clock goes in, because that wait cannot happen after it:
+    // `@testing-library/react`'s `asyncWrapper` ends every async query with
+    // `await new Promise(r => setTimeout(r, 0))` and only pumps the clock when
+    // `jestFakeTimersAreEnabled()` -- which tests for a `jest` global Vitest
+    // does not define. Under `vi.useFakeTimers()` that `setTimeout` is faked
+    // and never fires, so `waitFor`/`findBy*` hang for the whole 5 s test
+    // timeout even when their condition ALREADY holds (measured: 5.01 s at
+    // every slowness step, including 0). Hence real timers here, fake ones
+    // below.
+    await waitForEnabledButton(t.runtimeForceStop);
+
+    // From here the fake clock, for the 30 s override watchdog. Late enough to
+    // be free: the only two timers this component arms are that watchdog and
+    // the restart deadline, and both are armed by a click, never at mount.
     vi.useFakeTimers();
     try {
-      let landFirst: (updated: RuntimeSpec) => void = () => {};
-      const first = new Promise<RuntimeSpec>((resolve) => {
-        landFirst = resolve;
-      });
-      const { fakeApi, stream } = renderSection({
-        mappings: [makeMapping({ id: 'map_1' })],
-        specsByMappingId: { map_1: fullSpec() },
-        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
-      });
-      stream.setStatus('open');
-      await act(async () => {
-        await Promise.resolve();
-      });
-      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
-
       // Write A: force_stopped, hangs past its 30 s watchdog. The row unlocks
       // and the operator is told the outcome is unknown.
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
@@ -3344,6 +3393,12 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
 
       // Write B: the retry, on the same mapping -- and it REJECTS, so it never
       // writes the cache. It must not burn A's right to commit.
+      //
+      // This second click needs no gate of its own, and could not have one
+      // (fake timers, see above). The spec is cached from here on, so the
+      // action cannot go absent again, and the only thing that could still
+      // disable it is `overrideBusy` -- which the watchdog clears in the SAME
+      // commit that shows the notice the line above just asserted.
       fakeApi.putRuntimeSpec.mockImplementationOnce(() =>
         Promise.reject(new Error('write B failed')),
       );
@@ -3396,6 +3451,11 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
 
     fakeApi.putRuntimeSpec.mockImplementationOnce(() => override);
+    // `findByText('gw-model')` above answers for the MAPPINGS list, not for
+    // this row's per-row spec GET -- and the override actions are rendered
+    // only once that GET has landed. Measured without this gate: 4/5 runs
+    // failed with `Unable to find ... "Stopp erzwingen"` at slowness step 5.
+    await waitForEnabledButton(t.runtimeForceStop);
     fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
     await act(async () => {
       await Promise.resolve();
@@ -3409,9 +3469,7 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     );
     // Same shared-label hazard as the spec-delete test above: wait for the
     // settled, enabled control rather than for the name alone.
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
-    );
+    await waitForEnabledButton(t.runtimeSpecDelete);
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
@@ -3475,6 +3533,12 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
 
     // The operator switches to the live-status tab and forces the model down.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+    // Same gate as the two tests above. This one is only INCIDENTALLY safe --
+    // the lazy GET is meant to have settled by here (it is the Edit GET that
+    // is slow in this test), and it usually has; measured without the gate,
+    // 1/5 runs still failed with `Unable to find ... "Stopp erzwingen"` at
+    // slowness step 5. "Usually" is what this whole change is about.
+    await waitForEnabledButton(t.runtimeForceStop);
     fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
     await act(async () => {
       await Promise.resolve();
@@ -4052,24 +4116,50 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     );
   }
 
-  /**
-   * Clicks the row's Delete and, if that opened the confirmation, confirms it.
-   * A gated Delete opens no dialog at all; an ungated one opens the confirm,
-   * and THAT second click is what reaches an endpoint.
-   */
-  async function clickThroughDelete() {
-    fireEvent.click(rowDelete());
-    const dialog = screen.queryByRole('dialog');
-    if (dialog !== null) {
-      fireEvent.click(
-        within(dialog).queryByRole('button', { name: t.mappingDelete }) ??
-          within(dialog).getByRole('button', { name: t.runtimeSpecDelete }),
-      );
-    }
+  /** Drains the two await points a confirmed delete needs to reach its call. */
+  async function settleDelete() {
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+  }
+
+  /**
+   * Clicks the row's Delete on a row where it is OFFERED, and confirms it. That
+   * second click is the one that reaches an endpoint.
+   *
+   * The confirmation is required, not merely handled if present. It used to be
+   * optional -- `queryByRole('dialog')`, skipped when null -- which made this
+   * helper silently do nothing whenever the Delete was still disabled and ate
+   * the click (see `waitForEnabledButton`). The test then failed several lines
+   * later on `expected [] to deeply equal ['map_1']`, which names neither the
+   * swallowed click nor the row that swallowed it. Callers that expect the
+   * gate to REFUSE the click use `clickLockedDelete` instead, so nothing here
+   * has to guess which of the two it is looking at.
+   *
+   * `getByRole` and not `findByRole`, deliberately: an enabled click yields its
+   * dialog synchronously inside `fireEvent`'s `act()` (measured), so awaiting
+   * would only turn an instant, informative error into a 1 s timeout.
+   */
+  async function clickThroughDelete() {
+    fireEvent.click(rowDelete());
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(
+      within(dialog).queryByRole('button', { name: t.mappingDelete }) ??
+        within(dialog).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await settleDelete();
+  }
+
+  /**
+   * Clicks the row's Delete on a row where the gate must REFUSE it, and asserts
+   * that no confirmation opened -- the observable half of "locked", and what
+   * lets `clickThroughDelete` insist on the dialog everywhere else.
+   */
+  async function clickLockedDelete() {
+    fireEvent.click(rowDelete());
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await settleDelete();
   }
 
   it('never deletes the mapping while this row’s spec state is unknown', async () => {
@@ -4094,7 +4184,7 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     });
 
     const del = rowDelete();
-    await clickThroughDelete();
+    await clickLockedDelete();
 
     // THE assertion, and deliberately about the OUTCOME rather than the label:
     // a label that reads wrongly is a nuisance, a model route that no longer
@@ -4134,9 +4224,17 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     });
 
     // Settled and configured: the smaller operation, offered and working.
+    //
+    // The single flush above is not what settles this row -- awaiting the
+    // ENABLED control is (see `waitForEnabledButton`). Measured without it,
+    // 5/5 runs failed here on `Received element is not enabled: <button
+    // aria-label="Spezifikation löschen" disabled="">` at slowness step 5.
+    // Waiting first also moves the mapping-delete check into the settled
+    // state, where it is the assertion that matters: before the read lands the
+    // label is `t.runtimeSpecDelete` whatever the row turns out to be, so an
+    // absent `t.mappingDelete` there says nothing at all.
+    await waitForEnabledButton(t.runtimeSpecDelete);
     expect(screen.queryByRole('button', { name: t.mappingDelete })).not.toBeInTheDocument();
-    const del = await screen.findByRole('button', { name: t.runtimeSpecDelete });
-    expect(del).toBeEnabled();
     await clickThroughDelete();
     expect(deletedSpecIds).toEqual(['map_1']);
     expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
@@ -4191,6 +4289,12 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
       await Promise.resolve();
     });
 
+    // Same gate as the test above, and the reason `clickThroughDelete` now
+    // insists on its dialog: without the wait, 5/5 runs at slowness step 5 hit
+    // the disabled Delete, the click was eaten, the old helper skipped the
+    // confirmation it could not find, and the test failed two lines down on
+    // `expected [] to deeply equal ['map_1']`.
+    await waitForEnabledButton(t.runtimeSpecDelete);
     await clickThroughDelete();
     expect(deletedSpecIds).toEqual(['map_1']);
     // The dialog's exit transition keeps the rest of the screen aria-hidden
@@ -4224,7 +4328,7 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     });
 
     const del = rowDelete();
-    await clickThroughDelete();
+    await clickLockedDelete();
     expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
     expect(deletedMappingIds).toEqual([]);
     expect(deletedSpecIds).toEqual([]);
