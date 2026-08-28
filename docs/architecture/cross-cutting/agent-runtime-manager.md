@@ -685,6 +685,21 @@ which is exact because the agent knows which PIDs are its children — and write
 the measurement back to the gateway. There "unknown" is a self-resolving
 transient, not a permanent hole in the OOM protection.
 
+**What makes it self-resolving is a measurement of a process that is merely
+RUNNING**, and for a while nothing took one. The measurer was consulted from
+exactly one place — the admission snapshot — whose PID list is built from the
+specs that *already* have a live process, so the spec being admitted is never
+in its own list and a server whose specs are all up never builds another
+snapshot at all. A server with one managed spec invoked the measurer once,
+with an empty PID list, and never again; `vram_measured_mb` stayed `0` for the
+life of the deployment and the whole write-back chain behind it never ran. So
+the invitation to leave `vram_estimate_mb` at `0` and let measurement take
+over was, in practice, an invitation into the unknown-demand class for good.
+Measurement is now also dispatched from the owner's housekeeping beat and the
+moment a child first passes a health probe — the point where a model server
+has finished mapping its weights, so the first number is already the
+meaningful one.
+
 **Measurement is NVIDIA-only.** `main.go` installs exactly one measurer,
 `collector.NewNvidiaComputeApps()`, and that constructor returns nil when
 `nvidia-smi` is not on PATH — so an AMD host (the host-level `rocm-smi`
@@ -708,9 +723,40 @@ The measurer resolves GPU UUID → index from a cached `--query-gpu=index,uuid`
 mapping, re-fetched only on the first call or when a *wanted* PID's UUID is
 missing from the cache (a card added, removed or reindexed), so the steady state
 spawns one subprocess per measurement rather than two. An unknown UUID is
-skipped, never guessed — this runs on the single serialized owner goroutine
-(§5.5) once per admission decision, so its latency is the whole component's
-latency.
+skipped, never guessed.
+
+**The recurring measurement runs OFF the owner goroutine; the admission-time
+one still runs on it.** That split is deliberate, and it is what let
+measurement become recurring at all. The owner (§5.5) is the single serialized
+owner of all state and also answers `Status()` for the 1 s telemetry tick and
+every `EnsureRunning` over an unbuffered channel, so a subprocess spawn on it
+is a stall for all of them. An admission can afford that because it is
+occasional — the UUID cache above exists because even *that* was worth
+reducing. A beat cannot, because the cost stops being occasional and becomes
+constant. So the beat's dispatch does only the part that needs owner state
+(reading the live generation set) and hands the subprocess to its own
+goroutine, whose result returns as an ordinary command; at most one
+measurement is ever outstanding, so a measurer slower than the beat skips
+beats instead of accumulating subprocesses. The admission-time call stays
+synchronous on purpose: that is the arithmetic deciding whether one more
+process may share a GPU, and a spec started since the last beat would
+otherwise be charged its operator *estimate* — an estimate understating
+reality is exactly how a co-resident pair reaches an OOM.
+
+A returning measurement is matched to the **generation** it was taken for (the
+`*runningProc`, not the PID) before it is recorded: a subprocess takes real
+time, in which a spec can exit, restart or be reconfigured, and the OS recycles
+PIDs. A target the measurer says nothing about keeps its previous value —
+`nvidia-smi` not listing a PID for one cycle is a transient, not evidence that
+a process stopped using VRAM. Only an actual exit clears it.
+
+An installed measurer **must bound its own runtime**: nothing interrupts it,
+and `Close` waits for an in-flight one. The shipped measurer uses a 2 s context
+deadline covering both possible subprocess spawns.
+
+**On a host with no measurer installed none of this exists**: the dispatch
+returns before spawning or allocating anything, which is what keeps every AMD,
+Apple and CPU-only deployment byte-for-byte unchanged.
 
 `pending_vram_unknown` as a *terminal* reason is reserved for a holder that can
 never leave — a **pinned** process on the contested GPU. A merely busy,
@@ -820,6 +866,15 @@ with its own buffered reply channel. There is no mutex anywhere in the manager.
 Correctness arguments are therefore about command *ordering*, not lock ordering,
 and any new state must be reached the same way — a mutex-guarded side field
 defeats the model.
+
+**Work that blocks belongs on a side goroutine that posts a command back**, and
+the VRAM measurement is the worked example (§5.3): the owner reads the live
+generation set, the subprocess runs elsewhere, and the answer arrives as an
+ordinary command carrying the `*runningProc` it was taken for, so a result for
+a superseded generation is discarded exactly like every other late report. That
+shape is what keeps `Status()` non-blocking — a deliberate property, since the
+telemetry loop reads it every second and a stalled owner makes the whole agent
+look wedged.
 
 The ordering that guarantees at most one process per spec: inside the owner,
 `admitAndStart` runs Permit → `Admit` → mark victims draining or the target
@@ -1727,11 +1782,14 @@ contextual for the same reason — a configured row's delete removes the spec on
 mapping, which is safe because the spec's `mapping_id` foreign key is
 `on delete cascade`.
 
-Two field semantics the form encodes rather than leaving to guesswork:
+Three field semantics the form encodes rather than leaving to guesswork:
 `vram_measured_mb` is agent-owned and always ignored on write, so it renders as
-read-only text and never as an input; and `listen_port: 0` means "the agent picks
-a free ephemeral port", stated as helper text rather than left to look like an
-error.
+read-only text and never as an input; `vram_locked` is the operator's opt-out of
+being *governed* by that measurement — the label says so, and its hint names the
+case that sends people looking for it, a measurement above the GPU budget
+leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agent
+picks a free ephemeral port", stated as helper text rather than left to look
+like an error.
 
 `args` are **one per line and never split on spaces** — `--system-prompt "You are
 helpful"` would be destroyed. The parser preserves every line verbatim, strips

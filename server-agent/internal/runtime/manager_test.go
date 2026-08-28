@@ -2387,3 +2387,186 @@ func TestManagerClearsMeasuredVRAMWhenTheProcessExits(t *testing.T) {
 		t.Fatalf("Status()[spec-a].MeasuredVRAM = %v after the process exited (state %v, pid %d), want empty -- BUG F2: a dead process's measurement is still reported, so the agent keeps attaching gpus to every telemetry sample and the gateway rewrites the same value once per second forever", st.MeasuredVRAM, st.State, st.PID)
 	}
 }
+
+// TestManagerMeasuresARunningSpecWithoutAFurtherAdmission is the headline F1
+// case, and it is deliberately the SIMPLEST possible server: exactly one
+// managed spec, started once, never asked for again.
+//
+// Before the fix the only caller of the installed measurer was buildSnapshot,
+// reached only from admitAndStart, and its pid list is built from the specs
+// that ALREADY have a live process -- so the one admission this server ever
+// performs calls the measurer with a ZERO-LENGTH pid list (the spec being
+// admitted has not been exec'd yet) and nothing calls it again. Every
+// downstream consumer then reads an empty measurement forever:
+// Status.MeasuredVRAM stays nil, the telemetry sample omits `gpus`, the
+// gateway's write-back never runs, `vram_measured_mb` stays 0, and the
+// measured-wins-over-estimate rule never fires -- which is exactly why an
+// operator who leaves `vram_estimate_mb` at 0, as the documentation invites,
+// stays in the unknown-demand class forever and can never become co-resident.
+//
+// The pid assertion is the crux: it is not enough that SOME measurement
+// arrives, it must be a measurement OF THIS SPEC'S OWN CHILD.
+func TestManagerMeasuresARunningSpecWithoutAFurtherAdmission(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	// Never blocks: this test is about whether the measurer is ASKED about a
+	// live child at all, not about what that costs.
+	var measuredPIDs sync.Map // pid -> struct{}
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			measuredPIDs.Store(p, struct{}{})
+			out[p] = map[int]int{0: 4242}
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	// Pinned: Apply alone starts it, so this server performs exactly ONE
+	// admission in its whole life and no request ever arrives afterwards.
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	waitUntil(t, 5*time.Second, "spec-a reports a measurement -- BUG F1: the measurer is only ever consulted from admitAndStart, whose pid list cannot contain the spec being admitted, so a spec that is merely RUNNING is never measured and vram_measured_mb stays 0 forever", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && len(st.MeasuredVRAM) > 0
+	})
+
+	st := statusFor(m, "spec-a")
+	if st.PID == 0 {
+		t.Fatalf("Status()[spec-a].PID = 0 with state %v -- the test's own premise (a live child) does not hold", st.State)
+	}
+	if _, ok := measuredPIDs.Load(st.PID); !ok {
+		t.Fatalf("the measurer was never asked about spec-a's own child pid %d -- BUG F1: the pid list handed to the measurer never contains a live managed process", st.PID)
+	}
+	if got := st.MeasuredVRAM[0]; got != 4242 {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM[0] = %d, want 4242 (the measurer's own answer for this child)", got)
+	}
+}
+
+// TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight pins the design
+// constraint that makes F1 non-trivial: measurement is now RECURRING, and the
+// measurer spawns a subprocess (nvidia-smi in production). The owner goroutine
+// is the single serialized owner of all state -- it also answers Status() for
+// the 1 s telemetry tick and every EnsureRunning, over an UNBUFFERED channel --
+// so a recurring subprocess spawn on it would put a fixed, permanent cost in
+// front of every one of them. Status() being non-blocking is a deliberate
+// existing property, not an accident.
+//
+// The measurer here blocks forever until released, and only for a NON-EMPTY
+// pid list. That split is what makes the test mean one thing: an empty list is
+// admission's own buildSnapshot call, which runs on the owner by design and is
+// not what this test is about (returning at once keeps the spec startable);
+// a non-empty list can only be a measurement of a process that is ALREADY
+// live, which is the dispatch under test.
+//
+// Against the unfixed tree it fails at the first select: no measurement of a
+// live process is ever taken at all.
+func TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	releaseMeasurer := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered AFTER newTestManager's t.Cleanup(m.Close): cleanups run LIFO,
+	// so a t.Fatal anywhere below frees the measurer before Close waits on the
+	// goroutine running it. Without this one failing assertion hangs the binary.
+	t.Cleanup(releaseMeasurer)
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		if len(pids) == 0 {
+			return nil // admission's own call; see the doc above
+		}
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return nil
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the measurer was never called with a live pid -- BUG F1: nothing measures a spec that is merely running")
+	}
+
+	// The subprocess is out. The owner must still answer.
+	done := make(chan []Status, 1)
+	go func() { done <- m.Status() }()
+	select {
+	case got := <-done:
+		if len(got) != 1 {
+			t.Fatalf("Status() = %#v, want the one managed spec", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Status() did not return while a measurement was in flight -- BUG: the measurement is running ON the owner goroutine, so every telemetry tick and every EnsureRunning now queues behind a subprocess spawn")
+	}
+
+	releaseMeasurer()
+}
+
+// TestManagerWithNoMeasurerInstalledIsUnaffected is the non-regression that
+// matters most: EVERY AMD, Apple and CPU-only deployment installs no measurer
+// at all (collector.NewNvidiaComputeApps returns nil when nvidia-smi is off
+// PATH, and SetMeasurer(nil) is also NewManager's own default). Recurring
+// measurement must be entirely absent on those hosts -- not merely harmless.
+//
+// Deliberately green in BOTH trees: it is a guard, not a bug reproduction.
+// It is not vacuous, because the two tests above prove the measurement beat
+// does fire under exactly these shrunk timings when a measurer IS installed.
+func TestManagerWithNoMeasurerInstalledIsUnaffected(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy()) // no SetMeasurer, ever
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	// Well past several measurement beats at shrinkTimings' 30ms cadence.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := statusFor(m, "spec-a")
+		if st == nil {
+			t.Fatal("Status() lost spec-a")
+		}
+		if st.MeasuredVRAM != nil {
+			t.Fatalf("Status()[spec-a].MeasuredVRAM = %v with NO measurer installed, want nil -- the operator's estimate must be the only number on an AMD/Apple/CPU-only host", st.MeasuredVRAM)
+		}
+		if st.State != StateRunning {
+			t.Fatalf("Status()[spec-a].State = %v, want it to stay running", st.State)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// And it still serves, which is the whole point of not regressing it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	endpoint, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	defer release()
+	if code, body := httpEcho(t, endpoint, "hello"); code != http.StatusOK || body != "hello" {
+		t.Fatalf("echo = (%d, %q), want (200, %q)", code, body, "hello")
+	}
+}

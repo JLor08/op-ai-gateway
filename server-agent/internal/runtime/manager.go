@@ -72,8 +72,13 @@ var (
 	// healthPollInterval is the cadence of health-endpoint probes while a
 	// spec is Starting.
 	healthPollInterval = 500 * time.Millisecond
-	// idleTickInterval is how often the owner scans for idle-timeout
-	// unloads.
+	// idleTickInterval is the owner's housekeeping beat: how often it scans
+	// for idle-timeout unloads AND how often it dispatches a VRAM
+	// measurement of the live managed processes (dispatchMeasurement). One
+	// beat rather than two because both are "sweep the current process set
+	// and act on what has changed", and because neither does any real work
+	// on the owner goroutine -- the measurement's subprocess runs elsewhere
+	// and posts its answer back.
 	idleTickInterval = 15 * time.Second
 	// notPermittedRetryInterval bounds how often StateNotPermitted /
 	// StatePendingVRAMUnknown are re-evaluated (fix round 2 / R2-1). A
@@ -326,12 +331,27 @@ func (m *Manager) Transitions() <-chan struct{} {
 	return m.transitions
 }
 
-// SetMeasurer installs f, which the owner calls (with every currently-live
-// managed PID) while building each admission snapshot, to get real per-GPU
-// VRAM usage instead of a spec's static estimate (Task 18 wires this to
-// nvidia-smi). f may be nil to go back to estimates only, which is also
-// NewManager's default -- measurement is a capability, not a protocol
-// feature, so an agent without a measurement path simply never calls this.
+// SetMeasurer installs f, which is called with every currently-live managed
+// PID to get real per-GPU VRAM usage instead of a spec's static estimate
+// (main.go wires this to nvidia-smi). f may be nil to go back to estimates
+// only, which is also NewManager's default -- measurement is a hardware
+// capability, not a negotiated protocol feature, so every AMD, Apple and
+// CPU-only host simply never installs one and is entirely unaffected by
+// everything below.
+//
+// f is called from TWO places, and it must be safe for concurrent use because
+// they can overlap:
+//
+//   - the recurring, OFF-owner measurement (dispatchMeasurement), which is
+//     what keeps a merely-running spec's measurement current, and
+//   - each admission snapshot (buildSnapshot), synchronously on the owner
+//     goroutine, so an admission decides on the freshest numbers there are.
+//
+// f MUST BOUND ITS OWN RUNTIME. Nothing here interrupts it: on the owner it
+// stalls every Status() and EnsureRunning for its duration, and off the owner
+// it is tracked in the Manager's WaitGroup, so Close waits for it. The
+// shipped measurer uses a 2s context deadline covering both of its subprocess
+// spawns.
 func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	if f == nil {
 		m.measurer.Store(nil)
@@ -481,6 +501,28 @@ type cmdClose struct{}
 
 func (cmdClose) isCommand() {}
 
+// measureTarget names one live generation a dispatched measurement was taken
+// for. The *runningProc is the generation identity, exactly as everywhere
+// else in this file (see the package doc): a pid alone is not enough, because
+// the OS is free to hand the same number to something unrelated the moment
+// the child exits, and the measurement is in flight for as long as a
+// subprocess takes to answer.
+type measureTarget struct {
+	specID string
+	proc   *runningProc
+	pid    int
+}
+
+// cmdMeasured carries a completed off-owner measurement back to the owner.
+// byPID is exactly what the installed measurer returned (pid -> gpu index ->
+// MB), possibly nil.
+type cmdMeasured struct {
+	targets []measureTarget
+	byPID   map[int]map[int]int
+}
+
+func (cmdMeasured) isCommand() {}
+
 // ensureOutcome is what an EnsureRunning caller eventually receives.
 type ensureOutcome struct {
 	endpoint string
@@ -629,6 +671,13 @@ type owner struct {
 
 	closing bool // true from the moment cmdClose is received
 	stopped bool // true once every live process has been confirmed gone during close
+
+	// measuring is true from the moment dispatchMeasurement hands a
+	// measurement to its own goroutine until the matching cmdMeasured is
+	// handled. At most one measurement is ever outstanding: a measurer
+	// slower than the beat must not accumulate goroutines and subprocesses,
+	// and a skipped beat costs nothing but freshness.
+	measuring bool
 }
 
 // run is the owner's single event loop. Every state mutation in this
@@ -648,6 +697,7 @@ func (o *owner) run() {
 		case <-idleTick.C:
 			if !o.closing {
 				o.scanIdle()
+				o.dispatchMeasurement()
 			}
 		}
 		if o.stopped {
@@ -681,6 +731,8 @@ func (o *owner) handle(cmd command) {
 		o.handleDrainGraceExpired(c)
 	case cmdKillGraceExpired:
 		o.handleKillGraceExpired(c)
+	case cmdMeasured:
+		o.applyMeasurement(c)
 	case cmdStatus:
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
@@ -1110,9 +1162,164 @@ func (o *owner) admitAndStart(specID string) {
 	}
 }
 
+// dispatchMeasurement asks the installed measurer for the real per-GPU VRAM
+// of every live managed process, OFF the owner goroutine, and has the answer
+// posted back as cmdMeasured.
+//
+// THIS IS THE ONLY PATH THAT EVER MEASURES A SPEC THAT IS MERELY RUNNING, and
+// its absence was the F1 defect. buildSnapshot (below) also consults the
+// measurer, but it is reached only from admitAndStart and its pid list is
+// built from the specs that ALREADY have a live process -- so the spec being
+// admitted is never in its own pid list, and a server whose specs are all up
+// (the steady state) never reaches it again at all. On a server with exactly
+// one managed spec the measurer was therefore invoked exactly once, with a
+// zero-length pid list, and never again. Everything downstream then read an
+// empty measurement forever: Status.MeasuredVRAM stayed nil, the telemetry
+// sample omitted `gpus`, the gateway's write-back never ran,
+// `vram_measured_mb` stayed 0, and the measured-wins-over-estimate rule never
+// fired -- so an operator who left `vram_estimate_mb` at 0, exactly as the
+// documentation invites, stayed in the unknown-demand class permanently and
+// could never make the spec co-resident, which is the feature they configured
+// the GPU row for.
+//
+// WHY OFF THE OWNER, AND WHY THAT IS NOT OPTIONAL HERE. The measurer spawns a
+// subprocess (nvidia-smi). The owner goroutine is the single serialized owner
+// of all state; it also answers Status() for the 1 s telemetry tick and every
+// EnsureRunning, over an UNBUFFERED channel, so anything slow running ON it
+// parks all of them behind it. buildSnapshot can afford that because an
+// admission is occasional -- and an earlier round already had to mitigate
+// even that, by caching the measurer's index/UUID map. A RECURRING
+// measurement cannot: the cost would stop being occasional and become
+// constant. So the owner does only the part that requires owner state --
+// reading the live generation set -- and the subprocess goes to its own
+// goroutine, whose result returns as just another command. Status() therefore
+// never waits on a measurement, which is an existing deliberate property and
+// is pinned by
+// TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight.
+//
+// NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
+// most: every AMD, Apple unified-memory and CPU-only deployment lands here
+// (collector.NewNvidiaComputeApps returns nil when nvidia-smi is off PATH,
+// and nil is also NewManager's default). Those hosts take the first branch,
+// spawn nothing, allocate nothing, and behave exactly as they did before this
+// function existed.
+//
+// GATED ON A SPEC DECLARING A GPU, NOT ON BUDGETS EXISTING. Skipping the
+// measurement when no GPU budget is configured was considered and rejected:
+// the number is not only an input to the budget arithmetic. It is also what
+// moves a spec out of the unknown-VRAM class, and §5.3's "must start alone on
+// its GPUs" rule applies whether or not a budget exists -- so on a
+// budget-less server the measurement is the difference between co-residency
+// working and not. It is also what the portal shows as "Measured VRAM
+// (agent-reported)", which is the operator's own feedback that leaving the
+// estimate at 0 is safe. A GPU-declaring spec is the honest gate: with no
+// GPUs declared anywhere there is no index the measurement could be attached
+// to, no admission arithmetic it could inform, and no portal row it could
+// fill.
+func (o *owner) dispatchMeasurement() {
+	if o.closing || o.measuring {
+		return
+	}
+	mp := o.m.measurer.Load()
+	if mp == nil {
+		return
+	}
+	targets := o.measurementTargets()
+	if len(targets) == 0 {
+		return
+	}
+	pids := make([]int, len(targets))
+	for i, t := range targets {
+		pids[i] = t.pid
+	}
+	measure := *mp
+	o.measuring = true
+	// Tracked in m.wg like every other goroutine the owner spawns, so Close
+	// cannot return while a measurer is still running (which would let a
+	// test's package-var restore race it). The Add happens on the owner
+	// goroutine, which Close provably joins before it Waits, so this can
+	// never be an Add-after-Wait. It does mean Close waits out one measurer
+	// invocation: an installed measurer must therefore bound itself, and the
+	// shipped one does (collector.nvidiaMeasureTimeout, 2s, covering both of
+	// its subprocess spawns).
+	o.m.wg.Add(1)
+	go func() {
+		defer o.m.wg.Done()
+		// Always posts, even for a nil result: the cmdMeasured is what
+		// clears o.measuring, so a measurer that answers "nothing" must not
+		// wedge the flag. (postCmd drops the command once the owner has
+		// stopped, which only happens during Close, where the flag no longer
+		// matters.)
+		o.m.postCmd(cmdMeasured{targets: targets, byPID: measure(pids)})
+	}()
+}
+
+// measurementTargets lists the live generations worth measuring right now, or
+// nil when there is nothing to measure. Ordered by spec ID so the pid list
+// handed to an external command does not depend on Go's randomized map
+// iteration -- the measurer treats it as a set, but a stable order keeps logs
+// and test expectations reproducible.
+func (o *owner) measurementTargets() []measureTarget {
+	targets := make([]measureTarget, 0, len(o.specs))
+	declaresGPU := false
+	for id, st := range o.specs {
+		if st.proc == nil {
+			continue
+		}
+		if len(st.spec.GPUs) > 0 {
+			declaresGPU = true
+		}
+		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid})
+	}
+	if !declaresGPU {
+		return nil // see dispatchMeasurement's gating paragraph
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].specID < targets[j].specID })
+	return targets
+}
+
+// applyMeasurement records a completed measurement against the generations it
+// was actually taken for, and re-arms the next dispatch.
+//
+// The generation check is the whole of the correctness here: a measurement is
+// in flight for as long as a subprocess takes, and in that window a spec can
+// have exited, restarted, or been replaced by a config change. Writing the
+// result onto whatever happens to be running now would attribute one
+// process's VRAM to a different one -- and pids are recycled, so the pid
+// alone cannot tell them apart.
+//
+// A target the measurer said nothing about keeps its previous value rather
+// than being cleared: nvidia-smi not listing a pid this cycle is a transient
+// (a hiccup, a CPU-only child, a race with the process appearing), not
+// evidence that the process stopped using VRAM. Only an actual exit clears
+// the value, in onProcExited.
+func (o *owner) applyMeasurement(c cmdMeasured) {
+	o.measuring = false
+	for _, t := range c.targets {
+		st := o.specs[t.specID]
+		if st == nil || st.proc != t.proc {
+			continue // superseded generation -- see measureTarget
+		}
+		if byGPU := c.byPID[t.pid]; byGPU != nil {
+			st.measuredVRAM = byGPU
+		}
+	}
+}
+
 // buildSnapshot assembles the pure PolicySnapshot Admit needs from current
 // owner state, consulting the installed measurer (if any) for real per-GPU
 // VRAM instead of each spec's static estimate.
+//
+// It measures SYNCHRONOUSLY, on the owner, and that is deliberate even though
+// dispatchMeasurement (above) now keeps st.measuredVRAM continuously fresh.
+// This is the safety-critical read: the arithmetic that decides whether one
+// more process may share a GPU should use the newest numbers obtainable at
+// the instant it decides, not ones up to one housekeeping beat old. The
+// window is not academic -- a spec that started since the last beat would
+// otherwise be charged its operator ESTIMATE, and an estimate that
+// under-states reality is exactly how a co-resident pair reaches an OOM. An
+// admission is occasional, so the cost stays occasional; the recurring cost
+// is what had to move off the owner, and it did.
 func (o *owner) buildSnapshot() PolicySnapshot {
 	pids := make([]int, 0, len(o.specs))
 	for _, st := range o.specs {
@@ -1445,6 +1652,13 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 			o.m.postCmd(cmdStableRun{specID: c.specID, proc: proc})
 		})
 		o.succeedPending(st, c.specID)
+		// A new live process exists, and this is the best moment there is to
+		// measure it: a model server has finished mapping its weights by the
+		// time it answers a health probe, so the first measurement is
+		// already the meaningful one instead of catching the middle of a
+		// load. The housekeeping beat then keeps it current as the KV cache
+		// grows. Non-blocking -- see dispatchMeasurement.
+		o.dispatchMeasurement()
 		return
 	}
 
