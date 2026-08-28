@@ -809,7 +809,19 @@ describe('RuntimeAdminSection edit + delete', () => {
     });
 
     await screen.findByText('gw-model');
-    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecDelete }));
+    // The row's single Delete carries `t.runtimeSpecDelete` in BOTH the
+    // settled 'spec' state and the 'unknown' one that precedes this row's
+    // lazy spec GET (RuntimeAdminSection `deleteMeaning`), and it is DISABLED
+    // in 'unknown'. `findByRole` matches disabled buttons and React drops
+    // onClick on a disabled <button>, so awaiting the NAME alone can dispatch
+    // a click that does nothing and leaves no dialog to confirm -- an instant
+    // `role "dialog"` failure, seen in CI. Gate on the settled, ENABLED
+    // control instead, and re-query it: `IconAction` wraps only the disabled
+    // variant in a <span>, so the DOM node is replaced when the read lands.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
     );
@@ -3395,7 +3407,12 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     fakeApi.deleteRuntimeSpec.mockImplementationOnce(() =>
       Promise.reject(new Error('delete failed')),
     );
-    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecDelete }));
+    // Same shared-label hazard as the spec-delete test above: wait for the
+    // settled, enabled control rather than for the name alone.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
     );
