@@ -26,7 +26,22 @@ const nvidiaCSVFormat = "--format=csv,noheader,nounits"
 
 // nvidiaQueryFields is the ordered --query-gpu field list the collector requests
 // from nvidia-smi. parseNvidiaCSV assumes exactly this column order.
-const nvidiaQueryFields = "index,name,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,driver_version"
+//
+// APPEND HERE, NEVER INSERT. This constant and parseNvidiaCSV's positional
+// parts[N] indices are two halves of one contract with nothing but this
+// sentence connecting them: inserting a column shifts every field after it, so
+// each one silently reads its neighbour's data -- power arrives as a
+// temperature, a UUID as a name -- with no parse error anywhere, because every
+// value is still a well-formed string. Appending leaves every existing index
+// untouched, and the parser reads each appended column behind its own length
+// guard so a shorter row (an older driver that does not know the field) still
+// parses. TestNvidiaQueryFieldsColumnOrder pins the list itself so a future
+// insertion fails a test rather than a production host.
+//
+// Note the separate, deliberately minimal nvidiaGPUIndexFields below, used by
+// the measurer: it has its own parser and must not be changed in step with
+// this one.
+const nvidiaQueryFields = "index,name,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,driver_version,pci.bus_id"
 
 // nvidiaCollector reports NVIDIA GPUs via the nvidia-smi CLI in CSV mode.
 type nvidiaCollector struct{}
@@ -80,6 +95,15 @@ func naInt(s string) int {
 // nounits` output into GPUs. Rows with fewer than 9 fields are skipped. Memory
 // values are MiB and converted to bytes. VRAMTempC is not reported by this
 // query and stays 0.
+//
+// The trailing columns (driver_version, then pci.bus_id) each sit behind their
+// own length check, so a row from a driver that does not report one of them
+// parses with that field empty instead of being dropped. Positional indices
+// here are the other half of nvidiaQueryFields' contract -- read its doc
+// before touching either.
+//
+// pci.bus_id is safe to carry through a comma-split: its form is
+// `00000000:65:00.0` -- colons and a dot, never a comma.
 func parseNvidiaCSV(data []byte) ([]sample.GPU, error) {
 	var gpus []sample.GPU
 	for _, raw := range bytes.Split(data, []byte("\n")) {
@@ -107,6 +131,9 @@ func parseNvidiaCSV(data []byte) ([]sample.GPU, error) {
 		}
 		if len(parts) >= 10 {
 			gpu.DriverVersion = parts[9]
+		}
+		if len(parts) >= 11 {
+			gpu.PCIBusID = parts[10]
 		}
 		gpus = append(gpus, gpu)
 	}

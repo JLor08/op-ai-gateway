@@ -296,12 +296,20 @@ export type HardwareMemoryModule = {
 export type HardwareMemory = { total_bytes: number; modules?: HardwareMemoryModule[] };
 export type HardwareMainboard = { vendor: string; product: string; version: string };
 export type HardwareBIOS = { vendor: string; version: string };
+// pci_bus_id is the card's PCI address ("00000000:65:00.0"), NVIDIA only and
+// omitted by every other collector and by any agent older than this field --
+// so every consumer must render without it. It is a display/disambiguation
+// aid: on the 4x/8x identical-card hosts that are the normal AI-server build
+// it is the only handle that maps to a physical slot and survives index
+// renumbering across reboots. It is deliberately NOT an identity -- GPU rows,
+// budgets and admission all key on `index`.
 export type HardwareGPU = {
   index: number;
   name: string;
   uuid?: string;
   driver_version?: string;
   memory_total_bytes: number;
+  pci_bus_id?: string;
 };
 export type HardwareReport = {
   collected_at: string;

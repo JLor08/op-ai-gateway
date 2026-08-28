@@ -49,7 +49,7 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
-| NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version; `[N/A]`-style sentinels map to 0 |
+| NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
 | AMD | `amd.go` | `rocm-smi --json` (`--showid --showuse --showmemuse --showtemp --showpower --showdriverversion`) | Parses the `cardN`-keyed JSON object; a `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
@@ -90,11 +90,29 @@ from `host.InfoWithContext`, and per-OS mainboard/BIOS/DIMM detail via
 - **macOS** (`system_profiler.go`): `system_profiler` output for mainboard/BIOS
   identity.
 
+Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
+`memory_total_bytes` and `pci_bus_id` — the last three `omitempty`, so a
+consumer can tell "not reported" from "reported blank".
+
+**`pci_bus_id` is a display and disambiguation aid, and deliberately not an
+identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` and is therefore
+NVIDIA-only: `rocm-smi` and `ioreg` report nothing of this form and leave it
+empty rather than inventing an equivalent, so every consumer must render
+without it. It exists because 4×/8× identical cards is the normal AI-server
+build, and of the handles telemetry actually offers — an `index` that can
+renumber across reboots (which is exactly what the GPU-budget rows'
+`expected_uuid`/`expected_name` drift detection exists to catch), an opaque
+`uuid`, and live utilisation, which is not identity at all — the bus id is the
+only one that maps to a physical slot and survives renumbering. Nothing in the
+system matches or keys on it: spec GPU rows, budgets and the whole admission
+arithmetic key on `index`, and making the bus id a second identity would be a
+separate design, not a field addition.
+
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,
 board/chassis UUID, or MAC-address field at all — there is nothing to strip. GPU
-`UUID` is the one identifier-like exception (a device id, not personal/host
-identity).
+`UUID` and `pci_bus_id` are the identifier-like exceptions (device and slot
+addresses, not personal or host identity).
 
 ### 8.2.6 Optional inference-server scraping
 

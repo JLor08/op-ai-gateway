@@ -68,6 +68,10 @@ type GPUInfo struct {
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
 	MemoryTotalBytes int64  `json:"memory_total_bytes"`
+	// PCIBusID is the card's PCI address (NVIDIA only; empty everywhere
+	// else) -- see sample.GPU.PCIBusID for what it is for and, more
+	// importantly, what it is not.
+	PCIBusID string `json:"pci_bus_id,omitempty"`
 }
 
 // Normalize forces non-nil slices so the payload always decodes on the gateway.

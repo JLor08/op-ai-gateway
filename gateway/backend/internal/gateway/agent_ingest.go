@@ -507,6 +507,13 @@ type agentGPUInfo struct {
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
 	MemoryTotalBytes int64  `json:"memory_total_bytes"`
+	// PCIBusID is the card's PCI address (e.g. "00000000:65:00.0"), NVIDIA
+	// only. Additive and optional: an older agent omits it and the field
+	// decodes empty. Display and disambiguation only -- the portal shows it
+	// to tell 4x/8x identical cards apart, and nothing in this codebase
+	// matches or keys on it (GPU identity is the index; see the agent's
+	// sample.GPU.PCIBusID).
+	PCIBusID string `json:"pci_bus_id,omitempty"`
 }
 
 // errAgentSystemReportInvalid: the system-report payload failed to parse (POST ->
@@ -861,6 +868,7 @@ func sanitizeSystemReport(r *agentSystemReport, now time.Time) ([]byte, time.Tim
 		r.GPUs[i].Name = clampHardwareString(r.GPUs[i].Name)
 		r.GPUs[i].UUID = clampHardwareString(r.GPUs[i].UUID)
 		r.GPUs[i].DriverVersion = clampHardwareString(r.GPUs[i].DriverVersion)
+		r.GPUs[i].PCIBusID = clampHardwareString(r.GPUs[i].PCIBusID)
 		r.GPUs[i].Index = nonNegI(r.GPUs[i].Index)
 		r.GPUs[i].MemoryTotalBytes = nonNegI64(r.GPUs[i].MemoryTotalBytes)
 	}

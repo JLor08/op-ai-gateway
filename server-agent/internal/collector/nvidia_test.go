@@ -4,9 +4,12 @@
 package collector
 
 import (
+	"encoding/json"
+	"op-ai-server-agent/internal/sample"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -262,5 +265,107 @@ func TestNewNvidiaComputeAppsNilWithoutBinary(t *testing.T) {
 	}
 	if f := NewNvidiaComputeApps(); f != nil {
 		t.Fatal("NewNvidiaComputeApps() = non-nil without nvidia-smi on PATH, want nil")
+	}
+}
+
+// TestNvidiaQueryFieldsColumnOrder makes the contract between the query and
+// the parser machine-checked instead of a comment.
+//
+// nvidiaQueryFields and parseNvidiaCSV's positional parts[N] indices are two
+// halves of one thing, and the failure mode of getting them out of step is the
+// worst kind: INSERTING a column shifts every field after it, so each reads
+// its neighbour's data -- a power draw parsed as a temperature, a UUID stored
+// as a name -- and nothing errors, because every value is still a well-formed
+// string. Only the numbers are wrong, on production hosts, silently.
+//
+// So the rule is append-only, and this pins it: adding a field at the end
+// leaves this list's prefix intact and the test passes with one line added,
+// while inserting anywhere else fails here rather than in the field.
+func TestNvidiaQueryFieldsColumnOrder(t *testing.T) {
+	want := []string{
+		"index",           // parts[0]
+		"name",            // parts[1]
+		"uuid",            // parts[2]
+		"utilization.gpu", // parts[3]
+		"memory.used",     // parts[4]
+		"memory.total",    // parts[5]
+		"temperature.gpu", // parts[6]
+		"power.draw",      // parts[7]
+		"fan.speed",       // parts[8]
+		"driver_version",  // parts[9],  behind len >= 10
+		"pci.bus_id",      // parts[10], behind len >= 11
+	}
+	got := strings.Split(nvidiaQueryFields, ",")
+	if len(got) != len(want) {
+		t.Fatalf("nvidiaQueryFields has %d columns, want %d -- if you APPENDED a field, add it to `want` (and give it a length-guarded parts[N] in parseNvidiaCSV); if you INSERTED one, do not: every later column now reads its neighbour's value with no error anywhere", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("nvidiaQueryFields column %d = %q, want %q -- the query and parseNvidiaCSV's parts[%d] have gone out of step", i, got[i], want[i], i)
+		}
+	}
+
+	// The measurer's own list is deliberately independent and must not drift
+	// along with the one above: it has a different parser
+	// (parseNvidiaGPUIndexCSV) and is kept minimal on purpose.
+	if nvidiaGPUIndexFields != "index,uuid" {
+		t.Fatalf("nvidiaGPUIndexFields = %q, want it left minimal at \"index,uuid\" -- it feeds a different parser", nvidiaGPUIndexFields)
+	}
+}
+
+// TestParseNvidiaCSVCapturesPCIBusID: the appended 11th column. The value's
+// own form matters here -- "00000000:65:00.0" is colon- and dot-separated, so
+// it survives the comma split this parser is built on.
+func TestParseNvidiaCSVCapturesPCIBusID(t *testing.T) {
+	data := []byte("0, RTX 4090, GPU-uuid-0, 55, 8000, 24000, 61, 300, 45, 550.54.15, 00000000:65:00.0\n")
+	gpus, err := parseNvidiaCSV(data)
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("parse = %v err=%v", gpus, err)
+	}
+	if gpus[0].PCIBusID != "00000000:65:00.0" {
+		t.Fatalf("pci_bus_id = %q, want 00000000:65:00.0", gpus[0].PCIBusID)
+	}
+	// Every earlier column must be exactly where it was: this is the
+	// append-not-insert guarantee observed end to end.
+	if gpus[0].DriverVersion != "550.54.15" || gpus[0].Name != "RTX 4090" || gpus[0].TempC != 61 || gpus[0].PowerW != 300 {
+		t.Fatalf("appending pci.bus_id shifted an earlier column: %+v", gpus[0])
+	}
+}
+
+// TestParseNvidiaCSVBackCompatTenFieldsNoPCIBusID: a driver that does not
+// report pci.bus_id yields a 10-field row, which must still parse with the bus
+// id EMPTY -- not drop the GPU, and not shift anything.
+func TestParseNvidiaCSVBackCompatTenFieldsNoPCIBusID(t *testing.T) {
+	data := []byte("0, RTX 4090, GPU-uuid-0, 55, 8000, 24000, 61, 300, 45, 550.54.15\n")
+	gpus, err := parseNvidiaCSV(data)
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("parse = %v err=%v", gpus, err)
+	}
+	if gpus[0].PCIBusID != "" {
+		t.Fatalf("pci_bus_id = %q, want empty", gpus[0].PCIBusID)
+	}
+	if gpus[0].DriverVersion != "550.54.15" {
+		t.Fatalf("driver_version = %q, want 550.54.15", gpus[0].DriverVersion)
+	}
+}
+
+// TestGPUInfoOmitsEmptyPCIBusID: an AMD, Apple or GPU-less host reports no bus
+// id, and the wire must OMIT the key rather than send an empty string -- the
+// same rule driver_version and uuid already follow, so a consumer can tell
+// "not reported" from "reported as blank".
+func TestGPUInfoOmitsEmptyPCIBusID(t *testing.T) {
+	withBus, err := json.Marshal(sample.GPUInfo{Index: 0, Name: "RTX 4090", PCIBusID: "00000000:65:00.0"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(withBus), `"pci_bus_id":"00000000:65:00.0"`) {
+		t.Fatalf("GPUInfo with a bus id marshalled as %s", withBus)
+	}
+	without, err := json.Marshal(sample.GPUInfo{Index: 0, Name: "Radeon Pro"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(without), "pci_bus_id") {
+		t.Fatalf("GPUInfo without a bus id marshalled as %s, want the key omitted entirely", without)
 	}
 }

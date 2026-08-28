@@ -146,11 +146,27 @@ type Net struct {
 }
 
 // GPU is one GPU's metrics.
+//
+// PCIBusID follows DriverVersion's established path exactly: both are
+// unchanging identity, not metrics, so both are collected here (this is the
+// GPU collectors' own output type), both carry omitempty, and both reach the
+// gateway through the static hardware report (CollectHardware -> GPUInfo)
+// rather than through the per-second telemetry mirror, which decodes neither.
 type GPU struct {
-	Index         int     `json:"index"`
-	Name          string  `json:"name"`
-	UUID          string  `json:"uuid"`
-	DriverVersion string  `json:"driver_version,omitempty"`
+	Index         int    `json:"index"`
+	Name          string `json:"name"`
+	UUID          string `json:"uuid"`
+	DriverVersion string `json:"driver_version,omitempty"`
+	// PCIBusID is the card's PCI address, e.g. "00000000:65:00.0". NVIDIA
+	// only -- rocm-smi and ioreg report nothing of this form and must leave
+	// it empty rather than inventing an equivalent. It is a DISPLAY and
+	// disambiguation aid: on the 4x/8x identical-card hosts that are the
+	// normal AI-server build it is the one handle that maps to a physical
+	// slot and survives the index renumbering across reboots that
+	// expected_uuid/expected_name drift detection exists to catch. It is
+	// deliberately NOT an identity: admission, budgets and spec GPU rows all
+	// key on the index, and nothing matches on this field.
+	PCIBusID      string  `json:"pci_bus_id,omitempty"`
 	UtilPct       float64 `json:"util_pct"`
 	MemUsedBytes  int64   `json:"mem_used_bytes"`
 	MemTotalBytes int64   `json:"mem_total_bytes"`
