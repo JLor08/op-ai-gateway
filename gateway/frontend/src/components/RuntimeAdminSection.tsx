@@ -492,6 +492,177 @@ function formatArgsText(args: string[]): string {
   return args.join('\n');
 }
 
+/**
+ * A whitespace-separated token shaped like a command-line FLAG: one or two
+ * leading dashes followed by a LETTER.
+ *
+ * Deliberately narrower than "starts with a dash", because a legitimate
+ * argument VALUE is routinely full of tokens that merely do:
+ *   - a Jinja chat template's whitespace-control markers -- "{%- if x -%}"
+ *     alone yields "-%}", and a real template yields a dozen of them;
+ *   - a negative number or sentinel ("-1", "-inf") -- no letter follows;
+ *   - a horizontal rule or a dash run inside a system-prompt value ("---").
+ * Requiring a letter after the dashes leaves every one of those alone, which
+ * is what keeps the check below off correct input.
+ */
+const flagTokenPattern = /^--?[A-Za-z]/;
+
+/**
+ * Whether ONE argument -- i.e. one line of the textarea -- looks like a whole
+ * command line pasted onto it rather than a single argv element.
+ *
+ * The signal is deliberately NOT "contains whitespace": an argument may
+ * legitimately contain some, and often must -- a Windows model path
+ * ("C:\Program Files\models\x.gguf"), a chat template, a system prompt. What
+ * a pasted command line has and a value does not is TWO OR MORE flag-shaped
+ * tokens separated by whitespace ("--port 50395 --mmproj C:\...\mmproj.gguf"),
+ * for which there is no reading as a single argv element. One flag plus a
+ * value ("--port 50395") is deliberately NOT enough on its own: "--opt=a b"
+ * and "-p some prompt text" are shapes a foreign CLI may genuinely define.
+ */
+function looksLikePastedCommandLine(arg: string): boolean {
+  if (!/\s/.test(arg)) return false;
+  return arg.split(/\s+/).filter((token) => flagTokenPattern.test(token)).length > 1;
+}
+
+// The port flag in the three spellings an operator writes it: alone (value on
+// the next line), "--port=50395", and "--port 50395" squeezed onto one line.
+// Only that EXACT name -- never "--rpc-port" or another "*-port", which name a
+// DIFFERENT endpoint that a spec may legitimately pin to a fixed number.
+const portFlagPattern = /^--?port(?:[=\s]+(\S+))?$/i;
+
+// A bare, in-range TCP port: what a hard-coded `--port` value looks like, and
+// what "${PORT}" deliberately is not.
+function isLiteralPort(value: string): boolean {
+  if (!/^\d{1,5}$/.test(value)) return false;
+  const port = Number(value);
+  return port > 0 && port <= 65535;
+}
+
+/**
+ * The literal port a spec pins on its command line, or null.
+ *
+ * Scoped to a port-NAMING flag rather than "an argument that is a number":
+ * "--ctx-size 32768", "-ngl 99" and "--threads 8" are all bare numbers in the
+ * same range, so the number alone carries no signal at all.
+ */
+function findHardcodedPort(args: string[]): string | null {
+  for (let i = 0; i < args.length; i += 1) {
+    const match = portFlagPattern.exec(args[i].trim());
+    if (!match) continue;
+    const value = (match[1] ?? args[i + 1] ?? '').trim();
+    if (isLiteralPort(value)) return value;
+  }
+  return null;
+}
+
+// A pasted command line is long; 60 characters is enough for the operator to
+// recognise WHICH line the warning means without pushing the panel sideways.
+function argExcerpt(arg: string): string {
+  const trimmed = arg.trim();
+  return trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed;
+}
+
+// Whitespace the operator cannot see, made visible. Applied ONLY to a
+// leading/trailing run, never to the whole argument: a Windows path's internal
+// spaces are correct and dotting them would bury the one space that is not.
+function visualiseWhitespaceRun(run: string): string {
+  return run.replace(/[\s\S]/g, (ch) => (ch === '\t' ? '→' : '·'));
+}
+
+// The offending argument as ONE display line: "3: ·--model·". The core keeps
+// its real characters (so the operator can recognise the line) but is elided
+// in the MIDDLE when long -- eliding the tail would drop the trailing marker,
+// which is the entire thing being pointed at.
+function whitespaceDetailLine(arg: string, lineNumber: number): string {
+  const leadLength = arg.length - arg.trimStart().length;
+  const tailLength = arg.length - arg.trimEnd().length;
+  const core = arg.slice(leadLength, arg.length - tailLength);
+  const shownCore =
+    core.length > 48 ? `${core.slice(0, 24)}…${core.slice(core.length - 24)}` : core;
+  const lead = visualiseWhitespaceRun(arg.slice(0, leadLength));
+  const tail = visualiseWhitespaceRun(arg.slice(arg.length - tailLength));
+  return `${lineNumber}: ${lead}${shownCore}${tail}`;
+}
+
+// A line the operator would read as empty but that IS an argument, made of
+// whitespace. Rendered whole, since there is no core to keep.
+function blankDetailLine(arg: string, lineNumber: number): string {
+  return `${lineNumber}: ${visualiseWhitespaceRun(arg)}`;
+}
+
+type ArgsWarning = { key: string; message: string; detail?: string };
+
+/**
+ * The two argument shapes that are almost certainly a mistake, reported live
+ * under the field as the operator types.
+ *
+ * These WARN and never block the save, unlike the placeholder mirror below --
+ * and the difference is the point, not an oversight. `findPlaceholderViolation`
+ * restates a rule the AGENT itself enforces: a spec that trips it provably
+ * cannot start, so refusing it in the form forecloses nothing. These two are
+ * guesses about INTENT over a field whose legitimate contents are arbitrary
+ * strings from a foreign program's CLI. A heuristic that refuses is a wall with
+ * no way around it for the one operator whose legitimate value trips it (a
+ * system-prompt value quoting two flags would), and this form has no "save
+ * anyway". A live warning costs that operator one ignored sentence, and still
+ * reaches the operator who pasted a command line -- at paste time, which is
+ * earlier than a submit-time refusal could manage.
+ */
+function collectArgsWarnings(args: string[], listenPort: number, t: Translation): ArgsWarning[] {
+  const warnings: ArgsWarning[] = [];
+  const pasted = args.find(looksLikePastedCommandLine);
+  if (pasted !== undefined) {
+    warnings.push({
+      key: 'pasted-command-line',
+      message: `${t.runtimeSpecArgsCommandLine}: ${argExcerpt(pasted)}`,
+    });
+  }
+  // Whitespace at an argument's EDGE, split into two facts because they read
+  // differently to the operator and have different remedies. Neither is
+  // trimmed: `parseArgsText` preserves a line verbatim on purpose (an argument
+  // may legitimately be a separator or a formatting string), so the invisible
+  // character is named rather than removed. A line the operator left EMPTY is
+  // not reported at all -- an empty line is at least visible as one, and the
+  // documented round trip already treats it as a deliberate empty argument.
+  const edge: string[] = [];
+  const blank: string[] = [];
+  args.forEach((arg, index) => {
+    if (arg === '' || arg === arg.trim()) return;
+    if (arg.trim() === '') blank.push(blankDetailLine(arg, index + 1));
+    else edge.push(whitespaceDetailLine(arg, index + 1));
+  });
+  if (edge.length > 0) {
+    warnings.push({
+      key: 'edge-whitespace',
+      message: t.runtimeSpecArgsEdgeWhitespace,
+      detail: edge.join('\n'),
+    });
+  }
+  if (blank.length > 0) {
+    warnings.push({
+      key: 'blank-line',
+      message: t.runtimeSpecArgsBlankLine,
+      detail: blank.join('\n'),
+    });
+  }
+  // Only while the AGENT owns the port: a `listen_port` of 0 makes it grab an
+  // ephemeral one and route there (server-agent internal/runtime/manager.go
+  // startProcess), so a literal in the args puts the child somewhere the health
+  // probe never looks. With a listen port set, the same literal is at worst
+  // redundant, so there is nothing to say.
+  if (listenPort === 0) {
+    const port = findHardcodedPort(args);
+    if (port !== null) {
+      warnings.push({
+        key: 'hardcoded-port',
+        message: `${t.runtimeSpecArgsHardcodedPort}: ${port}`,
+      });
+    }
+  }
+  return warnings;
+}
+
 // A "${...}" occurrence's classification, ported line-for-line from
 // server-agent/internal/runtime/policy_local.go's ExpandPlaceholders -- see
 // that file for the full rationale. Both an argument string and an env
@@ -2521,6 +2692,10 @@ export function RuntimeAdminSection({
   // matching the rest of the portal's drill-down/sub-view convention.
   if (specMode !== 'list') {
     const editing = specMode !== 'create';
+    // Recomputed on every keystroke on purpose: the whole defect being fixed
+    // is that the field's contract was invisible until a foreign program
+    // rejected it, so the feedback has to land at paste time, not at submit.
+    const argsWarnings = collectArgsWarnings(parseArgsText(argsText), listenPort, t);
     return (
       <>
         <Breadcrumbs
@@ -2595,7 +2770,46 @@ export function RuntimeAdminSection({
               onChange={(e) => setArgsText(e.target.value)}
               multiline
               minRows={3}
+              // The rule stated, then SHOWN: the sentence alone never conveyed
+              // that a flag and its value are two lines, and the example is
+              // also where "${PORT}, not a number" becomes concrete.
+              helperText={
+                <>
+                  {t.runtimeSpecArgsHint}
+                  <Box
+                    component="span"
+                    sx={{
+                      display: 'block',
+                      mt: 0.5,
+                      fontFamily: 'monospace',
+                      whiteSpace: 'pre',
+                      overflowX: 'auto',
+                    }}
+                  >
+                    {t.runtimeSpecArgsExample}
+                  </Box>
+                </>
+              }
             />
+            {argsWarnings.map((warning) => (
+              <Alert key={warning.key} severity="warning" sx={{ mt: -1 }}>
+                {warning.message}
+                {warning.detail !== undefined && (
+                  <Box
+                    component="span"
+                    sx={{
+                      display: 'block',
+                      mt: 0.5,
+                      fontFamily: 'monospace',
+                      whiteSpace: 'pre',
+                      overflowX: 'auto',
+                    }}
+                  >
+                    {warning.detail}
+                  </Box>
+                )}
+              </Alert>
+            ))}
             <Field
               id="runtime-spec-env"
               label={t.runtimeSpecEnv}

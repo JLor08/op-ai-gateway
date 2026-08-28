@@ -918,6 +918,211 @@ describe('RuntimeAdminSection placeholder validation (mirrors the agent policy)'
   });
 });
 
+// The arguments field's contract -- ONE argument per line, a flag and its
+// value on two lines -- used to be stated nowhere at all: its label read
+// "Arguments" and nothing else. An operator pasted a whole llama-server
+// command line onto one line, the parser (correctly) made that one argv
+// element, and the first explanation they got was llama-server's own
+// `error: invalid argument: --port 50395 --mmproj C:\... -m C:\... --temp 1.0`
+// -- a foreign program's rejection that cannot possibly explain OUR rule.
+//
+// These tests pin the three signals that replace that experience, and, just as
+// importantly, pin what they must NOT fire on: the detection separates "looks
+// like a whole command line" from "contains a space", and only the first is
+// safe to act on, because a legitimate argument value contains spaces all the
+// time (a Windows path, a chat template, a prompt fragment).
+describe('RuntimeAdminSection arguments field contract (hint + warnings)', () => {
+  async function openCreateForm() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+  }
+
+  function setArgs(value: string) {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), { target: { value } });
+  }
+
+  // The example is multi-line by nature, and testing-library's default
+  // normalizer collapses whitespace -- which would erase exactly the property
+  // under test. Compare the text node verbatim instead.
+  const verbatim = { normalizer: (s: string) => s };
+
+  it('states the one-token-per-line rule under the field and SHOWS it as an example', async () => {
+    renderSection();
+    await openCreateForm();
+
+    expect(screen.getByText(t.runtimeSpecArgsHint)).toBeInTheDocument();
+    // The example is the load-bearing half: a flag and its value on separate
+    // lines, ${PORT} rather than a number, and a path whose internal spaces do
+    // NOT split it.
+    const example = screen.getByText(t.runtimeSpecArgsExample, verbatim);
+    expect(example).toBeInTheDocument();
+    expect(example.textContent).toBe(
+      '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+    );
+  });
+
+  it('warns when a whole command line is pasted onto one line, naming the line', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs(
+      '--port 50395 --mmproj C:\\models\\mmproj-BF16.gguf -m C:\\models\\Qwen3.8-27B-UD-Q4-K-XL.gguf --temp 1.0',
+    );
+
+    const warning = await screen.findByText(t.runtimeSpecArgsCommandLine, { exact: false });
+    expect(warning.textContent).toContain('--port 50395 --mmproj');
+  });
+
+  it('warns rather than refuses: the pasted line still saves if the operator insists', async () => {
+    const { created, putSpecs } = renderSection();
+    await openCreateForm();
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    setArgs('--port 50395 --mmproj C:\\models\\mmproj-BF16.gguf');
+    expect(
+      await screen.findByText(t.runtimeSpecArgsCommandLine, { exact: false }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(created).toHaveLength(1);
+    expect(putSpecs[0].body.args).toEqual(['--port 50395 --mmproj C:\\models\\mmproj-BF16.gguf']);
+  });
+
+  it('does NOT warn about a Windows model path whose spaces are part of the value', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('-m\nC:\\Program Files\\models\\Qwen3 27B UD-Q4-K-XL.gguf');
+
+    expect(screen.queryByText(t.runtimeSpecArgsCommandLine, { exact: false })).toBeNull();
+  });
+
+  it('does NOT warn about a chat template full of dash-prefixed tokens', async () => {
+    renderSection();
+    await openCreateForm();
+    // Jinja whitespace-control markers: `-%}` twice over, plus a leading `{%-`.
+    // A naive "more than one token starting with a dash" rule fires on this;
+    // requiring a LETTER after the dashes is what keeps it off correct input.
+    setArgs('--chat-template\n{%- for m in messages -%}{{ m.content }}{%- endfor -%}');
+
+    expect(screen.queryByText(t.runtimeSpecArgsCommandLine, { exact: false })).toBeNull();
+  });
+
+  it('warns about a hard-coded --port while the agent is the one assigning it', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--port\n50395');
+
+    const warning = await screen.findByText(t.runtimeSpecArgsHardcodedPort, { exact: false });
+    expect(warning.textContent).toContain('50395');
+  });
+
+  it('does NOT warn when the port argument is ${PORT}', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--port\n${PORT}');
+
+    expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
+  });
+
+  it('does NOT warn about literal numbers in unrelated arguments', async () => {
+    renderSection();
+    await openCreateForm();
+    // Every one of these is a bare in-range number: the NUMBER carries no
+    // signal, only a port-naming flag in front of it does.
+    setArgs('--ctx-size\n32768\n-ngl\n99\n--threads\n8080\n--port\n${PORT}');
+
+    expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
+  });
+
+  it('does NOT warn about a literal --port once the listen port is pinned to it', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--port\n50395');
+    expect(
+      await screen.findByText(t.runtimeSpecArgsHardcodedPort, { exact: false }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecListenPort), {
+      target: { value: '50395' },
+    });
+
+    expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
+  });
+
+  // Round 2, same operator: with the arguments split correctly, the next
+  // failure was `error while handling argument "--chat-template-file": error:
+  // failed to open file 'C:\llama-swap\chat-template.jinja'` -- a trailing
+  // space left behind by the paste, invisible in the field, indistinguishable
+  // from a missing file.
+  it('makes an invisible trailing space visible, naming the line and marking the space', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--chat-template-file\nC:\\llama-swap\\chat-template.jinja ');
+
+    const warning = await screen.findByText(t.runtimeSpecArgsEdgeWhitespace, { exact: false });
+    const detail = screen.getByText('2: C:\\llama-swap\\chat-template.jinja·', verbatim);
+    expect(warning).toBeInTheDocument();
+    expect(detail).toBeInTheDocument();
+  });
+
+  it('flags leading whitespace too, on the line it is actually on', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--alias\n  qwen3-27b');
+
+    expect(
+      await screen.findByText(t.runtimeSpecArgsEdgeWhitespace, { exact: false }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('2: ··qwen3-27b', verbatim)).toBeInTheDocument();
+  });
+
+  it('reports a whitespace-only line as its own case, not as an edge-space one', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--alias\n \nqwen3-27b');
+
+    expect(
+      await screen.findByText(t.runtimeSpecArgsBlankLine, { exact: false }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('2: ·', verbatim)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecArgsEdgeWhitespace, { exact: false })).toBeNull();
+  });
+
+  it('flags meaningful trailing whitespace but never rewrites or blocks it', async () => {
+    const { putSpecs } = renderSection();
+    await openCreateForm();
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    // A reverse-prompt whose trailing space is the whole point of the value.
+    setArgs('--reverse-prompt\nUser: ');
+    expect(
+      await screen.findByText(t.runtimeSpecArgsEdgeWhitespace, { exact: false }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['--reverse-prompt', 'User: ']);
+  });
+
+  it('says nothing at all about a correctly written argument list', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3 27B.gguf\n--ctx-size\n32768');
+
+    expect(screen.queryByText(t.runtimeSpecArgsCommandLine, { exact: false })).toBeNull();
+    expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
+    expect(screen.queryByText(t.runtimeSpecArgsEdgeWhitespace, { exact: false })).toBeNull();
+    expect(screen.queryByText(t.runtimeSpecArgsBlankLine, { exact: false })).toBeNull();
+  });
+});
+
 // Review round 2, Important 2/3: a load -> open edit -> save WITHOUT any
 // change must be a no-op on the wire. Filtering "blank-looking" arg lines or
 // trimming env values would silently rewrite the spec on every untouched

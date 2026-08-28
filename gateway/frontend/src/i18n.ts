@@ -550,6 +550,17 @@ const de = {
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
     'Ungültiger Platzhalter (gemeint ist vermutlich ${PORT} oder ${AGENT_ENV:NAME})',
+  runtimeSpecArgsHint:
+    'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
+  runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsCommandLine:
+    'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
+  runtimeSpecArgsHardcodedPort:
+    'Der Listen-Port steht auf 0, der Agent vergibt den Port also selbst und prüft genau diesen. Ein fest eingetragener Port lässt den Prozess woanders lauschen, der Health-Check schlägt fehl und der Start wird als fehlgeschlagen verbucht. Statt der Zahl ${PORT} eintragen – oder den Listen-Port oben auf diesen Wert setzen',
+  runtimeSpecArgsEdgeWhitespace:
+    'Diese Zeilen beginnen oder enden mit einem Leerzeichen. Im Feld ist das unsichtbar, im Wert steht es trotzdem: Ein Dateiname endet dann auf ein Leerzeichen, die Datei wird nicht gefunden, und die Meldung sieht genauso aus, als fehle sie. Wenn das Leerzeichen gewollt ist, bitte so lassen – sonst entfernen. Unten mit · (Leerzeichen) und → (Tabulator) markiert:',
+  runtimeSpecArgsBlankLine:
+    'Diese Zeilen bestehen nur aus Leerzeichen. Sie werden nicht übersprungen, sondern unverändert als Argument übergeben – als Argument aus Leerzeichen. Wenn das gewollt ist, bitte so lassen – sonst die Zeile leeren oder löschen. Unten mit · (Leerzeichen) und → (Tabulator) markiert:',
   runtimeSpecPartialFailure:
     'Die Modell-Zuordnung wurde gespeichert, die Spezifikation jedoch nicht',
   runtimeAreaPlaceholder: 'Dieser Bereich wird in einem folgenden Ausbauschritt ergänzt.',
@@ -2395,6 +2406,17 @@ const en: PortalMessages = {
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
     'Invalid placeholder (likely meant to be ${PORT} or ${AGENT_ENV:NAME})',
+  runtimeSpecArgsHint:
+    'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
+  runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsCommandLine:
+    'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
+  runtimeSpecArgsHardcodedPort:
+    'The listen port is 0, so the agent assigns the port itself and probes exactly that one. A hard-coded port leaves the process listening somewhere else, the health check fails, and the start is recorded as failed. Use ${PORT} instead of the number — or set the listen port above to this value',
+  runtimeSpecArgsEdgeWhitespace:
+    'These lines start or end with a space. The field cannot show it, but the value carries it: a file name then ends in a space, the file is not found, and the message reads exactly as if it were missing. If the space is deliberate, leave it — otherwise remove it. Marked below with · (space) and → (tab):',
+  runtimeSpecArgsBlankLine:
+    'These lines are nothing but whitespace. They are not skipped — each is handed over verbatim as an argument made of spaces. If that is deliberate, leave it — otherwise empty the line or delete it. Marked below with · (space) and → (tab):',
   runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
   runtimeAreaPlaceholder: 'This area will be added in a later rollout step.',
   runtimeStatusUnknown: 'Unknown',

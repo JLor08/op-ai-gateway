@@ -2059,3 +2059,43 @@ describe('agent-managed runtime i18n keys (task 22b, batch C)', () => {
     }
   });
 });
+
+describe('runtime-spec arguments-field i18n keys', () => {
+  it('defines the args hint, example and the three warning texts in de and en', () => {
+    const keys = [
+      // The contract the field never stated: one argument per line, a flag and
+      // its value on two lines.
+      'runtimeSpecArgsHint',
+      'runtimeSpecArgsExample',
+      // A whole command line pasted onto one line.
+      'runtimeSpecArgsCommandLine',
+      // A hard-coded port while `listen_port` is 0 and the agent owns it.
+      'runtimeSpecArgsHardcodedPort',
+      // Whitespace at an argument's edge, and a line that is only whitespace.
+      'runtimeSpecArgsEdgeWhitespace',
+      'runtimeSpecArgsBlankLine',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The example is the half that teaches the rule, so its SHAPE is the
+  // assertion: separate lines for a flag and its value, ${PORT} rather than a
+  // number, and a path whose internal spaces do not split it.
+  it('keeps the example one-token-per-line in both locales', () => {
+    for (const example of [
+      messages.de.runtimeSpecArgsExample,
+      messages.en.runtimeSpecArgsExample,
+    ]) {
+      const lines = example.split('\n');
+      expect(lines.length).toBeGreaterThanOrEqual(3);
+      expect(lines[0]).toBe('--port');
+      expect(lines[1]).toBe('${PORT}');
+      expect(lines.some((line) => line.includes(' ') && !line.startsWith('-'))).toBe(true);
+    }
+  });
+});

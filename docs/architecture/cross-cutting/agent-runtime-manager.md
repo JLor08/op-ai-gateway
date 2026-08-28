@@ -1847,6 +1847,32 @@ that **a trailing empty argument is unrepresentable**: `['--foo','','--bar','']`
 re-saved without editing becomes `['--foo','','--bar']`. An internal blank
 survives; a trailing one does not.
 
+That rule is correct and is **not** softened with quoting rules, but it used to
+be stated **nowhere**: the field's label read `Arguments` and nothing else, so
+the first thing an operator learned about it was the model server's own
+rejection of the whole pasted command line as one invalid argument — a foreign
+program's error that cannot explain our rule. The field therefore carries the
+rule *and an example that shows it* (a flag and its value on two lines, `${PORT}`
+rather than a number, a Windows path whose internal spaces do not split it), plus
+three live signals rendered under it as the operator types:
+
+| Signal | Fires when | Deliberately does **not** fire on |
+|---|---|---|
+| Pasted command line | one argument holds **two or more flag-shaped tokens** (`-`/`--` then a *letter*) separated by whitespace | a value that merely contains a space (Windows path, chat template, prompt), or dash-prefixed tokens without a letter (Jinja `-%}`, `-1`, `---`) |
+| Hard-coded port | `listen_port` is 0 **and** a `--port`/`-port` flag carries a literal 1–65535 | a bare number after any other flag (`--ctx-size 32768`, `-ngl 99`), `${PORT}`, `--rpc-port`, or any literal once `listen_port` is pinned |
+| Edge whitespace | an argument starts or ends with whitespace (reported separately from a whitespace-**only** line), rendered with `·`/`→` and the line number | an argument the operator left genuinely empty |
+
+All three **warn and never block the save**, and that is the load-bearing
+difference from the placeholder mirror above it. The mirror restates a rule the
+agent itself enforces, so a spec that trips it provably cannot start and
+refusing costs nothing. These three are guesses about *intent* over a field
+whose legitimate contents are arbitrary strings from a foreign CLI: a heuristic
+that refuses is a wall with no way around it for the one operator whose
+legitimate value trips it, and this form has no "save anyway". For the same
+reason the whitespace signal **names** the invisible character rather than
+trimming it — silently rewriting what the operator typed would turn a visible
+bug into an invisible one, and `parseArgsText` keeps its verbatim contract.
+
 The form mirrors the agent's placeholder policy client-side at save time, and the
 mirror is **additive safety, not a backend contract** — the gateway's spec PUT
 validates env *keys* only, so a reserved base name and `${AGENT_ENV:OP_AGENT_*}`
