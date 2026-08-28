@@ -677,9 +677,13 @@ test("5 — admission arithmetic: with a budget for one, an inference for B evic
   // triangle holds exactly one cell, so this locator is unambiguous without
   // depending on which spec the matrix happens to render as row vs column.
   await openRuntimeTab(t.runtimeMatrix);
-  const cell = page.getByRole("button", { name: new RegExp(`^${escapeRegExp(t.runtimeMatrixCell)}: `) });
+  // role=checkbox, not button: the cell is a real Checkbox. It was an
+  // IconButton with aria-pressed until the off state was made readable as
+  // "you may tick this" rather than as a prohibition, and this locator was
+  // not updated with it -- CI runs no Playwright suite, so nothing caught it.
+  const cell = page.getByRole("checkbox", { name: new RegExp(`^${escapeRegExp(t.runtimeMatrixCell)}: `) });
   await expect(cell).toHaveCount(1);
-  await expect(cell).toHaveAttribute("aria-pressed", "false");
+  await expect(cell).not.toBeChecked();
   const [paired] = await Promise.all([
     page.waitForResponse(
       (r) =>
@@ -689,7 +693,7 @@ test("5 — admission arithmetic: with a budget for one, an inference for B evic
     cell.click()
   ]);
   expect(paired.ok(), `allowing the co-residency pair: ${paired.status()} ${await paired.text()}`).toBe(true);
-  await expect(cell).toHaveAttribute("aria-pressed", "true");
+  await expect(cell).toBeChecked();
 
   // 700 + 700 > 1000: exactly one of the two may hold GPU 0. Each round drives
   // BOTH inferences, so whichever spec is currently stopped genuinely goes
