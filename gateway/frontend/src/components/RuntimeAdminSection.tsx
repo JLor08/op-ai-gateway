@@ -135,11 +135,12 @@ type GpuRow = {
   vramMeasuredMb: number;
 };
 
-// The sole warning code RuntimeWarnings emits today (see
+// The warning codes RuntimeWarnings emits today (see
 // gateway/backend/internal/portal/service_runtime.go); an unmapped future
 // code falls back to its raw wire value rather than a misleading label.
 const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   timeout_ms_below_startup_timeout: 'runtimeTimeoutWarning',
+  binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
 };
 
 // admin_state's three valid wire values (service_runtime.go): "" (no

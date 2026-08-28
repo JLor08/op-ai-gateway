@@ -513,6 +513,8 @@ const de = {
     'Diese Runtime-Spezifikationen liegen im Gateway (Reiter „Runtime-Spezifikationen“ dieser Anwendung) und haben keine Wirkung, solange der Agent seine Prozesse aus seiner eigenen lokalen Datei verwaltet. Sie werden nicht gelöscht und greifen wieder, sobald die Konfigurationsquelle des Agenten zurück auf „Gateway“ gestellt wird. Im Datei-Modus sind sie hier weder einsehbar noch bearbeitbar.',
   runtimeTimeoutWarning:
     'Das Anwendungs-Timeout ist kürzer als der längste Start-Timeout einer aktivierten Spezifikation; ein kalter Modellstart schlägt dadurch fehl.',
+  runtimeBinaryPathOsMismatchWarning:
+    'Mindestens ein Programmpfad passt nicht zum Betriebssystem, das der Agent dieses Servers meldet (z. B. ein Windows-Pfad wie „C:\\…“ auf einem Linux-Server oder umgekehrt). Der Agent wird den Prozess ablehnen. Der Pfad wird nicht blockiert – gemeldet wird nur, was die Telemetrie hergibt.',
   runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
   runtimeSpecCreate: 'Spezifikation anlegen',
   runtimeSpecEditAction: 'Bearbeiten',
@@ -788,7 +790,8 @@ const de = {
   errorMappingGatewayNameConflict: 'Gateway-Modellname existiert bereits auf diesem Server',
   errorMappingStatusInvalid: 'Ungültiger Zuordnungsstatus',
   errorRuntimeSpecNotFound: 'Runtime-Spezifikation nicht gefunden',
-  errorRuntimeSpecBinaryRequired: 'Programmpfad ist erforderlich und muss absolut sein',
+  errorRuntimeSpecBinaryRequired:
+    'Programmpfad ist erforderlich und muss ein absoluter Pfad des Zielsystems sein (z. B. /opt/llama/llama-server oder C:\\llama\\llama-server.exe)',
   errorRuntimeSpecArgsInvalid: 'Ungültige Argumente',
   errorRuntimeSpecEnvInvalid: 'Ungültige Umgebungsvariablen',
   errorRuntimeSpecGpuInvalid: 'Ungültige GPU-Konfiguration',
@@ -2350,6 +2353,8 @@ const en: PortalMessages = {
     'These runtime specs live in the gateway (the "Runtime specs" tab of this application) and have no effect while the agent manages its processes from its own local file. They are not deleted, and they take effect again as soon as the agent\'s configuration source is switched back to "gateway". While file mode is active they can neither be viewed nor edited here.',
   runtimeTimeoutWarning:
     'The application timeout is shorter than the longest startup timeout among the enabled specs; a cold model start will fail as a result.',
+  runtimeBinaryPathOsMismatchWarning:
+    'At least one binary path does not match the operating system this server\'s agent reports (for example a Windows path like "C:\\…" on a Linux server, or the reverse). The agent will refuse to launch the process. The path is not blocked — this only reports what the telemetry shows.',
   runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
   runtimeSpecCreate: 'Create spec',
   runtimeSpecEditAction: 'Edit',
@@ -2620,7 +2625,8 @@ const en: PortalMessages = {
   errorMappingGatewayNameConflict: 'Gateway model name already exists on this server',
   errorMappingStatusInvalid: 'Invalid mapping status',
   errorRuntimeSpecNotFound: 'Runtime spec not found',
-  errorRuntimeSpecBinaryRequired: 'Binary path is required and must be absolute',
+  errorRuntimeSpecBinaryRequired:
+    'Binary path is required and must be absolute on the target system (for example /opt/llama/llama-server or C:\\llama\\llama-server.exe)',
   errorRuntimeSpecArgsInvalid: 'Invalid arguments',
   errorRuntimeSpecEnvInvalid: 'Invalid environment variables',
   errorRuntimeSpecGpuInvalid: 'Invalid GPU configuration',

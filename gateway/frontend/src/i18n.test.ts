@@ -1843,6 +1843,7 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'runtimeManagedOnlyBanner',
       'runtimeIneffectiveSpecs',
       'runtimeTimeoutWarning',
+      'runtimeBinaryPathOsMismatchWarning',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');

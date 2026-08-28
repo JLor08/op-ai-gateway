@@ -102,6 +102,165 @@ const (
 // rewritten here; see the RuntimeSpecDTO.Env doc below).
 var runtimeSpecEnvKeyPattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
+// --- binary absoluteness: the gateway-side mirror of the agent's check -----
+//
+// THE AUTHORITY IS THE AGENT. `spec.binary` is executed on the AGENT's host,
+// and the agent decides whether it may run at all: LocalPolicy.Permit
+// (server-agent/internal/runtime/policy_local.go) requires
+// `filepath.IsAbs(spec.Binary)` and then an exact match against the agent
+// operator's own allowlist. `filepath.IsAbs` is compiled per-GOOS, so on a
+// windows-amd64/windows-arm64 agent it accepts `C:\llama\llama-server.exe`
+// and rejects `/opt/llama/llama-server`, and the reverse on linux/darwin.
+//
+// What follows is the EARLY-FEEDBACK MIRROR of that rule, nothing more. The
+// gateway is OS-agnostic, cannot execute the path and does not know which
+// GOOS the spec is destined for, so it accepts a path that `filepath.IsAbs`
+// would accept on EITHER platform — its only job is to catch a typo in the
+// portal form instead of letting it fail later as a terminal `not_permitted`
+// on the agent. It is deliberately no laxer than the agent (a spec the
+// portal accepts but the agent refuses is worse than a form error at the
+// point of entry) and no stricter (that is the defect this replaced: a
+// POSIX-only `strings.HasPrefix(binary, "/")` made a Windows AI server
+// impossible to configure at all).
+//
+// The two predicates below — one per platform, kept separate so a reader can
+// see which platform each branch serves instead of meeting one clever
+// combined rule — are transcribed from Go's own implementation
+// (internal/filepathlite.IsAbs + volumeNameLen, which path/filepath.IsAbs
+// delegates to), together with the small helpers those need.
+
+// isAbsPOSIXBinaryPath mirrors filepath.IsAbs as compiled for a unix GOOS,
+// where the whole rule is a leading slash.
+func isAbsPOSIXBinaryPath(path string) bool {
+	return strings.HasPrefix(path, "/")
+}
+
+// isAbsWindowsBinaryPath mirrors filepath.IsAbs as compiled for GOOS
+// windows. Accepted: a drive letter with either separator (`C:\x`, `c:/x`,
+// `C:\`), a UNC share (`\\host\share`, `//host/share/foo`), and the local /
+// root-local device forms (`\\?\c:\x`, `\\.\c:\x`, `\??\c:\x`). Rejected:
+// the two forms that LOOK rooted but are resolved against per-process state
+// Windows will not have here — drive-relative (`C:foo`, `c:`) and
+// root-relative (`\foo`, `/foo`, `\`).
+func isAbsWindowsBinaryPath(path string) bool {
+	volumeLen := windowsVolumeNameLen(path)
+	if volumeLen == 0 {
+		return false
+	}
+	// A volume name starting with two separators is a UNC or device path,
+	// which is always absolute. (volumeLen != 0 guarantees len(path) >= 2.)
+	if isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1]) {
+		return true
+	}
+	path = path[volumeLen:]
+	if path == "" {
+		return false // bare volume: `C:` names the drive's current directory
+	}
+	return isWindowsPathSeparator(path[0])
+}
+
+// isWindowsPathSeparator mirrors os.IsPathSeparator on windows: Windows
+// accepts the forward slash everywhere it accepts the backslash.
+func isWindowsPathSeparator(c byte) bool {
+	return c == '\\' || c == '/'
+}
+
+// windowsVolumeNameLen returns the length of path's leading volume name
+// under Windows rules, or 0 when it has none. Transcription of
+// internal/filepathlite.volumeNameLen (windows build).
+func windowsVolumeNameLen(path string) int {
+	switch {
+	case len(path) >= 2 && path[1] == ':':
+		// A drive letter. Windows itself does not insist the letter be in
+		// A-Z and neither does Go, so neither do we.
+		return 2
+	case len(path) == 0 || !isWindowsPathSeparator(path[0]):
+		return 0
+	case windowsPathHasPrefixFold(path, `\\.\UNC`):
+		// `\\.\UNC\host\share`: host and share count as the volume.
+		return windowsUNCLen(path, len(`\\.\UNC\`))
+	case windowsPathHasPrefixFold(path, `\\.`),
+		windowsPathHasPrefixFold(path, `\\?`),
+		windowsPathHasPrefixFold(path, `\??`):
+		// Local Device (`\\.\`) and Root Local Device (`\\?\`, `\??\`)
+		// paths: the component after the prefix is part of the volume.
+		if len(path) == 3 {
+			return 3
+		}
+		_, rest, ok := cutWindowsPath(path[4:])
+		if !ok {
+			return len(path)
+		}
+		return len(path) - len(rest) - 1
+	case len(path) >= 2 && isWindowsPathSeparator(path[1]):
+		// `\\host\share`: an ordinary UNC path.
+		return windowsUNCLen(path, 2)
+	}
+	return 0
+}
+
+// windowsPathHasPrefixFold reports whether path begins with prefix, ignoring
+// ASCII case and treating `\` and `/` as equivalent. A longer path must
+// continue with a separator, so `\\.foo` does not match prefix `\\.`.
+func windowsPathHasPrefixFold(path, prefix string) bool {
+	if len(path) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if isWindowsPathSeparator(prefix[i]) {
+			if !isWindowsPathSeparator(path[i]) {
+				return false
+			}
+		} else if asciiUpperByte(prefix[i]) != asciiUpperByte(path[i]) {
+			return false
+		}
+	}
+	return len(path) == len(prefix) || isWindowsPathSeparator(path[len(prefix)])
+}
+
+// windowsUNCLen returns the length of a UNC path's volume prefix
+// (`host\share`), where prefixLen is the offset at which the host starts —
+// 2 for `\\host\share`, len(`\\.\UNC\`) for the device spelling.
+func windowsUNCLen(path string, prefixLen int) int {
+	separators := 0
+	for i := prefixLen; i < len(path); i++ {
+		if isWindowsPathSeparator(path[i]) {
+			separators++
+			if separators == 2 {
+				return i
+			}
+		}
+	}
+	return len(path)
+}
+
+// cutWindowsPath slices path around its first path separator.
+func cutWindowsPath(path string) (before, after string, found bool) {
+	for i := 0; i < len(path); i++ {
+		if isWindowsPathSeparator(path[i]) {
+			return path[:i], path[i+1:], true
+		}
+	}
+	return path, "", false
+}
+
+// asciiUpperByte upper-cases one ASCII byte and leaves every other byte
+// alone (Windows path prefixes are ASCII).
+func asciiUpperByte(c byte) byte {
+	if 'a' <= c && c <= 'z' {
+		return c - ('a' - 'A')
+	}
+	return c
+}
+
+// runtimeSpecBinaryIsAbsolute reports whether binary is an absolute path for
+// at least one of the platforms an agent can run on. The empty string is
+// absolute nowhere, so this single check covers both halves of
+// ErrRuntimeSpecBinaryRequired ("required" and "must be absolute").
+func runtimeSpecBinaryIsAbsolute(binary string) bool {
+	return isAbsPOSIXBinaryPath(binary) || isAbsWindowsBinaryPath(binary)
+}
+
 // RuntimeSpecGPUDTO is one per-GPU VRAM demand row on the wire.
 // VRAMEstimateMB is operator-owned (round-tripped from PutRuntimeSpecRequest
 // verbatim); VRAMMeasuredMB is agent-owned and read-only on this API — see
@@ -205,7 +364,10 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	}
 	// Validate everything that can fail BEFORE mutating/persisting anything.
 	binary := strings.TrimSpace(req.Binary)
-	if binary == "" || !strings.HasPrefix(binary, "/") {
+	// Absolute on POSIX *or* on Windows -- the agent's own filepath.IsAbs is
+	// the authority and this is its early-feedback mirror; see
+	// runtimeSpecBinaryIsAbsolute.
+	if !runtimeSpecBinaryIsAbsolute(binary) {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecBinaryRequired
 	}
 	if req.ListenPort < 0 || req.HealthTimeoutSeconds < 0 || req.StartupTimeoutSeconds < 0 ||
@@ -650,20 +812,33 @@ func gpuBudgetDTOs(budgets []routing.ServerGPUBudget) []GPUBudgetDTO {
 	return out
 }
 
-// --- Task 6: runtime timeout warning ----------------------------------------
+// --- Task 6: runtime warnings -----------------------------------------------
 
-// runtimeTimeoutBelowStartupWarning is the sole warning code RuntimeWarnings
-// currently emits: the application's gateway-side upstream deadline
-// (TimeoutMS) keeps running while the agent is still starting a model
-// process, so a TimeoutMS below the slowest enabled spec's startup timeout
-// silently kills every cold start.
+// runtimeTimeoutBelowStartupWarning: the application's gateway-side upstream
+// deadline (TimeoutMS) keeps running while the agent is still starting a
+// model process, so a TimeoutMS below the slowest enabled spec's startup
+// timeout silently kills every cold start.
 const runtimeTimeoutBelowStartupWarning = "timeout_ms_below_startup_timeout"
+
+// runtimeBinaryPathOSMismatchWarning: a spec's binary path is absolute for
+// the OTHER platform than the one this server's agent reports in its
+// telemetry (a `C:\…` path on a linux-reporting server, or a `/…` path on a
+// windows-reporting server). The agent's filepath.IsAbs will refuse it at
+// launch with a terminal not_permitted, so it is worth saying now.
+//
+// Deliberately a WARNING and never a rejection: the reported OS is telemetry,
+// which a freshly created server has none of, and a runtime spec must be
+// configurable before — or entirely independently of — an agent ever checking
+// in. PutRuntimeSpec therefore accepts either platform's absolute form
+// unconditionally (runtimeSpecBinaryIsAbsolute) and this advisory carries the
+// OS knowledge we happen to have.
+const runtimeBinaryPathOSMismatchWarning = "binary_path_os_mismatch"
 
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
 // gates it (404-no-leak). Always a non-nil slice, even when empty.
 func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, appID string) ([]string, error) {
-	app, _, err := s.authorizeApplication(ctx, principal, appID)
+	app, server, err := s.authorizeApplication(ctx, principal, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -680,11 +855,74 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 			maxStartupSeconds = spec.StartupTimeoutSeconds
 		}
 	}
+	osMismatch, err := s.anySpecBinaryContradictsReportedOS(ctx, server.ID, specs)
+	if err != nil {
+		return nil, err
+	}
 	warnings := make([]string, 0)
 	if maxStartupSeconds > 0 && app.TimeoutMS < maxStartupSeconds*1000 {
 		warnings = append(warnings, runtimeTimeoutBelowStartupWarning)
 	}
+	if osMismatch {
+		warnings = append(warnings, runtimeBinaryPathOSMismatchWarning)
+	}
 	return warnings, nil
+}
+
+// anySpecBinaryContradictsReportedOS backs runtimeBinaryPathOSMismatchWarning:
+// it reads serverID's latest reported GOOS and reports whether any of specs
+// carries a binary path absolute for the other platform.
+//
+// Unlike the timeout warning, this pass does NOT skip disabled specs. That one
+// describes a consequence of RUNNING (a disabled spec never cold-starts); this
+// one describes a value the operator just typed, and a spec is routinely
+// created disabled and enabled afterwards -- staying silent until then would
+// withhold the advisory exactly when it is useful.
+//
+// A store failure IS propagated: the portal renders a failed warnings read as
+// "advisories unavailable" with a retry, which is honest, where swallowing it
+// would silently drop a warning. An ABSENT telemetry row is not a failure --
+// it is the ordinary "agent has never reported" state, and yields no warning.
+func (s *Service) anySpecBinaryContradictsReportedOS(ctx context.Context, serverID string, specs []routing.RuntimeSpec) (bool, error) {
+	if len(specs) == 0 {
+		return false, nil // nothing to compare against; skip the telemetry read
+	}
+	telemetry, ok, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	reportedOS := strings.ToLower(strings.TrimSpace(telemetry.OS))
+	for _, spec := range specs {
+		if runtimeSpecBinaryContradictsOS(spec.Binary, reportedOS) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// runtimeSpecBinaryContradictsOS reports whether binary's absolute-path FORM
+// belongs to a platform other than reportedOS (a Go GOOS string as the agent
+// sends it, or "" when the agent has never reported).
+//
+// Only a path absolute on exactly ONE platform can contradict anything: a
+// UNC path spelled with forward slashes (`//host/share/x`) is absolute under
+// both rules and never warns, and a path absolute under neither has already
+// been refused by PutRuntimeSpec. Every GOOS other than "windows" is treated
+// as POSIX-shaped, which is true of all of them.
+func runtimeSpecBinaryContradictsOS(binary, reportedOS string) bool {
+	if reportedOS == "" {
+		return false // never reported: nothing to contradict
+	}
+	binary = strings.TrimSpace(binary)
+	posix := isAbsPOSIXBinaryPath(binary)
+	windows := isAbsWindowsBinaryPath(binary)
+	if reportedOS == "windows" {
+		return posix && !windows
+	}
+	return windows && !posix
 }
 
 // notifyRuntimeChanged best-effort notifies the runtime-config-changed hook

@@ -1643,13 +1643,29 @@ wrongly rejects `${TRANSPORT}`; an `includes('${AGENT_ENV:OP_AGENT_')` test
 wrongly accepts the near-misses the agent refuses).
 
 A per-application warnings endpoint returns opaque string codes and today emits
-exactly one: **`timeout_ms_below_startup_timeout`** — the application's request
-`timeout_ms` is below the largest `startup_timeout_seconds` among its **enabled**
-specs, so the gateway's request deadline expires before a cold load can finish.
-It is a pure derivation with no store write, reloaded after every spec save or
-delete. An unmapped future code renders its raw wire string rather than a wrong
-label — the forward-compatibility convention applied to **every** opaque wire
-enum on this screen, runtime states included.
+two. Both are pure derivations with no store write, reloaded after every spec
+save or delete. An unmapped future code renders its raw wire string rather than
+a wrong label — the forward-compatibility convention applied to **every** opaque
+wire enum on this screen, runtime states included.
+
+**`timeout_ms_below_startup_timeout`** — the application's request `timeout_ms`
+is below the largest `startup_timeout_seconds` among its **enabled** specs, so
+the gateway's request deadline expires before a cold load can finish.
+
+**`binary_path_os_mismatch`** — a spec's `binary` is absolute for the *other*
+platform than the GOOS this server's agent reports in its telemetry (a `C:\…`
+path on a linux-reporting server, or a `/…` path on a windows-reporting one), so
+the agent's `filepath.IsAbs` (§3.1) will refuse it at launch with a terminal
+`not_permitted`. Three properties are deliberate. It **warns and never
+rejects**: the reported OS is telemetry, a freshly enrolled server has none, and
+a spec must be configurable before — or independently of — an agent ever
+checking in, which is why the spec PUT accepts either platform's absolute form
+unconditionally and only this advisory carries the OS knowledge. It does **not**
+skip disabled specs, unlike the timeout warning above: that one describes a
+consequence of *running*, this one describes a value the operator just typed,
+and a spec is routinely created disabled and enabled afterwards. And a path
+absolute under **both** rules (a UNC share spelled with forward slashes,
+`//host/share/x`) contradicts nothing and stays silent.
 
 **Co-residency matrix.** A strict lower triangle: rows are specs `1..n-1`,
 columns `0..i-1` for row `i`, so `n` specs produce exactly `n(n-1)/2` toggle

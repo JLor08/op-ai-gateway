@@ -156,7 +156,7 @@ semantics.
 |---|---|---|---|
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's complete co-residency pair list |
-| `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today only `timeout_ms_below_startup_timeout` |
+| `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout` and `binary_path_os_mismatch` |
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
 | `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
 | `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**) |
@@ -241,7 +241,20 @@ application`) is returned by both the application **create** (POST) and
 way past a create-only gate.
 
 The spec PUT's validation, all applied **before any mutation**: `binary` is
-required and must start with `/`; every tuning integer (`listen_port`,
+required and must be **absolute under Go's `filepath.IsAbs` for *either* target
+platform**: POSIX (`/opt/llama/llama-server`) or Windows (a drive letter with
+either separator, `C:\llama\llama-server.exe` / `c:/llama/…`; the UNC form
+`\\host\share\…`; the `\\?\` / `\\.\` / `\??\` device forms). Refused: the empty
+string, a relative path, a **drive-relative** path (`C:foo`, `c:`), and a
+**root-relative** one (`\foo`, `\` — rooted on the current drive, so it names no
+volume). The gateway is OS-agnostic and cannot execute the path, so this rule is
+the **early-feedback mirror** of the agent's own `filepath.IsAbs` check
+([§3.1](../cross-cutting/agent-runtime-manager.md#31-the-agent-local-policy)),
+which remains the authority — deliberately neither stricter (a POSIX-only
+`HasPrefix(binary, "/")` made a Windows AI server unconfigurable through the
+portal) nor laxer (a spec the portal accepts and the agent then refuses becomes
+a terminal `not_permitted` instead of a form error). Every tuning integer
+(`listen_port`,
 `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
 `admission_wait_timeout_seconds`) must be `>= 0`; `admin_state` must be one of
 the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env

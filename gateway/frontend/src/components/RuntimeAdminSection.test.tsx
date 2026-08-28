@@ -555,6 +555,22 @@ describe('RuntimeAdminSection launch specs list', () => {
     renderSection({ warnings: ['timeout_ms_below_startup_timeout'] });
     expect(await screen.findByText(t.runtimeTimeoutWarning)).toBeInTheDocument();
   });
+
+  // The binary-path/OS mismatch advisory: a spec's path is absolute for the
+  // other platform than the one this server's agent reports. It rides the same
+  // opaque-code channel as the timeout warning, so all that is pinned here is
+  // that the code maps to a label instead of falling through to its raw wire
+  // string -- and that two codes render as two banners.
+  it('shows the binary-path/OS mismatch warning banner, alongside the timeout one', async () => {
+    renderSection({ warnings: ['binary_path_os_mismatch'] });
+    expect(await screen.findByText(t.runtimeBinaryPathOsMismatchWarning)).toBeInTheDocument();
+    expect(screen.queryByText('binary_path_os_mismatch')).not.toBeInTheDocument();
+
+    cleanup();
+    renderSection({ warnings: ['timeout_ms_below_startup_timeout', 'binary_path_os_mismatch'] });
+    expect(await screen.findByText(t.runtimeTimeoutWarning)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeBinaryPathOsMismatchWarning)).toBeInTheDocument();
+  });
 });
 
 describe('RuntimeAdminSection create (mapping + spec)', () => {
