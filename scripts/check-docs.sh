@@ -5,7 +5,7 @@
 # Docs consistency check. Run from anywhere:
 #   ./scripts/check-docs.sh          (or: make lint-docs / make lint)
 #
-# Three things the repository's conventions require but nothing enforced:
+# Four things the repository's conventions require but nothing enforced:
 #
 #   1. Every intra-repo markdown link resolves — the file, and where the link
 #      carries a "#anchor", the anchor too. Anchors are derived from the target
@@ -18,6 +18,12 @@
 #      rule and, before this check, nobody enforced it.
 #   3. docs/architecture/*.yaml (the OpenAPI spec) reads as the YAML subset it
 #      is written in, and every "$ref" points at a node that exists.
+#   4. config-env.md's agent table agrees with the flags server-agent actually
+#      registers. The table states that every row has a matching CLI flag
+#      except those marked "no flag form"; passing a flag the agent does not
+#      register is a *startup error*, so a wrong marking sends an operator to
+#      a command that takes their AI server down. This drifted twice on the
+#      branch that added it, in both directions, which is why it is a gate.
 #
 # Deliberately out of scope:
 #   - http(s)/mailto links. They fail for reasons that have nothing to do with
@@ -531,6 +537,74 @@ if [ -s "$YAML_LIST" ]; then
   fi
 else
   echo "  no yaml documents under $ARCH_PREFIX"
+fi
+
+# ---------------------------------------------------------------------------
+# 4: config-env.md's agent table vs. the flags server-agent registers
+# ---------------------------------------------------------------------------
+# Both directions matter. A row that claims a flag the agent does not register
+# sends an operator to `server-agent -runtime-log-buffer-bytes=...`, which
+# flag.ContinueOnError turns into a startup error that takes every managed
+# model on that host down. A row marked "no flag form" for a flag that DOES
+# exist hides a supported way to configure the agent. Neither is visible by
+# reading either file alone.
+CONFIG_ENV_DOC="docs/architecture/reference/config-env.md"
+AGENT_CONFIG_GO="server-agent/internal/config/config.go"
+
+echo "==> agent config: config-env.md vs. registered flags"
+if [ ! -f "$CONFIG_ENV_DOC" ] || [ ! -f "$AGENT_CONFIG_GO" ]; then
+  echo "  skipped: $CONFIG_ENV_DOC or $AGENT_CONFIG_GO is absent"
+else
+  read -r -d '' AGENTFLAG_AWK <<'AWK' || true
+# Input 1: the registered flag names, one per line, from the Go flag set.
+# Input 2: config-env.md. NR==FNR keys the first file into `have`.
+NR == FNR { if (!($0 in have)) { have[$0] = 1; nflags++ }; next }
+
+/^## Agent \(`OP_AGENT_\*`\)/ { inagent = 1; next }
+inagent && /^## /             { inagent = 0 }
+
+inagent && /^\| `OP_AGENT_/ {
+  if (!match($0, /`OP_AGENT_[A-Z0-9_]+`/)) next
+  var = substr($0, RSTART + 1, RLENGTH - 2)
+  # Column 3 of a "| a | b | c |" row is the Type cell (split yields an empty
+  # field 1 for the leading pipe).
+  split($0, cell, "|")
+  marked = (index(cell[3], "no flag form") > 0)
+  # OP_AGENT_X_Y -> x-y. "OP_AGENT_" is 9 bytes, so the tail starts at 10.
+  flagname = tolower(substr(var, 10))
+  gsub(/_/, "-", flagname)
+  rows++
+  if (marked && (flagname in have)) {
+    printf "%s:%d: %s is marked \"no flag form\" but -%s is registered in %s\n", \
+           FILENAME, FNR, var, flagname, GOFILE
+    problems++
+  } else if (!marked && !(flagname in have)) {
+    printf "%s:%d: the table claims -%s for %s; %s registers no such flag, and passing it is a startup error. Mark the row \"no flag form\".\n", \
+           FILENAME, FNR, flagname, var, GOFILE
+    problems++
+  }
+}
+
+END {
+  if (rows == 0) {
+    print "no OP_AGENT_* rows found -- has the agent table moved or been renamed?"
+    problems++
+  }
+  printf "  agent settings checked: %d, registered flags: %d\n", rows, nflags
+  if (problems > 0) exit 1
+}
+AWK
+
+  # One flag name per line. The registration block is uniform:
+  #   name := fs.String("flag-name", ...)  /  fs.Bool("flag-name", ...)
+  AGENT_FLAGS="$(sed -n 's/.*fs\.\(String\|Bool\|Int\|Int64\|Duration\)("\([a-z0-9-]*\)".*/\2/p' "$AGENT_CONFIG_GO" | sort -u)"
+  if [ -z "$AGENT_FLAGS" ]; then
+    echo "  $AGENT_CONFIG_GO: no fs.String/fs.Bool registrations found -- the extractor no longer matches the source" >&2
+    rc=1
+  elif ! printf '%s\n' "$AGENT_FLAGS" \
+       | awk -v GOFILE="$AGENT_CONFIG_GO" "$AGENTFLAG_AWK" - "$CONFIG_ENV_DOC"; then
+    rc=1
+  fi
 fi
 
 if [ "$rc" -ne 0 ]; then

@@ -99,6 +99,7 @@ MD
 
 1. [Introduction](01-introduction.md) — and its [goals](01-introduction.md#1-goals--non-goals)
 2. [HTTP API](reference/api.md) (machine-readable: [openapi.yaml](reference/openapi.yaml))
+3. [Configuration](reference/config-env.md)
 MD
 
   cat >"$FIX/docs/architecture/01-introduction.md" <<'MD'
@@ -193,6 +194,42 @@ Branch-local, never merged, and deliberately not gated:
 ## Task 1
 MD
 
+  # Check 4's two inputs. Two settings with flags, one deliberately without --
+  # the same three shapes the real table has.
+  mkdir -p "$FIX/server-agent/internal/config"
+  cat >"$FIX/docs/architecture/reference/config-env.md" <<'MD'
+# Configuration
+
+Back to the [index](../README.md).
+
+## Gateway (`OP_AI_GATEWAY_*`)
+
+| Variable | Type | Purpose | Default |
+|---|---|---|---|
+| `OP_AI_GATEWAY_ADDR` | string | Listen address | `:8080` |
+
+## Agent (`OP_AGENT_*`)
+
+Every row below also has a matching CLI flag except those marked **no flag form**.
+
+| Variable | Type | Purpose | Default |
+|---|---|---|---|
+| `OP_AGENT_GATEWAY_URL` | string, required | Gateway base URL | — |
+| `OP_AGENT_TLS_INSECURE` | bool | Skip TLS verification | `false` |
+| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | string list (comma-separated; **no flag form**) | Permitted work_dir prefixes | `` (any) |
+MD
+
+  cat >"$FIX/server-agent/internal/config/config.go" <<'GO'
+package config
+
+func load(args []string) {
+	fs := flag.NewFlagSet("server-agent", flag.ContinueOnError)
+	gatewayURL := fs.String("gateway-url", "", "gateway base URL (env OP_AGENT_GATEWAY_URL)")
+	tlsInsecure := fs.Bool("tls-insecure", false, "skip TLS verification (env OP_AGENT_TLS_INSECURE)")
+	_, _ = gatewayURL, tlsInsecure
+}
+GO
+
   git -C "$FIX" init -q .
 }
 
@@ -202,7 +239,7 @@ MD
 build; run
 expect "a clean corpus passes" 0 \
   "check-docs: OK" \
-  "docs/architecture files: 5, reachable from the index: 5" \
+  "docs/architecture files: 6, reachable from the index: 6" \
   '$refs: 3' \
   '!does-not-exist.md' \
   '!also-missing.md' \
@@ -266,7 +303,7 @@ MD
 run
 expect "an architecture file no index reaches fails" 1 \
   "docs/architecture/cross-cutting/orphan.md: not reachable from docs/architecture/README.md" \
-  "docs/architecture files: 6, reachable from the index: 5"
+  "docs/architecture files: 7, reachable from the index: 6"
 
 build
 # The index links 01-introduction.md, which links runtime.md; the index itself
@@ -276,7 +313,7 @@ if grep -q 'cross-cutting/runtime.md' "$FIX/docs/architecture/README.md"; then
 fi
 run
 expect "reachability is transitive, not just direct" 0 \
-  "check-docs: OK" "docs/architecture files: 5, reachable from the index: 5"
+  "check-docs: OK" "docs/architecture files: 6, reachable from the index: 6"
 
 build
 grep -v 'cross-cutting/runtime.md' "$FIX/docs/architecture/01-introduction.md" >"$FIX/t" \
@@ -338,6 +375,53 @@ sed 's/^security: \[\]$/security: [{ a: [] },/' \
 run
 expect "a multi-line flow collection is refused, not silently mis-read" 1 \
   "multi-line flow collections are not supported"
+
+# --------------------------------------------------------------------------
+# 4: config-env.md's agent table vs. the flags server-agent registers
+# --------------------------------------------------------------------------
+build
+run
+expect "the clean agent table passes and reports what it checked" 0 \
+  "agent settings checked: 3, registered flags: 2"
+
+build
+sed 's/^| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | string list (comma-separated; \*\*no flag form\*\*) |/| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | string list |/' \
+  "$FIX/docs/architecture/reference/config-env.md" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/config-env.md"
+run
+expect "a row that claims a flag the agent does not register fails" 1 \
+  "the table claims -runtime-allowed-dirs for OP_AGENT_RUNTIME_ALLOWED_DIRS" \
+  "passing it is a startup error"
+
+build
+sed 's/^| `OP_AGENT_TLS_INSECURE` | bool |/| `OP_AGENT_TLS_INSECURE` | bool (**no flag form**) |/' \
+  "$FIX/docs/architecture/reference/config-env.md" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/config-env.md"
+run
+expect "the reverse drift fails too: marked \"no flag form\" while the flag exists" 1 \
+  'OP_AGENT_TLS_INSECURE is marked "no flag form" but -tls-insecure is registered'
+
+build
+sed 's/^## Agent (`OP_AGENT_\*`)$/## Agent settings/' \
+  "$FIX/docs/architecture/reference/config-env.md" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/config-env.md"
+run
+expect "renaming the agent table out from under the check fails loudly, not silently" 1 \
+  "no OP_AGENT_* rows found"
+
+build
+sed 's/fs\.String(/fs.StringVarRenamed(/; s/fs\.Bool(/fs.BoolVarRenamed(/' \
+  "$FIX/server-agent/internal/config/config.go" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/server-agent/internal/config/config.go"
+run
+expect "an extractor that no longer matches the Go source fails instead of passing vacuously" 1 \
+  "no fs.String/fs.Bool registrations found"
+
+build
+rm -f "$FIX/server-agent/internal/config/config.go"
+run
+expect "the check skips, rather than fails, where the agent module is absent" 0 \
+  "skipped:" "!agent settings checked"
 
 if [ "$fail" = 0 ]; then
   echo "all check-docs cases passed"
