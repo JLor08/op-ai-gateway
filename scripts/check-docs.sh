@@ -5,7 +5,7 @@
 # Docs consistency check. Run from anywhere:
 #   ./scripts/check-docs.sh          (or: make lint-docs / make lint)
 #
-# Four things the repository's conventions require but nothing enforced:
+# Five things the repository's conventions require but nothing enforced:
 #
 #   1. Every intra-repo markdown link resolves — the file, and where the link
 #      carries a "#anchor", the anchor too. Anchors are derived from the target
@@ -24,6 +24,11 @@
 #      register is a *startup error*, so a wrong marking sends an operator to
 #      a command that takes their AI server down. This drifted twice on the
 #      branch that added it, in both directions, which is why it is a gate.
+#   5. No document NAMES a CLI flag that no binary in this repository
+#      registers. Check 4 gates one table; this gates the claim wherever it is
+#      made, in prose or anywhere else — a second copy of exactly that false
+#      claim survived check 4 in a different document, which is how this one
+#      earned its place.
 #
 # Deliberately out of scope:
 #   - http(s)/mailto links. They fail for reasons that have nothing to do with
@@ -603,6 +608,83 @@ AWK
     rc=1
   elif ! printf '%s\n' "$AGENT_FLAGS" \
        | awk -v GOFILE="$AGENT_CONFIG_GO" "$AGENTFLAG_AWK" - "$CONFIG_ENV_DOC"; then
+    rc=1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5: no document names a CLI flag that no binary here registers
+# ---------------------------------------------------------------------------
+# Check 4 gates one table's flag column. This gates the underlying fact
+# wherever it is asserted, because the same false claim ("these settings have
+# flags") appeared in a SECOND document, in prose, and check 4 could not see
+# it. Passing a flag a Go binary does not register is a startup error, so a
+# document naming one sends an operator to a command that fails -- and for the
+# agent, takes every managed model on that host down with it.
+#
+# Scope: tokens of the shape "-a-b" (single leading dash, at least one internal
+# hyphen, starting with a letter). That deliberately excludes short flags
+# (-v, -n, -C), values (-count=2), double-dash flags of THIRD-PARTY tools
+# (llama.cpp's --chat-template-file is not ours to verify), numeric ranges and
+# ordinary hyphenated prose. Measured over this corpus at the time it was
+# written: 21 candidates, all of them real flags, zero false positives.
+#
+# Flags are collected from EVERY Go binary in the repository, test stubs
+# included -- development-and-quality.md legitimately documents the stub
+# children's -ready-after and -ignore-sigterm.
+echo "==> flags named in documents exist"
+FLAG_NAMES="$TMPDIR_RUN/flagnames"
+# shellcheck disable=SC2016  # the pattern is for grep, not the shell
+grep -rhoE '(flag|fs)\.(String|Bool|Int|Int64|Uint|Uint64|Float64|Duration)(Var)?\("[a-z0-9][a-z0-9-]*"' \
+  --include='*.go' . 2>/dev/null \
+  | sed -E 's/.*"([a-z0-9-]+)"/\1/' | LC_ALL=C sort -u >"$FLAG_NAMES" || true
+
+if [ ! -s "$FLAG_NAMES" ]; then
+  echo "  no Go flag registrations found in this repository -- the extractor no longer matches the source" >&2
+  rc=1
+else
+  read -r -d '' DOCFLAG_AWK <<'AWK' || true
+# Input 1: registered flag names, one per line. Input 2..: markdown files.
+NR == FNR { if (!($0 in have)) { have[$0] = 1; nflags++ }; next }
+
+# NOTE the asymmetry with check 1, which deliberately IGNORES fenced code
+# blocks: a link inside a fence is illustrative, but a COMMAND inside a fence
+# is meant to be copied and run. A fenced `server-agent -flag-that-does-not-
+# exist` is the most harmful form of this defect, not an exempt one, so fences
+# are scanned here on purpose.
+{
+  # A leading sentinel space, so a token at column 1 still has a character
+  # before it and the boundary test below needs no special case.
+  line = " " $0
+  start = 1
+  while (match(substr(line, start), /-[a-z][a-z0-9]*(-[a-z0-9]+)+/)) {
+    abs = start + RSTART - 1          # absolute index of the token's "-"
+    tok = substr(line, abs, RLENGTH)
+    before = substr(line, abs - 1, 1)
+    start = abs + RLENGTH             # continue after this token
+    # Not ours to judge: "--foo-bar" is a third-party long flag (llama.cpp),
+    # and "non-foo-bar" is ordinary hyphenated prose.
+    if (before ~ /[-A-Za-z0-9_]/) continue
+    name = substr(tok, 2)
+    checked[name] = 1
+    if (!(name in have)) {
+      printf "%s:%d: names the flag %s, which no binary in this repository registers (passing it is a startup error)\n", \
+             FILENAME, FNR, tok
+      problems++
+    }
+  }
+}
+
+END {
+  n = 0
+  for (k in checked) n++
+  printf "  flag names checked: %d, registered flags: %d\n", n, nflags
+  if (problems > 0) exit 1
+}
+AWK
+
+  # shellcheck disable=SC2086  # one path per line, none with spaces
+  if ! awk "$DOCFLAG_AWK" "$FLAG_NAMES" $(grep -Ev "$EXCLUDE_RE" "$MD_LIST"); then
     rc=1
   fi
 fi

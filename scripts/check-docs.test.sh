@@ -212,6 +212,9 @@ Back to the [index](../README.md).
 
 Every row below also has a matching CLI flag except those marked **no flag form**.
 
+Start the agent with `-gateway-url https://gw.example`. Not ours to verify:
+`--chat-template-file`, gateway-side, non-gateway-url, 2026-08-25.
+
 | Variable | Type | Purpose | Default |
 |---|---|---|---|
 | `OP_AGENT_GATEWAY_URL` | string, required | Gateway base URL | — |
@@ -227,6 +230,19 @@ func load(args []string) {
 	gatewayURL := fs.String("gateway-url", "", "gateway base URL (env OP_AGENT_GATEWAY_URL)")
 	tlsInsecure := fs.Bool("tls-insecure", false, "skip TLS verification (env OP_AGENT_TLS_INSECURE)")
 	_, _ = gatewayURL, tlsInsecure
+}
+GO
+
+  # A second binary, so removing the agent module does not remove EVERY flag
+  # registration -- mirrors the real repo, where test stubs register their own
+  # (development-and-quality.md documents -ready-after and -ignore-sigterm).
+  mkdir -p "$FIX/tools/stub"
+  cat >"$FIX/tools/stub/main.go" <<'GO'
+package main
+
+func main() {
+	readyAfter := flag.Duration("ready-after", 0, "stay unhealthy this long")
+	_ = readyAfter
 }
 GO
 
@@ -419,9 +435,53 @@ expect "an extractor that no longer matches the Go source fails instead of passi
 
 build
 rm -f "$FIX/server-agent/internal/config/config.go"
+# Drop the sentence naming -gateway-url too: with the agent module gone that
+# flag is genuinely unregistered, and check 5 would rightly fire on it. This
+# case is about check 4 SKIPPING, not about check 5.
+grep -v '^Start the agent with' "$FIX/docs/architecture/reference/config-env.md" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/config-env.md"
 run
 expect "the check skips, rather than fails, where the agent module is absent" 0 \
   "skipped:" "!agent settings checked"
+
+# --------------------------------------------------------------------------
+# 5: no document names a CLI flag no binary registers
+# --------------------------------------------------------------------------
+build
+run
+expect "a document naming only real flags passes, and the ignorable shapes stay quiet" 0 \
+  "flag names checked: 1, registered flags: 3" \
+  "!names the flag --chat-template-file" "!names the flag -gateway-url"
+
+build
+printf '\nSize it with `-runtime-log-buffer-bytes=4194304`.\n' \
+  >>"$FIX/docs/architecture/reference/config-env.md"
+run
+expect "a document naming a flag no binary registers fails" 1 \
+  "names the flag -runtime-log-buffer-bytes, which no binary in this repository registers"
+
+build
+printf '\n```sh\nserver-agent -totally-made-up-flag\n```\n' \
+  >>"$FIX/docs/architecture/reference/config-env.md"
+run
+expect "a fenced COMMAND is checked, unlike a fenced link -- it is meant to be run" 1 \
+  "names the flag -totally-made-up-flag"
+
+build
+printf '\n-runtime-log-buffer-bytes at the very start of a line.\n' \
+  >>"$FIX/docs/architecture/reference/config-env.md"
+run
+expect "a flag at column 1 is found (the boundary test must not need a preceding character)" 1 \
+  "names the flag -runtime-log-buffer-bytes"
+
+build
+for f in "$FIX/server-agent/internal/config/config.go" "$FIX/tools/stub/main.go"; do
+  sed 's/fs\.String(/fs.StringRenamed(/; s/fs\.Bool(/fs.BoolRenamed(/; s/flag\.Duration(/flag.DurationRenamed(/' \
+    "$f" >"$FIX/t" && mv "$FIX/t" "$f"
+done
+run
+expect "losing every flag registration fails loudly rather than passing vacuously" 1 \
+  "no Go flag registrations found"
 
 if [ "$fail" = 0 ]; then
   echo "all check-docs cases passed"
