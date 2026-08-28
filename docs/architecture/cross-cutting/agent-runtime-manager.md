@@ -2420,9 +2420,11 @@ operator is most often staring at — the pattern *across* attempts is the
 diagnosis ("it dies at the same layer every time" versus "the third one got
 further"), and replacing on restart throws that comparison away. The boundary
 stays visible as a **typed marker** carrying the pid and exit code, never as
-synthesized text: the event kind is a closed set (`started`, `exited`) that the
-gateway allow-lists on ingest, so an agent cannot put free text where an
-operator reads a portal-authored sentence.
+synthesized text: the event kind is a closed set — `started`, `exited`, and
+`start_failed` for a generation that never became a process
+([§14.7](#147-the-resolved-command-what-actually-ran)) — which the gateway
+allow-lists on ingest, so an agent cannot put free text where an operator reads
+a portal-authored sentence.
 
 ### 14.3 The memory bound is the operator's to set
 
@@ -2445,17 +2447,20 @@ The **total** is the number to reason about, because the per-spec figure alone
 is not a bound — twenty specs would be twenty times it. The agent keeps at most
 `total / per-spec` buffers and evicts the least-recently-written one nobody is
 watching. Worst case, precisely: the total ceiling, plus at most 64 KiB of live
-queue per **watched** spec, plus — for one 250 ms flush window after a
-subscribe — a scrollback snapshot that shares its strings with the retention
-buffer. With the defaults and the one or two specs an operator watches at a
-time, that is 16 MiB steady-state and under 17 MiB while watching.
+queue per **watched** spec (`logPendingBytes`), plus — while a history replay is
+in flight for it — a scrollback snapshot that shares its strings with the
+retention buffer. A replay is chunked, so that snapshot lives for as long as the
+replay does rather than for a single 250 ms flush window: roughly two windows at
+the 1 MiB default, and longer at a raised buffer. With the defaults and the one
+or two specs an operator watches at a time, that is 16 MiB steady-state and
+under 17 MiB while watching.
 
 ### 14.4 The wire
 
 | Frame | Direction | Payload |
 |---|---|---|
-| `runtime_log_config` | gateway → agent | `{"spec_ids":[…]}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing. Re-sent on **every** new agent connection, including the empty set, so a watch set can never outlive the connection it was issued on. |
-| `runtime_log` | agent → gateway | One spec's entries since the previous flush: `{"spec_id", "scrollback", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command"}]}`. `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). |
+| `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing; the epoch adds no state to the frame, it makes "a viewer arrived" expressible. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**, and the agent re-snapshots any spec whose epoch differs from the one its last snapshot was taken for — even one it is already streaming. That is the fact the agent cannot derive for itself: watching is a *set*, so a second viewer of the same spec produces a byte-identical `spec_ids`, and a rule keyed to "this id is new" leaves that viewer's window blank while the agent believes it delivered. Compared with `!=`, never `<`, because a gateway restart resets the counters. Re-sent on **every** new agent connection, including the empty set and with every epoch bumped, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. |
+| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). |
 
 The markers are **typed records carrying no text** — `event` plus `pid`/
 `exit_code`/`command`, with the `── … ──` line written by the portal. That is
@@ -2464,34 +2469,87 @@ printed, and therefore forgeable — a model server printing a convincing marker
 line would be read as a portal statement. The same rule is why the resolved
 command is a typed field rather than a rendered command line in the stream.
 
-A list of spec ids is deliberately the entire expressive power of the command.
-The ids name specs the gateway itself supplied in the runtime-config document,
-so the frame cannot express anything the agent was not already going to do —
-the same boundary the `cert_update` doorbell draws.
+A list of spec ids, each carrying a counter, is deliberately the entire
+expressive power of the command. The ids name specs the gateway itself supplied
+in the runtime-config document, and a counter can say nothing except "take a
+fresh snapshot of one of them", so the frame still cannot express anything the
+agent was not already going to do — the same boundary the `cert_update` doorbell
+draws.
 
+**`scrollback` does not mean the same thing on the two hops**, and since a
+replay became chunked, a sentence that does not say which hop it describes is
+ambiguous rather than merely brief.
+
+*Gateway → portal* it is exactly what it always was, and deliberately so:
 `scrollback: true` marks the one-shot replay of the agent's retained history
 that a subscribe produces. The portal **resets** its view on it rather than
 appending (an agent reconnect delivers a fresh scrollback, and appending would
 duplicate the history), and an **empty** scrollback batch is itself an answer —
 "the agent's buffer holds nothing", which is what an agent restart leaves
-behind.
+behind. The gateway guarantees that shape *per subscriber*: it sets `scrollback`
+on exactly the first chunk each subscriber receives, clears it on the rest, and
+never lets `scrollback_more` reach a portal at all. A portal therefore needs no
+notion of chunking, and one written before chunking existed renders a chunked
+replay correctly.
+
+*Agent → gateway* it is broader: it marks **any** chunk of a replay, and it is a
+routing key rather than a reset signal. The gateway hands a replay only to
+subscribers that have not already completed one, which is what lets a second
+viewer arrive, receive the whole history with one reset, and leave the viewer
+already watching undisturbed — its live stream unbroken and nothing of the
+replay delivered to it.
 
 ### 14.5 Overflow is always visible
 
-`dropped_bytes` means one thing everywhere it appears: *N bytes the process
-printed are missing immediately before this entry's text*. It is produced by all
-four places output can be lost — eviction from the agent's retention buffer, the
-agent's per-spec live queue overflowing between flushes, the gateway's
-per-subscriber queue overflowing, and the browser's own display cap — and the
-four are deliberately indistinguishable to the reader, who only needs the one
-fact. A gap rendered as silence would be a lie about what the process printed,
-and silence is exactly what the operator is trying to interpret.
+A gap rendered as silence would be a lie about what the process printed, and
+silence is exactly what the operator is trying to interpret. Output can be lost
+in **four** places, and they do not all emit the same signal — flattening them
+into one is what hid the one that emits nothing.
 
-Rate limits, all only in effect while someone is watching: the agent flushes at
-most once per spec per 250 ms, at most 64 KiB per spec per window, and at most
-128 KiB per window across all specs (round-robin, so the budget cannot starve
-whichever spec sorts last). That last bound exists because the agent has exactly
-**one** writer per WebSocket connection and telemetry shares it.
+`dropped_bytes` means one thing wherever it appears: *N bytes the process
+printed are missing immediately before this entry's text*. **Three** of the four
+produce it, and those three are deliberately indistinguishable to the reader,
+who needs only the one fact: eviction from the agent's retention buffer, the
+agent's per-spec live queue overflowing between flushes, and the gateway's
+per-subscriber queue overflowing.
+
+The fourth is the **browser's own display cap** (4,000 rendered entries), and it
+produces a *different* signal, because the bytes it drops were delivered and are
+still in the agent's buffer. Trimming the tail of a live stream raises a
+view-level notice — "older output is no longer shown in this view (N bytes);
+reopen the window to reload the agent's retained history in full" — not a
+`dropped_bytes` gap in the output. One path under that cap is genuinely silent:
+a **scrollback longer than the cap** is trimmed from the front with no signal at
+all. What partly covers it is the structural check in
+[§14.7](#147-the-resolved-command-what-actually-ran), which says so when the
+visible history begins with output instead of with an opening marker — and only
+then.
+
+The gateway's per-subscriber queue drops **text only, never a boundary marker**.
+Markers, and the resolved commands riding them, are rescued out of a batch that
+did not fit and delivered in front of the next batch that does: losing "the
+process exited, code 1" would be losing the very fact the operator is reading
+the stream to find, and `dropped_bytes` cannot honestly carry it. A subscriber
+so far behind that even that rescue ceiling is exhausted has its stream **ended**
+instead of degraded — its `EventSource` reconnects, a reconnect re-snapshots,
+and it comes back with a complete history rather than a silently incomplete one.
+
+Rate limits, all only in effect while someone is watching: the agent sends at
+most **one batch per spec per 250 ms flush**, replay chunks included; at most
+64 KiB per spec per window of live output; at most 128 KiB per window across all
+specs (round-robin, so the budget cannot starve whichever spec sorts last); and,
+on a budget of its own, at most one frame's worth of history replay per window
+**fleet-wide** (`maxLogBatchBytes`, just under 1 MiB). The replay budget is
+separate because a replay is one-shot and only ever follows a viewer arriving,
+so it should not compete with live output — but it is bounded, which is what
+stops a full retention buffer from producing a single frame the gateway's 1 MiB
+read limit refuses outright. The fleet-wide bounds exist because every frame the
+agent's **run loop** writes — telemetry, the reports, and these — leaves on the
+one agent WebSocket from that one goroutine. That is a property of the run
+loop's frames, not of the connection: under `transport: websocket` with
+`runtime_source: file`, the file-mode runtime report is written from the
+runtime-sync goroutine too, which `internal/client/ws.go` records as a defect to
+fix rather than an invariant to rely on.
 
 ### 14.6 Nothing is persisted, anywhere
 
@@ -2515,8 +2573,26 @@ bypassed.
 The portal's authorization boundary is the ordinary one — server
 ownership/admin-group via the same `authorizeServer` path as the live-status
 stream, with the 404-no-leak collapse — deliberately not a laxer path because it
-is "just logs". `spec_id` needs no separate check: fan-out is keyed by (server,
-spec) and an agent only ever reports its own server's specs.
+is "just logs". `spec_id` needs no **authorization** check of its own: fan-out
+is keyed by (server, spec) and an agent only ever reports its own server's
+specs, so an id belonging to another server can only ever receive nothing.
+
+It does need a **validity** check, and stating the authorization reason alone is
+what left it without one. The id is not only a fan-out key: it is also a value
+the gateway **ships to the agent** inside the `runtime_log_config` command,
+where every subscribed id for that server is marshaled into one frame. Request
+headers may be up to 1 MiB, so one authorized caller holding two GETs with
+~600 KiB of `spec_id` each produced a frame over the agent's own 1 MiB read
+limit — and because a fresh connection is answered with an unconditional
+restate, the agent's WebSocket then flapped for as long as those requests were
+held open. The agent's own watched-spec ceiling runs only *after* the frame has
+been read, so it never got the chance. The subscribe path therefore bounds both
+the id's length (128 bytes) and the number of distinct specs one server may have
+under view (64), and it **rejects** rather than clamps: ingest clamps a reported
+id, so a subscription on a longer one could never match a published batch, and
+clamping here would hand back a window guaranteed to stay empty forever — the
+outcome this feature exists to eliminate. See
+[HTTP API Surface](../reference/api-surface.md) for the codes.
 
 ### 14.7 The resolved command: what actually ran
 
@@ -2651,19 +2727,24 @@ markers.
 
 ## 15. Configuration reference
 
-Agent settings, all on the agent's existing precedence (flag, then environment,
-then config file — with the list-valued ones having no flag form):
+Agent settings on the agent's existing precedence — flag, then environment,
+then config file — except the four marked **no flag form**, which resolve
+environment, then file, then default. Passing a flag the agent does not register
+is a *startup error*, so that marking is load-bearing rather than editorial;
+`scripts/check-docs.sh` gates it against the flags `server-agent` actually
+registers, over the authoritative table in
+[Configuration & Environment Variables](../reference/config-env.md).
 
 | Setting / env var | Default | Governs |
 |---|---|---|
 | `runtime_source` / `OP_AGENT_RUNTIME_SOURCE` | `gateway` | `gateway` or `file` (§8). |
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
-| `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | empty | The binary allowlist. **Empty means nothing starts.** |
-| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` | empty | Permitted work/model directories. **Non-empty makes `work_dir` mandatory on every spec.** |
+| `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
+| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories. **Non-empty makes `work_dir` mandatory on every spec.** |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
-| `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
-| `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | 16 MiB | Ceiling on that retention across all specs. |
+| `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
+| `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` (**no flag form**) | 16 MiB | Ceiling on that retention across all specs. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
 variables: `ai_servers.runtime_max_processes`,

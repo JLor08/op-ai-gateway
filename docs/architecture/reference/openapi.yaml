@@ -759,12 +759,31 @@ paths:
         scrollback=true and replays the agent's retained history (possibly
         empty, which means the agent's buffer holds nothing); a consumer must
         RESET on it, never append, because a reconnect delivers a fresh one.
+        That guarantee is per subscriber and does not depend on the size of the
+        history: a large one crosses the agent-to-gateway hop as several frames,
+        but the gateway always forwards it as ONE scrollback=true event followed
+        by ordinary appends, so a consumer needs no notion of chunking.
         Each entry is either verbatim process output ("text") or a boundary
-        marker from the closed set ("event": started|exited). "dropped_bytes"
-        on an entry means N bytes the process printed are missing immediately
+        marker from the closed set ("event": started|exited|start_failed).
+        "start_failed" opens a generation whose exec itself failed, so it has no
+        pid, no exit code, and no output will follow it.
+        An OPENING marker ("started" or "start_failed") additionally carries
+        "command": the launch command that generation actually ran, resolved --
+        {"binary","args","work_dir","env","masked","truncated"}. Every
+        ${AGENT_ENV:NAME}-derived value is replaced agent-side by its own
+        placeholder ("masked": true), the gateway drops over-long entries whole
+        ("truncated": true) and never re-masks, and the field is stripped from
+        any entry that is not an opening marker. On a spec that fails to start
+        it is the entire content of this view. "dropped_bytes" on an entry means
+        N bytes the process printed are missing immediately
         before it. Nothing on this path is persisted -- not to disk, not to the
         database. Subscribing is what makes the agent stream this spec, and
         unsubscribing is what stops it.
+        Error codes: 400 runtime_logs.spec_required (spec_id absent),
+        400 runtime_logs.spec_invalid (spec_id too long -- the id is also
+        shipped to the agent inside the watch command, so it is rejected rather
+        than clamped), 503 runtime_logs.too_many_specs (this server already has
+        the maximum number of distinct specs under view).
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       parameters:
         - { name: spec_id, in: query, required: true, schema: { type: string } }
@@ -772,6 +791,7 @@ paths:
         '200': { $ref: '#/components/responses/SSE' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/portal/agent-binaries:
     get:
       tags: [portal]
@@ -1580,6 +1600,13 @@ components:
       description: >
         Not found — also returned for objects outside the caller's manageable
         set (no-existence-leak policy).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: >
+        Temporarily refused — the Error envelope carries the stable code (see
+        api-surface.md).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
