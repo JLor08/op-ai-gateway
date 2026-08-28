@@ -188,6 +188,27 @@ func (h *certHolder) bindHost() string {
 	return ""
 }
 
+// DeriveBindHost loads the TLS leaf at certDir (the certfiles.Fullchain/
+// Privkey layout) into a throwaway certHolder and returns its bindHost()
+// derivation: the leaf's first IP SAN, else its first DNS SAN -- the exact
+// mesh-identity address this package's own routes always bind to (see
+// bindHost's doc). Returns "" when certDir has no loadable leaf, or the leaf
+// carries no usable SAN.
+//
+// Exported for main.go, which needs the SAME derivation for the
+// agent-managed model runtime's router bind address (task-18-fix-round-1.md
+// I2): the runtime router lives in internal/runtime, which must not import
+// internal/proxy or internal/certfiles (archtest), so main.go -- which
+// already imports both -- resolves the default bind host here and threads
+// the resulting plain string into runtime.NewDriver instead.
+func DeriveBindHost(certDir string) string {
+	h := &certHolder{}
+	if err := h.LoadFromDir(certDir); err != nil {
+		return ""
+	}
+	return h.bindHost()
+}
+
 // runningProxy is one live generation of a route's listener+server. Its fields
 // are set once at start and read-only thereafter (except stopping, an atomic
 // flag); the *runningProxy pointer is the generation identity used by the drain

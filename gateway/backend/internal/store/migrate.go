@@ -95,6 +95,11 @@ var migrations = []migration{
 	{version: 62, name: "model_group_selection_settings", up: migration62Up},
 	{version: 63, name: "token_unknown_model_redirect", up: migration63Up},
 	{version: 64, name: "model_group_min_tps_double_precision", up: migration64Up},
+	{version: 65, name: "agent_runtime_manager", up: migration65Up},
+	{version: 66, name: "server_runtime_limits", up: migration66Up},
+	{version: 67, name: "server_runtime_reports", up: migration67Up},
+	{version: 68, name: "application_single_server_agent", up: migration68Up},
+	{version: 69, name: "runtime_spec_set_visible_devices", up: migration69Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -2835,4 +2840,198 @@ func migration64Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return execTx(ctx, tx, dl,
 		"alter table model_groups alter column min_tokens_per_second type double precision")
+}
+
+// migration65Up creates the agent-runtime-manager tables (T1): launch specs
+// (1:1 per mapping), per-GPU VRAM demand rows, and the pairwise co-residency
+// matrix (row present = pair allowed; mapping_a_id < mapping_b_id canonical).
+// Defaults reproduce the pre-feature behavior exactly: no rows, nothing starts.
+//
+// agent_runtime_specs.binary_path (the RuntimeSpec.Binary field) is named
+// binary_path, not binary: BINARY is a reserved PostgreSQL keyword and an
+// unquoted `binary` column fails DDL with a syntax error on that dialect
+// (caught by running the postgres leg of the conformance suite locally).
+func migration65Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists agent_runtime_specs (
+			id text primary key,
+			mapping_id text not null unique references model_mappings(id) on delete cascade,
+			enabled integer not null default 0,
+			binary_path text not null default '',
+			args text not null default '[]',
+			env text not null default '{}',
+			work_dir text not null default '',
+			listen_port integer not null default 0,
+			health_path text not null default '',
+			health_timeout_seconds integer not null default 0,
+			startup_timeout_seconds integer not null default 0,
+			idle_timeout_seconds integer not null default 0,
+			admission_wait_timeout_seconds integer not null default 0,
+			pinned integer not null default 0,
+			admin_state text not null default '',
+			vram_locked integer not null default 0,
+			created_at ` + ts + ` not null, updated_at ` + ts + ` not null
+		)`,
+		`create table if not exists agent_runtime_spec_gpus (
+			spec_id text not null references agent_runtime_specs(id) on delete cascade,
+			gpu_index integer not null,
+			vram_estimate_mb integer not null default 0,
+			vram_measured_mb integer not null default 0,
+			primary key (spec_id, gpu_index)
+		)`,
+		`create table if not exists agent_coresidency_rules (
+			application_id text not null references applications(id) on delete cascade,
+			mapping_a_id text not null references model_mappings(id) on delete cascade,
+			mapping_b_id text not null references model_mappings(id) on delete cascade,
+			created_at ` + ts + ` not null,
+			primary key (application_id, mapping_a_id, mapping_b_id)
+		)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration66Up creates the per-GPU VRAM budget table (Task 3), keyed by
+// (server_id, gpu_index): how much VRAM (MB) the operator has allotted to
+// agent-managed runtimes on that GPU for co-residency admission math. It also
+// adds two additive ai_servers columns: runtime_max_processes (0 =
+// unlimited) and managed_runtime_only (gates whether non-runtime
+// applications may be created on the server, enforced in Task 6). VRAM is
+// deliberately plain integer MB (ADR-005's wide-type rule applies to
+// floats/64-bit ints, not this bounded value).
+func migration66Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	if err := execTx(ctx, tx, dl, `create table if not exists ai_server_gpu_budgets (
+		server_id text not null references ai_servers(id) on delete cascade,
+		gpu_index integer not null,
+		budget_mb integer not null default 0,
+		expected_uuid text not null default '',
+		expected_name text not null default '',
+		created_at `+ts+` not null, updated_at `+ts+` not null,
+		primary key (server_id, gpu_index)
+	)`); err != nil {
+		return err
+	}
+	cols := []string{
+		"runtime_max_processes integer not null default 0",
+		"managed_runtime_only integer not null default 0",
+	}
+	for _, col := range cols {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration67Up creates the server_runtime_reports table (Task 4): the 1:1
+// latest agent-managed runtime configuration report per server (PK
+// server_id, upsert-overwrite), reported UPWARD by a server's ServerAgent
+// when it is configured from a local file on the AI server instead of from
+// the gateway. Deliberately shaped exactly like server_hardware (migration
+// 29): report_json is a validated canonical JSON blob the store never
+// parses (the gateway's ingest layer does the parsing, sanitizing, and
+// environment-variable redaction before a report ever reaches here). No
+// index needed (PK lookup).
+func migration67Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmt := `create table if not exists server_runtime_reports (
+		server_id    text primary key references ai_servers(id) on delete cascade,
+		collected_at ` + ts + ` not null,
+		report_json  text not null default '',
+		updated_at   ` + ts + ` not null
+	)`
+	return execTx(ctx, tx, dl, stmt)
+}
+
+// migration68Up adds the database-level guarantee behind the "at most one
+// server_agent application per AI server" invariant: a PARTIAL unique index on
+// applications(server_id) restricted to type = 'server_agent'. The
+// authoritative enforcement is in the portal service
+// (CreateApplication/UpdateApplication return
+// portal.ErrServerAgentApplicationExists); this index is defence in depth for
+// any future write path that forgets the gate. It matters because
+// portal.AgentRuntimeConfig derives a server's entire agent runtime-config
+// document from THE server_agent application — with two of them, whichever
+// the store returns first wins and configuration edited under the other one
+// persists but never reaches the agent.
+//
+// WHY IT CANNOT FAIL ON LIVE DATA. Two independent reasons:
+//
+//  1. 'server_agent' is not a value that any released deployment can hold.
+//     The type is only writable through portal.normalizeApplicationType, and
+//     that function first accepted "server_agent" in the same (unreleased)
+//     feature branch as migrations 65–67. A database migrated from any
+//     shipped version therefore has zero rows matching this index's WHERE
+//     clause, so creating it is a no-op on real data.
+//  2. Belt and braces for a pre-invariant DEVELOPMENT database of that same
+//     branch, which could have collected two such rows before the service
+//     gate existed: the duplicate pre-check below skips index creation
+//     instead of aborting. A migration failure here would refuse to start
+//     the gateway, and this index is a redundant guard, not the primary
+//     enforcement — bricking startup over it would trade a silent
+//     misconfiguration for a hard outage. The version is still recorded, so
+//     the skip is not retried on the next boot; such a database keeps the
+//     service-layer gate only, and the operator can delete the extra
+//     application and re-create the index by hand.
+//
+// Both dialects support partial and IF NOT EXISTS indexes (SQLite ≥ 3.8.0,
+// PostgreSQL ≥ 9.5), so no dialect branch is needed. The index name is
+// lower-case and unquoted, so PostgreSQL's identifier folding is a non-issue.
+//
+// NOTE: when the index does fire, the SQL store can only surface the bare
+// ErrConflict — this index and unique(server_id, port) are indistinguishable
+// at that layer without parsing dialect-specific error text. The portal does
+// not parse it: portal.classifyApplicationWriteConflict re-reads the server's
+// applications and answers with the honest
+// "application.server_agent_exists", not the misleading
+// "application.port_conflict". See that function for why the port condition
+// is checked first.
+func migration68Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	row := tx.QueryRowContext(ctx, dl.rebind(`
+		select count(*) from (
+			select server_id from applications
+			where type = 'server_agent'
+			group by server_id
+			having count(*) > 1
+		) dup`))
+	var offenders int
+	if err := row.Scan(&offenders); err != nil {
+		return fmt.Errorf("check duplicate server_agent applications: %w", err)
+	}
+	if offenders > 0 {
+		// See reason 2 above: leave the index off rather than fail the boot.
+		return nil
+	}
+	return execTx(ctx, tx, dl, `create unique index if not exists idx_applications_single_server_agent
+		on applications(server_id) where type = 'server_agent'`)
+}
+
+// migration69Up adds agent_runtime_specs.set_visible_devices: the per-spec
+// opt-in that turns the spec's GPU list from a DECLARATION into an
+// ENFORCEMENT. With it on, the agent sets the vendor-appropriate visibility
+// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD) for
+// that spec's child process from that spec's own GPU indices; with it off --
+// the default, and every row that exists before this migration -- nothing
+// about the launch changes.
+//
+// APPENDED rather than folded into migration65Up's create-table, even though
+// both were written on the same unreleased feature branch. Migration 65 has
+// already run against every developer database and both CI conformance legs,
+// so editing it would leave those at schema_version 68 with no such column
+// while a fresh install got one -- exactly the divergence the append-only
+// rule exists to prevent (migration64Up records the same reasoning for the
+// same reason).
+//
+// Plain integer boolean with a 0 default, matching the pinned/vram_locked
+// columns beside it: ADR-005's wide-Postgres-type rule is about floats and
+// 64-bit ints, not a flag.
+func migration69Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"set_visible_devices integer not null default 0")
 }

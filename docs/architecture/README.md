@@ -46,6 +46,7 @@ flowchart TD
 - [Security, Authentication & Authorization](cross-cutting/security-auth-rbac.md)
 - [Persistence](cross-cutting/persistence.md)
 - [Routing & Model Selection](cross-cutting/routing-and-model-selection.md)
+- [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md)
 - [Telemetry, Usage Analytics & Observability](cross-cutting/telemetry-usage-observability.md)
 - [Networking & Mesh (NetBird)](cross-cutting/networking-mesh.md)
 - [Certificates & TLS](cross-cutting/certificates-tls.md)

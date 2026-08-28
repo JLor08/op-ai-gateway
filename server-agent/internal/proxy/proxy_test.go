@@ -592,6 +592,25 @@ func TestCertHolderBindHostDerivation(t *testing.T) {
 	}
 }
 
+// TestDeriveBindHost proves the exported main.go-facing helper (I2,
+// task-18-fix-round-1.md): a real leaf on disk resolves to its IP SAN
+// (matching writeTestLeaf's 127.0.0.1/localhost pair, IP preferred over
+// DNS per bindHost's own order), and a directory with no loadable leaf at
+// all returns "" rather than erroring -- the caller's own signal to fall
+// back to its own default.
+func TestDeriveBindHost(t *testing.T) {
+	certDir := t.TempDir()
+	writeTestLeaf(t, certDir)
+	if got := DeriveBindHost(certDir); got != "127.0.0.1" {
+		t.Fatalf("DeriveBindHost(with leaf) = %q, want 127.0.0.1", got)
+	}
+
+	empty := t.TempDir()
+	if got := DeriveBindHost(empty); got != "" {
+		t.Fatalf("DeriveBindHost(no leaf) = %q, want empty", got)
+	}
+}
+
 // TestManagerStopDrainsOffLock proves stopProxyLocked frees the port fd under the
 // lock but drains in-flight connections OFF-LOCK: removing a route with an
 // in-flight (blocked) request must not stall Apply/Status for the shutdown grace,

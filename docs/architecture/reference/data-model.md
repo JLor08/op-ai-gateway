@@ -34,12 +34,25 @@ not route-based).
 
 | Table | Purpose |
 |---|---|
-| `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides. |
+| `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
-| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, native-passthrough flags, health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port. |
+| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, native-passthrough flags, health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port. At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
+
+### Agent-managed model runtime
+
+See [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) for
+what these five tables are for, and §4 below for their field semantics.
+
+| Table | Purpose |
+|---|---|
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `enabled` (off by default). |
+| `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`. |
+| `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
+| `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
+| `server_runtime_reports` | 1:1 latest runtime-config report per server (upsert-overwrite), for an agent whose configuration source is a local file: an opaque validated JSON blob with env values already masked. |
 
 ### Model groups
 
@@ -211,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (63 migrations)
+## 4. Migration history (69 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -363,8 +376,126 @@ that never touches the new switches stays fully downgradable; the residual is
 opt-in and limited to the tokens an operator configured with them (never the
 catch-all `model_override`, which has its own column).
 
+### Model-group speed floor
+
+| # | Migration | Purpose |
+|---|---|---|
+| 64 | `model_group_min_tps_double_precision` | Widens migration 62's `model_groups.min_tokens_per_second` from PostgreSQL `real` (float32, which silently rounds) to `double precision`. A forward migration rather than an edit to 62, per the append-only rule and [ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types); a no-op on SQLite. |
+
+### Agent-managed model runtime
+
+| # | Migration | Purpose |
+|---|---|---|
+| 65 | `agent_runtime_manager` | Creates `agent_runtime_specs` (one launch spec per model mapping), `agent_runtime_spec_gpus` (per-GPU VRAM demand), and `agent_coresidency_rules` (the pairwise matrix). |
+| 66 | `server_runtime_limits` | Creates `ai_server_gpu_budgets` (PK `(server_id, gpu_index)`); adds `ai_servers.runtime_max_processes` (`0` = unlimited) and `ai_servers.managed_runtime_only`. |
+| 67 | `server_runtime_reports` | Creates `server_runtime_reports` — 1:1 latest runtime-config report per server (PK `server_id`, upsert-overwrite), shaped column-for-column like migration 29's `server_hardware`: `report_json` is a validated opaque blob the store never parses. |
+| 68 | `application_single_server_agent` | A **partial unique index only, no columns**: `applications(server_id) where type = 'server_agent'`, enforcing at most one `server_agent` application per server. Skips index creation (while still recording version 68) on a database that already holds duplicates — see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runner) for why that is a deliberate policy rather than an incomplete migration. |
+| 69 | `runtime_spec_set_visible_devices` | Adds `agent_runtime_specs.set_visible_devices` (integer boolean, default `0`): the agent sets the vendor-appropriate GPU visibility variable (`CUDA_VISIBLE_DEVICES` on NVIDIA, `ROCR_VISIBLE_DEVICES` on AMD) for that spec's child from that spec's own GPU indices. Appended rather than folded into migration 65 — which created the table on the same unreleased branch — because 65 had already run against every developer database and both CI conformance legs. |
+
+Field semantics in these tables that are **not** self-evident, and where a
+plausible-looking validation rule would break the normal case:
+
+- **Every VRAM value is megabytes, stored as `integer`** (2³¹ MB ≈ 2 PB), and
+  every new float column is `double precision` from the start — the ADR-005
+  lesson applied so the int4-overflow class cannot recur here. `vram_mb`,
+  `budget_mb`, `vram_estimate_mb` and `vram_measured_mb` are MB everywhere, on
+  the wire and in the database, while live GPU telemetry reports **bytes** and
+  must be converted at the boundary. Mixing the two silently makes the admission
+  arithmetic wrong by a factor of a million.
+- **The binary column is `binary_path`, not `binary`** (`BINARY` is a reserved
+  PostgreSQL keyword), while the Go field stays `RuntimeSpec.Binary` and the wire
+  field stays `binary`. Do not rename it to match.
+- `agent_runtime_specs` holds **exactly one spec per mapping** (`mapping_id`
+  unique, `on delete cascade`). `enabled` defaults **off**, so a half-finished row
+  triggers nothing. `args` is an opaque JSON-array string and `env` an opaque JSON
+  object (the `netbird_group_ids` pattern — the store never parses either); a
+  stored value that fails to unmarshal surfaces as a **400**
+  (`runtime_spec.args_invalid` / `runtime_spec.env_invalid`), never a raw JSON
+  error or a 500. **`env` must never hold a secret value** — only
+  `${AGENT_ENV:…}` references (see [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway)).
+- **Five zero-values mean "unbounded" or "automatic", not "off":**
+  `listen_port` 0 = the agent picks a free loopback port (the normal case);
+  `idle_timeout_seconds` 0 = never unload; `admission_wait_timeout_seconds` 0 =
+  wait until the client disconnects; `ai_servers.runtime_max_processes` 0 =
+  unlimited; `ai_server_gpu_budgets.budget_mb` 0 = no budget for that GPU, i.e.
+  unconstrained, **identical to an absent row** (which is why the portal's write
+  validation rejects only negative values, and why the agent's admission policy
+  skips any GPU index whose budget is `<= 0`). A validator that rejects 0 as
+  unset breaks all five; one that reads `budget_mb` 0 as a literal ceiling of
+  zero refuses every model on that card.
+- `pinned` means "starts with the agent and is never evicted"; `admin_state` is
+  `''` | `force_running` | `force_stopped`. `vram_locked` lives on the **spec**
+  rather than per GPU, because an operator thinks "pin this model's numbers", not
+  "pin GPU 2" (mirroring `metrics_locked`).
+- **VRAM ownership is split and must stay split.**
+  `agent_runtime_spec_gpus.vram_estimate_mb` is operator-owned (written by the
+  portal) and `vram_measured_mb` is agent-owned (written only by the telemetry
+  write-back). The portal's write reads the existing GPU rows first and copies
+  each index's measured value forward, ignoring whatever the request carries
+  there; a new index starts at measured 0. `vram_locked` is never consulted by
+  the portal write path, but it governs **both** directions of the agent's
+  relationship with the number: it stops the write-back, *and* it makes
+  `agentRuntimeSpecDTO` serve `vram_estimate_mb` instead of `vram_measured_mb`.
+  Both halves are needed for it to be an escape hatch rather than a one-way
+  ratchet — see the runtime concept doc §5.1. A future handler
+  that starts trusting `vram_measured_mb` from the request lets a UI round-trip
+  erase real measurements, after which the agent does admission arithmetic on
+  estimates it has already disproved.
+- `agent_coresidency_rules` has PK `(application_id, mapping_a_id, mapping_b_id)`
+  with the canonical order `mapping_a_id < mapping_b_id` enforced at **write**
+  time — one row per unordered pair, making double occupancy structurally
+  impossible. **Row present means pair allowed**; there is deliberately no
+  `allowed` column, so "not co-resident" is the structural default (exactly
+  today's llama-swap behaviour until an operator opens a cell) and the table stays
+  small. Accepted trade-off: an explicit "forbidden" is indistinguishable from
+  "never considered", and carries no `updated_at`. The diagonal stays empty —
+  multiple instances of one spec is a concurrency question
+  (`model_mappings.max_concurrency`), not a co-residency one. Adding an `allowed`
+  boolean later would invert the safe default and reopen double occupancy.
+  The **store is a dumb pair table**: it never sorts, rejects or rewrites an
+  out-of-order or reversed pair. Canonicalisation and rejection of a reversed
+  duplicate live only in the portal service, so anything writing these rows
+  outside it — a fixture, an import path — must canonicalise itself or the matrix
+  silently holds both directions.
+- `ai_server_gpu_budgets` snapshots `expected_uuid` and `expected_name` **at
+  creation only**, from the server's single newest telemetry sample, and copies
+  them (with `created_at`) forward verbatim on every later write; the request's
+  own values are never read — those fields exist on the DTO only because it
+  doubles as the response shape. A mismatch against live telemetry is a
+  **warning, never a blocker**: a driver update that renumbers cards must not take
+  a server out of service. AMD (`cardN`, no UUID) and Apple (always index 0,
+  unified memory) report no UUID and skip the check entirely rather than warning
+  falsely. Refreshing the snapshot from the latest sample, or honouring the
+  client's values, destroys the detector.
+- `server_runtime_reports.report_json` is an **opaque string to the store**: it
+  validates nothing. All sanitisation, env-value masking and `parse_error`
+  redaction happen in the gateway's ingest before the upsert, so anyone adding a
+  second writer of this table must repeat them — the store will happily persist
+  unredacted secrets.
+
+Read shapes and store-level behaviour worth knowing:
+
+- `ServerRuntimeReportByServer`, `RuntimeSpecByMapping` and `RuntimeSpecByID`
+  return `(zero, false, nil)` when absent — a found-bool, not `ErrNotFound`.
+- `UpsertRuntimeSpec`'s SQL is `insert … on conflict(mapping_id) do update`, and
+  the update set-list **never touches `id`**. An upsert against a mapping that
+  already has a spec therefore keeps the **stored** id (and `created_at`),
+  discarding a different id supplied by the caller; the portal's write relies on
+  this, reading the existing row first and preserving id/`created_at` while
+  bumping `updated_at`. Code that assumes "upsert writes the id I passed" will
+  build broken cross-references.
+- **Deleting a model mapping on a `server_agent` application is a real
+  runtime-config change, not bookkeeping.** The delete cascades the mapping's
+  runtime spec, its per-spec GPU rows and its co-residency pairs (by FK on the SQL
+  drivers, by hand in the memory driver), so it removes a whole `specs[]` entry
+  from the agent's document — and the agent must be told. Reasoning about mapping
+  deletion as a routing-only concern misses all three.
+
 ## See also
 
 - [Persistence](../cross-cutting/persistence.md) — the store boundary,
   driver selection, the migration runner, and the narrow-type and
   secrets-at-rest rules that this schema is built under.
+- [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) —
+  what the runtime tables are *for*: the admission rule they feed, the document
+  assembled from them, and the portal screen that edits them.

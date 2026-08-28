@@ -143,6 +143,18 @@ func (_d *APIWithTracing) AgentProxyRoutes(ctx context.Context, s1 string) (a1 A
 	return _d.API.AgentProxyRoutes(ctx, s1)
 }
 
+func (_d *APIWithTracing) AgentRuntimeConfig(ctx context.Context, s1 string) (a1 AgentRuntimeConfigDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AgentRuntimeConfig")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AgentRuntimeConfig(ctx, s1)
+}
+
 func (_d *APIWithTracing) AgentTokenStatus(ctx context.Context, t1 auth.Token, s1 string) (a1 AgentTokenDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AgentTokenStatus")
 	defer span.End()
@@ -553,6 +565,18 @@ func (_d *APIWithTracing) DeleteResourceGroup(ctx context.Context, t1 auth.Token
 	return _d.API.DeleteResourceGroup(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) DeleteRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteRuntimeSpec(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) DeleteServer(ctx context.Context, t1 auth.Token, s1 string, b1 bool) (b2 bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteServer")
 	defer span.End()
@@ -749,6 +773,18 @@ func (_d *APIWithTracing) GetChat(ctx context.Context, t1 auth.Token, s1 string)
 	return _d.API.GetChat(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) GetCoResidency(ctx context.Context, t1 auth.Token, s1 string) (c2 CoResidencyDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetCoResidency")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetCoResidency(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) GetModelGroup(ctx context.Context, t1 auth.Token, s1 string) (m1 ModelGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetModelGroup")
 	defer span.End()
@@ -773,6 +809,18 @@ func (_d *APIWithTracing) GetResourceGroup(ctx context.Context, t1 auth.Token, s
 	return _d.API.GetResourceGroup(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) GetRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string) (r1 RuntimeSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetRuntimeSpec(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) GetServer(ctx context.Context, t1 auth.Token, s1 string) (s2 ServerDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetServer")
 	defer span.End()
@@ -783,6 +831,18 @@ func (_d *APIWithTracing) GetServer(ctx context.Context, t1 auth.Token, s1 strin
 		}
 	}()
 	return _d.API.GetServer(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) GetServerGPUBudgets(ctx context.Context, t1 auth.Token, s1 string) (ga1 []GPUBudgetDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetServerGPUBudgets(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) GetService(ctx context.Context, t1 auth.Token, s1 string) (s2 ServiceDTO, err error) {
@@ -1263,6 +1323,18 @@ func (_d *APIWithTracing) PublicThemeView(ctx context.Context) (t1 ThemePublicVi
 	return _d.API.PublicThemeView(ctx)
 }
 
+func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string, p1 PutRuntimeSpecRequest) (r1 RuntimeSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PutRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PutRuntimeSpec(ctx, t1, s1, p1)
+}
+
 func (_d *APIWithTracing) ReassignGroupsOwnedBy(ctx context.Context, t1 auth.Token, s1 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReassignGroupsOwnedBy")
 	defer span.End()
@@ -1558,6 +1630,18 @@ func (_d *APIWithTracing) RotateToken(ctx context.Context, t1 auth.Token, s1 str
 	return _d.API.RotateToken(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) RuntimeWarnings(ctx context.Context, t1 auth.Token, s1 string) (sa1 []string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RuntimeWarnings")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RuntimeWarnings(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) SMTPRuntimeConfig(ctx context.Context) (s1 SMTPRuntimeConfig, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SMTPRuntimeConfig")
 	defer span.End()
@@ -1654,6 +1738,18 @@ func (_d *APIWithTracing) ServerPerfHistory(ctx context.Context, t1 auth.Token, 
 	return _d.API.ServerPerfHistory(ctx, t1, s1, d1)
 }
 
+func (_d *APIWithTracing) ServerRuntimeReportView(ctx context.Context, t1 auth.Token, s1 string) (s2 ServerRuntimeReportViewDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServerRuntimeReportView")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServerRuntimeReportView(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminGroupCandidateDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServiceAdminGroupCandidates")
 	defer span.End()
@@ -1668,6 +1764,18 @@ func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 au
 
 func (_d *APIWithTracing) SetCaptureSecret(t1 auth.Token, s1 string, b1 bool) (err error) {
 	return _d.API.SetCaptureSecret(t1, s1, b1)
+}
+
+func (_d *APIWithTracing) SetCoResidency(ctx context.Context, t1 auth.Token, s1 string, s2 SetCoResidencyRequest) (c2 CoResidencyDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetCoResidency")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetCoResidency(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool) (err error) {
@@ -1776,6 +1884,18 @@ func (_d *APIWithTracing) SetServerEnergyConfig(ctx context.Context, t1 auth.Tok
 		}
 	}()
 	return _d.API.SetServerEnergyConfig(ctx, t1, s1, f1, f2, f3, f4, s2)
+}
+
+func (_d *APIWithTracing) SetServerGPUBudgets(ctx context.Context, t1 auth.Token, s1 string, s2 SetGPUBudgetsRequest) (ga1 []GPUBudgetDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetServerGPUBudgets(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) SetServerHTTPSSwitchOverride(ctx context.Context, t1 auth.Token, s1 string, s2 string) (s3 ServerDTO, err error) {

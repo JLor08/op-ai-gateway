@@ -404,6 +404,18 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	deps.TracingOTLPSet = cfg.OTLPEndpoint != ""
 
 	srv := gateway.New(deps)
+	// Task 8 (agent-runtime-manager): wire the runtime-config WS push in now
+	// that srv exists. deps.SetRuntimeConfigChangedHook is portalService's
+	// OWN exported setter (Service.SetRuntimeConfigChangedHook), handed
+	// forward through ServerDeps by buildRuntime -- which still has
+	// portalService in scope where it builds deps.Portal -- because the
+	// setter cannot be called any earlier: it takes srv.PushRuntimeConfig,
+	// a method on the gateway Server, which does not exist until the
+	// gateway.New call directly above returns. The Server itself never
+	// sees *portal.Service; deps stays in scope here as an ordinary local.
+	if deps.SetRuntimeConfigChangedHook != nil {
+		deps.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)
+	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the
@@ -425,8 +437,13 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	// EnergyBackfillWindow/EnergyIdleWindowSeconds deps set above), so — like the
 	// scheduler — it is started here rather than duplicated in each of the 3 DB
 	// driver builders (they all funnel through this one buildGatewayServer call).
-	energyCtx, cancelEnergy := context.WithCancel(context.Background())
-	go srv.StartEnergyReconciler(energyCtx, time.Duration(cfg.EnergyReconcileIntervalSeconds)*time.Second)
+	// Started through startCancellable like every other background loop here, so
+	// cancelEnergy() does not merely signal: it returns only once the reconciler
+	// goroutine is gone, i.e. before the cleanup chain below reaches the store's
+	// Close. See startCancellable's doc for why that ordering matters.
+	cancelEnergy := startCancellable(func(ctx context.Context) {
+		srv.StartEnergyReconciler(ctx, time.Duration(cfg.EnergyReconcileIntervalSeconds)*time.Second)
+	})
 	prevCleanup := cleanup
 	cleanup = func() error {
 		stopScheduler()
@@ -839,6 +856,29 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// TLS-proxy routes (agent_proxy_status.go), the switch reconcile reads it,
 	// and the app-health loop prunes it to live servers.
 	agentProxyStatus := gateway.NewAgentProxyStatusRegistry()
+	// runtimeStatus is ONE shared registry too (agent-runtime-manager Task 9):
+	// the agent-telemetry ingest path publishes each managed process's live
+	// status to it and flips its per-server file-mode flag on a runtime
+	// report, the portal's runtime-status SSE stream (ServerDeps) subscribes
+	// to it, and the app-health loop prunes it to live servers -- same shape
+	// as agentProxyStatus/agentCertReports/agentTransport above.
+	runtimeStatus := gateway.NewRuntimeStatusRegistry()
+	// agentFeatures is ONE shared registry too (agent-runtime-manager): the
+	// agent-telemetry ingest path records each agent's declared capabilities
+	// in it, PushRuntimeConfig reads it to gate the runtime_config WS push,
+	// and the app-health loop prunes it to live servers -- same shape as
+	// runtimeStatus above. Constructed HERE (not left to gateway.New's
+	// default) precisely so the pruned instance and the written instance are
+	// the same object.
+	agentFeatures := gateway.NewAgentFeaturesRegistry()
+	// runtimeLogs is the live managed-process log relay (T3). Unlike its
+	// siblings above it needs NO app-health pruning: an entry exists only
+	// while a portal log-view SSE request is in flight and the last
+	// unsubscribe removes it, so nothing here can outlive a deleted server.
+	// It is still constructed here rather than left to gateway.New's default
+	// for the same reason as the others -- one instance, visible at the wiring
+	// site, so a future consumer cannot accidentally get a second one.
+	runtimeLogs := gateway.NewRuntimeLogRegistry()
 	// agentStreams is ONE shared registry too: handleAgentStream (ServerDeps)
 	// registers/deregisters each open agent WebSocket connection, and the
 	// OnCertificateIssued hook below pushes a cert_update doorbell to it
@@ -946,7 +986,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		syncer:       portalService,
 		registry:     appHealth,
 		loaded:       loadedModels,
-		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus},
+		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
 		groups:       groups,
 		settings:     b.SystemSettings,
 		probeTimeout: cfg.AppHealthProbeTimeout,
@@ -991,13 +1031,20 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	}
 	captureFlagsHook := newCaptureFlagsHook(b.SystemSettings, time.Now)
 	return gateway.ServerDeps{
-		Tokens:                          b.ServerTokens,
-		LastUsedModelWriter:             b.SetTokenLastUsedModel,
-		Usage:                           b.Usage,
-		UsageEvents:                     usageBroker,
-		Provider:                        mux,
-		Routes:                          tracedRoutes,
-		Portal:                          portal.NewAPIWithTracing(portalService),
+		Tokens:              b.ServerTokens,
+		LastUsedModelWriter: b.SetTokenLastUsedModel,
+		Usage:               b.Usage,
+		UsageEvents:         usageBroker,
+		Provider:            mux,
+		Routes:              tracedRoutes,
+		Portal:              portal.NewAPIWithTracing(portalService),
+		// SetRuntimeConfigChangedHook hands portalService's OWN exported
+		// setter forward -- portalService is in scope right here, alongside
+		// where it is wrapped for Portal above -- so buildGatewayServer can
+		// call it once srv (and srv.PushRuntimeConfig) exists. See that
+		// setter's doc and ServerDeps.SetRuntimeConfigChangedHook's doc for
+		// why this indirection exists instead of a direct field value.
+		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,
@@ -1029,6 +1076,9 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentTransport:                  agentTransport,
 		AgentProxyStatus:                agentProxyStatus,
 		AgentStreams:                    agentStreams,
+		RuntimeStatus:                   runtimeStatus,
+		RuntimeLogs:                     runtimeLogs,
+		AgentFeatures:                   agentFeatures,
 		Benchmarks:                      gateway.NewBenchmarkRegistry(),
 		Groups:                          groups,
 		Users:                           b.Users,
@@ -1195,6 +1245,9 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		routing.ProviderLlamaCPP:  openAICompatible,
 		routing.ProviderLlamaSwap: openAICompatible,
 		routing.ProviderLiteLLM:   openAICompatible,
+		// ProviderServerAgent: the agent-managed runtime's router port speaks
+		// the OpenAI-compatible dialect, same as vllm/llama_cpp/llama_swap/litellm.
+		routing.ProviderServerAgent: openAICompatible,
 	}, nil)
 }
 

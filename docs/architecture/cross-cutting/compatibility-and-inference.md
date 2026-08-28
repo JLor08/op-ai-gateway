@@ -358,6 +358,64 @@ handler) keeps the server's default 30s `ReadTimeout`/`WriteTimeout` (60s
 `IdleTimeout`) unmodified — only the inference/streaming paths, and a handful
 of other genuinely long-lived responses (log/usage/benchmark SSE), lift them.
 
+### 7.1 Cold loads and long prefills are the same failure class
+
+A model that is not yet loaded, and a warm model with a very long prefill, both
+produce the same thing on the wire: **a silent window with no bytes.** Which
+timer bounds that window — and whether raising it helps at all — depends on the
+path, and the distinctions below are the reason the
+[agent-managed model runtime](agent-runtime-manager.md) exists at all.
+
+- **Non-streaming requests of every upstream type are bounded by
+  `Target.Timeout` = the application's `timeout_ms`, a TOTAL deadline that
+  upstream activity never resets** (`openai_compatible.go`, `ollama.go`, and the
+  buffered `native_passthrough.go`). At the stock 30 s default, the client gets
+  `502 provider.timeout` on **every** cold load longer than 30 s. Treating
+  `timeout_ms` as an idle timeout leads to the wrong remedy for every cold-load
+  report.
+- **Streaming requests are bounded by the idle watchdog above.** On the
+  *translate* path the client sees a 200 followed by a terminal
+  `provider.stream_idle_timeout` frame; the *native* path failing before headers
+  reports `502 provider.unavailable`, which is **mislabelled** — a separate fix.
+
+Four secondary traps on the same path are still live and explain field symptoms
+whose causes are elsewhere than where they appear:
+
+| Trap | Field symptom |
+|---|---|
+| The application health probe has a **3 s** timeout and flips a *blocking* application unreachable after **one** failed cycle. | A server drops out of routing entirely if that is its only application — and can then never warm up. |
+| The benchmark's own **120 s** watchdog. | A model that loads in more than ~2 minutes never records a `load_time_ms`. |
+| `warmCallTimeout` is hardcoded at **60 s**, defeating climb-up warming for large models (spun off as a separate fix). | Large models are never warmed. |
+| Swap-protection routes a concurrent same-model request to a **second server**. | The same model is loaded twice. |
+
+Because `timeout_ms` is a total deadline, the **`server_agent` application type
+defaults it to 600000 ms (10 minutes)** instead of the stock 30000 — at 30000
+every cold managed-model load fails reproducibly.
+`normalizeApplicationTimeoutMS(appType, timeoutMS)` preserves any non-zero value
+and maps zero to the type's default, so the default is re-applied on a retype and
+when an update sends `timeout_ms: 0`; note the ordering dependency, that
+`UpdateApplication` calls it **after** assigning the new type, so a single PATCH
+that both retypes to `server_agent` and sets `timeout_ms: 0` gets the *new*
+type's 600000. Normalising that value back to 30000 "for consistency" breaks
+every cold load. The portal additionally warns when an application's `timeout_ms`
+does not exceed the largest `startup_timeout_seconds` among its enabled
+mappings — **the agent runtime alone does not heal the 30 s case**, because the
+gateway's timer keeps running while the agent's router holds the request.
+
+The agent's router emits SSE keepalive comments during a silent streaming window,
+which re-arms the **native passthrough** watchdog (byte-based) and nginx's timer,
+but **not** the translate path's watchdog (event-based, and its scanner skips SSE
+comment lines) and **not** the non-streaming total deadline. The real gateway-side
+fix — deadlines computed from measured `load_time_ms` and
+`prompt_tokens_per_second` × a prompt estimate, using the authoritative
+loaded-state the agent now provides, plus benchmark-watchdog decoupling and the
+double-load vector — is deliberately deferred to a later routing-integration
+sub-project.
+
+**Immediate operator relief, independent of that work:** raise `timeout_ms` on
+applications serving large models, and raise `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`
+— at the cost of detecting genuine hangs later.
+
 ## 8. Provider clients
 
 | Client | `internal/provider/*.go` | `Complete` | `CompleteStream` | `NativeProxyClient` | `ModelLister` |
@@ -554,3 +612,6 @@ See [Configuration](configuration.md) for the full variable list.
   how every completed/failed/streamed request in this chapter becomes a usage
   event, and the optional encrypted payload capture threaded through
   `complete`/`completeStream*`.
+- [Agent-Managed Model Runtime](agent-runtime-manager.md) — the feature built
+  around §7.1: on-demand model starts behind one router port, and the timeout
+  budget that spans the gateway's deadlines and the agent's per-spec ones.

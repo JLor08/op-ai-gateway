@@ -48,6 +48,26 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'mapping.app_name_required': 'errorMappingAppNameRequired',
   'mapping.gateway_name_conflict': 'errorMappingGatewayNameConflict',
   'mapping.status_invalid': 'errorMappingStatusInvalid',
+  // Agent-runtime-manager (task 19+): runtime specs, co-residency, GPU
+  // budgets, and the managed-runtime-only application gate. Read verbatim
+  // from the Go sentinels in portal/service_runtime.go and the errRow tables
+  // in gateway/portal_runtime_endpoints.go, portal_application_endpoints.go,
+  // and portal_server_endpoints.go -- not guessed from memory.
+  'runtime_spec.not_found': 'errorRuntimeSpecNotFound',
+  'runtime_spec.binary_required': 'errorRuntimeSpecBinaryRequired',
+  'runtime_spec.args_invalid': 'errorRuntimeSpecArgsInvalid',
+  'runtime_spec.env_invalid': 'errorRuntimeSpecEnvInvalid',
+  'runtime_spec.gpu_invalid': 'errorRuntimeSpecGpuInvalid',
+  'runtime_spec.tuning_invalid': 'errorRuntimeSpecTuningInvalid',
+  'runtime_spec.admin_state_invalid': 'errorRuntimeSpecAdminStateInvalid',
+  'runtime_spec.visible_devices_no_gpus': 'errorRuntimeSpecVisibleDevicesNoGpus',
+  'runtime_spec.visible_devices_conflict': 'errorRuntimeSpecVisibleDevicesConflict',
+  'runtime_spec.application_not_server_agent': 'errorRuntimeSpecApplicationNotServerAgent',
+  'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
+  'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',
+  'server.runtime_limit_invalid': 'errorServerRuntimeLimitInvalid',
+  'application.managed_runtime_only': 'errorApplicationManagedRuntimeOnly',
+  'application.server_agent_exists': 'errorApplicationServerAgentExists',
   'benchmark.already_running': 'errorBenchmarkAlreadyRunning',
   'benchmark.server_in_use': 'errorBenchmarkServerInUse',
   'benchmark.no_models': 'errorBenchmarkNoModels',

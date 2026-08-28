@@ -1,0 +1,157 @@
+{
+  // The gateway base URL the agent sends telemetry to (origin only, no path).
+  // Required. Example: https://gateway.example.com. Under a NetBird-only
+  // restriction, use the gateway's mesh URL here instead.
+  "gateway_url": "https://gw.example.test",
+
+  // The per-server agent bearer token, shown once when generated in the portal.
+  // It identifies this server to the gateway. Required. Keep this file private
+  // (e.g. chmod 600) because it holds the token.
+  "token": "fixture-token",
+
+  // Telemetry transport: "websocket" (default; one persistent connection, cheap
+  // for high-frequency sending) or "post" (one HTTP POST per sample).
+  "transport": "websocket",
+
+  // Collection cadence as a Go duration, e.g. "500ms", "1s", "5s". Clamped up to
+  // a 250ms floor. Default "1s".
+  "interval": "1s",
+
+  // POST-mode re-send cadence for the static hardware inventory (self-heals a
+  // gateway restart). Floored at "1m"; ignored under the websocket transport.
+  // Default "30m".
+  "system_report_interval": "30m",
+
+  // Optional inference /metrics (Prometheus) URL to scrape for active/queued
+  // request counts. Empty disables it.
+  "metrics_url": "",
+
+  // Optional endpoint polled each cycle for currently-loaded models, e.g.
+  // "/running" for llama-swap, "/props" for llama.cpp, "/v1/models" for vLLM.
+  // Empty disables it.
+  "model_status_url": "",
+
+  // How to parse model_status_url: "openai" | "llama_swap" | "llama_cpp" |
+  // "litellm" | "" or "auto" (tolerant union of all shapes). Empty = auto.
+  "model_status_format": "",
+
+  // Optional LibreHardwareMonitor Remote Web Server /data.json URL for CPU (and
+  // best-effort system) power watts. Empty disables it.
+  "lhm_url": "",
+
+  // Certificate installation mode: "off" (default, never fetch a certificate),
+  // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
+  // cert_reload_command on change), or "proxy" (everything "files" does, and
+  // additionally runs the agent-side TLS-terminating reverse proxy: it serves
+  // the routes the gateway publishes -- merged with cert_proxy_routes below --
+  // with the installed leaf). cert_dir is required when this is not "off".
+  "cert_mode": "off",
+
+  // Directory certificate files are written to. Required when cert_mode is not
+  // "off".
+  "cert_dir": "",
+
+  // Local command run after a changed certificate is fully installed on disk.
+  // This value comes ONLY from this local file -- the gateway can never deliver
+  // a command to run. On Windows, keep the value quote-free (no embedded quotes).
+  "cert_reload_command": "",
+
+  // Certificate poll cadence as a Go duration, e.g. "15m". Empty or "0"/"0s" means
+  // automatic (websocket transport polls every 6h, post every 15m). A configured
+  // positive value below "1m" is clamped up to "1m".
+  "cert_poll_interval": "",
+
+  // Local routes for the cert_mode "proxy" listener, each an object
+  // {"listen": <port>, "upstream": "http://host:port"}. Config-file only: no
+  // env var, no flag. Empty (the default) means the agent serves only the
+  // routes the gateway publishes. Ignored unless cert_mode is "proxy".
+  "cert_proxy_routes": [],
+
+  // How a cert_proxy_routes entry is merged with a gateway-published route on
+  // the SAME listen port: "fallback" (the default; the local route fills only
+  // a port the gateway did not publish) or "override" (the local route wins).
+  // Empty resolves to "fallback".
+  "cert_proxy_routes_mode": "fallback",
+
+  // Optional operator-managed CA bundle. Generated configs leave this empty;
+  // the agent never writes this file.
+  "ca_file": "",
+
+  // Optional agent-managed CA cache, relative to this config file when not
+  // absolute. Self-signed gateway configs use "server-agent-ca.pem".
+  "ca_cache_file": "",
+
+  // Optional inline CA bootstrap bundle. Present only when the gateway's
+  // currently served leaf is signed by the internal CA.
+  "ca_pem": "",
+
+  // Where the agent-managed model runtime's launch specs come from: "gateway"
+  // (the default -- fetched from the portal-maintained runtime-config
+  // endpoint) or "file" (read from runtime_config below and reported upward
+  // read-only, so the portal shows them but cannot change them).
+  "runtime_source": "gateway",
+
+  // Path to the local runtime-config JSON file. REQUIRED when runtime_source
+  // is "file"; never read otherwise. Relative to this config file when not
+  // absolute.
+  "runtime_config": "",
+
+  // Absolute paths a launch spec's "binary" must match EXACTLY -- compared
+  // byte for byte, so spell each one as the spec does:
+  // "/opt/llama/llama-server" on POSIX, "C:/llama/llama-server.exe" on
+  // Windows (forward slashes; a backslash would need JSON escaping).
+  // EMPTY (the default) MEANS NOTHING MAY START -- a deliberate hard refusal,
+  // not a permissive default: every spec reports not_permitted until its
+  // binary is listed here. Comes ONLY from this local file, and it is the
+  // operator's half of the contract: the gateway decides when and how a model
+  // process runs, this list decides whether it may run at all.
+  "runtime_allowed_binaries": [],
+
+  // Permitted "work_dir" prefixes for launch specs. Empty (the default) means
+  // ANY work_dir is accepted -- deliberately the inverse of the list above,
+  // so an operator who does not care need not enumerate the filesystem. Once
+  // non-empty, a spec that sets no work_dir is refused too. Containment is a
+  // lexical path-prefix check that does not resolve symlinks: defense in
+  // depth, not the boundary.
+  "runtime_allowed_dirs": [],
+
+  // Where the last known-good runtime-config document from the gateway is
+  // cached, so the agent can start (and keep) model processes before its first
+  // successful gateway contact. Empty (the default) means
+  // "server-agent-runtime.cache.json" next to the agent binary; a relative
+  // value is resolved beside this config file.
+  "runtime_cache": "",
+
+  // Bind host for the agent-managed model runtime's router port -- the port the
+  // gateway sends inference requests to for a server_agent application. This
+  // value comes ONLY from this local file: the gateway supplies the router's
+  // PORT, never its bind host. Empty (the default) means derive one from the
+  // mesh leaf installed in cert_dir, and ALL INTERFACES -- with a warning in
+  // the agent log -- when there is none, which is what the empty cert_dir this
+  // file ships with gives you. Set it explicitly (the mesh IP, or
+  // "127.0.0.1") on any host that is not mesh-only.
+  "runtime_router_bind": "",
+
+  // How much of each managed model process's stdout+stderr this agent keeps
+  // in memory, in BYTES, so an operator can read it AFTER the fact -- the
+  // buffer belongs to the SPEC and outlives the process, so a crashed model's
+  // output is still there when its log view is opened, and a restart appends
+  // with a visible boundary marker instead of wiping the history. 0 (the
+  // default) means 1048576 (1 MiB), enough for a full model startup plus its
+  // context; anything below 65536 is raised to it. Kept in RAM only and NEVER
+  // written to disk -- this content can include prompt text.
+  "runtime_log_buffer_bytes": 0,
+
+  // Ceiling on the SUM of those buffers across every spec, in BYTES, so a
+  // server with twenty specs is not twenty times the number above. 0 (the
+  // default) means 16777216 (16 MiB). The agent keeps at most
+  // total/per-spec buffers, evicting the least-recently-written one nobody is
+  // watching to stay inside the ceiling.
+  "runtime_log_buffer_total_bytes": 0,
+
+  // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
+  "tls_insecure": false,
+
+  // Verbose mode: emit detailed debug logs to stderr. Default false.
+  "verbose": false
+}

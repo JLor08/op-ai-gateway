@@ -394,6 +394,18 @@ type ServiceDeps struct {
 	// transaction publishes a new public root bundle. It must be non-blocking;
 	// the periodic agent refresh is the delivery backstop.
 	OnCABundleChanged func(fingerprint string)
+	// OnRuntimeConfigChanged, when set, is invoked (best-effort) after a
+	// successful agent-runtime-spec CRUD write (Service.PutRuntimeSpec /
+	// DeleteRuntimeSpec) with the AFFECTED server's id, so the caller can
+	// push that server's current runtime config to its connected
+	// ServerAgent instead of waiting for the agent's next poll. Nil = no
+	// push (a later poll/reconnect is the backstop). Also settable AFTER
+	// construction via Service.SetRuntimeConfigChangedHook — see that
+	// method's doc for why: cmd/gateway builds the gateway Server (which
+	// owns the real push) AFTER the portal Service, so this field alone
+	// cannot carry it for the production wiring; ServiceDeps still exists
+	// for tests that want the hook from construction.
+	OnRuntimeConfigChanged func(serverID string)
 	// ACMEChallenges is the HTTP-01 token store the ACME issuer publishes
 	// key authorizations into (the gateway's /.well-known/acme-challenge/
 	// handler serves from the same instance). nil = the acme issuer mode cannot
@@ -577,9 +589,13 @@ type Service struct {
 	// AgentPresenceTimeoutSeconds when the KV is unset/invalid.
 	agentPresenceTimeoutDefault int
 	settingsVolatile            bool
-	clock                       func() time.Time
-	secretGenerator             func() (string, error)
-	idGenerator                 func() string
+	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
+	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
+	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
+	runtimeChanged  func(serverID string)
+	clock           func() time.Time
+	secretGenerator func() (string, error)
+	idGenerator     func() string
 	// themes is the loaded external-theme registry (see ServiceDeps.Themes).
 	// Always non-nil after NewService -- a nil deps.Themes is defaulted to an
 	// empty *theme.Registry so every reader can call its methods unguarded.
@@ -679,6 +695,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentTLSSeparateDefault:     deps.AgentTLSSeparateDefault,
 		agentPresenceTimeoutDefault: agentPresenceDefault,
 		settingsVolatile:            deps.SettingsVolatile,
+		runtimeChanged:              deps.OnRuntimeConfigChanged,
 		clock:                       clock,
 		secretGenerator:             secretGenerator,
 		idGenerator:                 idGenerator,
@@ -687,6 +704,17 @@ func NewService(deps ServiceDeps) *Service {
 	// Bound after construction so the method value carries the finished Service.
 	svc.cert.issuer = svc.issueCertificate
 	return svc
+}
+
+// SetRuntimeConfigChangedHook sets (or replaces) the best-effort callback
+// invoked after a successful agent-runtime-spec write (see ServiceDeps.
+// OnRuntimeConfigChanged for the exact contract). Exported as a setter,
+// distinct from every other ServiceDeps-only hook, because cmd/gateway
+// constructs the gateway Server -- which owns the real push implementation
+// -- AFTER the portal Service; this lets main.go wire the real hook in once
+// the gateway Server exists instead of restructuring construction order.
+func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string)) {
+	s.runtimeChanged = fn
 }
 
 type CurrentUser struct {
@@ -997,6 +1025,14 @@ type ServerDTO struct {
 	// AgentPresenceTimeoutSeconds is the per-server override (seconds) for "the
 	// agent is delivering values"; 0 = follow the system-wide default.
 	AgentPresenceTimeoutSeconds int `json:"agent_presence_timeout_seconds"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6, migration 66) mirror
+	// routing.AIServer's fields of the same name: how many agent-managed
+	// runtime processes (server_agent applications) may run concurrently on
+	// this server (0 = unlimited), and whether the server is restricted to
+	// agent-managed runtime applications only (gating CreateApplication --
+	// see ErrServerManagedRuntimeOnly).
+	RuntimeMaxProcesses int  `json:"runtime_max_processes"`
+	ManagedRuntimeOnly  bool `json:"managed_runtime_only"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet). All default 0 = "unset / use default".
 	EstimatedWatts float64 `json:"estimated_watts"`
@@ -1044,6 +1080,11 @@ type CreateServerRequest struct {
 	// override (seconds); nil = follow the system default (stored as 0). Must be
 	// >= 0 when set.
 	AgentPresenceTimeoutSeconds *int `json:"agent_presence_timeout_seconds,omitempty"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6): nil = default (0 /
+	// false). RuntimeMaxProcesses must be >= 0 when set (else
+	// ErrServerRuntimeLimitInvalid).
+	RuntimeMaxProcesses *int  `json:"runtime_max_processes,omitempty"`
+	ManagedRuntimeOnly  *bool `json:"managed_runtime_only,omitempty"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet). nil = unset (stored as 0). Must be >= 0 when set.
 	EstimatedWatts *float64 `json:"estimated_watts,omitempty"`
@@ -1078,6 +1119,11 @@ type UpdateServerRequest struct {
 	// override (seconds); a supplied 0 resets to "follow the system default".
 	// Must be >= 0 when set.
 	AgentPresenceTimeoutSeconds *int `json:"agent_presence_timeout_seconds,omitempty"`
+	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6): a supplied 0/false
+	// resets to the default. RuntimeMaxProcesses must be >= 0 when set (else
+	// ErrServerRuntimeLimitInvalid).
+	RuntimeMaxProcesses *int  `json:"runtime_max_processes,omitempty"`
+	ManagedRuntimeOnly  *bool `json:"managed_runtime_only,omitempty"`
 	// Energy-attribution config (purely additive — no engine consumes these
 	// yet); a supplied 0 resets to "unset". Must be >= 0 when set.
 	EstimatedWatts *float64 `json:"estimated_watts,omitempty"`
@@ -2387,6 +2433,17 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		}
 		agentPresenceTimeout = *req.AgentPresenceTimeoutSeconds
 	}
+	runtimeMaxProcesses := 0
+	if req.RuntimeMaxProcesses != nil {
+		if *req.RuntimeMaxProcesses < 0 {
+			return ServerDTO{}, ErrServerRuntimeLimitInvalid
+		}
+		runtimeMaxProcesses = *req.RuntimeMaxProcesses
+	}
+	managedRuntimeOnly := false
+	if req.ManagedRuntimeOnly != nil {
+		managedRuntimeOnly = *req.ManagedRuntimeOnly
+	}
 	var estimatedWatts, idleWatts, pricePerKwh, pue float64
 	if req.EstimatedWatts != nil {
 		if *req.EstimatedWatts < 0 {
@@ -2423,6 +2480,8 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		Status: status, HealthStatus: routing.HealthUnknown, NetbirdEnabled: netbirdEnabled,
 		NetbirdPolicyOverride:       policyOverride,
 		AgentPresenceTimeoutSeconds: agentPresenceTimeout,
+		RuntimeMaxProcesses:         runtimeMaxProcesses,
+		ManagedRuntimeOnly:          managedRuntimeOnly,
 		EstimatedWatts:              estimatedWatts,
 		IdleWatts:                   idleWatts,
 		PricePerKwh:                 pricePerKwh,
@@ -2540,6 +2599,15 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 		}
 		server.AgentPresenceTimeoutSeconds = *req.AgentPresenceTimeoutSeconds
 	}
+	if req.RuntimeMaxProcesses != nil {
+		if *req.RuntimeMaxProcesses < 0 {
+			return ServerDTO{}, ErrServerRuntimeLimitInvalid
+		}
+		server.RuntimeMaxProcesses = *req.RuntimeMaxProcesses
+	}
+	if req.ManagedRuntimeOnly != nil {
+		server.ManagedRuntimeOnly = *req.ManagedRuntimeOnly
+	}
 	if req.EstimatedWatts != nil {
 		if *req.EstimatedWatts < 0 {
 			return ServerDTO{}, ErrServerEnergyConfigInvalid
@@ -2578,6 +2646,34 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	if err := s.routes.UpdateAIServer(ctx, server); err != nil {
 		return ServerDTO{}, err
 	}
+	// Best-effort, immediately after the successful row write and long before
+	// the NetBird round trip below: the AI SERVER row is row 1 of THE RULE's
+	// list on notifyRuntimeChanged -- RuntimeMaxProcesses is the document's
+	// max_processes -- and UpdateServer is the only path that writes it.
+	//
+	// UNCONDITIONAL for this server, deliberately, on both counts:
+	//
+	//   - Not gated on req.RuntimeMaxProcesses != nil. That is precisely the
+	//     "relevant fields" allow-list THE RULE rejects: a second, uncompiled
+	//     copy of AgentRuntimeConfig's derivation that rots the day the
+	//     document reads a second server column.
+	//   - Not gated on the server actually HAVING a server_agent application
+	//     either, even though most servers do not. Such a gate would need an
+	//     ApplicationsByServer read on every server edit, it would be a second
+	//     copy of AgentRuntimeConfig's own server_agent lookup (the same rot),
+	//     and it would be racy against a concurrent application create. It
+	//     would also buy nothing: gateway.Server.PushRuntimeConfig already
+	//     fail-closes on "no runtime_manager agent connected for this server"
+	//     with a map lookup, before it reads any row -- a cheaper and strictly
+	//     more accurate version of the same test, at the point of delivery. A
+	//     server that does have a connected agent but no server_agent
+	//     application pushes the empty document, whose ETag is unchanged, and
+	//     the agent's driver no-ops.
+	//
+	// Placed before the SetServerOwners write below rather than after it: the
+	// row change has already landed, and owners are no part of the document, so
+	// a failing owner write must not swallow the announcement.
+	s.notifyRuntimeChanged(server.ID)
 	if req.OwnerIDs != nil {
 		if err := s.routes.SetServerOwners(ctx, server.ID, ownerIDs); err != nil {
 			return ServerDTO{}, err
@@ -3105,6 +3201,8 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
 		AgentStatus:                 s.agentStatus(ctx, server),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
+		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
+		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
 		EstimatedWatts:              server.EstimatedWatts,
 		IdleWatts:                   server.IdleWatts,
 		PricePerKwh:                 server.PricePerKwh,

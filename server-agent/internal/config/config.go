@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -92,6 +93,22 @@ type ProxyRoute struct {
 // neither -config nor OP_AGENT_CONFIG points elsewhere.
 const defaultConfigName = "server-agent.json"
 
+// Runtime spec sources for RuntimeSource: which document the agent-managed
+// model runtime (a later task) treats as authoritative for launch specs.
+const (
+	// RuntimeSourceGateway is the default: specs come from the gateway's
+	// GET /api/agent/v1/runtime-config.
+	RuntimeSourceGateway = "gateway"
+	// RuntimeSourceFile reads the runtime-config document from
+	// RuntimeConfigPath on the local disk instead of the gateway.
+	RuntimeSourceFile = "file"
+)
+
+// defaultRuntimeCacheName is the runtime process-state cache file looked for
+// next to the binary when RuntimeCachePath is not otherwise configured (the
+// defaultConfigName precedent).
+const defaultRuntimeCacheName = "server-agent-runtime.cache.json"
+
 // Config holds the resolved agent settings. The server identity is derived from
 // the token by the gateway, so there is no hostname field.
 type Config struct {
@@ -154,6 +171,67 @@ type Config struct {
 	// Transport selects how samples reach the gateway: "post" (default, one HTTP
 	// POST per sample) or "websocket" (one persistent connection).
 	Transport string
+
+	// RuntimeSource selects which document the agent-managed model runtime
+	// treats as authoritative: RuntimeSourceGateway (default, fetched from
+	// the gateway) or RuntimeSourceFile (read from RuntimeConfigPath
+	// locally). An empty value resolves to RuntimeSourceGateway.
+	RuntimeSource string
+	// RuntimeConfigPath is the local runtime-config JSON file path. Required
+	// when RuntimeSource is RuntimeSourceFile; ignored otherwise. A relative
+	// value is anchored beside the selected config file (the CAFile/
+	// CACacheFile precedent), since it names a file whose path is typically
+	// written relative to that same config file.
+	RuntimeConfigPath string
+	// RuntimeAllowedBinaries lists the absolute binary paths the agent's
+	// OWN local policy permits launching, regardless of what the gateway
+	// asks for -- this is the operator-controlled counterweight to the
+	// gateway-supplied launch spec (see internal/runtime.LocalPolicy). This
+	// value comes ONLY from this local config; the gateway can never expand
+	// what may run here. Nil (unset) means the operator has configured
+	// nothing, which LocalPolicy treats as "refuse everything", not
+	// "anything goes".
+	RuntimeAllowedBinaries []string
+	// RuntimeAllowedDirs lists permitted work_dir prefixes for the local
+	// policy, with the same operator-only provenance as
+	// RuntimeAllowedBinaries. Nil (unset) means any work_dir is permitted.
+	RuntimeAllowedDirs []string
+	// RuntimeCachePath is where the runtime process-state cache is
+	// persisted. Defaults to defaultRuntimeCacheName next to the binary. A
+	// relative value from the config file is anchored beside that config
+	// file (the CAFile/CACacheFile precedent) rather than the agent's
+	// process working directory, which for a service is typically "/".
+	RuntimeCachePath string
+	// RuntimeRouterBindHost is the operator-controlled bind address for the
+	// agent-managed model runtime's router port (task-18-fix-round-1.md
+	// I2): an empty string (the default) means "derive a default" -- main.go
+	// tries the agent's own mesh identity first (mirroring
+	// proxy.DeriveBindHost), then falls back to all interfaces, logging a
+	// Warn when it does. Same operator-only provenance as
+	// RuntimeAllowedBinaries/RuntimeAllowedDirs: this value comes ONLY from
+	// this local config, never from the gateway -- the gateway supplies
+	// only the router's PORT (router_listen), never its bind host.
+	RuntimeRouterBindHost string
+	// RuntimeLogBufferBytes is how much of each managed model process's
+	// stdout+stderr this agent keeps in memory so an operator can read it
+	// AFTER the fact -- the buffer survives the process, so a crashed model's
+	// output is still there when someone opens the log view. 0 (the default)
+	// means the built-in default (runtime.DefaultLogBufferBytes, 1 MiB).
+	//
+	// Same operator-only provenance as RuntimeAllowedBinaries/
+	// RuntimeAllowedDirs, and for the same kind of reason: memory on an AI
+	// server is the operator's tradeoff to make, and the gateway must not be
+	// able to make this host spend more of it.
+	//
+	// Retained content is kept in RAM only and is never written to disk --
+	// it can contain prompt text (see internal/runtime/logs.go).
+	RuntimeLogBufferBytes int
+	// RuntimeLogBufferTotalBytes caps the SUM of those buffers across every
+	// spec, so a server with twenty specs is not twenty times the per-spec
+	// number. 0 (the default) means runtime.DefaultLogBufferTotalBytes
+	// (16 MiB). The agent keeps at most total/per-spec buffers, evicting the
+	// least-recently-written unwatched one.
+	RuntimeLogBufferTotalBytes int
 }
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
@@ -180,6 +258,16 @@ type fileConfig struct {
 	TLSInsecure          *bool        `json:"tls_insecure"`
 	Verbose              *bool        `json:"verbose"`
 	Transport            string       `json:"transport"`
+
+	RuntimeSource          string   `json:"runtime_source"`
+	RuntimeConfigPath      string   `json:"runtime_config"`
+	RuntimeAllowedBinaries []string `json:"runtime_allowed_binaries"`
+	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
+	RuntimeCachePath       string   `json:"runtime_cache"`
+	RuntimeRouterBindHost  string   `json:"runtime_router_bind"`
+
+	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
+	RuntimeLogBufferTotalBytes int `json:"runtime_log_buffer_total_bytes"`
 }
 
 // executable is os.Executable, indirected so tests can control the
@@ -216,6 +304,10 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	vShort := fs.Bool("v", false, "verbose: emit detailed debug logs (env OP_AGENT_VERBOSE / config verbose)")
 	vLong := fs.Bool("verbose", false, "alias for -v")
 	configPath := fs.String("config", "", "path to a JSON config file (default: "+defaultConfigName+" next to the binary; env OP_AGENT_CONFIG)")
+	runtimeSource := fs.String("runtime-source", "", "agent-managed model runtime spec source: gateway|file (env OP_AGENT_RUNTIME_SOURCE / config runtime_source)")
+	runtimeConfigPath := fs.String("runtime-config", "", "path to a local runtime-config JSON file; required when runtime-source=file (env OP_AGENT_RUNTIME_CONFIG / config runtime_config)")
+	runtimeCachePath := fs.String("runtime-cache", "", "path to the runtime process-state cache file (default: "+defaultRuntimeCacheName+" next to the binary; env OP_AGENT_RUNTIME_CACHE / config runtime_cache)")
+	runtimeRouterBindHost := fs.String("runtime-router-bind", "", "bind host for the agent-managed model runtime's router port; empty = derive from the mesh identity, else all interfaces (env OP_AGENT_RUNTIME_ROUTER_BIND / config runtime_router_bind)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -285,6 +377,16 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		SystemReportInterval: systemReportInterval,
 		TLSInsecure:          resolveBool(set["tls-insecure"], *tlsInsecure, getenv("OP_AGENT_TLS_INSECURE"), file.TLSInsecure),
 		Verbose:              resolveBool(set["v"] || set["verbose"], *vShort || *vLong, getenv("OP_AGENT_VERBOSE"), file.Verbose),
+
+		RuntimeSource:          strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
+		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
+		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
+		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
+		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
+
+		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
+		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -295,12 +397,69 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if cfg.CertProxyRoutesMode == "" {
 		cfg.CertProxyRoutesMode = CertProxyRoutesModeFallback
 	}
+	if cfg.RuntimeSource == "" {
+		cfg.RuntimeSource = RuntimeSourceGateway
+	}
+	if cfg.RuntimeCachePath == "" {
+		cfg.RuntimeCachePath = defaultRuntimeCachePath()
+	}
 	cfg.CAFile = resolvePathAgainstConfig(cfg.CAFile, path)
 	cfg.CACacheFile = resolvePathAgainstConfig(cfg.CACacheFile, path)
+	cfg.RuntimeConfigPath = resolvePathAgainstConfig(cfg.RuntimeConfigPath, path)
+	cfg.RuntimeCachePath = resolvePathAgainstConfig(cfg.RuntimeCachePath, path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// resolveInt applies env > file for a plain integer setting that (per the
+// RuntimeAllowedBinaries/CertProxyRoutes precedent this family follows) has
+// no flag layer. An env value that is absent, blank, or not a base-10 integer
+// falls through to the file value rather than failing the whole load: these
+// are byte-size tuning knobs, and refusing to start an agent -- taking every
+// model on the host down with it -- over a fat-fingered buffer size would be
+// wildly out of proportion to the mistake. The consumer clamps whatever
+// arrives (runtime.NewLogStore), so an absurd value is bounded, not obeyed.
+func resolveInt(envVal string, fileVal int) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fileVal
+}
+
+// resolveStringList applies env(if non-empty, comma-separated) > file for a
+// structured slice field that (per the CertProxyRoutes precedent) has no
+// flag layer. Each comma-separated env entry is trimmed of surrounding
+// whitespace; empty entries (e.g. a trailing comma) are dropped. A file
+// value is returned exactly as decoded (nil when the key is absent), so
+// "never configured" stays distinguishable from "configured empty" the same
+// way CertProxyRoutes does.
+func resolveStringList(envVal string, fileVal []string) []string {
+	if v := strings.TrimSpace(envVal); v != "" {
+		parts := strings.Split(v, ",")
+		result := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				result = append(result, p)
+			}
+		}
+		return result
+	}
+	return fileVal
+}
+
+// defaultRuntimeCachePath is server-agent-runtime.cache.json in the binary's
+// own directory (the defaultConfigPath precedent).
+func defaultRuntimeCachePath() string {
+	exe, err := executable()
+	if err != nil {
+		return defaultRuntimeCacheName
+	}
+	return filepath.Join(filepath.Dir(exe), defaultRuntimeCacheName)
 }
 
 // resolvePathAgainstConfig makes a relative path independent of the process
@@ -533,6 +692,24 @@ func (c Config) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Port() == "" {
 			return fmt.Errorf("cert_proxy_routes[%d].upstream must be an absolute http(s) URL with host:port, got %q", i, r.Upstream)
 		}
+	}
+	// An empty source is treated as RuntimeSourceGateway: Load() always
+	// defaults it before reaching here, but a Config built directly (e.g. in
+	// tests) must still validate byte-neutrally rather than fail on a field
+	// it never set.
+	runtimeSource := c.RuntimeSource
+	if runtimeSource == "" {
+		runtimeSource = RuntimeSourceGateway
+	}
+	switch runtimeSource {
+	case RuntimeSourceGateway:
+		// No further requirement.
+	case RuntimeSourceFile:
+		if c.RuntimeConfigPath == "" {
+			return fmt.Errorf("runtime-config is required when runtime-source is %q", RuntimeSourceFile)
+		}
+	default:
+		return fmt.Errorf("runtime-source must be %q or %q, got %q", RuntimeSourceGateway, RuntimeSourceFile, c.RuntimeSource)
 	}
 	return nil
 }

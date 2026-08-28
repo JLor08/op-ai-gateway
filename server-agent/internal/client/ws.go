@@ -27,8 +27,12 @@ import (
 // streamPath is the gateway WebSocket route (mirrors telemetryPath for the POST path).
 const streamPath = "/api/agent/v1/stream"
 
-// wsMaxFrameBytes caps a single frame (symmetry with the gateway's read limit).
-const wsMaxFrameBytes int64 = 1 << 20
+// wsMaxFrameBytes caps a single frame. Not "symmetry with the gateway's read
+// limit" as a matter of taste -- it IS the gateway's read limit, held in one
+// place for the whole agent module (gwapi.MaxWSFrameBytes), because the frames
+// this file writes have to fit through it and internal/runtime has to size them
+// against it.
+const wsMaxFrameBytes = gwapi.MaxWSFrameBytes
 
 // streamFrame mirrors the gateway's typed WebSocket envelope
 // ({"type":"telemetry","data":{…}}); Data is the marshaled sample.
@@ -68,6 +72,49 @@ type WSSender struct {
 	certUpdates  chan struct{}
 	trustUpdates chan struct{}
 
+	// runtimeUpdates is the one genuinely different doorbell shape in this
+	// file: certUpdates/trustUpdates are content-free (chan struct{}) --
+	// the payload is idempotent and cheap to re-fetch over HTTP, so a
+	// coalesced "check again" is all a consumer ever needs. A pushed
+	// runtime_config frame instead CARRIES the whole document, so this is a
+	// latest-wins buffered(1) chan json.RawMessage: wakeRuntimeConfig always
+	// drains any stale pending value before sending the newest one, so a
+	// burst of pushes (or a burst with no reader draining at all) coalesces
+	// into exactly the LAST document, never a stale earlier one. A nil
+	// payload means "resync over HTTP" and is what maybeDial sends on every
+	// successful (re)connect, mirroring how it already wakes certUpdates/
+	// trustUpdates on connect.
+	runtimeUpdates chan json.RawMessage
+	// runtimeWakeMu makes wakeRuntimeConfig's drain-then-send pair a single
+	// atomic critical section -- see that function's doc for why this is
+	// required (readLoop and maybeDial's connect hook can call it
+	// concurrently) and why it is a DEDICATED lock rather than a reuse of
+	// mu below.
+	runtimeWakeMu sync.Mutex
+
+	// logWatchUpdates carries the gateway's runtime_log_config command (T3
+	// log streaming): the FULL set of spec IDs whose managed-process output
+	// it currently wants streamed. Latest-wins buffered(1), exactly like
+	// runtimeUpdates -- every command is self-contained, so a burst
+	// coalesces into the newest one and nothing is lost that matters.
+	//
+	// Unlike runtimeUpdates there is deliberately NO connect-hook wake here.
+	// A nil on runtimeUpdates means "resync over HTTP", which for a document
+	// the agent can re-fetch is the right idempotent fallback; there is no
+	// equivalent for a command, and a connect-hook nil would race readLoop's
+	// first real frame for the same latest-wins slot (the race
+	// wakeRuntimeConfig documents) with a genuine loss on the losing side.
+	// Instead the GATEWAY re-sends the authoritative set on every new agent
+	// connection, including the empty set, so a stale watch set can never
+	// outlive the connection it was issued on.
+	logWatchUpdates chan json.RawMessage
+	// logWatchMu is logWatchUpdates' own drain-then-send lock. A dedicated
+	// lock rather than a reuse of runtimeWakeMu for the same reason that one
+	// is not a reuse of mu: two independent doorbells that never need to
+	// exclude each other should not be able to contend, and coupling them
+	// would only create a way for a future change to deadlock.
+	logWatchMu sync.Mutex
+
 	mu          sync.Mutex
 	conn        *websocket.Conn
 	connDone    chan struct{} // closed by dropConn when this conn is torn down; stops pingLoop
@@ -76,6 +123,10 @@ type WSSender struct {
 	failures    int
 	closed      bool
 	sysReport   []byte // cached marshaled SystemReport, resent on each (re)connect
+	// runtimeReport is the cached, already-redacted, already-marshaled
+	// file-mode runtime report (internal/runtime.BuildReport), resent on
+	// each (re)connect exactly like sysReport.
+	runtimeReport []byte
 }
 
 // NewWSSender builds a WSSender for gatewayURL (http->ws, https->wss). A nil
@@ -106,6 +157,8 @@ func NewWSSender(gatewayURL, token string, httpClient *http.Client) (*WSSender, 
 		clock:           time.Now,
 		certUpdates:     make(chan struct{}, 1),
 		trustUpdates:    make(chan struct{}, 1),
+		runtimeUpdates:  make(chan json.RawMessage, 1),
+		logWatchUpdates: make(chan json.RawMessage, 1),
 	}, nil
 }
 
@@ -124,6 +177,26 @@ func (s *WSSender) CertUpdates() <-chan struct{} {
 // from CertUpdates so neither consumer can steal the other's wake.
 func (s *WSSender) TrustUpdates() <-chan struct{} { return s.trustUpdates }
 
+// RuntimeUpdates returns a channel that receives the latest gateway-pushed
+// runtime_config document (see the runtimeUpdates field doc) OR a nil
+// payload every time this connection is (re)established -- a nil means
+// "resync over HTTP" (the Task 18 consumer feeds either shape into the same
+// runtime.GatewaySource.ApplyPushed / .Load reconciliation). Buffered(1)
+// with a drain-then-send producer (wakeRuntimeConfig): a burst of pushes,
+// with or without a reader ever draining in between, coalesces into exactly
+// the newest document -- reading this channel is never required to keep the
+// connection alive, and the producer (readLoop) never blocks on it.
+//
+// NOTE for the consumer: a nil value is NOT proof this came from a
+// reconnect. readLoop decodes f.Data straight from the wire, so a
+// well-formed-but-contract-violating frame that omits "data" entirely
+// (`{"type":"runtime_config"}` -- valid JSON, invalid per the runtime_config
+// contract) also decodes to a Go-nil json.RawMessage and is indistinguishable
+// from the connect hook's intentional nil. This is harmless either way:
+// treat every nil, whatever its origin, as "resync over HTTP" -- which is
+// exactly the safe, idempotent fallback both cases want.
+func (s *WSSender) RuntimeUpdates() <-chan json.RawMessage { return s.runtimeUpdates }
+
 // wakeCertUpdates is the shared non-blocking send both wake sources (readLoop's
 // cert_update frame, maybeDial's connect success) use. A full channel (an
 // already-pending, not-yet-consumed wake) means the send is simply dropped --
@@ -139,6 +212,81 @@ func (s *WSSender) wakeCertUpdates() {
 func (s *WSSender) wakeTrustUpdates() {
 	select {
 	case s.trustUpdates <- struct{}{}:
+	default:
+	}
+}
+
+// wakeRuntimeConfig is the latest-wins doorbell producer for
+// RuntimeUpdates(): it unconditionally drains any stale pending document
+// before sending the new one, so a consumer that has not yet read the
+// previous value never observes it once a newer one has arrived. Called
+// from readLoop (a genuine "runtime_config" frame, data = f.Data) and from
+// maybeDial's connect hook (data = nil, meaning "resync over HTTP").
+//
+// The drain and the send are two INDEPENDENT atomic channel operations, not
+// one atomic transaction -- and this function has two call sites that run
+// on DIFFERENT goroutines with no other ordering between them: maybeDial
+// spawns readLoop on a new goroutine and then, still in the CALLING
+// goroutine, calls wakeRuntimeConfig(nil) itself after further work (two
+// network writes). If the gateway pushes a real document in that window,
+// readLoop's wakeRuntimeConfig(f.Data) call races the connect hook's
+// wakeRuntimeConfig(nil) call. Without synchronization, their drain/send
+// pairs can interleave so that an earlier call's send lands AFTER a later
+// call's drain already found the channel empty -- the later call's own
+// send then silently loses to the earlier one (a real pushed document can
+// be replaced by a stale nil, or the reverse). The channel is never left
+// empty and nothing hangs either way (each call's own send always has room
+// by the time it runs, since its own immediately-preceding drain guarantees
+// that), but WHICH document survives is only well-defined when the two
+// steps are atomic -- hence runtimeWakeMu.
+//
+// runtimeWakeMu is a DEDICATED lock, not a reuse of s.mu: s.mu guards
+// connection state (conn/connDone/backoff bookkeeping), and readLoop never
+// touches s.mu at all today -- coupling this doorbell to that lock would
+// risk a deadlock the moment either call site's path to here ever grows to
+// (re)acquire s.mu first, for zero benefit (s.mu's own invariants don't
+// need to protect this channel). Holding runtimeWakeMu is still safe for
+// readLoop to do unconditionally: both selects inside the critical section
+// are non-blocking (each has a `default`), so the section's duration is
+// bounded by two trivial channel operations, never by whether -- or when
+// -- a consumer drains RuntimeUpdates(). That is the property that matters
+// for readLoop's caller: readLoop must never block WAITING ON A CONSUMER,
+// because it is also the goroutine that detects a dead peer (see readLoop's
+// own doc); brief mutex contention between the two producers is not that.
+func (s *WSSender) wakeRuntimeConfig(data json.RawMessage) {
+	s.runtimeWakeMu.Lock()
+	defer s.runtimeWakeMu.Unlock()
+	select {
+	case <-s.runtimeUpdates: // drop the stale pending document, if any
+	default:
+	}
+	select {
+	case s.runtimeUpdates <- data:
+	default:
+	}
+}
+
+// LogWatchUpdates returns the channel carrying the gateway's latest
+// runtime_log_config command -- the full set of spec IDs whose managed-process
+// output it wants streamed right now (see the logWatchUpdates field doc).
+// Latest-wins: a command superseded before the consumer read it is simply
+// gone, which is correct, because each one states the whole desired set.
+// Reading this channel is never required to keep the connection alive.
+func (s *WSSender) LogWatchUpdates() <-chan json.RawMessage { return s.logWatchUpdates }
+
+// wakeLogWatch is the latest-wins producer for LogWatchUpdates. Both selects
+// are non-blocking, so readLoop -- which is also what detects a dead peer --
+// can never stall here on a consumer, the load-bearing property
+// wakeRuntimeConfig documents at length for its own channel.
+func (s *WSSender) wakeLogWatch(data json.RawMessage) {
+	s.logWatchMu.Lock()
+	defer s.logWatchMu.Unlock()
+	select {
+	case <-s.logWatchUpdates: // drop the superseded command, if any
+	default:
+	}
+	select {
+	case s.logWatchUpdates <- data:
 	default:
 	}
 }
@@ -249,6 +397,105 @@ func (s *WSSender) resendSystemReport(conn *websocket.Conn) {
 	}
 }
 
+// PostRuntimeReport caches an already-built, already-redacted file-mode
+// runtime report (internal/runtime.BuildReport) for resend on every future
+// reconnect, and writes it once on the current connection, dialing if
+// needed -- the exact same shape as PostSystemReport/sysReport, just for the
+// "runtime_report" frame type. raw is written byte-for-byte: redaction
+// already happened at the point the report was built, so this transport
+// must never re-marshal it.
+func (s *WSSender) PostRuntimeReport(ctx context.Context, raw json.RawMessage) error {
+	s.mu.Lock()
+	s.runtimeReport = append([]byte(nil), raw...)
+	s.mu.Unlock()
+
+	conn := s.currentConn()
+	if conn == nil {
+		if err := s.maybeDial(ctx); err != nil {
+			return err
+		}
+		if s.currentConn() == nil {
+			return errBackingOff
+		}
+		return nil // maybeDial already sent the cached report on connect
+	}
+	wctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_report", Data: raw}); err != nil {
+		s.dropConn(conn, isCleanClose(err))
+		return fmt.Errorf("write runtime report frame: %w", err)
+	}
+	return nil
+}
+
+// PostRuntimeLog writes ONE runtime_log frame: the managed-process output
+// accumulated for one spec since the previous flush, already marshaled by
+// internal/runtime.Driver.DrainLogFrames.
+//
+// Deliberately NOT cached for resend, unlike PostSystemReport/
+// PostRuntimeReport. Those two carry a current STATE that a reconnected
+// gateway needs restated; this carries output that has already happened, and
+// replaying it on reconnect would duplicate history in front of the operator
+// -- the agent instead delivers a fresh scrollback when the gateway re-asks
+// for the spec, which is the one authoritative replay.
+//
+// Called from internal/agent's run loop, the same goroutine as Post and
+// PostSystemReport. That is not incidental: the frames this transport writes are
+// meant to come from one goroutine, and this one always does.
+//
+// The BROADER claim that used to sit here -- "this transport has exactly one
+// writer per connection" -- was false, and worth correcting rather than
+// deleting, because a reader relied on it. With transport=websocket AND
+// runtime_source=file (a supported pairing: main.go installs the WSSender as the
+// RuntimeReporter regardless of source), Driver.Sync's file-mode branch calls
+// PostRuntimeReport from the goroutine triggerRuntimeSync spawns, so a second
+// goroutine does write to this connection. coder/websocket serializes frames
+// internally, so nothing is interleaved or corrupted -- but the two writers do
+// contend for that internal lock, and a write that waits out its writeTimeout on
+// it fails and calls dropConn, tearing down a healthy connection. The fix is to
+// move the file-mode report onto the run loop the way resendRuntimeReport
+// already is; it is a behaviour change and is deliberately not made here.
+func (s *WSSender) PostRuntimeLog(ctx context.Context, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	conn := s.currentConn()
+	if conn == nil {
+		// No dial attempt here, unlike the report posters: log output is
+		// worth nothing once it is late, and the watch command that asked
+		// for it only exists on a live connection anyway. The next connect
+		// re-establishes the subscription from the gateway's side.
+		return errBackingOff
+	}
+	wctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_log", Data: raw}); err != nil {
+		s.dropConn(conn, isCleanClose(err))
+		// The error names the frame TYPE only: raw is managed-process output
+		// and may carry prompt text, so it must never reach a log line or an
+		// error string that travels.
+		return fmt.Errorf("write runtime log frame: %w", err)
+	}
+	return nil
+}
+
+// resendRuntimeReport writes the cached runtime report on a freshly-dialed
+// connection (best-effort; a write error is left for the ping/read loop to
+// reap), mirroring resendSystemReport exactly.
+func (s *WSSender) resendRuntimeReport(conn *websocket.Conn) {
+	s.mu.Lock()
+	data := append([]byte(nil), s.runtimeReport...)
+	s.mu.Unlock()
+	if len(data) == 0 {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_report", Data: data}); err != nil {
+		slog.Debug("ws runtime report resend failed", "err", err)
+	}
+}
+
 // Close cleanly shuts the current connection (agent shutdown). Idempotent. Closing
 // connDone here (not just clearing s.conn) stops pingLoop immediately -- otherwise it
 // would sit idle on its ticker, pinging an already-closed conn, until its next tick
@@ -323,6 +570,7 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 	go s.pingLoop(conn, done)
 	slog.Debug("ws telemetry connected", "url", s.url)
 	s.resendSystemReport(conn)
+	s.resendRuntimeReport(conn)
 	// A fresh (re)connect is itself a "check for a new certificate" moment
 	// (Task 5b, Phase 2 distribution): a certificate issued while this agent
 	// was disconnected must not wait out the full poll interval (up to 6h on
@@ -330,18 +578,23 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 	// wakes a sync exactly like a cert_update doorbell would.
 	s.wakeCertUpdates()
 	s.wakeTrustUpdates()
+	// Likewise for the runtime-config document: a reconnect may have missed
+	// a push while disconnected, so it wakes RuntimeUpdates() with a nil
+	// payload ("resync over HTTP") exactly like the cert/trust wakes above.
+	s.wakeRuntimeConfig(nil)
 	return nil
 }
 
 // readLoop drains incoming frames so coder/websocket auto-pongs the gateway's
 // pings and a server-initiated close is detected promptly, and decodes a
-// cert_update doorbell (Phase 2 distribution) to wake CertUpdates(). It
-// deliberately does NOT use wsjson.Read: that helper writes a close frame with
-// a protocol-error status on ANY JSON decode failure, which would turn a
-// malformed -- or simply forward-incompatible, future-version -- frame into a
-// full connection teardown. Instead this reads the raw message and tolerates
-// anything that does not parse as the {type,data} envelope, or whose type it
-// does not recognize: only "cert_update" is acted on, every other type
+// cert_update/ca_update/runtime_config push to wake the matching doorbell
+// (CertUpdates/TrustUpdates/RuntimeUpdates). It deliberately does NOT use
+// wsjson.Read: that helper writes a close frame with a protocol-error status
+// on ANY JSON decode failure, which would turn a malformed -- or simply
+// forward-incompatible, future-version -- frame into a full connection
+// teardown. Instead this reads the raw message and tolerates anything that
+// does not parse as the {type,data} envelope, or whose type it does not
+// recognize: only the three types above are acted on, every other type
 // (including one this build has never heard of) is silently discarded. This
 // function NEVER writes to conn -- data frames and pings are written
 // exclusively by the future writer path (pingLoop's control frames today); a
@@ -349,6 +602,9 @@ func (s *WSSender) maybeDial(ctx context.Context) error {
 // "genau ein Writer" constraint, mirrored on the agent side) forbids. A
 // background context is used deliberately: a cancelled read context would
 // abruptly tear down the connection instead of surfacing the close status.
+// wakeRuntimeConfig's own doc explains why its send here can never block --
+// that is THE load-bearing property for this function: readLoop is also
+// what detects a dead peer, so it must never stall on any of these wakes.
 func (s *WSSender) readLoop(conn *websocket.Conn) {
 	for {
 		_, b, err := conn.Read(context.Background())
@@ -365,6 +621,10 @@ func (s *WSSender) readLoop(conn *websocket.Conn) {
 			s.wakeCertUpdates()
 		case "ca_update":
 			s.wakeTrustUpdates()
+		case "runtime_config":
+			s.wakeRuntimeConfig(f.Data)
+		case "runtime_log_config":
+			s.wakeLogWatch(f.Data)
 		}
 		// Any other (including unrecognized future) type is discarded --
 		// forward compatibility.

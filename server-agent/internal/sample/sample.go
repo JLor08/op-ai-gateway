@@ -49,6 +49,55 @@ type Sample struct {
 	// every off/files agent (no proxy Manager at all), so this field is a pure
 	// addition -- byte-neutral for every pre-existing agent's telemetry shape.
 	ProxyRoutes []ProxyRouteSample `json:"proxy_routes,omitempty"`
+	// Runtimes reports the live state of every agent-managed model process
+	// (agent-runtime-manager design spec §7/§9), populated by collectOnce
+	// only when internal/agent's runtime driver is non-nil -- i.e. only when
+	// the runtime_manager feature is active for THIS agent<->gateway pair.
+	// omitempty: nil (the Go zero value) for every agent that never
+	// negotiated the feature, so this field is a pure addition -- byte-
+	// neutral for every pre-existing agent's telemetry shape, exactly like
+	// ProxyRoutes above.
+	Runtimes []RuntimeSample `json:"runtimes,omitempty"`
+}
+
+// RuntimeGPUSample is one GPU's measured VRAM usage for a managed process,
+// as attributed by the agent's own measurer (e.g. nvidia-smi
+// --query-compute-apps, exact because the agent knows its own child's PID --
+// design spec §5). There is no "estimate" field here: an unmeasured GPU is
+// simply absent from RuntimeSample.GPUs, and the gateway keeps the
+// operator-entered estimate it already has.
+type RuntimeGPUSample struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
+// RuntimeErrorSample mirrors runtime.LastError for the wire: the most
+// recent failed start or crash for a spec, cleared only by that spec's next
+// successful start (design spec §7), never merely by a state change.
+type RuntimeErrorSample struct {
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+	ExitCode   int       `json:"exit_code"`
+	Failures   int       `json:"failures"`
+	StderrTail string    `json:"stderr_tail,omitempty"`
+}
+
+// RuntimeSample is one agent-managed launch spec's current visible-lifecycle
+// state (design spec §7), mirroring runtime.Status field-for-field for the
+// wire. GPUs carries ONLY the GPUs this measurement cycle actually measured
+// (omitempty: nil, not an empty array, when nothing was measured this
+// cycle -- e.g. no measurer installed, or the spec is not yet running).
+type RuntimeSample struct {
+	SpecID    string              `json:"spec_id"`
+	Model     string              `json:"model"`
+	State     string              `json:"state"`
+	Since     time.Time           `json:"since"`
+	PID       int                 `json:"pid,omitempty"`
+	Port      int                 `json:"port,omitempty"`
+	InFlight  int                 `json:"in_flight"`
+	Restarts  int                 `json:"restarts"`
+	GPUs      []RuntimeGPUSample  `json:"gpus,omitempty"`
+	LastError *RuntimeErrorSample `json:"last_error,omitempty"`
 }
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring
@@ -97,11 +146,27 @@ type Net struct {
 }
 
 // GPU is one GPU's metrics.
+//
+// PCIBusID follows DriverVersion's established path exactly: both are
+// unchanging identity, not metrics, so both are collected here (this is the
+// GPU collectors' own output type), both carry omitempty, and both reach the
+// gateway through the static hardware report (CollectHardware -> GPUInfo)
+// rather than through the per-second telemetry mirror, which decodes neither.
 type GPU struct {
-	Index         int     `json:"index"`
-	Name          string  `json:"name"`
-	UUID          string  `json:"uuid"`
-	DriverVersion string  `json:"driver_version,omitempty"`
+	Index         int    `json:"index"`
+	Name          string `json:"name"`
+	UUID          string `json:"uuid"`
+	DriverVersion string `json:"driver_version,omitempty"`
+	// PCIBusID is the card's PCI address, e.g. "00000000:65:00.0". NVIDIA
+	// only -- rocm-smi and ioreg report nothing of this form and must leave
+	// it empty rather than inventing an equivalent. It is a DISPLAY and
+	// disambiguation aid: on the 4x/8x identical-card hosts that are the
+	// normal AI-server build it is the one handle that maps to a physical
+	// slot and survives the index renumbering across reboots that
+	// expected_uuid/expected_name drift detection exists to catch. It is
+	// deliberately NOT an identity: admission, budgets and spec GPU rows all
+	// key on the index, and nothing matches on this field.
+	PCIBusID      string  `json:"pci_bus_id,omitempty"`
 	UtilPct       float64 `json:"util_pct"`
 	MemUsedBytes  int64   `json:"mem_used_bytes"`
 	MemTotalBytes int64   `json:"mem_total_bytes"`
@@ -109,6 +174,35 @@ type GPU struct {
 	VRAMTempC     int     `json:"vram_temp_c"`
 	PowerW        float64 `json:"power_w"`
 	FanPct        float64 `json:"fan_pct"`
+}
+
+// EmptyCapabilities returns the canonical "nothing to report" value for
+// Sample.Capabilities: a valid, empty JSON object -- never Go's nil, which
+// json.RawMessage would otherwise marshal as the literal `null` (a
+// nil-vs-null defect this wire field cannot afford: the gateway parses it
+// to negotiate agent feature flags). Normalize substitutes it for an
+// absent/empty Capabilities, so every producer of this field agrees on the
+// same bytes instead of each keeping its own json.RawMessage(`{}`) literal.
+// (internal/agent does NOT fall back to this value for its own capabilities
+// blob: mustMarshalCapabilities panics, at package init, and capabilitiesJSON
+// then only ever copies the bytes that init produced -- capabilitiesJSON
+// itself neither marshals nor panics (fix round 2, G4, correcting this
+// parenthesis's attribution). Fix round 1, M4: the reason is NOT
+// that "{}" would deactivate runtime_manager gateway-side -- it would not,
+// the agent gates on the gateway's declared list and the config poll path
+// is not gated at all -- but that "{}" silently costs WebSocket push
+// immediacy for portal spec edits and makes the portal's
+// feature-mismatch banner blame a current agent for an unrelated silent
+// runtime. See mustMarshalCapabilities' comment for the full trace.)
+//
+// A FUNCTION, not a package-level var: json.RawMessage is a []byte under
+// the hood, so a single shared package-level slice would let any future
+// caller that ever wrote through a Sample.Capabilities value (e.g. an
+// in-place mutation instead of a fresh assignment) corrupt this literal for
+// every other Sample in the process. Returning a fresh value on every call
+// makes that class of bug impossible rather than merely unlikely.
+func EmptyCapabilities() json.RawMessage {
+	return json.RawMessage(`{}`)
 }
 
 // Normalize fills defaults so the payload always decodes on the gateway:
@@ -133,7 +227,7 @@ func (s *Sample) Normalize() {
 		s.ProviderHealth = json.RawMessage(`{}`)
 	}
 	if len(s.Capabilities) == 0 {
-		s.Capabilities = json.RawMessage(`{}`)
+		s.Capabilities = EmptyCapabilities()
 	}
 }
 

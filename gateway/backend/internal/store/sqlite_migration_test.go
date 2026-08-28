@@ -362,3 +362,41 @@ func sqliteIndexExists(t *testing.T, db *sql.DB, name string) bool {
 	}
 	return count == 1
 }
+
+// TestMigration65RuntimeTables proves migration 65 creates all three
+// agent-runtime-manager tables in one migration: launch specs, per-GPU VRAM
+// demand rows, and the co-residency matrix (Task 2 adds that repo's methods;
+// the table exists from this migration on).
+func TestMigration65RuntimeTables(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	for _, table := range []string{"agent_runtime_specs", "agent_runtime_spec_gpus", "agent_coresidency_rules"} {
+		if !sqliteTableExists(t, s.db, table) {
+			t.Fatalf("table %s missing after migrate", table)
+		}
+	}
+}
+
+// TestMigration66GPUBudgetsTable proves migration 66 creates the per-GPU VRAM
+// budget table (Task 3); the two new ai_servers columns
+// (runtime_max_processes, managed_runtime_only) are exercised end-to-end by
+// TestConformanceServerAgentPresenceTimeoutSeconds instead, since
+// sqliteTableExists only checks for tables, not columns.
+func TestMigration66GPUBudgetsTable(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	if !sqliteTableExists(t, s.db, "ai_server_gpu_budgets") {
+		t.Fatal("table ai_server_gpu_budgets missing after migrate")
+	}
+}
+
+// TestMigration67RuntimeReportsTable proves migration 67 creates the
+// server_runtime_reports table (Task 4): 1:1 file-mode runtime report per
+// server, shaped exactly like server_hardware (migration 29).
+func TestMigration67RuntimeReportsTable(t *testing.T) {
+	s := openMigratedTestSQLite(t)
+	defer s.Close()
+	if !sqliteTableExists(t, s.db, "server_runtime_reports") {
+		t.Fatal("table server_runtime_reports missing after migrate")
+	}
+}

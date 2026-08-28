@@ -25,6 +25,7 @@ import { usageApi } from './api/usage';
 import { systemApi } from './api/system';
 import { netbirdApi } from './api/netbird';
 import { chatApi } from './api/chat';
+import { runtimeApi } from './api/runtime';
 
 export { PortalApiError, buildQueryString } from './api/transport';
 
@@ -41,6 +42,7 @@ export * from './api/usage';
 export * from './api/system';
 export * from './api/netbird';
 export * from './api/chat';
+export * from './api/runtime';
 
 export function createPortalApi(fetcher: Fetcher = fetch) {
   return {
@@ -57,6 +59,7 @@ export function createPortalApi(fetcher: Fetcher = fetch) {
     ...systemApi(fetcher),
     ...netbirdApi(fetcher),
     ...chatApi(fetcher),
+    ...runtimeApi(fetcher),
   };
 }
 

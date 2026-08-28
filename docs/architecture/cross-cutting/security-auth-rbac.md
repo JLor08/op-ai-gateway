@@ -240,8 +240,9 @@ Each AI server runs `op-ai-server-agent`, which authenticates to
 lookup and a separate token universe from user/service bearer tokens; an
 agent secret cannot be used against `/v1/chat/completions` and vice versa.
 
-The seven agent endpoints (`telemetry`, `stream` (WebSocket), `system-report`,
-`ca`, `certificate`, `proxy-routes`, `download/`) are registered on **both**
+The ten agent endpoints (`telemetry`, `stream` (WebSocket), `system-report`,
+`ca`, `certificate`, `proxy-routes`, `features`, `runtime-config`,
+`runtime-report`, `download/`) are registered on **both**
 the public mux and a dedicated agent mux, so an agent can reach the gateway
 either over the public listener or over the NetBird mesh listener. Because
 the handler functions are shared, the gateway threads *which listener* served
@@ -251,6 +252,135 @@ handler itself — this is what lets mesh-only behavior (e.g. gating
 `/proxy-routes` to mesh traffic, or only recording a telemetry-transport
 "seen over TLS" signal when the mesh listener served the request) stay
 correct without duplicating handler code per listener.
+
+### 8.1 The structural rule: an agent endpoint's target comes only from the token
+
+**Any resource id that arrives inside an agent payload must be re-resolved back
+to the token's own server before it is used for a write.** The token gives the
+server id for free, so trusting an id in the body looks harmless — and it is the
+shape the whole agent surface must be reviewed against, because it will recur in
+the next agent endpoint that accepts an id.
+
+The worked example is the GPU VRAM write-back on the telemetry path. It
+originally took its target from the agent-supplied `spec_id` and checked only
+whether that spec's numbers were locked, so **an agent authenticated for server A
+could name server B's spec and overwrite B's measured VRAM** — and because the
+runtime-config document the gateway assembles prefers a measured value over the
+operator's estimate, that changed the figure B's *own* agent did its admission
+arithmetic against. The fix resolves spec → mapping → application and requires
+`application.ServerID == tokenServerID`; the ownership check runs
+**unconditionally and before** the lock check, so a cross-server attempt is
+logged at Warn even when the spec happens to be locked.
+
+The same write-back also bounds its store fan-out, because it sits on an endpoint
+agents hit every second: the agent-supplied array is truncated (256 entries, 64
+GPUs each — clamp, never reject, mirroring the hardware-report clamps) *before*
+any resolution is attempted, and the resolve outcome is memoized per distinct
+spec id **including failures**. A memo that caches only successes looks correct
+and reintroduces the unbounded path: without both, a single 1 MiB telemetry POST
+could drive roughly 19,000 store reads.
+
+### 8.2 Free-form text from an agent is redacted safe-by-default
+
+A file-mode agent's runtime report carries the effective configuration with
+**env values already masked agent-side**, where the plaintext is; the gateway's
+structural re-masking on ingest is defence in depth, not a substitute. (The
+redaction *test* correspondingly lives agent-side — a gateway-side test would
+assert on values that arrive already masked, looking like coverage while proving
+nothing.)
+
+`parse_error` is the second, non-obvious leak path into that table, and it needs
+its own rule: **a configuration-loader error routinely quotes the offending
+line**, so an unparsed secret-bearing line could reach the report even though
+`env` values are masked. The rule is an **allow-list over a closed set of
+codes**: the field may only ever be one of the classification codes the agent's
+wire contract defines (`json_syntax`, `duplicate_spec_id`, `file_missing`,
+`read_failed` — see
+[the runtime chapter](agent-runtime-manager.md)), anything else is replaced by
+a fixed generic constant, and an **empty** value stays empty, because "this
+agent reported no parse failure" is not a redaction case at all. Free text has
+no path in, whatever the agent sends.
+
+Two earlier rules were tried and both failed, each a reasonable answer to the
+half of the problem it could see, and the pair is worth keeping because a
+future reader will otherwise re-derive them:
+
+1. **Keep everything before the first `:`, pass a colon-less string through.**
+   Leaked in two shapes: a colon-less message survived verbatim (nothing to
+   cut), and a secret sitting *before* the first colon survived too — the split
+   kept precisely the wrong half.
+2. **Keep that prefix only when it looks like a bare classification token**
+   (non-empty, bounded length, no whitespace/quote/`=`). That closed the leak
+   and broke the field. The actual producer's every error begins `"runtime: "`,
+   so the one reachable non-generic output, for every malformed file an
+   operator could write, was the single word `runtime` — a token that looks
+   like a meaningful subsystem tag and carries no information at all. Worse, it
+   had no empty-input case, and `""` is exactly what a *healthy* agent sends
+   (the field is `omitempty`), so it rewrote the healthy case into
+   `"config parse error"`: every file-mode agent whose config parsed perfectly
+   was stored, and shown in the portal, as one that had failed to parse — with
+   the portal suppressing the config view on exactly that field.
+
+The lesson generalises past this field: a redaction heuristic negotiates
+between hiding content and reporting a diagnosis, and loses both. Stating what
+the field **may contain** ends that negotiation instead of picking a winner,
+and it makes both sides readable against the same contract.
+
+### 8.3 What a gateway-authored launch spec may not reach
+
+The [agent-managed model runtime](agent-runtime-manager.md) lets the portal
+author a command line that an agent then executes. Three guards make that
+acceptable, each of which reads as an arbitrary restriction on a convenience
+feature — and removing any one converts portal write access into agent-identity
+theft or an allowlist bypass:
+
+1. **`${AGENT_ENV:…}` refuses the agent's own `OP_AGENT_*` namespace**, before
+   `getenv` is even consulted. Without it a portal-authored spec could read
+   `OP_AGENT_TOKEN` — the bearer secret that authenticates the certificate
+   endpoint which issues a **private key** — simply by referencing it in an
+   argument or env value that a model process then echoes. The refusal names the
+   variable but never a value, and applies identically to `args` and `env`.
+2. **The child's environment is built from scratch**: only the spec's expanded
+   env plus a small OS-appropriate base — `PATH`, `HOME`, `USERPROFILE`,
+   `LOCALAPPDATA`, `SYSTEMROOT`, `WINDIR` — copied from the agent's own
+   environment *where present*. Never the agent's full environment, which holds
+   that bearer token and every other model's secrets.
+3. **A spec `env` key naming one of those base variables is refused outright**,
+   in any capitalisation. Permitting the override would reopen the
+   relative-binary resolution path the absolute-path allowlist closes, by
+   steering a permitted binary's dynamic linker, its Windows DLL search
+   (`SystemRoot`) or any helper it shells out to. The reservation set *is* the
+   base set — one list in the code, so a name can never be copied into the base
+   while remaining spec-overridable.
+
+The hard boundary on *what may execute at all* is the agent-local allowlist, not
+the portal's RBAC: `LocalPolicy.Permit` refuses every spec when the binary
+allowlist is empty, then matches the binary **exactly** against it, then checks
+`work_dir` containment with `filepath.Clean` on both sides plus a
+**separator-boundary** comparison — which rejects both `../` traversal and the
+sibling-prefix case (`/srv/models-evil` must not pass a `/srv/models` rule; a
+naive `strings.HasPrefix` does). Containment is lexical and does **not** resolve
+symlinks, deliberately: see
+[§11.1 Operational risks](../11-risks-and-technical-debt.md) for why
+`EvalSymlinks` would be strictly worse. One operational consequence worth
+documenting: **once permitted directories are configured, a spec with an empty
+`work_dir` is refused outright**, so configuring them makes `work_dir` mandatory
+on every spec — otherwise every spec fails with an inexplicable
+`not_permitted`.
+
+Authorization for runtime *writes* introduces no new RBAC rule: it is exactly the
+model-mapping write rule — `system` scope, membership in the server's owner list,
+or admin-group delegation carrying `can_manage_servers`. **Plain `admin` is not
+sufficient.** The portal deliberately gets no new top-level view (no `views.tsx`
+entry) so no new RBAC surface appears at all. Every runtime portal method
+authorizes **inside `portal.Service`**, never in the gateway handler:
+runtime-spec CRUD via `authorizeMapping` (mapping → application → server, with
+all failures collapsed to a 404), co-residency and warnings via
+`authorizeApplication`, and GPU budgets and the report/SSE views via
+`authorizeServer`. The gateway handlers do nothing beyond the web-scope check
+and, for the SSE stream, an ownership check **before the first stream byte**. A
+new runtime endpoint added at the gateway layer on the assumption that "authz is
+handled upstream" would be unauthenticated for resource ownership.
 
 Certificate issuance and mTLS between the gateway and its agents is covered in
 [Certificates & TLS](certificates-tls.md); the mesh listener itself in

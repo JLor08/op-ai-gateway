@@ -40,6 +40,17 @@ per-server token, pushes host/GPU/power/temperature/hardware data over HTTP or a
 WebSocket, and can optionally terminate mesh TLS in front of the local AI server.
 → [Telemetry & Observability](cross-cutting/telemetry-usage-observability.md).
 
+That same agent can also **manage the model server processes** on its host, which
+is how the gateway replaced llama-swap with first-party machinery. The split of
+authority is the strategic part: the gateway holds the launch specification and
+decides *when* a model runs, while the AI server's own operator holds a binary
+allowlist that decides *what may run at all* — and the agent, not the gateway,
+enforces admission (a co-residency matrix, a process limit, per-GPU VRAM budgets)
+before it starts anything. The gateway sees one ordinary application per server,
+so routing, TLS and the mesh surface are untouched, and the whole capability is
+negotiated by feature flag, so an agent without it behaves exactly as before.
+→ [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).
+
 ## 4.5 Two auth modes, layered authorization
 
 Browsers authenticate with a **session cookie + CSRF header**; programs use

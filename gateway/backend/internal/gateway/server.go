@@ -175,6 +175,50 @@ type ServerDeps struct {
 	// connections (this field) and the side that pushes to them (the portal
 	// hook) agree on which connections exist.
 	AgentStreams *AgentStreamRegistry
+	// AgentFeatures tracks each connected ServerAgent's last-declared
+	// telemetry-capabilities feature set (agent_ingest.go's capabilities
+	// parse writes it; Server.PushRuntimeConfig, agent_runtime.go, reads it
+	// to gate the runtime_config WS push on the agent actually having
+	// declared support -- runtime_registry.go); nil-safe. gateway.New
+	// defaults a nil value to a fresh registry so a bare test Server still
+	// carries a usable one, mirroring AgentStreams above. ONE shared
+	// registry in production: cmd/gateway constructs it
+	// (gateway.NewAgentFeaturesRegistry), hands it here, and hands the SAME
+	// instance to the app-health loop's end-of-cycle pruning bundle -- if the
+	// two diverged, the loop would prune an instance nothing writes to while
+	// this one grew for every server ever deleted.
+	AgentFeatures *agentFeaturesRegistry
+	// RuntimeStatus holds per-server agent-managed-runtime status the
+	// gateway gates its own behavior on (runtime_registry.go); nil-safe.
+	// Task 8 populates only the file-mode flag Server.PushRuntimeConfig
+	// consults; a later task extends the SAME type with the
+	// snapshot+subscribe status stream. gateway.New defaults a nil value to
+	// a fresh registry.
+	RuntimeStatus *runtimeStatusRegistry
+	// RuntimeLogs fans live managed-process output out to open portal log
+	// views and, from the set of those views, derives what each agent is
+	// asked to stream (runtime_logs.go); nil-safe. gateway.New defaults a nil
+	// value to a fresh registry and wires its notify hook to AgentStreams.
+	RuntimeLogs *runtimeLogRegistry
+	// SetRuntimeConfigChangedHook, when non-nil, is called ONCE by
+	// cmd/gateway's buildGatewayServer immediately after gateway.New returns,
+	// with the just-built Server's PushRuntimeConfig bound as the argument --
+	// i.e. it is portal.Service.SetRuntimeConfigChangedHook itself, handed
+	// forward through ServerDeps by cmd/gateway's buildRuntime (which already
+	// holds the concrete *portal.Service in scope where it builds the Portal
+	// field above, before it is wrapped for the ServerDeps.Portal interface
+	// value). This field exists ONLY to carry that setter across the
+	// construction-order gap: the portal Service must exist before
+	// ServerDeps.Portal can be built, but the callback it needs
+	// (Server.PushRuntimeConfig) is a method on the Server, which does not
+	// exist until gateway.New(deps) returns -- so neither side can wire the
+	// other in directly at its own construction time. Server itself never
+	// stores or reads this field, and it plays no role in New's construction
+	// of *Server; it is read directly off the ServerDeps value still in
+	// scope in buildGatewayServer, purely as a wiring conduit. nil is the
+	// correct default for any Server built without cmd/gateway (e.g. a bare
+	// test Server) -- there is nothing to wire in that case.
+	SetRuntimeConfigChangedHook func(func(serverID string))
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.
@@ -372,6 +416,18 @@ type Server struct {
 	// deregisters each connection here; NotifyCertUpdate is the ONLY way
 	// anything pushes a frame to an agent.
 	AgentStreams *AgentStreamRegistry
+	// AgentFeatures tracks each connected ServerAgent's last-declared
+	// feature set (runtime_registry.go); nil-safe. Written by
+	// ingestTelemetrySample, read by PushRuntimeConfig.
+	AgentFeatures *agentFeaturesRegistry
+	// RuntimeStatus holds per-server agent-managed-runtime status
+	// (runtime_registry.go); nil-safe. PushRuntimeConfig consults its
+	// file-mode flag.
+	RuntimeStatus *runtimeStatusRegistry
+	// RuntimeLogs relays live managed-process output to portal log views
+	// (runtime_logs.go); nil-safe. Volatile only -- nothing on that path is
+	// ever persisted.
+	RuntimeLogs *runtimeLogRegistry
 	// onAgentReactivated fires on an inactive->active ServerAgent edge; see
 	// ServerDeps.OnAgentReactivated. nil-safe (unset -> no trigger).
 	onAgentReactivated func(serverID string)
@@ -549,6 +605,24 @@ func New(deps ServerDeps) *Server {
 	if agentStreams == nil {
 		agentStreams = NewAgentStreamRegistry()
 	}
+	agentFeatures := deps.AgentFeatures
+	if agentFeatures == nil {
+		agentFeatures = newAgentFeaturesRegistry()
+	}
+	runtimeStatus := deps.RuntimeStatus
+	if runtimeStatus == nil {
+		runtimeStatus = newRuntimeStatusRegistry()
+	}
+	runtimeLogs := deps.RuntimeLogs
+	if runtimeLogs == nil {
+		runtimeLogs = newRuntimeLogRegistry()
+	}
+	// The one place that holds both registries, which is why the "tell the
+	// agent what to stream" hook is bound here rather than in either of them:
+	// the log registry knows WHICH specs are being watched, the agent-stream
+	// registry knows HOW to reach the agent, and neither should have to know
+	// the other's type.
+	runtimeLogs.setNotify(agentStreams.NotifyRuntimeLogWatch)
 	benchmarks := deps.Benchmarks
 	if benchmarks == nil {
 		benchmarks = NewBenchmarkRegistry()
@@ -687,6 +761,9 @@ func New(deps ServerDeps) *Server {
 		AgentTransport:              agentTransport,
 		AgentProxyStatus:            agentProxyStatus,
 		AgentStreams:                agentStreams,
+		AgentFeatures:               agentFeatures,
+		RuntimeStatus:               runtimeStatus,
+		RuntimeLogs:                 runtimeLogs,
 		onAgentReactivated:          deps.OnAgentReactivated,
 		Benchmarks:                  benchmarks,
 		Groups:                      groups,
@@ -1169,6 +1246,9 @@ func (s *Server) routes() {
 		{"/api/agent/v1/certificate", s.handleAgentCertificate, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 		{"/api/agent/v1/ca", s.handleAgentCA, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 		{"/api/agent/v1/proxy-routes", s.handleAgentProxyRoutes, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
+		{"/api/agent/v1/features", s.handleAgentFeatures, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
+		{"/api/agent/v1/runtime-config", s.handleAgentRuntimeConfig, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
+		{"/api/agent/v1/runtime-report", s.handleAgentRuntimeReport, func(ctx context.Context) bool { return s.Portal.NetbirdOnly(ctx) }, agentGateMessage},
 	}
 	for _, rt := range agentRoutes {
 		s.mux.HandleFunc(rt.path, s.gatedAgentRoute(rt.handler, rt.gate, rt.message))

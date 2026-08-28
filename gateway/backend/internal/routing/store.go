@@ -17,6 +17,11 @@ const (
 	ProviderLlamaCPP  = "llama_cpp"
 	ProviderLlamaSwap = "llama_swap"
 	ProviderLiteLLM   = "litellm"
+	// ProviderServerAgent marks an application as an agent-managed model
+	// runtime (the agent-runtime-manager feature): its launch spec, per-GPU
+	// VRAM rows, and co-residency rules live in RuntimeStore. Routing treats
+	// it like any other application type otherwise.
+	ProviderServerAgent = "server_agent"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -135,13 +140,24 @@ type AIServer struct {
 	// a server OUT; under "selected" this opts a server IN. Routing never reads
 	// it (absent from the candidate join).
 	HTTPSSwitchOverride string
-	Provider            string
-	Endpoint            string
-	Status              string
-	HealthStatus        string
-	LastSeenAt          *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// RuntimeMaxProcesses caps how many agent-managed runtime processes
+	// (server_agent applications, migration 66, Task 3) may run concurrently
+	// on this server. 0 = unlimited. Enforced by the agent-runtime-manager
+	// admission logic (Task 6+); routing never reads it (absent from the
+	// candidate join).
+	RuntimeMaxProcesses int
+	// ManagedRuntimeOnly restricts this server to agent-managed runtime
+	// applications only, gating whether a non-runtime application may be
+	// created on it (migration 66, Task 3; enforced in Task 6+). Routing
+	// never reads it (absent from the candidate join).
+	ManagedRuntimeOnly bool
+	Provider           string
+	Endpoint           string
+	Status             string
+	HealthStatus       string
+	LastSeenAt         *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // Service is a Service Account (Phase 1 service accounts): an autonomous
@@ -1186,6 +1202,196 @@ type CertificateStore interface {
 	DeleteCertificate(ctx context.Context, domain string) error
 }
 
+// RuntimeSpec is a mapping's agent-managed launch spec (agent_runtime_specs,
+// migration 65): 1:1 per ModelMapping (MappingID is unique), owned by the
+// agent-runtime-manager feature. It tells a server's ServerAgent how to
+// launch, health-check, and (un)load the model process backing that mapping.
+type RuntimeSpec struct {
+	ID        string
+	MappingID string
+	Enabled   bool
+	Binary    string
+	// Args is an opaque JSON array string (the netbird_group_ids pattern):
+	// the store never parses it, just round-trips it.
+	Args string
+	// Env is an opaque JSON object string; values are ${AGENT_ENV:NAME}
+	// placeholders resolved by the agent from its own environment — never
+	// secrets at rest here.
+	Env                         string
+	WorkDir                     string
+	ListenPort                  int // 0 = agent picks a free loopback port
+	HealthPath                  string
+	HealthTimeoutSeconds        int
+	StartupTimeoutSeconds       int
+	IdleTimeoutSeconds          int // 0 = never unload
+	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
+	Pinned                      bool
+	AdminState                  string // "" | "force_running" | "force_stopped"
+	VRAMLocked                  bool
+	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
+	// this spec's GPU rows, by setting the vendor-appropriate visibility
+	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
+	// nothing on Apple or a host with no recognised GPU stack) from those
+	// HOST indices. Off, the GPU rows remain a declaration that drives
+	// admission arithmetic and the VRAM measurement mapping while nothing
+	// stops the process from landing on a different card.
+	//
+	// The gateway is hardware-agnostic and never resolves the variable name;
+	// it only carries the flag. The two invalid combinations it DOES refuse
+	// at save time (on with no GPU rows; on together with a hand-set
+	// visibility variable in Env) live in portal.PutRuntimeSpec, and the
+	// agent refuses them again at launch — see that method for why both.
+	SetVisibleDevices bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
+// (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUIndex).
+// VRAMEstimateMB is operator-owned (the portal writes it); VRAMMeasuredMB is
+// agent-owned and written ONLY by UpdateRuntimeSpecGPUMeasured — the two
+// never clobber each other.
+type RuntimeSpecGPU struct {
+	SpecID         string
+	GPUIndex       int
+	VRAMEstimateMB int
+	VRAMMeasuredMB int
+}
+
+// CoResidencyRule is one ALLOWED pair of model mappings that may be loaded on
+// the same AI server at the same time (agent_coresidency_rules, migration
+// 65, composite primary key (application_id, mapping_a_id, mapping_b_id), all
+// three columns FK on delete cascade). A row's PRESENCE is the only
+// co-residency signal — there is no `allowed` column, so "not co-resident" is
+// the structural default and the table holds nothing but allowed pairs.
+// Canonical ordering (MappingAID < MappingBID, so every unordered pair has
+// exactly one row) is validated by the caller (the portal, Task 6): the
+// store stays a dumb pair table and never sorts, rejects, or rewrites a pair.
+type CoResidencyRule struct {
+	ApplicationID string
+	MappingAID    string // canonical: MappingAID < MappingBID, enforced by the caller (portal)
+	MappingBID    string
+	CreatedAt     time.Time
+}
+
+// ServerGPUBudget is a per-GPU VRAM budget for co-residency admission math
+// (ai_server_gpu_budgets, migration 66, Task 3), keyed by (ServerID,
+// GPUIndex): how much VRAM (MB) the operator has allotted to agent-managed
+// runtimes on that GPU. BudgetMB 0 means "no budget for this GPU" =
+// unconstrained (also true for a GPU with no row at all) — which is why
+// SetServerGPUBudgets accepts 0 and rejects only negatives. This meaning is
+// consumed on the far side of the wire by the agent's admission policy:
+// runtime.Admit / PolicySnapshot.Budgets in
+// server-agent/internal/runtime/policy.go skips any index whose budget is
+// <= 0 precisely to honour it. The two comments are a matched pair —
+// changing what 0 means here without changing it there gives every model on
+// a zero-budget GPU a permanent not_permitted, which is exactly the bug that
+// pairing them documents. ExpectedUUID /
+// ExpectedName are a purely descriptive drift detector: snapshotted when the
+// row is created (by the portal, Task 6) and later compared against live
+// telemetry to WARN that a card was renumbered — they never block anything;
+// the store just persists them.
+type ServerGPUBudget struct {
+	ServerID     string
+	GPUIndex     int
+	BudgetMB     int
+	ExpectedUUID string
+	ExpectedName string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// ServerRuntimeReport is the latest agent-managed runtime configuration
+// reported UPWARD by a server's ServerAgent when it is configured from a
+// local file on the AI server instead of from the gateway
+// (server_runtime_reports, migration 67). 1:1 per server, upsert-overwrite —
+// shaped exactly like ServerHardware. ReportJSON is a validated canonical
+// JSON blob, opaque to the store: the gateway's ingest layer (a later task)
+// parses, sanitizes, and redacts environment-variable values before the
+// report ever reaches here. The portal displays it read-only (a later
+// task); the store never parses, validates, or inspects it.
+type ServerRuntimeReport struct {
+	ServerID string
+	// CollectedAt is when the agent gathered the report; UpdatedAt is when
+	// the gateway wrote it. Both are supplied by the caller.
+	CollectedAt time.Time
+	ReportJSON  string
+	UpdatedAt   time.Time
+}
+
+// RuntimeStore is the agent-runtime-manager persistence surface: per-mapping
+// launch specs and their per-GPU VRAM demand rows, the pairwise co-residency
+// matrix (Task 2), per-GPU VRAM budgets (Task 3), and file-mode runtime
+// reports (Task 4) — all on tables created by migration 65
+// (specs/GPUs/co-residency), migration 66 (GPU budgets + the ai_servers
+// runtime columns), and migration 67 (runtime reports).
+type RuntimeStore interface {
+	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
+	// spec per mapping — the unique key is mapping_id, not id): a fresh
+	// insert uses spec.CreatedAt, an overwrite preserves the existing
+	// created_at. A missing MappingID is ErrNotFound (FK violation).
+	UpsertRuntimeSpec(ctx context.Context, spec RuntimeSpec) error
+	// RuntimeSpecByMapping returns the spec for mappingID; ok is false when
+	// no spec has been created for that mapping yet (not an error).
+	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
+	// RuntimeSpecByID returns the spec for id, keyed by its own primary key
+	// rather than its owning mapping (RuntimeSpecByMapping's key). Added for
+	// the telemetry VRAM write-back path (agent-runtime-manager Task 9): a
+	// runtime sample carries only spec_id, and resolving whether the operator
+	// has pinned vram_locked requires a point read by that id. ok is false
+	// when no spec has that id (e.g. deleted out from under an in-flight
+	// sample) -- not an error, mirroring RuntimeSpecByMapping's absent-read
+	// contract.
+	RuntimeSpecByID(ctx context.Context, id string) (RuntimeSpec, bool, error)
+	// RuntimeSpecsByApplication lists every spec belonging to a mapping of
+	// appID, ordered by spec id. Always non-nil, empty when none.
+	RuntimeSpecsByApplication(ctx context.Context, appID string) ([]RuntimeSpec, error)
+	// DeleteRuntimeSpec removes the spec by id, cascading its GPU rows. An
+	// unknown id is ErrNotFound.
+	DeleteRuntimeSpec(ctx context.Context, id string) error
+	// SetRuntimeSpecGPUs atomically REPLACES the whole set of per-GPU VRAM
+	// rows for specID (delete-then-insert in one transaction, mirroring
+	// SetGroupMembers). An empty gpus clears the set. specID must exist
+	// (ErrNotFound otherwise).
+	SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []RuntimeSpecGPU) error
+	// RuntimeSpecGPUs lists specID's per-GPU VRAM rows, ordered by GPU
+	// index. Always non-nil, empty when none.
+	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
+	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
+	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.
+	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
+	// SetCoResidencyRules atomically REPLACES the whole set of allowed
+	// co-residency pairs for appID (delete-then-insert in one transaction,
+	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). An empty/nil rules
+	// clears the set. appID must exist (ErrNotFound, checked inside the
+	// transaction before the delete); a rule naming a mapping id that does
+	// not exist is also ErrNotFound (FK violation). The store does NOT
+	// enforce or rewrite the MappingAID < MappingBID canonical ordering —
+	// that validation belongs to the portal (Task 6).
+	SetCoResidencyRules(ctx context.Context, appID string, rules []CoResidencyRule) error
+	// CoResidencyRulesByApplication lists appID's allowed co-residency
+	// pairs, ordered by mapping_a_id then mapping_b_id. Always non-nil,
+	// empty when none.
+	CoResidencyRulesByApplication(ctx context.Context, appID string) ([]CoResidencyRule, error)
+	// SetServerGPUBudgets atomically REPLACES the whole set of per-GPU VRAM
+	// budgets for serverID (delete-then-insert in one transaction, mirroring
+	// SetRuntimeSpecGPUs/SetCoResidencyRules above). An empty/nil budgets
+	// clears the set. serverID must exist (ErrNotFound, checked inside the
+	// transaction before the delete).
+	SetServerGPUBudgets(ctx context.Context, serverID string, budgets []ServerGPUBudget) error
+	// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
+	// index. Always non-nil, empty when none.
+	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
+	// UpsertServerRuntimeReport stores the latest file-mode runtime report
+	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
+	// An unknown ServerID is ErrNotFound (FK violation).
+	UpsertServerRuntimeReport(ctx context.Context, report ServerRuntimeReport) error
+	// ServerRuntimeReportByServer returns the latest runtime report for
+	// serverID; ok is false when no report has ever been stored for that
+	// server (not an error) — mirrors ServerHardwareByServer.
+	ServerRuntimeReportByServer(ctx context.Context, serverID string) (ServerRuntimeReport, bool, error)
+}
+
 // Store is the full routing persistence surface: the composition of every
 // role-scoped sub-interface above, grouped by concern. *MemoryStore (this
 // package) and *store.SQLStore implement Store by implementing each
@@ -1208,6 +1414,7 @@ type Store interface {
 	ResourceGroupStore
 	LimitsStore
 	CertificateStore
+	RuntimeStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.

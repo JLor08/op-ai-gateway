@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
@@ -504,15 +505,8 @@ func TestHandleAgentDownloadServesConfig(t *testing.T) {
 	}
 	// Strip whole-line // comments (as the agent's loader does) — the remainder must
 	// be valid JSON with the caller's bearer echoed into token and a derived gateway_url.
-	var kept []string
-	for _, ln := range strings.Split(rec.Body.String(), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(ln), "//") {
-			continue
-		}
-		kept = append(kept, ln)
-	}
 	var cfg map[string]any
-	if err := json.Unmarshal([]byte(strings.Join(kept, "\n")), &cfg); err != nil {
+	if err := json.Unmarshal([]byte(stripJSONCComments(rec.Body.String())), &cfg); err != nil {
 		t.Fatalf("config not valid JSON after comment-strip: %v", err)
 	}
 	if cfg["token"] != "valid-agent-secret" {
@@ -537,17 +531,48 @@ func TestHandleAgentDownloadServesConfig(t *testing.T) {
 	}
 }
 
-// TestBuildAgentConfigJSONKeySet is a drift guard: the JSONC template is
-// hand-duplicated in THREE places that cannot share code (this Go backend,
-// the frontend's buildServerAgentConfig in AgentTokenSection.tsx, and the
-// standalone server-agent module's config fixture, which this package cannot
-// import since it is a separate Go module). This test pins the EXACT key set
-// buildAgentConfigJSON emits against a maintained expectation list below —
-// adding, removing, or renaming a key here without updating the other two
-// copies fails this test, forcing whoever changes one template to look at all
-// three rather than silently drift.
-func TestBuildAgentConfigJSONKeySet(t *testing.T) {
-	raw := buildAgentConfigJSON(agentConfigMaterial{GatewayURL: "https://gw.example"}, "tok")
+// The shared JSONC config-template golden and the fixed inputs it is
+// generated from. The golden lives in the server-agent module --
+// server-agent/testdata/server-agent.config.jsonc, reached here by a
+// repo-relative path because the two Go modules cannot import each other --
+// because that module OWNS the file format: it is the code that actually has
+// to read the document. Three separate checks point at this one file, and
+// together they are what makes drift BETWEEN the copies detectable:
+//
+//  1. this package's buildAgentConfigJSON (the `curl` endpoint) must equal it
+//     byte for byte -- TestBuildAgentConfigJSONMatchesSharedGolden below;
+//  2. the portal's buildServerAgentConfig (the download button) must equal it
+//     byte for byte -- AgentTokenSection.test.tsx. Each side used to pin only
+//     its OWN key set, so neither could see the other and the two copies
+//     could disagree indefinitely; that is exactly how one of them ended up
+//     carrying a comment about five runtime settings and none of the keys;
+//  3. server-agent's own config_test.go feeds this file through the REAL
+//     config.Load, and checks its key set against every `json` tag on
+//     fileConfig by reflection -- so a setting the agent can read but the
+//     template never mentions fails there, with no hand-maintained list
+//     anywhere in the chain.
+//
+// Every value in the fixed inputs is plain ASCII containing none of `<`, `>`
+// or `&` -- the only characters Go's json.Marshal escapes and JavaScript's
+// JSON.stringify does not. That is what lets a Go producer and a TypeScript
+// producer be compared byte for byte at all.
+const (
+	agentConfigGoldenPath       = "../../../../server-agent/testdata/server-agent.config.jsonc"
+	agentConfigGoldenGatewayURL = "https://gw.example.test"
+	agentConfigGoldenToken      = "fixture-token"
+)
+
+// updateAgentConfigGolden rewrites the golden from this template. Deliberately
+// spelled out rather than the conventional bare -update: the golden is read by
+// three test suites in two languages, so rewriting it is a cross-cutting act
+// and should not be reachable by a habit-typed flag.
+var updateAgentConfigGolden = flag.Bool("update-agent-config-golden", false,
+	"rewrite server-agent/testdata/server-agent.config.jsonc from buildAgentConfigJSON")
+
+// stripJSONCComments drops whole-line // comments exactly as the agent's own
+// config loader does (server-agent/internal/config/config.go
+// stripJSONLineComments), so what remains must be valid JSON.
+func stripJSONCComments(raw string) string {
 	var kept []string
 	for _, ln := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(ln), "//") {
@@ -555,38 +580,66 @@ func TestBuildAgentConfigJSONKeySet(t *testing.T) {
 		}
 		kept = append(kept, ln)
 	}
+	return strings.Join(kept, "\n")
+}
+
+// TestBuildAgentConfigJSONMatchesSharedGolden is the Go half of the cross-copy
+// drift guard. It asserts two things about the generated document: that
+// stripping its comments leaves valid JSON (the JSONC style is only useful if
+// the agent can still parse it), and that it is byte-for-byte the shared
+// golden -- which the portal's TypeScript copy is held to as well.
+//
+// Regenerate after a deliberate template change:
+//
+//	cd gateway/backend && go test ./internal/gateway -run TestBuildAgentConfigJSONMatchesSharedGolden -update-agent-config-golden
+//
+// then run the frontend and server-agent suites, which will tell you whether
+// the other copies still agree with what you just generated.
+func TestBuildAgentConfigJSONMatchesSharedGolden(t *testing.T) {
+	got := buildAgentConfigJSON(agentConfigMaterial{GatewayURL: agentConfigGoldenGatewayURL}, agentConfigGoldenToken)
+
 	var cfg map[string]any
-	if err := json.Unmarshal([]byte(strings.Join(kept, "\n")), &cfg); err != nil {
-		t.Fatalf("config not valid JSON after comment-strip: %v\n%s", err, raw)
+	if err := json.Unmarshal([]byte(stripJSONCComments(got)), &cfg); err != nil {
+		t.Fatalf("config not valid JSON after comment-strip: %v\n%s", err, got)
 	}
-	// Maintained by hand. When adding a key to buildAgentConfigJSON, add it
-	// here too, AND to server-agent/internal/config/config.go's fileConfig
-	// (+ its README table + JSONC example) AND to AgentTokenSection.tsx's
-	// buildServerAgentConfig.
-	want := []string{
-		"gateway_url", "token", "transport", "interval", "system_report_interval",
-		"metrics_url", "model_status_url", "model_status_format", "lhm_url",
-		"cert_mode", "cert_dir", "cert_reload_command", "cert_poll_interval",
-		"ca_file", "ca_cache_file", "ca_pem",
-		"tls_insecure", "verbose",
+
+	if *updateAgentConfigGolden {
+		if err := os.WriteFile(agentConfigGoldenPath, []byte(got), 0o644); err != nil {
+			t.Fatalf("rewrite golden %s: %v", agentConfigGoldenPath, err)
+		}
+		t.Logf("golden rewritten (%d keys): %s", len(cfg), agentConfigGoldenPath)
+		return
 	}
-	wantSet := make(map[string]bool, len(want))
-	for _, k := range want {
-		wantSet[k] = true
+
+	raw, err := os.ReadFile(agentConfigGoldenPath)
+	if err != nil {
+		t.Fatalf("read golden %s: %v\nregenerate with: go test ./internal/gateway -run %s -update-agent-config-golden", agentConfigGoldenPath, err, t.Name())
 	}
-	if len(cfg) != len(want) {
-		t.Errorf("buildAgentConfigJSON emits %d keys, want %d (got %v)", len(cfg), len(want), sortedKeys(cfg))
+	want := string(raw)
+	if got == want {
+		return
 	}
-	for k := range cfg {
-		if !wantSet[k] {
-			t.Errorf("unexpected key %q in buildAgentConfigJSON output (update the expectation list in this test AND server-agent's fileConfig AND buildServerAgentConfig)", k)
+
+	var wantCfg map[string]any
+	if err := json.Unmarshal([]byte(stripJSONCComments(want)), &wantCfg); err == nil {
+		if g, w := sortedKeys(cfg), sortedKeys(wantCfg); strings.Join(g, ",") != strings.Join(w, ",") {
+			t.Errorf("key set drifted from the golden:\n template: %v\n golden:   %v", g, w)
 		}
 	}
-	for _, k := range want {
-		if _, ok := cfg[k]; !ok {
-			t.Errorf("missing key %q from buildAgentConfigJSON output", k)
+	gotLines, wantLines := strings.Split(got, "\n"), strings.Split(want, "\n")
+	for i := 0; i < len(gotLines) || i < len(wantLines); i++ {
+		g, w := "<end of file>", "<end of file>"
+		if i < len(gotLines) {
+			g = gotLines[i]
+		}
+		if i < len(wantLines) {
+			w = wantLines[i]
+		}
+		if g != w {
+			t.Fatalf("buildAgentConfigJSON has drifted from %s at line %d:\n template: %q\n golden:   %q\n\nIf the template change is deliberate, regenerate the golden (go test ./internal/gateway -run %s -update-agent-config-golden) AND update the portal's buildServerAgentConfig in gateway/frontend/src/components/AgentTokenSection.tsx to match, or its own golden test will fail.", agentConfigGoldenPath, i+1, g, w, t.Name())
 		}
 	}
+	t.Fatalf("buildAgentConfigJSON differs from %s but no differing line was found", agentConfigGoldenPath)
 }
 
 func sortedKeys(m map[string]any) []string {

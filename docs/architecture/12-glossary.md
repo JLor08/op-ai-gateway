@@ -7,7 +7,7 @@ Domain and technical terms used throughout this documentation.
 | **OnPrem AI Gateway (OP AI Gateway)** | This product: a self-hostable AI gateway and management portal. |
 | **Gateway** | The Go backend service (`op-ai-gateway`) that terminates client APIs, routes/dispatches inference, and serves portal/system/agent APIs. |
 | **Portal** | The React/TypeScript SPA for administration and the chat playground, served under `/portal/`. |
-| **Server-Agent** | The standalone Go binary (`op-ai-server-agent`) installed next to an AI server that reports telemetry and can terminate mesh TLS. |
+| **Server-Agent** | The standalone Go binary (`op-ai-server-agent`) installed next to an AI server that reports telemetry, can terminate mesh TLS, and can manage the local model server processes. |
 | **AI server** | A host running an inference engine (Ollama, llama.cpp, or vLLM) that the gateway dispatches to. |
 | **Application** | A running inference endpoint on an AI server (type, port, scheme, API flavors, tuning fields). One AI server can have several. |
 | **Model mapping** | The link between a public gateway model name and an application's model name; routing operates over **active** mappings. |
@@ -33,6 +33,15 @@ Domain and technical terms used throughout this documentation.
 | **Usage event** | A per-request record (tokens, cost, energy, status, attribution) used for analytics. |
 | **Payload capture** | The opt-in, encrypted-or-volatile, redacted storage of request/response payloads. |
 | **Telemetry** | Host/GPU/power/temperature/hardware data pushed by the Server-Agent. |
+| **Managed runtime** | The agent-managed model runtime: model server *processes* started and stopped on demand by the Server-Agent from launch specifications held in the gateway. Replaces llama-swap. See [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md). |
+| **Launch spec** | The full command for one managed model — binary, argv, environment, working directory, listen port, health path, timeouts — stored per model mapping and edited in the portal. |
+| **Router port** | The single HTTP port an agent exposes for all its managed models; it reads the `model` field out of each request body and reverse-proxies to the matching child process (which binds loopback only). |
+| **Admission** | The agent-side decision, taken before any model process starts, that the new process may run alongside those already running: the co-residency matrix, the process limit, and the per-GPU VRAM budgets, all three. |
+| **Co-residency matrix** | The operator's pairwise statement of which two managed models may run at the same time. Row present means pair allowed; it expresses *intent* and covers non-VRAM constraints, while the VRAM arithmetic is the veto. |
+| **VRAM budget** | A per-`(server, GPU index)` megabyte ceiling that admission sums declared and measured demand against. An *absent* row and a row of `0` both mean unconstrained — "no budget for this GPU" is expressible either way, and admission skips the GPU identically. |
+| **Feature flag (agent capability)** | A named capability, e.g. `runtime_manager`, that gateway and agent each declare; a feature is active only where both lists intersect. Versions are never compared ([ADR-025](09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)). |
+| **Admin state** | The persisted desired-state override on a managed model: `''` (none), `force_running`, or `force_stopped`. There is no restart command — a restart is a sequence over these states. |
+| **File mode** | An agent whose managed-runtime configuration comes from a local file instead of the gateway. It reports its effective configuration upward with environment values masked, and the portal becomes read-only for that server. |
 | **Dialect seam** | The abstraction that keeps SQLite and PostgreSQL on one query set (`internal/store/dialect.go`). |
 | **Migration** | A forward-only, versioned schema change applied transactionally on startup. |
 | **Store driver** | One of `memory`, `sqlite`, `postgres`. |

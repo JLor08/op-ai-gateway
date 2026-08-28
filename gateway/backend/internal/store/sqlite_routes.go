@@ -25,8 +25,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		host.ID,
 		host.Name,
 		host.Domain,
@@ -57,6 +57,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 		host.SystemGroupID,
 		host.CertificateOverride,
 		host.HTTPSSwitchOverride,
+		host.RuntimeMaxProcesses,
+		host.ManagedRuntimeOnly,
 	)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -76,7 +78,7 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_group_ids = ?, netbird_peer_managed = ?, netbird_policy_override = ?, netbird_allow_ping = ?,
 			netbird_ping_exclude = ?, agent_presence_timeout_seconds = ?,
 			estimated_watts = ?, idle_watts = ?, price_per_kwh = ?, pue = ?, price_unit = ?, system_group_id = ?,
-			certificate_override = ?, https_switch_override = ?
+			certificate_override = ?, https_switch_override = ?, runtime_max_processes = ?, managed_runtime_only = ?
 		where id = ?`,
 		host.Name,
 		host.Domain,
@@ -106,6 +108,8 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 		host.SystemGroupID,
 		host.CertificateOverride,
 		host.HTTPSSwitchOverride,
+		host.RuntimeMaxProcesses,
+		host.ManagedRuntimeOnly,
 		host.ID,
 	)
 	if err != nil {
@@ -122,7 +126,7 @@ func (s *SQLiteStore) AIServerByID(ctx context.Context, id string) (routing.AISe
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
 		from ai_servers
 		where id = ?`, id)
 	return scanAIServer(row)
@@ -136,7 +140,7 @@ func (s *SQLiteStore) AIServers(ctx context.Context) ([]routing.AIServer, error)
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
 		from ai_servers
 		order by id`)
 	if err != nil {
@@ -385,7 +389,7 @@ func (s *SQLiteStore) ServersByOwner(ctx context.Context, userID string) ([]rout
 			s.netbird_group_ids, s.netbird_peer_managed, s.netbird_policy_override, s.netbird_allow_ping,
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
-			s.certificate_override, s.https_switch_override
+			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only
 		from ai_servers s
 		join server_owners o on o.server_id = s.id
 		where o.user_id = ?
@@ -508,7 +512,7 @@ func (s *SQLiteStore) ServersByAdminGroups(ctx context.Context, groupIDs []strin
 			s.netbird_group_ids, s.netbird_peer_managed, s.netbird_policy_override, s.netbird_allow_ping,
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
-			s.certificate_override, s.https_switch_override
+			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only
 		from ai_servers s
 		join server_admin_groups g on g.server_id = s.id
 		where g.group_id in (`+strings.Join(placeholders, ",")+`)
@@ -764,7 +768,7 @@ func encodeAPIFlavors(apiFlavors []string) (string, error) {
 func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	var host routing.AIServer
 	var lastSeenAt sql.NullTime
-	var netbirdEnabled, netbirdConnected, netbirdPeerManaged, netbirdAllowPing, netbirdPingExclude int64
+	var netbirdEnabled, netbirdConnected, netbirdPeerManaged, netbirdAllowPing, netbirdPingExclude, managedRuntimeOnly int64
 	err := row.Scan(
 		&host.ID,
 		&host.Name,
@@ -796,6 +800,8 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 		&host.SystemGroupID,
 		&host.CertificateOverride,
 		&host.HTTPSSwitchOverride,
+		&host.RuntimeMaxProcesses,
+		&managedRuntimeOnly,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.AIServer{}, ErrNotFound
@@ -811,6 +817,7 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	host.NetbirdPeerManaged = netbirdPeerManaged != 0
 	host.NetbirdAllowPing = netbirdAllowPing != 0
 	host.NetbirdPingExclude = netbirdPingExclude != 0
+	host.ManagedRuntimeOnly = managedRuntimeOnly != 0
 	return host, nil
 }
 

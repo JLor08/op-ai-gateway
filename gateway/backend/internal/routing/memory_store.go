@@ -89,6 +89,40 @@ type MemoryStore struct {
 	// plain value-map assignment is a full copy — no copyCertificate helper
 	// needed (mirrors e.g. ResourceGroup's by-value storage).
 	certificates map[string]Certificate
+	// runtimeSpecs mirrors agent_runtime_specs (migration 65, T1): spec id ->
+	// its RuntimeSpec row. RuntimeSpec has no slice/pointer fields, so a plain
+	// value-map assignment is a full copy (mirrors certificates above).
+	// mapping_id is a unique key on the SQL side, NOT the map key here (id is
+	// the primary key there too) — UpsertRuntimeSpec enforces the "1 spec per
+	// mapping" invariant by hand, scanning for an existing entry with the
+	// same MappingID.
+	runtimeSpecs map[string]RuntimeSpec
+	// runtimeSpecGPUs mirrors agent_runtime_spec_gpus: spec id -> its per-GPU
+	// VRAM rows (unordered on write; RuntimeSpecGPUs sorts by GPUIndex on
+	// read, mirroring the SQL `order by gpu_index`). Deleting a spec cascades
+	// deletion of its entry here (mirrors the table's ON DELETE CASCADE).
+	runtimeSpecGPUs map[string][]RuntimeSpecGPU
+	// coresidency mirrors agent_coresidency_rules (migration 65, Task 2):
+	// applicationID -> its full set of allowed co-residency pairs. A row's
+	// PRESENCE is the "allowed" signal (there is no separate flag) — the
+	// SQL table's shape, mirrored here directly. SetCoResidencyRules
+	// atomically replaces the whole per-application set (delete-then-insert
+	// on the SQL side; a single map assignment here, already atomic under
+	// m.mu). Unordered on write; CoResidencyRulesByApplication sorts by
+	// (MappingAID, MappingBID) on read, mirroring the SQL `order by
+	// mapping_a_id, mapping_b_id` (same pattern as runtimeSpecGPUs above).
+	coresidency map[string][]CoResidencyRule
+	// gpuBudgets mirrors ai_server_gpu_budgets (migration 66, Task 3): serverID
+	// -> its full set of per-GPU VRAM budgets. SetServerGPUBudgets atomically
+	// replaces the whole per-server set (delete-then-insert on the SQL side; a
+	// single map assignment here, already atomic under m.mu). Unordered on
+	// write; ServerGPUBudgets sorts by GPUIndex on read, mirroring the SQL
+	// `order by gpu_index` (same pattern as runtimeSpecGPUs/coresidency above).
+	gpuBudgets map[string][]ServerGPUBudget
+	// runtimeReports mirrors server_runtime_reports (migration 67, Task 4):
+	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
+	// same shape as `hardware` above.
+	runtimeReports map[string]ServerRuntimeReport
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -118,6 +152,11 @@ func NewMemoryStore() *MemoryStore {
 		resourceGroupProvisions:  map[string]map[ResourceGroupProvision]struct{}{},
 		principalLimits:          map[string]map[string]LimitConfig{},
 		certificates:             map[string]Certificate{},
+		runtimeSpecs:             map[string]RuntimeSpec{},
+		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
+		coresidency:              map[string][]CoResidencyRule{},
+		gpuBudgets:               map[string][]ServerGPUBudget{},
+		runtimeReports:           map[string]ServerRuntimeReport{},
 	}
 }
 
@@ -323,11 +362,27 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 	if _, ok := m.servers[id]; !ok {
 		return storeerr.ErrNotFound
 	}
+	// Every table with a `server_id ... references ai_servers(id) on delete
+	// cascade` FK must lose its rows here, plus everything that cascades
+	// TRANSITIVELY through applications and model_mappings — see
+	// deleteApplicationLocked / deleteMappingLocked below, which own the
+	// transitive half so DeleteApplication and DeleteMapping get the same
+	// cascade. The SQL FK graph (grep `references ai_servers(id)` in
+	// store/migrate.go) is the checklist; a per-server map missing from this
+	// method leaks a dangling row that no SQL driver ever returns, which the
+	// memory-mode dev/e2e driver then serves as if the server still existed.
 	m.deleteApplicationsForServerLocked(id)
 	delete(m.servers, id)
-	delete(m.owners, id)
-	delete(m.agentTokens, id)
-	delete(m.serverAdminGroups, id)
+	delete(m.owners, id)                  // server_owners
+	delete(m.agentTokens, id)             // agent_tokens (keyed by ServerID)
+	delete(m.serverAdminGroups, id)       // server_admin_groups
+	delete(m.telemetry, id)               // server_telemetry
+	delete(m.hardware, id)                // server_hardware
+	delete(m.samples, id)                 // server_telemetry_samples
+	delete(m.availSamples, id)            // server_availability_samples
+	delete(m.gpuBudgets, id)              // ai_server_gpu_budgets
+	delete(m.runtimeReports, id)          // server_runtime_reports
+	m.deleteAffinitiesForServerLocked(id) // route_affinity.server_id
 	// resourceGroupServers is keyed resourceGroupID -> serverID (the REVERSE
 	// direction from serverAdminGroups' serverID -> groupID), so cascading a
 	// server delete needs to drop id from EVERY resource group's server set —
@@ -343,6 +398,19 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 		}
 	}
 	return nil
+}
+
+// deleteAffinitiesForServerLocked drops every route_affinity row pinned to
+// serverID. affinities is keyed by AffinityKey (api token + model + flavor +
+// session), not by server, so the cascade is a scan over the values — the
+// same shape as the certificates loop above. Callers must hold m.mu for
+// writing.
+func (m *MemoryStore) deleteAffinitiesForServerLocked(serverID string) {
+	for key, aff := range m.affinities {
+		if aff.ServerID == serverID {
+			delete(m.affinities, key)
+		}
+	}
 }
 
 func (m *MemoryStore) SetServerOwners(_ context.Context, serverID string, userIDs []string) error {
@@ -727,6 +795,9 @@ func (m *MemoryStore) CreateApplication(_ context.Context, app Application) erro
 	if m.applicationPortTakenLocked(app.ServerID, app.Port, "") {
 		return storeerr.ErrConflict
 	}
+	if app.Type == ProviderServerAgent && m.serverAgentApplicationExistsLocked(app.ServerID, "") {
+		return storeerr.ErrConflict
+	}
 	m.applications[app.ID] = copyApplication(app)
 	return nil
 }
@@ -743,8 +814,42 @@ func (m *MemoryStore) UpdateApplication(_ context.Context, app Application) erro
 	if m.applicationPortTakenLocked(app.ServerID, app.Port, app.ID) {
 		return storeerr.ErrConflict
 	}
+	if app.Type == ProviderServerAgent && m.serverAgentApplicationExistsLocked(app.ServerID, app.ID) {
+		return storeerr.ErrConflict
+	}
 	m.applications[app.ID] = copyApplication(app)
 	return nil
+}
+
+// serverAgentApplicationExistsLocked reports whether serverID already has a
+// ProviderServerAgent application other than excludeID (pass "" on the create
+// path, the written application's own id on the update path so an in-place
+// edit of the server's own server_agent application is not a self-collision).
+//
+// This mirrors migration 68's partial unique index on
+// applications(server_id) where type = 'server_agent' -- SQL side ->
+// ErrConflict, so MemoryStore must reject it the same way. Shape copied from
+// applicationPortTakenLocked above, with one deliberate difference: the port
+// gate has no SQL constraint behind it at all, while this one does, so a
+// memory/SQL divergence here is observable through the API.
+//
+// This is the BACKSTOP, not the primary gate: portal.Service checks the same
+// condition before it writes (returning the honest
+// ErrServerAgentApplicationExists sentinel), but that check reads, releases
+// the lock and then calls CreateApplication in no transaction, so two
+// concurrent creates can both pass it. Catching the loser here is exactly
+// this guard's job -- do not read the service-level gate as race-free.
+// Callers must hold m.mu for writing.
+func (m *MemoryStore) serverAgentApplicationExistsLocked(serverID, excludeID string) bool {
+	for id, existing := range m.applications {
+		if id == excludeID {
+			continue
+		}
+		if existing.ServerID == serverID && existing.Type == ProviderServerAgent {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MemoryStore) applicationPortTakenLocked(serverID string, port int, excludeID string) bool {
@@ -792,28 +897,78 @@ func (m *MemoryStore) DeleteApplication(_ context.Context, id string) error {
 	if _, ok := m.applications[id]; !ok {
 		return storeerr.ErrNotFound
 	}
-	m.deleteMappingsForApplicationLocked(id)
-	delete(m.applications, id)
+	m.deleteApplicationLocked(id)
 	return nil
 }
 
 // deleteApplicationsForServerLocked removes every application owned by
-// serverID (and their mappings). Callers must hold m.mu for writing.
+// serverID, with the full cascade. Callers must hold m.mu for writing.
 func (m *MemoryStore) deleteApplicationsForServerLocked(serverID string) {
 	for id, app := range m.applications {
 		if app.ServerID == serverID {
-			m.deleteMappingsForApplicationLocked(id)
-			delete(m.applications, id)
+			m.deleteApplicationLocked(id)
+		}
+	}
+}
+
+// deleteApplicationLocked removes one application plus everything the SQL FK
+// graph cascades from `applications`: its mappings (and, through
+// deleteMappingLocked, everything under them), its co-residency matrix
+// (agent_coresidency_rules.application_id) and its route affinities
+// (route_affinity.application_id). Callers must hold m.mu for writing.
+//
+// Sharing this between DeleteApplication and the server-delete path is what
+// keeps the two cascades identical; before it existed both stopped at
+// `mappings` and left the rest of the per-application state dangling.
+func (m *MemoryStore) deleteApplicationLocked(applicationID string) {
+	m.deleteMappingsForApplicationLocked(applicationID)
+	delete(m.applications, applicationID)
+	delete(m.coresidency, applicationID)
+	for key, aff := range m.affinities {
+		if aff.ApplicationID == applicationID {
+			delete(m.affinities, key)
 		}
 	}
 }
 
 // deleteMappingsForApplicationLocked removes every mapping owned by
-// applicationID. Callers must hold m.mu for writing.
+// applicationID, with the full cascade. Callers must hold m.mu for writing.
 func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 	for id, mapping := range m.mappings {
 		if mapping.ApplicationID == applicationID {
-			delete(m.mappings, id)
+			m.deleteMappingLocked(id)
+		}
+	}
+}
+
+// deleteMappingLocked removes one mapping plus everything the SQL FK graph
+// cascades from `model_mappings`: its benchmark runs
+// (model_mapping_benchmarks.mapping_id), its runtime spec
+// (agent_runtime_specs.mapping_id) and that spec's per-GPU rows
+// (agent_runtime_spec_gpus.spec_id, a second hop), and any co-residency pair
+// naming it on EITHER side (agent_coresidency_rules.mapping_a_id /
+// mapping_b_id — a partial removal from the owning application's set, unlike
+// the whole-set delete in deleteApplicationLocked). Callers must hold m.mu
+// for writing.
+func (m *MemoryStore) deleteMappingLocked(mappingID string) {
+	delete(m.mappings, mappingID)
+	delete(m.benchmarks, mappingID)
+	for specID, spec := range m.runtimeSpecs {
+		if spec.MappingID == mappingID {
+			delete(m.runtimeSpecs, specID)
+			delete(m.runtimeSpecGPUs, specID)
+		}
+	}
+	for appID, rules := range m.coresidency {
+		kept := make([]CoResidencyRule, 0, len(rules))
+		for _, r := range rules {
+			if r.MappingAID == mappingID || r.MappingBID == mappingID {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if len(kept) != len(rules) {
+			m.coresidency[appID] = kept
 		}
 	}
 }
@@ -1061,7 +1216,7 @@ func (m *MemoryStore) DeleteMapping(_ context.Context, id string) error {
 	if _, ok := m.mappings[id]; !ok {
 		return storeerr.ErrNotFound
 	}
-	delete(m.mappings, id)
+	m.deleteMappingLocked(id)
 	return nil
 }
 
@@ -2073,4 +2228,298 @@ func (m *MemoryStore) DeleteCertificate(_ context.Context, domain string) error 
 	defer m.mu.Unlock()
 	delete(m.certificates, domain)
 	return nil
+}
+
+// --- RuntimeStore (agent-runtime-manager, migration 65, T1) -----------------
+
+// UpsertRuntimeSpec inserts or replaces the launch spec for spec.MappingID.
+// MappingID must reference an existing mapping — a hand-rolled FK existence
+// check against m.mappings, mirroring CreateApplication/CreateMapping's
+// server_id/application_id checks above. Mirrors the SQL upsert's `on
+// conflict(mapping_id) do update set ...`: an existing spec for this mapping
+// is updated IN PLACE (keeping its stored id and CreatedAt — the SQL update
+// set list never touches id or created_at); a spec.ID reused for a DIFFERENT
+// mapping is the primary-key collision the SQL insert would raise as a unique
+// violation, so it is rejected here too.
+func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mappings[spec.MappingID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	for existingID, existing := range m.runtimeSpecs {
+		if existing.MappingID == spec.MappingID {
+			spec.ID = existingID
+			spec.CreatedAt = existing.CreatedAt
+			m.runtimeSpecs[existingID] = spec
+			return nil
+		}
+	}
+	if existing, ok := m.runtimeSpecs[spec.ID]; ok && existing.MappingID != spec.MappingID {
+		return storeerr.ErrConflict
+	}
+	m.runtimeSpecs[spec.ID] = spec
+	return nil
+}
+
+// RuntimeSpecByMapping returns the spec for mappingID, if any. RuntimeSpec has
+// no slice/pointer fields, so the map value is already a safe copy.
+func (m *MemoryStore) RuntimeSpecByMapping(_ context.Context, mappingID string) (RuntimeSpec, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, spec := range m.runtimeSpecs {
+		if spec.MappingID == mappingID {
+			return spec, true, nil
+		}
+	}
+	return RuntimeSpec{}, false, nil
+}
+
+// RuntimeSpecByID returns the spec for id (the telemetry VRAM write-back
+// path's primary-key lookup -- see RuntimeStore.RuntimeSpecByID). RuntimeSpec
+// has no slice/pointer fields, so the map value is already a safe copy.
+func (m *MemoryStore) RuntimeSpecByID(_ context.Context, id string) (RuntimeSpec, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	spec, ok := m.runtimeSpecs[id]
+	return spec, ok, nil
+}
+
+// RuntimeSpecsByApplication lists every spec whose mapping belongs to appID,
+// ordered by spec id (mirrors the SQL join's `order by s.id`).
+func (m *MemoryStore) RuntimeSpecsByApplication(_ context.Context, appID string) ([]RuntimeSpec, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RuntimeSpec, 0)
+	for _, spec := range m.runtimeSpecs {
+		if mapping, ok := m.mappings[spec.MappingID]; ok && mapping.ApplicationID == appID {
+			out = append(out, spec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// DeleteRuntimeSpec removes the spec by id, cascading deletion of its GPU
+// rows (mirrors agent_runtime_spec_gpus' ON DELETE CASCADE).
+func (m *MemoryStore) DeleteRuntimeSpec(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runtimeSpecs[id]; !ok {
+		return storeerr.ErrNotFound
+	}
+	delete(m.runtimeSpecs, id)
+	delete(m.runtimeSpecGPUs, id)
+	return nil
+}
+
+// SetRuntimeSpecGPUs atomically replaces specID's whole set of per-GPU VRAM
+// rows (mirrors the SQL delete-then-insert transaction; the in-memory
+// assignment is already atomic under m.mu). specID must exist.
+func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus []RuntimeSpecGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runtimeSpecs[specID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	// A duplicate GPUIndex within gpus would hit the composite primary key
+	// (spec_id, gpu_index) on the SQL side — reject it here too so both
+	// backends agree (mirrors sqlite_runtime.go's isUniqueViolation
+	// classification for the same insert).
+	seen := make(map[int]struct{}, len(gpus))
+	for _, g := range gpus {
+		if _, dup := seen[g.GPUIndex]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[g.GPUIndex] = struct{}{}
+	}
+	stored := copyRuntimeSpecGPUs(gpus)
+	for i := range stored {
+		stored[i].SpecID = specID
+	}
+	m.runtimeSpecGPUs[specID] = stored
+	return nil
+}
+
+// RuntimeSpecGPUs returns specID's per-GPU VRAM rows ordered by GPU index
+// (mirrors the SQL `order by gpu_index`). The slice is deep-copied so the
+// caller cannot alias internal state.
+func (m *MemoryStore) RuntimeSpecGPUs(_ context.Context, specID string) ([]RuntimeSpecGPU, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := copyRuntimeSpecGPUs(m.runtimeSpecGPUs[specID])
+	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
+	return out, nil
+}
+
+// UpdateRuntimeSpecGPUMeasured writes back one agent measurement, touching
+// only VRAMMeasuredMB (VRAMEstimateMB, operator-owned, is never written
+// here). ErrNotFound when the (specID, gpuIndex) row does not exist.
+func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID string, gpuIndex int, measuredMB int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.runtimeSpecGPUs[specID]
+	for i := range rows {
+		if rows[i].GPUIndex == gpuIndex {
+			rows[i].VRAMMeasuredMB = measuredMB
+			return nil
+		}
+	}
+	return storeerr.ErrNotFound
+}
+
+// copyRuntimeSpecGPUs returns an ALWAYS-non-nil copy of gpus: RuntimeSpecGPUs'
+// documented contract (store.go) is "always non-nil, empty when none", which
+// the SQL side satisfies via `make([]routing.RuntimeSpecGPU, 0)`. Building
+// this with `append([]RuntimeSpecGPU(nil), gpus...)` would silently return a
+// bare nil for a nil OR an already-empty gpus (append onto a nil slice
+// literal with zero elements to append always yields nil in Go), diverging
+// from the SQL store and surfacing downstream as a JSON `null` vs `[]`
+// difference. `make` + `copy` always allocates, even for length 0.
+func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
+	out := make([]RuntimeSpecGPU, len(gpus))
+	copy(out, gpus)
+	return out
+}
+
+// --- RuntimeStore: co-residency matrix (agent-runtime-manager, Task 2) -----
+
+// SetCoResidencyRules atomically REPLACES appID's whole set of allowed
+// co-residency pairs (mirrors the SQL delete-then-insert transaction; the
+// in-memory assignment below is already atomic under m.mu, so no separate
+// "delete" step is needed — a failed check leaves the previous set
+// untouched, same as a rolled-back SQL transaction). appID must exist
+// (ErrNotFound otherwise); every rule's two mapping ids must also exist — a
+// hand-rolled FK existence check against m.mappings, mirroring
+// UpsertRuntimeSpec's mapping_id check above and the SQL FKs on
+// mapping_a_id/mapping_b_id. The store does NOT enforce or rewrite the
+// MappingAID < MappingBID canonical ordering — that is portal-level
+// validation (Task 6).
+func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules []CoResidencyRule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.applications[appID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	// An exact-duplicate (MappingAID, MappingBID) pair within rules would hit
+	// the composite primary key (application_id, mapping_a_id, mapping_b_id)
+	// on the SQL side — reject it here too so both backends agree (mirrors
+	// SetRuntimeSpecGPUs/SetServerGPUBudgets' duplicate-index checks, and
+	// sqlite_runtime.go's isUniqueViolation classification for the same
+	// insert). The portal validates pairs before calling this, so this is not
+	// the only guard in production — but a store-level divergence that only
+	// the portal's validation hides is exactly the kind that surfaces the
+	// first time another caller appears.
+	type pairKey struct{ a, b string }
+	seen := make(map[pairKey]struct{}, len(rules))
+	stored := make([]CoResidencyRule, 0, len(rules))
+	for _, r := range rules {
+		if _, ok := m.mappings[r.MappingAID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		if _, ok := m.mappings[r.MappingBID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		key := pairKey{a: r.MappingAID, b: r.MappingBID}
+		if _, dup := seen[key]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[key] = struct{}{}
+		r.ApplicationID = appID
+		stored = append(stored, r)
+	}
+	m.coresidency[appID] = stored
+	return nil
+}
+
+// CoResidencyRulesByApplication returns appID's allowed co-residency pairs,
+// ordered by MappingAID then MappingBID (mirrors the SQL `order by
+// mapping_a_id, mapping_b_id`). Always non-nil, empty when none. The result
+// is a fresh copy (CoResidencyRule has no slice/pointer fields, so a plain
+// element copy suffices — mirrors copyRuntimeSpecGPUs' non-nil contract).
+func (m *MemoryStore) CoResidencyRulesByApplication(_ context.Context, appID string) ([]CoResidencyRule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]CoResidencyRule, len(m.coresidency[appID]))
+	copy(out, m.coresidency[appID])
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].MappingAID != out[j].MappingAID {
+			return out[i].MappingAID < out[j].MappingAID
+		}
+		return out[i].MappingBID < out[j].MappingBID
+	})
+	return out, nil
+}
+
+// --- RuntimeStore: per-GPU VRAM budgets (agent-runtime-manager, Task 3) ----
+
+// SetServerGPUBudgets atomically REPLACES serverID's whole set of per-GPU
+// VRAM budgets (mirrors the SQL delete-then-insert transaction; the
+// in-memory assignment below is already atomic under m.mu, so no separate
+// "delete" step is needed — a failed check leaves the previous set
+// untouched, same as a rolled-back SQL transaction). serverID must exist
+// (ErrNotFound otherwise) — a hand-rolled FK existence check against
+// m.servers, mirroring SetRuntimeSpecGPUs/SetCoResidencyRules above.
+func (m *MemoryStore) SetServerGPUBudgets(_ context.Context, serverID string, budgets []ServerGPUBudget) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[serverID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	// A duplicate GPUIndex within budgets would hit the composite primary
+	// key (server_id, gpu_index) on the SQL side — reject it here too so
+	// both backends agree (mirrors sqlite_runtime.go's isUniqueViolation
+	// classification for the same insert).
+	seen := make(map[int]struct{}, len(budgets))
+	for _, b := range budgets {
+		if _, dup := seen[b.GPUIndex]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[b.GPUIndex] = struct{}{}
+	}
+	stored := make([]ServerGPUBudget, len(budgets))
+	copy(stored, budgets)
+	for i := range stored {
+		stored[i].ServerID = serverID
+	}
+	m.gpuBudgets[serverID] = stored
+	return nil
+}
+
+// ServerGPUBudgets returns serverID's per-GPU VRAM budgets, ordered by GPU
+// index (mirrors the SQL `order by gpu_index`). Always non-nil, empty when
+// none. The result is a fresh copy (ServerGPUBudget has no slice/pointer
+// fields, so a plain element copy suffices — mirrors
+// CoResidencyRulesByApplication's non-nil contract above).
+func (m *MemoryStore) ServerGPUBudgets(_ context.Context, serverID string) ([]ServerGPUBudget, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]ServerGPUBudget, len(m.gpuBudgets[serverID]))
+	copy(out, m.gpuBudgets[serverID])
+	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
+	return out, nil
+}
+
+// --- RuntimeStore: file-mode runtime reports (agent-runtime-manager, Task 4) ---
+
+// UpsertServerRuntimeReport stores the latest file-mode runtime report for
+// its server. An unknown ServerID classifies as ErrNotFound — a rename-level
+// copy of UpsertServerHardware above.
+func (m *MemoryStore) UpsertServerRuntimeReport(_ context.Context, report ServerRuntimeReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[report.ServerID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	m.runtimeReports[report.ServerID] = report
+	return nil
+}
+
+// ServerRuntimeReportByServer returns the latest runtime report for
+// serverID — a rename-level copy of ServerHardwareByServer above.
+func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID string) (ServerRuntimeReport, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	report, ok := m.runtimeReports[serverID]
+	return report, ok, nil
 }

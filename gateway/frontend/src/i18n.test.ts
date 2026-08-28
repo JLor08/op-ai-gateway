@@ -1803,3 +1803,364 @@ describe('certificates i18n keys', () => {
     }
   });
 });
+
+describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
+  it('defines every runtime admin/spec/matrix/limits/status key in de and en', () => {
+    const keys = [
+      'runtimeAdmin',
+      'runtimeSpecs',
+      'runtimeSpecEdit',
+      'runtimeSpecBinary',
+      'runtimeSpecArgs',
+      'runtimeSpecEnv',
+      'runtimeSpecWorkDir',
+      'runtimeSpecGpus',
+      'runtimeSpecVram',
+      'runtimeSpecIdleTimeout',
+      'runtimeSpecStartupTimeout',
+      'runtimeSpecPinned',
+      'runtimeSpecEnabled',
+      'runtimeMatrix',
+      'runtimeMatrixHint',
+      'runtimeLimits',
+      'runtimeGpuBudget',
+      'runtimeMaxProcesses',
+      'runtimeLiveStatus',
+      'runtimeStateStopped',
+      'runtimeStateStarting',
+      'runtimeStateRunning',
+      'runtimeStateDraining',
+      'runtimeStateBackoff',
+      'runtimeStateStartFailed',
+      'runtimeStateCrashed',
+      'runtimeStatePendingVram',
+      'runtimeStateNotPermitted',
+      'runtimeLastError',
+      'runtimeForceStart',
+      'runtimeForceStop',
+      'runtimeClearOverride',
+      'runtimeManagedLocally',
+      'runtimeManagedOnlyBanner',
+      'runtimeIneffectiveSpecs',
+      'runtimeTimeoutWarning',
+      'runtimeBinaryPathOsMismatchWarning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('defines an errorLabelByCode-backed key for every new runtime backend error code in de and en', () => {
+    const keys = [
+      'errorRuntimeSpecNotFound',
+      'errorRuntimeSpecBinaryRequired',
+      'errorRuntimeSpecArgsInvalid',
+      'errorRuntimeSpecEnvInvalid',
+      'errorRuntimeSpecGpuInvalid',
+      'errorRuntimeSpecTuningInvalid',
+      'errorRuntimeSpecAdminStateInvalid',
+      'errorRuntimeSpecApplicationNotServerAgent',
+      'errorRuntimeCoresidencyPairInvalid',
+      'errorServerGpuBudgetInvalid',
+      'errorServerRuntimeLimitInvalid',
+      'errorApplicationManagedRuntimeOnly',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
+  it('defines every launch-spec form/list/stub key in de and en', () => {
+    const keys = [
+      'runtimeSpecsIntro',
+      'runtimeSpecCreate',
+      'runtimeSpecEditAction',
+      'runtimeSpecDelete',
+      'runtimeSpecDeleteConfirm',
+      'runtimeSpecDeleteStateLoading',
+      'runtimeSpecDeleteStateUnknown',
+      'runtimeSpecMappingSection',
+      'runtimeSpecConfigSection',
+      'runtimeSpecListenPort',
+      'runtimeSpecListenPortHelp',
+      'runtimeSpecHealthPath',
+      'runtimeSpecHealthTimeout',
+      'runtimeSpecAdmissionWaitTimeout',
+      'runtimeSpecAdminState',
+      'runtimeSpecVramLocked',
+      'runtimeSpecVramLockedHint',
+      'runtimeSpecVramMeasured',
+      'runtimeSpecGpuIndex',
+      'runtimeSpecGpuPick',
+      'runtimeSpecGpuPickPlaceholder',
+      'runtimeSpecGpuNoTelemetry',
+      'runtimeSpecGpuAdd',
+      'runtimeSpecGpuRemove',
+      'runtimeSpecEnvHint',
+      'runtimeSpecEnvReserved',
+      'runtimeSpecPlaceholderInvalid',
+      'runtimeSpecPartialFailure',
+      'runtimeAreaPlaceholder',
+      'runtimeStatusUnknown',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('agent-managed runtime i18n keys (task 22 live status + file mode)', () => {
+  it('defines every live-status, override, restart-sequence and file-mode key in de and en', () => {
+    const keys = [
+      'runtimeStreamConnecting',
+      'runtimeStreamOpen',
+      'runtimeStreamOffline',
+      'runtimeStreamError',
+      'runtimeStatusEmpty',
+      'runtimeStatusSince',
+      'runtimeStatusPid',
+      'runtimeStatusPort',
+      'runtimeStatusInFlight',
+      'runtimeStatusRestarts',
+      'runtimeLastErrorAt',
+      'runtimeLastErrorExitCode',
+      'runtimeLastErrorFailures',
+      'runtimeLastErrorStderr',
+      'runtimeRestart',
+      'runtimeRestartStopping',
+      'runtimeRestartClearing',
+      'runtimeRestartTimeout',
+      'runtimeRestartVanished',
+      'runtimeParseError',
+      // C2 fix round: parse_error is a closed set of CODES, not free
+      // text, so the portal owns one sentence per code plus a fallback
+      // for a code this build does not know.
+      'runtimeParseErrorJsonSyntax',
+      'runtimeParseErrorDuplicateSpecId',
+      // A1: the two access codes. Missing here, the portal's third seam of
+      // the three-sided contract fails silently -- an unmapped code degrades
+      // to runtimeParseErrorUnknown, which is safe and says nothing.
+      'runtimeParseErrorFileMissing',
+      'runtimeParseErrorReadFailed',
+      'runtimeParseErrorUnknown',
+      'runtimeConfigUnavailable',
+      'runtimeConfigUnrecognised',
+      'runtimeFeatureMismatch',
+      'runtimeAgentVersion',
+      'runtimeAgentFeatures',
+      'runtimeReportCollectedAt',
+      // Fix round 1: the restart-state gate, the bounded writes, the
+      // report-failed third state, the gateway/upstream name pair and the
+      // "agent never reported" half of the feature-mismatch banner.
+      'runtimeRestartClearTimeout',
+      'runtimeWriteTimeout',
+      'runtimeModeUnknown',
+      'runtimeModeUnknownShort',
+      'runtimeStatusUpstream',
+      'runtimeStatusNameMismatch',
+      'runtimeStatusUnresolvedShort',
+      'runtimeStatusUnresolved',
+      'runtimeAgentNeverReported',
+      'resourceRetry',
+      // Fix round 2: the hover reason for a disabled Restart. A successful
+      // restart leaves the row `stopped`, where Restart is disabled, so this
+      // is the resting state of a healthy row and every operator meets it.
+      'runtimeRestartUnavailable',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The nine RuntimeState wire values (server-agent/internal/runtime/
+  // types.go) each need a DISTINCT label: the portal has exactly three
+  // status colours (theme/ThemeRoot.tsx -- success/watch/standby, no red),
+  // so the label is the only thing that can tell "crashed" apart from
+  // "stopped" or "not permitted". A duplicated label would silently merge
+  // two different facts into one visual.
+  it('gives all nine runtime lifecycle states a distinct label in de and en', () => {
+    const stateKeys = [
+      'runtimeStateStopped',
+      'runtimeStateStarting',
+      'runtimeStateRunning',
+      'runtimeStateDraining',
+      'runtimeStateBackoff',
+      'runtimeStateStartFailed',
+      'runtimeStateCrashed',
+      'runtimeStatePendingVram',
+      'runtimeStateNotPermitted',
+    ] as const;
+    for (const locale of ['de', 'en'] as const) {
+      const labels = stateKeys.map((k) => messages[locale][k]);
+      expect(new Set(labels).size).toBe(stateKeys.length);
+    }
+  });
+});
+
+describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
+  it('defines every co-residency-matrix and server-limits key in de and en', () => {
+    const keys = [
+      'runtimeMatrixCell',
+      'runtimeMatrixNeedTwo',
+      'runtimeMatrixConsequence',
+      'runtimeMatrixNoSharedGpu',
+      'runtimeMatrixAdvisory',
+      'runtimeMatrixOverBudget',
+      'runtimeMatrixDisabledFileMode',
+      'runtimeMatrixDisabledSaving',
+      'runtimeLimitsIntro',
+      'runtimeGpuDriftWarning',
+      'runtimeGpuDriftIconLabel',
+      'runtimeGpuDriftExpected',
+      'runtimeGpuDriftCurrent',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('agent-managed runtime i18n keys (task 22b, batch C)', () => {
+  it('defines the failed-resource and duplicate-GPU-index keys in de and en', () => {
+    const keys = [
+      // C1: the three resources that had no state of their own for a failed
+      // GET and said "loading" forever.
+      'runtimeMappingsUnavailable',
+      'runtimeCoresidencyUnavailable',
+      'runtimeBudgetsUnavailable',
+      // Fix round 1, M8: the fourth resource, which C1 left on the two-state
+      // shape although its title said "every remaining resource".
+      'runtimeWarningsUnavailable',
+      // Fix round 1, C4/M7: the `stale-error` half. The `*Unavailable` texts
+      // above state that nothing is loaded and nothing is possible, which is
+      // false once a payload is in hand and only the REFRESH failed -- and all
+      // four call sites were rendering them in that state.
+      'runtimeMappingsStale',
+      'runtimeCoresidencyStale',
+      'runtimeBudgetsStale',
+      'runtimeWarningsStale',
+      // C5: the collision the backend refuses without naming it.
+      'runtimeGpuIndexDuplicate',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('runtime-spec arguments-field i18n keys', () => {
+  it('defines the args hint, example and the three warning texts in de and en', () => {
+    const keys = [
+      // The contract the field never stated: one argument per line, a flag and
+      // its value on two lines.
+      'runtimeSpecArgsHint',
+      'runtimeSpecArgsExample',
+      // A whole command line pasted onto one line.
+      'runtimeSpecArgsCommandLine',
+      // A hard-coded port while `listen_port` is 0 and the agent owns it.
+      'runtimeSpecArgsHardcodedPort',
+      // Whitespace at an argument's edge, and a line that is only whitespace.
+      'runtimeSpecArgsEdgeWhitespace',
+      'runtimeSpecArgsBlankLine',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The example is the half that teaches the rule, so its SHAPE is the
+  // assertion: separate lines for a flag and its value, ${PORT} rather than a
+  // number, and a path whose internal spaces do not split it.
+  it('keeps the example one-token-per-line in both locales', () => {
+    for (const example of [
+      messages.de.runtimeSpecArgsExample,
+      messages.en.runtimeSpecArgsExample,
+    ]) {
+      const lines = example.split('\n');
+      expect(lines.length).toBeGreaterThanOrEqual(3);
+      expect(lines[0]).toBe('--port');
+      expect(lines[1]).toBe('${PORT}');
+      expect(lines.some((line) => line.includes(' ') && !line.startsWith('-'))).toBe(true);
+    }
+  });
+});
+
+// The operator-facing strings of the resolved-command block are the ones an
+// operator ACTS on, so their scope has to match the scope the code actually
+// has. These are content assertions: they pin what the sentences claim, and
+// cannot verify that the claim is true -- that is what command.go's own tests
+// and §14.7 are for. They exist because this exact string once carried a
+// guarantee the dialog rendering it could not keep.
+describe('resolved-command masking strings state their own scope', () => {
+  it('never claims a masked value does not reach the gateway', () => {
+    // False in the very dialog that renders it: a spec with
+    // args: ["--api-key", "${AGENT_ENV:HF_TOKEN}"] runs a model server that
+    // prints its full argv at startup -- llama.cpp and vLLM both do -- and the
+    // agent captures that line into the same stream, ten lines below the alert.
+    // last_error.stderr_tail is a second route to the same screen. The scope is
+    // "the reported command", exactly as command.go, server-agent/README.md and
+    // the architecture doc's §8.3/§14.7 all state it.
+    expect(messages.en.runtimeCommandMasked).not.toMatch(/do not reach the gateway/i);
+    expect(messages.de.runtimeCommandMasked).not.toMatch(/erreichen das Gateway nicht/i);
+  });
+
+  it('scopes the masking to the reported command and names the route that carries a resolved value anyway', () => {
+    expect(messages.en.runtimeCommandMasked).toMatch(/this reported command/i);
+    expect(messages.en.runtimeCommandMasked).toMatch(/command line or environment at startup/i);
+    expect(messages.de.runtimeCommandMasked).toMatch(/hier gemeldeten Befehl/i);
+    expect(messages.de.runtimeCommandMasked).toMatch(/Befehlszeile oder Umgebung/i);
+  });
+
+  it('keeps the operator guidance that follows from the gap: env, never args', () => {
+    for (const m of [messages.en, messages.de]) {
+      expect(m.runtimeCommandMasked).toContain('${AGENT_ENV:NAME}');
+      expect(m.runtimeCommandMasked).toMatch(/argument/i);
+    }
+  });
+
+  it('gives the file-mode env redaction a sentence of its own, in both locales', () => {
+    // A different reason for withholding -- the agent's specs come from a local
+    // document the gateway does not own -- and a different mask. Selecting the
+    // placeholder sentence for it told a file-mode operator to go and check a
+    // ${AGENT_ENV:NAME} variable that does not exist.
+    for (const m of [messages.en, messages.de]) {
+      expect(typeof m.runtimeCommandEnvRedacted).toBe('string');
+      expect(m.runtimeCommandEnvRedacted.length).toBeGreaterThan(0);
+      expect(m.runtimeCommandEnvRedacted).not.toBe(m.runtimeCommandMasked);
+    }
+  });
+
+  it('words a locally trimmed head differently from one the agent no longer holds', () => {
+    // Rendered directly under runtimeLogsTrimmed, which says reopening reloads
+    // the agent's retained history in full. The two must not answer each other.
+    for (const m of [messages.en, messages.de]) {
+      expect(typeof m.runtimeCommandTrimmedHere).toBe('string');
+      expect(m.runtimeCommandTrimmedHere).not.toBe(m.runtimeCommandNotRetained);
+    }
+    expect(messages.en.runtimeCommandTrimmedHere).toMatch(/this view/i);
+    expect(messages.de.runtimeCommandTrimmedHere).toMatch(/diese Ansicht/i);
+  });
+});

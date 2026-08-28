@@ -170,6 +170,27 @@ func TestAgentStreamRejectsUnknownBearer(t *testing.T) {
 	}
 }
 
+// readUntilClose drains data frames until the connection ends, returning the
+// error that ended it -- which is what a close-status assertion actually wants
+// to look at.
+//
+// A bare conn.Read used to be enough here because the gateway sent an agent
+// NOTHING on this connection unless something specific happened. That stopped
+// being true when the gateway gained a server->agent direction: every new
+// agent connection is now told which specs' logs to stream (T3's
+// runtime_log_config, sent unconditionally so a watch set cannot outlive the
+// connection it was issued on), so the very next frame after a dial is a data
+// frame, not the close. Skipping data is the durable shape: it stays correct
+// for whatever server->agent frame is added next, and it still fails -- via
+// the caller's own bounded read context -- if the close never arrives at all.
+func readUntilClose(ctx context.Context, conn *websocket.Conn) error {
+	for {
+		if _, _, err := conn.Read(ctx); err != nil {
+			return err
+		}
+	}
+}
+
 func TestAgentStreamCloseOnServerMismatch(t *testing.T) {
 	srv := NewTestServer()
 	srv.SetBaseContext(context.Background())
@@ -183,7 +204,7 @@ func TestAgentStreamCloseOnServerMismatch(t *testing.T) {
 	}
 	defer conn.CloseNow()
 	_ = wsjson.Write(ctx, conn, streamFrame{Type: "telemetry", Data: json.RawMessage(`{"server_id":"other-host","host":{"cpu_util_pct":1}}`)})
-	_, _, readErr := conn.Read(ctx)
+	readErr := readUntilClose(ctx, conn)
 	if websocket.CloseStatus(readErr) != websocket.StatusPolicyViolation {
 		t.Fatalf("close status = %v, want PolicyViolation; err=%v", websocket.CloseStatus(readErr), readErr)
 	}
@@ -207,7 +228,7 @@ func TestAgentStreamGracefulShutdownSendsGoingAway(t *testing.T) {
 	// locally instead of hanging until the package's overall test timeout.
 	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer readCancel()
-	_, _, readErr := conn.Read(readCtx)
+	readErr := readUntilClose(readCtx, conn)
 	if websocket.CloseStatus(readErr) != websocket.StatusGoingAway {
 		t.Fatalf("close status = %v, want GoingAway; err=%v", websocket.CloseStatus(readErr), readErr)
 	}
@@ -244,7 +265,7 @@ func TestAgentStreamListenerContextCancelClosesOnlyThatListenersStream(t *testin
 	cancelListener()
 	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer readCancel()
-	_, _, readErr := meshConn.Read(readCtx)
+	readErr := readUntilClose(readCtx, meshConn)
 	if websocket.CloseStatus(readErr) != websocket.StatusGoingAway {
 		t.Fatalf("mesh close status = %v, want GoingAway after listener rebind; err=%v", websocket.CloseStatus(readErr), readErr)
 	}

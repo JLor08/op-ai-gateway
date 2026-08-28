@@ -143,6 +143,147 @@ request still passes every admission gate — are in
 | `/api/portal/mappings/{id}` | PATCH/DELETE | `gateway:use` + ownership | Model-mapping CRUD |
 | `/api/portal/agent-binaries`, `/agent-binaries/{...}` | GET | `gateway:use` | List / download ServerAgent release binaries for manual install |
 
+#### Agent-managed model runtime
+
+All of these authorize **inside `portal.Service`** with the model-mapping write
+rule (`system` scope, server ownership, or admin-group delegation carrying
+`can_manage_servers` — plain `admin` is *not* sufficient); authorization failures
+on a mapping collapse to `404 mapping.not_found` so nothing leaks existence. See
+[Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) for
+semantics.
+
+| Path | Methods | Scope | Purpose |
+|---|---|---|---|
+| `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
+| `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's complete co-residency pair list |
+| `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout` and `binary_path_os_mismatch` |
+| `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
+| `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
+| `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**) |
+| `/api/portal/servers/{id}/runtime/logs?spec_id=…` | GET (SSE) | server | Live stdout+stderr of ONE managed process. Each generation's **opening marker entry** additionally carries the **resolved launch command** (`command`: binary, argv, work_dir and the complete effective environment, with every `${AGENT_ENV:NAME}`-derived value masked agent-side as its own placeholder). Same ownership check, before the first stream byte — argv is closer to user data than status, and the boundary is the same one, not a laxer one. `spec_id` is validated as well as authorized, because it is also shipped to the agent inside the watch command: `400 runtime_logs.spec_required` without it, `400 runtime_logs.spec_invalid` when it is over-long (rejected, never clamped), and `503 runtime_logs.too_many_specs` when the server already has the maximum number of distinct specs under view. Subscribing is what makes the agent stream, and unsubscribing is what stops it. |
+
+Conventions worth stating, because each is a judgement call a client depends on:
+
+- **Every write is a full-document replace, not a delta** — the spec PUT applies
+  the whole spec verbatim (never merged against the stored row), and the two list
+  PUTs replace the entire list. See
+  [ADR-029](../09-architecture-decisions.md#adr-029--runtime-domain-writes-are-full-document-replaces-gated-on-their-own-get).
+- **There is no bulk "list runtime specs for an application" endpoint.** The spec
+  is mapping-scoped, so a client fans out one GET per mapping.
+  `configured: false` is the *only* signal for "this mapping has no spec row
+  yet" — every other field is then a zero value (`gpus`/`args`/`env` still
+  non-nil but empty) and `id` is absent. A PUT never re-keys the row: the
+  returned spec keeps its `id`.
+- **`DELETE` returns `200 {"ok":true}`, never 204**; a wrong method returns 405
+  with an `Allow` header.
+- **`expected_uuid` / `expected_name` on a budget row are never
+  client-writable** — a request's values are ignored, on first creation and on
+  every later PUT. The server snapshots them from the latest telemetry sample for
+  a brand-new GPU index (left empty when no sample exists) and preserves the
+  stored values verbatim afterwards, because drift detection is only meaningful
+  against the *original* snapshot. So on real hardware a created row comes back
+  carrying the actual GPU identity, and an assertion must match only the subset
+  under the caller's control (`index`, `budget_mb`).
+- **`spec.vram_measured_mb` is agent-owned and always ignored on write**, even
+  though the request shape carries it. The operator-owned figure is
+  `vram_estimate_mb`. `spec.vram_locked` is how an operator opts out of being
+  *governed* by the measurement without being able to forge it: locked, the
+  write-back stops **and** the agent is served `vram_estimate_mb` in its
+  runtime-config document. It is the documented recovery for a spec that a
+  measurement above its GPU budget has left permanently `not_permitted`.
+- **The SSE stream wraps every frame as `{"runtimes":[…]}` — not `{"data":[…]}`**
+  like the model-servers and performance streams on this same portal. Both the
+  initial `snapshot` frame and every later `update` frame carry the **complete**
+  row set, so a consumer must *replace* its rows, never append; a `: ping`
+  comment keeps the connection alive. Parsing the wrong key with a `?? []`
+  fallback produces an eternally empty list with no error and no crash.
+- **Status rows carry `spec_id` and never an `application_id`**, and the stream is
+  authorized and keyed per **server** — so a client receives one flat,
+  server-wide list with no per-application filter, and must join rows back to
+  operator-facing names itself via `spec_id → spec.mapping_id → mapping`. Row
+  shape: `{spec_id, model, state, since, pid?, port?, in_flight, restarts,
+  last_error?}` with `last_error = {message, at, exit_code, failures,
+  stderr_tail?}`. There is deliberately **no GPU field** — measured VRAM reaches
+  the UI through the spec's `gpus[].vram_measured_mb` after the agent's
+  write-back.
+- **The runtime-report response deliberately reuses the hardware panel's
+  envelope**: `{available, collected_at?, updated_at?, report?, agent_version,
+  agent_features}`. `available: false` means no report has ever been stored, not
+  an error. The file-mode payload is **nested** under `report` —
+  `{source, collected_at, parse_error?, config}` — **not** flattened as siblings
+  of `available`; a client modelled on the flattened shape reads
+  `source`/`parse_error`/`config` as `undefined` forever and concludes the server
+  is in gateway mode. `agent_version` and `agent_features` are read from the
+  server's latest telemetry row regardless of whether a report was ever stored
+  (so no extra endpoint is needed for a feature-mismatch check) and are always
+  present, possibly empty.
+- **`report` is both optional *and* nullable on the wire.** A Go
+  `json.RawMessage` with `omitempty` omits the field only when the blob is
+  **empty**, and an empty stored blob is written out as the JSON literal `null`
+  (length 4, so `omitempty` does not fire) — so *absent*, `null` and an object
+  are all legal, and a type naming only two of the three is a lie. The same
+  applies to the hardware response's `report`.
+- **Every runtime collection is non-nil on the wire**: `args`, `env`, `gpus`,
+  `specs`, `gpu_budgets`, `coresident`, `warnings`, `budgets` and
+  `agent_features` serialise as `[]`/`{}` and never `null`, including on the
+  empty and cleared paths.
+
+Error codes and their statuses (the sentinel's own message string **is** the wire
+code, and the gateway's error table repeats the same literal — so renaming a
+sentinel is a breaking API change that must be applied in both places):
+
+| Code | Status |
+|---|---|
+| `runtime_spec.not_found` | 404 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.application_not_server_agent` | 400 |
+| `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
+| `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
+| unmapped | 500 `runtime_spec.request_failed` |
+
+`application.server_agent_exists` (message `server already has a server_agent
+application`) is returned by both the application **create** (POST) and
+**update** (PATCH) endpoints, since retyping an existing application is the easy
+way past a create-only gate.
+
+The spec PUT's validation, all applied **before any mutation**: `binary` is
+required and must be **absolute under Go's `filepath.IsAbs` for *either* target
+platform**: POSIX (`/opt/llama/llama-server`) or Windows (a drive letter with
+either separator, `C:\llama\llama-server.exe` / `c:/llama/…`; the UNC form
+`\\host\share\…`; the `\\?\` / `\\.\` / `\??\` device forms). Refused: the empty
+string, a relative path, a **drive-relative** path (`C:foo`, `c:`), and a
+**root-relative** one (`\foo`, `\` — rooted on the current drive, so it names no
+volume). The gateway is OS-agnostic and cannot execute the path, so this rule is
+the **early-feedback mirror** of the agent's own `filepath.IsAbs` check
+([§3.1](../cross-cutting/agent-runtime-manager.md#31-the-agent-local-policy)),
+which remains the authority — deliberately neither stricter (a POSIX-only
+`HasPrefix(binary, "/")` made a Windows AI server unconfigurable through the
+portal) nor laxer (a spec the portal accepts and the agent then refuses becomes
+a terminal `not_permitted` instead of a form error). Every tuning integer
+(`listen_port`,
+`health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
+`admission_wait_timeout_seconds`) must be `>= 0`; `admin_state` must be one of
+the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env
+**keys** must match `^[A-Z_][A-Z0-9_]*$`. `set_visible_devices` adds two refusals
+of its own, both returned **before any mutation**:
+`runtime_spec.visible_devices_no_gpus` when it is on with an empty `gpus` (an
+empty visibility value hides *every* card rather than restricting none), and
+`runtime_spec.visible_devices_conflict` when it is on while `env` already sets
+one of `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`
+(compared case-insensitively). Both rules are **vendor-independent** — this
+gateway cannot know the target host's hardware — and the agent enforces the
+identical pair again at launch, which is what covers the file-mode path that
+never reaches this endpoint. See
+[agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement). **Env values are never validated** —
+that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
+`${PORT}`, `${MODEL}` and `${HOST_GPU_IDS}` placeholder mechanism, and it means an env key naming an
+agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
+`SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
+and persisted* here, with the real refusal happening agent-side at process
+start. Defaults applied on
+zero/empty: `health_path` `/health`, `health_timeout_seconds` 5,
+`startup_timeout_seconds` 180. A duplicate GPU index is refused as a **whole-write
+failure, not deduped**, so no filled-in row is silently discarded.
+
 ### Groups, projects, services, resource-groups (governance model)
 
 | Path | Methods | Purpose |
@@ -204,7 +345,139 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 | `/api/agent/v1/certificate` | GET | Fetch the agent's current mesh leaf certificate (cert modes `files`/`proxy`) |
 | `/api/agent/v1/ca` | GET | Fetch the internal CA bundle |
 | `/api/agent/v1/proxy-routes` | GET | Fetch the gateway-provided TLS proxy route topology (cert mode `proxy`) |
+| `/api/agent/v1/features` | GET | The **gateway's** declared feature list, ETag-conditional — the gateway→agent half of capability negotiation |
+| `/api/agent/v1/runtime-config` | GET | The desired agent-managed runtime state for the caller's own server, ETag-conditional |
+| `/api/agent/v1/runtime-report` | POST | Ingest a file-mode agent's *effective* runtime configuration (env values already masked agent-side) |
 | `/api/agent/v1/download/{...}` | GET | Agent distribution: download a ServerAgent release binary/manifest/config (fetched by operators or scripts; the agent does not update itself) |
+
+### 5.1 The two managed-runtime GETs
+
+Both are `Cache-Control: no-store` (set on every path, **before** the method and
+auth checks) and both accept `If-None-Match` in quoted, unquoted and weak
+(`W/"…"`) forms, plus comma-separated lists and `*`, answering `304` with an
+empty body on a match. A stricter reimplementation of that matching would break
+agents relying on the looser forms.
+
+**They deliberately differ in where the ETag lives**, and an agent implementer
+reading only one of them guesses wrong:
+
+| Endpoint | ETag carried in |
+|---|---|
+| `/features` | the `ETag` **header only** (a sha256 hex digest of the marshalled body) — no in-body field |
+| `/runtime-config` | **both** the `ETag` header (quoted) and an in-body `etag` field |
+
+The in-body copy is not redundant: the same runtime-config document also reaches
+the agent as a WebSocket frame payload, which has no HTTP headers at all, so a
+header-only representation would silently disagree across the two transports.
+A pushed frame must therefore carry the full document **including** its `etag`.
+
+`/features` returns `{"features":["runtime_manager"]}`. Gating is name-based
+string equality: a feature is active only when the gateway and the agent both
+declare it. A **404 is not an error** for an agent — it means an older gateway,
+and reads as the empty feature set.
+
+`/runtime-config` returns the desired state **for the server that owns the agent
+token**; the server id is never taken from a parameter. Shape rules that two
+independent implementations must agree on:
+
+- top-level `router_listen`, `max_processes`, `gpu_budgets[{index, budget_mb}]`,
+  `specs[]`, `coresident[[specIdA, specIdB]]`, `etag`;
+- each spec carries `id`, `model`, `upstream_model`, `binary`, `args[]`, `env{}`,
+  `work_dir`, `gpus[{index, vram_mb}]`, `listen_port`, `health_path`,
+  `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
+  `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
+  `admin_state`;
+- **`coresident` entries are SPEC ids, never mapping ids** — the mistake that
+  would type-check and silently break admission;
+- `gpus[].vram_mb` is the *measured* value if present, else the estimate, with
+  `0` meaning **unknown** — never omitted, never null;
+- only **enabled** specs appear, and a spec whose `mapping_id` no longer resolves
+  is silently skipped;
+- `specs`, `gpu_budgets` and `coresident` are always present arrays.
+
+**A server with no `server_agent` application returns a fully zeroed document**
+(`router_listen` 0, `max_processes` 0, all arrays empty) as a normal 200 with a
+stable, reproducible ETag — not a partially populated one carrying the server's
+real GPU budgets or process limit, and never an error: without a router port
+there is nothing to apply budgets against, and it keeps the empty-document ETag
+trivially reproducible. `/proxy-routes` answers its own genuinely-empty cases
+the same way (unknown server, or a server out of https-auto-switch scope).
+
+**Neither endpoint degrades a store failure into that empty answer.** Both used
+to — "reads never fail" — and both now propagate it as a 500 instead, because
+on both endpoints a well-formed empty body is not an absence of instruction but
+a **teardown**: the runtime agent drops its router listener and drains every
+spec, and the proxy agent closes every TLS listener it is running. A 500 is the
+safe answer on both, since each client keeps its last known-good state on a
+non-200. The empty document is reserved for the cases that genuinely mean
+"nothing here".
+
+### 5.2 WebSocket frames and the runtime report
+
+Four frame types join the existing doorbells on `/api/agent/v1/stream`:
+
+| Frame | Direction | Payload |
+|---|---|---|
+| `runtime_config` | gateway → agent | The **complete** runtime-config document plus its `etag` — the first gateway→agent frame that carries a payload rather than being a content-free doorbell. Never a delta, never a command. Best-effort: a full per-connection queue drops it (logged at Debug) with no error, because the agent's own conditional GET is the authoritative path. |
+| `runtime_report` | agent → gateway | The same payload as the POST below. |
+| `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** set of specs whose managed-process output the gateway currently wants streamed, never a delta. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**; the agent re-snapshots a spec whose epoch differs from the one its last snapshot was taken for, which is how the second viewer of an already-watched spec gets a history at all (the set alone is byte-identical for it). Sent on every subscribe/unsubscribe transition and restated — including as the empty set, and with every epoch bumped — on **every** new agent connection, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. A list of ids the gateway itself supplied, each with a counter, is the entire expressive power of the frame: it can never carry an instruction. Not feature-gated — an agent that does not understand it discards it, whereas gating the send would skip a freshly started agent whose features are not yet known. |
+| `runtime_log` | agent → gateway | `{"spec_id","scrollback","scrollback_more","entries":[{"pid","at","text","dropped_bytes","event","exit_code","command":{"binary","args","work_dir","env","masked","env_redacted","truncated"}}]}` — one spec's output since the previous flush, **or one chunk of a history replay**. A retained history need not fit one frame, so a replay is a sequence of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more`; the gateway collapses that sequence back to the portal's one-reset-then-appends contract and never forwards `scrollback_more`. `event` is a closed, allow-listed set (`started`/`exited`/`start_failed`); anything else is stripped on ingest. `command` is the **resolved** launch command of the generation an OPENING marker (`started`/`start_failed`) opens, and is stripped from any other entry by the same allow-list. `start_failed` has no pid and no output: the exec itself failed. `masked` and `env_redacted` are the agent's two withholding reasons — a `${AGENT_ENV:NAME}` span replaced by its own placeholder, and a file-mode agent withholding the values its local document sets — independent, both settable at once, and relayed as they arrive. The gateway clamps `command` lengths and counts, dropping over-long entries whole and setting `truncated`, but never re-masks — only the agent knows which bytes came from which placeholder. Relayed to open portal log views in memory and forgotten: **never stored, never logged**. |
+
+`dropped_bytes` means the same thing wherever it appears: *N bytes the process
+printed are missing immediately before this entry's text*. See
+[Agent-Managed Model Runtime §14](../cross-cutting/agent-runtime-manager.md#14-managed-process-logs-t3).
+
+The runtime report has different transport semantics on each path, and the WS
+mapping is a house convention that is easy to get wrong:
+
+| Path | Outcome |
+|---|---|
+| POST, success | `200 {"accepted":true,"server_id":"<id>"}` |
+| POST, invalid payload | `400 agent.runtime_report_invalid` |
+| POST, unknown server | `404 agent.unknown_server` |
+| POST, store failure | `500 agent.runtime_report_failed` |
+| WS, malformed frame | **silently skipped, connection kept open** — no per-frame ack exists |
+| WS, unknown server | connection closed with `1008` PolicyViolation |
+| WS, store error | connection closed with `1011` InternalError |
+
+Both paths run through one ingest whose sanitisation is **structural, not a
+string scan**: the `config` blob is re-parsed into a fully typed gateway-side
+mirror of the runtime-config schema and re-marshalled, so any field the agent
+sent that the struct does not model is silently dropped, and every `env` value
+across every spec is overwritten with a fixed mask before anything is stored.
+`source` and `parse_error` are clamped, and an empty or unparseable `config`
+degrades to `"{}"` rather than rejecting the report — which is what makes a
+broken local file diagnosable. Adding a `json.RawMessage` field here for
+convenience reopens the leak.
+
+The exact string `"file"` in `source` is what flips the server into file mode —
+suppressing further `runtime_config` pushes to that agent — and it is set only
+**after** the store write succeeds. Any other value, `"gateway"` included, clears
+file mode. A cosmetic change to that literal, or setting the flag before the
+write, either keeps pushing configuration at a file-managed agent or marks a
+server file-mode on a failed ingest.
+
+### 5.3 The agent's own router port (not a gateway endpoint)
+
+For completeness, since the gateway's `server_agent` provider talks to it: the
+agent's managed-runtime router serves **exactly four GET control paths** —
+`/health`, `/v1/health`, `/running`, `/v1/models` — and routes everything else
+on a `model` field in a JSON request body.
+
+| Path | Answers |
+|---|---|
+| `GET /health`, `GET /v1/health` | `200 {"status":"ok"}` unconditionally, without touching the process manager |
+| `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only running** specs |
+| `GET /v1/models` | OpenAI's shape, `{"object":"list","data":[{"id":"<upstream>","object":"model"}]}` — **every managed** spec, cold ones included |
+
+Any other method on those exact paths falls through to model routing. A request
+with no body, a non-JSON body, or a body naming no managed model gets
+`404 runtime.model_not_managed` — **including a WebSocket handshake, which is a
+bodiless GET**; there is no `/ws` and no upgrade path, and a child that answers
+`101` anyway has its response refused. A body over 32 MiB gets
+`413 runtime.request_too_large`. Responses are never buffered. Full error-code
+table and the reasoning: [Agent-Managed Model
+Runtime](../cross-cutting/agent-runtime-manager.md).
 
 ## 6. Health & SPA
 
@@ -219,3 +492,4 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 - [Configuration](../cross-cutting/configuration.md) — session cookie, CSRF, and driver/env wiring behind this surface.
 - [Configuration & Environment Variables (Reference)](./config-env.md) — every variable referenced above.
 - [OpenAPI spec](./openapi.yaml) — machine-readable, path-level index of this surface (routes, methods, auth); this document stays the canonical prose reference.
+- [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) — the semantics behind the runtime endpoints, the WebSocket frames, and the agent's router port.

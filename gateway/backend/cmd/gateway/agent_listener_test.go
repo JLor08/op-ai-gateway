@@ -1194,7 +1194,16 @@ func TestAgentListenerEnablesTLSOnceOnSameAddress(t *testing.T) {
 	go func() {
 		readCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_, _, err := plainStream.Read(readCtx)
+		// Drain data frames first: the gateway now sends every new agent
+		// connection a runtime_log_config watch command (T3), so the next
+		// frame after a dial is data, not the close this test is about. The
+		// bounded readCtx still fails the test if no close ever arrives.
+		var err error
+		for {
+			if _, _, err = plainStream.Read(readCtx); err != nil {
+				break
+			}
+		}
 		streamClosed <- err
 	}()
 	fullchain, _, _ := storeGatewayListenerMaterial(t, routes, 12)
@@ -1365,7 +1374,22 @@ func TestAgentListenerWSSSurvivesHolderOnlyHotSwap(t *testing.T) {
 		t.Fatalf("dial initial WSS stream: %v", err)
 	}
 	defer stream.CloseNow()
-	streamClosed := stream.CloseRead(context.Background())
+	// A hand-rolled read pump rather than websocket.Conn.CloseRead: that
+	// helper tears the connection down on the first DATA message it sees, and
+	// the gateway now sends one on every new agent connection (T3's
+	// runtime_log_config watch command). What this test needs from it is only
+	// the auto-pong and the "did the connection die?" signal, both of which a
+	// plain read loop gives without the tear-down.
+	streamClosed, streamDead := context.WithCancel(context.Background())
+	defer streamDead()
+	go func() {
+		defer streamDead()
+		for {
+			if _, _, err := stream.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
 
 	fullchain2, fingerprint2, _ := storeGatewayListenerMaterial(t, routes, 114)
 	if err := mgr.ensure(context.Background(), srv, addr); err != nil {

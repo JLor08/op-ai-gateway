@@ -106,10 +106,86 @@ The ServerAgent (`op-ai-server-agent`, one process per monitored AI server) is c
 - **Proxy routes** (`cert_proxy_routes`, `cert_proxy_routes_mode`): configuration-file-only settings (no env-var form) that seed local TLS proxy routes used when `cert_mode` is `proxy`. `cert_proxy_routes_mode` is `fallback` (default — a local route only fills a listen port the gateway did not provide) or `override` (a local route wins over a gateway-provided one on the same listen port).
 - **Telemetry sourcing**: `metrics_url` (optional inference `/metrics` scrape), `model_status_url` + `model_status_format` (poll a loaded-models endpoint in `openai`/`llama_swap`/`llama_cpp`/`litellm`/auto form), `lhm_url` (optional LibreHardwareMonitor `/data.json` URL for Windows CPU/system power).
 - **TLS trust**: `ca_file` (operator-managed PEM the agent only reads), `ca_cache_file` (agent-managed cache written atomically), `ca_pem` (inline bootstrap CA from a generated config), `tls_insecure` (skip verification — development only).
+- **Managed model runtime** (`runtime_source`, `runtime_config`, `runtime_allowed_binaries`, `runtime_allowed_dirs`, `runtime_cache`, `runtime_router_bind`): whether launch specifications come from the gateway or a local file, and the agent-operator boundary on what may actually execute. Two of these are settings whose *empty* value is load-bearing rather than merely unset — an empty binary allowlist starts nothing, and a non-empty directory allowlist makes `work_dir` mandatory on every spec. See [Agent-Managed Model Runtime §3 and §14](agent-runtime-manager.md).
 
 See [Configuration & Environment Variables (Reference)](../reference/config-env.md) for the full `OP_AGENT_*` table with every default and floor/clamp rule.
+
+That reference **opens by claiming an exhaustive listing** of every environment
+variable, which makes adding the row a required part of adding a setting — in the
+same branch as the behaviour, per the repository's documentation rule. Its agent
+section additionally asserts that every row has a matching CLI flag and JSON
+config-file key with precedence flag > env > file > default, and that claim
+carries its three real exceptions:
+`OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are
+list-valued with **no flag form** (env, comma-separated, > file > default), and
+`OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key** —
+necessarily, since it names the file to read. An unqualified exhaustiveness or
+parity claim silently becomes false with the next setting; stating that the claim
+is load-bearing is what keeps it true.
+
+## 8. The generated ServerAgent config document, and how its copies stay honest
+
+The portal offers a ready-made annotated JSONC config for a new agent — the
+easiest way to start one, and for most operators the *only* documentation they
+read before the agent runs. That single document is produced or consumed by four
+independent pieces of code, in two languages and two Go modules, none of which
+can import another:
+
+| Copy | Role |
+|---|---|
+| `internal/gateway/agent_binaries.go` (`buildAgentConfigJSON`) | Produces it, behind the `curl` endpoint. |
+| `gateway/frontend/src/components/AgentTokenSection.tsx` (`buildServerAgentConfig`) | Produces it, behind the portal's **download button**. |
+| `server-agent/internal/config/config.go` (`fileConfig`) | Defines what the agent will actually read. |
+| `server-agent/README.md` | Documents the same keys for the operator. |
+
+One checked-in golden, **`server-agent/testdata/server-agent.config.jsonc`**,
+now joins them. It lives in the `server-agent` module because that module owns
+the file format, and four checks hang off it:
+
+- both **producers** must equal it byte for byte —
+  `TestBuildAgentConfigJSONMatchesSharedGolden` on the Go side (which also
+  regenerates it, behind an explicit `-update-agent-config-golden` flag) and the
+  golden test in `AgentTokenSection.test.tsx` on the portal side. This is the
+  only thing that compares the two copies **to each other**;
+- its key set must match every `json` tag on `fileConfig`, **by reflection** — so
+  a setting the agent can read fails the moment it exists without the template
+  mentioning it, and a template key the agent would silently ignore fails too;
+- it must **load** through the real `config.Load` to the documented default for
+  every field, which is the only proof that a JSONC document the gateway
+  generates actually parses and resolves in the agent;
+- every key must appear in `server-agent/README.md`, which is what stops the
+  operator-facing reference from falling behind the file it describes.
+
+No hand-maintained key list survives in that chain. The previous arrangement had
+one per producer and nothing between them, so the copies could disagree
+indefinitely — and did. The generated template shipped **one** of the six
+`runtime_*` settings, `runtime_router_bind`, while its comment referred the
+operator to the README for the other five; it omitted `cert_proxy_routes` and
+`cert_proxy_routes_mode` entirely; and it described `cert_mode: "proxy"` as not
+yet implemented, which it has not been true of since the agent-side proxy
+landed. The reflection and README checks found the last three of those the same
+way they will find the next one.
+
+The selection was the worst available. `runtime_router_bind` loads into a plain
+string, so its absence and its empty value are indistinguishable — omitting it
+was harmless. `runtime_allowed_binaries` is the opposite: an empty binary
+allowlist is a deliberate **hard refusal**, so an operator filling in URL and
+token from a runtime-aware-looking file got an agent that could not start
+anything, with nothing in the file hinting that a setting was missing.
+
+Which is why a generated template documents each key's **empty** value, not just
+its meaning. Those semantics differ per key by design and cannot be conveyed by
+the values, which must stay at their defaults in a document that cannot guess an
+operator's paths: an empty `runtime_allowed_binaries` starts nothing, while an
+empty `runtime_allowed_dirs` accepts *any* `work_dir` (an operator who does not
+care should not have to enumerate a filesystem), and an empty `runtime_cache`
+still resolves to a real default beside the binary. It is also this template's
+empty `cert_dir` — not its `cert_mode: "off"`, which the derivation never reads
+— that makes the runtime router's all-interfaces fallback the shipped default
+(see [Agent-Managed Model Runtime §4.6](agent-runtime-manager.md)).
 
 ## See also
 
 - [Configuration & Environment Variables (Reference)](../reference/config-env.md) — exhaustive variable tables.
 - [HTTP API Surface (Reference)](../reference/api-surface.md) — how auth (session/CSRF/bearer/agent-token) is wired to each route group.
+- [Agent-Managed Model Runtime](agent-runtime-manager.md) — the `runtime_*` agent settings in context, and the two configuration *sources* (gateway document vs local file) they select between.

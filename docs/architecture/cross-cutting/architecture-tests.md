@@ -19,9 +19,11 @@ Two test families per module:
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
    compared against a checked-in allowlist — 60 edges across 25 packages in
-   `op-ai-gateway`, 21 edges across 11 packages in `op-ai-server-agent`. Any
+   `op-ai-gateway`, 24 edges across 12 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
-   deliberate act.
+   deliberate act. The allowlist is frozen **in both directions**: a listed
+   edge that no longer exists fails too, so an over-generous entry cannot sit
+   there silently permitting an import the package does not actually have.
 2. **Forbidden edges** (`TestForbiddenEdges`): explicit never-rules that
    encode the architecture's load-bearing directions even if the allowlist
    is later loosened.
@@ -46,6 +48,28 @@ Server-agent (`op-ai-server-agent`):
 | `collector` ↛ `proxy`, `trust`, `client`, `agent` | telemetry collection is independent of transport and TLS machinery |
 | `sample` imports no internal package | the wire-format vocabulary is a leaf |
 | `trust`, `proxy`, `certinstall` do not import each other | their only integration is the shared `certfiles`/`gwapi` leaves and the filesystem contract |
+
+`internal/runtime` (the [agent-managed model runtime](agent-runtime-manager.md))
+is a deliberately narrow addition: its only allowed module-internal import is
+`internal/gwapi`, and the two edges toward it are `internal/agent → runtime` and
+`main → runtime`. That shape is what keeps the admission policy a pure function
+over snapshots — anything the policy would need from the agent's own packages is
+a signal it belongs in the manager instead. The reverse edge is impossible
+anyway: `internal/agent` declares the feature registry that `internal/runtime`
+intersects against, so `runtime → agent` would be an import cycle, which is why
+the intersection lives on the `runtime` side.
+
+Two structural consequences of these rules that read like DRY violations and are
+not:
+
+- The runtime **domain types** (`RuntimeSpec`, `RuntimeSpecGPU`,
+  `CoResidencyRule`, `ServerGPUBudget`, `ServerRuntimeReport`) and the
+  `RuntimeStore` interface live in `internal/routing`, while their SQL
+  implementation lives in `internal/store` — because `routing ↛ store`.
+- `internal/portal` carries its **own small copy** of the agent-capabilities
+  parse struct rather than reusing the gateway's, because `portal ↛ gateway`.
+  The two derived feature lists that result are separate state with separate
+  consumers, by design.
 
 ## Frontend: layer boundaries (`src/arch.test.ts`)
 
@@ -81,4 +105,15 @@ Related guards with the same philosophy: the memory-vs-SQL store conformance
 harnesses (`internal/store/routing_store_conformance_test.go`,
 `internal/portal/store_conformance_test.go`), the settings-domain
 classification guard (`internal/portal/service_system_settings_touches_test.go`),
-and the i18n key-parity compile check (`PortalMessages = typeof de`).
+the i18n key-parity compile check (`PortalMessages = typeof de`), and the
+agent's **feature-registry guard**.
+
+That last one is worth knowing precisely, because it is easy to over-trust. The
+agent keeps an append-only registry (`server-agent/internal/agent/features.go`)
+where every entry carries a `Since` version, and a test asserts each `Since` is
+valid SemVer, no greater than `agent.Version`, unique, and snake_case — so
+"added a feature flag without bumping the version" is a failing test. Its honest
+limit: it cannot catch a forgotten **PATCH** bump after a plain bugfix, because
+it compares only `Since <= Version` and has no external signal for what changed.
+That half is the process rule in [`AGENTS.md`](../../../AGENTS.md), not an
+automated check.

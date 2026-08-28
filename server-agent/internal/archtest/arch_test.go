@@ -52,6 +52,7 @@ var allowedDeps = map[string][]string{
 		"internal/collector",
 		"internal/config",
 		"internal/proxy",
+		"internal/runtime",
 		"internal/trust",
 	},
 	"internal/agent": {
@@ -59,6 +60,7 @@ var allowedDeps = map[string][]string{
 		"internal/collector",
 		"internal/config",
 		"internal/proxy",
+		"internal/runtime",
 		"internal/sample",
 	},
 	"internal/certfiles": {},
@@ -77,6 +79,9 @@ var allowedDeps = map[string][]string{
 	"internal/gwapi":  {},
 	"internal/proxy": {
 		"internal/certfiles",
+		"internal/gwapi",
+	},
+	"internal/runtime": {
 		"internal/gwapi",
 	},
 	"internal/sample": {},

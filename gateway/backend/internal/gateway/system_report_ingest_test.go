@@ -144,3 +144,49 @@ func TestIngestSystemReportDropsInjectedSerialFields(t *testing.T) {
 		t.Fatalf("expected the allowed GPU uuid to survive: %s", hw.ReportJSON)
 	}
 }
+
+// TestIngestSystemReportCarriesPCIBusID pins the gateway half of the GPU PCI
+// bus id's path: an agent that reports it must have it survive sanitisation
+// into the canonical stored blob (which is what the portal later serves), and
+// an agent that does not report it must leave the key ABSENT rather than
+// stored as an empty string -- so the portal can tell "this host does not
+// report bus ids" from "this card reported a blank one" and degrade its GPU
+// picker accordingly.
+//
+// Additive and optional in both directions: an older agent omits the field and
+// an older gateway ignores it, which is why this needs no negotiated feature
+// flag.
+func TestIngestSystemReportCarriesPCIBusID(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reported bus id survives into the canonical blob", func(t *testing.T) {
+		srv := NewTestServer()
+		raw := json.RawMessage(`{"agent_version":"1.2.3","gpus":[{"index":0,"name":"RTX 4090","uuid":"GPU-a","memory_total_bytes":25757220864,"pci_bus_id":"00000000:65:00.0"}]}`)
+		if err := srv.ingestSystemReport(ctx, "mock-host-qwen", raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		hw, ok, err := srv.Routes.ServerHardwareByServer(ctx, "mock-host-qwen")
+		if err != nil || !ok {
+			t.Fatalf("ServerHardwareByServer ok=%v err=%v", ok, err)
+		}
+		var got agentSystemReport
+		if err := json.Unmarshal([]byte(hw.ReportJSON), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got.GPUs) != 1 || got.GPUs[0].PCIBusID != "00000000:65:00.0" {
+			t.Fatalf("gpus = %#v, want the pci bus id preserved", got.GPUs)
+		}
+	})
+
+	t.Run("an agent that reports none leaves the key absent", func(t *testing.T) {
+		srv := NewTestServer()
+		raw := json.RawMessage(`{"agent_version":"1.2.3","gpus":[{"index":0,"name":"Radeon Pro W7900","memory_total_bytes":51539607552}]}`)
+		if err := srv.ingestSystemReport(ctx, "mock-host-qwen", raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		hw, _, _ := srv.Routes.ServerHardwareByServer(ctx, "mock-host-qwen")
+		if strings.Contains(hw.ReportJSON, "pci_bus_id") {
+			t.Fatalf("report json = %s, want no pci_bus_id key at all for an AMD/Apple/GPU-less host", hw.ReportJSON)
+		}
+	})
+}

@@ -129,10 +129,19 @@ func (s *Server) runScheduledBenchmarkPass(ctx context.Context, now time.Time, l
 
 // StartBenchmarkScheduler runs runScheduledBenchmarkPass on a ticker until the returned
 // cancel is called. A no-op-safe sibling of the health loop, started after gateway.New.
+//
+// The returned cancel WAITS for the goroutine to return, so when it comes back no
+// pass is in flight any more. Its caller (buildGatewayServer's cleanup) cancels
+// this scheduler and then closes the store, and a pass mid-query across that
+// Close is a real hazard, not a cosmetic one — see startCancellable's doc in
+// cmd/gateway/loop.go for the failure it produced. Calling it twice, or from
+// several goroutines, is safe.
 func (s *Server) StartBenchmarkScheduler(defaultSeconds int) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
 	lastRun := make(map[string]time.Time)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(benchmarkSchedulerTick)
 		defer ticker.Stop()
 		for {
@@ -144,5 +153,8 @@ func (s *Server) StartBenchmarkScheduler(defaultSeconds int) context.CancelFunc 
 			}
 		}
 	}()
-	return cancel
+	return func() {
+		cancel()
+		<-done
+	}
 }

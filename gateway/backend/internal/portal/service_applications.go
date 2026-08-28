@@ -70,6 +70,16 @@ const (
 	defaultApplicationTimeoutMS          = 30000
 	defaultApplicationAffinityTTLSeconds = 1800
 	defaultApplicationHealthCheckPath    = "/v1/health"
+	// defaultServerAgentTimeoutMS is the TimeoutMS default for
+	// routing.ProviderServerAgent applications. Application.TimeoutMS is a
+	// TOTAL request deadline: it starts when the provider adapter is entered
+	// and is never reset by upstream activity, covering the dial, the request
+	// write, the silent wait for response headers, and the full body read. An
+	// agent-managed runtime's very first request for a cold model must wait
+	// for that model process to start and load, which for a large model can
+	// take minutes -- with the stock 30s default every cold start would
+	// reproducibly fail with 502 provider.timeout.
+	defaultServerAgentTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -234,10 +244,27 @@ func (s *Service) ListApplications(ctx context.Context, principal auth.Token, se
 }
 
 // CreateApplication validates and persists a new application under serverID.
+//
+// Managed-runtime-only gate (Task 6): a server with ManagedRuntimeOnly set
+// may only host agent-managed model processes, so any create whose type is
+// not routing.ProviderServerAgent is rejected with ErrServerManagedRuntimeOnly
+// (409 -- a conflict with the server's own configuration, not a malformed
+// request). The comparison uses the RAW requested type, deliberately checked
+// BEFORE normalizeApplicationType below: "server_agent" itself is exempt from
+// this gate -- and, since Task 10 registered "server_agent" as a creatable
+// type, that exemption now lets a ManagedRuntimeOnly server actually accept
+// the server_agent creates the flag exists to allow (before Task 10,
+// normalizeApplicationType did not accept "server_agent" at all, so every
+// create on such a server still failed one way or another; this ordering
+// only guaranteed the failure was ErrApplicationTypeInvalid, never the
+// misleading ErrServerManagedRuntimeOnly).
 func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, serverID string, req CreateApplicationRequest) (ApplicationDTO, error) {
 	server, err := s.authorizeServer(ctx, principal, serverID)
 	if err != nil {
 		return ApplicationDTO{}, err
+	}
+	if server.ManagedRuntimeOnly && strings.TrimSpace(req.Type) != routing.ProviderServerAgent {
+		return ApplicationDTO{}, ErrServerManagedRuntimeOnly
 	}
 	appType, err := normalizeApplicationType(req.Type)
 	if err != nil {
@@ -300,6 +327,15 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	if proxyPortTaken {
 		return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
 	}
+	if appType == routing.ProviderServerAgent {
+		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, "")
+		if err != nil {
+			return ApplicationDTO{}, err
+		}
+		if exists {
+			return ApplicationDTO{}, ErrServerAgentApplicationExists
+		}
+	}
 	// Seal the upstream token up front so a disk-store-without-key rejection surfaces
 	// BEFORE anything is persisted ("" seals to "" = no token).
 	sealedToken, err := capture.SealSecret(s.cipher, s.settingsVolatile, req.APIToken)
@@ -316,7 +352,7 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		APIFlavors:                       flavors,
 		Priority:                         req.Priority,
 		Weight:                           req.Weight,
-		TimeoutMS:                        normalizeApplicationTimeoutMS(req.TimeoutMS),
+		TimeoutMS:                        normalizeApplicationTimeoutMS(appType, req.TimeoutMS),
 		AffinityTTLSeconds:               normalizeApplicationAffinityTTLSeconds(req.AffinityTTLSeconds),
 		AdmissionQueueTimeoutSeconds:     req.AdmissionQueueTimeoutSeconds,
 		Status:                           status,
@@ -342,10 +378,16 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	}
 	if err := s.routes.CreateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			return ApplicationDTO{}, ErrApplicationConflict
+			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, "")
 		}
 		return ApplicationDTO{}, err
 	}
+	// Best-effort: a new server_agent application IS the agent's router-port
+	// configuration, so tell any connected agent immediately instead of
+	// leaving it to the 60 s poll backstop. No previous type (the row did not
+	// exist). Fired BEFORE reconcileServerPolicy so a slow NetBird round trip
+	// cannot delay the push this fix exists to make prompt.
+	s.notifyRuntimeChangedForApplication(server.ID, "", app.Type)
 	// Best-effort: a new application changes the server's active port set, so its
 	// NetBird access policy (if managed) may need to grow. reconcileServerPolicy
 	// gates internally on the module + policy management and never errors.
@@ -368,6 +410,11 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	if err != nil {
 		return ApplicationDTO{}, err
 	}
+	// Captured before the mutation block below reassigns app.Type: the runtime
+	// notification needs BOTH sides of a retype (see
+	// notifyRuntimeChangedForApplication -- retyping AWAY from server_agent
+	// must notify too).
+	previousType := app.Type
 	// Validate everything that can fail BEFORE mutating the loaded application.
 	var appType, scheme, status, healthCheckPath string
 	var port int
@@ -454,6 +501,23 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 			return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
 		}
 	}
+	// The same "at most one server_agent application per server" invariant the
+	// create path enforces. Gated on req.Type being present AND resolving to
+	// server_agent: an update that does not touch the type is never refused
+	// here, so ordinary edits to an application on a server that already
+	// violates the invariant (only reachable on a pre-invariant dev database)
+	// keep working instead of becoming un-editable. app.ID is excluded, so
+	// re-sending the same type on the server's own server_agent application is
+	// not a self-collision.
+	if req.Type != nil && appType == routing.ProviderServerAgent {
+		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, app.ID)
+		if err != nil {
+			return ApplicationDTO{}, err
+		}
+		if exists {
+			return ApplicationDTO{}, ErrServerAgentApplicationExists
+		}
+	}
 	if req.Type != nil {
 		app.Type = appType
 	}
@@ -476,7 +540,10 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		app.Weight = *req.Weight
 	}
 	if req.TimeoutMS != nil {
-		app.TimeoutMS = normalizeApplicationTimeoutMS(*req.TimeoutMS)
+		// app.Type has already been reassigned above if req.Type != nil, so this
+		// picks up the application's OWN (post-mutation) type -- see
+		// normalizeApplicationTimeoutMS's doc comment.
+		app.TimeoutMS = normalizeApplicationTimeoutMS(app.Type, *req.TimeoutMS)
 	}
 	if req.AffinityTTLSeconds != nil {
 		app.AffinityTTLSeconds = normalizeApplicationAffinityTTLSeconds(*req.AffinityTTLSeconds)
@@ -559,10 +626,17 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	app.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			return ApplicationDTO{}, ErrApplicationConflict
+			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, app.ID)
 		}
 		return ApplicationDTO{}, err
 	}
+	// Best-effort: an edit to a server_agent application changes the agent's
+	// runtime config (its Port is router_listen), and retyping one away from
+	// server_agent means the agent must tear that router down. Both directions
+	// notify; so does an edit that touches no runtime-relevant field at all --
+	// see notifyRuntimeChangedForApplication for why over-notifying is the
+	// deliberate choice here.
+	s.notifyRuntimeChangedForApplication(server.ID, previousType, app.Type)
 	// Best-effort: a port/status change may alter the server's active port set, so
 	// its NetBird access policy (if managed) may need to be updated. Gates
 	// internally on the module + policy management and never errors.
@@ -579,6 +653,11 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 	if err := s.routes.DeleteApplication(ctx, app.ID); err != nil {
 		return err
 	}
+	// Best-effort: deleting the server_agent application empties the server's
+	// runtime-config document (AgentRuntimeConfig's "no server_agent
+	// application" case), which the agent must act on by tearing its router
+	// and every managed process down. No current type (the row is gone).
+	s.notifyRuntimeChangedForApplication(server.ID, app.Type, "")
 	// Best-effort: removing an application may drop ports from the server's active
 	// set, so its NetBird access policy (if managed) may need to shrink or be
 	// deleted. server was captured BEFORE the delete; reconcileServerPolicy
@@ -792,6 +871,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderLlamaSwap, nil
 	case routing.ProviderLiteLLM:
 		return routing.ProviderLiteLLM, nil
+	case routing.ProviderServerAgent:
+		return routing.ProviderServerAgent, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -852,6 +933,91 @@ func (s *Service) proxyListenPortTakenOnServer(ctx context.Context, serverID str
 	return false, nil
 }
 
+// serverAgentApplicationExistsOnServer reports whether serverID already has a
+// routing.ProviderServerAgent application other than excludeAppID (pass "" on
+// the create path; the updated application's own id on the update path, so a
+// no-op retype of the server's own server_agent application is not a
+// self-collision).
+//
+// Mirrors proxyListenPortTakenOnServer above: one ApplicationsByServer read,
+// no store-layer support needed. Callers gate on the requested type first, so
+// the extra read only happens for a write that actually targets
+// server_agent. See ErrServerAgentApplicationExists for why the invariant
+// matters.
+//
+// NOT race-free, by construction: this reads, returns, and the caller then
+// calls Create/UpdateApplication in no transaction, so two concurrent POSTs
+// can both pass it. This is the gate that produces the HONEST error code, not
+// the one that guarantees the invariant -- that is the store's job (migration
+// 68's partial unique index on SQL, MemoryStore's
+// serverAgentApplicationExistsLocked on memory), and the loser of the race
+// gets its ErrConflict classified back into the honest sentinel by
+// classifyApplicationWriteConflict.
+func (s *Service) serverAgentApplicationExistsOnServer(ctx context.Context, serverID, excludeAppID string) (bool, error) {
+	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	for _, app := range apps {
+		if app.ID == excludeAppID {
+			continue
+		}
+		if app.Type == routing.ProviderServerAgent {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// classifyApplicationWriteConflict turns the store's opaque ErrConflict from
+// Create/UpdateApplication into the sentinel that names the condition which
+// actually holds. `app` is the application as it was written (Type/Port/
+// ServerID post-mutation on the update path); excludeAppID is "" on create
+// and the application's own id on update.
+//
+// Two constraints on `applications` can produce ErrConflict, and they mean
+// completely different things to an operator: unique(server_id, port), and
+// migration 68's partial unique index on (server_id) where type =
+// 'server_agent' (MemoryStore.serverAgentApplicationExistsLocked on the
+// memory driver). Reporting the port code for the second one told the
+// operator "application port already in use" on a request where no port
+// collided.
+//
+// Classified by RE-READING the server's applications rather than by parsing
+// the driver's error text: sqlite, postgres and memory all surface the same
+// bare store.ErrConflict with no constraint name, and the text that does
+// exist is dialect-specific. The read is only paid on a request that has
+// already failed.
+//
+// Port first, deliberately: it is the constraint MemoryStore checks first,
+// SQL leaves the order undefined when both hold, and a request that really
+// does collide on a port must keep hearing so. When neither condition is
+// visible (a duplicate id -- unreachable with 32 hex of randomness -- or a
+// read failure) the answer stays ErrApplicationConflict, the behaviour before
+// this classification existed.
+func (s *Service) classifyApplicationWriteConflict(ctx context.Context, app routing.Application, excludeAppID string) error {
+	apps, err := s.routes.ApplicationsByServer(ctx, app.ServerID)
+	if err != nil {
+		return ErrApplicationConflict
+	}
+	serverAgentTaken := false
+	for _, existing := range apps {
+		if existing.ID == excludeAppID {
+			continue
+		}
+		if existing.Port == app.Port {
+			return ErrApplicationConflict
+		}
+		if existing.Type == routing.ProviderServerAgent {
+			serverAgentTaken = true
+		}
+	}
+	if app.Type == routing.ProviderServerAgent && serverAgentTaken {
+		return ErrServerAgentApplicationExists
+	}
+	return ErrApplicationConflict
+}
+
 func normalizeApplicationFlavors(raw []string) ([]string, error) {
 	if len(raw) == 0 {
 		return []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, nil
@@ -897,11 +1063,23 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 	return nil
 }
 
-func normalizeApplicationTimeoutMS(timeoutMS int) int {
-	if timeoutMS == 0 {
-		return defaultApplicationTimeoutMS
+// normalizeApplicationTimeoutMS maps a zero TimeoutMS to the type-appropriate
+// default: defaultServerAgentTimeoutMS for a server_agent application (cold
+// model loads can take minutes -- see defaultServerAgentTimeoutMS), or
+// defaultApplicationTimeoutMS for every other type. A non-zero value is
+// always preserved as given. Both CreateApplication and UpdateApplication
+// call this -- UpdateApplication passes the application's own (already
+// mutated, if req.Type changed in the same request) type so that a PATCH
+// combining a retype to/from server_agent with timeout_ms:0 applies the
+// NEW type's default rather than a stale one.
+func normalizeApplicationTimeoutMS(appType string, timeoutMS int) int {
+	if timeoutMS != 0 {
+		return timeoutMS
 	}
-	return timeoutMS
+	if appType == routing.ProviderServerAgent {
+		return defaultServerAgentTimeoutMS
+	}
+	return defaultApplicationTimeoutMS
 }
 
 func normalizeApplicationAffinityTTLSeconds(affinityTTLSeconds int) int {
@@ -1079,12 +1257,18 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
+	// Best-effort, after the successful store write: a mapping under the
+	// server_agent application is a runtime-config input (its two model-name
+	// fields are a spec's model/upstream_model). See
+	// notifyRuntimeChangedForMapping -- the gate is the owning application's
+	// type, not which field this request set.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
 	return mappingDTO(mapping), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
 func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappingID string, req UpdateMappingRequest) (ModelMappingDTO, error) {
-	mapping, _, server, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
@@ -1203,16 +1387,34 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
+	// Best-effort, after the successful store write: renaming a mapping under
+	// the server_agent application rewrites its spec's model/upstream_model in
+	// the agent's document, and without this the new gateway model name 404s at
+	// the agent's router for up to a minute while the old one still routes. See
+	// notifyRuntimeChangedForMapping.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
 	return mappingDTO(mapping), nil
 }
 
 // DeleteMapping removes the mapping.
 func (s *Service) DeleteMapping(ctx context.Context, principal auth.Token, mappingID string) error {
-	mapping, _, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	// app and server are captured here, BEFORE the delete: the notification
+	// below needs the owning application's type to gate on, and after the row
+	// is gone there is nothing left to resolve it from (authorizeMapping walks
+	// mapping -> application -> server).
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return err
 	}
-	return s.routes.DeleteMapping(ctx, mapping.ID)
+	if err := s.routes.DeleteMapping(ctx, mapping.ID); err != nil {
+		return err
+	}
+	// Best-effort, after the successful store write: the store cascades the
+	// mapping's runtime spec, its GPU rows and its co-residency pairs, so
+	// deleting a mapping under the server_agent application removes a whole
+	// spec from the agent's document. See notifyRuntimeChangedForMapping.
+	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
+	return nil
 }
 
 // SyncApplicationModels calls the ModelLister for appID's upstream and
@@ -1271,6 +1473,22 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		deduped = append(deduped, name)
 	}
 	upstream = deduped
+	// Best-effort runtime notification for the FOURTH mapping write path (the
+	// manual "Sync models" button and the background model_sync probe loop both
+	// land here). Registered BEFORE the lock below so LIFO defer order runs it
+	// AFTER reconcileMu is released, and deferred rather than tail-placed so a
+	// reconcile that fails halfway still announces the writes it DID make --
+	// under-notifying is the bug this whole rule exists to prevent. Gated on
+	// having written anything at all: Added and Conflicted each mean one
+	// CreateMapping, Disabled one UpdateMapping, Unchanged no write. See
+	// notifyRuntimeChangedForMapping (including why this notifies even though
+	// neither of the two writes this path makes can change the document today).
+	var result SyncResultDTO
+	defer func() {
+		if result.Added+result.Conflicted+result.Disabled > 0 {
+			s.notifyRuntimeChangedForMapping(server.ID, app.Type)
+		}
+	}()
 	// Serialize the store-mutating critical section: the per-server gateway-name
 	// uniqueness check below (gatewayNameTakenOnServer -> CreateMapping) is a
 	// check-then-act with no DB constraint behind it, and the background
@@ -1293,7 +1511,6 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		upstreamSet[model] = struct{}{}
 	}
 
-	var result SyncResultDTO
 	now := s.clock().UTC()
 	for _, model := range upstream {
 		if _, ok := existingByAppName[model]; ok {

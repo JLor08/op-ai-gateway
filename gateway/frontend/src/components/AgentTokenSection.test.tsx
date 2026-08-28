@@ -3,6 +3,9 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { AgentTokenSection, buildServerAgentConfig } from './AgentTokenSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages } from '../i18n';
@@ -354,6 +357,93 @@ describe('AgentTokenSection agent-binary downloads', () => {
     expect(raw).toContain('the gateway can never deliver');
     // Windows guidance for the reload command.
     expect(raw).toContain('quote-free');
+    // The operator-only half of the managed-runtime router bind contract: the
+    // gateway supplies the router PORT, this file decides its bind host, and an
+    // empty value means the agent falls back to ALL INTERFACES. A generated
+    // config that never mentions the key leaves that decision invisible to the
+    // one person making it.
+    expect(cfg.runtime_router_bind).toBe('');
+    expect(raw).toContain('the gateway supplies the router');
+    // The other five managed-runtime keys. Every one of them used to be
+    // MISSING while this template's runtime_router_bind comment referred the
+    // operator to the README for them — the worst possible split, because the
+    // key that was present is the one whose empty value is identical to being
+    // absent, and the one most conspicuously absent (the binary allowlist) is
+    // the one whose absence stops every model process by design.
+    expect(cfg.runtime_source).toBe('gateway');
+    expect(cfg.runtime_config).toBe('');
+    expect(cfg.runtime_allowed_binaries).toEqual([]);
+    expect(cfg.runtime_allowed_dirs).toEqual([]);
+    expect(cfg.runtime_cache).toBe('');
+    // The two empty-value semantics are opposite, and the comments — not the
+    // values, which a generated template cannot guess — are what carry that.
+    expect(raw).toContain('EMPTY (the default) MEANS NOTHING MAY START');
+    expect(raw).toContain('ANY work_dir is accepted');
+    // A user hit this while configuring a WINDOWS server, so the binary
+    // allowlist names an example for both platforms (the same reason the
+    // portal's own binary-path error message was reworded).
+    expect(raw).toContain('/opt/llama/llama-server');
+    expect(raw).toContain('C:/llama/llama-server.exe');
+    // cert_mode "proxy" is implemented and wired (server-agent/main.go builds
+    // proxy.New/NewRoutesClient/NewDriver for it); this template used to tell
+    // the operator it was not.
+    expect(raw).not.toContain('NOT IMPLEMENTED YET');
+    expect(cfg.cert_proxy_routes).toEqual([]);
+    expect(cfg.cert_proxy_routes_mode).toBe('fallback');
+  });
+
+  // The frontend half of the cross-copy drift guard. One JSONC template is
+  // duplicated in two producers that cannot share code — this function and the
+  // Go backend's buildAgentConfigJSON
+  // (gateway/backend/internal/gateway/agent_binaries.go) — plus two consumers
+  // that must agree with it: server-agent's fileConfig, which decides what the
+  // agent can actually read, and the server-agent README, which documents it.
+  //
+  // Each producer used to pin only its OWN key set, so neither test could see
+  // the other template and the two could disagree indefinitely. They did: this
+  // copy carried a comment naming five runtime settings while emitting none of
+  // them, and the one runtime key it did emit was the only one whose absence is
+  // indistinguishable from its empty value.
+  //
+  // Both producers are now compared byte for byte against ONE generated golden,
+  // server-agent/testdata/server-agent.config.jsonc — so a change on either
+  // side fails on the other until they match. The golden's key set is in turn
+  // checked against every `json` tag on fileConfig by reflection
+  // (server-agent/internal/config/config_test.go), which is what catches a
+  // setting the agent can read but neither template mentions. No hand-
+  // maintained key list survives anywhere in that chain.
+  //
+  // Regenerate the golden after a deliberate template change:
+  //   cd gateway/backend && go test ./internal/gateway \
+  //     -run TestBuildAgentConfigJSONMatchesSharedGolden -update-agent-config-golden
+  it('buildServerAgentConfig is byte-for-byte the shared golden (cross-copy drift guard)', () => {
+    // The golden's fixed inputs, identical to the Go side's: plain ASCII with
+    // none of `<`, `>` or `&`, the only characters Go's json.Marshal escapes
+    // and JSON.stringify does not — which is what makes a byte comparison
+    // between a Go and a TypeScript producer meaningful at all.
+    const raw = buildServerAgentConfig(
+      { gateway_url: 'https://gw.example.test', ca_file: '', ca_cache_file: '', ca_pem: '' },
+      'fixture-token',
+    );
+    const goldenPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../../server-agent/testdata/server-agent.config.jsonc',
+    );
+    const golden = fs.readFileSync(goldenPath, 'utf8');
+    // Reported as a line-by-line first difference rather than a whole-file
+    // diff: the template is ~140 lines and a raw mismatch dump buries which
+    // key drifted.
+    const got = raw.split('\n');
+    const want = golden.split('\n');
+    for (let i = 0; i < Math.max(got.length, want.length); i++) {
+      expect(
+        got[i] ?? '<end of file>',
+        `buildServerAgentConfig has drifted from ${goldenPath} at line ${i + 1}. If the change is deliberate, update the Go copy in gateway/backend/internal/gateway/agent_binaries.go and regenerate the golden (go test ./internal/gateway -run TestBuildAgentConfigJSONMatchesSharedGolden -update-agent-config-golden).`,
+      ).toBe(want[i] ?? '<end of file>');
+    }
+    // And the whole document, so a difference the loop cannot express (a
+    // trailing newline) still fails.
+    expect(raw).toBe(golden);
   });
 
   it('uses token.config even when the binary manifest is unavailable', async () => {

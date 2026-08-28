@@ -2,12 +2,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 #
-# Pre-commit hook: Go format check + lint on both modules. Install with
-# `make hooks` (sets core.hooksPath). Skip a single commit with `--no-verify`.
+# Pre-commit hook: Go format check + lint on both modules, and the docs
+# consistency check when documentation is staged. Install with `make hooks`
+# (sets core.hooksPath). Skip a single commit with `--no-verify`.
 set -euo pipefail
 
-# Only run when Go files are staged.
-if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.go$'; then
+root="$(git rev-parse --show-toplevel)"
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+
+# Documentation first: it costs a fraction of a second and needs no toolchain.
+if printf '%s\n' "$staged" | grep -qE '\.md$|^docs/architecture/.*\.ya?ml$'; then
+  "$root/scripts/check-docs.sh" || {
+    echo "pre-commit: docs consistency check failed — see above (or commit with --no-verify)" >&2; exit 1; }
+fi
+
+# The Go half only when Go files are staged.
+if ! printf '%s\n' "$staged" | grep -qE '\.go$'; then
   exit 0
 fi
 
@@ -16,7 +26,6 @@ if ! command -v golangci-lint >/dev/null 2>&1; then
   exit 1
 fi
 
-root="$(git rev-parse --show-toplevel)"
 for mod in gateway/backend server-agent; do
   ( cd "$root/$mod" && golangci-lint fmt --diff >/dev/null 2>&1 ) || {
     echo "pre-commit: $mod is not formatted — run 'make fmt'" >&2; exit 1; }

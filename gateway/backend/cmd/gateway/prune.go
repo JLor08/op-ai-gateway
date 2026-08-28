@@ -39,9 +39,9 @@ func runCapturePruneLoop(ctx context.Context, pruner capturePruner, interval tim
 // var so the Task 5.4 test can substitute a countable fake pruner + a short interval
 // and observe that the goroutine actually starts and stops.
 var startCapturePruneLoop = func(pruner capturePruner, interval time.Duration) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runCapturePruneLoop(ctx, pruner, interval, func() time.Time { return time.Now().UTC() })
-	return cancel
+	return startCancellable(func(ctx context.Context) {
+		runCapturePruneLoop(ctx, pruner, interval, func() time.Time { return time.Now().UTC() })
+	})
 }
 
 // pruneCapturesOnce reads the current retention window and deletes captures older
@@ -96,9 +96,9 @@ func runTelemetryPruneLoop(ctx context.Context, pruner telemetryPruner, retentio
 // cancel into cleanup. It is a package var so a test can substitute a countable fake
 // pruner + a short interval.
 var startTelemetryPruneLoop = func(pruner telemetryPruner, retention, availabilityRetention, interval time.Duration) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runTelemetryPruneLoop(ctx, pruner, retention, availabilityRetention, interval, func() time.Time { return time.Now().UTC() })
-	return cancel
+	return startCancellable(func(ctx context.Context) {
+		runTelemetryPruneLoop(ctx, pruner, retention, availabilityRetention, interval, func() time.Time { return time.Now().UTC() })
+	})
 }
 
 // pruneTelemetryOnce deletes telemetry/benchmark samples older than the telemetry

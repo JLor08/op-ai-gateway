@@ -158,9 +158,7 @@ func runCertReconcileLoop(ctx context.Context, r certReconciler, interval time.D
 // lets a caller force an immediate extra pass (e.g. after a certificate settings
 // change); pass nil when no such trigger is needed.
 var startCertReconcileLoop = func(r certReconciler, interval time.Duration, trigger <-chan struct{}) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go runCertReconcileLoop(ctx, r, interval, trigger)
-	return cancel
+	return startCancellable(func(ctx context.Context) { runCertReconcileLoop(ctx, r, interval, trigger) })
 }
 
 // certReconcileTriggerFunc builds the portal.ServiceDeps.OnCertSettingsChanged

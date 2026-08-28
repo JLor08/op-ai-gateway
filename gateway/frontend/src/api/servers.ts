@@ -94,6 +94,24 @@ export type PortalServer = {
   // existing PortalServer literal fixtures across the test suite compile
   // unchanged.
   https_switch_override?: string;
+  // Managed-runtime-only restriction (Task 6, migration 66; surfaced to the
+  // portal in the agent-runtime-manager feature): true when this server only
+  // accepts server_agent applications (CreateApplication otherwise rejects a
+  // non-server_agent type with ErrServerManagedRuntimeOnly / the
+  // application.managed_runtime_only error code). Always present on the real
+  // wire DTO (no omitempty server-side); optional here so existing
+  // PortalServer literal fixtures across the test suite compile unchanged
+  // (mirrors certificate_override/https_switch_override above).
+  managed_runtime_only?: boolean;
+  // RuntimeMaxProcesses caps how many agent-managed runtime processes may run
+  // concurrently on this server (0 = unlimited; Task 6, migration 66 --
+  // declared alongside managed_runtime_only server-side). Drives the "server
+  // limits" tab's process-limit field (agent-runtime-manager feature, Task
+  // 21). Always present on the real wire DTO (no omitempty --
+  // ServerDTO.RuntimeMaxProcesses in service.go); optional here so existing
+  // PortalServer literal fixtures across the test suite compile unchanged
+  // (mirrors managed_runtime_only above).
+  runtime_max_processes?: number;
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
@@ -187,6 +205,13 @@ export type UpdateServerRequest = {
   price_per_kwh?: number;
   pue?: number;
   price_unit?: CurrencyUnit;
+  // The "server limits" tab's process-limit field (agent-runtime-manager
+  // feature, Task 21): caps concurrent agent-managed runtime processes; a
+  // supplied 0 resets to unlimited (mirrors the Go
+  // UpdateServerRequest.RuntimeMaxProcesses `*int` -- undefined here means
+  // "leave unchanged", matching every other optional field in this request).
+  // Must be >= 0 (else server.runtime_limit_invalid).
+  runtime_max_processes?: number;
 };
 
 // One resource group a server OWNER may enter their server into (spec
@@ -271,12 +296,20 @@ export type HardwareMemoryModule = {
 export type HardwareMemory = { total_bytes: number; modules?: HardwareMemoryModule[] };
 export type HardwareMainboard = { vendor: string; product: string; version: string };
 export type HardwareBIOS = { vendor: string; version: string };
+// pci_bus_id is the card's PCI address ("00000000:65:00.0"), NVIDIA only and
+// omitted by every other collector and by any agent older than this field --
+// so every consumer must render without it. It is a display/disambiguation
+// aid: on the 4x/8x identical-card hosts that are the normal AI-server build
+// it is the only handle that maps to a physical slot and survives index
+// renumbering across reboots. It is deliberately NOT an identity -- GPU rows,
+// budgets and admission all key on `index`.
 export type HardwareGPU = {
   index: number;
   name: string;
   uuid?: string;
   driver_version?: string;
   memory_total_bytes: number;
+  pci_bus_id?: string;
 };
 export type HardwareReport = {
   collected_at: string;
@@ -291,11 +324,16 @@ export type HardwareReport = {
   bios: HardwareBIOS;
   gpus: HardwareGPU[];
 };
+// `report` is `| null` as well as optional for the same reason as
+// RuntimeReport.report (api/runtime.ts): `report,omitempty` on a
+// `json.RawMessage` only omits an EMPTY blob, and hardware_endpoints.go writes
+// an empty stored ReportJSON out as the JSON literal `null`. Absent, `null`
+// and an object are all on the wire.
 export type HardwareResponse = {
   available: boolean;
   collected_at?: string;
   updated_at?: string;
-  report?: HardwareReport;
+  report?: HardwareReport | null;
 };
 
 // A gateway model one specific server offers (see api.serverModels), used to

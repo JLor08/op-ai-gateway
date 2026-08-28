@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useState, useEffect, type SubmitEvent } from 'react';
-import { Box, Button, Typography } from '@mui/material';
+import { useState, useEffect, useRef, type SubmitEvent } from 'react';
+import { Alert, Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import AppsIcon from '@mui/icons-material/Apps';
 import EditIcon from '@mui/icons-material/Edit';
@@ -33,6 +33,7 @@ import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { applicationTypeDefaults, migrateTypeFields } from './shared/applicationTypeDefaults';
 import { MappingSection } from './MappingSection';
+import { RuntimeAdminSection } from './RuntimeAdminSection';
 
 const applicationTypeOptions: ApplicationType[] = [
   'ollama',
@@ -40,6 +41,7 @@ const applicationTypeOptions: ApplicationType[] = [
   'llama_cpp',
   'llama_swap',
   'litellm',
+  'server_agent',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 const applicationFlavorOptions = ['openai', 'anthropic'];
@@ -51,7 +53,6 @@ function isProxied(app: PortalApplication): boolean {
   return app.scheme === 'https' && app.proxy_listen_port !== 0;
 }
 
-const defaultApplicationTimeoutMs = 30000;
 const defaultApplicationAffinityTtlSeconds = 1800;
 const defaultApplicationAdmissionQueueTimeoutSeconds = 0;
 const defaultApplicationHealthPath = '/v1/health';
@@ -117,6 +118,23 @@ export function ApplicationSection({
     | 'syncApplicationModels'
     | 'updateApplication'
     | 'updateMapping'
+    // Agent-runtime-manager (Task 20): forwarded to RuntimeAdminSection when a
+    // server_agent application's "manage models" drill-down opens it instead
+    // of MappingSection.
+    | 'runtimeSpec'
+    | 'putRuntimeSpec'
+    | 'deleteRuntimeSpec'
+    | 'runtimeCoresidency'
+    | 'putRuntimeCoresidency'
+    | 'runtimeWarnings'
+    | 'gpuBudgets'
+    | 'putGpuBudgets'
+    | 'runtimeReport'
+    | 'subscribeRuntimeStatus'
+    | 'subscribeRuntimeLogs'
+    // Task 21 (matrix + server limits): forwarded the same way.
+    | 'updateServer'
+    | 'serverHardware'
   >;
   server: PortalServer;
   onModelsChanged?: () => void;
@@ -134,8 +152,26 @@ export function ApplicationSection({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [error]);
   const applications = applicationsData ?? [];
+  const managedRuntimeOnly = Boolean(server.managed_runtime_only);
+  const serverAgentApps = applications.filter((a) => a.type === 'server_agent');
 
   const [mode, setMode] = useState<Mode>('list');
+
+  // managed_runtime_only mirrors the backend's own gate (Task 6): a server
+  // restricted this way only ever needs ONE server_agent application (its
+  // model mappings, each with a launch spec, live underneath it) -- so once
+  // that one application exists there is nothing else to click through to on
+  // the list, and the operator lands straight in its runtime admin. Guarded
+  // to fire once, on the first successful load, not on every poll refresh.
+  const autoDrilledRef = useRef(false);
+  useEffect(() => {
+    if (autoDrilledRef.current || !managedRuntimeOnly || applicationsData === null) return;
+    autoDrilledRef.current = true;
+    if (serverAgentApps.length === 1) {
+      setMode({ kind: 'mappings', app: serverAgentApps[0] });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [managedRuntimeOnly, applicationsData]);
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
 
@@ -146,7 +182,7 @@ export function ApplicationSection({
   const [status, setStatus] = useState<ApplicationStatus>('active');
   const [priority, setPriority] = useState(0);
   const [weight, setWeight] = useState(0);
-  const [timeoutMs, setTimeoutMs] = useState(defaultApplicationTimeoutMs);
+  const [timeoutMs, setTimeoutMs] = useState(applicationTypeDefaults.ollama.timeoutMs);
   const [affinityTtl, setAffinityTtl] = useState(defaultApplicationAffinityTtlSeconds);
   const [admissionQueueTimeout, setAdmissionQueueTimeout] = useState(
     defaultApplicationAdmissionQueueTimeoutSeconds,
@@ -194,15 +230,20 @@ export function ApplicationSection({
   }, [api]);
 
   function openCreate() {
-    const d = applicationTypeDefaults.ollama;
-    setType('ollama');
+    // managed_runtime_only servers only ever accept a server_agent create
+    // (the backend rejects anything else with application.managed_runtime_only)
+    // -- seed the form with that type instead of ollama's so the operator
+    // does not have to know to switch it themselves.
+    const defaultType: ApplicationType = managedRuntimeOnly ? 'server_agent' : 'ollama';
+    const d = applicationTypeDefaults[defaultType];
+    setType(defaultType);
     setPort(d.port);
     setScheme(d.scheme);
     setFlavors([...applicationFlavorOptions]);
     setStatus('active');
     setPriority(0);
     setWeight(0);
-    setTimeoutMs(defaultApplicationTimeoutMs);
+    setTimeoutMs(d.timeoutMs);
     setAffinityTtl(defaultApplicationAffinityTtlSeconds);
     setAdmissionQueueTimeout(defaultApplicationAdmissionQueueTimeoutSeconds);
     setHealthMode(defaultApplicationHealthMode);
@@ -233,6 +274,7 @@ export function ApplicationSection({
       loadedModelsPath,
       loadedModelsFormat,
       contextProbePath,
+      timeoutMs,
     });
     if (patch.port !== undefined) setPort(patch.port);
     if (patch.scheme !== undefined) setScheme(patch.scheme);
@@ -241,6 +283,7 @@ export function ApplicationSection({
     if (patch.loadedModelsPath !== undefined) setLoadedModelsPath(patch.loadedModelsPath);
     if (patch.loadedModelsFormat !== undefined) setLoadedModelsFormat(patch.loadedModelsFormat);
     if (patch.contextProbePath !== undefined) setContextProbePath(patch.contextProbePath);
+    if (patch.timeoutMs !== undefined) setTimeoutMs(patch.timeoutMs);
     setType(newType);
   }
 
@@ -458,6 +501,21 @@ export function ApplicationSection({
   // trail (this server's applications become a clickable ancestor).
   if (typeof mode !== 'string' && mode.kind === 'mappings') {
     const app = applications.find((a) => a.id === mode.app.id) ?? mode.app;
+    // A server_agent application's model view IS the agent-managed runtime
+    // admin (spec decision 5) -- the row action's label stays "manage
+    // models"; only the destination differs.
+    if (app.type === 'server_agent') {
+      return (
+        <RuntimeAdminSection
+          key={app.id}
+          t={t}
+          api={api}
+          server={server}
+          application={app}
+          trail={[...trail, { label: server.name, onClick: () => setMode('list') }]}
+        />
+      );
+    }
     return (
       <MappingSection
         key={app.id}
@@ -826,11 +884,18 @@ export function ApplicationSection({
         title={t.applications}
         subtitle={t.applicationsIntro}
         actions={
-          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-            {t.applicationCreate}
-          </Button>
+          (!managedRuntimeOnly || serverAgentApps.length === 0) && (
+            <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+              {t.applicationCreate}
+            </Button>
+          )
         }
       >
+        {managedRuntimeOnly && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            {t.runtimeManagedOnlyBanner}
+          </Alert>
+        )}
         <ListTable
           rows={applications}
           columns={columns}

@@ -14,6 +14,7 @@ import type {
   PortalApplication,
   PortalModelMapping,
   PortalServer,
+  RuntimeSpec,
   ServerHealthStatus,
   SystemSettings as SystemSettingsDTO,
 } from '../api';
@@ -215,6 +216,32 @@ function defaultMapping(overrides: Partial<PortalModelMapping> = {}): PortalMode
   };
 }
 
+// Agent-runtime-manager (Task 20): a benign "not configured" runtime spec,
+// mirroring RuntimeSpec's own zero-value convention (configured: false).
+function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+  return {
+    configured: false,
+    mapping_id: 'map_1',
+    enabled: false,
+    binary: '',
+    args: [],
+    env: {},
+    work_dir: '',
+    listen_port: 0,
+    health_path: '',
+    health_timeout_seconds: 0,
+    startup_timeout_seconds: 0,
+    idle_timeout_seconds: 0,
+    admission_wait_timeout_seconds: 0,
+    pinned: false,
+    admin_state: '',
+    vram_locked: false,
+    set_visible_devices: false,
+    gpus: [],
+    ...overrides,
+  };
+}
+
 // Complete stub for ServerList's whole narrowed Pick, with benign defaults for
 // every method. Most tests below only exercise a handful of these (the list
 // view + at most one drill-down section); every other method is never called
@@ -249,6 +276,7 @@ function baseServerListApi(): ServerListApi {
     createServer: vi.fn(async () => makeServer('srv_created', 'healthy')),
     deleteApplication: vi.fn(async () => ({ ok: true })),
     deleteMapping: vi.fn(async () => ({ ok: true })),
+    deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
     deleteServer: vi.fn(async () => ({ ok: true })),
     downloadAgentBinary: vi.fn(async () => new Blob()),
     generateAgentToken: vi.fn(async () => ({
@@ -261,6 +289,7 @@ function baseServerListApi(): ServerListApi {
     })),
     getCurrency: vi.fn(async () => ({ usd_per_eur: 0 })),
     getSystemSettings: vi.fn(async () => makeSystemSettings()),
+    gpuBudgets: vi.fn(async () => ({ budgets: [] })),
     healthCheckInterval: vi.fn(async () => ({ health_check_interval_seconds: 30 })),
     joinResourceGroup: vi.fn(async () => ({ ok: true })),
     leaveResourceGroup: vi.fn(async () => ({ ok: true })),
@@ -277,8 +306,15 @@ function baseServerListApi(): ServerListApi {
     netbirdGroups: vi.fn(async () => ({ data: [] })),
     netbirdPeers: vi.fn(async () => ({ data: [] })),
     probeMappingContext: vi.fn(async () => idleBenchmarkStatus),
+    putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
+    putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    putRuntimeSpec: vi.fn(async () => defaultRuntimeSpec()),
     regenerateNetbirdKey: vi.fn(async () => ({ setup_key: '' })),
     revokeAgentToken: vi.fn(async () => ({ ok: true })),
+    runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
+    runtimeSpec: vi.fn(async () => defaultRuntimeSpec()),
+    runtimeWarnings: vi.fn(async () => ({ warnings: [] })),
     serverAdminGroupCandidates: vi.fn(async () => []),
     serverAvailability: vi.fn(async () => ({ points: [], from: '', to: '' })),
     serverHardware: vi.fn(async () => ({ available: false })),
@@ -291,6 +327,8 @@ function baseServerListApi(): ServerListApi {
     setServerHTTPSSwitchOverride: vi.fn(async () => makeServer('srv_1', 'healthy')),
     setServerNetbird: vi.fn(async () => makeServer('srv_1', 'healthy')),
     subscribeBenchmark: vi.fn(() => () => {}),
+    subscribeRuntimeStatus: vi.fn(() => () => {}),
+    subscribeRuntimeLogs: vi.fn(() => () => {}),
     subscribeServerPerf: vi.fn(() => () => {}),
     syncApplicationModels: vi.fn(async () => ({
       added: 0,

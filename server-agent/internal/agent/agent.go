@@ -10,20 +10,34 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/proxy"
 	"op-ai-server-agent/internal/sample"
+
+	// runtimectl is internal/runtime, aliased because this file already
+	// imports the standard library's "runtime" package (used for
+	// runtime.GOOS/runtime.GOARCH below) -- internal/runtime's own package
+	// doc calls out this exact collision and names "runtimectl" as the
+	// alias every importer that needs both should use.
+	runtimectl "op-ai-server-agent/internal/runtime"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Version is the agent's self-reported version, sent as agent_version.
-const Version = "0.1.0"
+// Bump rule (design spec §9, feature negotiation): MINOR when Features
+// gains a new entry (as here -- 0.1.0 -> 0.2.0 for "runtime_manager"),
+// PATCH for anything else. TestFeatureRegistry enforces the MINOR case by
+// failing if any Feature.Since outruns Version; it cannot catch a forgotten
+// PATCH bump after a plain bugfix, which stays a process rule.
+const Version = "0.2.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -91,7 +105,135 @@ type certProxyDriver interface {
 	Status() []proxy.RouteStatus
 }
 
+// runtimeDriver is the optional agent-managed model runtime hook set,
+// symmetric with certProxyDriver above: *runtimectl.Driver satisfies it.
+// Sync fetches/reconciles the desired runtime-config document (see
+// runtimectl.Driver.Sync's own doc for the exact three-step contract);
+// Status reports the live per-spec state for the outgoing telemetry
+// sample. It is an interface (not the concrete type) so a nil value is a
+// well-typed no-op -- every call site below guards it with a plain
+// "!= nil" check -- and so tests can inject a counting fake instead of a
+// real process-supervision stack.
+//
+// Fix round 1, I3: main.go now constructs the driver UNCONDITIONALLY
+// (never gated on a one-shot startup features probe, which used to freeze
+// "inactive" for the whole process on any transient failure at boot).
+// Active reports the driver's OWN current feature-negotiation outcome
+// (its Sync's own step 1, re-checked on every call) -- collectOnce below
+// gates the Runtimes/LoadedModels override on Active(), NOT merely on this
+// interface being non-nil, precisely because "a driver exists" no longer
+// implies "this agent's runtime feature is doing anything right now". A
+// nil runtimeDriver (still possible: a test, or a hypothetical build that
+// never wires one at all) is the only remaining case that keeps a legacy
+// agent's telemetry sample byte-identical purely by construction (no
+// "runtimes" key at all, see collectOnce below); an inactive-but-non-nil
+// driver reaches the identical byte-neutral outcome via the Active() gate
+// instead.
+type runtimeDriver interface {
+	Sync(ctx context.Context, pushed json.RawMessage)
+	Status() []runtimectl.Status
+	Active() bool
+}
+
+// runtimeReportResender is the optional interface a runtimeDriver may
+// additionally implement to accept a periodic, unconditional resend of its
+// file-mode report (fix round 1, I5): design spec §10.2 requires this as a
+// POST-transport backstop (the WS transport already gets it for free on
+// every reconnect via WSSender's own cached-frame resend). Rather than
+// teaching this package or the driver which transport is in use, Run
+// piggybacks the call on the EXISTING system-report ticker cadence --
+// exactly the same transport-agnostic mechanism the system report itself
+// already relies on. *runtimectl.Driver implements it; a fake that omits
+// it (or a nil runtimeDriver) simply never gets this call.
+type runtimeReportResender interface {
+	ResendReport(ctx context.Context)
+}
+
+// runtimeWaker is the optional interface a poster may additionally
+// implement to signal "a new runtime-config document is available now":
+// a WS-pushed runtime_config frame, or this connection being (re)established
+// (a nil payload in that case -- "resync over HTTP", see
+// client.WSSender.RuntimeUpdates' own doc). Only *client.WSSender
+// implements it today, mirroring certWaker/trustWaker exactly -- the POST
+// transport has no server->agent channel at all, so runtime-config
+// reconciliation there relies solely on newRuntimeTicker's periodic
+// cadence. NewFromDeps derives it via a type assertion on d.Poster, exactly
+// like certWaker/trustWaker.
+type runtimeWaker interface {
+	RuntimeUpdates() <-chan json.RawMessage
+}
+
+// runtimeTransitionsWaker is the optional interface a runtimeDriver may
+// additionally implement to expose an immediate-resample doorbell: a spec
+// state transition (design spec §7: "reverse direction latency" -- a
+// portal click should feel like network latency, not the next 1s telemetry
+// tick... let alone the 60s runtime-config poll). *runtimectl.Driver
+// implements it (delegating to its Manager's own Transitions() channel).
+// NewFromDeps derives it via a type assertion on d.RuntimeDriver, mirroring
+// how certWaker/trustWaker are derived from d.Poster.
+type runtimeTransitionsWaker interface {
+	Transitions() <-chan struct{}
+}
+
+// runtimeLogWaker is the optional interface a poster may additionally
+// implement to deliver the gateway's runtime_log_config command (T3): the
+// full set of spec IDs whose managed-process output the gateway currently
+// wants streamed. Only *client.WSSender implements it, and that is the whole
+// story for log streaming under the POST transport: with no server->agent
+// direction there is no way to ask for a stream, so a POST-transport agent
+// never streams and the portal says so rather than showing an empty window.
+type runtimeLogWaker interface {
+	LogWatchUpdates() <-chan json.RawMessage
+}
+
+// runtimeLogPoster is the optional interface a poster may additionally
+// implement to carry one runtime_log frame upward. Deliberately separate from
+// `reporter` so a poster can support the state reports without also
+// supporting live log frames.
+type runtimeLogPoster interface {
+	PostRuntimeLog(ctx context.Context, raw json.RawMessage) error
+}
+
+// runtimeLogPort is the optional interface a runtimeDriver may additionally
+// implement to accept the watch command and hand back the frames queued since
+// the last flush. *runtimectl.Driver implements it; a fake that omits it (or a
+// nil runtimeDriver) simply never gets these calls, and the log-flush ticker
+// below is never even created.
+type runtimeLogPort interface {
+	SetLogWatch(raw json.RawMessage)
+	DrainLogFrames() []json.RawMessage
+}
+
 var trustRefreshInterval = 15 * time.Minute
+
+// runtimePollInterval is the periodic backstop cadence for the runtime
+// driver's Sync (analogous to certPollInterval, but a single fixed const
+// rather than a transport-dependent choice): the WS wake/reconnect and the
+// Transitions() doorbell already cover the common cases promptly, so this
+// is purely a safety net against a missed wake -- no test needs to shrink
+// it (every runtime-driver test in this package drives Sync directly via
+// the wake/transitions channels or a direct triggerRuntimeSync call, never
+// by waiting out this ticker), so unlike this file's other timing knobs it
+// stays a plain const.
+const runtimePollInterval = 60 * time.Second
+
+// runtimeLogFlushInterval is how often Run drains whatever managed-process
+// output has been queued for the specs someone is watching, and writes one
+// frame per spec.
+//
+// It is a var so a test can shrink it, and it is the feature's RATE LIMIT as
+// much as its latency budget. Batching over a window is what keeps a chatty
+// model server from turning into a frame per line on the single WebSocket
+// that telemetry also uses. What one window can actually produce, stated as
+// internal/runtime's Drain enforces it rather than as it was once claimed here:
+// at most ONE frame per watched spec, carrying at most logDrainBudget bytes of
+// live output across all of them, plus at most ONE history-replay chunk
+// fleet-wide -- each frame itself bounded by maxLogBatchBytes, which is derived
+// from the gateway's read limit rather than from the retention setting. 250 ms
+// is below the threshold at which a human reading a scrolling log perceives lag,
+// and four wakeups a second on a loop that already samples once a second is not
+// a cost worth optimizing.
+var runtimeLogFlushInterval = 250 * time.Millisecond
 
 // certPollIntervalWS/POST are the AUTOMATIC certificate-poll cadences (used
 // when cfg.CertPollInterval == 0) selected by transport. WebSocket already
@@ -208,6 +350,48 @@ type Agent struct {
 	// certificate-poll cadence, so no extra synchronization is needed here (the
 	// proxy.Manager it wraps is itself concurrency-safe regardless).
 	proxy certProxyDriver
+
+	// runtimeDriver is the optional agent-managed model runtime hook set;
+	// nil (main.go's default, and every pre-Task-18 test construction)
+	// disables the feature entirely -- no ticker, no wake handling, no
+	// "runtimes" field on the outgoing Sample, no LoadedModels override.
+	// See the runtimeDriver interface doc above for the exact contract.
+	runtimeDriver runtimeDriver
+	// runtimeWake is the optional wake channel derived from the poster (see
+	// runtimeWaker); nil when the poster does not support it (the POST
+	// transport, or a test poster). A nil channel in a select case simply
+	// never becomes ready, mirroring certWake/trustWake exactly.
+	runtimeWake <-chan json.RawMessage
+	// runtimeTransitions is the optional immediate-resample doorbell derived
+	// from runtimeDriver (see runtimeTransitionsWaker); nil when there is no
+	// driver, or the driver does not implement it.
+	runtimeTransitions <-chan struct{}
+	// runtimeSyncing serializes runtime-config syncs: the periodic ticker,
+	// the wake channel, and a direct call to Sync can all fire arbitrarily
+	// close together, and this CompareAndSwap guarantees at most one Sync
+	// runs at a time -- the exact same single-flight discipline
+	// certSyncing/trustSyncing already use, and the pattern the task brief
+	// calls "the AGENT's trigger pattern, not the Driver's own".
+	runtimeSyncing atomic.Bool
+	// runtimeReportResender is the optional periodic file-mode-report
+	// resend hook derived from runtimeDriver (see the interface doc above);
+	// nil when there is no driver, or the driver does not implement it.
+	// Invoked from the same reportTicker cadence sendSystemReport already
+	// uses (fix round 1, I5) -- never on its own ticker.
+	runtimeReportResender runtimeReportResender
+
+	// --- T3, live managed-process log streaming -------------------------
+	//
+	// All three are optional and derived by type assertion at construction,
+	// exactly like their cert/runtime siblings. Log streaming happens only
+	// when ALL THREE are present: something to ask for it (runtimeLogWake),
+	// something to produce it (runtimeLogPort), and something to carry it
+	// (runtimeLogPoster). Any one missing -- the POST transport, a driver
+	// fake, a test poster -- disables the whole path, including its ticker,
+	// with no conditional anywhere in the hot loop.
+	runtimeLogWake   <-chan json.RawMessage
+	runtimeLogPort   runtimeLogPort
+	runtimeLogPoster runtimeLogPoster
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -226,19 +410,22 @@ func (a *Agent) SetCertProxyDriver(d certProxyDriver) {
 // ProxyRoutes fields on the outgoing Sample. Host, GPUs, Scraper, Loaded,
 // Power, and Temp are the base collectors; Poster is the telemetry sink;
 // CertSync/TrustSync are the Phase 2 certificate/trust syncers; ProxyDriver
-// is the cert_mode=proxy hook set. See New's and SetCertProxyDriver's docs
-// above for the exact per-field disabled behavior each one preserves.
+// is the cert_mode=proxy hook set; RuntimeDriver is the agent-managed model
+// runtime hook set (nil = feature absent, the no-op invariant -- see the
+// runtimeDriver interface doc above). See New's and SetCertProxyDriver's
+// docs above for the exact per-field disabled behavior each one preserves.
 type Deps struct {
-	Host        collector.HostCollector
-	GPUs        []collector.GPUCollector
-	Scraper     collector.Scraper
-	Loaded      collector.LoadedModelLister
-	Power       collector.PowerCollector
-	Temp        collector.TempCollector
-	Poster      poster
-	CertSync    certSyncer
-	TrustSync   trustSyncer
-	ProxyDriver certProxyDriver
+	Host          collector.HostCollector
+	GPUs          []collector.GPUCollector
+	Scraper       collector.Scraper
+	Loaded        collector.LoadedModelLister
+	Power         collector.PowerCollector
+	Temp          collector.TempCollector
+	Poster        poster
+	CertSync      certSyncer
+	TrustSync     trustSyncer
+	ProxyDriver   certProxyDriver
+	RuntimeDriver runtimeDriver
 }
 
 // New builds an Agent from the resolved config and its collectors/poster. The
@@ -287,17 +474,18 @@ func New(cfg config.Config, host collector.HostCollector, gpus []collector.GPUCo
 // setter for the proxy driver.
 func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	a := &Agent{
-		cfg:       cfg,
-		host:      d.Host,
-		gpus:      d.GPUs,
-		scraper:   d.Scraper,
-		loaded:    d.Loaded,
-		power:     d.Power,
-		temp:      d.Temp,
-		poster:    d.Poster,
-		certSync:  d.CertSync,
-		trustSync: d.TrustSync,
-		proxy:     d.ProxyDriver,
+		cfg:           cfg,
+		host:          d.Host,
+		gpus:          d.GPUs,
+		scraper:       d.Scraper,
+		loaded:        d.Loaded,
+		power:         d.Power,
+		temp:          d.Temp,
+		poster:        d.Poster,
+		certSync:      d.CertSync,
+		trustSync:     d.TrustSync,
+		proxy:         d.ProxyDriver,
+		runtimeDriver: d.RuntimeDriver,
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -307,6 +495,30 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	}
 	if w, ok := d.Poster.(trustWaker); ok {
 		a.trustWake = w.TrustUpdates()
+	}
+	if w, ok := d.Poster.(runtimeWaker); ok {
+		a.runtimeWake = w.RuntimeUpdates()
+	}
+	if w, ok := d.RuntimeDriver.(runtimeTransitionsWaker); ok {
+		a.runtimeTransitions = w.Transitions()
+	}
+	if r, ok := d.RuntimeDriver.(runtimeReportResender); ok {
+		a.runtimeReportResender = r
+	}
+	// The log-streaming trio is derived ALL-OR-NOTHING on purpose. Wiring
+	// only the wake channel would leave Run's select ready to fire on a
+	// command with no port to apply it to, and wiring only the ticker would
+	// have it drain frames it has no way to send. Requiring all three makes
+	// every partial combination (a WS poster with a driver fake, a driver
+	// with a POST poster) a complete, panic-free no-op rather than a case
+	// each call site has to guard.
+	logWaker, hasLogWake := d.Poster.(runtimeLogWaker)
+	logPoster, hasLogPoster := d.Poster.(runtimeLogPoster)
+	logPort, hasLogPort := d.RuntimeDriver.(runtimeLogPort)
+	if hasLogWake && hasLogPoster && hasLogPort {
+		a.runtimeLogWake = logWaker.LogWatchUpdates()
+		a.runtimeLogPoster = logPoster
+		a.runtimeLogPort = logPort
 	}
 	return a
 }
@@ -329,6 +541,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.seedCertReport()
 	a.triggerCertSync(ctx)
 	a.triggerTrustSync(ctx)
+	// Agent-managed model runtime (Task 18): kick off one reconciliation in
+	// the background right after cert/trust, exactly like those do -- the
+	// very first sample below should reflect whatever the runtime driver
+	// can determine promptly, rather than waiting up to runtimePollInterval
+	// for the first tick. A nil pushed payload here means "resync over
+	// HTTP", the same convention client.WSSender.RuntimeUpdates uses for a
+	// fresh connect.
+	a.triggerRuntimeSync(ctx, nil)
 
 	a.collectOnce(ctx)
 	ticker := time.NewTicker(a.cfg.Interval)
@@ -349,6 +569,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	if trustTicker != nil {
 		defer trustTicker.Stop()
 	}
+	runtimeTicker, runtimeTickerC := a.newRuntimeTicker()
+	if runtimeTicker != nil {
+		defer runtimeTicker.Stop()
+	}
+	logTicker, logTickerC := a.newRuntimeLogTicker()
+	if logTicker != nil {
+		defer logTicker.Stop()
+	}
 
 	for {
 		select {
@@ -358,6 +586,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.collectOnce(ctx)
 		case <-reportTicker.C:
 			a.sendSystemReport(ctx)
+			a.resendRuntimeReport(ctx)
 		case <-certTickerC:
 			a.triggerCertSync(ctx)
 		case <-a.certWake:
@@ -366,6 +595,23 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.triggerTrustSync(ctx)
 		case <-a.trustWake:
 			a.triggerTrustSync(ctx)
+		case <-runtimeTickerC:
+			a.triggerRuntimeSync(ctx, nil)
+		case data := <-a.runtimeWake:
+			a.triggerRuntimeSync(ctx, data)
+		case data := <-a.runtimeLogWake:
+			// Applying the gateway's watch command is a bounded, purely
+			// in-memory map swap (internal/runtime.LogStore.SetWatch), so
+			// unlike the sync triggers around it there is nothing here worth
+			// a goroutine and a single-flight flag.
+			a.runtimeLogPort.SetLogWatch(data)
+		case <-logTickerC:
+			a.flushRuntimeLogs(ctx)
+		case <-a.runtimeTransitions:
+			// Immediate coalesced sample on a spec state transition (design
+			// spec §7): a portal click should feel like network latency, not
+			// the next 1s telemetry tick.
+			a.collectOnce(ctx)
 		}
 	}
 }
@@ -389,6 +635,120 @@ func (a *Agent) triggerTrustSync(ctx context.Context) {
 		} else {
 			slog.Debug("gateway CA trust refreshed")
 		}
+	}()
+}
+
+// newRuntimeTicker builds the periodic runtime-config poll ticker, or --
+// when there is no runtime driver at all -- returns a nil ticker and a nil
+// channel. A nil channel in Run's select never becomes ready, so the hot
+// loop needs no conditional branch to keep this case disabled; the caller
+// is responsible for Stop()ing a non-nil ticker. Unlike newCertTicker there
+// is no separate "mode off" check here: a.runtimeDriver's mere presence
+// already means feature negotiation decided runtime_manager is active for
+// this agent at startup (main.go only ever sets Deps.RuntimeDriver inside
+// that check) -- the only thing that can change AFTER startup is whether
+// the GATEWAY still declares it, which runtimeDriver.Sync itself re-checks
+// on every call.
+func (a *Agent) newRuntimeTicker() (*time.Ticker, <-chan time.Time) {
+	if a.runtimeDriver == nil {
+		return nil, nil
+	}
+	t := time.NewTicker(runtimePollInterval)
+	return t, t.C
+}
+
+// newRuntimeLogTicker builds the managed-process log flush ticker, or a nil
+// ticker and a nil channel when the log-streaming trio is not fully wired
+// (see NewFromDeps). A nil channel in Run's select never becomes ready, so
+// the hot loop needs no conditional branch to keep this case disabled --
+// the same shape as newCertTicker/newRuntimeTicker.
+//
+// The ticker runs unconditionally once wired, even with nothing watched: it
+// is a wakeup, not traffic. Drain returns nil on an unwatched fleet and
+// flushRuntimeLogs writes nothing, so a fleet nobody is looking at produces
+// no frames at all -- which is the point of the on-demand design.
+func (a *Agent) newRuntimeLogTicker() (*time.Ticker, <-chan time.Time) {
+	if a.runtimeLogPort == nil || a.runtimeLogPoster == nil {
+		return nil, nil
+	}
+	t := time.NewTicker(runtimeLogFlushInterval)
+	return t, t.C
+}
+
+// flushRuntimeLogs writes one runtime_log frame per watched spec that has
+// produced output since the last flush.
+//
+// It runs INLINE on Run's goroutine, never in a goroutine of its own, and
+// that is the load-bearing detail: Post and PostSystemReport are written from
+// this same loop, and spawning here would add a writer racing them -- the
+// precise defect class the client package's one-writer rule exists to prevent.
+//
+// Note the rule is a discipline, not a property the transport enforces: the
+// broader claim this comment used to make -- "this transport allows exactly one
+// writer per connection" -- is false in transport=websocket + runtime_source=file,
+// where PostRuntimeReport is written from the goroutine triggerRuntimeSync
+// spawns. WSSender.PostRuntimeLog carries the full correction and what it costs.
+// Keeping this flush on the run loop is what stops a THIRD writer being added to
+// that, so the reasoning survives the correction intact.
+//
+// A write failure is dropped, not retried and not logged with any content:
+// the frames carry managed-process output, which may include prompt text and
+// must never reach a log line.
+//
+// Dropping is affordable only because of what happens on the NEXT connection,
+// and that deserves stating precisely, because the previous statement of it was
+// true for one of the two cases and false for the other. DrainLogFrames has
+// already removed these records from the send queue by the time the write fails,
+// and their drop counters with them, so nothing downstream will ever emit a
+// gap marker for them. What repairs the hole is the gateway restating the watch
+// set on every fresh agent connection WITH A BUMPED SNAPSHOT EPOCH: the agent
+// then re-snapshots from its retention buffer -- which Drain never touches -- and
+// the operator gets the missing output back as a fresh scrollback, with anything
+// the buffer evicted meanwhile counted in that scrollback's dropped_bytes.
+// Before the epoch existed this held only when the AGENT had restarted (an empty
+// watch map re-snapshots by definition); across a plain WebSocket reconnect the
+// map survived, the restate named the same specs, and the agent skipped the
+// snapshot -- so the operator read the output before the drop and the output
+// after it as one contiguous run.
+//
+// Skipping the drain entirely while disconnected was the alternative, and it is
+// worse: the bytes would sit in the per-spec queue, overflow it, and be reported
+// as a gap the operator can see -- for output that is still perfectly intact in
+// the retention buffer and about to be replayed.
+func (a *Agent) flushRuntimeLogs(ctx context.Context) {
+	if a.runtimeLogPort == nil || a.runtimeLogPoster == nil {
+		return
+	}
+	for _, frame := range a.runtimeLogPort.DrainLogFrames() {
+		if err := a.runtimeLogPoster.PostRuntimeLog(ctx, frame); err != nil {
+			slog.Debug("runtime log frame not delivered", "err", err)
+			// One failure means the connection is gone; the rest of this
+			// batch would fail identically.
+			return
+		}
+	}
+}
+
+// triggerRuntimeSync starts one runtime-config sync in its own goroutine
+// unless one is already running -- copies triggerCertSync's single-flight
+// CompareAndSwap coalescing discipline verbatim (see that function's doc
+// for the full rationale): a burst of ticker+wake+transition signals
+// arriving close together must never run two syncs concurrently, and must
+// never block Run's select loop on however long a sync takes.
+//
+// A pushed payload lost to single-flight coalescing (data arrives while a
+// sync is already in flight, so this call is a no-op) is safe: the next
+// tick calls Sync again with a nil payload, and the driver's own
+// source.Load()/GatewaySource re-fetches or reads the source's own
+// already-cached latest document regardless -- nothing pushed is ever
+// silently dropped for good.
+func (a *Agent) triggerRuntimeSync(ctx context.Context, data json.RawMessage) {
+	if a.runtimeDriver == nil || !a.runtimeSyncing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.runtimeSyncing.Store(false)
+		a.runtimeDriver.Sync(ctx, data)
 	}()
 }
 
@@ -507,6 +867,19 @@ func (a *Agent) sendSystemReport(ctx context.Context) {
 	}
 }
 
+// resendRuntimeReport re-sends the runtime driver's current file-mode
+// report unconditionally, piggybacking on the SAME ticker cadence as
+// sendSystemReport (fix round 1, I5: design spec §10.2's POST-transport
+// periodic backstop) rather than teaching this loop -- or the driver --
+// which transport is in use. A nil runtimeReportResender (no driver, or a
+// driver/fake that does not implement it) makes this a no-op.
+func (a *Agent) resendRuntimeReport(ctx context.Context) {
+	if a.runtimeReportResender == nil {
+		return
+	}
+	a.runtimeReportResender.ResendReport(ctx)
+}
+
 // collectOnce builds one sample from the host, GPU, and scrape collectors and
 // pushes it. Each collector failure is logged and skipped so a partial sample
 // still ships; a push failure is logged but not returned (the loop keeps going).
@@ -518,6 +891,11 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		AgentVersion: Version,
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
+		// Feature negotiation (design spec §9): declare what this agent
+		// binary can do so the gateway can gate agent-only behavior (e.g.
+		// runtime_manager) on name equality instead of guessing from
+		// AgentVersion.
+		Capabilities: capabilitiesJSON(),
 	}
 	if a.host != nil {
 		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
@@ -590,6 +968,84 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		} else {
 			s.LoadedModels = models
 		}
+	}
+	// Agent-managed model runtime (Task 18, design spec §7/§9): when a
+	// runtime driver is installed AND currently negotiated active, its
+	// Status() is AUTHORITATIVE for both Runtimes and LoadedModels -- this
+	// deliberately overrides whatever the a.loaded model-status scraper
+	// above just set, per the design's own "the gateway treats a fresh
+	// agent report as authoritative" contract applied consistently to the
+	// runtime feature's own source of truth.
+	//
+	// Fix round 1, I3: the gate is Active(), NOT merely "a.runtimeDriver !=
+	// nil". main.go now constructs the driver UNCONDITIONALLY (no more
+	// one-shot startup probe that used to decide this forever), so a
+	// non-nil driver no longer implies the feature is doing anything right
+	// now -- gating the LoadedModels override on existence alone would wipe
+	// a non-runtime (or not-yet-negotiated, or currently-drained) agent's
+	// REAL loaded-model list with an empty one. Active() reflects the
+	// driver's own last Sync outcome, re-checked on every call, so this
+	// self-heals exactly when negotiation does. A nil driver (still
+	// possible: a test, or a hypothetical build that never wires one)
+	// short-circuits before even calling Active(), which is what keeps
+	// Runtimes completely absent -- nil, thus omitted by the sample's
+	// omitempty tag, exactly like ProxyRoutes above -- for every agent
+	// that never wires the feature at all: the no-op invariant this whole
+	// feature is built around.
+	if a.runtimeDriver != nil && a.runtimeDriver.Active() {
+		statuses := a.runtimeDriver.Status()
+		var loaded []string
+		if len(statuses) > 0 {
+			runtimes := make([]sample.RuntimeSample, 0, len(statuses))
+			for _, st := range statuses {
+				rs := sample.RuntimeSample{
+					SpecID:   st.SpecID,
+					Model:    st.Model,
+					State:    string(st.State),
+					Since:    st.Since,
+					PID:      st.PID,
+					Port:     st.Port,
+					InFlight: st.InFlight,
+					Restarts: st.Restarts,
+				}
+				if len(st.MeasuredVRAM) > 0 {
+					gpus := make([]sample.RuntimeGPUSample, 0, len(st.MeasuredVRAM))
+					for idx, mb := range st.MeasuredVRAM {
+						gpus = append(gpus, sample.RuntimeGPUSample{Index: idx, VRAMMeasuredMB: mb})
+					}
+					// map iteration order is unspecified; sort by index so
+					// the wire order is deterministic (easier to diff/read,
+					// and avoids flaky-looking test assertions downstream).
+					sort.Slice(gpus, func(i, j int) bool { return gpus[i].Index < gpus[j].Index })
+					rs.GPUs = gpus
+				}
+				if st.LastError != nil {
+					rs.LastError = &sample.RuntimeErrorSample{
+						Message:    st.LastError.Message,
+						At:         st.LastError.At,
+						ExitCode:   st.LastError.ExitCode,
+						Failures:   st.LastError.Failures,
+						StderrTail: st.LastError.StderrTail,
+					}
+				}
+				runtimes = append(runtimes, rs)
+				// Routing must never see a cold/loading model as usable
+				// (prefer-loaded must not route to a model that cannot
+				// answer yet) -- only StateRunning counts, matching the
+				// design spec's own §7 "flat loaded_models list carries
+				// only truly loaded models" rule and Manager.LoadedModels'
+				// identical StateRunning-only filter.
+				if st.State == runtimectl.StateRunning {
+					loaded = append(loaded, st.Model)
+				}
+			}
+			s.Runtimes = runtimes
+		}
+		// Authoritative from the manager even when EMPTY (no specs, or
+		// none running): overrides whatever a.loaded produced above, since
+		// the runtime feature being active means IT owns this server's
+		// loaded-model truth now, not the generic model-status scraper.
+		s.LoadedModels = loaded
 	}
 	// Phase 2 certificate distribution: report the LAST report syncCert (or
 	// the startup seedCertReport) produced, read under certReportMu. This

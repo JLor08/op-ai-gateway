@@ -109,6 +109,38 @@ flowchart TB
 | `logbuffer` | In-memory log ring buffer with live SSE streaming and level control. |
 | `theme` | Loads and validates external, data-only themes from the themes directory. |
 
+**The sanctioned seam for a service → server callback.**
+`gateway.ServerDeps.SetRuntimeConfigChangedHook func(func(serverID string))`
+exists because `portalService` and the gateway `Server` are never in scope in the
+same function: `buildRuntime` assigns the field where `portalService` is
+available, and `buildGatewayServer` invokes it with `srv.PushRuntimeConfig`
+immediately after `gateway.New` returns — so the `Server` never sees a
+`*portal.Service`. The field looks like dead weight on `ServerDeps` and would be
+deleted by a tidy-up; it exists solely to bridge that wiring-order gap. **Tried,
+reviewed and rejected — do not re-attempt:** a `portal.UnwrapService(api API)
+*Service` helper that reached through the generated OTel tracing decorator to
+recover the concrete service from `srv.Portal`. It defeats the exact
+`Portal portal.API` boundary the decorator exists to enforce; because
+`api_tracing_gen.go` is generated, a template change or a second wrapping layer
+would break the type assertion with **no compile error, only a nil at runtime**;
+and it added permanent public API surface a later reader would treat as a
+sanctioned escape hatch. It has been deleted.
+
+**A per-server registry that `cmd/gateway` must prune needs an exported
+constructor.** Without one, `gateway.New`'s internal nil-default fallback builds
+an instance `cmd/gateway` never sees, so a `Retain` method — however correct —
+runs against an object production never writes to and prunes nothing, silently:
+everything compiles and the prune runs. Both `runtimeStatusRegistry` and
+`agentFeaturesRegistry` therefore have exported constructors, are constructed
+once in `main.go`, and are passed both into `ServerDeps` and into the
+`agentRegistries` bundle whose `Retain(live)` runs at the end of each app-health
+cycle. Each field of that bundle is declared as an **inline structural interface
+with an explicit nil check**, for two reasons that are both needed: the concrete
+type is unexported, and a nil *interface* cannot forward to a nil-safe receiver
+the way a nil concrete pointer can. Pruning here is a memory bound, not a
+correctness fix — server ids are 32 random hex characters and are never reused,
+so a stale entry can never make a lookup return true for a live server.
+
 ## 5.3 Level 2 — Portal frontend
 
 A single SPA under `gateway/frontend/src`: an app shell (`App.tsx`, topbar +
@@ -126,6 +158,32 @@ servers, services, models, usage, system, netbird, chat), a `theme/` subsystem
 (MUI + CSS-variable bridge + `ThemeRoot`), and `i18n.ts` (de/en). It talks
 only to the gateway HTTP APIs.
 
+Two additions worth knowing when looking for code on this side:
+
+- The `api.ts` barrel also carries a **`runtime` domain module**
+  (`api/runtime.ts`) covering mapping-scoped launch specs, application-scoped
+  co-residency and warnings, server-scoped GPU budgets, the file-mode report
+  view, and the per-server live-status SSE subscription. In the AI-servers
+  drill-down an application of type `server_agent` renders `RuntimeAdminSection`
+  **instead of** `MappingSection` — same row-action label, only the destination
+  differs — which is why that section must also cover the plain mapping CRUD
+  `MappingSection` would otherwise have provided, and why a reader looking for
+  the mapping editor on an agent-managed server will not find it. A shared
+  `components/shared/ResourceFallback.tsx` (`resourceState()` +
+  `<ResourceFallback>`) was extracted there as the canonical
+  loading/error/stale-error/ready rendering for `useResource` call sites.
+- `RowAction.title` — the "why is this disabled" reason — is now honoured on
+  **both** rendering paths. `RowActionsCell` previously dropped it on the inline
+  icon path, and `IconAction` spent its only tooltip on the action's label
+  anchored directly on the `IconButton`, which meant a **disabled** inline action
+  showed no tooltip at all, not even its own label (MUI warns about exactly this:
+  a disabled element fires no events, so a Tooltip needs a wrapper element).
+  `IconAction` now takes an optional `title`, wraps only the disabled button in a
+  `span`, and prefers `title` over `label` when both are set — the reason is
+  strictly more informative than the name, which the icon and the `aria-label`
+  already carry. The enabled path's DOM is unchanged, so no other screen's
+  markup, layout or queries move.
+
 ## 5.4 Level 2 — Server-Agent components
 
 | Package | Responsibility |
@@ -137,4 +195,25 @@ only to the gateway HTTP APIs.
 | `trust` | Gateway trust store (CA handling) for outbound TLS. |
 | `certinstall` | Fetches/installs mesh certificates for the local AI server. |
 | `proxy` | The TLS-terminating reverse proxy in front of the AI server (`cert_mode=proxy`). |
+| `runtime` | The [agent-managed model runtime](cross-cutting/agent-runtime-manager.md): launch-spec wire types, the admission policy, the agent-local security policy, the process manager, the log ring buffer, the router, both config sources, the features client, the redacted report builder, and the driver. |
 | `config` | Agent configuration (env `OP_AGENT_*`, config file, flags). |
+
+`internal/runtime` is modelled on `internal/proxy` (focused files) and is worth
+naming file by file, because two of its properties are what make the component
+analysable at all:
+
+| File | Holds |
+|---|---|
+| `types.go` | The runtime-config wire types and their parser (tolerant of unknown fields, hard-fails a duplicate spec id, silently drops a dangling co-residency pair). |
+| `policy.go` | The admission decision — matrix, per-GPU budgets, process limit, victim selection — as **pure functions over snapshots**: no clocks, no I/O, no goroutines, no logging. This is why it is the most heavily tested part, and why anything needing a clock or a syscall belongs in the manager instead. |
+| `policy_local.go` | The agent-operator boundary: the binary allowlist, permitted directories, and placeholder expansion. |
+| `manager.go` | Child processes, reconciled against desired state by a **single serialized owner goroutine** with the proxy manager's generation discipline, so a late process exit can never clobber its successor. |
+| `router.go` | The single HTTP listener and both proxy paths. |
+| `config_client.go` | The gateway conditional-GET source (mirroring `proxy.RoutesClient`) plus the atomic on-disk last-good cache; and the local-file source in file mode. |
+| `features_client.go` | The gateway's declared feature list, ETag-conditional. |
+| `logs.go` | A bounded per-process stdout/stderr ring buffer — local-only today, but present from the start so the later log-streaming sub-project need not touch process startup. |
+| `driver.go` | The top-level object wiring all of it into the agent's main loop behind `Deps.RuntimeDriver`, symmetric with `Deps.ProxyDriver`. |
+
+The package name shadows the standard library's `runtime`, so importers alias it
+(`runtimectl`). Its only allowed module-internal import is `internal/gwapi` — see
+[Architecture Tests](cross-cutting/architecture-tests.md).

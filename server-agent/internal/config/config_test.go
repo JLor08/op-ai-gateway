@@ -5,10 +5,12 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -547,6 +549,44 @@ func TestLoadResolvesRelativeCAPathsAgainstSelectedConfig(t *testing.T) {
 	}
 }
 
+// TestLoadResolvesRelativeRuntimePathsAgainstSelectedConfig mirrors
+// TestLoadResolvesRelativeCAPathsAgainstSelectedConfig: RuntimeConfigPath and
+// RuntimeCachePath are files the agent reads/writes whose names typically
+// come from the config file (RuntimeConfigPath is the closest analogue to
+// CAFile/CACacheFile in this whole struct), so a relative value must be
+// anchored beside the selected config file rather than left relative to the
+// agent's process working directory (which, for a service, is typically
+// "/" -- a relative runtime_cache would write into "/", and a relative
+// runtime_config would simply never be found).
+func TestLoadResolvesRelativeRuntimePathsAgainstSelectedConfig(t *testing.T) {
+	dir := t.TempDir()
+	absRuntimeConfig := filepath.Join(t.TempDir(), "absolute-runtime.json")
+	path := filepath.Join(dir, "selected-agent.json")
+	body := `{"gateway_url":"https://gw.example","token":"x","runtime_source":"file","runtime_config":"runtime.json","runtime_cache":"cache/runtime.cache.json"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := filepath.Join(dir, "runtime.json"); cfg.RuntimeConfigPath != want {
+		t.Errorf("RuntimeConfigPath = %q, want %q", cfg.RuntimeConfigPath, want)
+	}
+	if want := filepath.Join(dir, "cache", "runtime.cache.json"); cfg.RuntimeCachePath != want {
+		t.Errorf("RuntimeCachePath = %q, want %q", cfg.RuntimeCachePath, want)
+	}
+
+	cfg, err = Load([]string{"-config", path, "-runtime-config", absRuntimeConfig}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load absolute runtime-config path: %v", err)
+	}
+	if cfg.RuntimeConfigPath != absRuntimeConfig {
+		t.Errorf("absolute RuntimeConfigPath = %q, want unchanged %q", cfg.RuntimeConfigPath, absRuntimeConfig)
+	}
+}
+
 func TestLoadCAFieldsRespectFlagEnvFilePrecedence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "precedence.json")
@@ -870,100 +910,365 @@ func TestValidateProxyRoutesModeZeroValueIsFallback(t *testing.T) {
 	}
 }
 
-// agentConfigJSONCFixture is a byte-for-byte copy of what
-// gateway/backend/internal/gateway/agent_binaries.go's buildAgentConfigJSON
-// produces for gateway_url="https://gw.example.test", token="fixture-token" (as
-// of the certificate-installation and mesh-trust additions). It is a COPY, not an import — the
-// gateway is a separate Go module this package cannot import — so it can drift;
-// the gateway side additionally pins the exact KEY SET of its own template
-// against a maintained list (TestBuildAgentConfigJSONKeySet in
-// gateway/backend/internal/gateway/agent_binaries_test.go) so an added/removed
-// key is caught there even if this fixture is not updated. This test instead
-// proves the OTHER direction: feeding that exact text through the REAL Load()
-// yields the documented default for every field.
-const agentConfigJSONCFixture = `{
-  // The gateway base URL the agent sends telemetry to (origin only, no path).
-  // Required. Example: https://gateway.example.com. Under a NetBird-only
-  // restriction, use the gateway's mesh URL here instead.
-  "gateway_url": "https://gw.example.test",
-
-  // The per-server agent bearer token, shown once when generated in the portal.
-  // It identifies this server to the gateway. Required. Keep this file private
-  // (e.g. chmod 600) because it holds the token.
-  "token": "fixture-token",
-
-  // Telemetry transport: "websocket" (default; one persistent connection, cheap
-  // for high-frequency sending) or "post" (one HTTP POST per sample).
-  "transport": "websocket",
-
-  // Collection cadence as a Go duration, e.g. "500ms", "1s", "5s". Clamped up to
-  // a 250ms floor. Default "1s".
-  "interval": "1s",
-
-  // POST-mode re-send cadence for the static hardware inventory (self-heals a
-  // gateway restart). Floored at "1m"; ignored under the websocket transport.
-  // Default "30m".
-  "system_report_interval": "30m",
-
-  // Optional inference /metrics (Prometheus) URL to scrape for active/queued
-  // request counts. Empty disables it.
-  "metrics_url": "",
-
-  // Optional endpoint polled each cycle for currently-loaded models, e.g.
-  // "/running" for llama-swap, "/props" for llama.cpp, "/v1/models" for vLLM.
-  // Empty disables it.
-  "model_status_url": "",
-
-  // How to parse model_status_url: "openai" | "llama_swap" | "llama_cpp" |
-  // "litellm" | "" or "auto" (tolerant union of all shapes). Empty = auto.
-  "model_status_format": "",
-
-  // Optional LibreHardwareMonitor Remote Web Server /data.json URL for CPU (and
-  // best-effort system) power watts. Empty disables it.
-  "lhm_url": "",
-
-  // Certificate installation mode: "off" (default, never fetch a certificate),
-  // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
-  // cert_reload_command on change), or "proxy" (accepted for a future release;
-  // NOT IMPLEMENTED YET, behaves like "files"). Required cert_dir when not "off".
-  "cert_mode": "off",
-
-  // Directory certificate files are written to. Required when cert_mode is not
-  // "off".
-  "cert_dir": "",
-
-  // Local command run after a changed certificate is fully installed on disk.
-  // This value comes ONLY from this local file -- the gateway can never deliver
-  // a command to run. On Windows, keep the value quote-free (no embedded quotes).
-  "cert_reload_command": "",
-
-  // Certificate poll cadence as a Go duration, e.g. "15m". Empty or "0"/"0s" means
-  // automatic (websocket transport polls every 6h, post every 15m). A configured
-  // positive value below "1m" is clamped up to "1m".
-  "cert_poll_interval": "",
-
-  // Optional operator-managed CA bundle. Generated configs leave this empty;
-  // the agent never writes this file.
-  "ca_file": "",
-
-  // Optional agent-managed CA cache, relative to this config file when not
-  // absolute. Self-signed gateway configs use "server-agent-ca.pem".
-  "ca_cache_file": "",
-
-  // Optional inline CA bootstrap bundle. Present only when the gateway's
-  // currently served leaf is signed by the internal CA.
-  "ca_pem": "",
-
-  // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
-  "tls_insecure": false,
-
-  // Verbose mode: emit detailed debug logs to stderr. Default false.
-  "verbose": false
+// TestRuntimeSourceDefaultsToGateway proves an unconfigured runtime source
+// resolves to RuntimeSourceGateway -- the gateway is the default supplier of
+// the runtime-config document.
+func TestRuntimeSourceDefaultsToGateway(t *testing.T) {
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RuntimeSource != RuntimeSourceGateway {
+		t.Fatalf("RuntimeSource = %q, want %q (default)", cfg.RuntimeSource, RuntimeSourceGateway)
+	}
+	if cfg.RuntimeConfigPath != "" {
+		t.Errorf("RuntimeConfigPath = %q, want empty default", cfg.RuntimeConfigPath)
+	}
 }
-`
 
-func TestAgentConfigJSONCFixtureLoadsToDocumentedDefaults(t *testing.T) {
-	path := writeConfig(t, agentConfigJSONCFixture)
+// TestRuntimeSourcePrecedence mirrors TestCertModePrecedence's shape: file,
+// then env-over-file, then flag-over-env, proven together with the paired
+// RuntimeConfigPath field the same way CertMode is proven together with
+// CertDir.
+func TestRuntimeSourcePrecedence(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_source":"file","runtime_config":"/from-file/runtime.json"}`)
+	// file only
+	if cfg, err := Load([]string{"-config", path}, func(string) string { return "" }); err != nil || cfg.RuntimeSource != "file" || cfg.RuntimeConfigPath != "/from-file/runtime.json" {
+		t.Fatalf("file runtime_source/runtime_config = %q/%q (err %v), want file//from-file/runtime.json", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+	// env overrides file
+	envOnly := func(k string) string {
+		switch k {
+		case "OP_AGENT_RUNTIME_SOURCE":
+			return "gateway"
+		case "OP_AGENT_RUNTIME_CONFIG":
+			return "/from-env/runtime.json"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, envOnly); err != nil || cfg.RuntimeSource != "gateway" || cfg.RuntimeConfigPath != "/from-env/runtime.json" {
+		t.Fatalf("env runtime_source/runtime_config = %q/%q (err %v), want gateway//from-env/runtime.json (env > file)", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+	// flag overrides env and file
+	if cfg, err := Load([]string{"-config", path, "-runtime-source=file", "-runtime-config=/from-flag/runtime.json"}, envOnly); err != nil || cfg.RuntimeSource != "file" || cfg.RuntimeConfigPath != "/from-flag/runtime.json" {
+		t.Fatalf("flag runtime_source/runtime_config = %q/%q (err %v), want file//from-flag/runtime.json (flag > env > file)", cfg.RuntimeSource, cfg.RuntimeConfigPath, err)
+	}
+}
+
+// TestValidateRuntimeSourceEnum pins the exact enum error format, matching
+// the house pattern (e.g. Transport's error).
+func TestValidateRuntimeSourceEnum(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff, RuntimeSource: "bogus"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("unknown runtime-source should error")
+	}
+	want := `runtime-source must be "gateway" or "file", got "bogus"`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRuntimeSourceZeroValueIsGateway proves a directly-constructed
+// zero-value Config (RuntimeSource never set) still validates, mirroring
+// TestValidateProxyRoutesModeZeroValueIsFallback's byte-neutrality guarantee.
+func TestRuntimeSourceZeroValueIsGateway(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero-value RuntimeSource should validate as gateway: %v", err)
+	}
+}
+
+// TestRuntimeFileModeRequiresConfigPath proves runtime-source=file without a
+// runtime-config path fails Validate -- the file source is useless without
+// knowing which file.
+func TestRuntimeFileModeRequiresConfigPath(t *testing.T) {
+	cfg := Config{GatewayURL: "https://gw.example", Token: "x", Interval: time.Second, Transport: TransportWebSocket, CertMode: CertModeOff, RuntimeSource: RuntimeSourceFile}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("runtime-source=file without runtime-config should error")
+	}
+	cfg.RuntimeConfigPath = "/some/runtime.json"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("runtime-source=file with runtime-config set should validate: %v", err)
+	}
+}
+
+// TestRuntimeAllowedBinariesFromEnvCommaSeparated proves the comma-separated
+// env encoding for the structured (no-flag) RuntimeAllowedBinaries field:
+// entries are split on commas and trimmed of surrounding whitespace.
+func TestRuntimeAllowedBinariesFromEnvCommaSeparated(t *testing.T) {
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_BINARIES" {
+			return "/usr/bin/ollama, /usr/local/bin/llama-server ,/opt/vllm/bin/vllm"
+		}
+		return ""
+	}
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"/usr/bin/ollama", "/usr/local/bin/llama-server", "/opt/vllm/bin/vllm"}
+	if !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+}
+
+// TestRuntimeAllowedDirsFromEnvCommaSeparated proves RuntimeAllowedDirs
+// follows the identical comma-separated env pattern as RuntimeAllowedBinaries.
+func TestRuntimeAllowedDirsFromEnvCommaSeparated(t *testing.T) {
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_DIRS" {
+			return "/srv/models, /srv/other-models "
+		}
+		return ""
+	}
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"/srv/models", "/srv/other-models"}
+	if !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+}
+
+// TestRuntimeAllowedBinariesAndDirsFromConfigFile proves the JSON-array file
+// encoding, and that an env value overrides the file (env > file, same
+// precedence as every other tri-source-minus-flag field in this package).
+func TestRuntimeAllowedBinariesAndDirsFromConfigFile(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x",`+
+		`"runtime_allowed_binaries":["/usr/bin/ollama"],`+
+		`"runtime_allowed_dirs":["/srv/models"]}`)
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/usr/bin/ollama"}; !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+	if want := []string{"/srv/models"}; !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_BINARIES" {
+			return "/opt/vllm/bin/vllm"
+		}
+		return ""
+	}
+	cfg, err = Load([]string{"-config", path}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/opt/vllm/bin/vllm"}; !reflect.DeepEqual(cfg.RuntimeAllowedBinaries, want) {
+		t.Errorf("RuntimeAllowedBinaries (env-over-file) = %#v, want %#v", cfg.RuntimeAllowedBinaries, want)
+	}
+	// runtime_allowed_dirs untouched by env: still the file value.
+	if want := []string{"/srv/models"}; !reflect.DeepEqual(cfg.RuntimeAllowedDirs, want) {
+		t.Errorf("RuntimeAllowedDirs (file, env did not set it) = %#v, want %#v", cfg.RuntimeAllowedDirs, want)
+	}
+}
+
+// TestRuntimeAllowedBinariesAndDirsNilWhenAbsent proves the byte-neutral
+// default (mirroring TestConfigProxyRoutesDefaultWhenAbsent): a config that
+// never mentions either key resolves to nil, not an allocated-but-empty
+// slice, since neither env var nor file key was present at all.
+func TestRuntimeAllowedBinariesAndDirsNilWhenAbsent(t *testing.T) {
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RuntimeAllowedBinaries != nil {
+		t.Errorf("RuntimeAllowedBinaries = %#v, want nil when absent", cfg.RuntimeAllowedBinaries)
+	}
+	if cfg.RuntimeAllowedDirs != nil {
+		t.Errorf("RuntimeAllowedDirs = %#v, want nil when absent", cfg.RuntimeAllowedDirs)
+	}
+}
+
+// TestRuntimeCachePathPrecedence proves flag > env > file > the
+// next-to-binary default for RuntimeCachePath, mirroring the defaultConfigName
+// precedent (TestExplicitMissingConfigErrors's use of the executable() seam).
+func TestRuntimeCachePathPrecedence(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// default: next to the (stubbed) binary.
+	orig := executable
+	t.Cleanup(func() { executable = orig })
+	binDir := t.TempDir()
+	executable = func() (string, error) { return filepath.Join(binDir, "server-agent"), nil }
+	if cfg, err := Load(base, noenv); err != nil || cfg.RuntimeCachePath != filepath.Join(binDir, "server-agent-runtime.cache.json") {
+		t.Fatalf("default RuntimeCachePath = %q (err %v), want %q", cfg.RuntimeCachePath, err, filepath.Join(binDir, "server-agent-runtime.cache.json"))
+	}
+
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_cache":"/from-file/runtime.cache.json"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.RuntimeCachePath != "/from-file/runtime.cache.json" {
+		t.Fatalf("file RuntimeCachePath = %q (err %v), want /from-file/runtime.cache.json", cfg.RuntimeCachePath, err)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_CACHE" {
+			return "/from-env/runtime.cache.json"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.RuntimeCachePath != "/from-env/runtime.cache.json" {
+		t.Fatalf("env RuntimeCachePath = %q (err %v), want /from-env/runtime.cache.json (env > file)", cfg.RuntimeCachePath, err)
+	}
+	args := append([]string{"-config", path}, "-runtime-cache=/from-flag/runtime.cache.json")
+	if cfg, err := Load(args, env); err != nil || cfg.RuntimeCachePath != "/from-flag/runtime.cache.json" {
+		t.Fatalf("flag RuntimeCachePath = %q (err %v), want /from-flag/runtime.cache.json (flag > env > file)", cfg.RuntimeCachePath, err)
+	}
+}
+
+// TestRuntimeRouterBindHostPrecedence proves flag > env > file > empty
+// (the "let main.go derive a default" sentinel) for RuntimeRouterBindHost
+// (task-18-fix-round-1.md, I2): unlike RuntimeCachePath this is a plain
+// operator-supplied string, not a path anchored against the config file, so
+// there is no defaultRuntimeCachePath-style fallback to prove -- absent
+// entirely, it must simply stay "".
+func TestRuntimeRouterBindHostPrecedence(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.RuntimeRouterBindHost != "" {
+		t.Fatalf("default RuntimeRouterBindHost = %q (err %v), want empty", cfg.RuntimeRouterBindHost, err)
+	}
+
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_router_bind":"10.0.0.5"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.RuntimeRouterBindHost != "10.0.0.5" {
+		t.Fatalf("file RuntimeRouterBindHost = %q (err %v), want 10.0.0.5", cfg.RuntimeRouterBindHost, err)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ROUTER_BIND" {
+			return "10.0.0.9"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.RuntimeRouterBindHost != "10.0.0.9" {
+		t.Fatalf("env RuntimeRouterBindHost = %q (err %v), want 10.0.0.9 (env > file)", cfg.RuntimeRouterBindHost, err)
+	}
+	args := append([]string{"-config", path}, "-runtime-router-bind=127.0.0.1")
+	if cfg, err := Load(args, env); err != nil || cfg.RuntimeRouterBindHost != "127.0.0.1" {
+		t.Fatalf("flag RuntimeRouterBindHost = %q (err %v), want 127.0.0.1 (flag > env > file)", cfg.RuntimeRouterBindHost, err)
+	}
+}
+
+// agentConfigGoldenPath is the generated JSONC config document the gateway
+// hands a new agent, checked in as a golden. It lives in THIS module's testdata
+// because this module owns the file format -- it is the code that actually has
+// to read the document -- and it is generated from, and byte-for-byte pinned
+// against, both producers, which cannot import each other (two languages, two
+// Go modules):
+//
+//   - gateway/backend/internal/gateway/agent_binaries.go's
+//     buildAgentConfigJSON, served over /api/agent/v1/download/config
+//     (TestBuildAgentConfigJSONMatchesSharedGolden, which also regenerates
+//     this file: go test ./internal/gateway -run
+//     TestBuildAgentConfigJSONMatchesSharedGolden -update-agent-config-golden);
+//   - gateway/frontend/src/components/AgentTokenSection.tsx's
+//     buildServerAgentConfig, behind the portal's download button
+//     (AgentTokenSection.test.tsx).
+//
+// It used to be a hand-copied const in this file, which is precisely how the
+// copies drifted: each side pinned only its OWN key set, so nothing compared
+// the copies to each other and the template fell five keys behind the struct
+// below without a single test failing.
+//
+// What this module adds is the two directions no byte comparison can give:
+// that the document LOADS through the real Load() to the documented defaults,
+// and that its key set matches every json tag on fileConfig by reflection
+// (TestGeneratedAgentConfigCoversEverySettingTheAgentCanRead).
+const agentConfigGoldenPath = "../../testdata/server-agent.config.jsonc"
+
+// readAgentConfigGolden returns the golden's exact bytes as a string.
+func readAgentConfigGolden(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(agentConfigGoldenPath)
+	if err != nil {
+		t.Fatalf("read the generated-config golden %s: %v", agentConfigGoldenPath, err)
+	}
+	return string(raw)
+}
+
+// goldenKeys returns the golden's top-level key set, parsed the way the agent
+// itself parses the file (whole-line // comments stripped first).
+func goldenKeys(t *testing.T) map[string]bool {
+	t.Helper()
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(stripJSONLineComments([]byte(readAgentConfigGolden(t))), &doc); err != nil {
+		t.Fatalf("the generated-config golden is not valid JSON after comment-strip: %v", err)
+	}
+	keys := make(map[string]bool, len(doc))
+	for k := range doc {
+		keys[k] = true
+	}
+	return keys
+}
+
+// TestGeneratedAgentConfigCoversEverySettingTheAgentCanRead is the guard that
+// subsumes every hand-maintained key list this template used to need. It
+// derives the expectation from fileConfig's own json tags by reflection, so a
+// setting the agent can read is caught the moment it exists without the
+// template mentioning it -- which is how BOTH of the omissions this test was
+// written for got in: five runtime_* keys, and the two cert_proxy_routes* keys
+// belonging to a certificate mode the template additionally described as
+// unimplemented.
+//
+// Both directions matter. A tag with no golden key is a setting an operator
+// cannot discover from the file the portal gives them. A golden key with no tag
+// is a key the agent silently ignores -- json.Unmarshal does not complain about
+// unknown fields, so the operator would set it, see no effect, and have nothing
+// to read that says why.
+func TestGeneratedAgentConfigCoversEverySettingTheAgentCanRead(t *testing.T) {
+	keys := goldenKeys(t)
+
+	tags := map[string]bool{}
+	fields := reflect.TypeOf(fileConfig{})
+	for i := range fields.NumField() {
+		tag := fields.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			t.Fatalf("fileConfig field %s has no usable json tag", fields.Field(i).Name)
+		}
+		tag = strings.Split(tag, ",")[0]
+		tags[tag] = true
+		if !keys[tag] {
+			t.Errorf("the agent reads config key %q but the generated template never mentions it -- add it, at its own default and with a comment saying what its EMPTY value means, to BOTH gateway/backend/internal/gateway/agent_binaries.go (buildAgentConfigJSON) and gateway/frontend/src/components/AgentTokenSection.tsx (buildServerAgentConfig), then regenerate %s", tag, agentConfigGoldenPath)
+		}
+	}
+	for k := range keys {
+		if !tags[k] {
+			t.Errorf("the generated template emits key %q, which fileConfig has no json tag for -- the agent would silently ignore it", k)
+		}
+	}
+}
+
+// TestGeneratedAgentConfigDocumentsEverySettingInTheREADME closes the last copy
+// of this template that nothing watched: server-agent/README.md, the operator's
+// reference for the same document. It was missing four keys when this test was
+// written (model_status_url, model_status_format, cert_proxy_routes,
+// cert_proxy_routes_mode), found the same way this test finds them.
+//
+// It deliberately checks the README as a whole rather than the settings table
+// specifically, and only for a backtick-quoted mention: a stricter check would
+// pin the table's markdown shape, which is not what needs guarding.
+func TestGeneratedAgentConfigDocumentsEverySettingInTheREADME(t *testing.T) {
+	const readmePath = "../../README.md"
+	raw, err := os.ReadFile(readmePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", readmePath, err)
+	}
+	readme := string(raw)
+	for key := range goldenKeys(t) {
+		if !strings.Contains(readme, "`"+key+"`") {
+			t.Errorf("config key %q is in the generated template but not documented in %s", key, readmePath)
+		}
+	}
+}
+
+func TestGeneratedAgentConfigLoadsToDocumentedDefaults(t *testing.T) {
+	path := writeConfig(t, readAgentConfigGolden(t))
 	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("Load(fixture): %v", err)
@@ -999,6 +1304,44 @@ func TestAgentConfigJSONCFixtureLoadsToDocumentedDefaults(t *testing.T) {
 	if cfg.CertPollInterval != 0 {
 		t.Errorf("CertPollInterval = %v, want 0 (automatic)", cfg.CertPollInterval)
 	}
+	if cfg.RuntimeRouterBindHost != "" {
+		t.Errorf("RuntimeRouterBindHost = %q, want empty (the documented default: derive from the mesh identity, else all interfaces)", cfg.RuntimeRouterBindHost)
+	}
+	// The no-op invariant for the keys the template gained. Every one of them
+	// must resolve to exactly what their ABSENCE resolved to, or enlarging the
+	// generated template would have changed what a downloaded config does:
+	//
+	//   - the two allowlists arrive as `[]`, an empty non-nil slice. Every
+	//     consumer tests len(...) == 0 (runtime.LocalPolicy.Permit,
+	//     main.go's proxyRoutes), so `[]` and an absent key are the same
+	//     configuration: nothing may start, and any work_dir is accepted --
+	//     proved in runtime's own TestPermitEmptyAllowlistRejectsEverything
+	//     and TestPermitNoAllowedDirsMeansAnyWorkDir;
+	//   - runtime_source "gateway" and cert_proxy_routes_mode "fallback" are
+	//     the values Load() defaults an empty string to anyway;
+	//   - runtime_cache "" still resolves to the next-to-the-binary default,
+	//     NOT to the empty string, which would disable the disk cache.
+	if cfg.RuntimeSource != RuntimeSourceGateway {
+		t.Errorf("RuntimeSource = %q, want %q", cfg.RuntimeSource, RuntimeSourceGateway)
+	}
+	if cfg.RuntimeConfigPath != "" {
+		t.Errorf("RuntimeConfigPath = %q, want empty (only read when runtime_source is %q)", cfg.RuntimeConfigPath, RuntimeSourceFile)
+	}
+	if len(cfg.RuntimeAllowedBinaries) != 0 {
+		t.Errorf("RuntimeAllowedBinaries = %v, want empty -- the generated default must stay the hard refusal", cfg.RuntimeAllowedBinaries)
+	}
+	if len(cfg.RuntimeAllowedDirs) != 0 {
+		t.Errorf("RuntimeAllowedDirs = %v, want empty -- the generated default must keep accepting any work_dir", cfg.RuntimeAllowedDirs)
+	}
+	if base := filepath.Base(cfg.RuntimeCachePath); base != defaultRuntimeCacheName {
+		t.Errorf("RuntimeCachePath = %q, want a path ending in %q (an empty runtime_cache must still get the built-in default)", cfg.RuntimeCachePath, defaultRuntimeCacheName)
+	}
+	if len(cfg.CertProxyRoutes) != 0 {
+		t.Errorf("CertProxyRoutes = %v, want empty", cfg.CertProxyRoutes)
+	}
+	if cfg.CertProxyRoutesMode != CertProxyRoutesModeFallback {
+		t.Errorf("CertProxyRoutesMode = %q, want %q", cfg.CertProxyRoutesMode, CertProxyRoutesModeFallback)
+	}
 	if cfg.TLSInsecure {
 		t.Error("TLSInsecure = true, want false")
 	}
@@ -1007,9 +1350,34 @@ func TestAgentConfigJSONCFixtureLoadsToDocumentedDefaults(t *testing.T) {
 	}
 }
 
+// TestGeneratedAgentConfigFixtureHonoursAnExplicitRouterBind is the other half
+// of the runtime_router_bind contract: the key the gateway now emits must
+// actually take effect when an operator fills it in, not merely parse. The
+// fixture is a byte-for-byte copy of buildAgentConfigJSON's template
+// (gateway/backend/internal/gateway/agent_binaries.go), so this is what proves
+// the generated document and this module's own loader agree -- the two live in
+// separate Go modules and cannot share code.
+func TestGeneratedAgentConfigFixtureHonoursAnExplicitRouterBind(t *testing.T) {
+	golden := readAgentConfigGolden(t)
+	body := strings.Replace(golden,
+		`"runtime_router_bind": ""`, `"runtime_router_bind": "100.64.0.7"`, 1)
+	if body == golden {
+		t.Fatal("the fixture no longer contains a runtime_router_bind key; the generated config template and this fixture have drifted")
+	}
+	path := writeConfig(t, body)
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load generated fixture: %v", err)
+	}
+	if cfg.RuntimeRouterBindHost != "100.64.0.7" {
+		t.Errorf("RuntimeRouterBindHost = %q, want %q", cfg.RuntimeRouterBindHost, "100.64.0.7")
+	}
+}
+
 func TestGeneratedAgentConfigFixtureResolvesMeshTrustDefaults(t *testing.T) {
 	const bootstrap = "-----BEGIN CERTIFICATE-----\\nbootstrap\\n-----END CERTIFICATE-----"
-	body := strings.Replace(agentConfigJSONCFixture,
+	body := strings.Replace(readAgentConfigGolden(t),
 		`"ca_cache_file": ""`, `"ca_cache_file": "server-agent-ca.pem"`, 1)
 	body = strings.Replace(body,
 		`"ca_pem": ""`, `"ca_pem": "-----BEGIN CERTIFICATE-----\\nbootstrap\\n-----END CERTIFICATE-----"`, 1)

@@ -5,17 +5,21 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/proxy"
+	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/sample"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,6 +140,35 @@ func TestRunCollectsMergesPushes(t *testing.T) {
 	}
 	if got.Arch != runtime.GOARCH {
 		t.Errorf("Arch = %q, want %q", got.Arch, runtime.GOARCH)
+	}
+	// Feature negotiation (design spec §9): collectOnce must actually
+	// populate Capabilities -- a legacy agent that leaves it empty is
+	// normalized to {} downstream, but a current build reports its real
+	// feature set. The version is reported ONCE, as the top-level
+	// agent_version asserted above, and deliberately NOT repeated inside
+	// capabilities (see capabilitiesTemplate's comment).
+	if len(got.Capabilities) == 0 {
+		t.Fatal("Capabilities is empty; want collectOnce to populate it")
+	}
+	var caps map[string]json.RawMessage
+	if err := json.Unmarshal(got.Capabilities, &caps); err != nil {
+		t.Fatalf("Capabilities does not decode as a JSON object: %v (raw=%s)", err, got.Capabilities)
+	}
+	if _, dup := caps["agent_version"]; dup {
+		t.Errorf("Capabilities carries agent_version (%s); the version must be reported ONCE, via the top-level agent_version field, so a version bump has a single place to touch", got.Capabilities)
+	}
+	if len(caps) != 1 {
+		t.Errorf("Capabilities has %d keys (%s), want exactly one (features)", len(caps), got.Capabilities)
+	}
+	var features []string
+	if err := json.Unmarshal(caps["features"], &features); err != nil {
+		t.Fatalf("Capabilities.features does not decode as a string array: %v (raw=%s)", err, got.Capabilities)
+	}
+	// Derived from the registry, not a second copy of it: what a sample must
+	// carry is exactly what this binary declares, in registry order --
+	// TestFeatureRegistry is what guards the contents of that registry.
+	if !reflect.DeepEqual(features, FeatureNames()) {
+		t.Errorf("Capabilities.features = %v, want %v (the declared registry, in order)", features, FeatureNames())
 	}
 }
 
@@ -969,5 +1002,381 @@ func TestCollectOnceCarriesProxyRoutes(t *testing.T) {
 	}
 	if got3.ProxyRoutes != nil {
 		t.Fatalf("ProxyRoutes = %+v, want nil (omitted) when the driver reports zero routes", got3.ProxyRoutes)
+	}
+}
+
+// fakeRuntimeDriver is a runtimeDriver test double: it counts Sync calls,
+// records the last pushed payload, can optionally block a Sync call until
+// the test releases it (proving single-flight coalescing, mirroring
+// fakeCertSyncer exactly), and returns a configurable Status slice. It also
+// satisfies runtimeTransitionsWaker via its own trans channel field, which
+// NewFromDeps discovers via a type assertion exactly like Deps.Poster's
+// certWaker/trustWaker.
+type fakeRuntimeDriver struct {
+	mu          sync.Mutex
+	calls       int
+	lastPushed  json.RawMessage
+	statuses    []runtimectl.Status
+	block       bool
+	release     chan struct{}
+	trans       chan struct{}
+	active      atomic.Bool // fix round 1, I3: defaults to false, matching the real Driver's honest "not yet negotiated" zero value
+	resendCalls int
+}
+
+func newFakeRuntimeDriver() *fakeRuntimeDriver {
+	return &fakeRuntimeDriver{release: make(chan struct{})}
+}
+
+func (f *fakeRuntimeDriver) Sync(_ context.Context, pushed json.RawMessage) {
+	f.mu.Lock()
+	f.calls++
+	f.lastPushed = pushed
+	block := f.block
+	f.mu.Unlock()
+	if block {
+		<-f.release
+	}
+}
+
+func (f *fakeRuntimeDriver) Status() []runtimectl.Status {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statuses
+}
+
+func (f *fakeRuntimeDriver) Transitions() <-chan struct{} { return f.trans }
+
+func (f *fakeRuntimeDriver) setStatuses(s []runtimectl.Status) {
+	f.mu.Lock()
+	f.statuses = s
+	f.mu.Unlock()
+}
+
+func (f *fakeRuntimeDriver) setBlocking(b bool) {
+	f.mu.Lock()
+	f.block = b
+	f.mu.Unlock()
+}
+
+func (f *fakeRuntimeDriver) unblock() { close(f.release) }
+
+func (f *fakeRuntimeDriver) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeRuntimeDriver) lastPush() json.RawMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPushed
+}
+
+// Active satisfies runtimeDriver's new (fix round 1, I3) required method.
+// Defaults to false -- a test that wants collectOnce's runtime block
+// engaged must call setActive(true) explicitly, matching the real Driver's
+// honest "not yet negotiated" starting state now that main.go no longer
+// blocks startup on a one-shot features probe.
+func (f *fakeRuntimeDriver) Active() bool { return f.active.Load() }
+
+func (f *fakeRuntimeDriver) setActive(b bool) { f.active.Store(b) }
+
+// ResendReport satisfies the optional runtimeReportResender interface
+// (fix round 1, I5), counting calls so tests can prove Run's reportTicker
+// cadence actually reaches it.
+func (f *fakeRuntimeDriver) ResendReport(context.Context) {
+	f.mu.Lock()
+	f.resendCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeRuntimeDriver) resendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resendCalls
+}
+
+// runtimeWakePoster is a poster that also implements runtimeWaker, mirroring
+// trustWakePoster exactly.
+type runtimeWakePoster struct {
+	capturePoster
+	wake chan json.RawMessage
+}
+
+func (p *runtimeWakePoster) RuntimeUpdates() <-chan json.RawMessage { return p.wake }
+
+// TestCollectOnceRuntimeNilOmitsRuntimesKey pins the no-op invariant this
+// whole feature depends on (task-18-brief.md): an Agent built with a nil
+// RuntimeDriver -- every pre-Task-18 test construction, and every agent
+// that never negotiates runtime_manager -- must produce a BYTE-IDENTICAL
+// telemetry sample to one built before this feature existed. The "runtimes"
+// key must be absent entirely from the marshaled JSON, not present-and-empty.
+func TestCollectOnceRuntimeNilOmitsRuntimesKey(t *testing.T) {
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := New(cfg, nil, nil, nil, nil, nil, nil, poster, nil)
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil {
+		t.Fatal("no sample posted")
+	}
+	if got.Runtimes != nil {
+		t.Fatalf("Runtimes = %+v, want nil (no runtime driver installed)", got.Runtimes)
+	}
+	got.Normalize()
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "runtimes") {
+		t.Fatalf("marshaled sample contains a \"runtimes\" key with no runtime driver installed: %s", raw)
+	}
+}
+
+// TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels proves
+// the non-nil path: driver.Status() maps to Runtimes (including measured
+// VRAM and last_error), and LoadedModels is set AUTHORITATIVELY from the
+// manager (running states only) -- overriding whatever a separately
+// configured model-status lister would otherwise have reported.
+func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true) // fix round 1, I3: the override is gated on Active(), not merely a driver existing
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	failedAt := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:       "rspec_a",
+			Model:        "qwen-coder",
+			State:        runtimectl.StateRunning,
+			Since:        since,
+			PID:          111,
+			Port:         9001,
+			InFlight:     2,
+			Restarts:     1,
+			MeasuredVRAM: map[int]int{1: 8000, 0: 21234},
+		},
+		{
+			SpecID: "rspec_b",
+			Model:  "llama-small",
+			State:  runtimectl.StateCrashed,
+			Since:  since,
+			LastError: &runtimectl.LastError{
+				Message:    "boom",
+				At:         failedAt,
+				ExitCode:   1,
+				Failures:   3,
+				StderrTail: "oom",
+			},
+		},
+	})
+
+	// A model-status lister that WOULD populate LoadedModels if the runtime
+	// driver did not override it -- proving the override actually happens,
+	// not merely that it is absent by coincidence.
+	loaded := stubLoadedLister{models: []string{"stale-model-from-scraper"}}
+
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Loaded: loaded, Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil {
+		t.Fatal("no sample posted")
+	}
+	if len(got.Runtimes) != 2 {
+		t.Fatalf("Runtimes len = %d, want 2: %+v", len(got.Runtimes), got.Runtimes)
+	}
+	r0 := got.Runtimes[0]
+	if r0.SpecID != "rspec_a" || r0.Model != "qwen-coder" || r0.State != "running" {
+		t.Errorf("Runtimes[0] identity = %+v", r0)
+	}
+	if r0.PID != 111 || r0.Port != 9001 || r0.InFlight != 2 || r0.Restarts != 1 {
+		t.Errorf("Runtimes[0] counters = %+v", r0)
+	}
+	if len(r0.GPUs) != 2 || r0.GPUs[0].Index != 0 || r0.GPUs[0].VRAMMeasuredMB != 21234 || r0.GPUs[1].Index != 1 || r0.GPUs[1].VRAMMeasuredMB != 8000 {
+		t.Errorf("Runtimes[0].GPUs = %+v, want sorted [{0 21234} {1 8000}]", r0.GPUs)
+	}
+	r1 := got.Runtimes[1]
+	if r1.LastError == nil || r1.LastError.Message != "boom" || r1.LastError.ExitCode != 1 || r1.LastError.Failures != 3 || r1.LastError.StderrTail != "oom" {
+		t.Errorf("Runtimes[1].LastError = %+v", r1.LastError)
+	}
+
+	if len(got.LoadedModels) != 1 || got.LoadedModels[0] != "qwen-coder" {
+		t.Fatalf("LoadedModels = %v, want [qwen-coder] (authoritative from the manager, overriding the model-status lister)", got.LoadedModels)
+	}
+}
+
+// stubLoadedLister is a minimal collector.LoadedModelLister fake.
+type stubLoadedLister struct{ models []string }
+
+func (s stubLoadedLister) Available() bool { return true }
+func (s stubLoadedLister) Collect(context.Context) ([]string, error) {
+	return s.models, nil
+}
+
+// TestCollectOnceInactiveRuntimeDriverDoesNotOverrideLoadedModels pins fix
+// round 1's I3 trap, exactly as the review named it: main.go now
+// constructs the runtime driver UNCONDITIONALLY, so "a.runtimeDriver !=
+// nil" is no longer sufficient to know whether the runtime feature is
+// doing anything right now. Before the fix, a driver that exists but has
+// never (yet) negotiated runtime_manager active (Active()==false --
+// startup, a drain, a gateway that never declares the feature) would still
+// unconditionally overwrite LoadedModels with an empty list, wiping a
+// non-runtime agent's REAL loaded-model set reported by its own
+// model-status scraper. This test fails against a version of collectOnce
+// that gates the override on "a.runtimeDriver != nil" alone (see
+// task-18-report.md's I3 fix log for the pasted failure).
+func TestCollectOnceInactiveRuntimeDriverDoesNotOverrideLoadedModels(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver() // Active() defaults to false -- never negotiated (yet)
+	loaded := stubLoadedLister{models: []string{"real-model-from-scraper"}}
+
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Loaded: loaded, Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil {
+		t.Fatal("no sample posted")
+	}
+	if got.Runtimes != nil {
+		t.Fatalf("Runtimes = %+v, want nil (driver present but not Active)", got.Runtimes)
+	}
+	if len(got.LoadedModels) != 1 || got.LoadedModels[0] != "real-model-from-scraper" {
+		t.Fatalf("LoadedModels = %v, want [real-model-from-scraper] -- an inactive runtime driver must NOT wipe the real model-status scraper's result", got.LoadedModels)
+	}
+}
+
+// TestResendRuntimeReportPiggybacksOnSystemReportTicker pins fix round 1's
+// I5: the runtime driver's periodic file-mode-report resend rides the SAME
+// ticker cadence as sendSystemReport, not a transport-aware mechanism of
+// its own.
+func TestResendRuntimeReportPiggybacksOnSystemReportTicker(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	cfg := config.Config{Interval: time.Hour, SystemReportInterval: 15 * time.Millisecond}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	waitUntil(t, time.Second, func() bool { return drv.resendCount() >= 2 })
+	cancel()
+	<-done
+}
+
+// TestRuntimeTransitionsWakeTriggersImmediateSample proves the
+// runtimeTransitions doorbell: a spec state transition produces an
+// immediate extra Post, without waiting for the (very long, in this test)
+// telemetry interval.
+func TestRuntimeTransitionsWakeTriggersImmediateSample(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	drv.trans = make(chan struct{}, 1)
+	cfg := config.Config{Interval: time.Hour, SystemReportInterval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	waitUntil(t, time.Second, func() bool { return poster.count() >= 1 })
+	base := poster.count()
+
+	drv.trans <- struct{}{}
+	waitUntil(t, time.Second, func() bool { return poster.count() > base })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// TestRuntimeWakePassesPushedPayloadToSync proves the runtimeWake channel
+// plumbing end to end: a poster implementing runtimeWaker delivers a pushed
+// payload straight through triggerRuntimeSync into Driver.Sync.
+func TestRuntimeWakePassesPushedPayloadToSync(t *testing.T) {
+	poster := &runtimeWakePoster{wake: make(chan json.RawMessage, 1)}
+	drv := newFakeRuntimeDriver()
+	cfg := config.Config{Interval: time.Hour, SystemReportInterval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	// The initial startup sync (triggerRuntimeSync(ctx, nil) inside Run)
+	// races the wake below; wait for at least one Sync call before pushing,
+	// so the assertion is unambiguous about which call carried the payload.
+	waitUntil(t, time.Second, func() bool { return drv.count() >= 1 })
+
+	payload := json.RawMessage(`{"router_listen":9000,"specs":[]}`)
+	poster.wake <- payload
+	waitUntil(t, time.Second, func() bool { return drv.count() >= 2 })
+	if got := drv.lastPush(); string(got) != string(payload) {
+		t.Fatalf("last Sync payload = %s, want %s", got, payload)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestTriggerRuntimeSyncCoalescesConcurrentSignals mirrors
+// TestTriggerCertSyncCoalescesConcurrentSignals verbatim, for
+// triggerRuntimeSync's own single-flight CompareAndSwap.
+func TestTriggerRuntimeSyncCoalescesConcurrentSignals(t *testing.T) {
+	drv := newFakeRuntimeDriver()
+	drv.setBlocking(true)
+	a := &Agent{cfg: config.Config{}, runtimeDriver: drv}
+
+	a.triggerRuntimeSync(context.Background(), nil)
+	// Deterministic, not a race: runtimeSyncing is set synchronously by
+	// CompareAndSwap inside the first call, strictly before it spawns its
+	// goroutine, and no goroutine scheduling occurs between these two
+	// sequential calls on this single test goroutine.
+	a.triggerRuntimeSync(context.Background(), nil)
+
+	waitUntil(t, time.Second, func() bool { return drv.count() >= 1 })
+	time.Sleep(30 * time.Millisecond)
+	if got := drv.count(); got != 1 {
+		t.Fatalf("Sync call count while blocked = %d, want exactly 1 (both signals must coalesce into one in-flight sync)", got)
+	}
+
+	drv.unblock()
+	waitUntil(t, time.Second, func() bool { return !a.runtimeSyncing.Load() })
+
+	drv.setBlocking(false)
+	a.triggerRuntimeSync(context.Background(), nil)
+	waitUntil(t, time.Second, func() bool { return drv.count() == 2 })
+}
+
+// TestNewRuntimeTickerNilWithoutDriver proves the nil-channel discipline:
+// no driver -> no ticker, mirroring TestNewCertTickerNilForOffModeOrNoSyncer.
+func TestNewRuntimeTickerNilWithoutDriver(t *testing.T) {
+	a := &Agent{}
+	ticker, ch := a.newRuntimeTicker()
+	if ticker != nil || ch != nil {
+		t.Fatalf("newRuntimeTicker() with no driver = (%v, %v), want (nil, nil)", ticker, ch)
 	}
 }

@@ -174,3 +174,105 @@ then passes every admission gate exactly as if the client had sent it.
 and a rewrite can never widen what a token may reach; conversely, judging a
 request by the listing would reroute requests the token was entitled to serve.
 See [Routing & Model Selection §2.1–2.2](cross-cutting/routing-and-model-selection.md).
+
+## ADR-024 — Managed runtime: the gateway specifies the launch, the AI server permits it
+**Context:** replacing llama-swap means portal users author real command lines
+that a process on an AI server then executes. **Decision:** split ownership. The
+full launch specification (binary, argv, env, work dir, port, health path,
+timeouts) lives in the gateway database and is portal-maintained; **what may
+actually execute is decided only by the agent's own local configuration** — an
+absolute-path binary allowlist plus permitted work/model directories — and the
+agent `exec`s an argv array directly, with no shell, as an unprivileged user.
+The two empty-list defaults are deliberately asymmetric: an empty **binary**
+allowlist starts nothing (and says so with a visible `not_permitted` reason),
+while an empty **directory** allowlist permits any `work_dir`, because the
+directory check is defence in depth behind an already-allowlisted binary, not
+the primary boundary. **Consequence:** enabling the feature is an explicit act
+on each agent host and the gateway cannot widen it; a portal admin with
+server-management rights chooses *what runs* only within that allowlist. A later
+change that lets the gateway supply a shell string, or that reads an empty
+allowlist as "allow all" for convenience, converts portal write access into
+arbitrary code execution on every AI server.
+→ [Agent-Managed Model Runtime §3](cross-cutting/agent-runtime-manager.md).
+
+## ADR-025 — Agent capabilities negotiate by named feature flags, not versions
+**Context:** the agent and gateway ship and upgrade independently, and version
+comparison is fragile under forks and backports. **Decision:** gateway and agent
+each declare a list of **named feature flags**, and a feature is active if and
+only if a string-equal name appears on both lists. Agent → gateway rides the
+telemetry sample's existing `capabilities` object; gateway → agent is an
+ETag-conditional `GET /api/agent/v1/features` — deliberately not a hello frame,
+so it works identically for POST and WebSocket agents. Negotiation is re-decided
+continuously, not at boot. Unknown names are ignored on both sides; a missing or
+empty list, and a 404 on the features endpoint, all read as the empty set. One
+flag per **shipped** capability. **Consequence:** `if agent_version >= X` is not
+an acceptable gate anywhere; a mixed-version fleet degrades silently and
+correctly; and a negotiated-away feature must be surfaced explicitly in the
+portal rather than becoming a silent no-op.
+→ [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
+
+## ADR-026 — Gateway→agent control is desired state, not commands
+**Context:** operator actions on a managed model must survive a WebSocket
+reconnect. **Decision:** manual start/stop are **persisted desired-state
+overrides** (`admin_state`: `''` | `force_running` | `force_stopped`), never
+fire-once command frames. A command sent during a reconnect is silently lost, so
+commands would demand acks, retries and dedup — while a persisted desired state
+has to exist anyway for resync after any disconnect. **Consequence:** every
+operator action is expressible as state, including *restart*, which the portal
+drives as the sequence `force_stopped` → observe `stopped` → clear. There is no
+restart endpoint, and the sequence therefore carries the whole correctness
+burden (bounded wait, completion on a transition rather than a state, and no
+silent clearing on timeout). A genuinely imperative action would need its own
+frame type behind its own feature flag.
+→ [Agent-Managed Model Runtime §11.2](cross-cutting/agent-runtime-manager.md).
+
+## ADR-027 — Model secrets never enter the gateway
+**Context:** a launch spec's environment is exactly where a model server's
+tokens live, and the gateway has a system-wide no-plaintext-secrets rule.
+**Decision:** a spec's `env` **values are referential placeholders**
+(`${AGENT_ENV:NAME}`) resolved on the AI server from the agent's own process
+environment; `${PORT}`, `${MODEL}` and `${HOST_GPU_IDS}` are the only other
+placeholders, and none of them carries a secret. A missing variable is a
+hard error naming the variable, never a silent empty substitution; the
+`OP_AGENT_*` namespace is refused before `getenv` is consulted; and the child's
+environment is built from scratch rather than inherited. **Consequence:** the
+gateway never stores or transports a model secret and the portal cannot leak
+one, so no new exception to the secrets rule is needed. The accepted cost,
+stated plainly: the secret must already exist on the AI server and the portal
+cannot set it — the natural feature request "let me type the token in the
+portal" must be refused. Note the residual: `args` are expanded the same way but
+are **not** masked in the upward report, so secrets belong in `env` only.
+→ [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md).
+
+## ADR-028 — Runtime-config notifications are gated by write scope, not by changed field
+**Context:** the agent's runtime-config document is derived from six kinds of
+row, and a portal write that changes any of them must reach the agent promptly.
+**Decision:** any successful write that **can** change a server's document
+notifies that server's agent, and the decision is taken from the **write path's
+own scope** — which row it writes, and for an application-owned row whether that
+application is the server's `server_agent` one — never from which field the
+request carried. A per-path "runtime-relevant fields" filter was rejected: it is
+an uncompiled duplicate of the document's derivation in another file, which rots
+the first time that derivation grows a field. **Consequence:** twelve call sites
+notify, some redundantly; over-notification is licensed by one fail-closed map
+lookup at the delivery point plus the agent's ETag-based idempotence; the 60 s
+agent poll is the backstop, so a missed notification degrades to "the change
+takes effect after about a minute" rather than permanent divergence. Every new
+write path in the portal service must be checked against this rule.
+→ [Agent-Managed Model Runtime §9](cross-cutting/agent-runtime-manager.md).
+
+## ADR-029 — Runtime-domain writes are full-document replaces, gated on their own GET
+**Context:** the runtime spec, the co-residency pair list and the per-GPU budget
+list are each edited as a whole. **Decision:** every runtime-domain write is a
+**full replacement**, never a delta — and the rule that follows for any UI on top
+of one is that **a control which triggers such a write must not exist until its
+own GET has resolved**, must be disabled while a write is in flight, and must
+treat a *failed reload over an existing payload* as not-ready. **Consequence:**
+`null` (not loaded) and `[]` (loaded and empty) are different facts, and the
+idiomatic `data ?? []` collapses them into silent data loss with a successful
+200 and no error anywhere — a single click landing early once erased an
+application's whole co-residency set, and a Save landing early erased a server's
+whole budget set. The canonical rendering is the four-state
+`loading | error | stale-error | ready` fallback, and a not-ready tab renders a
+loading line *instead of* the form rather than a disabled form.
+→ [Agent-Managed Model Runtime §11.1](cross-cutting/agent-runtime-manager.md).

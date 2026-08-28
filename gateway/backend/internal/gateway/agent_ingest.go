@@ -88,6 +88,322 @@ type agentTelemetryRequest struct {
 	// nil slice — AgentProxyStatusRegistry.Report treats that as "no routes",
 	// byte-neutral for every pre-existing agent's telemetry.
 	ProxyRoutes []ProxyRouteSample `json:"proxy_routes"`
+	// Runtimes reports the live state of every agent-managed model process
+	// (agent-runtime-manager Task 9): one entry per running/starting/stopped
+	// spec, published to RuntimeStatusRegistry for the portal's live SSE
+	// stream, plus the per-GPU measured VRAM this sample carries (written
+	// back to the store -- see writeBackRuntimeVRAM). Additive: a legacy
+	// payload without it decodes with a nil slice, which publishes an empty
+	// status snapshot -- never an error.
+	Runtimes []agentRuntimeSample `json:"runtimes"`
+}
+
+// agentRuntimeGPUSample is one GPU's measured VRAM inside an
+// agentRuntimeSample, the gateway-side mirror of the agent's per-runtime GPU
+// sample (agent-runtime-manager Task 9). Consumed ONLY by the VRAM
+// write-back (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO,
+// which carries no per-GPU detail.
+type agentRuntimeGPUSample struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
+// agentRuntimeError is one managed process's last failure, as reported inside
+// an agentRuntimeSample. StderrTail is clamped to maxRuntimeStderrTail bytes
+// on ingest -- volatile only (see runtime_registry.go's runtimeStatusRegistry
+// doc): a chatty model server's stderr can carry prompt fragments, so this
+// value is NEVER persisted to the database, only held in the in-memory
+// status registry.
+type agentRuntimeError struct {
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+	ExitCode   int       `json:"exit_code"`
+	Failures   int       `json:"failures"`
+	StderrTail string    `json:"stderr_tail,omitempty"`
+}
+
+// agentRuntimeSample is one agent-managed model process's live state inside
+// the telemetry sample (agent-runtime-manager Task 9, design spec §7/§9):
+// state machine phase, OS-level identifiers, in-flight/restart counters, and
+// the last-error detail that back the portal's live runtime status stream.
+// GPUs (measured VRAM) is consumed separately, ONLY by the store write-back
+// (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO, which carries
+// no per-GPU detail (see agentRuntimeGPUSample's doc). SpecID ties it back to
+// the launch spec (runtime-config's AgentRuntimeSpecDTO.ID) the gateway
+// itself handed the agent, so there is no ambiguity about which
+// mapping/model this entry describes even when the agent has not (yet)
+// resolved Model.
+type agentRuntimeSample struct {
+	SpecID    string                  `json:"spec_id"`
+	Model     string                  `json:"model"`
+	State     string                  `json:"state"`
+	Since     time.Time               `json:"since"`
+	PID       int                     `json:"pid,omitempty"`
+	Port      int                     `json:"port,omitempty"`
+	InFlight  int                     `json:"in_flight"`
+	Restarts  int                     `json:"restarts"`
+	GPUs      []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError *agentRuntimeError      `json:"last_error,omitempty"`
+}
+
+// maxRuntimeStderrTail bounds agentRuntimeError.StderrTail on ingest (Task 9
+// brief): a chatty/hostile agent must never be able to grow the in-memory
+// status registry's per-server footprint without bound. Byte-based, like
+// clampHardwareString elsewhere in this file (a truncation mid multi-byte
+// rune is an acceptable trade-off for a diagnostic tail, not user content).
+const maxRuntimeStderrTail = 2048
+
+// clampRuntimeStderrTail truncates an over-long stderr tail to
+// maxRuntimeStderrTail bytes.
+func clampRuntimeStderrTail(s string) string {
+	if len(s) > maxRuntimeStderrTail {
+		return s[:maxRuntimeStderrTail]
+	}
+	return s
+}
+
+// runtimeStatusDTOsFromSamples maps the wire-decoded runtime samples to the
+// registry's RuntimeStatusDTO, clamping each LastError's stderr tail and
+// always returning a non-nil slice (a nil req.Runtimes -- a legacy agent, or
+// simply a fleet with nothing managed yet -- must publish an EMPTY snapshot,
+// not a JSON null, to any live SSE subscriber).
+func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample) []RuntimeStatusDTO {
+	out := make([]RuntimeStatusDTO, 0, len(samples))
+	for _, rt := range samples {
+		dto := RuntimeStatusDTO{
+			SpecID:   rt.SpecID,
+			Model:    rt.Model,
+			State:    rt.State,
+			Since:    rt.Since,
+			PID:      rt.PID,
+			Port:     rt.Port,
+			InFlight: rt.InFlight,
+			Restarts: rt.Restarts,
+		}
+		if rt.LastError != nil {
+			dto.LastError = &RuntimeErrorDTO{
+				Message:    rt.LastError.Message,
+				At:         rt.LastError.At,
+				ExitCode:   rt.LastError.ExitCode,
+				Failures:   rt.LastError.Failures,
+				StderrTail: clampRuntimeStderrTail(rt.LastError.StderrTail),
+			}
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// maxRuntimeSamplesPerSample bounds how many entries of a telemetry sample's
+// runtimes array the VRAM write-back loop will process. Nothing else caps
+// this array's length, and within the 1 MiB readRawJSON body cap a minimal
+// runtime entry is only ~55 bytes on the wire -- uncapped, a single POST
+// could drive on the order of 19,000 RuntimeSpecByID/resolution attempts on
+// an endpoint agents hit every second. Clamp, don't reject -- mirrors
+// maxHardwareGPUs/maxHardwareModules elsewhere in this file. Only the
+// write-back loop is bounded here; runtimeStatusDTOsFromSamples' status
+// publish is a pure in-memory transform with no store fan-out per entry, so
+// it is not the concern this constant exists for.
+const maxRuntimeSamplesPerSample = 256
+
+// maxRuntimeGPUsPerSample bounds how many per-GPU measured-VRAM entries one
+// runtime sample's GPUs array will drive a store write for. A real server
+// has at most a handful of GPUs; this is generous headroom (matching
+// maxHardwareGPUs' magnitude), not a realistic ceiling -- it exists so ONE
+// resolved-writable spec_id cannot alone drive unbounded
+// UpdateRuntimeSpecGPUMeasured writes (maxRuntimeSamplesPerSample only
+// bounds the number of DISTINCT/total sample entries considered, not the
+// GPU fan-out within a single one).
+const maxRuntimeGPUsPerSample = 64
+
+// resolveRuntimeSpecWritable reports whether specID's measured VRAM may be
+// written back for THIS sample, reached from server serverID. Three
+// conditions must all hold:
+//
+//  1. The spec exists (RuntimeSpecByID's ok).
+//  2. Its owning application belongs to serverID -- resolved via
+//     spec.MappingID -> MappingByID -> mapping.ApplicationID ->
+//     ApplicationByID -> application.ServerID. This is the authorization
+//     check: spec_id is an agent-supplied body field with no other
+//     verification anywhere in this path, and the connected agent's token
+//     binds it to exactly one server (every other agent endpoint in this
+//     package resolves its target SOLELY from the token, never from a body
+//     parameter -- see handleAgentRuntimeConfig's doc). Without this check
+//     an agent authenticated for server A could name a spec_id belonging to
+//     server B and overwrite B's measured VRAM -- which is not
+//     display-only: agentRuntimeSpecDTO prefers the measured value over the
+//     operator's estimate when building the vram_mb the gateway later
+//     pushes to B's OWN agent, so a forged value would corrupt the
+//     admission arithmetic B's agent runs against a spec it never reported
+//     on.
+//  3. It is not VRAMLocked (vram_estimate_mb is operator-owned,
+//     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
+//     opt-out of being governed by the measurement -- it stops the write
+//     here AND makes agentRuntimeSpecDTO serve the estimate, which together
+//     are what let an operator recover a spec a measurement has made
+//     terminally not_permitted).
+//
+// The ownership check (2) is evaluated UNCONDITIONALLY, before the
+// VRAMLocked check (3) -- deliberately, so the audit-trail Warn below fires
+// for every genuine cross-server naming attempt regardless of whether the
+// targeted spec happens to be locked. Checking VRAMLocked first would let a
+// locked spec's cross-server mismatch return false silently, leaving no
+// record of exactly the attack this method exists to catch. Still exactly
+// ONE resolution pass per call (RuntimeSpecByID + MappingByID +
+// ApplicationByID, at most) -- reordering costs nothing extra.
+//
+// Any failure to resolve (a lookup error, or a spec/mapping/application
+// that no longer exists) is treated the same as "not writable" -- logged and
+// skipped, never propagated -- matching the "a report is evidence, not a
+// transaction" best-effort discipline this whole file follows. A
+// cross-server mismatch is logged at Warn (not Debug): unlike a merely
+// stale id, it is a signal an agent is naming another server's resources.
+func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specID string) bool {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return false
+	}
+	if !ok {
+		// The spec has since been deleted (or never existed); nothing to
+		// write the measurement back to. Not an error.
+		return false
+	}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return false
+	}
+	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return false
+	}
+	if app.ServerID != serverID {
+		// Checked BEFORE VRAMLocked below: this Warn must fire for a
+		// cross-server naming attempt EVEN when the targeted spec happens to
+		// be locked -- see the doc above.
+		slog.Warn("runtime vram write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return false
+	}
+	if spec.VRAMLocked {
+		return false // the operator pinned this spec's VRAM numbers
+	}
+	return true
+}
+
+// writeBackRuntimeVRAM writes each sample GPU's measured VRAM back to its
+// launch spec (agent-runtime-manager Task 9), but only for a spec
+// resolveRuntimeSpecWritable confirms belongs to serverID, is not
+// VRAMLocked, and still exists. That resolution happens with exactly ONE
+// set of reads (RuntimeSpecByID + MappingByID + ApplicationByID) per
+// DISTINCT spec_id in the sample: the outcome -- writable or not, for
+// WHATEVER reason -- is memoized in writable below, so a sample repeating
+// the same spec_id (writable or not) never re-resolves it. runtimes and
+// each entry's GPUs are both length-capped (maxRuntimeSamplesPerSample,
+// maxRuntimeGPUsPerSample) before any store call, bounding the worst case
+// regardless of how many distinct ids a hostile/buggy sample names.
+//
+// AN UNCHANGED MEASUREMENT IS NOT REWRITTEN, and that is a cost fix rather
+// than a tidiness one. Telemetry arrives once per second and every sample is
+// a FULL SNAPSHOT, so a spec whose measurement is merely stable -- the normal
+// state of a loaded model serving nothing -- used to drive one unconditional
+// UPDATE per second per (spec, gpu), indefinitely. An idle overnight server
+// with a handful of measured specs across two cards produced on the order of
+// a million identical UPDATEs a day: WAL growth on SQLite, dead-tuple churn
+// and autovacuum pressure on PostgreSQL, for a table with a dozen rows.
+//
+// The comparison is against WHAT IS STORED, read once per distinct writable
+// spec_id and memoized next to the writability verdict, rather than against
+// what the agent last sent. Suppressing at the agent would be cheaper still
+// (it would save the report as well as the write) but it cannot converge: the
+// stored row can change out from under a long-running agent -- an operator
+// deleting and re-adding a GPU row resets vram_measured_mb to 0 -- and an
+// agent that had suppressed its unchanged report would never resend, leaving
+// the portal showing 0 for a spec that is measured and running. Comparing
+// here costs one extra read per writable spec per sample and converges no
+// matter what happened to the row; a read is also far cheaper than the write
+// it replaces on both engines.
+//
+// Best-effort throughout, matching the "a report is evidence, not a
+// transaction" ingest discipline this whole file follows: nothing here is
+// ever returned as an error -- this must NEVER reject the telemetry sample
+// it rode in on. A failed RuntimeSpecGPUs read degrades to "write
+// unconditionally", never to "skip the write": staleness must not be able to
+// suppress a real measurement. Called only AFTER every store write in
+// ingestTelemetrySample has succeeded.
+func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	writable := make(map[string]bool, len(runtimes))
+	// stored[specID][gpuIndex] is the measured value already on file. Only
+	// populated for a writable spec, and only once per distinct spec_id.
+	stored := make(map[string]map[int]int, len(runtimes))
+	for _, rt := range runtimes {
+		specID := strings.TrimSpace(rt.SpecID)
+		if specID == "" || len(rt.GPUs) == 0 {
+			continue
+		}
+		ok, seen := writable[specID]
+		if !seen {
+			ok = s.resolveRuntimeSpecWritable(ctx, serverID, specID)
+			writable[specID] = ok
+			if ok {
+				stored[specID] = s.storedMeasuredVRAM(ctx, serverID, specID)
+			}
+		}
+		if !ok {
+			continue
+		}
+		gpus := rt.GPUs
+		if len(gpus) > maxRuntimeGPUsPerSample {
+			gpus = gpus[:maxRuntimeGPUsPerSample]
+		}
+		for _, g := range gpus {
+			if g.VRAMMeasuredMB <= 0 {
+				continue
+			}
+			if was, known := stored[specID][g.Index]; known && was == g.VRAMMeasuredMB {
+				continue // already on file, byte for byte
+			}
+			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, g.Index, g.VRAMMeasuredMB); err != nil {
+				// Tolerates ErrNotFound (a GPU row deleted out from under an
+				// in-flight sample) the same as any other failure here: log
+				// and move on, never reject the sample.
+				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", g.Index, "err", err)
+				continue
+			}
+			if stored[specID] != nil {
+				// Keep the memo truthful for the rest of THIS sample: a
+				// malformed payload naming the same (spec, gpu) twice must
+				// not write twice.
+				stored[specID][g.Index] = g.VRAMMeasuredMB
+			}
+		}
+	}
+}
+
+// storedMeasuredVRAM reads specID's currently-stored measured value per GPU
+// index, for writeBackRuntimeVRAM's change detection. A read failure returns
+// nil, which the caller reads as "nothing known" and therefore writes
+// unconditionally -- the safe direction: a missed comparison costs one
+// redundant UPDATE, whereas a wrongly-assumed match would silently drop a
+// real measurement.
+func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[int]int {
+	gpus, err := s.Routes.RuntimeSpecGPUs(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: current gpu rows unreadable, writing unconditionally", "server_id", serverID, "spec_id", specID, "err", err)
+		return nil
+	}
+	out := make(map[int]int, len(gpus))
+	for _, g := range gpus {
+		out[g.GPUIndex] = g.VRAMMeasuredMB
+	}
+	return out
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's
@@ -191,6 +507,13 @@ type agentGPUInfo struct {
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
 	MemoryTotalBytes int64  `json:"memory_total_bytes"`
+	// PCIBusID is the card's PCI address (e.g. "00000000:65:00.0"), NVIDIA
+	// only. Additive and optional: an older agent omits it and the field
+	// decodes empty. Display and disambiguation only -- the portal shows it
+	// to tell 4x/8x identical cards apart, and nothing in this codebase
+	// matches or keys on it (GPU identity is the index; see the agent's
+	// sample.GPU.PCIBusID).
+	PCIBusID string `json:"pci_bus_id,omitempty"`
 }
 
 // errAgentSystemReportInvalid: the system-report payload failed to parse (POST ->
@@ -351,8 +674,59 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// each sample is a full snapshot, and an agent that never sends proxy_routes
 	// (cert_mode != proxy) reports nil here, which Report treats as "no routes".
 	s.AgentProxyStatus.Report(serverID, proxyRouteStatusesFromSamples(req.ProxyRoutes))
+	// Record the agent's declared feature set (design spec §9, feature
+	// negotiation), so a later portal runtime-spec write's PushRuntimeConfig
+	// knows whether this connected agent understands a runtime_config frame
+	// at all. Deliberately AFTER every store write succeeded, mirroring
+	// AgentCertReports/AgentProxyStatus above: a report is evidence about
+	// this agent's own binary, and stamping it while the sample itself
+	// failed to persist would claim freshness the gateway does not have.
+	// Tolerant: a malformed capabilities blob yields an empty feature set
+	// (PushRuntimeConfig then correctly withholds delivery) rather than
+	// rejecting the whole sample -- see parseAgentCapabilities.
+	s.AgentFeatures.Set(serverID, parseAgentCapabilities(req.Capabilities))
+	// Publish the agent-managed runtime status snapshot (agent-runtime-manager
+	// Task 9) to the volatile status registry the portal's SSE stream reads.
+	// Deliberately AFTER every store write succeeded, mirroring every other
+	// registry update in this block: a report is evidence about what the
+	// agent is running RIGHT NOW, and stamping it while the sample itself
+	// failed to persist would claim freshness the gateway does not have.
+	s.RuntimeStatus.publish(serverID, runtimeStatusDTOsFromSamples(req.Runtimes))
+	// Best-effort write-back of each managed process's measured VRAM onto its
+	// launch spec (skipped for a VRAMLocked spec) -- see writeBackRuntimeVRAM.
+	// Never rejects the sample; a failure here is logged and dropped.
+	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
 	s.maybeFireReactivation(ctx, server)
 	return nil
+}
+
+// agentCapabilitiesReport is the tolerant subset of an agent's telemetry
+// capabilities object this gateway currently understands (design spec §9,
+// feature negotiation): the feature names it declares support for. Any other
+// keys an agent may additionally carry here are ignored, not rejected --
+// forward compatibility with a future agent build that adds fields must
+// never break ingest on today's gateway.
+type agentCapabilitiesReport struct {
+	Features []string `json:"features"`
+}
+
+// parseAgentCapabilities tolerantly extracts the declared feature list from a
+// raw telemetry capabilities object. Absent, malformed, or wrong-shaped JSON
+// (not an object, or a "features" that is not a string array) all yield a
+// nil feature set rather than an error -- a capabilities parse failure must
+// NEVER reject the telemetry sample it rode in on (see the call site in
+// ingestTelemetrySample): a garbled or forward-incompatible capabilities blob
+// from a future agent build must not stop routing telemetry from reaching
+// the gateway.
+func parseAgentCapabilities(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var report agentCapabilitiesReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return nil
+	}
+	return report.Features
 }
 
 // proxyRouteStatusesFromSamples maps the wire-decoded ProxyRouteSample slice to
@@ -494,6 +868,7 @@ func sanitizeSystemReport(r *agentSystemReport, now time.Time) ([]byte, time.Tim
 		r.GPUs[i].Name = clampHardwareString(r.GPUs[i].Name)
 		r.GPUs[i].UUID = clampHardwareString(r.GPUs[i].UUID)
 		r.GPUs[i].DriverVersion = clampHardwareString(r.GPUs[i].DriverVersion)
+		r.GPUs[i].PCIBusID = clampHardwareString(r.GPUs[i].PCIBusID)
 		r.GPUs[i].Index = nonNegI(r.GPUs[i].Index)
 		r.GPUs[i].MemoryTotalBytes = nonNegI64(r.GPUs[i].MemoryTotalBytes)
 	}

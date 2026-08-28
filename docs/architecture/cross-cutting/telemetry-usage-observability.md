@@ -49,7 +49,7 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
-| NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version; `[N/A]`-style sentinels map to 0 |
+| NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
 | AMD | `amd.go` | `rocm-smi --json` (`--showid --showuse --showmemuse --showtemp --showpower --showdriverversion`) | Parses the `cardN`-keyed JSON object; a `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
@@ -90,11 +90,29 @@ from `host.InfoWithContext`, and per-OS mainboard/BIOS/DIMM detail via
 - **macOS** (`system_profiler.go`): `system_profiler` output for mainboard/BIOS
   identity.
 
+Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
+`memory_total_bytes` and `pci_bus_id` — the last three `omitempty`, so a
+consumer can tell "not reported" from "reported blank".
+
+**`pci_bus_id` is a display and disambiguation aid, and deliberately not an
+identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` and is therefore
+NVIDIA-only: `rocm-smi` and `ioreg` report nothing of this form and leave it
+empty rather than inventing an equivalent, so every consumer must render
+without it. It exists because 4×/8× identical cards is the normal AI-server
+build, and of the handles telemetry actually offers — an `index` that can
+renumber across reboots (which is exactly what the GPU-budget rows'
+`expected_uuid`/`expected_name` drift detection exists to catch), an opaque
+`uuid`, and live utilisation, which is not identity at all — the bus id is the
+only one that maps to a physical slot and survives renumbering. Nothing in the
+system matches or keys on it: spec GPU rows, budgets and the whole admission
+arithmetic key on `index`, and making the bus id a second identity would be a
+separate design, not a field addition.
+
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,
 board/chassis UUID, or MAC-address field at all — there is nothing to strip. GPU
-`UUID` is the one identifier-like exception (a device id, not personal/host
-identity).
+`UUID` and `pci_bus_id` are the identifier-like exceptions (device and slot
+addresses, not personal or host identity).
 
 ### 8.2.6 Optional inference-server scraping
 
@@ -210,6 +228,81 @@ negative values are rejected outright for required scalars, and silently coerced
 `CPUTempC`) — a single bad sensor reading degrades gracefully rather than
 poisoning the persisted series.
 
+The sample also carries two **additive** keys for the
+[agent-managed model runtime](agent-runtime-manager.md), both recorded only
+*after* every store write in the ingest has succeeded — a report is evidence, and
+evidence is not stamped on a failed write:
+
+- **`capabilities`** — parsed tolerantly as `{"features":[…]}`. Anything
+  malformed, wrongly shaped or absent yields an empty feature set and never
+  rejects the sample; every other key is ignored, so a new capability key is a
+  backward-compatible addition. `AgentFeatures.Set` is a **full-snapshot
+  replace**, never a merge. Do not add a version here: the agent version rides on
+  the sample's top-level `agent_version`, which is what is persisted and
+  rendered.
+- **`runtimes`** — one entry per managed spec: `spec_id`, `model`, `state`,
+  `since`, `pid`/`port` (omitted when there is no live process), `in_flight`,
+  `restarts`, `gpus[]` of `{index, vram_measured_mb}` (omitted when nothing was
+  measured this cycle, and explicitly sorted by index because it is built from a
+  Go map), and `last_error` of `{message, at, exit_code, failures, stderr_tail}`.
+  When a runtime driver is active it **also overrides `loaded_models`** to
+  contain only specs in state `running` — `starting` deliberately does not count,
+  because prefer-loaded routing must never send traffic to a model that cannot
+  answer yet.
+
+Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
+
+1. With **no** runtime driver the sample is byte-identical to the pre-feature
+   shape — the key is absent entirely, not `null` and not `[]`. That is the
+   compatibility guarantee for every agent that never negotiates the feature, and
+   it is pinned by a test asserting the marshalled JSON never contains the
+   substring `"runtimes"`.
+2. For an agent that *does* support the feature, **every sample must carry the
+   full current snapshot.** Omitting the key is additive at the schema level but
+   *replaces* the gateway's per-server status snapshot with empty at the
+   behaviour level — there is no "leave it as it was" option, which is why the SSE
+   `snapshot` and `update` frames carry the identical shape. A bandwidth
+   optimisation that sends `runtimes` "only when changed" makes the portal's live
+   runtime table visibly flicker empty between ~1 s samples, and looks like a
+   portal bug.
+
+The gateway-side runtime status this feeds is held in a **volatile in-RAM
+registry and never persisted** (a stderr tail can carry prompt fragments, which
+the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
+on ingest, and the status DTO deliberately has no GPU field — measured VRAM
+reaches the UI through the spec's `vram_measured_mb` after the agent's write-back.
+
+**The write-back skips an unchanged value, and the skip lives on the gateway,
+not on the agent.** Rule 2 above forbids the obvious agent-side saving — a spec
+whose measurement has not moved must still be *reported*, or the portal's live
+table flickers — but nothing obliges the gateway to *rewrite* what it already
+holds. It used to: the `UPDATE` was unconditional and every sample is a full
+snapshot, so a spec whose measurement was merely stable cost one write per
+second per `(spec, gpu)` indefinitely, which on an idle overnight server with a
+handful of measured specs is of the order of a million identical `UPDATE`s a day
+against a table with a dozen rows. `writeBackRuntimeVRAM` now reads the stored
+rows once per distinct writable `spec_id` and writes only what differs.
+Comparing against the **store** rather than against what the agent last sent is
+what makes it converge: the stored value can change out from under a
+long-running agent (deleting and re-adding a GPU row resets it to `0`), and an
+agent that had suppressed its own unchanged report would never resend. A failed
+read degrades to writing unconditionally — a missed comparison costs one
+redundant write, a wrong one would silently drop a real measurement.
+
+> **A recurring wire-shape trap, worth stating once.** A nil Go collection and a
+> nil `json.RawMessage` marshal as `null`, not `{}`/`[]`, and the TypeScript
+> portal treats `null` as a crash-class value. The countermeasures are structural
+> and must be preserved: one canonical `sample.EmptyCapabilities()` shared by
+> both `Sample.Normalize()` and the agent's `capabilitiesJSON()` so both
+> producers emit identical bytes; the runtime config parser normalising every
+> collection; the report builder re-applying that normalisation so a zero-value
+> config (the parse-error case) still marshals `[]`/`{}`; and a custom marshaller
+> mapping a nil measured-VRAM map to `{}`. Anything handing out a
+> `json.RawMessage` must return a **fresh copy per call** — it is a `[]byte`, so a
+> package-level literal shared by reference lets any future write through one
+> sample's field corrupt the value for every other sample. Any path that builds a
+> wire struct without going through the normaliser can reintroduce `null`.
+
 ### 8.3.3 Hardware inventory sanitization
 
 `sanitizeSystemReport` (`agent_ingest.go`) enforces `maxHardwareGPUs=64`,
@@ -257,6 +350,15 @@ contiguous same-state runs always preserves state transitions and gap boundaries
 `availabilityPointDTO`; the frontend paints the interval leading into a
 `gap_before=true` point as *unknown* rather than incorrectly holding the prior
 state forward.
+
+> **`reachable` alone cannot distinguish "confirmed up" from "never checked".**
+> The portal's application DTO defaults to `reachable: true` with
+> `last_checked_at: null` for a never-probed application — and whenever the
+> health-registry reader is nil — because the cold-start default is deliberately
+> lenient; only a real probe stamps the timestamp (`enrichReachability`). So any
+> alert, UI signal or test assertion that means "a probe has confirmed this" must
+> require a **non-null `last_checked_at`**. Without that check, an assertion on
+> `reachable: true` cannot fail.
 
 ## 8.4 Usage & activity analytics
 
@@ -517,3 +619,6 @@ log line and its mirrored trace span can be correlated.
   everything in this chapter): the capture chapter.
 - TLS certificate distribution fields carried alongside telemetry
   (`CertFingerprint`/`CertMode`/`ProxyRoutes`): the certificates & mTLS chapter.
+- The `capabilities` and `runtimes` sample keys in context — what fills them,
+  the volatile status registry they feed, and the live SSE stream on top:
+  [Agent-Managed Model Runtime](agent-runtime-manager.md).

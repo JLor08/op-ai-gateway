@@ -87,6 +87,9 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 				UUID:             gp.UUID,
 				DriverVersion:    gp.DriverVersion,
 				MemoryTotalBytes: gp.MemTotalBytes,
+				// Empty for every collector but NVIDIA, and that is the
+				// intended degradation -- see sample.GPU.PCIBusID.
+				PCIBusID: gp.PCIBusID,
 			})
 		}
 	}

@@ -33,6 +33,10 @@ const de = {
   gatewayCheck: 'Gateway prüfen',
   gatewayToken: 'Gateway-Token',
   loading: 'Laden...',
+  // Generic retry label for ResourceFallback: "failed to load" is a THIRD
+  // state next to "loading" and "loaded", and it needs an action, not just a
+  // toast that scrolls away.
+  resourceRetry: 'Erneut versuchen',
   portalError: 'Portal API Fehler',
   connectionLostTitle: 'Verbindung verloren',
   connectionLostBody: 'Verbindung zum Server verloren. Wiederverbindung läuft…',
@@ -455,6 +459,265 @@ const de = {
   mappingProbeContext: 'Kontextgröße ermitteln',
   mappingProbeContextRunning: 'Wird ermittelt…',
   mappingProbeContextFailed: 'Kontextgröße konnte nicht ermittelt werden',
+  runtimeAdmin: 'Agent-gesteuerte Runtime',
+  runtimeSpecs: 'Runtime-Spezifikationen',
+  runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
+  runtimeSpecBinary: 'Programmpfad',
+  runtimeSpecArgs: 'Argumente',
+  runtimeSpecEnv: 'Umgebungsvariablen',
+  runtimeSpecWorkDir: 'Arbeitsverzeichnis',
+  runtimeSpecGpus: 'GPUs',
+  runtimeSpecVram: 'VRAM (MB)',
+  runtimeSpecIdleTimeout: 'Leerlauf-Timeout (s)',
+  runtimeSpecStartupTimeout: 'Start-Timeout (s)',
+  runtimeSpecPinned: 'Angeheftet (nie beenden)',
+  runtimeSpecEnabled: 'Aktiviert',
+  runtimeMatrix: 'Koresidenz-Matrix',
+  runtimeMatrixHint:
+    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen.',
+  runtimeMatrixCell: 'Koresidenz umschalten',
+  runtimeMatrixNeedTwo:
+    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz-Matrix zu verwalten.',
+  // The lead line of every cell tooltip. It answers the question the operator
+  // actually has ("dürfen diese zwei zusammen laufen?") and names the rule
+  // that surprised a real one: the matrix is checked over the whole running
+  // set, GPUs do not enter into it.
+  runtimeMatrixConsequence:
+    'Erlaubt diesen beiden Modellen, gleichzeitig zu laufen. Die Matrix gilt unabhängig von den GPUs: Solange dieses Paar nicht angehakt ist, verdrängt der Start des einen das andere – auch auf getrennten Karten.',
+  runtimeMatrixNoSharedGpu:
+    'Keine gemeinsame GPU – diese beiden Modelle konkurrieren um kein VRAM.',
+  runtimeMatrixAdvisory:
+    'Nur ein Hinweis: Die endgültige Entscheidung trifft der Agent zur Laufzeit anhand der tatsächlich laufenden Prozesse.',
+  runtimeMatrixOverBudget: 'über Budget',
+  runtimeMatrixDisabledFileMode:
+    'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
+  runtimeMatrixDisabledSaving:
+    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Matrix wieder Klicks an.',
+  runtimeLimits: 'Runtime-Limits',
+  runtimeLimitsIntro:
+    'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
+  runtimeGpuBudget: 'GPU-VRAM-Budget (MB)',
+  runtimeMaxProcesses: 'Max. gleichzeitige Prozesse',
+  runtimeGpuDriftWarning:
+    'Die Hardware an diesem GPU-Index hat sich seit der Budget-Anlage verändert (z. B. durch ein Treiber-Update oder Hardware-Tausch); der Server bleibt dadurch weiterhin in Betrieb.',
+  runtimeGpuDriftIconLabel: 'GPU-Hardware-Warnung',
+  runtimeGpuDriftExpected: 'Erwartet',
+  runtimeGpuDriftCurrent: 'Aktuell',
+  runtimeLiveStatus: 'Live-Status',
+  runtimeStateStopped: 'Gestoppt',
+  runtimeStateStarting: 'Startet…',
+  runtimeStateRunning: 'Läuft',
+  runtimeStateDraining: 'Wird geleert',
+  runtimeStateBackoff: 'Wartet nach Absturz',
+  runtimeStateStartFailed: 'Start fehlgeschlagen',
+  runtimeStateCrashed: 'Abgestürzt',
+  runtimeStatePendingVram: 'Wartet auf VRAM',
+  runtimeStateNotPermitted: 'Nicht zulässig',
+  runtimeLastError: 'Letzter Fehler',
+  runtimeForceStart: 'Start erzwingen',
+  runtimeForceStop: 'Stopp erzwingen',
+  runtimeClearOverride: 'Übersteuerung aufheben',
+  runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
+  runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
+  runtimeIneffectiveSpecs:
+    'Diese Runtime-Spezifikationen liegen im Gateway (Reiter „Runtime-Spezifikationen“ dieser Anwendung) und haben keine Wirkung, solange der Agent seine Prozesse aus seiner eigenen lokalen Datei verwaltet. Sie werden nicht gelöscht und greifen wieder, sobald die Konfigurationsquelle des Agenten zurück auf „Gateway“ gestellt wird. Im Datei-Modus sind sie hier weder einsehbar noch bearbeitbar.',
+  runtimeTimeoutWarning:
+    'Das Anwendungs-Timeout ist kürzer als der längste Start-Timeout einer aktivierten Spezifikation; ein kalter Modellstart schlägt dadurch fehl.',
+  runtimeBinaryPathOsMismatchWarning:
+    'Mindestens ein Programmpfad passt nicht zum Betriebssystem, das der Agent dieses Servers meldet (z. B. ein Windows-Pfad wie „C:\\…“ auf einem Linux-Server oder umgekehrt). Der Agent wird den Prozess ablehnen. Der Pfad wird nicht blockiert – gemeldet wird nur, was die Telemetrie hergibt.',
+  runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
+  runtimeSpecCreate: 'Spezifikation anlegen',
+  runtimeSpecEditAction: 'Bearbeiten',
+  runtimeSpecDelete: 'Spezifikation löschen',
+  runtimeSpecDeleteConfirm:
+    'Runtime-Spezifikation wirklich löschen? Die Modell-Zuordnung bleibt erhalten.',
+  runtimeSpecDeleteStateLoading:
+    'Löschen ist gesperrt, solange noch nicht bekannt ist, ob für diese Zuordnung eine Runtime-Spezifikation existiert – die Abfrage läuft noch.',
+  runtimeSpecDeleteStateUnknown:
+    'Löschen ist gesperrt: Die Runtime-Spezifikation dieser Zuordnung konnte nicht geladen werden, daher ist unbekannt, ob eine existiert. Über „Bearbeiten“ erneut laden.',
+  runtimeSpecMappingSection: 'Modell-Zuordnung',
+  runtimeSpecConfigSection: 'Startkonfiguration',
+  runtimeSpecListenPort: 'Listen-Port',
+  runtimeSpecListenPortHelp: '0 = automatisch einen freien Port wählen',
+  runtimeSpecHealthPath: 'Health-Pfad',
+  runtimeSpecHealthTimeout: 'Health-Timeout (s)',
+  runtimeSpecAdmissionWaitTimeout: 'Wartezeit bis Zulassung (s)',
+  runtimeSpecAdminState: 'Admin-Übersteuerung',
+  runtimeSpecVramLocked: 'VRAM-Schätzung fixieren (Messung des Agenten ignorieren)',
+  runtimeSpecVramLockedHint:
+    'Der Agent misst den tatsächlichen VRAM-Verbrauch seines Kindprozesses; diese Messung ersetzt normalerweise Ihre Schätzung – auch in der Budget-Berechnung, die über den Start entscheidet. Fixieren Sie die Schätzung, wenn eine Messung falsch ist oder wenn eine Messung oberhalb des GPU-Budgets den Start dauerhaft verhindert. Die Messung wird weiterhin erfasst und angezeigt, nur nicht mehr verwendet.',
+  runtimeSpecSetVisibleDevices: 'GPU-Sichtbarkeit erzwingen (Prozess auf diese Karten begrenzen)',
+  runtimeSpecSetVisibleDevicesHint:
+    'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
+  runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
+  runtimeSpecGpuIndex: 'GPU-Index',
+  runtimeSpecGpuPick: 'Gemeldete GPU',
+  runtimeSpecGpuPickPlaceholder: 'Karte auswählen …',
+  runtimeSpecGpuNoTelemetry:
+    'Dieser Server hat noch keine GPUs gemeldet – GPU-Index bitte manuell eintragen.',
+  runtimeSpecGpuAdd: 'GPU hinzufügen',
+  runtimeSpecGpuRemove: 'Entfernen',
+  runtimeSpecEnvHint:
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+  runtimeSpecEnvReserved:
+    'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
+  runtimeSpecPlaceholderInvalid:
+    'Ungültiger Platzhalter (gemeint ist vermutlich ${PORT} oder ${AGENT_ENV:NAME})',
+  runtimeSpecArgsHint:
+    'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
+  runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsCommandLine:
+    'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
+  runtimeSpecArgsHardcodedPort:
+    'Der Listen-Port steht auf 0, der Agent vergibt den Port also selbst und prüft genau diesen. Ein fest eingetragener Port lässt den Prozess woanders lauschen, der Health-Check schlägt fehl und der Start wird als fehlgeschlagen verbucht. Statt der Zahl ${PORT} eintragen – oder den Listen-Port oben auf diesen Wert setzen',
+  runtimeSpecArgsEdgeWhitespace:
+    'Diese Zeilen beginnen oder enden mit einem Leerzeichen. Im Feld ist das unsichtbar, im Wert steht es trotzdem: Ein Dateiname endet dann auf ein Leerzeichen, die Datei wird nicht gefunden, und die Meldung sieht genauso aus, als fehle sie. Wenn das Leerzeichen gewollt ist, bitte so lassen – sonst entfernen. Unten mit · (Leerzeichen) und → (Tabulator) markiert:',
+  runtimeSpecArgsBlankLine:
+    'Diese Zeilen bestehen nur aus Leerzeichen. Sie werden nicht übersprungen, sondern unverändert als Argument übergeben – als Argument aus Leerzeichen. Wenn das gewollt ist, bitte so lassen – sonst die Zeile leeren oder löschen. Unten mit · (Leerzeichen) und → (Tabulator) markiert:',
+  runtimeSpecPartialFailure:
+    'Die Modell-Zuordnung wurde gespeichert, die Spezifikation jedoch nicht',
+  runtimeAreaPlaceholder: 'Dieser Bereich wird in einem folgenden Ausbauschritt ergänzt.',
+  runtimeStatusUnknown: 'Unbekannt',
+  // Task 22: Live-Status, Admin-Übersteuerungen, Datei-Modus (schreibgeschützt).
+  runtimeStreamConnecting: 'Live-Datenstrom wird verbunden…',
+  runtimeStreamOpen: 'Live-Datenstrom verbunden',
+  runtimeStreamOffline: 'Live-Datenstrom unterbrochen',
+  runtimeStreamError:
+    'Live-Datenstrom unterbrochen — diese Anzeige kann veraltet sein. Es ist nicht bekannt, welche Prozesse gerade laufen.',
+  runtimeStatusEmpty: 'Der Agent meldet aktuell keinen verwalteten Modellprozess.',
+  runtimeStatusSince: 'Seit',
+  runtimeStatusPid: 'PID',
+  runtimeStatusPort: 'Port',
+  runtimeStatusInFlight: 'Laufende Anfragen',
+  runtimeStatusRestarts: 'Neustarts',
+  runtimeLastErrorAt: 'Zeitpunkt',
+  runtimeLastErrorExitCode: 'Exit-Code',
+  runtimeLastErrorFailures: 'Fehlversuche',
+  runtimeLastErrorStderr: 'stderr (Auszug)',
+  runtimeRestart: 'Neu starten',
+  // Task 22, Fix-Runde 2 (N-Accepted): der Hover-Grund fuer eine
+  // ausgegraute Aktion. Nach einem erfolgreichen Neustart ist genau dieser
+  // Zustand der Ruhezustand der Zeile, also begegnet er jedem Betreiber.
+  runtimeRestartUnavailable:
+    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Start erzwingen“ verwenden.',
+  runtimeRestartStopping: 'Neustart: wird gestoppt…',
+  runtimeRestartClearing: 'Neustart: Übersteuerung wird aufgehoben…',
+  runtimeRestartTimeout:
+    'Neustart-Zeitüberschreitung: Der Prozess hat sich nicht innerhalb der Wartezeit gestoppt. Die Übersteuerung „Stopp erzwingen“ ist weiterhin aktiv und muss von Hand aufgehoben werden.',
+  runtimeRestartVanished:
+    'Neustart abgebrochen: Der Prozess wird nicht mehr gemeldet (Spezifikation gelöscht?). Die Übersteuerung „Stopp erzwingen“ wurde nicht aufgehoben — im Reiter „Runtime-Spezifikationen“ prüfen und dort von Hand aufheben, falls die Spezifikation noch existiert.',
+  // Task 22, Fix-Runde 1.
+  runtimeRestartClearTimeout:
+    'Neustart: Das Aufheben der Übersteuerung wurde nicht innerhalb der Zeitgrenze abgeschlossen. „Stopp erzwingen“ kann weiterhin aktiv sein — im Reiter „Runtime-Spezifikationen“ prüfen und dort von Hand aufheben.',
+  runtimeWriteTimeout:
+    'Die Anfrage wurde nicht innerhalb der Zeitgrenze abgeschlossen. Ob die Übersteuerung übernommen wurde, ist unbekannt — die Seite neu laden, um den aktuellen Stand zu sehen.',
+  runtimeModeUnknown:
+    'Der Betriebsmodus dieses Servers konnte nicht ermittelt werden (die Abfrage ist fehlgeschlagen). Solange das so ist, bleibt dieser Bildschirm vollständig schreibgeschützt — es ist unbekannt, ob Änderungen hier überhaupt wirksam würden.',
+  runtimeModeUnknownShort: 'Nicht verfügbar, solange der Betriebsmodus unbekannt ist.',
+  // Task 22b (Batch C, C1): die drei uebrigen Ressourcen dieses Bildschirms
+  // hatten fuer eine fehlgeschlagene Abfrage keinen eigenen Zustand -- sie
+  // meldeten dauerhaft „Laden…“. Jede Meldung nennt die Folge, nicht nur den
+  // Fehler: alle drei Schreibvorgaenge ersetzen die VOLLSTAENDIGE Liste.
+  runtimeMappingsUnavailable:
+    'Die Modell-Zuordnungen dieser Anwendung konnten nicht geladen werden. Solange das so ist, lässt sich kein gemeldeter Prozess einem Modell zuordnen, und im Reiter „Live-Status“ stehen keine Übersteuerungen zur Verfügung.',
+  runtimeCoresidencyUnavailable:
+    'Die Co-Residency-Regeln konnten nicht geladen werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Paare löschen.',
+  runtimeBudgetsUnavailable:
+    'Die GPU-Budgets konnten nicht geladen werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Budgets löschen.',
+  runtimeWarningsUnavailable:
+    'Die Hinweise zu dieser Anwendung konnten nicht geladen werden. „Keine Hinweise“ ist hier deshalb keine Aussage.',
+  // Task 22b (Batch C, Fix-Runde 1, C4/M7): eine fehlgeschlagene AKTUALISIERUNG
+  // ist eine andere Tatsache als eine fehlgeschlagene Erstabfrage -- die zuvor
+  // geladenen Daten sind weiterhin vorhanden. Die Texte oben behaupteten in
+  // diesem Fall, es sei nichts geladen und nichts möglich; beides war falsch.
+  runtimeMappingsStale:
+    'Die Modell-Zuordnungen konnten nicht aktualisiert werden. Angezeigt wird — und zugeordnet wird gegen — die zuletzt geladene Liste; sie kann veraltet sein.',
+  runtimeCoresidencyStale:
+    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+  runtimeBudgetsStale:
+    'Die GPU-Budgets konnten nicht aktualisiert werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+  runtimeWarningsStale:
+    'Die Hinweise konnten nicht aktualisiert werden. Angezeigt wird der zuletzt geladene Stand.',
+  // Task 22b (Batch C, C5): das Backend weist einen doppelten GPU-Index ab,
+  // ohne zu sagen, welcher es ist -- hier wird er benannt, vor dem Schreiben.
+  runtimeGpuIndexDuplicate: 'Ein GPU-Index ist mehrfach vergeben',
+  runtimeStatusUpstream: 'Vom Agenten gemeldet',
+  runtimeStatusNameMismatch:
+    'Der Agent meldet einen anderen Modellnamen als die Gateway-Zuordnung.',
+  runtimeStatusUnresolvedShort: 'Nicht zuordenbar',
+  runtimeStatusUnresolved:
+    'Dieser Prozess lässt sich keiner Modell-Zuordnung dieser Anwendung zuordnen (der Datenstrom gilt für den ganzen Server, die Zuordnungen nur für diese Anwendung). Deshalb sind hier keine Übersteuerungen möglich.',
+  runtimeAgentNeverReported:
+    'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber es liegt noch keine Agent-Telemetrie vor: Der Agent hat sich noch nie gemeldet. Die Spezifikationen bleiben wirkungslos, bis der Agent auf diesem Server installiert und verbunden ist.',
+  // "laden", nicht "auswerten": derselbe Satz führt inzwischen auch die
+  // Codes an, die vor dem Auswerten entstehen (Datei fehlt, Datei nicht
+  // lesbar). Der Feldname auf der Leitung bleibt `parse_error`.
+  runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht laden.',
+  runtimeParseErrorJsonSyntax: 'Die Datei ist kein gültiges JSON.',
+  runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
+  runtimeParseErrorFileMissing: 'Am konfigurierten Pfad liegt keine Datei.',
+  runtimeParseErrorReadFailed:
+    'Die Datei ist vorhanden, ließ sich aber nicht lesen — Eigentümer und Berechtigungen prüfen.',
+  runtimeParseErrorUnknown: 'Der Grund wurde nicht übermittelt.',
+  runtimeConfigUnavailable: 'Die gemeldete Konfiguration ist deshalb nicht verfügbar.',
+  runtimeConfigUnrecognised:
+    'Teile der gemeldeten Konfiguration haben ein unbekanntes Format und werden nicht angezeigt.',
+  runtimeFeatureMismatch:
+    'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber der Agent meldet die Funktion „runtime_manager“ nicht. Die Spezifikationen bleiben wirkungslos, bis der Agent aktualisiert wird.',
+  // T3, Live-Protokoll eines verwalteten Modellprozesses. Jede Meldung sagt,
+  // WARUM das Fenster leer ist -- ein unerklaert leeres Fenster ist von „dieses
+  // Modell gibt nichts aus“ nicht zu unterscheiden, und genau das ist die
+  // Frage, die der Betreiber hier beantworten will.
+  runtimeLogs: 'Protokoll',
+  runtimeLogsTitle: 'Prozessausgabe',
+  runtimeLogsIntro:
+    'Standardausgabe und Standardfehlerausgabe dieses Modellprozesses, so wie er sie geschrieben hat. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
+  runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
+  runtimeLogsEmptyBuffer:
+    'Der Agent hat für diesen Prozess nichts vorgehalten. Das ist keine Aussage darüber, ob der Prozess etwas ausgegeben hat: Der Puffer liegt ausschließlich im Arbeitsspeicher des Agenten und geht bei einem Neustart des Agenten verloren.',
+  runtimeLogsUnsupported:
+    'Der Agent dieses Servers meldet die Funktion „runtime_logs“ nicht. Er wird die Anfrage nie beantworten — dieses Fenster bliebe dauerhaft leer. Den Agenten aktualisieren.',
+  runtimeLogsOffline:
+    'Zu diesem Server besteht derzeit keine Live-Verbindung, über die eine Übertragung angefordert werden könnte. Mögliche Gründe: Der Agent läuft nicht, er ist nicht erreichbar, oder er ist auf die Übertragungsart „post“ eingestellt — die hat keine Gegenrichtung vom Gateway zum Agenten.',
+  runtimeLogsDisconnected:
+    'Die Verbindung zum Datenstrom wurde unterbrochen. Es wird erneut verbunden; danach wird der vorgehaltene Verlauf neu geladen.',
+  runtimeLogsProcessStarted: (pid: number) => `Prozess gestartet (PID ${pid})`,
+  runtimeLogsProcessExited: (code: number) => `Prozess beendet (Exit-Code ${code})`,
+  runtimeLogsDropped: (bytes: number) => `[${bytes} Byte Ausgabe fehlen hier]`,
+  runtimeLogsTrimmed: (bytes: number) =>
+    `Ältere Ausgabe wird in dieser Ansicht nicht mehr angezeigt (${bytes} Byte). Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf wieder vollständig zu laden.`,
+  runtimeLogsProcessStartFailed: 'Prozess nicht gestartet',
+  // Der tatsächlich ausgeführte Befehl, direkt an der Startmarkierung der
+  // jeweiligen Generation. Der Betreiber hat eine Vorlage geschrieben; ${PORT},
+  // ${MODEL}, ${HOST_GPU_IDS} und ${AGENT_ENV:NAME} werden erst beim Start
+  // aufgelöst -- genau in dieser Lücke sitzt der Fehler meistens.
+  runtimeCommandTitle: 'Ausgeführter Befehl',
+  runtimeCommandIntro:
+    'Genau das hat der Agent für diesen Prozess gestartet, mit allen beim Start aufgelösten Platzhaltern. Die aufgeführten Umgebungsvariablen sind die vollständige Umgebung des Prozesses — sie ersetzt die des Agenten, sie ergänzt sie nicht. Bewusst ohne „Kopieren“-Schaltfläche: der Port war kurzlebig und ist inzwischen veraltet, und in einer Shell eingefügt wäre dies nicht derselbe Befehl.',
+  runtimeCommandStartFailedHint:
+    'Dieser Versuch hat keinen Prozess erzeugt: der Aufruf selbst ist gescheitert. Es gibt daher keine Ausgabe — der Befehl hier ist alles, was vorliegt. Binärdatei und Arbeitsverzeichnis zuerst prüfen.',
+  runtimeCommandNotRetained:
+    'Der Agent hat seinen vorgehaltenen Verlauf vollständig gesendet, und dieser beginnt ohne Startmarkierung: Er hält die Startmarkierung dieser Generation nicht mehr vor und damit auch nicht ihren ausgeführten Befehl — das heißt nicht, dass keiner gemeldet wurde. Erneutes Öffnen bringt ihn nicht zurück; späteren Generationen liegt ihr Befehl weiterhin bei.',
+  runtimeCommandTrimmedHere:
+    'Die angezeigte Ausgabe beginnt ohne Startmarkierung, weil diese Ansicht ihre eigenen ältesten Einträge entfernt hat — nicht, weil der Agent sie nicht mehr vorhält. Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf neu zu laden: Hält er die Startmarkierung dieser Generation noch, kommt ihr ausgeführter Befehl mit.',
+  runtimeCommandMasked:
+    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert — der Platzhalter nennt die Variable, die auf dem AI-Server nachzusehen ist. Diese Maskierung gilt für den hier gemeldeten Befehl und für nichts darüber hinaus: Ein Modellserver, der beim Start seine eigene Befehlszeile oder Umgebung ausgibt, schreibt den aufgelösten Wert in die Ausgabe unten und in den Fehlerauszug auf der Runtime-Seite. Was der Prozess selbst ausgibt, kann der Agent nicht maskieren — deshalb gehört ein Geheimnis als „${AGENT_ENV:NAME}“ nach „env“ und niemals als Klartext in ein Argument.',
+  runtimeCommandEnvRedacted:
+    'Dieser Agent bezieht seine Startspezifikationen aus einer lokalen Datei. Deshalb wird jeder Wert, den die Spezifikation selbst unter „env“ setzt, vollständig zurückgehalten: Der Schlüssel bleibt sichtbar, der Wert wird durch eine Maske ersetzt. Das ist dieselbe Grenze, die der Bericht des Agenten an das Gateway bereits zieht — eine lokale Datei ist das Dokument des Betreibers und darf einen Wert im Klartext enthalten. Es gibt hier keinen Platzhalter und nichts nachzuschlagen. Argumente fallen nicht darunter: Ein Argument wird so gemeldet, wie es geschrieben wurde.',
+  runtimeCommandTruncated:
+    'Der Befehl war zu lang, um vollständig gemeldet zu werden: einzelne Argumente oder Umgebungsvariablen fehlen hier.',
+  runtimeCommandBinary: 'Binärdatei',
+  runtimeCommandArgs: 'Argumente (eines pro Zeile)',
+  runtimeCommandArgsNone: 'keine',
+  runtimeCommandWorkDir: 'Arbeitsverzeichnis',
+  runtimeCommandWorkDirInherited:
+    'nicht gesetzt — der Prozess übernimmt das Arbeitsverzeichnis des Agenten',
+  runtimeCommandEnv: 'Umgebung (vollständig)',
+  runtimeCommandEnvNone: 'leer',
+  runtimeCommandUnknown: 'unbekannt',
+  runtimeAgentVersion: 'Agent-Version',
+  runtimeAgentFeatures: 'Gemeldete Funktionen',
+  runtimeReportCollectedAt: 'Gemeldet am',
   modelGroups: 'Modellgruppen',
   modelGroupCreate: 'Gruppe anlegen',
   modelGroupEditTitle: 'Gruppe bearbeiten',
@@ -613,6 +876,25 @@ const de = {
   errorMappingAppNameRequired: 'Anwendungs-Modellname ist erforderlich',
   errorMappingGatewayNameConflict: 'Gateway-Modellname existiert bereits auf diesem Server',
   errorMappingStatusInvalid: 'Ungültiger Zuordnungsstatus',
+  errorRuntimeSpecNotFound: 'Runtime-Spezifikation nicht gefunden',
+  errorRuntimeSpecBinaryRequired:
+    'Programmpfad ist erforderlich und muss ein absoluter Pfad des Zielsystems sein (z. B. /opt/llama/llama-server oder C:\\llama\\llama-server.exe)',
+  errorRuntimeSpecArgsInvalid: 'Ungültige Argumente',
+  errorRuntimeSpecEnvInvalid: 'Ungültige Umgebungsvariablen',
+  errorRuntimeSpecGpuInvalid: 'Ungültige GPU-Konfiguration',
+  errorRuntimeSpecTuningInvalid: 'Zeitwerte müssen größer oder gleich null sein',
+  errorRuntimeSpecAdminStateInvalid: 'Ungültiger Admin-Status',
+  errorRuntimeSpecVisibleDevicesNoGpus:
+    'Für „GPU-Sichtbarkeit erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
+  errorRuntimeSpecVisibleDevicesConflict:
+    'Diese Variable ist bereits von Hand gesetzt. „GPU-Sichtbarkeit erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
+  errorRuntimeSpecApplicationNotServerAgent:
+    'Runtime-Spezifikationen erfordern eine Server-Agent-Anwendung',
+  errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
+  errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
+  errorServerRuntimeLimitInvalid: 'Ungültiges Prozess-Limit',
+  errorApplicationManagedRuntimeOnly: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen',
+  errorApplicationServerAgentExists: 'Dieser Server hat bereits eine Server-Agent-Anwendung',
   errorBenchmarkAlreadyRunning: 'Auf diesem Server läuft bereits ein Benchmark.',
   errorBenchmarkServerInUse:
     'Der Server wird gerade verwendet; bitte erneut versuchen, wenn er frei ist.',
@@ -1692,6 +1974,7 @@ const en: PortalMessages = {
   gatewayCheck: 'Check gateway',
   gatewayToken: 'Gateway token',
   loading: 'Loading...',
+  resourceRetry: 'Try again',
   portalError: 'Portal API error',
   connectionLostTitle: 'Connection lost',
   connectionLostBody: 'Lost connection to the server. Reconnecting…',
@@ -2110,6 +2393,255 @@ const en: PortalMessages = {
   mappingProbeContext: 'Determine context size',
   mappingProbeContextRunning: 'Determining…',
   mappingProbeContextFailed: 'Could not determine context size',
+  runtimeAdmin: 'Agent-managed runtime',
+  runtimeSpecs: 'Runtime specs',
+  runtimeSpecEdit: 'Edit runtime spec',
+  runtimeSpecBinary: 'Binary path',
+  runtimeSpecArgs: 'Arguments',
+  runtimeSpecEnv: 'Environment variables',
+  runtimeSpecWorkDir: 'Working directory',
+  runtimeSpecGpus: 'GPUs',
+  runtimeSpecVram: 'VRAM (MB)',
+  runtimeSpecIdleTimeout: 'Idle timeout (s)',
+  runtimeSpecStartupTimeout: 'Startup timeout (s)',
+  runtimeSpecPinned: 'Pinned (never stop)',
+  runtimeSpecEnabled: 'Enabled',
+  runtimeMatrix: 'Co-residency matrix',
+  runtimeMatrixHint:
+    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy.',
+  runtimeMatrixCell: 'Toggle co-residency',
+  runtimeMatrixNeedTwo: 'At least two launch specs are needed to manage the co-residency matrix.',
+  runtimeMatrixConsequence:
+    'Allows these two models to run at the same time. The matrix applies regardless of GPUs: while this pair is unticked, starting one evicts the other — even on separate cards.',
+  runtimeMatrixNoSharedGpu: 'No shared GPU — these two models never compete for VRAM.',
+  runtimeMatrixAdvisory:
+    'Advisory only — the agent makes the final call at runtime based on the processes actually running.',
+  runtimeMatrixOverBudget: 'over budget',
+  runtimeMatrixDisabledFileMode:
+    'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
+  runtimeMatrixDisabledSaving:
+    'The previous change is still saving — the matrix accepts clicks again in a moment.',
+  runtimeLimits: 'Runtime limits',
+  runtimeLimitsIntro:
+    'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',
+  runtimeGpuBudget: 'GPU VRAM budget (MB)',
+  runtimeMaxProcesses: 'Max concurrent processes',
+  runtimeGpuDriftWarning:
+    'The hardware at this GPU index has changed since the budget was created (e.g. a driver update or a hardware swap); the server stays in service regardless.',
+  runtimeGpuDriftIconLabel: 'GPU hardware warning',
+  runtimeGpuDriftExpected: 'Expected',
+  runtimeGpuDriftCurrent: 'Now',
+  runtimeLiveStatus: 'Live status',
+  runtimeStateStopped: 'Stopped',
+  runtimeStateStarting: 'Starting…',
+  runtimeStateRunning: 'Running',
+  runtimeStateDraining: 'Draining',
+  runtimeStateBackoff: 'Backing off',
+  runtimeStateStartFailed: 'Start failed',
+  runtimeStateCrashed: 'Crashed',
+  runtimeStatePendingVram: 'Pending VRAM',
+  runtimeStateNotPermitted: 'Not permitted',
+  runtimeLastError: 'Last error',
+  runtimeForceStart: 'Force start',
+  runtimeForceStop: 'Force stop',
+  runtimeClearOverride: 'Clear override',
+  runtimeManagedLocally: 'Managed locally by the agent (file mode)',
+  runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
+  runtimeIneffectiveSpecs:
+    'These runtime specs live in the gateway (the "Runtime specs" tab of this application) and have no effect while the agent manages its processes from its own local file. They are not deleted, and they take effect again as soon as the agent\'s configuration source is switched back to "gateway". While file mode is active they can neither be viewed nor edited here.',
+  runtimeTimeoutWarning:
+    'The application timeout is shorter than the longest startup timeout among the enabled specs; a cold model start will fail as a result.',
+  runtimeBinaryPathOsMismatchWarning:
+    'At least one binary path does not match the operating system this server\'s agent reports (for example a Windows path like "C:\\…" on a Linux server, or the reverse). The agent will refuse to launch the process. The path is not blocked — this only reports what the telemetry shows.',
+  runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
+  runtimeSpecCreate: 'Create spec',
+  runtimeSpecEditAction: 'Edit',
+  runtimeSpecDelete: 'Delete spec',
+  runtimeSpecDeleteConfirm: 'Really delete this runtime spec? The model mapping itself is kept.',
+  runtimeSpecDeleteStateLoading:
+    'Deleting is locked while it is not yet known whether this mapping has a runtime spec — the query is still running.',
+  runtimeSpecDeleteStateUnknown:
+    'Deleting is locked: this mapping\'s runtime spec could not be loaded, so whether one exists is unknown. Use "Edit" to load it again.',
+  runtimeSpecMappingSection: 'Model mapping',
+  runtimeSpecConfigSection: 'Launch configuration',
+  runtimeSpecListenPort: 'Listen port',
+  runtimeSpecListenPortHelp: '0 = choose a free port automatically',
+  runtimeSpecHealthPath: 'Health path',
+  runtimeSpecHealthTimeout: 'Health timeout (s)',
+  runtimeSpecAdmissionWaitTimeout: 'Admission wait timeout (s)',
+  runtimeSpecAdminState: 'Admin override',
+  runtimeSpecVramLocked: "Lock the VRAM estimate (ignore the agent's measurement)",
+  runtimeSpecVramLockedHint:
+    "The agent measures its child process's actual VRAM, and that measurement normally replaces your estimate — including in the budget arithmetic that decides whether the model may start. Lock the estimate when a measurement is wrong, or when one above the GPU budget has left the spec refusing to start. The measurement is still recorded and shown, only no longer used.",
+  runtimeSpecSetVisibleDevices: 'Enforce GPU visibility (restrict the process to these cards)',
+  runtimeSpecSetVisibleDevicesHint:
+    "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
+  runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
+  runtimeSpecGpuIndex: 'GPU index',
+  runtimeSpecGpuPick: 'Reported GPU',
+  runtimeSpecGpuPickPlaceholder: 'Select a card …',
+  runtimeSpecGpuNoTelemetry:
+    'This server has not reported any GPUs yet — enter the GPU index by hand.',
+  runtimeSpecGpuAdd: 'Add GPU',
+  runtimeSpecGpuRemove: 'Remove',
+  runtimeSpecEnvHint:
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+  runtimeSpecEnvReserved:
+    'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
+  runtimeSpecPlaceholderInvalid:
+    'Invalid placeholder (likely meant to be ${PORT} or ${AGENT_ENV:NAME})',
+  runtimeSpecArgsHint:
+    'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
+  runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsCommandLine:
+    'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
+  runtimeSpecArgsHardcodedPort:
+    'The listen port is 0, so the agent assigns the port itself and probes exactly that one. A hard-coded port leaves the process listening somewhere else, the health check fails, and the start is recorded as failed. Use ${PORT} instead of the number — or set the listen port above to this value',
+  runtimeSpecArgsEdgeWhitespace:
+    'These lines start or end with a space. The field cannot show it, but the value carries it: a file name then ends in a space, the file is not found, and the message reads exactly as if it were missing. If the space is deliberate, leave it — otherwise remove it. Marked below with · (space) and → (tab):',
+  runtimeSpecArgsBlankLine:
+    'These lines are nothing but whitespace. They are not skipped — each is handed over verbatim as an argument made of spaces. If that is deliberate, leave it — otherwise empty the line or delete it. Marked below with · (space) and → (tab):',
+  runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
+  runtimeAreaPlaceholder: 'This area will be added in a later rollout step.',
+  runtimeStatusUnknown: 'Unknown',
+  // Task 22: live status, admin overrides, file-mode read-only.
+  runtimeStreamConnecting: 'Connecting the live stream…',
+  runtimeStreamOpen: 'Live stream connected',
+  runtimeStreamOffline: 'Live stream interrupted',
+  runtimeStreamError:
+    'Live stream interrupted — this view may be stale. Which processes are running right now is unknown.',
+  runtimeStatusEmpty: 'The agent currently reports no managed model process.',
+  runtimeStatusSince: 'Since',
+  runtimeStatusPid: 'PID',
+  runtimeStatusPort: 'Port',
+  runtimeStatusInFlight: 'In-flight requests',
+  runtimeStatusRestarts: 'Restarts',
+  runtimeLastErrorAt: 'Time',
+  runtimeLastErrorExitCode: 'Exit code',
+  runtimeLastErrorFailures: 'Failures',
+  runtimeLastErrorStderr: 'stderr (tail)',
+  runtimeRestart: 'Restart',
+  // Task 22, fix round 2 (accepted): the hover reason for a greyed-out
+  // action. A successful restart leaves the row in exactly this state, so it
+  // is the resting state every operator meets, not an edge case.
+  runtimeRestartUnavailable:
+    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "force start" instead.',
+  runtimeRestartStopping: 'Restart: stopping…',
+  runtimeRestartClearing: 'Restart: clearing the override…',
+  runtimeRestartTimeout:
+    'Restart timed out: the process did not report itself stopped within the wait. The "force stop" override is still in effect and has to be cleared by hand.',
+  runtimeRestartVanished:
+    'Restart aborted: the process is no longer reported (spec deleted?). The "force stop" override was not cleared — check the "Runtime specs" tab and clear it by hand there if the spec still exists.',
+  // Task 22, fix round 1.
+  runtimeRestartClearTimeout:
+    'Restart: clearing the override did not complete within the time limit. "Force stop" may still be in effect — check the "Runtime specs" tab and clear it by hand there.',
+  runtimeWriteTimeout:
+    'The request did not complete within the time limit. Whether the override was applied is unknown — reload the page to see the current state.',
+  runtimeModeUnknown:
+    'The runtime mode of this server could not be determined (the request failed). Until it succeeds this screen stays entirely read-only — it is unknown whether changes made here would take effect at all.',
+  runtimeModeUnknownShort: 'Unavailable while the runtime mode is unknown.',
+  // Task 22b (Batch C, C1): the three remaining resources on this screen had
+  // no state of their own for a failed GET -- they said "Loading…" forever.
+  // Each message names the CONSEQUENCE, not just the failure: all three writes
+  // replace the COMPLETE list.
+  runtimeMappingsUnavailable:
+    'The model mappings of this application could not be loaded. Until they do, no reported process can be matched to a model and no override actions are available on the "Live status" tab.',
+  runtimeCoresidencyUnavailable:
+    'The co-residency rules could not be loaded, so the matrix stays hidden: a toggle writes the complete pair list, and computing it from a list we could not load would delete pairs that are already saved.',
+  runtimeBudgetsUnavailable:
+    'The GPU budgets could not be loaded, so the form stays hidden: saving writes the complete budget list, and computing it from a list we could not load would delete budgets that are already saved.',
+  runtimeWarningsUnavailable:
+    'The advisory notices for this application could not be loaded, so "no notices" is not a statement here.',
+  // Task 22b (Batch C, fix round 1, C4/M7): a failed REFRESH is a different
+  // fact from a failed first load -- the previously loaded data is still in
+  // hand. The texts above claimed nothing was loaded and nothing was possible;
+  // in this state both clauses are false.
+  runtimeMappingsStale:
+    'The model mappings could not be refreshed. What is shown — and what every reported process is matched against — is the last list loaded, which may be out of date.',
+  runtimeCoresidencyStale:
+    'The co-residency rules could not be refreshed, so the matrix stays hidden: a toggle writes the complete pair list, and the last one loaded may no longer be current.',
+  runtimeBudgetsStale:
+    'The GPU budgets could not be refreshed, so the form stays hidden: saving writes the complete budget list, and the last one loaded may no longer be current.',
+  runtimeWarningsStale:
+    'The advisory notices could not be refreshed. What is shown is the last state loaded.',
+  // Task 22b (Batch C, C5): the backend refuses a duplicate GPU index without
+  // saying which one it is -- named here, before the write.
+  runtimeGpuIndexDuplicate: 'A GPU index is used more than once',
+  runtimeStatusUpstream: 'Reported by the agent',
+  runtimeStatusNameMismatch: 'The agent reports a different model name than the gateway mapping.',
+  runtimeStatusUnresolvedShort: 'Unmatched',
+  runtimeStatusUnresolved:
+    'This process cannot be matched to a model mapping of this application (the stream covers the whole server, the mappings only this application). No override actions are available here.',
+  runtimeAgentNeverReported:
+    'This server has runtime specs configured, but no agent telemetry exists yet: the agent has never reported. The specs stay ineffective until the agent is installed on this server and connected.',
+  // "load", not "parse": the same lead sentence now introduces codes raised
+  // before any parsing (the file is missing, or unreadable). The wire field
+  // keeps its name, `parse_error`.
+  runtimeParseError: 'The agent could not load its local configuration file.',
+  runtimeParseErrorJsonSyntax: 'The file is not valid JSON.',
+  runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
+  runtimeParseErrorFileMissing: 'There is no file at the configured path.',
+  runtimeParseErrorReadFailed:
+    'The file is there but could not be read — check its ownership and permissions.',
+  runtimeParseErrorUnknown: 'The reason was not reported.',
+  runtimeConfigUnavailable: 'The reported configuration is therefore unavailable.',
+  runtimeConfigUnrecognised:
+    'Parts of the reported configuration have an unrecognised shape and are not shown.',
+  runtimeFeatureMismatch:
+    'This server has runtime specs configured, but the agent does not declare the "runtime_manager" feature. The specs stay ineffective until the agent is updated.',
+  // T3, live managed-process output. Every message says WHY the window is
+  // empty -- an unexplained empty window is indistinguishable from "this model
+  // prints nothing", which is the question the operator opened it to answer.
+  runtimeLogs: 'Logs',
+  runtimeLogsTitle: 'Process output',
+  runtimeLogsIntro:
+    "This model process's stdout and stderr, as it wrote them. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
+  runtimeLogsWaiting: 'Connecting…',
+  runtimeLogsEmptyBuffer:
+    "The agent has nothing retained for this process. That is not a statement about whether the process printed anything: the buffer lives only in the agent's memory and is lost when the agent restarts.",
+  runtimeLogsUnsupported:
+    'This server\'s agent does not declare the "runtime_logs" feature. It will never answer the request — this window would stay empty forever. Update the agent.',
+  runtimeLogsOffline:
+    'There is no live connection to this server to request a stream over. Possible reasons: the agent is not running, it is unreachable, or it is configured with the "post" transport, which has no gateway-to-agent direction.',
+  runtimeLogsDisconnected:
+    'The stream connection dropped. Reconnecting; the retained history will be reloaded afterwards.',
+  runtimeLogsProcessStarted: (pid: number) => `Process started (pid ${pid})`,
+  runtimeLogsProcessExited: (code: number) => `Process exited (exit code ${code})`,
+  runtimeLogsDropped: (bytes: number) => `[${bytes} bytes of output are missing here]`,
+  runtimeLogsTrimmed: (bytes: number) =>
+    `Older output is no longer shown in this view (${bytes} bytes). Reopen the window to reload the agent's retained history in full.`,
+  runtimeLogsProcessStartFailed: 'Process did not start',
+  // The command the agent actually executed, attached to that generation's own
+  // start marker. The operator wrote a template; ${PORT}, ${MODEL},
+  // ${HOST_GPU_IDS} and ${AGENT_ENV:NAME} are resolved only at launch -- and
+  // that gap is where the bug usually is.
+  runtimeCommandTitle: 'Executed command',
+  runtimeCommandIntro:
+    'Exactly what the agent launched for this process, with every placeholder resolved at launch time. The environment listed is the process\'s complete environment — it REPLACES the agent\'s rather than adding to it. Deliberately no "copy" button: the port was ephemeral and is stale by now, so pasted into a shell this would not be the same command.',
+  runtimeCommandStartFailedHint:
+    'This attempt produced no process: the exec itself failed. That is also why there is no output — this command is all there is. Check the binary and the working directory first.',
+  runtimeCommandNotRetained:
+    "The agent sent its retained history in full and it begins without a start marker: the agent no longer holds that generation's marker, and with it its executed command — which does not mean none was reported. Reopening will not bring it back; later generations still carry theirs.",
+  runtimeCommandTrimmedHere:
+    "The output shown begins without a start marker because this view trimmed its own oldest entries, not because the agent stopped retaining them. Reopen the window to load the agent's retained history again — if it still holds that generation's marker, its executed command comes with it.",
+  runtimeCommandMasked:
+    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value — the placeholder names the variable to go and check on the AI server. That masking covers this reported command and nothing beyond it: a model server that prints its own command line or environment at startup writes the resolved value into the output below, and into the error tail on the runtime screen. Nothing the agent does can mask what the process itself prints — which is why a secret belongs in "env" as "${AGENT_ENV:NAME}" and never as plain text in an argument.',
+  runtimeCommandEnvRedacted:
+    'This agent takes its launch specs from a local file, so every value the spec itself sets in "env" is withheld in full: the key stays visible, the value is replaced by a mask. That is the same line the agent\'s report to the gateway already draws — a local file is the operator\'s own document and may legitimately hold a plain-text value. There is no placeholder here and nothing to look up. Arguments are not covered: an argument is reported exactly as it was written.',
+  runtimeCommandTruncated:
+    'The command was too long to report in full: some arguments or environment entries are missing here.',
+  runtimeCommandBinary: 'Binary',
+  runtimeCommandArgs: 'Arguments (one per line)',
+  runtimeCommandArgsNone: 'none',
+  runtimeCommandWorkDir: 'Working directory',
+  runtimeCommandWorkDirInherited:
+    "not set — the process inherits the agent's own working directory",
+  runtimeCommandEnv: 'Environment (complete)',
+  runtimeCommandEnvNone: 'empty',
+  runtimeCommandUnknown: 'unknown',
+  runtimeAgentVersion: 'Agent version',
+  runtimeAgentFeatures: 'Declared features',
+  runtimeReportCollectedAt: 'Reported at',
   modelGroups: 'Model groups',
   modelGroupCreate: 'Create group',
   modelGroupEditTitle: 'Edit group',
@@ -2266,6 +2798,24 @@ const en: PortalMessages = {
   errorMappingAppNameRequired: 'Application model name is required',
   errorMappingGatewayNameConflict: 'Gateway model name already exists on this server',
   errorMappingStatusInvalid: 'Invalid mapping status',
+  errorRuntimeSpecNotFound: 'Runtime spec not found',
+  errorRuntimeSpecBinaryRequired:
+    'Binary path is required and must be absolute on the target system (for example /opt/llama/llama-server or C:\\llama\\llama-server.exe)',
+  errorRuntimeSpecArgsInvalid: 'Invalid arguments',
+  errorRuntimeSpecEnvInvalid: 'Invalid environment variables',
+  errorRuntimeSpecGpuInvalid: 'Invalid GPU configuration',
+  errorRuntimeSpecTuningInvalid: 'Timing values must be zero or greater',
+  errorRuntimeSpecAdminStateInvalid: 'Invalid admin state',
+  errorRuntimeSpecVisibleDevicesNoGpus:
+    'Enforcing GPU visibility needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
+  errorRuntimeSpecVisibleDevicesConflict:
+    'This variable is already set by hand. Enforcing GPU visibility and your own entry are two sources for one value — remove one of them.',
+  errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
+  errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
+  errorServerGpuBudgetInvalid: 'Invalid GPU budget',
+  errorServerRuntimeLimitInvalid: 'Invalid process limit',
+  errorApplicationManagedRuntimeOnly: 'This server only accepts agent-managed applications',
+  errorApplicationServerAgentExists: 'This server already has a server_agent application',
   errorBenchmarkAlreadyRunning: 'A benchmark is already running on this server.',
   errorBenchmarkServerInUse: 'The server is in use; try again when idle.',
   errorBenchmarkNoModels: 'No models to benchmark.',

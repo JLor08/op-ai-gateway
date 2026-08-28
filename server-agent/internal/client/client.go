@@ -24,6 +24,10 @@ const telemetryPath = "/api/agent/v1/telemetry"
 // systemReportPath is the gateway's static hardware-inventory ingest route.
 const systemReportPath = "/api/agent/v1/system-report"
 
+// runtimeReportPath is the gateway's file-mode agent-managed-runtime report
+// ingest route (task-9-report.md).
+const runtimeReportPath = "/api/agent/v1/runtime-report"
+
 // maxAttempts bounds the number of POST tries per Post call.
 const maxAttempts = 3
 
@@ -84,6 +88,16 @@ func (c *Client) PostSystemReport(ctx context.Context, r *sample.SystemReport) e
 		return fmt.Errorf("marshal system report: %w", err)
 	}
 	return c.postBody(ctx, c.gatewayURL+systemReportPath, body)
+}
+
+// PostRuntimeReport POSTs an already-built, already-redacted file-mode
+// runtime report (internal/runtime.BuildReport) to the gateway with the same
+// bearer + retry/backoff discipline as Post/PostSystemReport. raw is sent
+// byte-for-byte: redaction happened at the point the report was built, and
+// this transport must never re-marshal (and so must never risk
+// re-introducing) anything it was handed.
+func (c *Client) PostRuntimeReport(ctx context.Context, raw json.RawMessage) error {
+	return c.postBody(ctx, c.gatewayURL+runtimeReportPath, raw)
 }
 
 // postBody runs the bearer-authenticated POST-with-retry loop against url.

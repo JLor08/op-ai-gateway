@@ -18,6 +18,19 @@ const DEFAULT_OPTIONS: { trackLoading?: boolean } = {};
  * sites mutate `data` directly for an optimistic local update decoupled from
  * the next fetch -- see GroupsView.tsx) that this hook re-seeds whenever a
  * fetch settles.
+ *
+ * Note the two facts a call site has to keep in mind, both of which
+ * `shared/ResourceFallback.tsx`'s `resourceState` exists to name:
+ *
+ *  - a FAILED fetch sets `error` and leaves `data` exactly as it was. After a
+ *    first failure that is `null`; after a failed RELOAD (or a deps change,
+ *    e.g. a server switch) it is the previous, possibly wrong, payload. So
+ *    `!loading && data !== null` is not "ready";
+ *  - `data === null` is the only "no payload yet" signal there is, so a loader
+ *    that legitimately resolves `null` is indistinguishable from one that has
+ *    never run. Such a call site must wrap its payload (resolve
+ *    `{ value: T | null }`); the type system cannot catch it, see
+ *    `resourceState`'s doc comment.
  */
 export function useResource<T>(
   loader: () => Promise<T>,

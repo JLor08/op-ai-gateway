@@ -639,6 +639,165 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/mappings/{id}/runtime-spec:
+    description: >
+      Agent-managed model runtime: the launch specification for one mapping.
+      PUT is a full-document replace, never a delta.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Read a mapping's launch spec (configured=false when none exists)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [portal]
+      summary: Replace a mapping's launch spec (full document)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [portal]
+      summary: Delete a mapping's launch spec (ungated by application type, deliberately)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        # Two distinct 404s, as on get/put: runtime_spec.not_found when the
+        # mapping carries no spec row, and mapping.not_found from the
+        # authorization no-leak collapse.
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/applications/{id}/runtime/coresidency:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: The application's co-residency pair list (canonical order)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Replace the application's complete co-residency pair list
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/applications/{id}/runtime/warnings:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Opaque runtime warning codes ({"warnings":[...]}), a pure derivation
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/servers/{id}/gpu-budgets:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Per-GPU VRAM budgets ({"budgets":[...]})
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    put:
+      tags: [portal]
+      summary: Replace the server's complete per-GPU budget list
+      description: >
+        expected_uuid/expected_name are never client-writable; the server
+        snapshots them once per GPU index and preserves them afterwards.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/servers/{id}/runtime/report:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: A file-mode agent's reported effective runtime configuration
+      description: >
+        Hardware-panel envelope: {available, collected_at?, updated_at?,
+        report?, agent_version, agent_features}. report is both optional and
+        nullable. available=false means no report was ever stored, not an error.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/servers/{id}/runtime/events:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Live per-spec runtime status (SSE)
+      description: >
+        text/event-stream. Events "snapshot" and "update" both carry the
+        COMPLETE row set wrapped as {"runtimes":[...]} — not {"data":[...]}
+        like the other portal streams — so a consumer replaces, never appends.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/SSE' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/servers/{id}/runtime/logs:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Live stdout+stderr of one managed model process (SSE)
+      description: >
+        text/event-stream. A "status" event states whether a live stream is
+        possible at all -- {"state":"streaming"|"unsupported"|"offline"} -- and
+        is re-sent whenever that changes, so an empty window always carries a
+        reason. Then a "log" event per agent flush:
+        {"spec_id","scrollback","entries":[...]}. The FIRST log event carries
+        scrollback=true and replays the agent's retained history (possibly
+        empty, which means the agent's buffer holds nothing); a consumer must
+        RESET on it, never append, because a reconnect delivers a fresh one.
+        That guarantee is per subscriber and does not depend on the size of the
+        history: a large one crosses the agent-to-gateway hop as several frames,
+        but the gateway always forwards it as ONE scrollback=true event followed
+        by ordinary appends, so a consumer needs no notion of chunking.
+        Each entry is either verbatim process output ("text") or a boundary
+        marker from the closed set ("event": started|exited|start_failed).
+        "start_failed" opens a generation whose exec itself failed, so it has no
+        pid, no exit code, and no output will follow it.
+        An OPENING marker ("started" or "start_failed") additionally carries
+        "command": the launch command that generation actually ran, resolved --
+        {"binary","args","work_dir","env","masked","env_redacted","truncated"}.
+        Every ${AGENT_ENV:NAME}-derived value is replaced agent-side by its
+        own placeholder ("masked": true); on a file-mode agent every value
+        the spec sets in "env" is additionally withheld in full, keys intact
+        ("env_redacted": true). The two are independent reasons and both can
+        be set at once. The masking covers the REPORTED COMMAND only -- a
+        model server that prints its own argv at startup puts the resolved
+        value into this stream, and nothing agent-side can mask that. The
+        gateway drops over-long entries whole ("truncated": true) and never
+        re-masks, and the field is stripped from any entry that is not an
+        opening marker. On a spec that fails to start
+        it is the entire content of this view. "dropped_bytes" on an entry means
+        N bytes the process printed are missing immediately
+        before it. Nothing on this path is persisted -- not to disk, not to the
+        database. Subscribing is what makes the agent stream this spec, and
+        unsubscribing is what stops it.
+        Error codes: 400 runtime_logs.spec_required (spec_id absent),
+        400 runtime_logs.spec_invalid (spec_id too long -- the id is also
+        shipped to the agent inside the watch command, so it is rejected rather
+        than clamped), 503 runtime_logs.too_many_specs (this server already has
+        the maximum number of distinct specs under view).
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: spec_id, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/SSE' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/portal/agent-binaries:
     get:
       tags: [portal]
@@ -1241,7 +1400,12 @@ paths:
       summary: Persistent telemetry stream (WebSocket upgrade)
       description: >
         WebSocket transport for telemetry plus server-pushed doorbells
-        (e.g. certificate updates).
+        (e.g. certificate updates). Two frames carry payloads rather than
+        acting as doorbells: gateway to agent `runtime_config` (the COMPLETE
+        runtime-config document plus its etag, best-effort, never a delta) and
+        agent to gateway `runtime_report` (no per-frame ack; a malformed frame
+        is skipped with the connection kept open, an unknown server closes with
+        1008, a store error with 1011).
       security: [{ agentToken: [] }]
       responses:
         '101': { description: Switching Protocols (WebSocket) }
@@ -1279,6 +1443,56 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/features:
+    get:
+      tags: [agent]
+      summary: The gateway's declared feature list (capability negotiation)
+      description: >
+        {"features":[...]}. ETag-conditional; the validator is carried in the
+        ETag HEADER ONLY (no in-body etag field), unlike /runtime-config. A 404
+        from an older gateway is not an error — the agent reads it as the empty
+        feature set. Cache-Control: no-store.
+      security: [{ agentToken: [] }]
+      parameters:
+        - { name: If-None-Match, in: header, required: false, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '304': { description: Not modified (empty body) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/runtime-config:
+    get:
+      tags: [agent]
+      summary: Desired agent-managed runtime state for the caller's own server
+      description: >
+        The server id comes only from the agent token, never a parameter.
+        ETag-conditional; the validator appears BOTH in the ETag header
+        (quoted) and as an in-body `etag` field, because the same document is
+        also pushed as a WebSocket `runtime_config` frame that has no headers.
+        A server with no server_agent application gets a fully zeroed document
+        as a normal 200, never an error. Cache-Control: no-store.
+      security: [{ agentToken: [] }]
+      parameters:
+        - { name: If-None-Match, in: header, required: false, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '304': { description: Not modified (empty body) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/agent/v1/runtime-report:
+    post:
+      tags: [agent]
+      summary: Ingest a file-mode agent's effective runtime configuration
+      description: >
+        Env values are already masked agent-side; the gateway re-masks
+        structurally as defence in depth. An empty or unparseable config
+        degrades rather than rejecting the report. Answers
+        {"accepted":true,"server_id":"..."}.
+      security: [{ agentToken: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/agent/v1/download/{path}:
     get:
       tags: [agent]
@@ -1366,6 +1580,13 @@ components:
       content:
         application/json:
           schema: { type: object }
+    BadRequest:
+      description: >
+        Invalid request payload — the Error envelope carries the stable
+        validation code (see api-surface.md).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     SSE:
       description: Server-sent event stream
       content:
@@ -1385,6 +1606,13 @@ components:
       description: >
         Not found — also returned for objects outside the caller's manageable
         set (no-existence-leak policy).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: >
+        Temporarily refused — the Error envelope carries the stable code (see
+        api-surface.md).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -1432,4 +1660,58 @@ components:
         latency_ms: { type: number }
         error_rate: { type: number }
         provider_health: { type: object, additionalProperties: true }
-        capabilities: { type: object, additionalProperties: true }
+        capabilities:
+          type: object
+          additionalProperties: true
+          description: >
+            Capability negotiation, agent to gateway. Exactly one key is read:
+            {"features":[...]}. Everything else is ignored, so a new key is a
+            backward-compatible addition. Do NOT put agent_version here — the
+            version rides on the top-level agent_version field, which is the
+            only one the gateway persists and the portal renders.
+        loaded_models:
+          type: array
+          items: { type: string }
+          description: >
+            When an agent-managed model runtime is active this is overridden
+            authoritatively to contain only specs in state "running";
+            "starting" deliberately does not count.
+        runtimes:
+          type: array
+          description: >
+            Per-managed-spec runtime status. ABSENT entirely (not null, not [])
+            when the agent has no runtime driver — the compatibility guarantee
+            for agents that never negotiate the feature. An agent that DOES
+            support it must send the full current snapshot on EVERY sample: the
+            gateway replaces its per-server snapshot from each sample, so
+            sending the key only when something changed makes the portal's live
+            table flicker empty.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              spec_id: { type: string }
+              model: { type: string }
+              state:
+                type: string
+                enum: [stopped, starting, running, draining, backoff, start_failed, crashed, pending_vram_unknown, not_permitted]
+              since: { type: string, format: date-time }
+              pid: { type: integer }
+              port: { type: integer }
+              in_flight: { type: integer }
+              restarts: { type: integer }
+              gpus:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    index: { type: integer }
+                    vram_measured_mb: { type: integer }
+              last_error:
+                type: object
+                properties:
+                  message: { type: string }
+                  at: { type: string, format: date-time }
+                  exit_code: { type: integer }
+                  failures: { type: integer }
+                  stderr_tail: { type: string }

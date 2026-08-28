@@ -1747,10 +1747,15 @@ func TestConformanceServerNetbirdPingExclude(t *testing.T) {
 
 // TestConformanceServerAgentPresenceTimeoutSeconds exercises the migration-v31
 // ai_servers.agent_presence_timeout_seconds int column (0 = follow the
-// system-wide default): it round-trips a non-zero value through create ->
-// every read path (AIServerByID / AIServers / ServersByOwner, both scan
-// sites), a second server created without the field defaults to 0, and a
-// full UpdateAIServer changes + persists the value end-to-end. Both dialects.
+// system-wide default) AND (Task 3) migration 66's two additive
+// runtime_max_processes / managed_runtime_only columns: it round-trips
+// non-zero/non-default values through create -> every read path
+// (AIServerByID / AIServers / ServersByOwner, all scan sites), a second
+// server created without the fields defaults to 0/false, and a full
+// UpdateAIServer changes + persists the values end-to-end (including flipping
+// runtime_max_processes and managed_runtime_only to DIFFERENT values, which
+// would fail if any of the insert/update/select/scan sites were missed).
+// Both dialects.
 func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -1761,6 +1766,8 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 			Provider: routing.ProviderVLLM, Endpoint: "http://e",
 			Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			AgentPresenceTimeoutSeconds: 42,
+			RuntimeMaxProcesses:         3,
+			ManagedRuntimeOnly:          true,
 			CreatedAt:                   now, UpdatedAt: now,
 		}
 		if err := s.CreateUser(ctx, newTestUser("usr_apt", "apt@example.test", now)); err != nil {
@@ -1790,6 +1797,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		if gotDef.AgentPresenceTimeoutSeconds != 0 {
 			t.Fatalf("agent_presence_timeout_seconds defaulted to %d, want 0", gotDef.AgentPresenceTimeoutSeconds)
 		}
+		if gotDef.RuntimeMaxProcesses != 0 {
+			t.Fatalf("runtime_max_processes defaulted to %d, want 0", gotDef.RuntimeMaxProcesses)
+		}
+		if gotDef.ManagedRuntimeOnly {
+			t.Fatal("managed_runtime_only defaulted to true, want false")
+		}
 
 		// Round-trips through all three read paths (both scan sites).
 		got, err := s.AIServerByID(ctx, srv.ID)
@@ -1798,6 +1811,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		}
 		if got.AgentPresenceTimeoutSeconds != 42 {
 			t.Fatalf("AIServerByID agent_presence_timeout_seconds = %d, want 42", got.AgentPresenceTimeoutSeconds)
+		}
+		if got.RuntimeMaxProcesses != 3 {
+			t.Fatalf("AIServerByID runtime_max_processes = %d, want 3", got.RuntimeMaxProcesses)
+		}
+		if !got.ManagedRuntimeOnly {
+			t.Fatal("AIServerByID managed_runtime_only = false, want true")
 		}
 		all, err := s.AIServers(ctx)
 		if err != nil {
@@ -1809,16 +1828,21 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 				listed = &all[i]
 			}
 		}
-		if listed == nil || listed.AgentPresenceTimeoutSeconds != 42 {
-			t.Fatalf("AIServers agent_presence_timeout_seconds round-trip: %+v", listed)
+		if listed == nil || listed.AgentPresenceTimeoutSeconds != 42 || listed.RuntimeMaxProcesses != 3 || !listed.ManagedRuntimeOnly {
+			t.Fatalf("AIServers agent_presence_timeout_seconds/runtime round-trip: %+v", listed)
 		}
 		owned, err := s.ServersByOwner(ctx, "usr_apt")
-		if err != nil || len(owned) != 1 || owned[0].AgentPresenceTimeoutSeconds != 42 {
-			t.Fatalf("ServersByOwner agent_presence_timeout_seconds round-trip: err=%v %+v", err, owned)
+		if err != nil || len(owned) != 1 || owned[0].AgentPresenceTimeoutSeconds != 42 || owned[0].RuntimeMaxProcesses != 3 || !owned[0].ManagedRuntimeOnly {
+			t.Fatalf("ServersByOwner agent_presence_timeout_seconds/runtime round-trip: err=%v %+v", err, owned)
 		}
 
-		// A full UpdateAIServer changes + persists a new value end-to-end.
+		// A full UpdateAIServer changes + persists new values end-to-end,
+		// flipping runtime_max_processes and managed_runtime_only to
+		// DIFFERENT values (not just toggling a bool) so a missed set-list/
+		// arg/scan site cannot hide behind reusing the same value.
 		got.AgentPresenceTimeoutSeconds = 99
+		got.RuntimeMaxProcesses = 7
+		got.ManagedRuntimeOnly = false
 		got.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateAIServer(ctx, got); err != nil {
 			t.Fatalf("full update: %v", err)
@@ -1830,9 +1854,17 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		if reread.AgentPresenceTimeoutSeconds != 99 {
 			t.Fatalf("full update did not persist agent_presence_timeout_seconds=99, got %d", reread.AgentPresenceTimeoutSeconds)
 		}
+		if reread.RuntimeMaxProcesses != 7 {
+			t.Fatalf("full update did not persist runtime_max_processes=7, got %d", reread.RuntimeMaxProcesses)
+		}
+		if reread.ManagedRuntimeOnly {
+			t.Fatal("full update did not persist managed_runtime_only=false")
+		}
 
-		// Back to 0 (follow-system) round-trips too.
+		// Back to 0/false (follow-system / unrestricted) round-trips too.
 		reread.AgentPresenceTimeoutSeconds = 0
+		reread.RuntimeMaxProcesses = 0
+		reread.ManagedRuntimeOnly = false
 		reread.UpdatedAt = now.Add(2 * time.Minute)
 		if err := s.UpdateAIServer(ctx, reread); err != nil {
 			t.Fatalf("full update (reset to 0): %v", err)
@@ -1843,6 +1875,12 @@ func TestConformanceServerAgentPresenceTimeoutSeconds(t *testing.T) {
 		}
 		if final.AgentPresenceTimeoutSeconds != 0 {
 			t.Fatalf("full update did not persist agent_presence_timeout_seconds=0, got %d", final.AgentPresenceTimeoutSeconds)
+		}
+		if final.RuntimeMaxProcesses != 0 {
+			t.Fatalf("full update did not persist runtime_max_processes=0, got %d", final.RuntimeMaxProcesses)
+		}
+		if final.ManagedRuntimeOnly {
+			t.Fatal("full update did not persist managed_runtime_only=false")
 		}
 	})
 }
@@ -2568,6 +2606,64 @@ func TestConformanceServerHardware(t *testing.T) {
 		orphan := routing.ServerHardware{ServerID: "nope", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
 		if err := s.UpsertServerHardware(ctx, orphan); err != ErrNotFound {
 			t.Fatalf("UpsertServerHardware(missing server) = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestConformanceServerRuntimeReports mirrors TestConformanceServerHardware's
+// shape verbatim: server_runtime_reports (migration 67) is deliberately
+// shaped exactly like server_hardware (1:1 per server, upsert-overwrite, one
+// opaque validated JSON blob the store never parses).
+func TestConformanceServerRuntimeReports(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+
+		srv := routing.AIServer{
+			ID: "rr1", Name: "rr1", Domain: "rr1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://rr1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateAIServer(ctx, srv); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		// Absent -> (zero, false, nil).
+		if _, ok, err := s.ServerRuntimeReportByServer(ctx, "rr1"); err != nil || ok {
+			t.Fatalf("ServerRuntimeReportByServer(absent) = ok=%v err=%v, want ok=false", ok, err)
+		}
+
+		// Insert, then round-trip.
+		first := routing.ServerRuntimeReport{
+			ServerID: "rr1", CollectedAt: now, ReportJSON: `{"mode":"file","binary":"/usr/bin/llama-server"}`, UpdatedAt: now,
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, first); err != nil {
+			t.Fatalf("UpsertServerRuntimeReport(insert): %v", err)
+		}
+		got, ok, err := s.ServerRuntimeReportByServer(ctx, "rr1")
+		if err != nil || !ok {
+			t.Fatalf("ServerRuntimeReportByServer = ok=%v err=%v, want ok=true", ok, err)
+		}
+		if got.ReportJSON != `{"mode":"file","binary":"/usr/bin/llama-server"}` || !got.CollectedAt.Equal(now) || !got.UpdatedAt.Equal(now) {
+			t.Fatalf("round-trip = %#v", got)
+		}
+
+		// Upsert overwrites the same server row (still exactly one; report replaced).
+		second := routing.ServerRuntimeReport{
+			ServerID: "rr1", CollectedAt: now.Add(time.Minute), ReportJSON: `{"mode":"file","binary":"/usr/bin/vllm"}`, UpdatedAt: now.Add(time.Minute),
+		}
+		if err := s.UpsertServerRuntimeReport(ctx, second); err != nil {
+			t.Fatalf("UpsertServerRuntimeReport(overwrite): %v", err)
+		}
+		got, ok, err = s.ServerRuntimeReportByServer(ctx, "rr1")
+		if err != nil || !ok || got.ReportJSON != `{"mode":"file","binary":"/usr/bin/vllm"}` || !got.CollectedAt.Equal(now.Add(time.Minute)) {
+			t.Fatalf("after overwrite = %#v ok=%v err=%v", got, ok, err)
+		}
+
+		// Missing server -> ErrNotFound (FK violation classified).
+		orphan := routing.ServerRuntimeReport{ServerID: "nope", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
+		if err := s.UpsertServerRuntimeReport(ctx, orphan); err != ErrNotFound {
+			t.Fatalf("UpsertServerRuntimeReport(missing server) = %v, want ErrNotFound", err)
 		}
 	})
 }
@@ -7467,4 +7563,405 @@ func TestConformanceServerHTTPSSwitchOverride(t *testing.T) {
 			t.Fatal("expected ErrNotFound for an unknown server")
 		}
 	})
+}
+
+// --- Agent runtime manager: launch specs + per-GPU VRAM rows (T1) ----------
+
+// TestConformanceRuntimeSpecs proves the agent-runtime-manager persistence
+// (migration 65: agent_runtime_specs, agent_runtime_spec_gpus) behaves
+// identically on both dialects: absent read, upsert-by-mapping (1 spec per
+// mapping, CreatedAt preserved across an overwrite), listing by application,
+// atomic GPU-row replace with ordered read, the measured-vs-estimate write
+// isolation (UpdateRuntimeSpecGPUMeasured never touches vram_estimate_mb),
+// the FK-before-unique error classification on a missing mapping, and
+// delete + GPU-row cascade.
+func TestConformanceRuntimeSpecs(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedRuntimeParents(t, s, now) // helper below: server srv_rt + app app_rt + mapping map_rt
+		// Absent -> (zero, false, nil)
+		if _, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt"); err != nil || ok {
+			t.Fatalf("absent spec: ok=%v err=%v", ok, err)
+		}
+		spec := routing.RuntimeSpec{
+			ID: "rspec_1", MappingID: "map_rt", Enabled: true,
+			Binary: "/usr/bin/llama-server", Args: `["--port","${PORT}"]`,
+			Env: `{"HF_TOKEN":"${AGENT_ENV:HF_TOKEN}"}`, WorkDir: "/srv/models",
+			ListenPort: 0, HealthPath: "/health", HealthTimeoutSeconds: 5,
+			StartupTimeoutSeconds: 180, IdleTimeoutSeconds: 900,
+			AdmissionWaitTimeoutSeconds: 30, Pinned: true,
+			AdminState: "force_running", VRAMLocked: true,
+			SetVisibleDevices: true,
+			CreatedAt:         now, UpdatedAt: now,
+		}
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		got, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt")
+		if err != nil || !ok {
+			t.Fatalf("read back: ok=%v err=%v", ok, err)
+		}
+		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
+			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
+			got.AdminState != "force_running" || got.AdmissionWaitTimeoutSeconds != 30 ||
+			!got.CreatedAt.Equal(now) {
+			t.Fatalf("round-trip mismatch: %+v", got)
+		}
+		// RuntimeSpecByID: the same row, keyed by its own primary key rather
+		// than its owning mapping (the telemetry VRAM write-back path's point
+		// read). Absent -> (zero, false, nil), mirroring RuntimeSpecByMapping.
+		gotByID, ok, err := s.RuntimeSpecByID(ctx, "rspec_1")
+		if err != nil || !ok {
+			t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+		}
+		if gotByID.Binary != spec.Binary || gotByID.MappingID != "map_rt" {
+			t.Fatalf("RuntimeSpecByID mismatch: %+v", gotByID)
+		}
+		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_missing"); err != nil || ok {
+			t.Fatalf("RuntimeSpecByID absent: ok=%v err=%v", ok, err)
+		}
+		// Upsert on the same mapping overwrites (1 spec per mapping)
+		spec.Binary = "/usr/bin/vllm"
+		spec.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert overwrite: %v", err)
+		}
+		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt")
+		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
+			t.Fatalf("overwrite must keep created_at, got %+v", got)
+		}
+		// A spec id reused for a DIFFERENT mapping is a primary-key
+		// collision: the upsert's conflict target is mapping_id ALONE, so a
+		// colliding id is never absorbed by the do-update branch. map_rt2
+		// (seeded by seedRuntimeParents) deliberately has no spec of its own
+		// yet, so the id primary key is the only constraint this insert can
+		// violate -- targeting a mapping that already had a spec would make
+		// WHICH constraint fires first ambiguous between the dialects, and
+		// that ambiguity is not what this asserts.
+		reusedID := spec
+		reusedID.MappingID = "map_rt2"
+		if err := s.UpsertRuntimeSpec(ctx, reusedID); err != ErrConflict {
+			t.Fatalf("spec id reused for another mapping: want ErrConflict, got %v", err)
+		}
+		if _, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2"); err != nil || ok {
+			t.Fatalf("rejected id-reuse upsert must not have written anything: ok=%v err=%v", ok, err)
+		}
+
+		// List by application, ordered by spec id. Asserting the order needs
+		// at least TWO rows written in the WRONG order: against a single row
+		// a broken ORDER BY still passes. "rspec_0" sorts BEFORE the
+		// already-written "rspec_1" and is written second.
+		second := spec
+		second.ID, second.MappingID = "rspec_0", "map_rt2"
+		if err := s.UpsertRuntimeSpec(ctx, second); err != nil {
+			t.Fatalf("upsert second spec: %v", err)
+		}
+		specs, err := s.RuntimeSpecsByApplication(ctx, "app_rt")
+		if err != nil || len(specs) != 2 {
+			t.Fatalf("by application: err=%v n=%d, want 2", err, len(specs))
+		}
+		if specs[0].ID != "rspec_0" || specs[1].ID != "rspec_1" {
+			t.Fatalf("specs must read ordered by id, got [%s %s]", specs[0].ID, specs[1].ID)
+		}
+		// Leave only rspec_1 behind, so the GPU-row and delete assertions
+		// below still describe a single-spec application.
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_0"); err != nil {
+			t.Fatalf("delete second spec: %v", err)
+		}
+		// GPU rows: atomic replace + ordered read
+		gpus := []routing.RuntimeSpecGPU{
+			{SpecID: "rspec_1", GPUIndex: 1, VRAMEstimateMB: 21500},
+			{SpecID: "rspec_1", GPUIndex: 0, VRAMEstimateMB: 22000},
+		}
+		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_1", gpus); err != nil {
+			t.Fatalf("set gpus: %v", err)
+		}
+		gotGPUs, err := s.RuntimeSpecGPUs(ctx, "rspec_1")
+		if err != nil || len(gotGPUs) != 2 || gotGPUs[0].GPUIndex != 0 || gotGPUs[1].GPUIndex != 1 {
+			t.Fatalf("gpus must read ordered by index: %v %+v", err, gotGPUs)
+		}
+		// Measurement write-back
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", 0, 21800); err != nil {
+			t.Fatalf("measured: %v", err)
+		}
+		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_1")
+		if gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[0].VRAMEstimateMB != 22000 {
+			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[0])
+		}
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", 7, 1); err != ErrNotFound {
+			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
+		}
+		// Duplicate GPUIndex within one set hits the composite primary key
+		// (spec_id, gpu_index) on insert -> ErrConflict (not a wrapped
+		// generic error), mirroring UpsertRuntimeSpec/SetCoResidencyRules'
+		// unique-violation classification in the same file. The failed
+		// transaction must also leave the previous set untouched.
+		dupGPUs := []routing.RuntimeSpecGPU{
+			{SpecID: "rspec_1", GPUIndex: 0, VRAMEstimateMB: 1000},
+			{SpecID: "rspec_1", GPUIndex: 0, VRAMEstimateMB: 2000},
+		}
+		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_1", dupGPUs); err != ErrConflict {
+			t.Fatalf("duplicate gpu_index: want ErrConflict, got %v", err)
+		}
+		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_1")
+		if len(gotGPUs) != 2 || gotGPUs[0].GPUIndex != 0 || gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[1].GPUIndex != 1 {
+			t.Fatalf("failed duplicate-index set must not clobber the previous set: %+v", gotGPUs)
+		}
+		// FK: spec on a missing mapping -> ErrNotFound
+		orphan := spec
+		orphan.ID, orphan.MappingID = "rspec_orphan", "map_missing"
+		if err := s.UpsertRuntimeSpec(ctx, orphan); err != ErrNotFound {
+			t.Fatalf("orphan spec: want ErrNotFound, got %v", err)
+		}
+		// Delete + cascade of GPU rows
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_1"); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_1"); err != ErrNotFound {
+			t.Fatalf("double delete: want ErrNotFound, got %v", err)
+		}
+		if gotGPUs, err = s.RuntimeSpecGPUs(ctx, "rspec_1"); err != nil || len(gotGPUs) != 0 {
+			t.Fatalf("gpu rows must cascade: %v %d", err, len(gotGPUs))
+		}
+		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_1"); err != nil || ok {
+			t.Fatalf("RuntimeSpecByID after delete: ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestConformanceCoResidencyRules proves the co-residency matrix (migration
+// 65: agent_coresidency_rules) behaves identically on both dialects: empty by
+// default, atomic full replace (set + ordered read, then clear via an
+// empty/nil set), unknown-application ErrNotFound, and the FK-before-unique
+// classification when a rule names a mapping id that does not exist. The
+// store itself does not enforce or rewrite the MappingAID < MappingBID
+// canonical ordering — that is portal-level validation added in Task 6.
+func TestConformanceCoResidencyRules(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedRuntimeParents(t, s, now)
+		// Empty by default
+		rules, err := s.CoResidencyRulesByApplication(ctx, "app_rt")
+		if err != nil || len(rules) != 0 {
+			t.Fatalf("default: %v %d", err, len(rules))
+		}
+		if rules == nil {
+			t.Fatal("default must be non-nil, empty")
+		}
+		// Set + ordered read (order by mapping_a_id, mapping_b_id). THREE
+		// pairs, submitted in fully reversed order, so both halves of the
+		// ORDER BY are actually exercised: the two (map_rt, *) pairs pin the
+		// mapping_b_id tie-break and (map_rt2, map_rt3) pins the primary key.
+		// A single-pair assertion could not fail against a broken ORDER BY at
+		// all.
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_rt3", ApplicationID: "app_rt", GatewayModelName: "map_rt3-model",
+			AppModelName: "map_rt3-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed third mapping: %v", err)
+		}
+		want := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt2", MappingBID: "map_rt3", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt3", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt")
+		if len(rules) != 3 {
+			t.Fatalf("read back: %+v, want 3", rules)
+		}
+		for i, w := range [][2]string{{"map_rt", "map_rt2"}, {"map_rt", "map_rt3"}, {"map_rt2", "map_rt3"}} {
+			if rules[i].MappingAID != w[0] || rules[i].MappingBID != w[1] {
+				t.Fatalf("position %d = (%s, %s), want (%s, %s); full read: %+v",
+					i, rules[i].MappingAID, rules[i].MappingBID, w[0], w[1], rules)
+			}
+		}
+
+		// An EXACT duplicate pair within one set hits the composite primary
+		// key (application_id, mapping_a_id, mapping_b_id) -> ErrConflict, and
+		// the failed transaction must leave the previous three pairs intact.
+		dupPairs := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", dupPairs); err != ErrConflict {
+			t.Fatalf("exact duplicate pair: want ErrConflict, got %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 3 {
+			t.Fatalf("failed duplicate-pair set must not partially apply: %+v", rules)
+		}
+		// The reversed pair (b, a) is a DISTINCT row for the composite PK --
+		// the store neither enforces nor rewrites the canonical ordering
+		// (that is portal-level validation), so this must be accepted.
+		reversedOK := []routing.CoResidencyRule{
+			{ApplicationID: "app_rt", MappingAID: "map_rt", MappingBID: "map_rt2", CreatedAt: now},
+			{ApplicationID: "app_rt", MappingAID: "map_rt2", MappingBID: "map_rt", CreatedAt: now},
+		}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", reversedOK); err != nil {
+			t.Fatalf("reversed pair must not be treated as a duplicate by the store: %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 2 {
+			t.Fatalf("reversed pair set: %+v, want 2", rules)
+		}
+		// Full replace with empty clears
+		if err := s.SetCoResidencyRules(ctx, "app_rt", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if rules, _ = s.CoResidencyRulesByApplication(ctx, "app_rt"); len(rules) != 0 {
+			t.Fatalf("clear must empty the set: %+v", rules)
+		}
+		if rules == nil {
+			t.Fatal("cleared read must be non-nil, empty")
+		}
+		// Unknown application -> ErrNotFound
+		if err := s.SetCoResidencyRules(ctx, "app_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown app: want ErrNotFound, got %v", err)
+		}
+		// FK: rule naming a missing mapping -> ErrNotFound
+		bad := []routing.CoResidencyRule{{ApplicationID: "app_rt", MappingAID: "map_missing", MappingBID: "map_rt", CreatedAt: now}}
+		if err := s.SetCoResidencyRules(ctx, "app_rt", bad); err != ErrNotFound {
+			t.Fatalf("missing mapping: want ErrNotFound, got %v", err)
+		}
+	})
+}
+
+// TestConformanceServerGPUBudgets proves the per-GPU VRAM budget table
+// (migration 66, Task 3: ai_server_gpu_budgets) behaves identically on both
+// dialects: empty by default, atomic full replace (two budgets set for
+// indexes 1 and 0 deliberately out of order, ordered read by gpu_index, then
+// a full replace with a different set), clear via a nil set, and
+// unknown-server ErrNotFound. BudgetMB 0 means "no budget" = unconstrained —
+// the store just persists the value, it never interprets it, and a 0 row is
+// asserted to survive the round trip AS 0 on both dialects (a driver that
+// coerced it to NULL, or dropped the row, would break the layer above: the
+// agent's admission policy relies on receiving that 0 to skip the GPU, and
+// the portal keeps the row's expected_uuid/expected_name drift snapshot on
+// it).
+func TestConformanceServerGPUBudgets(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedRuntimeParents(t, s, now) // server srv_rt
+
+		// Empty by default, and non-nil.
+		budgets, err := s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 0 {
+			t.Fatalf("default: %v %d", err, len(budgets))
+		}
+		if budgets == nil {
+			t.Fatal("default must be non-nil, empty")
+		}
+
+		// Set two budgets, indexes 1 then 0 (deliberately out of order) ->
+		// must read back ordered by gpu_index (a broken order-by or sort
+		// comparator would still pass a single-row assertion; Task 2's
+		// review flagged exactly that, hence two rows here).
+		want := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 1, BudgetMB: 12000, ExpectedUUID: "GPU-1", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 24000, ExpectedUUID: "GPU-0", ExpectedName: "RTX 4090", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", want); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 2 {
+			t.Fatalf("read back: %v %d", err, len(budgets))
+		}
+		if budgets[0].GPUIndex != 0 || budgets[0].BudgetMB != 24000 || budgets[0].ExpectedUUID != "GPU-0" || budgets[0].ExpectedName != "RTX 4090" {
+			t.Fatalf("position 0 must be gpu_index 0: %+v", budgets[0])
+		}
+		if budgets[1].GPUIndex != 1 || budgets[1].BudgetMB != 12000 || budgets[1].ExpectedUUID != "GPU-1" {
+			t.Fatalf("position 1 must be gpu_index 1: %+v", budgets[1])
+		}
+
+		// Full replace with a different set overwrites the previous one.
+		replacement := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 8000, ExpectedUUID: "GPU-0b", ExpectedName: "A100", CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", replacement); err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 1 || budgets[0].BudgetMB != 8000 || budgets[0].ExpectedUUID != "GPU-0b" {
+			t.Fatalf("replace must overwrite the previous set: %v %+v", err, budgets)
+		}
+
+		// A BudgetMB of 0 -- "no budget for this GPU" = unconstrained -- is
+		// persisted and read back as 0, alongside a real budget on another
+		// index, with the expected_* snapshot on the zero row intact. This
+		// is the store-level half of the contract the agent's admission
+		// policy depends on: it can only treat a 0 as unconstrained if a 0
+		// actually reaches it.
+		withZero := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 0, ExpectedUUID: "GPU-0z", ExpectedName: "A100", CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 1, BudgetMB: 16000, CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", withZero); err != nil {
+			t.Fatalf("set with a zero budget: %v", err)
+		}
+		budgets, err = s.ServerGPUBudgets(ctx, "srv_rt")
+		if err != nil || len(budgets) != 2 {
+			t.Fatalf("read back zero budget: %v %d", err, len(budgets))
+		}
+		if budgets[0].GPUIndex != 0 || budgets[0].BudgetMB != 0 || budgets[0].ExpectedUUID != "GPU-0z" {
+			t.Fatalf("a 0 budget must round-trip as 0 with its expected_* intact: %+v", budgets[0])
+		}
+		if budgets[1].GPUIndex != 1 || budgets[1].BudgetMB != 16000 {
+			t.Fatalf("a real budget alongside a 0 one must survive unchanged: %+v", budgets[1])
+		}
+
+		// Full replace with a nil set clears, still non-nil on read.
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", nil); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if budgets, err = s.ServerGPUBudgets(ctx, "srv_rt"); err != nil || len(budgets) != 0 {
+			t.Fatalf("clear must empty the set: %v %+v", err, budgets)
+		}
+		if budgets == nil {
+			t.Fatal("cleared read must be non-nil, empty")
+		}
+
+		// Duplicate GPUIndex within one set hits the composite primary key
+		// (server_id, gpu_index) on insert -> ErrConflict (not a wrapped
+		// generic error), mirroring UpsertRuntimeSpec/SetCoResidencyRules'
+		// unique-violation classification in the same file. The failed
+		// transaction must also leave the previous (empty) set untouched.
+		dup := []routing.ServerGPUBudget{
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 1000, CreatedAt: now, UpdatedAt: now},
+			{ServerID: "srv_rt", GPUIndex: 0, BudgetMB: 2000, CreatedAt: now, UpdatedAt: now},
+		}
+		if err := s.SetServerGPUBudgets(ctx, "srv_rt", dup); err != ErrConflict {
+			t.Fatalf("duplicate gpu_index: want ErrConflict, got %v", err)
+		}
+		if budgets, err := s.ServerGPUBudgets(ctx, "srv_rt"); err != nil || len(budgets) != 0 {
+			t.Fatalf("failed duplicate-index set must not partially apply: %v %+v", err, budgets)
+		}
+
+		// Unknown server -> ErrNotFound.
+		if err := s.SetServerGPUBudgets(ctx, "srv_missing", nil); err != ErrNotFound {
+			t.Fatalf("unknown server: want ErrNotFound, got %v", err)
+		}
+	})
+}
+
+// seedRuntimeParents creates server srv_rt, server_agent application app_rt, and
+// mapping map_rt (+ a second mapping map_rt2 for later tasks).
+func seedRuntimeParents(t *testing.T, s *SQLStore, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.CreateAIServer(ctx, routing.AIServer{ID: "srv_rt", Name: "RT", Domain: "rt.example.test", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed server: %v", err)
+	}
+	if err := s.CreateApplication(ctx, routing.Application{ID: "app_rt", ServerID: "srv_rt", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIFlavors: []string{"openai"}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	for _, mid := range []string{"map_rt", "map_rt2"} {
+		if err := s.CreateMapping(ctx, routing.ModelMapping{ID: mid, ApplicationID: "app_rt", GatewayModelName: mid + "-model", AppModelName: mid + "-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("seed mapping %s: %v", mid, err)
+		}
+	}
 }

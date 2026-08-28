@@ -160,6 +160,18 @@ func (_d *RoutingStoreWithTracing) Certificates(ctx context.Context) (ca1 []_sou
 	return _d.Store.Certificates(ctx)
 }
 
+func (_d *RoutingStoreWithTracing) CoResidencyRulesByApplication(ctx context.Context, appID string) (ca1 []_sourceRouting.CoResidencyRule, err error) {
+	ctx, span := Start(ctx, "routing.Store.CoResidencyRulesByApplication")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.CoResidencyRulesByApplication(ctx, appID)
+}
+
 func (_d *RoutingStoreWithTracing) CreateAIServer(ctx context.Context, host _sourceRouting.AIServer) (err error) {
 	ctx, span := Start(ctx, "routing.Store.CreateAIServer")
 	defer span.End()
@@ -338,6 +350,18 @@ func (_d *RoutingStoreWithTracing) DeleteResourceGroup(ctx context.Context, id s
 		}
 	}()
 	return _d.Store.DeleteResourceGroup(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) DeleteRuntimeSpec(ctx context.Context, id string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteRuntimeSpec(ctx, id)
 }
 
 func (_d *RoutingStoreWithTracing) DeleteService(ctx context.Context, id string) (err error) {
@@ -712,6 +736,54 @@ func (_d *RoutingStoreWithTracing) ResourceGroupsByServer(ctx context.Context, s
 	return _d.Store.ResourceGroupsByServer(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) RuntimeSpecByID(ctx context.Context, id string) (r1 _sourceRouting.RuntimeSpec, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecByID")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecByID(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) RuntimeSpecByMapping(ctx context.Context, mappingID string) (r1 _sourceRouting.RuntimeSpec, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecByMapping")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecByMapping(ctx, mappingID)
+}
+
+func (_d *RoutingStoreWithTracing) RuntimeSpecGPUs(ctx context.Context, specID string) (ra1 []_sourceRouting.RuntimeSpecGPU, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecGPUs(ctx, specID)
+}
+
+func (_d *RoutingStoreWithTracing) RuntimeSpecsByApplication(ctx context.Context, appID string) (ra1 []_sourceRouting.RuntimeSpec, err error) {
+	ctx, span := Start(ctx, "routing.Store.RuntimeSpecsByApplication")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RuntimeSpecsByApplication(ctx, appID)
+}
+
 func (_d *RoutingStoreWithTracing) ServerAdminGroups(ctx context.Context, serverID string) (sa1 []string, err error) {
 	ctx, span := Start(ctx, "routing.Store.ServerAdminGroups")
 	defer span.End()
@@ -736,6 +808,18 @@ func (_d *RoutingStoreWithTracing) ServerAvailabilitySamples(ctx context.Context
 	return _d.Store.ServerAvailabilitySamples(ctx, serverID, from, to, limit)
 }
 
+func (_d *RoutingStoreWithTracing) ServerGPUBudgets(ctx context.Context, serverID string) (sa1 []_sourceRouting.ServerGPUBudget, err error) {
+	ctx, span := Start(ctx, "routing.Store.ServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ServerGPUBudgets(ctx, serverID)
+}
+
 func (_d *RoutingStoreWithTracing) ServerHardwareByServer(ctx context.Context, serverID string) (s1 _sourceRouting.ServerHardware, b1 bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.ServerHardwareByServer")
 	defer span.End()
@@ -758,6 +842,18 @@ func (_d *RoutingStoreWithTracing) ServerOwners(ctx context.Context, serverID st
 		}
 	}()
 	return _d.Store.ServerOwners(ctx, serverID)
+}
+
+func (_d *RoutingStoreWithTracing) ServerRuntimeReportByServer(ctx context.Context, serverID string) (s1 _sourceRouting.ServerRuntimeReport, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.ServerRuntimeReportByServer")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ServerRuntimeReportByServer(ctx, serverID)
 }
 
 func (_d *RoutingStoreWithTracing) ServersByAdminGroups(ctx context.Context, groupIDs []string) (aa1 []_sourceRouting.AIServer, err error) {
@@ -868,6 +964,18 @@ func (_d *RoutingStoreWithTracing) ServicesByDelegate(ctx context.Context, userI
 	return _d.Store.ServicesByDelegate(ctx, userID)
 }
 
+func (_d *RoutingStoreWithTracing) SetCoResidencyRules(ctx context.Context, appID string, rules []_sourceRouting.CoResidencyRule) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetCoResidencyRules")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetCoResidencyRules(ctx, appID, rules)
+}
+
 func (_d *RoutingStoreWithTracing) SetGroupMembers(ctx context.Context, groupID string, members []_sourceRouting.GroupMember) (err error) {
 	ctx, span := Start(ctx, "routing.Store.SetGroupMembers")
 	defer span.End()
@@ -940,6 +1048,18 @@ func (_d *RoutingStoreWithTracing) SetResourceGroupServer(ctx context.Context, r
 	return _d.Store.SetResourceGroupServer(ctx, rgID, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []_sourceRouting.RuntimeSpecGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetRuntimeSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetRuntimeSpecGPUs(ctx, specID, gpus)
+}
+
 func (_d *RoutingStoreWithTracing) SetServerAdminGroup(ctx context.Context, serverID string, groupID string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.SetServerAdminGroup")
 	defer span.End()
@@ -950,6 +1070,18 @@ func (_d *RoutingStoreWithTracing) SetServerAdminGroup(ctx context.Context, serv
 		}
 	}()
 	return _d.Store.SetServerAdminGroup(ctx, serverID, groupID)
+}
+
+func (_d *RoutingStoreWithTracing) SetServerGPUBudgets(ctx context.Context, serverID string, budgets []_sourceRouting.ServerGPUBudget) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetServerGPUBudgets")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetServerGPUBudgets(ctx, serverID, budgets)
 }
 
 func (_d *RoutingStoreWithTracing) SetServerHealth(ctx context.Context, serverID string, health string) (err error) {
@@ -1180,6 +1312,18 @@ func (_d *RoutingStoreWithTracing) UpdateResourceGroupSystemGroup(ctx context.Co
 	return _d.Store.UpdateResourceGroupSystemGroup(ctx, rgID, systemGroupID)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateRuntimeSpecGPUMeasured")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateServerCertificateOverride(ctx context.Context, id string, override string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateServerCertificateOverride")
 	defer span.End()
@@ -1396,6 +1540,18 @@ func (_d *RoutingStoreWithTracing) UpsertModelSetting(ctx context.Context, setti
 	return _d.Store.UpsertModelSetting(ctx, setting)
 }
 
+func (_d *RoutingStoreWithTracing) UpsertRuntimeSpec(ctx context.Context, spec _sourceRouting.RuntimeSpec) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertRuntimeSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertRuntimeSpec(ctx, spec)
+}
+
 func (_d *RoutingStoreWithTracing) UpsertServerHardware(ctx context.Context, hardware _sourceRouting.ServerHardware) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpsertServerHardware")
 	defer span.End()
@@ -1406,6 +1562,18 @@ func (_d *RoutingStoreWithTracing) UpsertServerHardware(ctx context.Context, har
 		}
 	}()
 	return _d.Store.UpsertServerHardware(ctx, hardware)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertServerRuntimeReport(ctx context.Context, report _sourceRouting.ServerRuntimeReport) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertServerRuntimeReport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertServerRuntimeReport(ctx, report)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertTelemetry(ctx context.Context, telemetry _sourceRouting.ServerTelemetry) (err error) {

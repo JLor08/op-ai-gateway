@@ -84,6 +84,60 @@ func (s *Server) handlePortalApplicationItem(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// GET/PUT /api/portal/applications/{id}/runtime/coresidency and
+	// GET /api/portal/applications/{id}/runtime/warnings (Task 6): both are
+	// gated the same way as every other application sub-resource above
+	// (authorizeApplication inside the Portal method -- 404-no-leak), so
+	// they share writePortalApplicationError.
+	if len(parts) == 3 && parts[1] == "runtime" {
+		switch parts[2] {
+		case "coresidency":
+			switch r.Method {
+			case http.MethodGet:
+				dto, err := s.Portal.GetCoResidency(r.Context(), token, appID)
+				if err != nil {
+					writePortalApplicationError(w, err)
+					return
+				}
+				writeJSON(w, http.StatusOK, dto)
+			case http.MethodPut:
+				raw, ok := readRawJSON(w, r)
+				if !ok {
+					return
+				}
+				var req portal.SetCoResidencyRequest
+				if err := json.Unmarshal(raw, &req); err != nil {
+					writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+					return
+				}
+				dto, err := s.Portal.SetCoResidency(r.Context(), token, appID, req)
+				if err != nil {
+					writePortalApplicationError(w, err)
+					return
+				}
+				writeJSON(w, http.StatusOK, dto)
+			default:
+				w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+				writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
+			}
+			return
+		case "warnings":
+			if !requireMethod(w, r, http.MethodGet) {
+				return
+			}
+			warnings, err := s.Portal.RuntimeWarnings(r.Context(), token, appID)
+			if err != nil {
+				writePortalApplicationError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"warnings": warnings})
+			return
+		default:
+			writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeApplicationNotFound, msgApplicationNotFound, ""))
+			return
+		}
+	}
+
 	if len(parts) != 1 {
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeApplicationNotFound, msgApplicationNotFound, ""))
 		return
@@ -144,6 +198,16 @@ var portalApplicationErrRows = []errRow{
 	{err: portal.ErrApplicationHealthIntervalInvalid, status: http.StatusBadRequest, code: "application.health_interval_invalid", msg: "application health check interval is invalid"},
 	{err: portal.ErrApplicationBenchmarkIntervalInvalid, status: http.StatusBadRequest, code: "application.benchmark_interval_invalid", msg: "application benchmark schedule interval is invalid"},
 	{err: portal.ErrApplicationTokenHeaderInvalid, status: http.StatusBadRequest, code: "application.token_header_invalid", msg: "token header name is invalid"},
+	{err: portal.ErrCoResidencyPairInvalid, status: http.StatusBadRequest, code: "runtime_coresidency.pair_invalid", msg: "co-residency pair is invalid"},
+	// ErrServerManagedRuntimeOnly is a 409 (a conflict with the target
+	// server's own configuration), not a 400 -- the request shape is fine,
+	// it is simply refused given the server's current state.
+	{err: portal.ErrServerManagedRuntimeOnly, status: http.StatusConflict, code: "application.managed_runtime_only", msg: "server is restricted to agent-managed runtime applications"},
+	// ErrServerAgentApplicationExists is a 409 for the same reason as
+	// ErrServerManagedRuntimeOnly above: the request shape is valid, it
+	// conflicts with the server's existing configuration (it already has the
+	// one server_agent application it is allowed).
+	{err: portal.ErrServerAgentApplicationExists, status: http.StatusConflict, code: "application.server_agent_exists", msg: "server already has a server_agent application"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 
