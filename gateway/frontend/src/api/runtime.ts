@@ -46,6 +46,14 @@ export interface RuntimeSpec {
   pinned: boolean;
   admin_state: string;
   vram_locked: boolean;
+  // Turns the spec's GPU list from a declaration into an enforcement: the
+  // agent sets the vendor-appropriate visibility variable
+  // (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on
+  // Apple or a host with no recognised GPU stack) for this spec's child, from
+  // this spec's own HOST gpu indices. Two combinations the backend refuses:
+  // on with an empty `gpus` (an empty visibility value hides EVERY card), and
+  // on together with one of those variables hand-set in `env`.
+  set_visible_devices: boolean;
   gpus: RuntimeSpecGPU[];
 }
 

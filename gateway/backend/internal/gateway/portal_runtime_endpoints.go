@@ -73,6 +73,8 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecGPUInvalid, status: http.StatusBadRequest, code: "runtime_spec.gpu_invalid", msg: "runtime spec gpu configuration is invalid"},
 	{err: portal.ErrRuntimeSpecTuningInvalid, status: http.StatusBadRequest, code: "runtime_spec.tuning_invalid", msg: "runtime spec tuning values must be non-negative"},
 	{err: portal.ErrRuntimeSpecAdminStateInvalid, status: http.StatusBadRequest, code: "runtime_spec.admin_state_invalid", msg: "runtime spec admin state is invalid"},
+	{err: portal.ErrRuntimeSpecVisibleDevicesNoGPUs, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_no_gpus", msg: "set_visible_devices requires at least one gpu row: an empty visible-devices value hides every gpu from the model"},
+	{err: portal.ErrRuntimeSpecVisibleDevicesConflict, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_conflict", msg: "set_visible_devices conflicts with a gpu visibility variable set by hand in env"},
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 }
 

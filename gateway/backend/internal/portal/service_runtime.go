@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -35,6 +36,18 @@ var (
 	ErrRuntimeSpecGPUInvalid        = errors.New("runtime_spec.gpu_invalid")
 	ErrRuntimeSpecTuningInvalid     = errors.New("runtime_spec.tuning_invalid")
 	ErrRuntimeSpecAdminStateInvalid = errors.New("runtime_spec.admin_state_invalid")
+	// ErrRuntimeSpecVisibleDevicesNoGPUs rejects set_visible_devices on a
+	// spec with no GPU rows. The agent would emit `CUDA_VISIBLE_DEVICES=`
+	// for such a spec, and an EMPTY visibility value does not mean "no
+	// restriction" — it means NOTHING is visible, i.e. the model sees no GPU
+	// at all. Refused here rather than emitted; the agent refuses it again
+	// at launch (see PutRuntimeSpec for why both).
+	ErrRuntimeSpecVisibleDevicesNoGPUs = errors.New("runtime_spec.visible_devices_no_gpus")
+	// ErrRuntimeSpecVisibleDevicesConflict rejects set_visible_devices on a
+	// spec whose env already sets a GPU visibility variable by hand. Two
+	// sources for one value, whichever wins, is a configuration an operator
+	// cannot read the truth out of.
+	ErrRuntimeSpecVisibleDevicesConflict = errors.New("runtime_spec.visible_devices_conflict")
 	// ErrRuntimeSpecNotServerAgent rejects a write (PUT or DELETE) targeting
 	// a mapping whose owning application is not of type
 	// routing.ProviderServerAgent — a runtime spec only makes sense for an
@@ -277,24 +290,28 @@ type RuntimeSpecDTO struct {
 	// Configured is false when the mapping has no runtime spec row yet — the
 	// only signal GetRuntimeSpec ever uses for "not configured"; every other
 	// field is then a zero value (GPUs/Args/Env still non-nil empty).
-	Configured                  bool                `json:"configured"`
-	ID                          string              `json:"id,omitempty"`
-	MappingID                   string              `json:"mapping_id"`
-	Enabled                     bool                `json:"enabled"`
-	Binary                      string              `json:"binary"`
-	Args                        []string            `json:"args"`
-	Env                         map[string]string   `json:"env"`
-	WorkDir                     string              `json:"work_dir"`
-	ListenPort                  int                 `json:"listen_port"`
-	HealthPath                  string              `json:"health_path"`
-	HealthTimeoutSeconds        int                 `json:"health_timeout_seconds"`
-	StartupTimeoutSeconds       int                 `json:"startup_timeout_seconds"`
-	IdleTimeoutSeconds          int                 `json:"idle_timeout_seconds"`
-	AdmissionWaitTimeoutSeconds int                 `json:"admission_wait_timeout_seconds"`
-	Pinned                      bool                `json:"pinned"`
-	AdminState                  string              `json:"admin_state"`
-	VRAMLocked                  bool                `json:"vram_locked"`
-	GPUs                        []RuntimeSpecGPUDTO `json:"gpus"`
+	Configured                  bool              `json:"configured"`
+	ID                          string            `json:"id,omitempty"`
+	MappingID                   string            `json:"mapping_id"`
+	Enabled                     bool              `json:"enabled"`
+	Binary                      string            `json:"binary"`
+	Args                        []string          `json:"args"`
+	Env                         map[string]string `json:"env"`
+	WorkDir                     string            `json:"work_dir"`
+	ListenPort                  int               `json:"listen_port"`
+	HealthPath                  string            `json:"health_path"`
+	HealthTimeoutSeconds        int               `json:"health_timeout_seconds"`
+	StartupTimeoutSeconds       int               `json:"startup_timeout_seconds"`
+	IdleTimeoutSeconds          int               `json:"idle_timeout_seconds"`
+	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
+	Pinned                      bool              `json:"pinned"`
+	AdminState                  string            `json:"admin_state"`
+	VRAMLocked                  bool              `json:"vram_locked"`
+	// SetVisibleDevices turns this spec's GPU list from a declaration into
+	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
+	// PutRuntimeSpec for the two combinations this API refuses.
+	SetVisibleDevices bool                `json:"set_visible_devices"`
+	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -302,21 +319,25 @@ type RuntimeSpecDTO struct {
 // against the stored row — except VRAMMeasuredMB on each GPU entry, which is
 // ALWAYS ignored (agent-owned; see PutRuntimeSpec's VRAM ownership rule).
 type PutRuntimeSpecRequest struct {
-	Enabled                     bool                `json:"enabled"`
-	Binary                      string              `json:"binary"`
-	Args                        []string            `json:"args"`
-	Env                         map[string]string   `json:"env"`
-	WorkDir                     string              `json:"work_dir"`
-	ListenPort                  int                 `json:"listen_port"`
-	HealthPath                  string              `json:"health_path"`
-	HealthTimeoutSeconds        int                 `json:"health_timeout_seconds"`
-	StartupTimeoutSeconds       int                 `json:"startup_timeout_seconds"`
-	IdleTimeoutSeconds          int                 `json:"idle_timeout_seconds"`
-	AdmissionWaitTimeoutSeconds int                 `json:"admission_wait_timeout_seconds"`
-	Pinned                      bool                `json:"pinned"`
-	AdminState                  string              `json:"admin_state"`
-	VRAMLocked                  bool                `json:"vram_locked"`
-	GPUs                        []RuntimeSpecGPUDTO `json:"gpus"`
+	Enabled                     bool              `json:"enabled"`
+	Binary                      string            `json:"binary"`
+	Args                        []string          `json:"args"`
+	Env                         map[string]string `json:"env"`
+	WorkDir                     string            `json:"work_dir"`
+	ListenPort                  int               `json:"listen_port"`
+	HealthPath                  string            `json:"health_path"`
+	HealthTimeoutSeconds        int               `json:"health_timeout_seconds"`
+	StartupTimeoutSeconds       int               `json:"startup_timeout_seconds"`
+	IdleTimeoutSeconds          int               `json:"idle_timeout_seconds"`
+	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
+	Pinned                      bool              `json:"pinned"`
+	AdminState                  string            `json:"admin_state"`
+	VRAMLocked                  bool              `json:"vram_locked"`
+	// SetVisibleDevices turns this spec's GPU list from a declaration into
+	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
+	// PutRuntimeSpec for the two combinations this API refuses.
+	SetVisibleDevices bool                `json:"set_visible_devices"`
+	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -390,6 +411,9 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			return RuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
 		}
 	}
+	if err := validateRuntimeSpecVisibleDevices(req); err != nil {
+		return RuntimeSpecDTO{}, err
+	}
 	args := req.Args
 	if args == nil {
 		args = []string{}
@@ -453,6 +477,7 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		Pinned:                      req.Pinned,
 		AdminState:                  adminState,
 		VRAMLocked:                  req.VRAMLocked,
+		SetVisibleDevices:           req.SetVisibleDevices,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -511,6 +536,68 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 		return err
 	}
 	s.notifyRuntimeChanged(server.ID)
+	return nil
+}
+
+// runtimeSpecVisibleDevicesVars is the set of environment variables the
+// set_visible_devices option OWNS: a spec may not hand-set any of them while
+// the option is on. It mirrors the agent's own visibleDevicesOwnedVars
+// (server-agent internal/runtime/policy_local.go) name for name, deliberately
+// — the two validators must refuse exactly the same inputs, or the portal
+// starts rejecting specs the agent would accept (or worse, the other way
+// round).
+//
+// HIP_VISIBLE_DEVICES is in the list although the agent never SETS it: it
+// selects from WHAT ROCR_VISIBLE_DEVICES ALREADY LEFT VISIBLE, so combining a
+// hand-set HIP list with agent-managed ROCR filtering is the double-filter
+// trap in its purest form (the child ends up with no usable device). Runtime-
+// specific selectors the agent neither sets nor filters through —
+// ONEAPI_DEVICE_SELECTOR, GPU_DEVICE_ORDINAL — are deliberately NOT here:
+// composing one of those (built from ${HOST_GPU_IDS}) with the option is the
+// documented escape hatch, not a contradiction.
+var runtimeSpecVisibleDevicesVars = []string{
+	"CUDA_VISIBLE_DEVICES",
+	"ROCR_VISIBLE_DEVICES",
+	"HIP_VISIBLE_DEVICES",
+}
+
+// validateRuntimeSpecVisibleDevices enforces the two combinations
+// set_visible_devices may not be saved in. Both are ALSO refused by the agent
+// at launch, and that duplication is deliberate in both directions:
+//
+//   - Only the portal can tell the operator IN THE MOMENT. The agent's refusal
+//     surfaces as a terminal `not_permitted` on a spec the operator already
+//     saved and walked away from; a form error is the one an operator acts on.
+//   - Only the agent covers the file-mode path. An agent configured with
+//     OP_AGENT_RUNTIME_SOURCE=file reads a hand-written local document that
+//     never passes through this service at all, so the portal alone would
+//     leave that whole path unguarded.
+//
+// The rules themselves are vendor-independent on BOTH sides, which is what
+// lets them be identical: this gateway is hardware-agnostic and cannot know
+// whether the target host runs NVIDIA, AMD or neither (the spec is authored
+// before anyone has necessarily looked at the machine), so a vendor-dependent
+// agent rule would be a rule the portal could not mirror.
+//
+// Runs BEFORE any mutation, like every other check in PutRuntimeSpec, and
+// reads req rather than the stored row: this API is a full-document upsert, so
+// the request IS the resulting spec.
+func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
+	if !req.SetVisibleDevices {
+		return nil
+	}
+	// Trap 3 before trap 1, matching the agent's order, so a spec that is
+	// wrong in both ways reports the same one on both sides.
+	for k := range req.Env {
+		if slices.Contains(runtimeSpecVisibleDevicesVars, strings.ToUpper(strings.TrimSpace(k))) {
+			return ErrRuntimeSpecVisibleDevicesConflict
+		}
+	}
+	// An empty GPU list is not "no restriction" — the agent would emit
+	// `CUDA_VISIBLE_DEVICES=`, which hides every card from the model.
+	if len(req.GPUs) == 0 {
+		return ErrRuntimeSpecVisibleDevicesNoGPUs
+	}
 	return nil
 }
 
@@ -579,6 +666,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		Pinned:                      spec.Pinned,
 		AdminState:                  spec.AdminState,
 		VRAMLocked:                  spec.VRAMLocked,
+		SetVisibleDevices:           spec.SetVisibleDevices,
 		GPUs:                        gpuDTOs,
 	}, nil
 }
@@ -1104,7 +1192,12 @@ type AgentRuntimeSpecDTO struct {
 	IdleTimeoutSeconds          int                      `json:"idle_timeout_seconds"`
 	AdmissionWaitTimeoutSeconds int                      `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool                     `json:"pinned"`
-	AdminState                  string                   `json:"admin_state"`
+	// SetVisibleDevices tells the agent to set the vendor-appropriate GPU
+	// visibility variable for this spec's child from the GPUs above. The
+	// gateway is hardware-agnostic and never resolves WHICH variable that
+	// is — only the agent knows what stack the host runs.
+	SetVisibleDevices bool   `json:"set_visible_devices"`
+	AdminState        string `json:"admin_state"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1372,6 +1465,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		IdleTimeoutSeconds:          spec.IdleTimeoutSeconds,
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
+		SetVisibleDevices:           spec.SetVisibleDevices,
 		AdminState:                  spec.AdminState,
 	}, nil
 }

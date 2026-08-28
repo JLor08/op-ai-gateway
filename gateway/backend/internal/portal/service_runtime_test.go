@@ -1626,3 +1626,192 @@ func TestAgentRuntimeConfigVRAMLockedServesTheOperatorEstimate(t *testing.T) {
 		t.Fatalf("re-unlocked vram_mb = %d, want the measured 22000 back", got)
 	}
 }
+
+// --- set_visible_devices -----------------------------------------------------
+
+// seedVisibleDevicesMapping builds the server + server_agent application +
+// mapping the set_visible_devices tests below all need, and returns the
+// mapping id.
+func seedVisibleDevicesMapping(t *testing.T, svc *Service, routeStore *routing.MemoryStore, now time.Time) string {
+	t.Helper()
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{
+		GatewayModelName: "qwen", AppModelName: "qwen-upstream",
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	return mapping.ID
+}
+
+// TestPutRuntimeSpecSetVisibleDevicesRoundTrip proves the flag survives the
+// whole write path — request -> store -> portal DTO -> the agent's
+// runtime-config document. The last hop is the one that matters: the flag is
+// useless unless the AGENT sees it, and the agent is the only party that knows
+// which visibility variable this host's hardware wants.
+func TestPutRuntimeSpecSetVisibleDevicesRoundTrip(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen-upstream"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled:           true,
+		Binary:            "/usr/local/bin/llama-server",
+		SetVisibleDevices: true,
+		GPUs:              []RuntimeSpecGPUDTO{{Index: 2, VRAMEstimateMB: 8000}, {Index: 5, VRAMEstimateMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if !dto.SetVisibleDevices {
+		t.Fatalf("dto.SetVisibleDevices = false, want true")
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if !got.SetVisibleDevices {
+		t.Fatalf("GetRuntimeSpec().SetVisibleDevices = false, want true")
+	}
+
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if len(cfg.Specs) != 1 {
+		t.Fatalf("runtime-config specs = %#v, want exactly one", cfg.Specs)
+	}
+	if !cfg.Specs[0].SetVisibleDevices {
+		t.Fatalf("the runtime-config document dropped set_visible_devices: %#v", cfg.Specs[0])
+	}
+	// The gateway carries the flag and NOTHING about the variable name: it is
+	// hardware-agnostic and cannot know whether this host runs NVIDIA or AMD.
+	if len(cfg.Specs[0].Env) != 0 {
+		t.Errorf("the gateway injected env %#v; resolving the visibility variable is the agent's job alone", cfg.Specs[0].Env)
+	}
+
+	// Turning it back off is an ordinary full-document upsert.
+	off, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/llama-server",
+		GPUs:   []RuntimeSpecGPUDTO{{Index: 2, VRAMEstimateMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (off): %v", err)
+	}
+	if off.SetVisibleDevices {
+		t.Errorf("set_visible_devices survived a PUT that did not ask for it; this endpoint is a full-document replace")
+	}
+}
+
+// TestPutRuntimeSpecSetVisibleDevicesRequiresGPUs is trap 1 at the save
+// boundary: an empty visible-devices value means NOTHING is visible, so the
+// option with no GPU rows is refused rather than persisted and handed to the
+// agent. (The agent refuses it again at launch, for the file-mode path that
+// never passes through here — see validateRuntimeSpecVisibleDevices.)
+func TestPutRuntimeSpecSetVisibleDevicesRequiresGPUs(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	for _, gpus := range [][]RuntimeSpecGPUDTO{nil, {}} {
+		_, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+			Binary:            "/usr/local/bin/llama-server",
+			SetVisibleDevices: true,
+			GPUs:              gpus,
+		})
+		if !errors.Is(err, ErrRuntimeSpecVisibleDevicesNoGPUs) {
+			t.Fatalf("PutRuntimeSpec(gpus=%#v) error = %v, want ErrRuntimeSpecVisibleDevicesNoGPUs", gpus, err)
+		}
+	}
+
+	// Validate-before-mutate: the refused write must have persisted nothing.
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.Configured {
+		t.Fatalf("a refused write created a spec row: %#v", got)
+	}
+
+	// The same option with a GPU row is accepted — the refusal is about the
+	// empty list, not about the option.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:            "/usr/local/bin/llama-server",
+		SetVisibleDevices: true,
+		GPUs:              []RuntimeSpecGPUDTO{{Index: 0}},
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec with one gpu row: %v", err)
+	}
+
+	// And a spec with NO gpus and the option OFF stays perfectly valid: that
+	// is every CPU-only and every pre-feature spec.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/llama-server",
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec with no gpus and the option off: %v", err)
+	}
+}
+
+// TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv is trap 3 at the save
+// boundary: the option and a hand-set visibility variable are two sources for
+// one value, and a spec where both are present reads identically whichever one
+// wins. Refused, not silently resolved.
+//
+// The refusal is vendor-independent — all three owned variables, on every
+// host — because this gateway cannot know what hardware the target server has,
+// and the agent's rule is deliberately written to be the same one.
+func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	for _, key := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+				Binary:            "/usr/local/bin/llama-server",
+				SetVisibleDevices: true,
+				Env:               map[string]string{key: "0,1"},
+				GPUs:              []RuntimeSpecGPUDTO{{Index: 0}},
+			})
+			if !errors.Is(err, ErrRuntimeSpecVisibleDevicesConflict) {
+				t.Fatalf("PutRuntimeSpec with env %s error = %v, want ErrRuntimeSpecVisibleDevicesConflict", key, err)
+			}
+		})
+		t.Run(key+" is fine with the option off", func(t *testing.T) {
+			dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+				Binary: "/usr/local/bin/llama-server",
+				Env:    map[string]string{key: "0,1"},
+				GPUs:   []RuntimeSpecGPUDTO{{Index: 0}},
+			})
+			if err != nil {
+				t.Fatalf("a hand-set %s with the option off must still save: %v", key, err)
+			}
+			if dto.Env[key] != "0,1" {
+				t.Errorf("env = %#v, want the operator's own %s preserved verbatim", dto.Env, key)
+			}
+		})
+	}
+
+	// ONEAPI_DEVICE_SELECTOR is deliberately NOT owned: composing it with the
+	// option (built from ${HOST_GPU_IDS}) is the documented escape hatch for a
+	// runtime the agent has no vendor mapping for.
+	t.Run("ONEAPI_DEVICE_SELECTOR composes", func(t *testing.T) {
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+			Binary:            "/usr/local/bin/llama-server",
+			SetVisibleDevices: true,
+			Env:               map[string]string{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"},
+			GPUs:              []RuntimeSpecGPUDTO{{Index: 0}},
+		}); err != nil {
+			t.Fatalf("ONEAPI_DEVICE_SELECTOR must compose with set_visible_devices: %v", err)
+		}
+	})
+}

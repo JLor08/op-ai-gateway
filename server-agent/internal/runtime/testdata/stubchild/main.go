@@ -34,6 +34,8 @@ func main() {
 	crashAfter := flag.Duration("crash-after", 0, "if > 0, exit with -exit-code this long after start")
 	exitCode := flag.Int("exit-code", 1, "process exit code used by -crash-after")
 	invocationLog := flag.String("invocation-log", "", "if set, append one line (this PID) per invocation -- proves how many times the binary was actually exec'd, independent of the manager's own bookkeeping")
+	envLog := flag.String("env-log", "", "if set, write what this process ACTUALLY received for -env-name, as \"set:<value>\" or \"unset\" -- the only way to observe a child's own environment from the parent's test, and it deliberately distinguishes an absent variable from one set to the empty string")
+	envName := flag.String("env-name", "", "the environment variable -env-log reports")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	flag.Parse()
 
@@ -57,6 +59,20 @@ func main() {
 		}
 		fmt.Fprintf(f, "%d\n", os.Getpid())
 		f.Close()
+	}
+
+	// "set:<value>" vs "unset", never a bare value: an EMPTY visibility
+	// variable means "no device is visible" while an ABSENT one means "no
+	// restriction", so a log format that rendered both as an empty line would
+	// be blind to exactly the distinction the tests exist to check.
+	if *envLog != "" {
+		record := "unset"
+		if value, ok := os.LookupEnv(*envName); ok {
+			record = "set:" + value
+		}
+		if err := os.WriteFile(*envLog, []byte(record), 0o644); err != nil {
+			log.Fatalf("stubchild: write env log: %v", err)
+		}
 	}
 
 	if *crashAfter > 0 {

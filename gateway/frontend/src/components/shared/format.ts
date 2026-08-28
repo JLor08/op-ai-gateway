@@ -60,6 +60,8 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.gpu_invalid': 'errorRuntimeSpecGpuInvalid',
   'runtime_spec.tuning_invalid': 'errorRuntimeSpecTuningInvalid',
   'runtime_spec.admin_state_invalid': 'errorRuntimeSpecAdminStateInvalid',
+  'runtime_spec.visible_devices_no_gpus': 'errorRuntimeSpecVisibleDevicesNoGpus',
+  'runtime_spec.visible_devices_conflict': 'errorRuntimeSpecVisibleDevicesConflict',
   'runtime_spec.application_not_server_agent': 'errorRuntimeSpecApplicationNotServerAgent',
   'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',

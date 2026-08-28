@@ -2581,3 +2581,195 @@ func TestManagerWithNoMeasurerInstalledIsUnaffected(t *testing.T) {
 		t.Fatalf("echo = (%d, %q), want (200, %q)", code, body, "hello")
 	}
 }
+
+// --- set_visible_devices, through the real two-process path -----------------
+
+// readEnvLog reads a stubchild -env-log file, polling until it appears (the
+// child writes it during its own startup, so a read racing the exec would
+// otherwise flake). Returns the raw record: "set:<value>" or "unset" -- see
+// the stubchild flag's own comment for why those two are not collapsed.
+func readEnvLog(t *testing.T, path string) string {
+	t.Helper()
+	var record string
+	waitUntil(t, 5*time.Second, "child to write its env log at "+path, func() bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		record = string(data)
+		return record != ""
+	})
+	return record
+}
+
+// visibleDevicesStubArgs is stubArgs plus the -env-log/-env-name pair, so the
+// child records what IT actually received rather than what the parent believes
+// it passed.
+func visibleDevicesStubArgs(envLog, envName string) []string {
+	return append(stubArgs(0, 0, 0, ""), "-env-log", envLog, "-env-name", envName)
+}
+
+// TestManagerVisibleDevicesIsPerSpecIsolated is the user's explicit
+// requirement, proved rather than assumed: every spec has its own device
+// setting and the two do not interfere -- one model on three GPUs, another on
+// two, running CONCURRENTLY, each child seeing only its own list.
+//
+// Isolation is structural (ExpandPlaceholders computes every value from the
+// spec it was handed and returns a fresh []string that becomes exactly one
+// exec.Cmd.Env), which is precisely why it is worth a test at this level: the
+// claim is about the real Apply -> EnsureRunning -> startProcess -> exec path
+// with two live processes, not about the pure function. It runs both specs at
+// once and asserts on what each CHILD read out of its own environment.
+func TestManagerVisibleDevicesIsPerSpecIsolated(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	dir := t.TempDir()
+	logA := filepath.Join(dir, "env-a")
+	logB := filepath.Join(dir, "env-b")
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Args = visibleDevicesStubArgs(logA, "CUDA_VISIBLE_DEVICES")
+	specA.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1}, {Index: 1, VRAMMB: 1}, {Index: 2, VRAMMB: 1}}
+	specA.SetVisibleDevices = true
+
+	specB := baseSpec("spec-b", "model-b")
+	specB.Args = visibleDevicesStubArgs(logB, "CUDA_VISIBLE_DEVICES")
+	specB.GPUs = []SpecGPU{{Index: 5, VRAMMB: 1}, {Index: 6, VRAMMB: 1}}
+	specB.SetVisibleDevices = true
+
+	m := NewManager(ManagerOptions{
+		Policy:    allowlistPolicy(),
+		Getenv:    func(string) string { return "" },
+		GPUVendor: GPUVendorNVIDIA,
+	})
+	t.Cleanup(m.Close)
+	// Co-resident: both must be up AT THE SAME TIME, or "they do not
+	// interfere" would be proved by nothing more than them never overlapping.
+	m.Apply(Config{
+		Specs:      []Spec{specA, specB},
+		Coresident: [][2]string{{"spec-a", "spec-b"}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	endpointA, releaseA, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a): %v", err)
+	}
+	defer releaseA()
+	endpointB, releaseB, err := m.EnsureRunning(ctx, "model-b")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-b): %v", err)
+	}
+	defer releaseB()
+
+	// Both genuinely running, at the same moment, before anything is asserted.
+	if stA, stB := statusFor(m, "spec-a"), statusFor(m, "spec-b"); stA == nil || stA.State != StateRunning || stB == nil || stB.State != StateRunning {
+		t.Fatalf("want both specs running concurrently, got %+v and %+v", stA, stB)
+	}
+	if endpointA == endpointB {
+		t.Fatalf("both specs reported the same endpoint %q; they are not two processes", endpointA)
+	}
+
+	if got, want := readEnvLog(t, logA), "set:0,1,2"; got != want {
+		t.Errorf("spec-a's child read CUDA_VISIBLE_DEVICES as %q, want %q", got, want)
+	}
+	if got, want := readEnvLog(t, logB), "set:5,6"; got != want {
+		t.Errorf("spec-b's child read CUDA_VISIBLE_DEVICES as %q, want %q", got, want)
+	}
+}
+
+// TestManagerVisibleDevicesOffLeavesTheChildEnvironmentAlone is the paired
+// negative, at the same level: with the option off, the child receives NO
+// visibility variable at all -- not an empty one. "Absent" and "set to the
+// empty string" are the two states this feature exists to keep apart, and the
+// second would hide every card from the model.
+func TestManagerVisibleDevicesOffLeavesTheChildEnvironmentAlone(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	envLog := filepath.Join(t.TempDir(), "env")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = visibleDevicesStubArgs(envLog, "CUDA_VISIBLE_DEVICES")
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1}, {Index: 1, VRAMMB: 1}}
+	spec.SetVisibleDevices = false
+
+	m := NewManager(ManagerOptions{
+		Policy:    allowlistPolicy(),
+		Getenv:    func(string) string { return "" },
+		GPUVendor: GPUVendorNVIDIA, // a real GPU host: the option, not the hardware, is what makes this a no-op
+	})
+	t.Cleanup(m.Close)
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	defer release()
+
+	if got := readEnvLog(t, envLog); got != "unset" {
+		t.Errorf("child read CUDA_VISIBLE_DEVICES as %q, want it to be entirely absent (%q)", got, "unset")
+	}
+}
+
+// TestManagerVisibleDevicesRefusalIsNotPermitted pins how the two refusals
+// SURFACE to an operator: as StateNotPermitted with the explanation in
+// LastError.Message, on the same path every other ExpandPlaceholders refusal
+// takes -- not as a crash loop the operator has to read stderr to understand.
+func TestManagerVisibleDevicesRefusalIsNotPermitted(t *testing.T) {
+	skipOnWindows(t)
+
+	cases := []struct {
+		name     string
+		mutate   func(*Spec)
+		wantText string
+	}{
+		{
+			name:     "no gpus declared",
+			mutate:   func(s *Spec) { s.GPUs = []SpecGPU{} },
+			wantText: "no gpus",
+		},
+		{
+			name: "hand-set variable conflicts",
+			mutate: func(s *Spec) {
+				s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1}}
+				s.Env = map[string]string{"CUDA_VISIBLE_DEVICES": "3"}
+			},
+			wantText: "CUDA_VISIBLE_DEVICES",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			spec := baseSpec("spec-a", "model-a")
+			spec.SetVisibleDevices = true
+			tc.mutate(&spec)
+
+			m := NewManager(ManagerOptions{
+				Policy:    allowlistPolicy(),
+				Getenv:    func(string) string { return "" },
+				GPUVendor: GPUVendorNVIDIA,
+			})
+			t.Cleanup(m.Close)
+			m.Apply(Config{Specs: []Spec{spec}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+			}
+			st := statusFor(m, "spec-a")
+			if st == nil || st.State != StateNotPermitted {
+				t.Fatalf("Status()[spec-a] = %+v, want not_permitted", st)
+			}
+			if st.LastError == nil || !strings.Contains(st.LastError.Message, tc.wantText) {
+				t.Errorf("LastError = %+v, want a message containing %q -- this text is the operator's only explanation", st.LastError, tc.wantText)
+			}
+		})
+	}
+}

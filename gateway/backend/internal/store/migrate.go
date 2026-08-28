@@ -99,6 +99,7 @@ var migrations = []migration{
 	{version: 66, name: "server_runtime_limits", up: migration66Up},
 	{version: 67, name: "server_runtime_reports", up: migration67Up},
 	{version: 68, name: "application_single_server_agent", up: migration68Up},
+	{version: 69, name: "runtime_spec_set_visible_devices", up: migration69Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3009,4 +3010,28 @@ func migration68Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return execTx(ctx, tx, dl, `create unique index if not exists idx_applications_single_server_agent
 		on applications(server_id) where type = 'server_agent'`)
+}
+
+// migration69Up adds agent_runtime_specs.set_visible_devices: the per-spec
+// opt-in that turns the spec's GPU list from a DECLARATION into an
+// ENFORCEMENT. With it on, the agent sets the vendor-appropriate visibility
+// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD) for
+// that spec's child process from that spec's own GPU indices; with it off --
+// the default, and every row that exists before this migration -- nothing
+// about the launch changes.
+//
+// APPENDED rather than folded into migration65Up's create-table, even though
+// both were written on the same unreleased feature branch. Migration 65 has
+// already run against every developer database and both CI conformance legs,
+// so editing it would leave those at schema_version 68 with no such column
+// while a fresh install got one -- exactly the divergence the append-only
+// rule exists to prevent (migration64Up records the same reasoning for the
+// same reason).
+//
+// Plain integer boolean with a 0 default, matching the pinned/vram_locked
+// columns beside it: ADR-005's wide-Postgres-type rule is about floats and
+// 64-bit ints, not a flag.
+func migration69Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"set_visible_devices integer not null default 0")
 }

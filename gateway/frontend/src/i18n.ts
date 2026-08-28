@@ -536,6 +536,9 @@ const de = {
   runtimeSpecVramLocked: 'VRAM-Schätzung fixieren (Messung des Agenten ignorieren)',
   runtimeSpecVramLockedHint:
     'Der Agent misst den tatsächlichen VRAM-Verbrauch seines Kindprozesses; diese Messung ersetzt normalerweise Ihre Schätzung – auch in der Budget-Berechnung, die über den Start entscheidet. Fixieren Sie die Schätzung, wenn eine Messung falsch ist oder wenn eine Messung oberhalb des GPU-Budgets den Start dauerhaft verhindert. Die Messung wird weiterhin erfasst und angezeigt, nur nicht mehr verwendet.',
+  runtimeSpecSetVisibleDevices: 'GPU-Sichtbarkeit erzwingen (Prozess auf diese Karten begrenzen)',
+  runtimeSpecSetVisibleDevicesHint:
+    'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   runtimeSpecGpuIndex: 'GPU-Index',
   runtimeSpecGpuPick: 'Gemeldete GPU',
@@ -836,6 +839,10 @@ const de = {
   errorRuntimeSpecGpuInvalid: 'Ungültige GPU-Konfiguration',
   errorRuntimeSpecTuningInvalid: 'Zeitwerte müssen größer oder gleich null sein',
   errorRuntimeSpecAdminStateInvalid: 'Ungültiger Admin-Status',
+  errorRuntimeSpecVisibleDevicesNoGpus:
+    'Für „GPU-Sichtbarkeit erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
+  errorRuntimeSpecVisibleDevicesConflict:
+    'Diese Variable ist bereits von Hand gesetzt. „GPU-Sichtbarkeit erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
     'Runtime-Spezifikationen erfordern eine Server-Agent-Anwendung',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
@@ -2414,6 +2421,9 @@ const en: PortalMessages = {
   runtimeSpecVramLocked: "Lock the VRAM estimate (ignore the agent's measurement)",
   runtimeSpecVramLockedHint:
     "The agent measures its child process's actual VRAM, and that measurement normally replaces your estimate — including in the budget arithmetic that decides whether the model may start. Lock the estimate when a measurement is wrong, or when one above the GPU budget has left the spec refusing to start. The measurement is still recorded and shown, only no longer used.",
+  runtimeSpecSetVisibleDevices: 'Enforce GPU visibility (restrict the process to these cards)',
+  runtimeSpecSetVisibleDevicesHint:
+    "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecGpuIndex: 'GPU index',
   runtimeSpecGpuPick: 'Reported GPU',
@@ -2709,6 +2719,10 @@ const en: PortalMessages = {
   errorRuntimeSpecGpuInvalid: 'Invalid GPU configuration',
   errorRuntimeSpecTuningInvalid: 'Timing values must be zero or greater',
   errorRuntimeSpecAdminStateInvalid: 'Invalid admin state',
+  errorRuntimeSpecVisibleDevicesNoGpus:
+    'Enforcing GPU visibility needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
+  errorRuntimeSpecVisibleDevicesConflict:
+    'This variable is already set by hand. Enforcing GPU visibility and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',

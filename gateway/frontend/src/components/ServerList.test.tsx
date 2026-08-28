@@ -236,6 +236,7 @@ function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     pinned: false,
     admin_state: '',
     vram_locked: false,
+    set_visible_devices: false,
     gpus: [],
     ...overrides,
   };

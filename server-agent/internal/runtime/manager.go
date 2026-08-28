@@ -128,6 +128,13 @@ type ManagerOptions struct {
 	// PATH/HOME (see ExpandPlaceholders). os.Getenv in production; injected
 	// in tests so no real environment variable is required.
 	Getenv func(string) string
+	// GPUVendor is the GPU stack this HOST actually has, discovered locally
+	// by main.go from collector.DetectGPUCollectors() -- never a
+	// gateway-supplied value. It selects the environment variable a
+	// SetVisibleDevices spec gets (VisibleDevicesVar); its zero value,
+	// GPUVendorNone, is the correct answer for a CPU-only host and makes
+	// that option a no-op rather than an error.
+	GPUVendor GPUVendor
 	// LogBufferBytes / LogBufferTotalBytes size the per-spec managed-process
 	// output retention and its fleet-wide ceiling (see LogStore). Both are
 	// OPERATOR settings from the agent's own local config -- memory on an AI
@@ -195,6 +202,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		m:            m,
 		policy:       opts.Policy,
 		getenv:       getenv,
+		gpuVendor:    opts.GPUVendor,
 		specs:        make(map[string]*specState),
 		allowedPairs: map[[2]string]bool{},
 		logs:         m.logs,
@@ -690,6 +698,10 @@ type owner struct {
 	m      *Manager
 	policy LocalPolicy
 	getenv func(string) string
+	// gpuVendor is fixed for the process lifetime (the host's hardware does
+	// not change under a running agent), so it is a plain field read by the
+	// owner goroutine and never written after construction.
+	gpuVendor GPUVendor
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -1445,7 +1457,7 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.getenv); err != nil {
+	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -1463,7 +1475,7 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	args, env, err := ExpandPlaceholders(spec, port, o.getenv)
+	args, env, err := ExpandPlaceholders(spec, port, o.gpuVendor, o.getenv)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port

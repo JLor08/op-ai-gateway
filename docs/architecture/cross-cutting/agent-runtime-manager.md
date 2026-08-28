@@ -157,7 +157,7 @@ rather than `env`, and a child that prints its own argv or environment into the
 output that `last_error.stderr_tail` samples.
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly three placeholders are resolved, in both `args` and `env` values:
+Exactly four placeholders are resolved, in both `args` and `env` values:
 
 - `${PORT}` — an exact match substitutes the child's listen port.
 - `${MODEL}` — an exact match substitutes the spec's **`upstream_model`**: the
@@ -171,6 +171,24 @@ Exactly three placeholders are resolved, in both `args` and `env` values:
   placeholder is unaffected. The gateway-facing name has no placeholder: it was
   not asked for, and a second token would have to be named so neither reading is
   ambiguous (`${GATEWAY_MODEL}`, never `${MODEL_NAME}`).
+- `${HOST_GPU_IDS}` — an exact match substitutes the spec's own declared GPU
+  indices **as the host sees them**, ascending, deduplicated, comma-separated
+  (`"2,5"`). It is the manual escape hatch beside `set_visible_devices`
+  ([§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)):
+  an operator on a runtime the agent has no vendor mapping for writes
+  `{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"}` themselves rather
+  than hand-copying the index list into a second place where it can drift from
+  the GPU rows that drive admission. **The name carries the invariant on
+  purpose**: these are *host* indices, and the child renumbers from zero, so
+  the same digits mean different cards on the two sides of the `exec` boundary
+  — a token called `${GPU_IDS}` would have read as either. Using it on a spec
+  that declares **no** GPUs is a hard error, on the same reasoning as an empty
+  `upstream_model`: substituting `""` produces an empty visibility value, and
+  an empty visibility value does not mean "no restriction", it means *nothing
+  is visible*. Ascending and deduplicated because the declared order never
+  survives a save anyway (the store reads GPU rows back `order by gpu_index`)
+  and because CUDA stops parsing the list at the first repeated entry, so
+  `1,1,2` would silently yield one visible device rather than three.
 - `${AGENT_ENV:NAME}` — resolved from the agent's own process environment. A
   **missing variable is a hard error naming the variable**, never a silent empty
   substitution.
@@ -183,8 +201,8 @@ refused by name (`${PORTX}`, `${PORT_1}`, `${port}`, `${AGENT_ENVV:…}`,
 rather than passed through: in this position it is far more likely a typo of
 `${PORT}` than genuine templating.
 
-**`MODEL` is deliberately absent from that prefix list**, and the asymmetry is a
-decision, not an oversight. The near-miss rule's own justification is that
+**`MODEL` and `HOST_GPU_IDS` are deliberately absent from that prefix list**,
+and the asymmetry is a decision, not an oversight. The near-miss rule's own justification is that
 nothing plausible starts with `PORT` or `AGENT_ENV` except an attempt at those
 placeholders — and that reasoning does not transfer: `${MODEL_PATH}`,
 `${MODELS_DIR}`, `${MODEL_ID}` and `${MODEL_NAME}` are all plausible tokens an
@@ -195,14 +213,20 @@ when a containment rule on `PORT` wrongly refused `${TRANSPORT}`,
 surprise: a typo (`${MDOEL}`) or the wrong case (`${model}`) reaches the child
 as literal text rather than erroring — the cheaper of the two mistakes, since an
 over-eager refusal breaks specs that work while a literal pass-through breaks
-only a spec that was already wrong.
+only a spec that was already wrong. `HOST_GPU_IDS` inherits that rule for the
+same reason (`${GPU_IDS_FILE}`, `${HOST_GPU_IDS_JSON}`), with the same accepted
+cost: `${GPU_IDS}` — the shorter name this token deliberately does *not* use —
+reaches the child as literal text.
 
-`${MODEL}` needs **no feature flag** ([ADR-025](../09-architecture-decisions.md)
-negotiation), and that was checked rather than assumed. The silent failure mode
-is real — an agent that does not know the token passes `${MODEL}` through as
-four literal characters instead of failing loudly — but no such agent can exist
-in the field: `runtime_manager` and this placeholder ship in the same
-unreleased `0.2.0`, so every agent that can run a spec at all understands it.
+`${MODEL}` and `${HOST_GPU_IDS}` need **no feature flag**
+([ADR-025](../09-architecture-decisions.md) negotiation), and that was checked
+rather than assumed. The silent failure mode is real — an agent that does not
+know a token passes it through as literal characters instead of failing loudly
+— but no such agent can exist in the field: `runtime_manager` and both
+placeholders ship in the same unreleased `0.2.0`, so every agent that can run a
+spec at all understands them. The same argument covers `set_visible_devices`:
+an agent that did not know the field would ignore it and silently run
+unconstrained, but no such agent exists.
 `agent.Features` is append-only and an entry can never be removed, so a flag
 whose intersection is true from the day it ships is permanent dead weight. The
 branch's single `0.2.0` bump covers this change; no further bump (`Version` is
@@ -291,6 +315,121 @@ configuration error it is. Expansion is also **dry-run with port 0 before any
 resource is acquired**, so a permanently broken spec fails without grabbing an
 ephemeral port; the port value only substitutes a decimal string, so the dry run
 is faithful.
+
+### 3.3 `set_visible_devices`: turning the GPU list into an enforcement
+
+A spec's `gpus` rows drive the per-GPU admission arithmetic
+([§5.2](#52-the-three-gates)) and the VRAM measurement mapping
+([§5.1](#51-the-per-gpu-data-model)) — but on their own they are
+a **declaration, not an enforcement**. Nothing constrains the child to those
+cards. Set `CUDA_VISIBLE_DEVICES` yourself in `env` and the two agree; forget
+to, and the accounting believes a model sits on GPU 2 with 18 GB while it
+actually landed on GPU 0. Nothing warns, because nothing can: the agent has no
+way to know which card a process *meant* to use.
+
+The obvious shell workaround does not exist on this path. The agent runs
+`exec.Command(spec.Binary, args...)` with an explicit `cmd.Env` and **no shell**
+([§3.1](#31-the-agent-local-policy)), and the allowlist requires an exact
+absolute binary path — so `VAR=x /path/binary` cannot work, on Linux either, and
+Windows has no prefix form at all. A per-spec option is therefore the only clean
+route, and it is OS-independent for the same reason: the environment is built
+programmatically.
+
+**`set_visible_devices` (per spec, default off)** asks the agent to set the
+visibility variable **its own detected hardware** uses, to **this spec's own
+GPU indices**:
+
+| Detected stack | Variable set |
+|---|---|
+| NVIDIA (`nvidia-smi` present) | `CUDA_VISIBLE_DEVICES` |
+| AMD (`rocm-smi` present) | `ROCR_VISIBLE_DEVICES` — **and nothing else** |
+| Apple, or no recognised stack | *nothing*, and that is a success, not an error |
+
+The vendor comes from the **same** detection the telemetry collectors use
+(`collector.DetectGPUCollectors`, which probes nvidia → amd → apple in that
+fixed order and keeps whichever reports `Available()`). It is a hardware
+capability discovered locally, never a gateway-supplied value — the same posture
+as the VRAM measurer ([§5.1](#51-the-per-gpu-data-model)). The
+gateway carries the boolean and nothing about the variable name, because it
+cannot know what is in the machine.
+
+> **AMD sets the ROCR level only, and adding `HIP_VISIBLE_DEVICES` is the
+> mistake to expect.** The two are not synonyms, they are *stacked* filters.
+> `ROCR_VISIBLE_DEVICES` is read by the ROCr runtime and selects from the
+> machine's real cards; `HIP_VISIBLE_DEVICES` is read one layer up by HIP and
+> selects from **what ROCR already left visible**. Setting both to the same host
+> list is the classic double-filter trap: with `ROCR_VISIBLE_DEVICES=2,3` the
+> HIP layer sees two devices numbered `0,1`, so a simultaneous
+> `HIP_VISIBLE_DEVICES=2,3` selects two devices that do not exist and the child
+> comes up with **no usable GPU at all**. One level — the lowest one — is the
+> whole of the correct answer.
+
+#### The four traps, and where each is handled
+
+1. **An empty value is not "no restriction" — it means "nothing visible".** The
+   option with no GPU rows would emit `CUDA_VISIBLE_DEVICES=`, hiding every card
+   from the model; it presents as a model that silently falls back to CPU, or
+   fails with *no CUDA-capable device is detected*, for a reason nothing in the
+   config hints at. **Refused, not emitted** — by the portal at save
+   (`runtime_spec.visible_devices_no_gpus`, HTTP 400) **and** by the agent at
+   launch (`not_permitted`). Both, deliberately: only the portal can tell an
+   operator *in the moment*, and only the agent covers the **file-mode** path,
+   where a hand-written local document never passes through the portal at all.
+   The agent's refusal is **vendor-independent** — an Apple host refuses the
+   combination too, although it would have set nothing — because one rule on
+   every platform is the only version a reader can check, and because a spec
+   document that is silently fine on the laptop and hides every card on the GPU
+   box is the worst available behaviour.
+2. **The child renumbers from 0.** With `CUDA_VISIBLE_DEVICES=3,4` the child
+   enumerates devices `0` and `1`, not `3` and `4` — so any **argument** naming
+   a device number (`--main-gpu`, `--tensor-split`, `--device`) is expressed in
+   the *child's* numbering from then on, while the spec's GPU rows, the budgets
+   and the measurements stay in the *host's*. This cannot be enforced: the agent
+   cannot parse an arbitrary model server's argv. It is therefore **surfaced
+   where the operator turns the option on** — the portal states it in the hint
+   directly under the checkbox, in German and English, and a test asserts the
+   hint is there. It does **not** make two specs interfere (see below).
+3. **Conflict with a hand-set entry.** The option together with a
+   visibility variable in the spec's own `env` is **refused, never silently
+   resolved**. Both resolution orders are defensible, which is exactly the
+   problem: whichever wins, the spec reads identically, so an operator cannot
+   tell from the configuration which cards the model is on. Refusing converts an
+   invisible ambiguity into a message
+   (`runtime_spec.visible_devices_conflict`, HTTP 400; `not_permitted`
+   agent-side). The owned set is `CUDA_VISIBLE_DEVICES`,
+   `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, compared case-insensitively,
+   and it is **vendor-independent on both sides** — the gateway cannot know the
+   target host's hardware, and a portal rule that could not mirror the agent's
+   would reintroduce, in the validator, the very "two states that look identical
+   and mean different things" defect this option removes. `HIP_VISIBLE_DEVICES`
+   is in the set although the agent never *sets* it, precisely because it
+   double-filters what ROCR already filtered. `ONEAPI_DEVICE_SELECTOR` and
+   `GPU_DEVICE_ORDINAL` are deliberately **not** owned: composing one of those
+   with the option is the documented escape hatch (`${HOST_GPU_IDS}`), not a
+   contradiction.
+4. **Host indices, not child indices.** The emitted value is the spec's declared
+   indices as the **host** sees them — the same numbers `nvidia-smi`/`rocm-smi`
+   report and the same ones the per-GPU budgets and measurement rows are keyed
+   by. `${HOST_GPU_IDS}` carries host indices too, which is why it is named that
+   and not `${GPU_IDS}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)).
+
+#### Isolation is structural
+
+Every spec has its own setting and they do not interfere — one model on three
+GPUs, another on two, at the same time. That is not a property that had to be
+added: the child environment is built **per spec** in `ExpandPlaceholders`, from
+the spec it was handed, into a fresh slice that becomes exactly one
+`exec.Cmd.Env`. There is no shared or process-wide state for one spec's value to
+leak into another's. It is nevertheless **pinned by a test that runs two
+co-resident specs on disjoint GPU sets concurrently and asserts on what each
+*child* read out of its own environment** — proved rather than assumed, because
+"structurally impossible" is what every leak looked like before it was found.
+
+**A spec with the option off is byte-identical to the pre-feature behaviour** —
+same environment entries, same order — which is every deployment that exists
+today. A test asserts that literally, on all four vendor values, including for a
+spec that declares GPUs (the case where the feature had something it *could*
+have emitted).
 
 ## 4. One router port per AI server
 

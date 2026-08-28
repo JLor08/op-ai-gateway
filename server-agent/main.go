@@ -150,9 +150,18 @@ func main() {
 	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
 	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
+	// The GPU vendor comes from the SAME detection the telemetry collectors
+	// use (gpus, above): DetectGPUCollectors probes nvidia-smi, then
+	// rocm-smi, then Apple's ioreg, in that fixed order and keeps whichever
+	// reports Available(). It selects which visibility variable a
+	// set_visible_devices spec's child receives. A host with none of them
+	// yields GPUVendorNone, which makes that option a documented no-op
+	// rather than an error -- the same "hardware capability, not a
+	// negotiated feature" posture as the measurer below.
 	mgr := runtimectl.NewManager(runtimectl.ManagerOptions{
-		Policy: localPolicy,
-		Getenv: os.Getenv,
+		Policy:    localPolicy,
+		Getenv:    os.Getenv,
+		GPUVendor: runtimeGPUVendor(gpus),
 		// Managed-process output retention (T3). Operator-owned, exactly
 		// like the allowlists above: how much of this host's memory goes to
 		// remembering what the models printed is the operator's call, and
@@ -303,4 +312,23 @@ func collectorNames(gpus []collector.GPUCollector) []string {
 		names = append(names, g.Name())
 	}
 	return names
+}
+
+// runtimeGPUVendor picks the runtime manager's GPU vendor from the detected
+// collectors: the FIRST one this package's runtime seam recognises, which
+// preserves DetectGPUCollectors' own nvidia -> amd -> apple precedence on a
+// host that somehow presents more than one. No recognised collector (a
+// CPU-only host, or a vendor the collectors know but the runtime seam does
+// not) yields GPUVendorNone.
+//
+// The name -> vendor mapping itself lives in internal/runtime
+// (ParseGPUVendor), not here, so it is covered by that package's tests
+// instead of by a func in package main that nothing exercises.
+func runtimeGPUVendor(gpus []collector.GPUCollector) runtimectl.GPUVendor {
+	for _, g := range gpus {
+		if v := runtimectl.ParseGPUVendor(g.Name()); v != runtimectl.GPUVendorNone {
+			return v
+		}
+	}
+	return runtimectl.GPUVendorNone
 }

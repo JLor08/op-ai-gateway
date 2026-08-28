@@ -142,6 +142,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     pinned: false,
     admin_state: '',
     vram_locked: false,
+    set_visible_devices: false,
     gpus: [],
     ...overrides,
   };
@@ -1432,7 +1433,12 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     enabled: true,
     binary: '/usr/local/bin/llama-server',
     args: ['--model', '/models/a model.gguf', '--port', '${PORT}'],
-    env: { CUDA_VISIBLE_DEVICES: '0', HF_HOME: '/data/hf' },
+    // NOT one of the visibility variables set_visible_devices owns: this
+    // fixture also sets that option below, and the two together are exactly
+    // the combination the form refuses (validateVisibleDevices) -- a fixture
+    // that cannot be saved would make every save-path test below untestable
+    // for the wrong reason.
+    env: { NCCL_P2P_DISABLE: '1', HF_HOME: '/data/hf' },
     work_dir: '/opt/models',
     listen_port: 8099,
     health_path: '/healthz',
@@ -1443,6 +1449,10 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     pinned: true,
     admin_state: '',
     vram_locked: true,
+    // Non-default on purpose: the override actions build their PUT body by
+    // spreading the LOADED spec, so a `false` here could not tell a preserved
+    // value from a defaulted one.
+    set_visible_devices: true,
     gpus: [{ index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
     ...overrides,
   });
@@ -1466,6 +1476,7 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     pinned: spec.pinned,
     admin_state: adminState,
     vram_locked: spec.vram_locked,
+    set_visible_devices: spec.set_visible_devices,
     gpus: spec.gpus,
   };
 }
@@ -4436,5 +4447,150 @@ describe('RuntimeAdminSection spec GPU picker', () => {
     expect(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }).textContent).toBe(
       t.runtimeSpecGpuPickPlaceholder,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// set_visible_devices: the checkbox that turns the GPU rows from a declaration
+// into an enforcement.
+// ---------------------------------------------------------------------------
+
+describe('RuntimeAdminSection set_visible_devices', () => {
+  // Fills the create form's mandatory fields and turns the checkbox on.
+  // Returns nothing: every assertion below is about what the form did with it.
+  async function openCreateWithVisibleDevices() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecSetVisibleDevices));
+  }
+
+  it('sends the flag with the GPU rows it applies to', async () => {
+    const { putSpecs } = renderSection();
+    await openCreateWithVisibleDevices();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecGpuIndex), { target: { value: '3' } });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.set_visible_devices).toBe(true);
+    expect(putSpecs[0].body.gpus).toEqual([{ index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 }]);
+  });
+
+  // Trap 2 lives here and nowhere else: nothing can ENFORCE that an argument
+  // naming a device number is written in the child's numbering, because the
+  // agent cannot parse an arbitrary model server's argv. Saying it at the
+  // checkbox is the whole of the mitigation, so its absence is a regression.
+  it('states the child-side renumbering where the option is turned on', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const hint = await screen.findByText(t.runtimeSpecSetVisibleDevicesHint);
+    expect(hint).toBeInTheDocument();
+    // Not merely present -- it has to actually carry the consequence.
+    expect(t.runtimeSpecSetVisibleDevicesHint).toMatch(/0/);
+    expect(t.runtimeSpecSetVisibleDevicesHint).toContain('--main-gpu');
+  });
+
+  // Trap 1: an EMPTY visibility value does not mean "no restriction", it means
+  // nothing is visible. Caught before the round trip, like the reserved-env-key
+  // and duplicate-GPU-index checks.
+  it('refuses the option with no GPU rows before ever calling the API', async () => {
+    const { created, putSpecs } = renderSection();
+    await openCreateWithVisibleDevices();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(await screen.findByText(t.errorRuntimeSpecVisibleDevicesNoGpus)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // Trap 3, in every spelling and for all three owned variables. HIP is in the
+  // list although the agent never sets it: it selects from what ROCR already
+  // left visible, so a hand-set HIP list on top of agent-managed ROCR
+  // filtering leaves the child with no usable device.
+  it.each([
+    'CUDA_VISIBLE_DEVICES',
+    'cuda_visible_devices',
+    'ROCR_VISIBLE_DEVICES',
+    'Hip_Visible_Devices',
+  ])('refuses the option alongside a hand-set %s', async (key) => {
+    const { created, putSpecs } = renderSection();
+    await openCreateWithVisibleDevices();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: `${key}=0,1` },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(new RegExp(t.errorRuntimeSpecVisibleDevicesConflict.slice(0, 24))),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // The same variable is fine when the option is OFF: the refusal is about two
+  // sources for one value, never about the variable itself. An operator who
+  // wants to pin devices by hand still can.
+  it('accepts a hand-set visibility variable when the option is off', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'CUDA_VISIBLE_DEVICES=0,1' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.set_visible_devices).toBe(false);
+    expect(putSpecs[0].body.env).toEqual({ CUDA_VISIBLE_DEVICES: '0,1' });
+  });
+
+  // ONEAPI_DEVICE_SELECTOR is deliberately NOT owned: composing it with the
+  // option is the documented escape hatch for a runtime the agent has no
+  // vendor mapping for, so refusing it would break the very thing
+  // ${HOST_GPU_IDS} exists for.
+  it('lets ONEAPI_DEVICE_SELECTOR compose with the option', async () => {
+    const { putSpecs } = renderSection();
+    await openCreateWithVisibleDevices();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'ONEAPI_DEVICE_SELECTOR=level_zero:${HOST_GPU_IDS}' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.set_visible_devices).toBe(true);
+    expect(putSpecs[0].body.env).toEqual({
+      ONEAPI_DEVICE_SELECTOR: 'level_zero:${HOST_GPU_IDS}',
+    });
+  });
+
+  // Hydration: the edit form must show the STORED value, or a save would
+  // silently turn the option off on a spec that had it on.
+  it('hydrates the checkbox from the stored spec', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const checkbox = screen.getByLabelText(t.runtimeSpecSetVisibleDevices) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
   });
 });

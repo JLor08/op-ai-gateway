@@ -1228,8 +1228,22 @@ type RuntimeSpec struct {
 	Pinned                      bool
 	AdminState                  string // "" | "force_running" | "force_stopped"
 	VRAMLocked                  bool
-	CreatedAt                   time.Time
-	UpdatedAt                   time.Time
+	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
+	// this spec's GPU rows, by setting the vendor-appropriate visibility
+	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
+	// nothing on Apple or a host with no recognised GPU stack) from those
+	// HOST indices. Off, the GPU rows remain a declaration that drives
+	// admission arithmetic and the VRAM measurement mapping while nothing
+	// stops the process from landing on a different card.
+	//
+	// The gateway is hardware-agnostic and never resolves the variable name;
+	// it only carries the flag. The two invalid combinations it DOES refuse
+	// at save time (on with no GPU rows; on together with a hand-set
+	// visibility variable in Env) live in portal.PutRuntimeSpec, and the
+	// agent refuses them again at launch — see that method for why both.
+	SetVisibleDevices bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec

@@ -148,7 +148,7 @@ flowchart TB
 ## 3. The migration runner
 
 `internal/store/migrate.go` holds an append-only, ordered slice `migrations`
-of 68 entries (see [Data Model (Reference)](../reference/data-model.md) for
+of 69 entries (see [Data Model (Reference)](../reference/data-model.md) for
 the full list). `(*SQLStore).Migrate(ctx)`:
 
 1. Creates `schema_migrations (version integer primary key, name text, applied_at timestamp)`
@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 68 migrations in order, same as
+- **Only-pending.** A fresh install runs all 69 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -197,6 +197,13 @@ Rules that keep this safe over time:
   67 `server_runtime_reports` — specifically so a binary rollback survives each
   half independently. Collapsing them into one for neatness removes exactly the
   property they were split to provide.
+- **Append even inside an unreleased feature branch.** 69
+  `runtime_spec_set_visible_devices` adds one column to a table migration 65
+  created on that same branch, and it is a *new* migration rather than an edit
+  to 65 — because 65 has already run against every developer database and both
+  CI conformance legs, so editing it would leave those at version 68 with no
+  such column while a fresh install got one. "Not released yet" is not the
+  test; "has any database already run it" is.
 
 ### A constraint added over possibly-dirty live data skips, it does not abort
 
@@ -556,4 +563,4 @@ itself is never returned to a client.
 ## See also
 
 - [Data Model (Reference)](../reference/data-model.md) — the concrete
-  tables, the domain types they back, and the full 68-migration history.
+  tables, the domain types they back, and the full 69-migration history.

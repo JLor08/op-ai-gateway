@@ -7592,7 +7592,8 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			StartupTimeoutSeconds: 180, IdleTimeoutSeconds: 900,
 			AdmissionWaitTimeoutSeconds: 30, Pinned: true,
 			AdminState: "force_running", VRAMLocked: true,
-			CreatedAt: now, UpdatedAt: now,
+			SetVisibleDevices: true,
+			CreatedAt:         now, UpdatedAt: now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert: %v", err)
@@ -7602,7 +7603,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			t.Fatalf("read back: ok=%v err=%v", ok, err)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked ||
+			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || got.AdmissionWaitTimeoutSeconds != 30 ||
 			!got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)

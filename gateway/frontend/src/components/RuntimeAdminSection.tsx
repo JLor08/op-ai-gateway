@@ -175,6 +175,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     pinned: false,
     admin_state: '',
     vram_locked: false,
+    set_visible_devices: false,
     gpus: [],
   };
 }
@@ -310,6 +311,7 @@ type ReportSpec = {
   args: string[];
   gpus: { index: number; vramMb: number }[];
   pinned: boolean;
+  setVisibleDevices: boolean;
   idleTimeoutSeconds: number;
 };
 
@@ -361,6 +363,7 @@ function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): Repo
     args,
     gpus,
     pinned: value.pinned === true,
+    setVisibleDevices: value.set_visible_devices === true,
     idleTimeoutSeconds:
       typeof value.idle_timeout_seconds === 'number' ? value.idle_timeout_seconds : 0,
   };
@@ -738,6 +741,57 @@ function validatePlaceholders(values: string[], t: Translation): string | undefi
       ? t.runtimeSpecEnvReserved
       : `${t.runtimeSpecPlaceholderInvalid}: ${violation.match}`;
   }
+  return undefined;
+}
+
+// The environment variables the `set_visible_devices` option OWNS: a spec may
+// not hand-set any of them while the option is on. Mirrors the backend's
+// runtimeSpecVisibleDevicesVars (portal/service_runtime.go) and, through it,
+// the agent's visibleDevicesOwnedVars -- all three lists must refuse exactly
+// the same names, or the form starts rejecting specs the backend accepts.
+//
+// HIP_VISIBLE_DEVICES is included although the agent never SETS it: it selects
+// from what ROCR_VISIBLE_DEVICES already left visible, so combining a hand-set
+// HIP list with agent-managed ROCR filtering leaves the child with no usable
+// device. Runtime-specific selectors the agent neither sets nor filters through
+// (ONEAPI_DEVICE_SELECTOR, GPU_DEVICE_ORDINAL) are deliberately NOT here --
+// composing one of those with the option is the documented escape hatch.
+const visibleDevicesOwnedVars = [
+  'CUDA_VISIBLE_DEVICES',
+  'ROCR_VISIBLE_DEVICES',
+  'HIP_VISIBLE_DEVICES',
+];
+
+/**
+ * The two combinations `set_visible_devices` may not be saved in, checked
+ * before the round trip so the operator reads a message in the form instead of
+ * a backend error code.
+ *
+ * Both are refused by the backend too (and by the agent again at launch); this
+ * is the same early-feedback mirror the reserved-env-key and duplicate-GPU-index
+ * checks are, not a second source of truth. The order matches the backend's, so
+ * a spec that is wrong in both ways reports the same one either way.
+ *
+ *  - A hand-set visibility variable is two sources for one value: whichever
+ *    wins, the config reads identically, so an operator cannot tell which cards
+ *    the model is actually on.
+ *  - An empty GPU list would make the agent emit `CUDA_VISIBLE_DEVICES=`, and an
+ *    EMPTY visibility value does not mean "no restriction" -- it means NOTHING
+ *    is visible.
+ */
+function validateVisibleDevices(
+  on: boolean,
+  env: Record<string, string>,
+  gpuCount: number,
+  t: Translation,
+): string | undefined {
+  if (!on) return undefined;
+  for (const key of Object.keys(env)) {
+    if (visibleDevicesOwnedVars.includes(key.trim().toUpperCase())) {
+      return `${t.errorRuntimeSpecVisibleDevicesConflict}: ${key}`;
+    }
+  }
+  if (gpuCount === 0) return t.errorRuntimeSpecVisibleDevicesNoGpus;
   return undefined;
 }
 
@@ -1919,6 +1973,7 @@ export function RuntimeAdminSection({
   const [pinned, setPinned] = useState(false);
   const [adminState, setAdminState] = useState('');
   const [vramLocked, setVramLocked] = useState(false);
+  const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
 
   function resetSpecFields() {
@@ -1936,6 +1991,7 @@ export function RuntimeAdminSection({
     setPinned(false);
     setAdminState('');
     setVramLocked(false);
+    setSetVisibleDevices(false);
     setGpuRows([]);
   }
 
@@ -1954,6 +2010,7 @@ export function RuntimeAdminSection({
     setPinned(spec.pinned);
     setAdminState(spec.admin_state);
     setVramLocked(spec.vram_locked);
+    setSetVisibleDevices(spec.set_visible_devices);
     setGpuRows(
       spec.gpus.map((g) => ({
         rowKey: makeRowKey(),
@@ -2077,6 +2134,7 @@ export function RuntimeAdminSection({
       pinned,
       admin_state: adminState,
       vram_locked: vramLocked,
+      set_visible_devices: setVisibleDevices,
       gpus: gpuRows.map((r) => ({
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,
@@ -2101,6 +2159,16 @@ export function RuntimeAdminSection({
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
     if (duplicateGpu !== null) {
       showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      return;
+    }
+    const visibleDevicesError = validateVisibleDevices(
+      setVisibleDevices,
+      parsedEnv.env,
+      gpuRows.length,
+      t,
+    );
+    if (visibleDevicesError) {
+      showError(visibleDevicesError);
       return;
     }
     setBusy(true);
@@ -2163,6 +2231,16 @@ export function RuntimeAdminSection({
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
     if (duplicateGpu !== null) {
       showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      return;
+    }
+    const visibleDevicesError = validateVisibleDevices(
+      setVisibleDevices,
+      parsedEnv.env,
+      gpuRows.length,
+      t,
+    );
+    if (visibleDevicesError) {
+      showError(visibleDevicesError);
       return;
     }
     setBusy(true);
@@ -2312,6 +2390,22 @@ export function RuntimeAdminSection({
       value: (m) => formatGpus(specsById[m.id]?.gpus ?? []),
       filter: 'text',
       searchable: false,
+    },
+    {
+      // Deliberately adjacent to the GPU column: together the two say whether
+      // the cards listed there are what the process actually gets, or only
+      // what the admission arithmetic believes it gets.
+      id: 'set_visible_devices',
+      label: t.runtimeSpecSetVisibleDevices,
+      value: (m) => (specsById[m.id]?.set_visible_devices ? 'yes' : 'no'),
+      filter: 'enum',
+      searchable: false,
+      enumLabel: (v) => (v === 'yes' ? t.runtimeSpecSetVisibleDevices : '–'),
+      render: (m) =>
+        renderBoolChip(
+          Boolean(specsById[m.id]?.set_visible_devices),
+          t.runtimeSpecSetVisibleDevices,
+        ),
     },
     {
       id: 'pinned',
@@ -2706,6 +2800,16 @@ export function RuntimeAdminSection({
       render: (s) => renderBoolChip(s.pinned, t.runtimeSpecPinned),
     },
     {
+      // Worth a column HERE in particular: a file-mode document never passes
+      // through this portal's validation, so this read-only echo is where an
+      // operator sees what their hand-written file actually asked for.
+      id: 'set_visible_devices',
+      label: t.runtimeSpecSetVisibleDevices,
+      value: (s) => (s.setVisibleDevices ? 'yes' : 'no'),
+      searchable: false,
+      render: (s) => renderBoolChip(s.setVisibleDevices, t.runtimeSpecSetVisibleDevices),
+    },
+    {
       id: 'idle_timeout',
       label: t.runtimeSpecIdleTimeout,
       value: (s) => formatMetric(s.idleTimeoutSeconds, 0),
@@ -2936,6 +3040,34 @@ export function RuntimeAdminSection({
             />
             <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
               {t.runtimeSpecVramLockedHint}
+            </Typography>
+            {/* Without this, the GPU rows below are a DECLARATION: they drive
+                the admission arithmetic and the VRAM measurement mapping, and
+                nothing stops the process from landing on a different card --
+                after which the accounting is confidently wrong and nothing
+                warns. With it on, the agent sets the visibility variable its
+                own hardware wants (CUDA_VISIBLE_DEVICES on NVIDIA,
+                ROCR_VISIBLE_DEVICES on AMD; nothing on Apple) from these rows.
+
+                The hint carries the renumbering consequence because this is
+                the only place an operator meets it: a child launched with
+                CUDA_VISIBLE_DEVICES=3,4 enumerates its devices as 0 and 1, so
+                any ARGUMENT naming a device number (--main-gpu,
+                --tensor-split) is in the child's numbering from then on while
+                these rows stay in the host's. Nothing can enforce that -- the
+                agent cannot parse an arbitrary model server's argv -- so
+                saying it here is the whole of the mitigation. */}
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={setVisibleDevices}
+                  onChange={(e) => setSetVisibleDevices(e.target.checked)}
+                />
+              }
+              label={t.runtimeSpecSetVisibleDevices}
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecSetVisibleDevicesHint}
             </Typography>
             <SelectField
               id="runtime-spec-admin-state"

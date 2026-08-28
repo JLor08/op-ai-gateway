@@ -280,6 +280,7 @@ type agentRuntimeReportSpec struct {
 	IdleTimeoutSeconds          int                         `json:"idle_timeout_seconds"`
 	AdmissionWaitTimeoutSeconds int                         `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool                        `json:"pinned"`
+	SetVisibleDevices           bool                        `json:"set_visible_devices"`
 	AdminState                  string                      `json:"admin_state"`
 }
 

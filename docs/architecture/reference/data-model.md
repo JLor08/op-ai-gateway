@@ -48,7 +48,7 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `enabled` (off by default). |
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `enabled` (off by default). |
 | `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`. |
 | `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (68 migrations)
+## 4. Migration history (69 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -390,6 +390,7 @@ catch-all `model_override`, which has its own column).
 | 66 | `server_runtime_limits` | Creates `ai_server_gpu_budgets` (PK `(server_id, gpu_index)`); adds `ai_servers.runtime_max_processes` (`0` = unlimited) and `ai_servers.managed_runtime_only`. |
 | 67 | `server_runtime_reports` | Creates `server_runtime_reports` — 1:1 latest runtime-config report per server (PK `server_id`, upsert-overwrite), shaped column-for-column like migration 29's `server_hardware`: `report_json` is a validated opaque blob the store never parses. |
 | 68 | `application_single_server_agent` | A **partial unique index only, no columns**: `applications(server_id) where type = 'server_agent'`, enforcing at most one `server_agent` application per server. Skips index creation (while still recording version 68) on a database that already holds duplicates — see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runner) for why that is a deliberate policy rather than an incomplete migration. |
+| 69 | `runtime_spec_set_visible_devices` | Adds `agent_runtime_specs.set_visible_devices` (integer boolean, default `0`): the agent sets the vendor-appropriate GPU visibility variable (`CUDA_VISIBLE_DEVICES` on NVIDIA, `ROCR_VISIBLE_DEVICES` on AMD) for that spec's child from that spec's own GPU indices. Appended rather than folded into migration 65 — which created the table on the same unreleased branch — because 65 had already run against every developer database and both CI conformance legs. |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:

@@ -50,7 +50,15 @@ type Spec struct {
 	IdleTimeoutSeconds          int               `json:"idle_timeout_seconds"`
 	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool              `json:"pinned"`
-	AdminState                  string            `json:"admin_state"` // "" | "force_running" | "force_stopped"
+	// SetVisibleDevices asks the agent to CONSTRAIN this spec's child to the
+	// cards in GPUs, by setting the vendor-appropriate visibility variable
+	// (VisibleDevicesVar) to those HOST indices. Without it, GPUs is a
+	// DECLARATION only -- it drives admission arithmetic and the measurement
+	// mapping, and nothing stops the child from landing on a different card,
+	// leaving the accounting confidently wrong with no warning anywhere.
+	// The rules and the four traps live on ExpandPlaceholders.
+	SetVisibleDevices bool   `json:"set_visible_devices"`
+	AdminState        string `json:"admin_state"` // "" | "force_running" | "force_stopped"
 }
 
 // GPUBudget is one per-GPU VRAM budget row.

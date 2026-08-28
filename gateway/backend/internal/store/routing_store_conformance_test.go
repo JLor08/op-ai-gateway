@@ -532,7 +532,8 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			Env: `{"HF_TOKEN":"${AGENT_ENV:HF_TOKEN}"}`, WorkDir: "/srv/models",
 			HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
-			AdminState: "force_running", VRAMLocked: true, CreatedAt: now, UpdatedAt: now,
+			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
+			CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert: %v", err)
@@ -542,7 +543,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("read back: ok=%v err=%v", ok, err)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked ||
+			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}

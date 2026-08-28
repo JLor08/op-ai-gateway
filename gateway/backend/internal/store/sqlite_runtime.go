@@ -23,8 +23,8 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			id, mapping_id, enabled, binary_path, args, env, work_dir, listen_port,
 			health_path, health_timeout_seconds, startup_timeout_seconds,
 			idle_timeout_seconds, admission_wait_timeout_seconds, pinned,
-			admin_state, vram_locked, created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			admin_state, vram_locked, set_visible_devices, created_at, updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env, work_dir = excluded.work_dir,
@@ -34,12 +34,14 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			idle_timeout_seconds = excluded.idle_timeout_seconds,
 			admission_wait_timeout_seconds = excluded.admission_wait_timeout_seconds,
 			pinned = excluded.pinned, admin_state = excluded.admin_state,
-			vram_locked = excluded.vram_locked, updated_at = excluded.updated_at`,
+			vram_locked = excluded.vram_locked,
+			set_visible_devices = excluded.set_visible_devices,
+			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
 		spec.StartupTimeoutSeconds, spec.IdleTimeoutSeconds,
 		spec.AdmissionWaitTimeoutSeconds, spec.Pinned, spec.AdminState,
-		spec.VRAMLocked, spec.CreatedAt, spec.UpdatedAt,
+		spec.VRAMLocked, spec.SetVisibleDevices, spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
 		// FK before unique: sqlite's FK error text also matches the
@@ -58,7 +60,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, work_dir,
 	listen_port, health_path, health_timeout_seconds, startup_timeout_seconds,
 	idle_timeout_seconds, admission_wait_timeout_seconds, pinned, admin_state,
-	vram_locked, created_at, updated_at`
+	vram_locked, set_visible_devices, created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
 // the RuntimeSpecsByApplication join below where an unqualified column list
@@ -67,7 +69,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, work_d
 const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s.args, s.env, s.work_dir,
 	s.listen_port, s.health_path, s.health_timeout_seconds, s.startup_timeout_seconds,
 	s.idle_timeout_seconds, s.admission_wait_timeout_seconds, s.pinned, s.admin_state,
-	s.vram_locked, s.created_at, s.updated_at`
+	s.vram_locked, s.set_visible_devices, s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
 	row := s.queryRow(ctx, `select `+runtimeSpecCols+` from agent_runtime_specs where mapping_id = ?`, mappingID)
@@ -326,12 +328,12 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
-	var enabled, pinned, vramLocked int64
+	var enabled, pinned, vramLocked, setVisibleDevices int64
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
 		&spec.Env, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
 		&spec.HealthTimeoutSeconds, &spec.StartupTimeoutSeconds,
 		&spec.IdleTimeoutSeconds, &spec.AdmissionWaitTimeoutSeconds, &pinned,
-		&spec.AdminState, &vramLocked, &spec.CreatedAt, &spec.UpdatedAt)
+		&spec.AdminState, &vramLocked, &setVisibleDevices, &spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound
 	}
@@ -339,6 +341,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		return routing.RuntimeSpec{}, fmt.Errorf("scan runtime spec: %w", err)
 	}
 	spec.Enabled, spec.Pinned, spec.VRAMLocked = enabled != 0, pinned != 0, vramLocked != 0
+	spec.SetVisibleDevices = setVisibleDevices != 0
 	return spec, nil
 }
 

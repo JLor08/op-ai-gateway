@@ -235,7 +235,7 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.application_not_server_agent` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.application_not_server_agent` | 400 |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
 | unmapped | 500 `runtime_spec.request_failed` |
@@ -263,9 +263,19 @@ a terminal `not_permitted` instead of a form error). Every tuning integer
 `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
 `admission_wait_timeout_seconds`) must be `>= 0`; `admin_state` must be one of
 the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env
-**keys** must match `^[A-Z_][A-Z0-9_]*$`. **Env values are never validated** —
+**keys** must match `^[A-Z_][A-Z0-9_]*$`. `set_visible_devices` adds two refusals
+of its own, both returned **before any mutation**:
+`runtime_spec.visible_devices_no_gpus` when it is on with an empty `gpus` (an
+empty visibility value hides *every* card rather than restricting none), and
+`runtime_spec.visible_devices_conflict` when it is on while `env` already sets
+one of `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`
+(compared case-insensitively). Both rules are **vendor-independent** — this
+gateway cannot know the target host's hardware — and the agent enforces the
+identical pair again at launch, which is what covers the file-mode path that
+never reaches this endpoint. See
+[agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement). **Env values are never validated** —
 that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
-`${PORT}` and `${MODEL}` placeholder mechanism, and it means an env key naming an
+`${PORT}`, `${MODEL}` and `${HOST_GPU_IDS}` placeholder mechanism, and it means an env key naming an
 agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
 `SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
 and persisted* here, with the real refusal happening agent-side at process
@@ -375,7 +385,8 @@ independent implementations must agree on:
 - each spec carries `id`, `model`, `upstream_model`, `binary`, `args[]`, `env{}`,
   `work_dir`, `gpus[{index, vram_mb}]`, `listen_port`, `health_path`,
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
-  `admission_wait_timeout_seconds`, `pinned`, `admin_state`;
+  `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
+  `admin_state`;
 - **`coresident` entries are SPEC ids, never mapping ids** — the mistake that
   would type-check and silently break admission;
 - `gpus[].vram_mb` is the *measured* value if present, else the estimate, with

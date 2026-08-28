@@ -216,7 +216,7 @@ explicit count of the missing bytes at the point they were lost.
 
 #### Placeholders in `args` and `env` values
 
-Three, resolved by the agent at launch time in **both** `args` and `env`
+Four, resolved by the agent at launch time in **both** `args` and `env`
 values. Everything else shaped like `${…}` is passed through byte-for-byte, so
 a model server's own templating still works.
 
@@ -224,6 +224,7 @@ a model server's own templating still works.
 |---|---|---|
 | `${PORT}` | the port the agent assigned this process | — |
 | `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
+| `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, ascending and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
 | `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
 
 `${MODEL}` is the one to reach for when a command line has to repeat the model
@@ -232,14 +233,61 @@ deliberately the *application-side* name, not the gateway-facing one clients
 send, because the child is the thing that has to recognise it. There is no
 placeholder for the gateway-facing name.
 
+`${HOST_GPU_IDS}` is for a runtime this agent has no built-in mapping for:
+`{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"}` builds the value from
+the same GPU rows the admission arithmetic uses, so the two cannot drift. For
+NVIDIA and AMD you want `set_visible_devices` (below) instead — this is the
+escape hatch, not the normal route. **The name says `HOST` because the numbers
+are the host's**: a child launched with those indices renumbers its devices from
+`0`, so the same digits mean different cards inside the process.
+
 Two shapes are refused rather than passed through: `${AGENT_ENV:OP_AGENT_*}`
 (the agent's own credentials), and a **typo of `${PORT}` or `${AGENT_ENV:…}`** —
 anything whose inner text starts with `PORT` or `AGENT_ENV` but is not one of
-the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` has no such
-rule, deliberately: `${MODEL_PATH}`, `${MODELS_DIR}` and `${MODEL_ID}` are
-plausible things to pass through, so only the exact spelling `${MODEL}` is
-substituted — the cost being that `${MDOEL}` or `${model}` reaches the child as
-literal text instead of erroring.
+the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` and
+`${HOST_GPU_IDS}` have no such rule, deliberately: `${MODEL_PATH}`,
+`${MODELS_DIR}`, `${MODEL_ID}` and `${GPU_IDS_FILE}` are plausible things to
+pass through, so only the exact spellings are substituted — the cost being that
+`${MDOEL}`, `${model}` or the shorter `${GPU_IDS}` reaches the child as literal
+text instead of erroring.
+
+#### `set_visible_devices`: pinning a model to its GPUs
+
+A spec's GPU rows tell the gateway how much VRAM this model wants on which
+cards. On their own they do **not** stop the process from starting on a
+different card — and if it does, the accounting is wrong and nothing warns.
+
+Switch **`set_visible_devices`** on (the checkbox in the portal, the
+`set_visible_devices` field in a file-mode config) and the agent sets the
+variable *your hardware* uses, to *this spec's* indices:
+
+| The agent found | It sets |
+|---|---|
+| `nvidia-smi` | `CUDA_VISIBLE_DEVICES` |
+| `rocm-smi` | `ROCR_VISIBLE_DEVICES` — and **only** that one |
+| Apple, or no GPU tooling | nothing at all, and that is not an error |
+
+On AMD only the ROCR level is set on purpose. `HIP_VISIBLE_DEVICES` selects from
+what ROCR already left visible, so setting both to the same list leaves the
+process with no usable GPU.
+
+Three things worth knowing before you turn it on:
+
+- **Your process renumbers from 0.** Given cards `3,4` it sees devices `0,1`.
+  Any argument that names a device number — `--main-gpu`, `--tensor-split` —
+  means the *process's* numbering from then on; the GPU rows in the spec keep
+  meaning the host's.
+- **Turning it on with no GPU rows is refused**, not treated as "no
+  restriction". An empty value means *no device is visible*, which would leave
+  the model with no GPU at all.
+- **Setting one of those variables in `env` yourself while it is on is
+  refused** (`CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`,
+  `HIP_VISIBLE_DEVICES`, any capitalisation). Pick one source. Other selectors
+  — `ONEAPI_DEVICE_SELECTOR`, `GPU_DEVICE_ORDINAL` — are yours and compose
+  freely with it.
+
+Each spec gets its own value; one model on three cards and another on two do not
+interfere. Leaving it off changes nothing about how a spec launches.
 
 #### What environment a model process gets
 

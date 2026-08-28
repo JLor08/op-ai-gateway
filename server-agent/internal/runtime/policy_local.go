@@ -149,6 +149,160 @@ var baseEnvNames = []string{
 	"WINDIR",
 }
 
+// GPUVendor names the GPU stack the agent actually found on THIS host. It is
+// a hardware fact, discovered locally, never a gateway-supplied value: main.go
+// derives it from collector.DetectGPUCollectors(), which probes for
+// nvidia-smi, then rocm-smi, then Apple's ioreg, in that fixed order and keeps
+// whichever reports Available() first. The string values are exactly
+// collector.GPUCollector.Name()'s three values, so ParseGPUVendor can map one
+// to the other without a second naming convention to keep in sync.
+type GPUVendor string
+
+const (
+	// GPUVendorNone is a host with no GPU stack the agent recognises -- a
+	// CPU-only machine, an Intel/oneAPI box, or a vendor added to the
+	// collectors later but not here. Never an error: see VisibleDevicesVar.
+	GPUVendorNone   GPUVendor = ""
+	GPUVendorNVIDIA GPUVendor = "nvidia"
+	GPUVendorAMD    GPUVendor = "amd"
+	GPUVendorApple  GPUVendor = "apple"
+)
+
+// ParseGPUVendor maps a collector.GPUCollector.Name() to a GPUVendor,
+// returning GPUVendorNone for any name this package does not know. Lives here
+// rather than in main.go so the mapping is covered by this package's tests
+// instead of by a func in package main that nothing exercises.
+func ParseGPUVendor(name string) GPUVendor {
+	switch GPUVendor(name) {
+	case GPUVendorNVIDIA:
+		return GPUVendorNVIDIA
+	case GPUVendorAMD:
+		return GPUVendorAMD
+	case GPUVendorApple:
+		return GPUVendorApple
+	default:
+		return GPUVendorNone
+	}
+}
+
+// VisibleDevicesVar returns the environment variable that restricts a child
+// to a chosen set of cards on vendor's stack, or "" when this agent has
+// nothing to set.
+//
+// NVIDIA -> CUDA_VISIBLE_DEVICES. The universal one; every CUDA runtime, and
+// therefore llama.cpp/vLLM/ollama on NVIDIA, honours it.
+//
+// AMD -> ROCR_VISIBLE_DEVICES, and DELIBERATELY NOTHING ELSE. Do not "fix"
+// this by also setting HIP_VISIBLE_DEVICES: the two are not synonyms, they are
+// STACKED filters. ROCR_VISIBLE_DEVICES is read by the ROCr runtime and
+// selects from the machine's real cards; HIP_VISIBLE_DEVICES is read one layer
+// up by HIP and selects from WHAT ROCR ALREADY LEFT VISIBLE. Setting both to
+// the same host list is the classic double-filter trap -- with
+// ROCR_VISIBLE_DEVICES=2,3 the HIP layer sees two devices numbered 0,1, so a
+// simultaneous HIP_VISIBLE_DEVICES=2,3 selects two devices that do not exist
+// and the child comes up with NO usable GPU at all. One level, the lowest one,
+// is the whole of the correct answer.
+//
+// Apple and GPUVendorNone -> "", and that is a SUCCESSFUL no-op, never an
+// error. Apple's unified memory has no per-card visibility concept to
+// constrain (there is one integrated GPU and Metal always sees it), and a host
+// with no recognised stack has nothing to name. A spec that asks for device
+// pinning on such a host simply gets a child with no visibility variable --
+// exactly the environment it would have received before this option existed.
+func VisibleDevicesVar(vendor GPUVendor) string {
+	switch vendor {
+	case GPUVendorNVIDIA:
+		return "CUDA_VISIBLE_DEVICES"
+	case GPUVendorAMD:
+		return "ROCR_VISIBLE_DEVICES"
+	case GPUVendorApple, GPUVendorNone:
+		return ""
+	default:
+		return ""
+	}
+}
+
+// visibleDevicesOwnedVars is the set of environment variables the
+// SetVisibleDevices option OWNS: a spec may not hand-set any of them while the
+// option is on (ExpandPlaceholders refuses the pair outright -- trap 3).
+//
+// It is deliberately VENDOR-INDEPENDENT, i.e. the same three names are refused
+// on every host, even though only one of them would ever be SET on any given
+// one. Two reasons, and the second is the load-bearing one:
+//
+//  1. The portal enforces the identical rule at save time and cannot know the
+//     agent's vendor (the gateway is OS- and hardware-agnostic; the config
+//     document is authored before anyone knows which card is in the machine).
+//     A vendor-dependent agent rule and a vendor-independent portal rule are
+//     two rules that disagree -- the portal would refuse a spec the agent
+//     accepts, which is the "two states that look identical and mean different
+//     things" defect this option exists to remove, reintroduced in the
+//     validator.
+//  2. HIP_VISIBLE_DEVICES is in the set even though this agent never sets it,
+//     precisely BECAUSE it double-filters what ROCR_VISIBLE_DEVICES already
+//     filtered (see VisibleDevicesVar). A hand-set HIP_VISIBLE_DEVICES
+//     alongside agent-managed ROCR filtering is the trap in its purest form,
+//     so it must be refused rather than merged.
+//
+// NOT in the set, and that is also deliberate: ONEAPI_DEVICE_SELECTOR,
+// GPU_DEVICE_ORDINAL and any other runtime-specific selector. This agent
+// neither sets nor filters through those, so an operator combining the
+// checkbox with a hand-written ONEAPI_DEVICE_SELECTOR (built from
+// ${HOST_GPU_IDS}) is composing two independent things, not contradicting
+// itself -- that composition is the documented escape hatch and must keep
+// working.
+var visibleDevicesOwnedVars = []string{
+	"CUDA_VISIBLE_DEVICES",
+	"ROCR_VISIBLE_DEVICES",
+	"HIP_VISIBLE_DEVICES",
+}
+
+// hostGPUIDs renders spec.GPUs as the comma-separated list of HOST GPU
+// indices, ascending and deduplicated -- the value both SetVisibleDevices and
+// ${HOST_GPU_IDS} emit. Empty string when the spec declares no GPUs; every
+// caller treats that as a refusal rather than a value (trap 1).
+//
+// HOST indices, always. These are the numbers the AGENT's own nvidia-smi /
+// rocm-smi report and the numbers the gateway's per-GPU budgets and
+// measurement rows are keyed by. They are NOT the numbers the child will see:
+// a child launched with CUDA_VISIBLE_DEVICES=3,4 enumerates its two devices as
+// 0 and 1. That renumbering is trap 2, and it is why the placeholder is named
+// HOST_GPU_IDS and not GPU_IDS.
+//
+// Sorted ascending rather than kept in the document's order because the order
+// is not the operator's to begin with: the gateway's RuntimeSpecGPUs reads the
+// rows back `order by gpu_index`, so a hand-chosen order never survives a save
+// anyway. Emitting a stable ascending list makes the value a pure function of
+// the declared SET, which is what the whole feature reasons about -- and it
+// keeps the child's device 0 predictable (the lowest declared host index)
+// instead of dependent on row order nobody controls.
+//
+// Deduplicated because a duplicate index is not merely redundant: CUDA stops
+// parsing the list at the first invalid or repeated entry, so
+// CUDA_VISIBLE_DEVICES=1,1,2 silently yields ONE visible device, not three.
+// The gateway already refuses a duplicate index at save time; a file-mode
+// document is hand-written and has no such gate.
+func hostGPUIDs(spec Spec) string {
+	if len(spec.GPUs) == 0 {
+		return ""
+	}
+	indices := make([]int, 0, len(spec.GPUs))
+	seen := make(map[int]bool, len(spec.GPUs))
+	for _, g := range spec.GPUs {
+		if seen[g.Index] {
+			continue
+		}
+		seen[g.Index] = true
+		indices = append(indices, g.Index)
+	}
+	sort.Ints(indices)
+	parts := make([]string, len(indices))
+	for i, idx := range indices {
+		parts[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(parts, ",")
+}
+
 // LocalPolicy is the agent-operator-controlled counterweight to the
 // gateway-supplied Spec. The gateway decides WHEN and HOW a process runs
 // (binary, args, env, work_dir); LocalPolicy, populated from the agent's OWN
@@ -293,9 +447,9 @@ func withinDir(candidate, dir string) bool {
 // substitution happens, never after.
 var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 
-// ExpandPlaceholders resolves every ${PORT}, ${MODEL} and ${AGENT_ENV:NAME}
-// occurrence in spec.Args and spec.Env values, and builds the exact
-// environment the child process will receive.
+// ExpandPlaceholders resolves every ${PORT}, ${MODEL}, ${HOST_GPU_IDS} and
+// ${AGENT_ENV:NAME} occurrence in spec.Args and spec.Env values, and builds
+// the exact environment the child process will receive.
 //
 // ${PORT} becomes the decimal port chosen for this process. ${MODEL} becomes
 // spec.UpstreamModel, the application-side model name (see the ${MODEL}
@@ -411,9 +565,104 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // a behaviour change for anyone using that text as literal templating, which
 // is the reason to name it right rather than early.
 //
+// ${HOST_GPU_IDS} is the FOURTH token, exact match only for the same reason as
+// ${MODEL} (${GPU_IDS_FILE}, ${HOST_GPU_IDS_JSON} and friends are plausible
+// pass-through tokens, and an over-eager prefix rule breaks working specs
+// while a literal pass-through breaks only a spec that was already wrong). It
+// resolves to hostGPUIDs(spec) -- the spec's own declared GPU indices as the
+// HOST sees them, ascending, comma-separated, e.g. "2,3".
+//
+// It exists as the manual escape hatch beside spec.SetVisibleDevices: an
+// operator on a runtime this agent has no vendor mapping for writes
+// "ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}" themselves instead of
+// hand-copying the index list into a second place where it can drift from the
+// GPU rows that drive admission. The two compose: the checkbox sets the
+// vendor-appropriate variable, the placeholder builds any other.
+//
+// THE NAME CARRIES THE INVARIANT ON PURPOSE. These are host indices; the child
+// renumbers from zero (trap 2, see the SetVisibleDevices section below), so
+// "3,4" here and "3,4" inside the child name different cards. A token called
+// ${GPU_IDS} would have read as either. See hostGPUIDs for the ordering and
+// deduplication rules.
+//
+// A spec that uses ${HOST_GPU_IDS} while declaring NO GPUs is a hard error, on
+// exactly the ${MODEL}-with-empty-upstream_model reasoning: substituting ""
+// would produce "ONEAPI_DEVICE_SELECTOR=level_zero:" or a bare
+// "CUDA_VISIBLE_DEVICES=", and an EMPTY visibility value does not mean "no
+// restriction" -- it means NOTHING IS VISIBLE. The error fires only where the
+// placeholder is actually used.
+//
+// # SetVisibleDevices: making the GPU list an enforcement, not a declaration
+//
+// When spec.SetVisibleDevices is set, this function adds ONE agent-owned
+// variable to the child's environment: VisibleDevicesVar(vendor) =
+// hostGPUIDs(spec). vendor is the agent's own locally-detected hardware, never
+// anything the gateway said. On Apple or an unrecognised stack the variable
+// name is "" and nothing is added at all -- a successful no-op, not an error.
+//
+// The four traps this option has to defuse, and where each is handled:
+//
+//  1. AN EMPTY VALUE IS NOT "NO RESTRICTION" -- IT MEANS "NOTHING VISIBLE".
+//     SetVisibleDevices with no GPU rows would emit "CUDA_VISIBLE_DEVICES="
+//     and hide every card from the model, which presents as a model that
+//     loads onto the CPU (or fails with "no CUDA-capable device is detected")
+//     for reasons nothing in the config hints at. Refused here, before any
+//     resource is acquired, and refused AGAIN at save time by the portal --
+//     both, deliberately. The portal is where an operator gets an error they
+//     can act on in the moment, but a file-mode agent
+//     (OP_AGENT_RUNTIME_SOURCE=file) never passes through the portal at all,
+//     so the portal alone would leave the whole file path unguarded. The
+//     refusal here is VENDOR-INDEPENDENT -- an Apple host refuses the
+//     combination too, even though it would set nothing -- because one rule
+//     on every platform is the only version a reader can check (the same
+//     reasoning baseEnvNames and the ${AGENT_ENV:...} case fold state), and
+//     because a spec document that is silently fine on the laptop and
+//     dangerous on the GPU box is the worst of the available behaviours.
+//
+//  2. THE CHILD RENUMBERS FROM 0. With CUDA_VISIBLE_DEVICES=3,4 the child
+//     enumerates devices 0 and 1, not 3 and 4 -- so any ARGUMENT that names a
+//     device number (--main-gpu, --tensor-split, --device, CUDA_DEVICE_ORDER
+//     reasoning) is expressed in the CHILD's numbering from then on, while
+//     the spec's GPU rows, the budgets and the measurements stay in the
+//     host's. This is not enforceable here -- the agent cannot parse an
+//     arbitrary model server's argv -- so it is surfaced where the operator
+//     turns the option on: the portal states it at the checkbox, and the
+//     architecture doc states it in full. It does NOT make two specs
+//     interfere; see the isolation note below.
+//
+//  3. CONFLICT WITH A HAND-SET ENTRY. SetVisibleDevices together with any
+//     visibleDevicesOwnedVars key in spec.Env is refused outright rather than
+//     silently resolved in either direction. Both orderings are defensible
+//     and that is exactly the problem: a spec where the checkbox is on and
+//     CUDA_VISIBLE_DEVICES is also typed in looks identical whichever value
+//     wins, so an operator cannot tell from the config which cards the model
+//     is on. Refusing turns an invisible ambiguity into a message. Checked
+//     case-insensitively, like every other env-key rule here, because Windows
+//     resolves environment names case-insensitively and os/exec deduplicates
+//     them that way.
+//
+//  4. HOST INDICES, NOT CHILD INDICES. The emitted value is hostGPUIDs(spec)
+//     -- the spec's declared indices as the host sees them -- and so is
+//     ${HOST_GPU_IDS}. Pinned in that token's name, in hostGPUIDs's doc, and
+//     by TestExpandPlaceholdersHostGPUIDsAreHostIndices.
+//
+// ISOLATION IS STRUCTURAL, NOT ADDED. Every value above is computed from the
+// spec passed to THIS call, and this function returns a fresh []string that
+// becomes exactly one exec.Cmd.Env. There is no shared or process-wide state
+// to leak between specs, so two specs on disjoint GPU sets running
+// concurrently each receive only their own list by construction -- pinned
+// against the real two-process path by
+// TestManagerVisibleDevicesIsPerSpecIsolated rather than assumed.
+//
+// A spec with SetVisibleDevices FALSE takes none of these paths and receives a
+// byte-identical environment to the one it received before this option existed
+// (TestExpandPlaceholdersVisibleDevicesOffIsUnchanged).
+//
 // Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
-// still passes through untouched; this function owns only these three tokens.
-func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args []string, env []string, err error) {
+// still passes through untouched; this function owns only these four tokens.
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (args []string, env []string, err error) {
+	gpuIDs := hostGPUIDs(spec)
+
 	expand := func(s string) (string, error) {
 		var firstErr error
 		result := placeholderPattern.ReplaceAllStringFunc(s, func(match string) string {
@@ -435,6 +684,16 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 					return match
 				}
 				return spec.UpstreamModel
+			}
+
+			// EXACT match only, same reasoning as ${MODEL} above. HOST, not
+			// child, indices -- the name says so because the digits do not.
+			if inner == "HOST_GPU_IDS" {
+				if gpuIDs == "" {
+					firstErr = fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
+					return match
+				}
+				return gpuIDs
 			}
 
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
@@ -535,14 +794,42 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 		}
 	}
 
+	// Trap 3, and trap 1, in that order -- both BEFORE any value is built, so
+	// a spec that can never launch fails on the same validate-before-acquire
+	// path as every other refusal here (startProcess's dry run reaches this
+	// code before grabEphemeralPort). Both are vendor-independent; see the
+	// SetVisibleDevices section of the doc comment for why.
+	if spec.SetVisibleDevices {
+		for _, k := range envKeys {
+			if slices.Contains(visibleDevicesOwnedVars, strings.ToUpper(k)) {
+				return nil, nil, fmt.Errorf("runtime: spec env %q conflicts with set_visible_devices: this spec both asks the agent to set the gpu visibility variable and sets one by hand, and the two cannot be resolved into a single unambiguous answer -- turn set_visible_devices off, or remove the env entry", k)
+			}
+		}
+		if gpuIDs == "" {
+			return nil, nil, fmt.Errorf("runtime: set_visible_devices is on but this spec declares no gpus: an empty visible-devices value means NO device is visible, not every device, so the child would see no gpu at all -- add the gpu rows this model runs on, or turn set_visible_devices off")
+		}
+	}
+
 	// Minimal base: baseEnvNames from the agent's OWN environment, each only
 	// if actually present -- never fabricated, and never the agent's full
 	// environment (see doc comment above). Which of them exist is what makes
 	// this list correct on both platform families; see baseEnvNames.
-	resultEnv := make([]string, 0, len(envKeys)+len(baseEnvNames))
+	resultEnv := make([]string, 0, len(envKeys)+len(baseEnvNames)+1)
 	for _, name := range baseEnvNames {
 		if v := getenv(name); v != "" {
 			resultEnv = append(resultEnv, name+"="+v)
+		}
+	}
+	// The agent-owned visibility variable joins the agent-provided base block,
+	// not the spec block, because that is what it is: a value this agent
+	// computed from local hardware. It cannot collide with a spec key -- the
+	// conflict refusal above is what guarantees that, exactly as the
+	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
+	// or an unrecognised stack: nothing is appended and the child's
+	// environment is byte-identical to the SetVisibleDevices-off one.
+	if spec.SetVisibleDevices {
+		if name := VisibleDevicesVar(vendor); name != "" {
+			resultEnv = append(resultEnv, name+"="+gpuIDs)
 		}
 	}
 	for _, k := range envKeys {
