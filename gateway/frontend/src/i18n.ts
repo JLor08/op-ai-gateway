@@ -649,9 +649,15 @@ const de = {
     'Dieser Prozess lässt sich keiner Modell-Zuordnung dieser Anwendung zuordnen (der Datenstrom gilt für den ganzen Server, die Zuordnungen nur für diese Anwendung). Deshalb sind hier keine Übersteuerungen möglich.',
   runtimeAgentNeverReported:
     'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber es liegt noch keine Agent-Telemetrie vor: Der Agent hat sich noch nie gemeldet. Die Spezifikationen bleiben wirkungslos, bis der Agent auf diesem Server installiert und verbunden ist.',
-  runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht auswerten.',
+  // "laden", nicht "auswerten": derselbe Satz führt inzwischen auch die
+  // Codes an, die vor dem Auswerten entstehen (Datei fehlt, Datei nicht
+  // lesbar). Der Feldname auf der Leitung bleibt `parse_error`.
+  runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht laden.',
   runtimeParseErrorJsonSyntax: 'Die Datei ist kein gültiges JSON.',
   runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
+  runtimeParseErrorFileMissing: 'Am konfigurierten Pfad liegt keine Datei.',
+  runtimeParseErrorReadFailed:
+    'Die Datei ist vorhanden, ließ sich aber nicht lesen — Eigentümer und Berechtigungen prüfen.',
   runtimeParseErrorUnknown: 'Der Grund wurde nicht übermittelt.',
   runtimeConfigUnavailable: 'Die gemeldete Konfiguration ist deshalb nicht verfügbar.',
   runtimeConfigUnrecognised:
@@ -2568,9 +2574,15 @@ const en: PortalMessages = {
     'This process cannot be matched to a model mapping of this application (the stream covers the whole server, the mappings only this application). No override actions are available here.',
   runtimeAgentNeverReported:
     'This server has runtime specs configured, but no agent telemetry exists yet: the agent has never reported. The specs stay ineffective until the agent is installed on this server and connected.',
-  runtimeParseError: 'The agent could not parse its local configuration file.',
+  // "load", not "parse": the same lead sentence now introduces codes raised
+  // before any parsing (the file is missing, or unreadable). The wire field
+  // keeps its name, `parse_error`.
+  runtimeParseError: 'The agent could not load its local configuration file.',
   runtimeParseErrorJsonSyntax: 'The file is not valid JSON.',
   runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
+  runtimeParseErrorFileMissing: 'There is no file at the configured path.',
+  runtimeParseErrorReadFailed:
+    'The file is there but could not be read — check its ownership and permissions.',
   runtimeParseErrorUnknown: 'The reason was not reported.',
   runtimeConfigUnavailable: 'The reported configuration is therefore unavailable.',
   runtimeConfigUnrecognised:

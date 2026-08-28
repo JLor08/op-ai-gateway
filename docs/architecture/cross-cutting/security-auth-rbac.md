@@ -294,7 +294,8 @@ its own rule: **a configuration-loader error routinely quotes the offending
 line**, so an unparsed secret-bearing line could reach the report even though
 `env` values are masked. The rule is an **allow-list over a closed set of
 codes**: the field may only ever be one of the classification codes the agent's
-wire contract defines (`json_syntax`, `duplicate_spec_id` — see
+wire contract defines (`json_syntax`, `duplicate_spec_id`, `file_missing`,
+`read_failed` — see
 [the runtime chapter](agent-runtime-manager.md)), anything else is replaced by
 a fixed generic constant, and an **empty** value stays empty, because "this
 agent reported no parse failure" is not a redaction case at all. Free text has

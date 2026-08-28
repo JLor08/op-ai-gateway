@@ -198,9 +198,18 @@ const runtimeReportParseErrorGeneric = "config parse error"
 //
 // Not listed here (including the agent's own defensive "unclassified") means
 // the value degrades to runtimeReportParseErrorGeneric.
+//
+// The last two are not parse failures at all: the agent raises them BEFORE
+// parsing, for a runtime.json that is not there or cannot be read. They ride
+// this field because its subject is "why the local file was not adopted", and
+// because the alternative -- what the agent did until A1 -- was reporting
+// nothing, which rendered a missing file and a server with no specs
+// identically.
 var runtimeReportParseErrorCodes = map[string]bool{
 	"json_syntax":       true,
 	"duplicate_spec_id": true,
+	"file_missing":      true,
+	"read_failed":       true,
 }
 
 // redactRuntimeReportParseError keeps a file-mode report's parse_error only

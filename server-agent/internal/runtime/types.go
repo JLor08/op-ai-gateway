@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"time"
 )
 
@@ -113,12 +114,21 @@ type Config struct {
 // its generic constant, so a buggy or compromised agent still cannot put
 // free text in front of an operator), and the portal owns the wording.
 //
+// THE SET IS WIDER THAN ITS NAME. parse_error is the wire field's name and
+// stays that way (renaming it would break the gateway and every stored
+// report), but the subject is "why the local file was not adopted", and two
+// of the codes below -- file_missing, read_failed -- are raised before any
+// parsing happens. FileSource.Load once returned those two cases silently,
+// which put a missing runtime.json and a server with no specs at all on the
+// same blank screen.
+//
 // ADDING A CODE IS A THREE-SIDED CHANGE. A new code must be added here, to
 // the gateway's allow-list, and to the portal's i18n label map (German and
 // English together) -- a code the gateway does not know degrades to the
 // generic message, which is safe but silently drops the diagnosis this
 // mechanism exists to deliver. TestParseConfigErrorsAreAllClassified pins
-// that every error ParseConfig can actually produce carries one of these.
+// that every error ParseConfig can actually produce carries one of these,
+// and pins the literal wire value of every code in the set.
 type ParseErrorCode string
 
 const (
@@ -132,6 +142,27 @@ const (
 	// ParseErrorDuplicateSpecID: two specs share an id. Structural, and
 	// deliberately fatal to the whole document -- see ParseConfig.
 	ParseErrorDuplicateSpecID ParseErrorCode = "duplicate_spec_id"
+	// ParseErrorFileMissing: nothing exists at the configured path. The
+	// file never got parsed, so this is not a parse failure at all -- it
+	// rides the same field because the field's real subject is "why the
+	// local file was not adopted", and the alternative was the silence
+	// this code replaced (FileSource.Load used to swallow every stat and
+	// read failure, so a missing file was indistinguishable in the portal
+	// from a server with no specs at all).
+	//
+	// Kept SEPARATE from ParseErrorReadFailed because the two point an
+	// operator at different things: a missing file is a path typo, a
+	// failed deploy, or a legitimately fresh install, while a file that is
+	// there but unreadable is an ownership/permission fault that is never
+	// legitimate.
+	ParseErrorFileMissing ParseErrorCode = "file_missing"
+	// ParseErrorReadFailed: the path resolves to something, but the agent
+	// could not stat or read it -- permissions, a non-directory component,
+	// an I/O error, a file replaced by a directory. Every access failure
+	// that is not "not there" lands here; no attempt is made to split it
+	// further, because from the operator's side the next step is the same
+	// one (look at the file and its directory on the host).
+	ParseErrorReadFailed ParseErrorCode = "read_failed"
 	// ParseErrorUnclassified is the defensive floor for a load failure that
 	// carries no *ParseError at all. Nothing produces it today (every
 	// ParseConfig return path is classified, and a test pins that), and it
@@ -140,6 +171,20 @@ const (
 	// rendering of "the agent could not say why".
 	ParseErrorUnclassified ParseErrorCode = "unclassified"
 )
+
+// classifyFileAccessError maps a stat/read failure from FileSource.Load onto
+// the closed set. It never looks at err's TEXT -- the text names the path and
+// may name more, and the whole point of the closed set is that the wire
+// carries no agent-chosen prose (see ParseErrorCode).
+func classifyFileAccessError(err error) ParseErrorCode {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return ParseErrorFileMissing
+	}
+	return ParseErrorReadFailed
+}
 
 // ParseError is the error ParseConfig returns: a Code from the closed set
 // above for the wire, plus the full underlying detail for LOCAL diagnosis

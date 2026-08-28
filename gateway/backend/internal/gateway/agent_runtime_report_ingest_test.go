@@ -175,6 +175,20 @@ func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
 			wantStored: `"parse_error":"duplicate_spec_id"`,
 		},
 		{
+			// A1: the two access codes are not parse failures, but they use
+			// the same field and must survive ingest for the same reason --
+			// degraded to the generic constant, "the file is missing" and
+			// "the file is unreadable" become the same sentence again.
+			name:       "file_missing code kept",
+			parseError: "file_missing",
+			wantStored: `"parse_error":"file_missing"`,
+		},
+		{
+			name:       "read_failed code kept",
+			parseError: "read_failed",
+			wantStored: `"parse_error":"read_failed"`,
+		},
+		{
 			// The whole reason for the closed set: the previous rule kept
 			// this, and it was the only non-generic value ANY real parse
 			// failure could produce.

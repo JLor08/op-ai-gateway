@@ -1948,6 +1948,11 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
       // for a code this build does not know.
       'runtimeParseErrorJsonSyntax',
       'runtimeParseErrorDuplicateSpecId',
+      // A1: the two access codes. Missing here, the portal's third seam of
+      // the three-sided contract fails silently -- an unmapped code degrades
+      // to runtimeParseErrorUnknown, which is safe and says nothing.
+      'runtimeParseErrorFileMissing',
+      'runtimeParseErrorReadFailed',
       'runtimeParseErrorUnknown',
       'runtimeConfigUnavailable',
       'runtimeConfigUnrecognised',

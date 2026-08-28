@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -443,9 +444,23 @@ func TestStatusAndLastErrorJSONTags(t *testing.T) {
 // portal's i18n label map -- and no compiler checks any of those seams, so a
 // rename has to fail here.
 func TestParseConfigErrorsAreAllClassified(t *testing.T) {
-	if ParseErrorJSONSyntax != "json_syntax" || ParseErrorDuplicateSpecID != "duplicate_spec_id" {
-		t.Fatalf("the wire values changed (%q, %q): the gateway's allow-list and the portal's i18n labels must change in the same unit of work",
-			ParseErrorJSONSyntax, ParseErrorDuplicateSpecID)
+	// Every code in the set, not only the two ParseConfig itself produces:
+	// file_missing and read_failed are raised by FileSource.Load before any
+	// parsing happens, and they ride the same three-sided contract.
+	for _, tc := range []struct {
+		got  ParseErrorCode
+		want ParseErrorCode
+	}{
+		{ParseErrorJSONSyntax, "json_syntax"},
+		{ParseErrorDuplicateSpecID, "duplicate_spec_id"},
+		{ParseErrorFileMissing, "file_missing"},
+		{ParseErrorReadFailed, "read_failed"},
+		{ParseErrorUnclassified, "unclassified"},
+	} {
+		if tc.got != tc.want {
+			t.Fatalf("the wire value changed (%q, want %q): the gateway's allow-list and the portal's i18n labels must change in the same unit of work",
+				tc.got, tc.want)
+		}
 	}
 	closed := map[ParseErrorCode]bool{
 		ParseErrorJSONSyntax:      true,
@@ -502,6 +517,21 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 	}
 	if got := ClassifyParseError(nil); got != "" {
 		t.Fatalf("ClassifyParseError(nil) = %q, want the empty code", got)
+	}
+
+	// The access-failure half of the same closed set. os.Stat/os.ReadFile
+	// return a *fs.PathError wrapping the syscall errno, so the "not there"
+	// test has to be errors.Is, not equality -- and everything else,
+	// including an error carrying a path that could itself be sensitive,
+	// must land on read_failed rather than leak.
+	if got := classifyFileAccessError(&fs.PathError{Op: "open", Path: "/etc/runtime.json", Err: fs.ErrNotExist}); got != ParseErrorFileMissing {
+		t.Fatalf("classifyFileAccessError(wrapped ErrNotExist) = %q, want %q", got, ParseErrorFileMissing)
+	}
+	if got := classifyFileAccessError(errors.New("HF_TOKEN=sk-abc123")); got != ParseErrorReadFailed {
+		t.Fatalf("classifyFileAccessError(foreign error) = %q, want %q -- never the error's own text", got, ParseErrorReadFailed)
+	}
+	if got := classifyFileAccessError(nil); got != "" {
+		t.Fatalf("classifyFileAccessError(nil) = %q, want the empty code", got)
 	}
 }
 

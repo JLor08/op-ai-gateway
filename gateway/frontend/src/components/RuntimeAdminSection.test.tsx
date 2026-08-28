@@ -2133,11 +2133,11 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
   // config file. In that state `config` is unusable, so it must not be shown.
   //
   // C2 fix round: the field carries a CODE from a closed set
-  // (`json_syntax`, `duplicate_spec_id`, and the agent's `unclassified`
-  // floor), never free text -- so the operator must be shown a sentence, not
-  // the identifier. The gating stays truthiness-based, which is why the
-  // unknown-code case below still suppresses the config exactly as a known
-  // one does.
+  // (`json_syntax`, `duplicate_spec_id`, `file_missing`, `read_failed`, and
+  // the agent's `unclassified` floor), never free text -- so the operator must
+  // be shown a sentence, not the identifier. The gating stays truthiness-based,
+  // which is why the unknown-code case below still suppresses the config
+  // exactly as a known one does.
   it('surfaces parse_error as a sentence, not a code, and stops rendering config', async () => {
     renderFileMode(fileConfig, { parse_error: 'json_syntax' });
     expect(
@@ -2161,6 +2161,30 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorDuplicateSpecId}`),
     ).toBeInTheDocument();
     expect(screen.queryByText('duplicate_spec_id', { exact: false })).not.toBeInTheDocument();
+  });
+
+  // A1: the two ACCESS codes. They are the reason this whole mechanism was
+  // reachable-but-unreachable for the most ordinary file-mode failure there
+  // is -- the agent swallowed a missing or unreadable runtime.json entirely,
+  // so the operator got the "nothing configured" screen with no hint that a
+  // file was supposed to be there. Each must render its OWN sentence: the
+  // shared fallback would put "the file is gone" and "the file's permissions
+  // are wrong" behind the same words, which is the distinction the operator
+  // is here for.
+  it.each([
+    ['file_missing', 'runtimeParseErrorFileMissing'],
+    ['read_failed', 'runtimeParseErrorReadFailed'],
+  ] as const)('maps the %s access code to its own sentence', async (code, key) => {
+    renderFileMode(fileConfig, { parse_error: code });
+    expect(await screen.findByText(`${t.runtimeParseError} ${t[key]}`)).toBeInTheDocument();
+    // Neither the raw code nor the generic fallback reaches the operator.
+    expect(screen.queryByText(code, { exact: false })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(t.runtimeParseErrorUnknown, { exact: false }),
+    ).not.toBeInTheDocument();
+    // The config is unusable in this state for the same reason a parse
+    // failure makes it unusable, so the same suppression applies.
+    expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
   });
 
   // A code this build does not know: the agent's `unclassified` floor, a code

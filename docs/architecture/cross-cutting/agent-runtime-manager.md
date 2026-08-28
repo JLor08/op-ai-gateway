@@ -1435,10 +1435,18 @@ field is normalised to non-nil so callers never nil-check.
 
 `OP_AGENT_RUNTIME_CONFIG` names a local file the agent polls by **mtime** on the
 existing cadence; an unchanged mtime returns without re-reading. A parse error
-keeps the last good config, records a last-parse-error message and timestamp
+keeps the last good config, records a last-parse-error code and timestamp
 (cleared by the next successful parse, the same convention `last_error` uses),
 and **still advances the tracked mtime** — so an untouched broken file is not
 re-parsed every cycle, while a further edit is still noticed.
+
+A file that is **missing or unreadable** is treated the same way — last good
+config kept, failure recorded — but with the mtime memory **discarded** rather
+than advanced, since there is no mtime to trust and the next successful read
+must not be skipped as unchanged. Its code (`file_missing` or `read_failed`)
+travels upward in the report exactly as a parse error's does; see
+[§8.3](#83-the-upward-report-and-what-it-redacts). Only the unchanged-mtime
+path records nothing at all.
 
 **In file mode the portal is read-only by design, and the treatment is total:**
 no create button, no spec row actions, the co-residency matrix disabled, no
@@ -1546,10 +1554,35 @@ agent-chosen prose can never be allowed through (see
 |---|---|
 | `json_syntax` | The file is not valid JSON, in any of the ways `encoding/json` reports. |
 | `duplicate_spec_id` | Two entries in the file share a spec id — the one parse failure that is not a syntax error. |
+| `file_missing` | Nothing exists at the configured path. |
+| `read_failed` | Something is there, but the agent could not stat or read it — permissions, a non-directory path component, an I/O error. |
 | *(empty)* | **No failure.** The field is `omitempty`, so a healthy agent sends nothing here. |
 
+**The last two are not parse failures**, and the field's name is a wire name,
+not a description of its contents: it carries *why the local file was not
+adopted*, whatever stage that happened at. They exist because the field used to
+be silent about them. `FileSource.Load` returned the last known-good config with
+no recorded failure from both its `os.Stat` and its `os.ReadFile` error paths —
+so a file-mode agent whose `runtime.json` was missing, moved or unreadable ran
+indefinitely and reported nothing, and the portal showed "nothing configured":
+the *absent* state rendered exactly like the *empty* one, which is the specific
+outcome this whole mechanism exists to prevent. They are kept apart from each
+other because they send an operator to different places — a missing file is a
+path typo, a failed deploy, or a legitimately fresh install; a file that is
+there but unreadable is an ownership or permission fault that is never
+legitimate.
+
+Two properties of the reporting are load-bearing and easy to break on a
+re-implementation. An **unchanged** file must stay silent — that is the steady
+state every poll lands in, and recording there would have a healthy agent
+reporting a failure several times a minute. And a file restored with an mtime
+the agent has **already seen** (a timestamp-preserving restore, an atomic
+replace by a copy of the same bytes) must still clear the failure: an access
+failure therefore discards the agent's mtime memory, so the next successful
+stat cannot take the unchanged shortcut past the re-parse that clears the code.
+
 The agent additionally owns an `unclassified` floor which nothing currently
-produces; it is a defensive value, not a third meaning, and the gateway
+produces; it is a defensive value, not a fifth meaning, and the gateway
 degrades it like any other unknown code.
 
 It is a **three-sided contract with no compiler on any seam**, so adding a code
@@ -1793,6 +1826,16 @@ the default (backed by the backend's own 409); and an auto-drill into the single
 operator's own create does *not* bounce them out of the form they just
 submitted, and the latch also stops the drill re-firing on the parent list's
 poll.
+
+**The flag itself is API-only today: nothing in the portal sets it.** Everything
+above is driven by `managed_runtime_only` as it arrives on the server DTO, and
+all of it works the moment the flag is true — but no portal control writes it.
+Both `POST /api/portal/servers` and `PATCH /api/portal/servers/{id}` already
+accept `"managed_runtime_only": true`, so an operator sets it with an API call;
+the server form does not offer it, and the server-limits tab's PATCH carries
+`runtime_max_processes` alone. Whether to add a toggle is the operator's product
+decision, not a defect to close silently — see
+[§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ### 11.1 Writes are full-document replaces, gated on their own GET
 
@@ -2489,7 +2532,16 @@ operator meets first:
   agent for Windows. The Windows implementation has no graceful-drain
   equivalent — a stop terminates the child rather than letting it finish
   in-flight work. A real fix needs `CREATE_NEW_PROCESS_GROUP` plus
-  `GenerateConsoleCtrlEvent`. CI only checks that it compiles.
+  `GenerateConsoleCtrlEvent`. **CI does not check it at all** — every job in
+  `.github/workflows/ci.yml` runs on `ubuntu-latest` with no `GOOS` set, so
+  `proc_windows.go` is never built there
+  ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks) and
+  [§11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember);
+  the same fact is stated in
+  [§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway) above, where the
+  environment base is a union rather than a `GOOS` switch for exactly this
+  reason). Cross-compile locally with
+  `GOOS=windows GOARCH={amd64,arm64} go vet ./...` before changing it.
 - **Three smaller accepted risks in the agent.** When a spec does not pin a
   listen port the agent binds `127.0.0.1:0`, reads the port back and closes the
   listener — an accepted TOCTOU window before the child's own bind. Measured VRAM

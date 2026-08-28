@@ -524,6 +524,227 @@ func TestFileSourceParseErrorKeepsLastGood(t *testing.T) {
 	}
 }
 
+// runtimeConfigAccessLogMsg is recordAccessFailure's exact message, duplicated
+// here for the same reason runtimeConfigMissingLogMsg below is: a loose match
+// would keep passing if the edge-triggering broke and a different line started
+// appearing instead.
+const runtimeConfigAccessLogMsg = "runtime: local runtime-config file could not be read; keeping current config"
+
+// TestFileSourceAccessFailuresAreReported is A1: FileSource.Load used to
+// return `current, false, nil` from BOTH os.Stat and os.ReadFile failures,
+// with no lastErr and no log line -- while the parse branch three lines below
+// did both. A file-mode agent whose runtime.json was missing, moved or
+// unreadable therefore ran indefinitely on the last known-good (or on nothing
+// at all, on a first read) and reported NO failure upward, so the portal
+// showed "nothing configured" -- indistinguishable from a server that
+// genuinely has no specs.
+//
+// The subtests are the whole reachable surface of that gap plus the two
+// boundaries a naive fix breaks:
+//
+//   - missing and unreadable each get their OWN code, because they send an
+//     operator to different places (see ParseErrorFileMissing);
+//   - a stat failure that is not "not there" is read_failed, not
+//     file_missing -- the classification is errors.Is(fs.ErrNotExist), never
+//     "stat failed at all";
+//   - an UNCHANGED file still reports nothing. This is the steady state every
+//     poll lands in, so a fix that records on the quiet path turns a healthy
+//     agent into one reporting an error several times a minute;
+//   - a file restored with an mtime the source has already seen still clears
+//     the failure. Without recordAccessFailure clearing haveSeen, the
+//     unchanged-mtime shortcut would skip the re-parse that clears lastErr
+//     and the portal would show a resolved failure indefinitely.
+func TestFileSourceAccessFailuresAreReported(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		dir := t.TempDir()
+		s := NewFileSource(filepath.Join(dir, "runtime.json"))
+
+		before := time.Now()
+		cfg, changed, err := s.Load(context.Background())
+		if err != nil {
+			t.Fatalf("Load on a missing file: err = %v, want nil (a bad moment on disk never tears down a running set)", err)
+		}
+		if changed {
+			t.Fatal("Load on a missing file: changed = true, want false")
+		}
+		if !reflect.DeepEqual(cfg, emptyConfig()) {
+			t.Fatalf("Load on a missing file returned %+v, want the empty config", cfg)
+		}
+		code, at := s.LastParseError()
+		if code != ParseErrorFileMissing {
+			t.Fatalf("LastParseError = %q, want %q -- silence here is what makes an absent file look like an empty one in the portal", code, ParseErrorFileMissing)
+		}
+		if at.Before(before) || at.After(time.Now()) {
+			t.Fatalf("LastParseError timestamp %v not within the call's window (after %v)", at, before)
+		}
+	})
+
+	t.Run("unreadable file", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root: file mode bits do not deny a read, so there is nothing to observe")
+		}
+		dir := t.TempDir()
+		path := filepath.Join(dir, "runtime.json")
+		// Mode 0 denies the READ while leaving the file stat-able (stat
+		// needs the directory's x bit, not the file's r bit), so this is
+		// the os.ReadFile branch specifically, not the os.Stat one.
+		if err := os.WriteFile(path, []byte(minimalConfigJSON(8080, "r1")), 0o000); err != nil {
+			t.Fatalf("seed unreadable file: %v", err)
+		}
+		s := NewFileSource(path)
+
+		if _, changed, err := s.Load(context.Background()); err != nil || changed {
+			t.Fatalf("Load on an unreadable file: changed=%v err=%v, want (false, nil)", changed, err)
+		}
+		if code, _ := s.LastParseError(); code != ParseErrorReadFailed {
+			t.Fatalf("LastParseError = %q, want %q -- a file that is there but unreadable is a permission fault, never a fresh install", code, ParseErrorReadFailed)
+		}
+	})
+
+	t.Run("stat failure that is not not-exist", func(t *testing.T) {
+		dir := t.TempDir()
+		notADir := filepath.Join(dir, "runtime.json")
+		if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		// A path THROUGH a regular file: os.Stat fails with ENOTDIR, which
+		// is not fs.ErrNotExist. The classification must follow the error,
+		// not the fact that stat failed.
+		s := NewFileSource(filepath.Join(notADir, "runtime.json"))
+		if _, changed, err := s.Load(context.Background()); err != nil || changed {
+			t.Fatalf("Load through a non-directory: changed=%v err=%v, want (false, nil)", changed, err)
+		}
+		if code, _ := s.LastParseError(); code != ParseErrorReadFailed {
+			t.Fatalf("LastParseError = %q, want %q -- only fs.ErrNotExist is file_missing", code, ParseErrorReadFailed)
+		}
+	})
+
+	t.Run("unchanged file reports no failure", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "runtime.json")
+		if err := os.WriteFile(path, []byte(minimalConfigJSON(8080, "u1")), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		s := NewFileSource(path)
+		if _, changed, err := s.Load(context.Background()); err != nil || !changed {
+			t.Fatalf("first Load: changed=%v err=%v, want (true, nil)", changed, err)
+		}
+		// The steady state: several polls of a file nobody touched.
+		for i := range 4 {
+			_, changed, err := s.Load(context.Background())
+			if err != nil || changed {
+				t.Fatalf("poll %d: changed=%v err=%v, want (false, nil)", i, changed, err)
+			}
+			if code, at := s.LastParseError(); code != "" || !at.IsZero() {
+				t.Fatalf("poll %d: LastParseError = (%q, %v), want no failure -- this path is every poll of a healthy agent", i, code, at)
+			}
+		}
+	})
+
+	t.Run("restored with an already-seen mtime still clears", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "runtime.json")
+		body := []byte(minimalConfigJSON(8080, "s1"))
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		s := NewFileSource(path)
+		if _, changed, err := s.Load(context.Background()); err != nil || !changed {
+			t.Fatalf("first Load: changed=%v err=%v, want (true, nil)", changed, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		mod := info.ModTime()
+
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if _, _, err := s.Load(context.Background()); err != nil {
+			t.Fatalf("Load while missing: %v", err)
+		}
+		if code, _ := s.LastParseError(); code != ParseErrorFileMissing {
+			t.Fatalf("LastParseError while missing = %q, want %q", code, ParseErrorFileMissing)
+		}
+
+		// Restored byte-identically AND with the mtime the source already
+		// recorded -- a timestamp-preserving restore, or an atomic replace
+		// by a copy of the same file.
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatalf("chtimes (pin to the already-seen mtime): %v", err)
+		}
+		cfg, _, err := s.Load(context.Background())
+		if err != nil {
+			t.Fatalf("Load after restore: %v", err)
+		}
+		if cfg.ETag != "s1" {
+			t.Fatalf("Load after restore etag = %q, want s1", cfg.ETag)
+		}
+		if code, at := s.LastParseError(); code != "" || !at.IsZero() {
+			t.Fatalf("LastParseError after restore = (%q, %v), want cleared -- an mtime the source has already seen must not shortcut past the re-parse that clears it", code, at)
+		}
+	})
+}
+
+// TestFileSourceAccessFailureLogsOnTheEdgeOnly pins recordAccessFailure's
+// second discipline, the one an at-least-once assertion cannot see: the file
+// is polled continuously, so a Debug line per poll for a wrong path that is
+// not changing is how a log stops being read. The line must appear when the
+// failure ARRIVES and when it CHANGES KIND, and not in between -- and
+// lastErrAt must not creep forward while the same failure persists, or "since
+// when" becomes "just now, always".
+func TestFileSourceAccessFailureLogsOnTheEdgeOnly(t *testing.T) {
+	h := withCountedLogs(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.json")
+	s := NewFileSource(path)
+
+	for range 3 {
+		if _, _, err := s.Load(context.Background()); err != nil {
+			t.Fatalf("Load while missing: %v", err)
+		}
+	}
+	if got := h.count(runtimeConfigAccessLogMsg); got != 1 {
+		t.Fatalf("log count after 3 polls of a missing file = %d, want 1 (a per-poll line is ~17k a day at a 5s cadence)", got)
+	}
+	code, firstAt := s.LastParseError()
+	if code != ParseErrorFileMissing || firstAt.IsZero() {
+		t.Fatalf("LastParseError = (%q, %v), want (%q, non-zero)", code, firstAt, ParseErrorFileMissing)
+	}
+
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("fourth Load: %v", err)
+	}
+	if _, at := s.LastParseError(); !at.Equal(firstAt) {
+		t.Fatalf("LastParseError timestamp moved from %v to %v while the same failure persisted", firstAt, at)
+	}
+
+	// A DIFFERENT failure kind is an edge: it both re-logs and re-stamps.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: the unreadable half of this test cannot be observed")
+	}
+	if err := os.WriteFile(path, []byte(minimalConfigJSON(8080, "e1")), 0o000); err != nil {
+		t.Fatalf("seed unreadable file: %v", err)
+	}
+	if _, _, err := s.Load(context.Background()); err != nil {
+		t.Fatalf("Load on an unreadable file: %v", err)
+	}
+	if got := h.count(runtimeConfigAccessLogMsg); got != 2 {
+		t.Fatalf("log count after the failure changed kind = %d, want 2 -- a latch that never clears silences the new fault for the process's lifetime", got)
+	}
+	code, secondAt := s.LastParseError()
+	if code != ParseErrorReadFailed {
+		t.Fatalf("LastParseError = %q, want %q", code, ParseErrorReadFailed)
+	}
+	if !secondAt.After(firstAt) {
+		t.Fatalf("LastParseError timestamp %v did not advance past %v when the failure changed kind", secondAt, firstAt)
+	}
+}
+
 // countingHandler is a slog.Handler that counts records by message. The
 // certinstall recordingHandler pattern (internal/certinstall/testutil_test.go),
 // reduced to the one thing the dedup assertion below needs: how many times a

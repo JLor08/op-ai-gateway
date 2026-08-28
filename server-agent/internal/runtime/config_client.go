@@ -345,18 +345,19 @@ func NewFileSource(path string) *FileSource {
 	return &FileSource{path: path, cached: emptyConfig()}
 }
 
-// Load implements Source. A missing/unreadable file, or one whose mtime has
-// not changed since the last successfully processed read, returns the last
-// known-good config with changed=false and a nil error. A parse error does
-// the same AND records the failure via LastParseError, for Task 17's
-// upward report -- never logged-and-forgotten.
+// Load implements Source. A missing file, an unreadable one, an unparseable
+// one, or one whose mtime has not changed since the last successfully
+// processed read all return the last known-good config with changed=false
+// and a nil error -- a bad moment on disk never tears down a running set.
+//
+// Every one of those EXCEPT the unchanged-mtime case also records the
+// failure via LastParseError, for the upward file-mode report: never
+// logged-and-forgotten, and never swallowed. The unchanged case must stay
+// silent, since it is the steady state every poll lands in.
 func (s *FileSource) Load(_ context.Context) (Config, bool, error) {
 	info, err := os.Stat(s.path)
 	if err != nil {
-		s.mu.Lock()
-		current := s.cached
-		s.mu.Unlock()
-		return current, false, nil
+		return s.recordAccessFailure(err), false, nil
 	}
 
 	s.mu.Lock()
@@ -369,10 +370,10 @@ func (s *FileSource) Load(_ context.Context) (Config, bool, error) {
 
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
-		s.mu.Lock()
-		current := s.cached
-		s.mu.Unlock()
-		return current, false, nil
+		// Reached by its own right (an unreadable but stat-able file) and
+		// by the stat->read race (the file was removed in between), which
+		// is why this classifies rather than assuming "unreadable".
+		return s.recordAccessFailure(err), false, nil
 	}
 
 	cfg, err := ParseConfig(raw)
@@ -409,11 +410,63 @@ func (s *FileSource) Load(_ context.Context) (Config, bool, error) {
 	return cfg, true, nil
 }
 
-// LastParseError returns the most recent parse failure's wire
-// CLASSIFICATION CODE and timestamp, cleared by the next successful parse.
-// An empty code (with a zero time) means no parse failure is currently on
-// record. The code -- never the underlying error text -- is what the
-// file-mode report carries upward; see ParseErrorCode for why.
+// recordAccessFailure records a stat or read failure the same way the parse
+// branch records a parse failure, and returns the last known-good config for
+// the caller to hand back. Splitting it out keeps both call sites honest:
+// they used to differ from the parse branch only by omission, and the
+// omission was invisible.
+//
+// THREE THINGS HAPPEN HERE, each for its own reason.
+//
+//  1. haveSeen is CLEARED. Without it a file that comes back with an mtime
+//     the source has already seen -- restored from a backup that preserves
+//     timestamps, or an atomic replace by a copy of the same bytes -- takes
+//     the unchanged-mtime shortcut, never re-parses, and so never clears
+//     lastErr: the portal would report a failure that has been over for
+//     hours. The cost is that a transient read error forces one re-read and
+//     re-parse of possibly identical content (Load then returns
+//     changed=true once); applying an unchanged config is idempotent, and a
+//     stuck error banner is not.
+//  2. The failure is recorded only when the CODE CHANGES. The condition
+//     that produced it is usually persistent (a wrong path stays wrong), so
+//     lastErrAt is the moment the failure was first seen and does not creep
+//     forward with every poll. The report still carries the code on every
+//     send -- what is suppressed is the restamping, not the reporting.
+//  3. The log line follows the same edge, for the same reason: the file is
+//     polled continuously, and a Debug line per poll for a condition that
+//     is not changing is how a log stops being read.
+func (s *FileSource) recordAccessFailure(err error) Config {
+	code := classifyFileAccessError(err)
+
+	s.mu.Lock()
+	s.haveSeen = false
+	s.seenMod = time.Time{}
+	edge := s.lastErr != code
+	if edge {
+		s.lastErr = code
+		s.lastErrAt = time.Now()
+	}
+	current := s.cached
+	s.mu.Unlock()
+
+	if edge {
+		// The path and the full error are LOCAL diagnosis only; upward,
+		// only the code travels. Same rule as the parse branch below.
+		slog.Debug("runtime: local runtime-config file could not be read; keeping current config", "path", s.path, "code", code, "error", err)
+	}
+	return current
+}
+
+// LastParseError returns the most recent load failure's wire CLASSIFICATION
+// CODE and timestamp, cleared by the next successful parse. An empty code
+// (with a zero time) means no failure is currently on record. The code --
+// never the underlying error text -- is what the file-mode report carries
+// upward; see ParseErrorCode for why, including why a set named for parsing
+// also covers a missing or unreadable file.
+//
+// The timestamp is when the CURRENT failure was recorded, not when it was
+// last re-observed: a persistent failure keeps its original time until the
+// code changes or a successful parse clears it.
 func (s *FileSource) LastParseError() (ParseErrorCode, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

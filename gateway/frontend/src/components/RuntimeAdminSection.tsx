@@ -207,14 +207,23 @@ function runtimeStateLabel(state: string, t: Translation): string {
 
 // The file-mode `parse_error` codes, mapped to the sentence the operator
 // reads. The field carries a CODE from a closed set and NEVER free text: the
-// agent classifies its own parse failure (`json_syntax`, `duplicate_spec_id`,
-// plus an `unclassified` floor) and the gateway allow-lists the two real codes,
-// degrading anything else to its own generic constant. That contract is
-// THREE-SIDED and no compiler checks either seam -- adding a code means the
-// agent's set, the gateway's allow-list, and this map plus its two i18n keys.
+// agent classifies its own load failure (`json_syntax`, `duplicate_spec_id`,
+// `file_missing`, `read_failed`, plus an `unclassified` floor) and the gateway
+// allow-lists the four real codes, degrading anything else to its own generic
+// constant. That contract is THREE-SIDED and no compiler checks either seam --
+// adding a code means the agent's set, the gateway's allow-list, and this map
+// plus its two i18n keys.
+//
+// The last two are named for parsing only because the WIRE FIELD is: the agent
+// raises them before any parsing happens, for a runtime.json that is not there
+// or cannot be read. They exist because the agent used to report neither, so a
+// file-mode server with a missing file rendered exactly like one with no specs
+// configured -- the empty state and the absent state, told apart nowhere.
 const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
   json_syntax: 'runtimeParseErrorJsonSyntax',
   duplicate_spec_id: 'runtimeParseErrorDuplicateSpecId',
+  file_missing: 'runtimeParseErrorFileMissing',
+  read_failed: 'runtimeParseErrorReadFailed',
 };
 
 // Unlike runtimeStateLabel above, an unrecognised value does NOT fall back to
