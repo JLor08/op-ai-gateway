@@ -259,6 +259,123 @@ func TestExpandPlaceholdersPort(t *testing.T) {
 	}
 }
 
+// TestExpandPlaceholdersModel proves ${MODEL} resolves in args AND in env
+// values -- the two places every other placeholder is expanded -- and that it
+// carries the APPLICATION-side name (spec.UpstreamModel, the owning
+// mapping's app_model_name), NOT the gateway-facing spec.Model. The two are
+// deliberately different strings here: a test where they matched would pass
+// against an implementation that read the wrong field.
+func TestExpandPlaceholdersModel(t *testing.T) {
+	spec := Spec{
+		Model:         "gpt-4o-mini", // gateway-facing, must NOT appear
+		UpstreamModel: "qwen3-30b-a3b-instruct",
+		Args: []string{
+			"--alias", "${MODEL}",
+			"--model", "/srv/models/${MODEL}/weights.gguf",
+			"--served-model-name=${MODEL}",
+		},
+		Env: map[string]string{"MODEL_TAG": "${MODEL}", "MIXED": "${MODEL}:${PORT}"},
+	}
+
+	args, env, err := ExpandPlaceholders(spec, 41123, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	wantArgs := []string{
+		"--alias", "qwen3-30b-a3b-instruct",
+		"--model", "/srv/models/qwen3-30b-a3b-instruct/weights.gguf",
+		"--served-model-name=qwen3-30b-a3b-instruct",
+	}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("args = %#v, want %#v", args, wantArgs)
+	}
+	wantEnv := map[string]string{
+		"MODEL_TAG": "qwen3-30b-a3b-instruct",
+		"MIXED":     "qwen3-30b-a3b-instruct:41123",
+	}
+	if !envContainsExactly(env, wantEnv) {
+		t.Errorf("env = %#v, want exactly %#v", env, wantEnv)
+	}
+	for _, s := range append(append([]string{}, args...), env...) {
+		if strings.Contains(s, spec.Model) {
+			t.Errorf("%q carries the GATEWAY-facing model name; ${MODEL} must resolve the application-side upstream_model", s)
+		}
+	}
+}
+
+// TestExpandPlaceholdersModelVariantsPassThroughLiterally is the decision
+// test for ${MODEL} having NO near-miss rule. ${PORT} refuses anything whose
+// inner text starts with "PORT", on the stated ground that nothing plausible
+// starts with it except a typo of the placeholder. That ground does not hold
+// for MODEL: every row below is a plausible token an operator wants handed to
+// a model server that does its own templating, and refusing them would be the
+// ${TRANSPORT}/${EXPORT_DIR} defect again under a new name.
+//
+// The last two rows are the accepted cost, pinned deliberately rather than
+// left undiscovered: a typo and a lowercase spelling reach the child as
+// literal text instead of erroring.
+func TestExpandPlaceholdersModelVariantsPassThroughLiterally(t *testing.T) {
+	for _, text := range []string{
+		"${MODEL_PATH}",
+		"${MODELS_DIR}",
+		"${MODEL_ID}",
+		"${MODEL_NAME}",
+		"${MODELFILE}",
+		"${MODEL2}",
+		"${MDOEL}", // typo -- accepted cost
+		"${model}", // wrong case -- accepted cost
+	} {
+		t.Run(text, func(t *testing.T) {
+			spec := Spec{
+				UpstreamModel: "qwen3-30b-a3b-instruct",
+				Args:          []string{text},
+				Env:           map[string]string{"X": text},
+			}
+			args, env, err := ExpandPlaceholders(spec, 8080, func(string) string { return "" })
+			if err != nil {
+				t.Fatalf("%s should pass through untouched, not error: %v", text, err)
+			}
+			if !reflect.DeepEqual(args, []string{text}) {
+				t.Errorf("args = %#v, want the literal %q", args, text)
+			}
+			if !envContainsExactly(env, map[string]string{"X": text}) {
+				t.Errorf("env = %#v, want the literal %q", env, text)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersModelEmptyUpstreamErrors pins the empty case: a spec
+// that USES ${MODEL} while its upstream_model is empty is a hard error, not
+// an empty substitution -- `--alias ""` or a path with a hole in it fails
+// somewhere downstream and confusingly, exactly what the unset-${AGENT_ENV}
+// error exists to prevent. Expansion failures map to `not_permitted`, so the
+// operator sees this text rather than a crash loop.
+func TestExpandPlaceholdersModelEmptyUpstreamErrors(t *testing.T) {
+	for _, spec := range []Spec{
+		{Model: "gpt-4o-mini", Args: []string{"--alias", "${MODEL}"}},
+		{Model: "gpt-4o-mini", Env: map[string]string{"TAG": "${MODEL}"}},
+	} {
+		_, _, err := ExpandPlaceholders(spec, 8080, func(string) string { return "" })
+		if err == nil {
+			t.Fatalf("ExpandPlaceholders(%+v) with an empty UpstreamModel should refuse, not substitute an empty string", spec)
+		}
+		if !strings.Contains(err.Error(), "upstream_model") {
+			t.Errorf("error = %q, want it to name upstream_model so the operator knows which field is empty", err.Error())
+		}
+		if got := strings.Count(err.Error(), "runtime:"); got != 1 {
+			t.Errorf("error = %q, want exactly one %q prefix", err.Error(), "runtime:")
+		}
+	}
+
+	// The refusal is scoped to specs that actually USE the placeholder: an
+	// empty upstream_model is not by itself a launch failure.
+	unused := Spec{Args: []string{"--port", "${PORT}"}, Env: map[string]string{"MODE": "solo"}}
+	if _, _, err := ExpandPlaceholders(unused, 8080, func(string) string { return "" }); err != nil {
+		t.Errorf("a spec that never mentions ${MODEL} must not be refused for an empty upstream_model: %v", err)
+	}
+}
+
 // TestExpandPlaceholdersAgentEnvResolves proves ${AGENT_ENV:NAME} resolves
 // via the injected getenv -- the agent's OWN process environment, never a
 // value carried on the wire.

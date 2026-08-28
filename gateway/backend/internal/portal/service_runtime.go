@@ -97,7 +97,7 @@ const (
 
 // runtimeSpecEnvKeyPattern matches a shell-style environment variable name:
 // upper-case letters, digits, underscore, not starting with a digit. Values
-// are unrestricted (they legitimately carry ${AGENT_ENV:NAME}/${PORT}
+// are unrestricted (they legitimately carry ${AGENT_ENV:NAME}/${PORT}/${MODEL}
 // placeholders the agent resolves at launch time — never validated or
 // rewritten here; see the RuntimeSpecDTO.Env doc below).
 var runtimeSpecEnvKeyPattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
@@ -1082,8 +1082,8 @@ type AgentRuntimeSpecGPUDTO struct {
 // document -- everything the agent needs to exec and supervise the process.
 // Model/UpstreamModel fold in the owning ModelMapping's two model-name
 // fields (gateway_model_name / app_model_name), since the agent has no other
-// way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}
-// placeholders the agent resolves locally from its own environment -- this
+// way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}/
+// ${MODEL} placeholders the agent resolves locally at launch time -- this
 // DTO, like RuntimeSpecDTO, passes them through untouched: never validated or
 // rewritten here.
 type AgentRuntimeSpecDTO struct {

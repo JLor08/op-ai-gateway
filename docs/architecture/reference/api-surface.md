@@ -259,8 +259,8 @@ a terminal `not_permitted` instead of a form error). Every tuning integer
 `admission_wait_timeout_seconds`) must be `>= 0`; `admin_state` must be one of
 the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env
 **keys** must match `^[A-Z_][A-Z0-9_]*$`. **Env values are never validated** —
-that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`
-and `${PORT}` placeholder mechanism, and it means an env key naming an
+that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
+`${PORT}` and `${MODEL}` placeholder mechanism, and it means an env key naming an
 agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
 `SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
 and persisted* here, with the real refusal happening agent-side at process

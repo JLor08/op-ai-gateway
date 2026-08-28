@@ -178,13 +178,40 @@ from this local config — never from the gateway:
 convenience/defence-in-depth, not a boundary (containment is a lexical
 path-prefix check and does not resolve symlinks).
 
+#### Placeholders in `args` and `env` values
+
+Three, resolved by the agent at launch time in **both** `args` and `env`
+values. Everything else shaped like `${…}` is passed through byte-for-byte, so
+a model server's own templating still works.
+
+| Placeholder | Becomes | If it cannot be resolved |
+|---|---|---|
+| `${PORT}` | the port the agent assigned this process | — |
+| `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
+| `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
+
+`${MODEL}` is the one to reach for when a command line has to repeat the model
+name — `["--alias", "${MODEL}"]`, `"/srv/models/${MODEL}/weights.gguf"`. It is
+deliberately the *application-side* name, not the gateway-facing one clients
+send, because the child is the thing that has to recognise it. There is no
+placeholder for the gateway-facing name.
+
+Two shapes are refused rather than passed through: `${AGENT_ENV:OP_AGENT_*}`
+(the agent's own credentials), and a **typo of `${PORT}` or `${AGENT_ENV:…}`** —
+anything whose inner text starts with `PORT` or `AGENT_ENV` but is not one of
+the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` has no such
+rule, deliberately: `${MODEL_PATH}`, `${MODELS_DIR}` and `${MODEL_ID}` are
+plausible things to pass through, so only the exact spelling `${MODEL}` is
+substituted — the cost being that `${MDOEL}` or `${model}` reaches the child as
+literal text instead of erroring.
+
 #### What environment a model process gets
 
 A child gets a **minimal, agent-built environment**, never the agent's own
 one — that would hand every model server the agent's gateway token and every
 other model's `${AGENT_ENV:…}` secret. It contains exactly:
 
-1. the spec's own `env`, with `${PORT}` and `${AGENT_ENV:NAME}` expanded, and
+1. the spec's own `env`, with the placeholders below expanded, and
 2. a small **base** copied from the agent's own environment, and only the
    variables the agent actually has (nothing is invented):
 

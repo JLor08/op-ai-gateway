@@ -500,11 +500,15 @@ function formatArgsText(args: string[]): string {
 // the task-20 report's Deviation 2), so the portal form must refuse
 // everything the agent would refuse and accept everything it would accept:
 //   - "${PORT}" (exact) -> valid, becomes the assigned port at start.
+//   - "${MODEL}" (exact) -> valid, becomes the mapping's app_model_name.
 //   - "${AGENT_ENV:NAME}" with a non-empty NAME -> valid, UNLESS NAME starts
 //     with "OP_AGENT_" (the agent's own credential namespace) -> reserved.
 //   - anything else whose upper-cased inner text STARTS WITH "PORT" or
-//     "AGENT_ENV" -> a malformed near-miss (a typo of one of the two forms
-//     above): "${PORTX}", "${port}", "${AGENT_ENV:}", "${AGENT_ENVV:x}".
+//     "AGENT_ENV" -> a malformed near-miss (a typo of one of those forms):
+//     "${PORTX}", "${port}", "${AGENT_ENV:}", "${AGENT_ENVV:x}". MODEL is
+//     deliberately NOT in that prefix list -- "${MODEL_PATH}",
+//     "${MODELS_DIR}" and "${MODEL_ID}" are plausible pass-through tokens, so
+//     the agent exact-matches "${MODEL}" and lets every variant through.
 //   - everything else -- arbitrary "${...}" text a model server's own
 //     templating syntax might use, e.g. "${TRANSPORT}", "${EXPORT_DIR}",
 //     "${MY_AGENT_ENVIRONMENT}" -- passes through untouched.
@@ -514,6 +518,21 @@ function formatArgsText(args: string[]): string {
 const placeholderPattern = /\$\{[^}]*\}/g;
 const agentEnvPrefix = 'AGENT_ENV:';
 const agentOwnEnvPrefix = 'OP_AGENT_';
+
+// The agent's base-environment names (server-agent internal/runtime
+// policy_local.go `baseEnvNames`), which it copies from its OWN environment
+// into every child and therefore refuses as spec env keys. Mirrored here so
+// the form says no before the round trip rather than letting the spec save
+// and fail at process start as `not_permitted`.
+//
+// UPPER-CASE and compared upper-cased, exactly as the agent does: Windows
+// resolves environment names case-insensitively, so "Path" and "SystemRoot"
+// -- the only spellings a Windows operator would type -- are the same
+// variables. The four Windows names are not decoration: the agent copies
+// USERPROFILE/LOCALAPPDATA (per-user cache roots) and SYSTEMROOT/WINDIR
+// (system DLLs, and Winsock initialisation) so a Windows child can resolve a
+// home directory and open a socket at all.
+const reservedEnvKeys = ['PATH', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'];
 
 function findPlaceholderViolation(
   text: string,
@@ -580,10 +599,11 @@ function duplicateGpuIndex(indices: number[]): number | null {
 // indentation from a paste) -- the VALUE is preserved byte-for-byte after
 // the first "=" (a value may legitimately contain "=" itself, and trimming
 // the whole line before splitting would silently eat meaningful leading/
-// trailing whitespace IN the value). PATH/HOME keys are refused outright
-// (reserved by the agent's own base environment); the ${AGENT_ENV:OP_AGENT_*}
-// / malformed-placeholder checks run separately, over both args and env
-// values together, via validatePlaceholders.
+// trailing whitespace IN the value). A key naming one of the agent's base
+// environment variables is refused outright, in any capitalisation -- see
+// reservedEnvKeys; the ${AGENT_ENV:OP_AGENT_*} / malformed-placeholder checks
+// run separately, over both args and env values together, via
+// validatePlaceholders.
 function parseEnvText(
   text: string,
   t: Translation,
@@ -598,7 +618,7 @@ function parseEnvText(
     }
     const key = line.slice(0, eq).trim();
     const value = line.slice(eq + 1);
-    if (key === 'PATH' || key === 'HOME') {
+    if (reservedEnvKeys.includes(key.toUpperCase())) {
       return { env: {}, error: t.runtimeSpecEnvReserved };
     }
     env[key] = value;

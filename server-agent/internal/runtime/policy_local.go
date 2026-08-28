@@ -293,11 +293,14 @@ func withinDir(candidate, dir string) bool {
 // substitution happens, never after.
 var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 
-// ExpandPlaceholders resolves every ${PORT} and ${AGENT_ENV:NAME} occurrence
-// in spec.Args and spec.Env values, and builds the exact environment the
-// child process will receive.
+// ExpandPlaceholders resolves every ${PORT}, ${MODEL} and ${AGENT_ENV:NAME}
+// occurrence in spec.Args and spec.Env values, and builds the exact
+// environment the child process will receive.
 //
-// ${PORT} becomes the decimal port chosen for this process. ${AGENT_ENV:NAME}
+// ${PORT} becomes the decimal port chosen for this process. ${MODEL} becomes
+// spec.UpstreamModel, the application-side model name (see the ${MODEL}
+// paragraph further down for why it is that one and not spec.Model, and why
+// it has no near-miss rule). ${AGENT_ENV:NAME}
 // resolves NAME from the agent's own process environment via getenv -- this
 // is the only path a secret takes to reach a model process without ever
 // being stored in the gateway database or sent over the wire. An unset (or
@@ -370,8 +373,46 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // right trade -- unlike, say, ${TRANSPORT}, nothing plausible starts with
 // "PORT" or "AGENT_ENV" except an attempt at one of these two placeholders.
 //
+// ${MODEL} is the THIRD token, and it is deliberately NOT part of that
+// near-miss rule -- exact match only. It resolves to spec.UpstreamModel, the
+// APPLICATION-side model name (the owning mapping's app_model_name), so a
+// spec can write ["--alias", "${MODEL}"] or build a path from it. Anything
+// else beginning with "MODEL" passes through literally like any other
+// unrecognised "${...}".
+//
+// That asymmetry with ${PORT} is the point, not an oversight. The near-miss
+// rule's own justification above is that "nothing plausible starts with PORT
+// or AGENT_ENV except an attempt at one of these two placeholders". That
+// reasoning simply does not transfer: ${MODEL_PATH}, ${MODELS_DIR},
+// ${MODEL_ID} and ${MODEL_NAME} are all plausible tokens an operator wants
+// passed through for a model server to expand itself, and a prefix rule on
+// MODEL would refuse every one of them -- reintroducing, under a new name,
+// exactly the defect a prior round fixed when a containment rule on PORT
+// wrongly refused ${TRANSPORT}, ${EXPORT_DIR} and ${IMPORT_PATH}.
+//
+// The accepted cost, stated so it is a decision and not a surprise: a typo
+// (${MDOEL}, or the lowercase ${model}) reaches the child as those literal
+// characters instead of erroring. That is the same silent outcome every
+// other unrecognised placeholder already has, and it is the cheaper of the
+// two mistakes -- an over-eager refusal breaks working specs, a literal
+// pass-through breaks only the spec that was already wrong.
+//
+// An EMPTY spec.UpstreamModel with ${MODEL} present is a hard error, on the
+// same reasoning as an unset ${AGENT_ENV:NAME}: substituting "" would launch
+// a child with `--alias ""` or a path with a hole in it and fail somewhere
+// downstream, confusingly. The error is raised only when the placeholder is
+// actually used, so a spec that never mentions ${MODEL} is unaffected by an
+// empty upstream_model.
+//
+// Only spec.UpstreamModel is exposed. The gateway-facing spec.Model has no
+// placeholder: it was not asked for, and a second token would have to be
+// named so that neither reading is ambiguous (${GATEWAY_MODEL}, never
+// ${MODEL_NAME}, which reads as a synonym of ${MODEL}). Adding one later is
+// a behaviour change for anyone using that text as literal templating, which
+// is the reason to name it right rather than early.
+//
 // Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
-// still passes through untouched; this function owns only these two tokens.
+// still passes through untouched; this function owns only these three tokens.
 func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args []string, env []string, err error) {
 	expand := func(s string) (string, error) {
 		var firstErr error
@@ -383,6 +424,17 @@ func ExpandPlaceholders(spec Spec, port int, getenv func(string) string) (args [
 
 			if inner == "PORT" {
 				return strconv.Itoa(port)
+			}
+
+			// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
+			// See the doc comment above for why the ${PORT} prefix rule
+			// deliberately does not extend here.
+			if inner == "MODEL" {
+				if spec.UpstreamModel == "" {
+					firstErr = fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+					return match
+				}
+				return spec.UpstreamModel
 			}
 
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {

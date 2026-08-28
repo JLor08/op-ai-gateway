@@ -631,6 +631,63 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(putSpecs).toHaveLength(0);
   });
 
+  // The agent reserves six base-environment names, not two, and folds case
+  // before comparing -- Windows resolves environment names case-insensitively,
+  // so `Path` and `SystemRoot` (the only spellings a Windows operator types)
+  // are the same variables. A mirror that knew only exact `PATH`/`HOME` let
+  // those save and fail later at process start as `not_permitted`.
+  it.each(['Path', 'SystemRoot', 'userprofile', 'LOCALAPPDATA', 'windir', 'hOmE'])(
+    'rejects the reserved env key %s in the spelling an operator would type',
+    async (key) => {
+      const { created, putSpecs } = renderSection();
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+      fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+      fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+        target: { value: '/usr/bin/llama-server' },
+      });
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+        target: { value: `${key}=C:\\attacker\\bin` },
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      expect(await screen.findByText(t.runtimeSpecEnvReserved)).toBeInTheDocument();
+      expect(created).toHaveLength(0);
+      expect(putSpecs).toHaveLength(0);
+    },
+  );
+
+  // The other half of the same rule: the variables deliberately left OUT of
+  // the agent's base stay settable, because they are the operator's only lever
+  // for redirecting a child's home or cache once HOME is reserved. ${MODEL}
+  // rides along here since it must reach the agent untouched.
+  it('accepts the cache/home redirection keys the agent deliberately does not reserve', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--alias\n${MODEL}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'HF_HOME=D:\\models\\hf\nTEMP=D:\\models\\tmp\nMODEL_TAG=${MODEL}' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['--alias', '${MODEL}']);
+    expect(putSpecs[0].body.env).toEqual({
+      HF_HOME: 'D:\\models\\hf',
+      TEMP: 'D:\\models\\tmp',
+      MODEL_TAG: '${MODEL}',
+    });
+  });
+
   it('reports a partial failure honestly when the spec write fails after the mapping was created', async () => {
     const mappings = [makeMapping({ id: 'map_1' })];
     const fakeApi = {

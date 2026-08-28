@@ -157,9 +157,20 @@ rather than `env`, and a child that prints its own argv or environment into the
 output that `last_error.stderr_tail` samples.
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly two placeholders are resolved, in both `args` and `env` values:
+Exactly three placeholders are resolved, in both `args` and `env` values:
 
 - `${PORT}` — an exact match substitutes the child's listen port.
+- `${MODEL}` — an exact match substitutes the spec's **`upstream_model`**: the
+  **application-side** model name, i.e. the owning mapping's `app_model_name`,
+  *not* the gateway-facing `model` (`gateway_model_name`). That distinction is
+  the whole point of the placeholder — it is what the model server itself calls
+  the model, so `["--alias", "${MODEL}"]` or
+  `/srv/models/${MODEL}/weights.gguf` name the thing the child expects. An
+  **empty `upstream_model` while `${MODEL}` is used is a hard error**, on the
+  same reasoning as a missing variable; a spec that never mentions the
+  placeholder is unaffected. The gateway-facing name has no placeholder: it was
+  not asked for, and a second token would have to be named so neither reading is
+  ambiguous (`${GATEWAY_MODEL}`, never `${MODEL_NAME}`).
 - `${AGENT_ENV:NAME}` — resolved from the agent's own process environment. A
   **missing variable is a hard error naming the variable**, never a silent empty
   substitution.
@@ -171,6 +182,31 @@ refused by name (`${PORTX}`, `${PORT_1}`, `${port}`, `${AGENT_ENVV:…}`,
 `${AGENT_ENV:}`). The accepted consequence is that `${PORT_RANGE}` is refused
 rather than passed through: in this position it is far more likely a typo of
 `${PORT}` than genuine templating.
+
+**`MODEL` is deliberately absent from that prefix list**, and the asymmetry is a
+decision, not an oversight. The near-miss rule's own justification is that
+nothing plausible starts with `PORT` or `AGENT_ENV` except an attempt at those
+placeholders — and that reasoning does not transfer: `${MODEL_PATH}`,
+`${MODELS_DIR}`, `${MODEL_ID}` and `${MODEL_NAME}` are all plausible tokens an
+operator wants handed to a model server that templates them itself, so a prefix
+rule on `MODEL` would reintroduce, under a new name, exactly the defect fixed
+when a containment rule on `PORT` wrongly refused `${TRANSPORT}`,
+`${EXPORT_DIR}` and `${IMPORT_PATH}`. The accepted cost, stated so it is not a
+surprise: a typo (`${MDOEL}`) or the wrong case (`${model}`) reaches the child
+as literal text rather than erroring — the cheaper of the two mistakes, since an
+over-eager refusal breaks specs that work while a literal pass-through breaks
+only a spec that was already wrong.
+
+`${MODEL}` needs **no feature flag** ([ADR-025](../09-architecture-decisions.md)
+negotiation), and that was checked rather than assumed. The silent failure mode
+is real — an agent that does not know the token passes `${MODEL}` through as
+four literal characters instead of failing loudly — but no such agent can exist
+in the field: `runtime_manager` and this placeholder ship in the same
+unreleased `0.2.0`, so every agent that can run a spec at all understands it.
+`agent.Features` is append-only and an entry can never be removed, so a flag
+whose intersection is true from the day it ships is permanent dead weight. The
+branch's single `0.2.0` bump covers this change; no further bump (`Version` is
+per shipped change, not per commit).
 
 Four properties of that one pass are load-bearing, and each has a wrong
 implementation that shipped once:
@@ -1674,12 +1710,12 @@ The form mirrors the agent's placeholder policy client-side at save time, and th
 mirror is **additive safety, not a backend contract** — the gateway's spec PUT
 validates env *keys* only, so a reserved base name and `${AGENT_ENV:OP_AGENT_*}`
 references are accepted and persisted, and the real rejection fires only when the
-agent tries to start the process, surfacing as a `last_error`. The mirror itself
-is narrower than the agent in two known ways, both accepted for the same reason:
-it compares the two original names (`PATH`, `HOME`) **case-sensitively** and does
-not know the four Windows base names, so `Path` and `USERPROFILE` are accepted
-client-side and refused agent-side. The authority is `ExpandPlaceholders`;
-widening the hint is a portal-side follow-up, not a contract change. Two properties of
+agent tries to start the process, surfacing as a `last_error`. The mirror knows
+all six reserved base names and folds case exactly as the agent does, so `Path`
+and `SystemRoot` — the only spellings a Windows operator types — are refused in
+the form rather than at process start. The authority remains
+`ExpandPlaceholders`; the mirror is early feedback on the same rule, never a
+second contract. Two properties of
 the mirror are load-bearing: it covers `args` as well as `env`, and it classifies
 by **prefix**, not substring, in both directions (a substring test on `PORT`
 wrongly rejects `${TRANSPORT}`; an `includes('${AGENT_ENV:OP_AGENT_')` test

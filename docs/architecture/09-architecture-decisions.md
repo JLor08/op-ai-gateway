@@ -231,7 +231,8 @@ frame type behind its own feature flag.
 tokens live, and the gateway has a system-wide no-plaintext-secrets rule.
 **Decision:** a spec's `env` **values are referential placeholders**
 (`${AGENT_ENV:NAME}`) resolved on the AI server from the agent's own process
-environment; `${PORT}` is the only other placeholder. A missing variable is a
+environment; `${PORT}` and `${MODEL}` are the only other placeholders, and
+neither carries a secret. A missing variable is a
 hard error naming the variable, never a silent empty substitution; the
 `OP_AGENT_*` namespace is refused before `getenv` is consulted; and the child's
 environment is built from scratch rather than inherited. **Consequence:** the

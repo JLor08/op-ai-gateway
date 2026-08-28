@@ -539,9 +539,9 @@ const de = {
   runtimeSpecGpuAdd: 'GPU hinzufügen',
   runtimeSpecGpuRemove: 'Entfernen',
   runtimeSpecEnvHint:
-    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt. PATH, HOME und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
-    'PATH, HOME und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
+    'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
     'Ungültiger Platzhalter (gemeint ist vermutlich ${PORT} oder ${AGENT_ENV:NAME})',
   runtimeSpecPartialFailure:
@@ -2378,9 +2378,9 @@ const en: PortalMessages = {
   runtimeSpecGpuAdd: 'Add GPU',
   runtimeSpecGpuRemove: 'Remove',
   runtimeSpecEnvHint:
-    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port. PATH, HOME, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
-    'PATH, HOME, and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
+    'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
     'Invalid placeholder (likely meant to be ${PORT} or ${AGENT_ENV:NAME})',
   runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
