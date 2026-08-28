@@ -431,8 +431,12 @@ plausible-looking validation rule would break the normal case:
   portal) and `vram_measured_mb` is agent-owned (written only by the telemetry
   write-back). The portal's write reads the existing GPU rows first and copies
   each index's measured value forward, ignoring whatever the request carries
-  there; a new index starts at measured 0. `vram_locked` gates only the agent
-  write-back and is never consulted by the portal write path. A future handler
+  there; a new index starts at measured 0. `vram_locked` is never consulted by
+  the portal write path, but it governs **both** directions of the agent's
+  relationship with the number: it stops the write-back, *and* it makes
+  `agentRuntimeSpecDTO` serve `vram_estimate_mb` instead of `vram_measured_mb`.
+  Both halves are needed for it to be an escape hatch rather than a one-way
+  ratchet — see the runtime concept doc §5.1. A future handler
   that starts trusting `vram_measured_mb` from the request lets a UI round-trip
   erase real measurements, after which the agent does admission arithmetic on
   estimates it has already disproved.

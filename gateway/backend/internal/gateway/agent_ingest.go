@@ -238,7 +238,10 @@ const maxRuntimeGPUsPerSample = 64
 //     on.
 //  3. It is not VRAMLocked (vram_estimate_mb is operator-owned,
 //     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
-//     opt-out of the agent overwriting its own estimate).
+//     opt-out of being governed by the measurement -- it stops the write
+//     here AND makes agentRuntimeSpecDTO serve the estimate, which together
+//     are what let an operator recover a spec a measurement has made
+//     terminally not_permitted).
 //
 // The ownership check (2) is evaluated UNCONDITIONALLY, before the
 // VRAMLocked check (3) -- deliberately, so the audit-trail Warn below fires

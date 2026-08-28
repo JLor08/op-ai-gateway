@@ -532,7 +532,7 @@ here:
 |---|---|---|
 | `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. |
 | `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each index's stored measured value forward. |
-| `agent_runtime_specs.vram_locked` | Operator | Gates only the agent's write-back; never consulted by the portal write path. |
+| `agent_runtime_specs.vram_locked` | Operator | "My estimate is authoritative": stops the agent's write-back **and** makes the runtime-config document carry `vram_estimate_mb` instead of `vram_measured_mb`. Never consulted by the portal write path. |
 | `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget for this GPU" = unconstrained**, identical to an absent row — see §5.2. |
 | `ai_servers.runtime_max_processes` | Operator | Concurrent managed processes; `0` = unlimited. |
 
@@ -542,8 +542,47 @@ request lets a UI round-trip erase real measurements, after which the agent's
 admission arithmetic uses estimates it has already disproved.
 
 The document the agent receives carries, per GPU, the **measured** value if
-present and the estimate otherwise, with `0` meaning *unknown* (never omitted,
-never null).
+present and the estimate otherwise — unless the spec is `vram_locked`, in which
+case it carries the estimate — with `0` meaning *unknown* (never omitted, never
+null).
+
+> **`vram_locked` has to reach the config document, not only the write-back,
+> and that is what makes it an escape hatch instead of decoration.** The
+> measurement loop is closed and one-way: the agent measures its own child, the
+> write-back stores it, the document above prefers measured over estimate, the
+> agent reads it back **as the spec's own declared demand**, and §5.2's rule 3
+> answers a demand exceeding its GPU's budget *on its own* with a **terminal**
+> `not_permitted`. A 24 GB card budgeted at 20000 MB for headroom, an 18000 MB
+> estimate that served fine, and one 22000 MB measurement — llama.cpp with a
+> large KV cache — is the entire scenario: from then on every start of a model
+> that had been working is refused, with no operator action having occurred.
+>
+> It also could not be undone. `PutRuntimeSpec` deliberately copies the stored
+> measured value forward and ignores what the request sends, the write-back
+> skips values `<= 0`, and the spec never runs again so no newer measurement is
+> ever taken. Raising the budget past what the card physically holds is a
+> capitulation, not a lever, and deleting and re-adding the GPU row across two
+> saves is not something an operator can be expected to find.
+>
+> Locking is that lever, and it is deliberately the *only* one: the operator
+> chooses whether to be **governed** by the measurement, never what it says, so
+> the agent stays the owner of the number and the measurement stays on file and
+> on screen as the evidence explaining why they had to intervene. Unlocking
+> hands it straight back. The portal states this at the checkbox — whose label
+> read "VRAM locked (not evictable)" until this was written, describing
+> `pinned` and not this flag at all.
+>
+> **An operator-facing "reset the measured value to 0" button was rejected.**
+> It escapes the trap exactly once and then re-arms it within one measurement
+> beat: the spec starts on its estimate, is measured at the same 22000 MB, and
+> is refused again. It would need to be combined with locking to be durable, at
+> which point locking alone is the whole answer with one control instead of two.
+> **Treating a measured breach as non-terminal was rejected too** — the agent
+> cannot tell a measured demand from a declared one (the wire carries one
+> number by design), and inferring it would mean either running a process the
+> operator's budget says does not fit, or silently discarding the measurement.
+> Refusing and explaining is the honest behaviour; the defect was never the
+> refusal, it was the absent lever.
 
 ### 5.2 The three gates
 

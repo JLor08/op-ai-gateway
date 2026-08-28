@@ -2581,12 +2581,25 @@ export function RuntimeAdminSection({
               control={<Checkbox checked={pinned} onChange={(e) => setPinned(e.target.checked)} />}
               label={t.runtimeSpecPinned}
             />
+            {/* The label used to read "VRAM locked (not evictable)", which
+                described `pinned` (directly above) and not this flag at all --
+                two adjacent checkboxes both promising non-eviction, one of them
+                falsely. vram_locked decides which VRAM number the AGENT is
+                told: locked, the operator's estimate wins over the agent's
+                measurement, in the config document and in the write-back
+                alike. That is the operator's only lever when a measurement
+                above the GPU budget has made a spec terminally
+                `not_permitted`, so the hint has to say so where they are
+                looking. */}
             <FormControlLabel
               control={
                 <Checkbox checked={vramLocked} onChange={(e) => setVramLocked(e.target.checked)} />
               }
               label={t.runtimeSpecVramLocked}
             />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecVramLockedHint}
+            </Typography>
             <SelectField
               id="runtime-spec-admin-state"
               label={t.runtimeSpecAdminState}

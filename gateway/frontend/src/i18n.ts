@@ -533,7 +533,9 @@ const de = {
   runtimeSpecHealthTimeout: 'Health-Timeout (s)',
   runtimeSpecAdmissionWaitTimeout: 'Wartezeit bis Zulassung (s)',
   runtimeSpecAdminState: 'Admin-Übersteuerung',
-  runtimeSpecVramLocked: 'VRAM reserviert (nicht verdrängbar)',
+  runtimeSpecVramLocked: 'VRAM-Schätzung fixieren (Messung des Agenten ignorieren)',
+  runtimeSpecVramLockedHint:
+    'Der Agent misst den tatsächlichen VRAM-Verbrauch seines Kindprozesses; diese Messung ersetzt normalerweise Ihre Schätzung – auch in der Budget-Berechnung, die über den Start entscheidet. Fixieren Sie die Schätzung, wenn eine Messung falsch ist oder wenn eine Messung oberhalb des GPU-Budgets den Start dauerhaft verhindert. Die Messung wird weiterhin erfasst und angezeigt, nur nicht mehr verwendet.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   runtimeSpecGpuIndex: 'GPU-Index',
   runtimeSpecGpuAdd: 'GPU hinzufügen',
@@ -2372,7 +2374,9 @@ const en: PortalMessages = {
   runtimeSpecHealthTimeout: 'Health timeout (s)',
   runtimeSpecAdmissionWaitTimeout: 'Admission wait timeout (s)',
   runtimeSpecAdminState: 'Admin override',
-  runtimeSpecVramLocked: 'VRAM locked (not evictable)',
+  runtimeSpecVramLocked: "Lock the VRAM estimate (ignore the agent's measurement)",
+  runtimeSpecVramLockedHint:
+    "The agent measures its child process's actual VRAM, and that measurement normally replaces your estimate — including in the budget arithmetic that decides whether the model may start. Lock the estimate when a measurement is wrong, or when one above the GPU budget has left the spec refusing to start. The measurement is still recorded and shown, only no longer used.",
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecGpuIndex: 'GPU index',
   runtimeSpecGpuAdd: 'Add GPU',

@@ -185,7 +185,11 @@ Conventions worth stating, because each is a judgement call a client depends on:
   under the caller's control (`index`, `budget_mb`).
 - **`spec.vram_measured_mb` is agent-owned and always ignored on write**, even
   though the request shape carries it. The operator-owned figure is
-  `vram_estimate_mb`.
+  `vram_estimate_mb`. `spec.vram_locked` is how an operator opts out of being
+  *governed* by the measurement without being able to forge it: locked, the
+  write-back stops **and** the agent is served `vram_estimate_mb` in its
+  runtime-config document. It is the documented recovery for a spec that a
+  measurement above its GPU budget has left permanently `not_permitted`.
 - **The SSE stream wraps every frame as `{"runtimes":[…]}` — not `{"data":[…]}`**
   like the model-servers and performance streams on this same portal. Both the
   initial `snapshot` frame and every later `update` frame carry the **complete**
