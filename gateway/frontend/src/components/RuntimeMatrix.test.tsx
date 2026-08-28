@@ -137,9 +137,7 @@ describe('RuntimeMatrix advisory tooltip', () => {
     // sum -- not "44000 / 0 MB (over budget)", a limit the agent's admission
     // policy does not enforce. 0 is reachable: a fresh budget row starts at 0
     // MB in the limits form, and clearing the MB field yields 0.
-    render(
-      <RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{ 0: 0 }} />,
-    );
+    render(<RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{ 0: 0 }} />);
     const bravoAlpha = screen.getByRole('button', {
       name: `${t.runtimeMatrixCell}: Bravo + Alpha`,
     });
