@@ -679,11 +679,17 @@ func (a *Agent) newRuntimeLogTicker() (*time.Ticker, <-chan time.Time) {
 // produced output since the last flush.
 //
 // It runs INLINE on Run's goroutine, never in a goroutine of its own, and
-// that is the load-bearing detail: this transport allows exactly one writer
-// per connection, and Post/PostSystemReport/PostRuntimeReport are all written
-// from this same loop. Spawning here would be a second writer racing them --
-// the precise defect class the client package's one-writer rule exists to
-// prevent.
+// that is the load-bearing detail: Post and PostSystemReport are written from
+// this same loop, and spawning here would add a writer racing them -- the
+// precise defect class the client package's one-writer rule exists to prevent.
+//
+// Note the rule is a discipline, not a property the transport enforces: the
+// broader claim this comment used to make -- "this transport allows exactly one
+// writer per connection" -- is false in transport=websocket + runtime_source=file,
+// where PostRuntimeReport is written from the goroutine triggerRuntimeSync
+// spawns. WSSender.PostRuntimeLog carries the full correction and what it costs.
+// Keeping this flush on the run loop is what stops a THIRD writer being added to
+// that, so the reasoning survives the correction intact.
 //
 // A write failure is dropped, not retried and not logged with any content:
 // the frames carry managed-process output, which may include prompt text and
