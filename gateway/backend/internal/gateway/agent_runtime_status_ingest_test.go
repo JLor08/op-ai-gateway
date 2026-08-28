@@ -409,3 +409,68 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLock
 		t.Fatal("a cross-server naming attempt against a LOCKED spec must still log a Warn -- the audit trail must not depend on lock status")
 	}
 }
+
+// countingMeasuredWriteStore counts the agent-owned VRAM write-back's own
+// UPDATE, so a test can assert that an UNCHANGED measurement costs no write
+// at all.
+type countingMeasuredWriteStore struct {
+	*routing.MemoryStore
+	updateCalls atomic.Int32
+}
+
+func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex, measuredMB int) error {
+	c.updateCalls.Add(1)
+	return c.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+}
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue is F2's
+// second half. Telemetry arrives once per second and each sample is a full
+// snapshot, so a spec whose measurement is simply STABLE -- the normal case
+// for a loaded model serving nothing -- drove one unconditional UPDATE per
+// second per (spec, gpu), forever. Neither side had change detection and the
+// SQL is an unconditional write, so an idle overnight server with a handful
+// of measured specs across two cards generated on the order of a million
+// identical UPDATEs a day: WAL growth on SQLite and dead-tuple churn on
+// Postgres, for a table with a dozen rows.
+//
+// Detection belongs HERE, on the side that owns the stored row, not on the
+// agent: suppressing the report at the source would make the two sides
+// diverge permanently the moment the stored value changed out from under a
+// long-running agent (an operator deleting and re-adding a GPU row resets it
+// to 0), and the agent would never resend. Comparing against what is actually
+// stored converges no matter what happened to the row.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_unchanged", false)
+	counting := &countingMeasuredWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_unchanged","state":"running","gpus":[{"index":0,"vram_measured_mb":21234}]}]}`
+	for i := 0; i < 3; i++ {
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateRuntimeSpecGPUMeasured calls = %d across three samples carrying the SAME measurement, want exactly 1 -- BUG F2: an unchanged value is rewritten on every telemetry sample, once per second per (spec, gpu), forever", got)
+	}
+
+	// A value that genuinely moved must still be written: change detection
+	// must not turn into "write once and never again".
+	changed := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_unchanged","state":"running","gpus":[{"index":0,"vram_measured_mb":22500}]}]}`
+	req, raw := ingestReq(t, changed)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest (changed): %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 2 {
+		t.Fatalf("UpdateRuntimeSpecGPUMeasured calls = %d after a CHANGED measurement, want 2", got)
+	}
+	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), "rspec_unchanged")
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
+	}
+	if gpus[0].VRAMMeasuredMB != 22500 {
+		t.Fatalf("VRAMMeasuredMB = %d, want the changed 22500", gpus[0].VRAMMeasuredMB)
+	}
+}

@@ -574,10 +574,19 @@ type specState struct {
 	// StateStopped.
 	removed bool
 
-	// measuredVRAM is the last real per-GPU measurement observed for this
-	// spec's current process, cached opportunistically whenever ANY spec's
-	// admission snapshot is built (buildSnapshot). Reported via Status; falls
-	// back to nil (never measured) when no measurer is installed.
+	// measuredVRAM is the last real per-GPU measurement observed for THIS
+	// SPEC'S CURRENT PROCESS, from whichever spec's admission snapshot was
+	// built most recently (buildSnapshot). Reported via Status; nil when
+	// nothing has been measured -- which is the permanent state of every
+	// host with no measurer installed.
+	//
+	// CLEARED BY onProcExited, and the claim in the first sentence is why:
+	// it describes one process, and it stops being true the instant that
+	// process exits. Leaving it in place (the F2 defect) meant a
+	// force-stopped spec kept reporting a dead process's measurement in
+	// every Status(), the agent kept attaching `gpus` to every telemetry
+	// sample, and the gateway kept writing the same value back once per
+	// second per (spec, gpu) forever -- on a server doing nothing at all.
 	measuredVRAM map[int]int
 
 	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
@@ -1483,6 +1492,15 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// InFlight==0) then treated this spec as permanently busy, as if
 	// pinned -- never evictable again, and never idle-unloadable.
 	st.inFlight = 0
+	// F2 fix: a measurement describes A LIVE PROCESS, and this one is gone.
+	// Keeping it made Status() report an exited process's VRAM indefinitely,
+	// which the agent then republished on every 1 s telemetry sample and the
+	// gateway rewrote to the store on every one of them -- an idle overnight
+	// server with a handful of measured specs across two cards produced on
+	// the order of a million identical UPDATEs a day for a table with a dozen
+	// rows. Cleared for EVERY kind of exit (crash, drain, idle unload,
+	// force_stopped, shutdown): none of them leaves the number true.
+	st.measuredVRAM = nil
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false

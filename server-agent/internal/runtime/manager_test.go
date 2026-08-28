@@ -2315,3 +2315,75 @@ func TestConcurrentAdmissionUnderPressureDoesNotForkExecStorm(t *testing.T) {
 		})
 	}
 }
+
+// TestManagerClearsMeasuredVRAMWhenTheProcessExits is F2. st.measuredVRAM
+// describes ONE process; onProcExited used to leave it in place, so a spec the
+// operator had force-stopped kept reporting the exited process's measurement
+// in every Status(), the agent kept attaching `gpus` to every telemetry
+// sample, and the gateway's write-back kept issuing the SAME unconditional
+// UPDATE once per second per (spec, gpu) forever -- WAL growth on SQLite and
+// dead-tuple churn on Postgres for a table with a dozen rows, on a server
+// doing nothing at all.
+//
+// The vehicle populates the measurement THE WAY THE UNFIXED TREE CAN: a second
+// spec's admission builds a snapshot whose pid list contains the first spec's
+// live child. That keeps this test red for the F2 reason (a stale measurement
+// survives the process) rather than for the F1 reason.
+func TestManagerClearsMeasuredVRAMWhenTheProcessExits(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[int]int{0: 7777}
+		}
+		return out
+	})
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Pinned = true
+	specA.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	specB := baseSpec("spec-b", "model-b")
+	specB.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	// Co-resident, so admitting B neither evicts A nor waits on it: B's
+	// admission is here only to build a snapshot that names A's live pid.
+	cfg := Config{Specs: []Spec{specA, specB}, Coresident: [][2]string{{"spec-a", "spec-b"}}, ETag: "v1"}
+	m.Apply(cfg)
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, releaseB, err := m.EnsureRunning(ctx, "model-b")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-b): %v", err)
+	}
+	releaseB()
+
+	waitUntil(t, 5*time.Second, "spec-a carries a measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && len(st.MeasuredVRAM) > 0
+	})
+
+	// Now stop spec-a. force_stopped rather than a crash so the stop is
+	// unambiguous and nothing restarts it (applyConfig checks force_stopped
+	// ahead of the pinned restart).
+	stopped := specA
+	stopped.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{stopped, specB}, Coresident: cfg.Coresident, ETag: "v2"})
+
+	waitUntil(t, 5*time.Second, "spec-a's process is gone", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.PID == 0 && st.State != StateRunning && st.State != StateDraining
+	})
+
+	st := statusFor(m, "spec-a")
+	if len(st.MeasuredVRAM) != 0 {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM = %v after the process exited (state %v, pid %d), want empty -- BUG F2: a dead process's measurement is still reported, so the agent keeps attaching gpus to every telemetry sample and the gateway rewrites the same value once per second forever", st.MeasuredVRAM, st.State, st.PID)
+	}
+}

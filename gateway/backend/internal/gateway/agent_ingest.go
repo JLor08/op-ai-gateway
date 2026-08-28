@@ -301,11 +301,34 @@ func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specI
 // maxRuntimeGPUsPerSample) before any store call, bounding the worst case
 // regardless of how many distinct ids a hostile/buggy sample names.
 //
+// AN UNCHANGED MEASUREMENT IS NOT REWRITTEN, and that is a cost fix rather
+// than a tidiness one. Telemetry arrives once per second and every sample is
+// a FULL SNAPSHOT, so a spec whose measurement is merely stable -- the normal
+// state of a loaded model serving nothing -- used to drive one unconditional
+// UPDATE per second per (spec, gpu), indefinitely. An idle overnight server
+// with a handful of measured specs across two cards produced on the order of
+// a million identical UPDATEs a day: WAL growth on SQLite, dead-tuple churn
+// and autovacuum pressure on PostgreSQL, for a table with a dozen rows.
+//
+// The comparison is against WHAT IS STORED, read once per distinct writable
+// spec_id and memoized next to the writability verdict, rather than against
+// what the agent last sent. Suppressing at the agent would be cheaper still
+// (it would save the report as well as the write) but it cannot converge: the
+// stored row can change out from under a long-running agent -- an operator
+// deleting and re-adding a GPU row resets vram_measured_mb to 0 -- and an
+// agent that had suppressed its unchanged report would never resend, leaving
+// the portal showing 0 for a spec that is measured and running. Comparing
+// here costs one extra read per writable spec per sample and converges no
+// matter what happened to the row; a read is also far cheaper than the write
+// it replaces on both engines.
+//
 // Best-effort throughout, matching the "a report is evidence, not a
 // transaction" ingest discipline this whole file follows: nothing here is
 // ever returned as an error -- this must NEVER reject the telemetry sample
-// it rode in on. Called only AFTER every store write in ingestTelemetrySample
-// has succeeded.
+// it rode in on. A failed RuntimeSpecGPUs read degrades to "write
+// unconditionally", never to "skip the write": staleness must not be able to
+// suppress a real measurement. Called only AFTER every store write in
+// ingestTelemetrySample has succeeded.
 func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
 	if s.Routes == nil {
 		return
@@ -314,6 +337,9 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runt
 		runtimes = runtimes[:maxRuntimeSamplesPerSample]
 	}
 	writable := make(map[string]bool, len(runtimes))
+	// stored[specID][gpuIndex] is the measured value already on file. Only
+	// populated for a writable spec, and only once per distinct spec_id.
+	stored := make(map[string]map[int]int, len(runtimes))
 	for _, rt := range runtimes {
 		specID := strings.TrimSpace(rt.SpecID)
 		if specID == "" || len(rt.GPUs) == 0 {
@@ -323,6 +349,9 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runt
 		if !seen {
 			ok = s.resolveRuntimeSpecWritable(ctx, serverID, specID)
 			writable[specID] = ok
+			if ok {
+				stored[specID] = s.storedMeasuredVRAM(ctx, serverID, specID)
+			}
 		}
 		if !ok {
 			continue
@@ -335,14 +364,43 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runt
 			if g.VRAMMeasuredMB <= 0 {
 				continue
 			}
+			if was, known := stored[specID][g.Index]; known && was == g.VRAMMeasuredMB {
+				continue // already on file, byte for byte
+			}
 			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, g.Index, g.VRAMMeasuredMB); err != nil {
 				// Tolerates ErrNotFound (a GPU row deleted out from under an
 				// in-flight sample) the same as any other failure here: log
 				// and move on, never reject the sample.
 				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", g.Index, "err", err)
+				continue
+			}
+			if stored[specID] != nil {
+				// Keep the memo truthful for the rest of THIS sample: a
+				// malformed payload naming the same (spec, gpu) twice must
+				// not write twice.
+				stored[specID][g.Index] = g.VRAMMeasuredMB
 			}
 		}
 	}
+}
+
+// storedMeasuredVRAM reads specID's currently-stored measured value per GPU
+// index, for writeBackRuntimeVRAM's change detection. A read failure returns
+// nil, which the caller reads as "nothing known" and therefore writes
+// unconditionally -- the safe direction: a missed comparison costs one
+// redundant UPDATE, whereas a wrongly-assumed match would silently drop a
+// real measurement.
+func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[int]int {
+	gpus, err := s.Routes.RuntimeSpecGPUs(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime vram write-back: current gpu rows unreadable, writing unconditionally", "server_id", serverID, "spec_id", specID, "err", err)
+		return nil
+	}
+	out := make(map[int]int, len(gpus))
+	for _, g := range gpus {
+		out[g.GPUIndex] = g.VRAMMeasuredMB
+	}
+	return out
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's

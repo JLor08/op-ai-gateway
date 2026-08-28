@@ -254,6 +254,23 @@ the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
 on ingest, and the status DTO deliberately has no GPU field — measured VRAM
 reaches the UI through the spec's `vram_measured_mb` after the agent's write-back.
 
+**The write-back skips an unchanged value, and the skip lives on the gateway,
+not on the agent.** Rule 2 above forbids the obvious agent-side saving — a spec
+whose measurement has not moved must still be *reported*, or the portal's live
+table flickers — but nothing obliges the gateway to *rewrite* what it already
+holds. It used to: the `UPDATE` was unconditional and every sample is a full
+snapshot, so a spec whose measurement was merely stable cost one write per
+second per `(spec, gpu)` indefinitely, which on an idle overnight server with a
+handful of measured specs is of the order of a million identical `UPDATE`s a day
+against a table with a dozen rows. `writeBackRuntimeVRAM` now reads the stored
+rows once per distinct writable `spec_id` and writes only what differs.
+Comparing against the **store** rather than against what the agent last sent is
+what makes it converge: the stored value can change out from under a
+long-running agent (deleting and re-adding a GPU row resets it to `0`), and an
+agent that had suppressed its own unchanged report would never resend. A failed
+read degrades to writing unconditionally — a missed comparison costs one
+redundant write, a wrong one would silently drop a real measurement.
+
 > **A recurring wire-shape trap, worth stating once.** A nil Go collection and a
 > nil `json.RawMessage` marshal as `null`, not `{}`/`[]`, and the TypeScript
 > portal treats `null` as a crash-class value. The countermeasures are structural
