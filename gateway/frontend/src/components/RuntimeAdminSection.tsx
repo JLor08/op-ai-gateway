@@ -592,6 +592,64 @@ function duplicateGpuIndex(indices: number[]): number | null {
   return null;
 }
 
+/**
+ * gpuOptionLabel renders one telemetry-reported GPU as a picker option.
+ *
+ * THE DESIGN CONSTRAINT IS EIGHT IDENTICAL CARDS. 4x or 8x of the same model
+ * is the normal AI-server build, so `name` is a recognition aid and never a
+ * handle: a list that reads as eight copies of "NVIDIA RTX 4090" has failed
+ * even though every value behind it differs. The label is therefore built as
+ * `GPU <index> · <name> · <handle>`:
+ *
+ *  - the INDEX leads because it is the value being set. Whatever else the row
+ *    shows, the operator must be able to see which number they just chose --
+ *    and it is the only part that is always present, which is what makes the
+ *    eight-identical-cards case work at all.
+ *  - the NAME is what a human recognises the card by.
+ *  - the HANDLE (stableGpuHandle) is the tie-breaker, and it is the part worth
+ *    extending: see its own note.
+ *
+ * memory_total_bytes is deliberately NOT here. On the host this exists for it
+ * is identical across all eight cards, so it adds a wide column and breaks no
+ * tie; on a mixed host the name already differs. (Live free memory would
+ * genuinely answer "which card should I use", but it is not in this data
+ * source -- the hardware inventory is static -- and it is not identity.)
+ */
+function gpuOptionLabel(gpu: HardwareGPU): string {
+  const parts = [`GPU ${gpu.index}`];
+  const name = gpu.name.trim();
+  if (name) parts.push(name);
+  const handle = stableGpuHandle(gpu);
+  if (handle) parts.push(handle);
+  return parts.join(' · ');
+}
+
+/**
+ * stableGpuHandle picks the most physically meaningful identifier telemetry
+ * actually reported for this card, in descending order of what an operator can
+ * act on. ADD NEW IDENTIFIERS HERE, in priority order -- that is the whole
+ * point of the indirection.
+ *
+ *  1. `pci_bus_id` — maps to a physical slot and survives the index
+ *     renumbering across reboots that the GPU budget rows'
+ *     expected_uuid/expected_name drift detection exists to catch. NVIDIA
+ *     only.
+ *  2. a shortened `uuid` — unique and stable but opaque; enough to tell two
+ *     otherwise identical rows apart, which is all this needs to do.
+ *  3. nothing — AMD and Apple report neither. The label falls back to index +
+ *     name, which still distinguishes every row.
+ */
+function stableGpuHandle(gpu: HardwareGPU): string {
+  const busID = gpu.pci_bus_id?.trim() ?? '';
+  if (busID) return busID;
+  const uuid = gpu.uuid?.trim() ?? '';
+  if (!uuid) return '';
+  // "GPU-a1b2c3d4-...." -> "a1b2c3d4…": the prefix is constant across every
+  // NVIDIA card and the tail is never read, so neither disambiguates.
+  const body = uuid.replace(/^GPU-/i, '');
+  return body.length > 8 ? `${body.slice(0, 8)}…` : body;
+}
+
 // KEY=value per line, one env var per line. Blank/whitespace-only lines are
 // skipped; a malformed (no "=") line is reported via the existing
 // runtime_spec.env_invalid label so it reads the same way a backend
@@ -1036,6 +1094,12 @@ export function RuntimeAdminSection({
   const hardware = useLatestFetch(() => api.serverHardware(server.id), [api, server.id]);
   const telemetryGpus: HardwareGPU[] =
     hardware.data?.available && hardware.data.report ? hardware.data.report.gpus : [];
+  // Whether the hardware fetch has actually SETTLED, as distinct from having
+  // returned nothing yet. The spec form's GPU picker degrades to "this server
+  // has reported no GPUs" when the list is empty, and flashing that sentence
+  // during the initial load would tell an operator something false about their
+  // hardware for as long as the request takes.
+  const hardwareSettled = hardware.status === 'ok' || hardware.status === 'error';
 
   const {
     data: gpuBudgetsData,
@@ -1783,6 +1847,32 @@ export function RuntimeAdminSection({
   // where the backend's own refusal would land.
   function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+
+  // The reported GPUs row `rowIdx` may be switched to: every telemetry card
+  // except the ones a SIBLING row already holds. duplicateGpuIndex refuses a
+  // collision at submit and the backend refuses it again, so offering an index
+  // only to fail validation afterwards is worse than not offering it.
+  //
+  // The row's OWN index is deliberately still in the list -- that is what lets
+  // the select display the current selection rather than reading as unset.
+  // This does NOT tighten updateGpuRow, which still accepts a typed collision
+  // on purpose: swapping two rows' indices has to pass through a colliding
+  // intermediate state, and refusing the keystroke would make that edit
+  // impossible. The picker simply never OFFERS one.
+  function gpuOptionsFor(rowIdx: number): HardwareGPU[] {
+    const takenBySiblings = new Set(gpuRows.filter((_, i) => i !== rowIdx).map((r) => r.index));
+    return telemetryGpus.filter((g) => !takenBySiblings.has(g.index));
+  }
+
+  // The select shows a card only when the row's index actually matches one the
+  // server reported. A hand-typed index for a card telemetry does not know
+  // about (a machine that has not reported yet, a card about to be installed)
+  // leaves the select on its placeholder while the numeric field keeps the
+  // real value -- honest in both halves, rather than the select silently
+  // implying the index is something else.
+  function gpuSelectValue(row: GpuRow, rowIdx: number): string {
+    return gpuOptionsFor(rowIdx).some((g) => g.index === row.index) ? String(row.index) : '';
   }
 
   function buildSpecBody(args: string[], env: Record<string, string>): PutRuntimeSpecRequest {
@@ -2617,11 +2707,48 @@ export function RuntimeAdminSection({
               <Typography variant="subtitle2" component="h3">
                 {t.runtimeSpecGpus}
               </Typography>
+              {/* No reported GPUs: say so ONCE, and omit the picker rather
+                  than rendering an empty dropdown that reads as broken. The
+                  numeric index below stays fully editable -- a machine that
+                  has not reported yet, or a CPU-only host being prepared, must
+                  still be configurable by hand. Suppressed until the fetch has
+                  settled so the sentence is never a lie about hardware we have
+                  simply not heard about yet. */}
+              {hardwareSettled && telemetryGpus.length === 0 && (
+                <Typography variant="caption" color="text.secondary">
+                  {t.runtimeSpecGpuNoTelemetry}
+                </Typography>
+              )}
               {gpuRows.map((row, idx) => (
                 <Box
                   key={row.rowKey}
                   sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                 >
+                  {/* Picks a card BY NAME and writes its index into the field
+                      beside it. It augments that field and never replaces it:
+                      telemetry can be stale, absent, or behind the hardware
+                      actually in the machine. */}
+                  {telemetryGpus.length > 0 && (
+                    <SelectField
+                      id={`runtime-spec-gpu-pick-${idx}`}
+                      label={t.runtimeSpecGpuPick}
+                      value={gpuSelectValue(row, idx)}
+                      onChange={(e) => {
+                        // The placeholder is a display state, not a choice:
+                        // selecting it would otherwise blank the index.
+                        if (e.target.value === '') return;
+                        updateGpuRow(idx, { index: Number(e.target.value) });
+                      }}
+                      sx={{ maxWidth: 340 }}
+                    >
+                      <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
+                      {gpuOptionsFor(idx).map((g) => (
+                        <option value={String(g.index)} key={g.index}>
+                          {gpuOptionLabel(g)}
+                        </option>
+                      ))}
+                    </SelectField>
+                  )}
                   <Field
                     id={`runtime-spec-gpu-index-${idx}`}
                     label={t.runtimeSpecGpuIndex}

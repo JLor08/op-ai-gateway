@@ -3983,3 +3983,181 @@ describe('RuntimeAdminSection row identity across a mid-list delete (Sonar S6479
     expect(document.activeElement).toBe(editing);
   });
 });
+
+// The spec form's GPU rows: pick a reported card by name, get its index.
+//
+// The case this is designed around is 4x or 8x of the SAME card, which is the
+// normal AI-server build rather than an edge case -- a picker labelled by name
+// alone would read as eight copies of one string and be useless exactly where
+// it is most needed.
+describe('RuntimeAdminSection spec GPU picker', () => {
+  // Eight identical cards, distinguishable only by index, PCI bus id and UUID
+  // -- i.e. the real thing.
+  function eightIdenticalCards(): HardwareGPU[] {
+    return Array.from({ length: 8 }, (_, i) => ({
+      index: i,
+      name: 'NVIDIA GeForce RTX 4090',
+      uuid: `GPU-${String(i).repeat(8)}-dead-beef`,
+      // Real bus ids are hex and non-contiguous, e.g. 0x21, 0x25, 0x29 ...
+      pci_bus_id: `00000000:${(0x21 + i * 4).toString(16).padStart(2, '0')}:00.0`,
+      memory_total_bytes: 24 * 1024 * 1024 * 1024,
+    }));
+  }
+
+  async function openSpecFormWithOneGpuRow() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecGpuAdd }));
+  }
+
+  it('selects a card by name and writes its index into the GPU index field', async () => {
+    renderSection({
+      hardware: makeHardware([
+        { index: 0, name: 'RTX 4090', uuid: 'GPU-aaa', memory_total_bytes: 0 },
+        { index: 3, name: 'RTX A6000', uuid: 'GPU-bbb', memory_total_bytes: 0 },
+      ]),
+    });
+    await openSpecFormWithOneGpuRow();
+
+    const indexField = (await screen.findByLabelText(t.runtimeSpecGpuIndex)) as HTMLInputElement;
+    expect(indexField.value).toBe('0');
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }));
+    fireEvent.click(await screen.findByRole('option', { name: /RTX A6000/ }));
+
+    expect(indexField.value).toBe('3');
+  });
+
+  it('makes eight identically named cards individually distinguishable and picks the right one', async () => {
+    renderSection({ hardware: makeHardware(eightIdenticalCards()) });
+    await openSpecFormWithOneGpuRow();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }));
+    const options = await screen.findAllByRole('option');
+    // 8 cards + the placeholder.
+    expect(options).toHaveLength(9);
+
+    // THE REQUIREMENT: no two options read the same. A list of eight identical
+    // strings fails an operator even though the values behind it differ.
+    const labels = options.map((o) => o.textContent ?? '');
+    expect(new Set(labels).size).toBe(labels.length);
+
+    // And each one still carries what a human recognises the card by, plus the
+    // handle that maps to a physical slot.
+    expect(labels).toContain('GPU 5 · NVIDIA GeForce RTX 4090 · 00000000:35:00.0');
+
+    fireEvent.click(screen.getByRole('option', { name: /00000000:35:00\.0/ }));
+    expect((screen.getByLabelText(t.runtimeSpecGpuIndex) as HTMLInputElement).value).toBe('5');
+  });
+
+  it('falls back to a shortened UUID when the agent reports no PCI bus id', async () => {
+    renderSection({
+      hardware: makeHardware([
+        {
+          index: 0,
+          name: 'RTX 4090',
+          uuid: 'GPU-a1b2c3d4-5e6f-7788-99aa-bbccddeeff00',
+          memory_total_bytes: 0,
+        },
+        {
+          index: 1,
+          name: 'RTX 4090',
+          uuid: 'GPU-99887766-5e6f-7788-99aa-bbccddeeff00',
+          memory_total_bytes: 0,
+        },
+      ]),
+    });
+    await openSpecFormWithOneGpuRow();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }));
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+    expect(labels).toContain('GPU 0 · RTX 4090 · a1b2c3d4…');
+    expect(labels).toContain('GPU 1 · RTX 4090 · 99887766…');
+  });
+
+  it('still labels every option distinctly when a host reports neither bus id nor UUID (AMD/Apple)', async () => {
+    renderSection({
+      hardware: makeHardware([
+        { index: 0, name: 'Radeon Pro W7900', memory_total_bytes: 0 },
+        { index: 1, name: 'Radeon Pro W7900', memory_total_bytes: 0 },
+      ]),
+    });
+    await openSpecFormWithOneGpuRow();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }));
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+    expect(labels).toContain('GPU 0 · Radeon Pro W7900');
+    expect(labels).toContain('GPU 1 · Radeon Pro W7900');
+  });
+
+  // A machine that has never reported, or a CPU-only host: no picker at all
+  // (an empty dropdown reads as broken), a sentence saying why, and the index
+  // field still fully usable -- this branch has twice shipped a control that
+  // failed closed when a resource had not resolved.
+  it('omits the picker and explains itself when the server has reported no GPUs, while manual entry still works', async () => {
+    const { putSpecs, created } = renderSection(); // default hardware: { available: false }
+    await openSpecFormWithOneGpuRow();
+
+    expect(await screen.findByText(t.runtimeSpecGpuNoTelemetry)).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: t.runtimeSpecGpuPick })).not.toBeInTheDocument();
+
+    const indexField = screen.getByLabelText(t.runtimeSpecGpuIndex);
+    expect(indexField).not.toBeDisabled();
+    fireEvent.change(indexField, { target: { value: '2' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecVram), { target: { value: '18000' } });
+
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus).toEqual([
+      { index: 2, vram_estimate_mb: 18000, vram_measured_mb: 0 },
+    ]);
+  });
+
+  // duplicateGpuIndex refuses a collision at submit and the backend refuses it
+  // again, so offering an index only to fail validation afterwards is a worse
+  // experience than not offering it.
+  it("does not offer an index a sibling row already uses, but keeps offering the row's own", async () => {
+    renderSection({
+      hardware: makeHardware([
+        { index: 0, name: 'Card A', memory_total_bytes: 0 },
+        { index: 1, name: 'Card B', memory_total_bytes: 0 },
+        { index: 2, name: 'Card C', memory_total_bytes: 0 },
+      ]),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const addGpu = await screen.findByRole('button', { name: t.runtimeSpecGpuAdd });
+    fireEvent.click(addGpu); // row 0 -> index 0
+    fireEvent.click(addGpu); // row 1 -> index 1
+
+    const pickers = screen.getAllByRole('combobox', { name: t.runtimeSpecGpuPick });
+    expect(pickers).toHaveLength(2);
+
+    fireEvent.mouseDown(pickers[0]);
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+    expect(labels).toContain('GPU 0 · Card A'); // its own -- still shown, or the select reads as unset
+    expect(labels).toContain('GPU 2 · Card C');
+    expect(labels.some((l) => l.includes('Card B'))).toBe(false); // held by row 1
+  });
+
+  // Telemetry can be behind reality. A hand-typed index for a card the server
+  // has not reported must not make the picker claim something else is selected.
+  it('leaves the picker on its placeholder for a hand-typed index telemetry does not know', async () => {
+    renderSection({
+      hardware: makeHardware([{ index: 0, name: 'Card A', memory_total_bytes: 0 }]),
+    });
+    await openSpecFormWithOneGpuRow();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecGpuIndex), { target: { value: '7' } });
+
+    expect((screen.getByLabelText(t.runtimeSpecGpuIndex) as HTMLInputElement).value).toBe('7');
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }).textContent).toBe(
+      t.runtimeSpecGpuPickPlaceholder,
+    );
+  });
+});

@@ -1791,6 +1791,50 @@ leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agen
 picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
 
+Each spec GPU row carries a **picker of the server's reported cards** that
+writes the chosen card's index into the numeric field beside it. It exists
+because **4×/8× of the same card is the normal AI-server build**, and the
+picker is designed around that rather than tolerating it: an option is
+`GPU <index> · <name> · <handle>` — the index first because it is the value
+being set and the only part always present, the name for recognition, and the
+strongest identifier telemetry actually reported as the tie-breaker
+(`pci_bus_id`, else a shortened `uuid`, else nothing). A list that reads as
+eight copies of one string has failed even though the values behind it differ.
+`memory_total_bytes` is deliberately not in the label: on the host this exists
+for it is identical across every card, so it lengthens the row and breaks no
+tie.
+
+Three rules keep it an aid rather than a gate:
+
+- **It augments the numeric index, never replaces it.** Telemetry can be
+  stale, absent, or behind the hardware in the machine, and a server being
+  configured before it has ever reported must still be fully configurable by
+  typing.
+- **No telemetry means no picker**, plus one sentence saying why — not an empty
+  dropdown, which reads as broken, and never a disabled row. The sentence is
+  withheld until the hardware fetch has actually settled, so it is never a
+  claim about hardware the portal has simply not heard about yet.
+- **An index a sibling row already holds is not offered.** `duplicateGpuIndex`
+  refuses that collision at submit and the backend refuses it again, so
+  offering it only to fail validation afterwards is worse than omitting it. The
+  row's *own* index stays offered, or the picker would read as unset. This does
+  not tighten typing: an operator swapping two rows' indices must pass through
+  a colliding intermediate state, so the keystroke is still accepted and the
+  collision still caught at submit.
+
+**Selecting a card prefills nothing else, and specifically not the VRAM
+estimate.** `memory_total_bytes` sits right next to a VRAM field, but a card's
+total memory is not a model's demand — it is off by whatever fraction of the
+card the model actually uses — and that field feeds the admission arithmetic.
+A confidently wrong number there is worse than an empty one. (The *limits*
+form does prefill `budget_mb` from total memory, and that is not the same
+thing: a budget is a ceiling on the card, which is exactly what total memory
+is.) The limits form deliberately did **not** get this picker: `addBudgetRow`
+already prefills index and VRAM from telemetry, so it never had the gap, and
+its rows carry `expected_uuid`/`expected_name` drift state that
+`updateBudgetRow` clears on an index change — a second index-setting path
+would be a second place that has to remember to clear it.
+
 `args` are **one per line and never split on spaces** — `--system-prompt "You are
 helpful"` would be destroyed. The parser preserves every line verbatim, strips
 only a trailing `\r` from a CRLF paste, and drops **at most one** trailing blank

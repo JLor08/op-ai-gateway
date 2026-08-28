@@ -538,6 +538,10 @@ const de = {
     'Der Agent misst den tatsächlichen VRAM-Verbrauch seines Kindprozesses; diese Messung ersetzt normalerweise Ihre Schätzung – auch in der Budget-Berechnung, die über den Start entscheidet. Fixieren Sie die Schätzung, wenn eine Messung falsch ist oder wenn eine Messung oberhalb des GPU-Budgets den Start dauerhaft verhindert. Die Messung wird weiterhin erfasst und angezeigt, nur nicht mehr verwendet.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   runtimeSpecGpuIndex: 'GPU-Index',
+  runtimeSpecGpuPick: 'Gemeldete GPU',
+  runtimeSpecGpuPickPlaceholder: 'Karte auswählen …',
+  runtimeSpecGpuNoTelemetry:
+    'Dieser Server hat noch keine GPUs gemeldet – GPU-Index bitte manuell eintragen.',
   runtimeSpecGpuAdd: 'GPU hinzufügen',
   runtimeSpecGpuRemove: 'Entfernen',
   runtimeSpecEnvHint:
@@ -2379,6 +2383,10 @@ const en: PortalMessages = {
     "The agent measures its child process's actual VRAM, and that measurement normally replaces your estimate — including in the budget arithmetic that decides whether the model may start. Lock the estimate when a measurement is wrong, or when one above the GPU budget has left the spec refusing to start. The measurement is still recorded and shown, only no longer used.",
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecGpuIndex: 'GPU index',
+  runtimeSpecGpuPick: 'Reported GPU',
+  runtimeSpecGpuPickPlaceholder: 'Select a card …',
+  runtimeSpecGpuNoTelemetry:
+    'This server has not reported any GPUs yet — enter the GPU index by hand.',
   runtimeSpecGpuAdd: 'Add GPU',
   runtimeSpecGpuRemove: 'Remove',
   runtimeSpecEnvHint:
