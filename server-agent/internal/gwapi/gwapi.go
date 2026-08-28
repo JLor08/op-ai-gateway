@@ -22,6 +22,31 @@ import (
 // misbehaving or compromised gateway, not a realistic limit.
 const MaxResponseBytes = 1 << 20 // 1 MiB
 
+// MaxWSFrameBytes is the maximum size of ONE agent<->gateway WebSocket frame,
+// in either direction, and it is a CONTRACT WITH THE GATEWAY rather than a
+// local preference: the gateway installs exactly this number as its inbound
+// SetReadLimit (gateway/backend/internal/gateway/agent_stream.go's
+// maxAgentFrameBytes), and coder/websocket answers a frame one byte over it by
+// failing the read and closing 1009 -- which tears down the ONE connection
+// telemetry, the system and runtime reports, the runtime_config push and the
+// certificate doorbell all share. Producing an oversized frame is therefore not
+// a dropped message; it is an outage.
+//
+// It lives in this leaf package because it has to be visible to BOTH sides of
+// the agent's own split: internal/client installs it as its own read limit
+// (symmetry with the gateway's), and internal/runtime sizes its outbound
+// runtime_log frames against it (see maxLogBatchBytes there). That the number
+// used to exist as two independent literals with no stated relationship is
+// exactly how a full log-retention buffer came to marshal into a frame the
+// gateway could not read.
+//
+// The gateway is a separate Go module, so a compiler cannot hold the two ends
+// together. What holds them instead: this doc, the counterpart doc on
+// maxAgentFrameBytes, and a test on each side that pins the literal and names
+// the other (TestLogFrameFitsTheGatewayReadLimit here,
+// TestAgentFrameLimitMatchesTheAgentsOwnCap there).
+const MaxWSFrameBytes int64 = 1 << 20 // 1 MiB
+
 // TrimBase strips a trailing '/' from a configured gateway base URL. Every
 // site normalizes its base exactly once (here, or via NewEndpoint) so a later
 // path join by plain concatenation never produces a doubled slash.

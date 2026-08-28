@@ -32,7 +32,7 @@ func waitForLog(t *testing.T, m *Manager, specID string, what string, ok func(Lo
 	deadline := time.Now().Add(10 * time.Second)
 	var last LogBatch
 	for {
-		m.Logs().SetWatch([]string{specID})
+		m.Logs().SetWatch([]string{specID}, nil)
 		for _, b := range m.Logs().Drain() {
 			if b.SpecID != specID || !b.Scrollback {
 				continue
@@ -47,7 +47,7 @@ func waitForLog(t *testing.T, m *Manager, specID string, what string, ok func(Lo
 		}
 		// Drop the watch so the next round takes a fresh scrollback snapshot
 		// rather than only the (already consumed) live delta.
-		m.Logs().SetWatch(nil)
+		m.Logs().SetWatch(nil, nil)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -148,7 +148,7 @@ func TestManagerRetainsTheWHOLEOfACrashedProcessOutput(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	var best int
 	for {
-		m.Logs().SetWatch([]string{"spec-volume"})
+		m.Logs().SetWatch([]string{"spec-volume"}, nil)
 		for _, b := range m.Logs().Drain() {
 			if b.SpecID != "spec-volume" || !b.Scrollback {
 				continue
@@ -163,7 +163,7 @@ func TestManagerRetainsTheWHOLEOfACrashedProcessOutput(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("recoverable output after the crash = %d bytes, want the ~11000 the process printed", best)
 		}
-		m.Logs().SetWatch(nil)
+		m.Logs().SetWatch(nil, nil)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -249,7 +249,7 @@ func TestManagerLogRetentionFollowsSpecRemoval(t *testing.T) {
 	// The operator deletes the spec.
 	m.Apply(Config{ETag: "e2", MaxProcesses: 1, Specs: []Spec{}})
 
-	m.Logs().SetWatch([]string{"spec-gone"})
+	m.Logs().SetWatch([]string{"spec-gone"}, nil)
 	for _, b := range m.Logs().Drain() {
 		if b.SpecID == "spec-gone" && batchText(b) != "" {
 			t.Fatalf("a deleted spec kept its retained output: %q", batchText(b))
@@ -304,7 +304,7 @@ func waitForCommand(t *testing.T, m *Manager, specID, what string, ok func(LogEn
 	deadline := time.Now().Add(10 * time.Second)
 	var last LogEntry
 	for {
-		m.Logs().SetWatch([]string{specID})
+		m.Logs().SetWatch([]string{specID}, nil)
 		for _, b := range m.Logs().Drain() {
 			if b.SpecID != specID || !b.Scrollback {
 				continue
@@ -323,7 +323,7 @@ func waitForCommand(t *testing.T, m *Manager, specID, what string, ok func(LogEn
 		if time.Now().After(deadline) {
 			t.Fatalf("spec %q never reported a command satisfying %s; last: %+v", specID, what, last)
 		}
-		m.Logs().SetWatch(nil)
+		m.Logs().SetWatch(nil, nil)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -412,7 +412,7 @@ func TestManagerReportsEachGenerationsOwnCommand(t *testing.T) {
 	var batch LogBatch
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		m.Logs().SetWatch([]string{"spec-loop"})
+		m.Logs().SetWatch([]string{"spec-loop"}, nil)
 		for _, b := range m.Logs().Drain() {
 			if b.SpecID != "spec-loop" || !b.Scrollback {
 				continue
@@ -427,7 +427,7 @@ func TestManagerReportsEachGenerationsOwnCommand(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the crash loop never produced two generations in one snapshot")
 		}
-		m.Logs().SetWatch(nil)
+		m.Logs().SetWatch(nil, nil)
 		time.Sleep(20 * time.Millisecond)
 	}
 

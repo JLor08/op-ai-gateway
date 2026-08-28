@@ -93,7 +93,7 @@ func TestLogCollectionIsUnconditionalButStreamingIsNot(t *testing.T) {
 
 	// Now someone watches: the history captured while nobody was looking is
 	// exactly what they must receive first.
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("first drain after subscribe = %+v, want one scrollback batch", batches)
@@ -115,7 +115,7 @@ func TestLogRetentionSurvivesTheProcess(t *testing.T) {
 	// The generation is over and its procLog is gone as far as the manager is
 	// concerned. Subscribing now must still find the output.
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 {
 		t.Fatalf("drain = %d batches, want 1", len(batches))
@@ -142,7 +142,7 @@ func TestLogGenerationsAppendWithBoundaryMarkers(t *testing.T) {
 	second.Started(202, ResolvedCommand{})
 	second.Write([]byte("attempt two\n"))
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 {
 		t.Fatalf("drain = %d batches, want 1", len(batches))
@@ -185,27 +185,39 @@ func TestLogGenerationsAppendWithBoundaryMarkers(t *testing.T) {
 // TestLogScrollbackThenLive is the end-to-end shape a subscriber sees: the
 // retained history exactly once, then everything written afterwards, with
 // nothing duplicated across the boundary.
+//
+// One FRAME per spec per interval, so the live tail arrives on the drain after
+// the replay finishes rather than beside it -- a spec's live output waits behind
+// its own history, which is what keeps a chunked replay from being torn by it.
+//
+// The history is snapshotted at the first DRAIN after the subscribe, not at the
+// subscribe itself, so it also contains whatever was written in between: the cut
+// of the live queue happens in the same locked step, so those bytes appear
+// exactly once. "Nothing duplicated across the boundary" is the property; "the
+// boundary is the subscribe instant" was only ever how it was implemented.
 func TestLogScrollbackThenLive(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
 	p.Started(1, ResolvedCommand{})
 	p.Write([]byte("before-subscribe\n"))
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	p.Write([]byte("after-subscribe\n"))
 
-	batches := s.Drain()
-	if len(batches) != 2 {
-		t.Fatalf("drain = %d batches, want 2 (scrollback then live)", len(batches))
+	first := s.Drain()
+	if len(first) != 1 || !first[0].Scrollback || first[0].More {
+		t.Fatalf("first drain = %+v, want one complete scrollback batch", first)
 	}
-	if !batches[0].Scrollback || batches[1].Scrollback {
-		t.Fatalf("scrollback flags = %v/%v, want true then false", batches[0].Scrollback, batches[1].Scrollback)
+	if text := batchText(first[0]); text != "before-subscribe\nafter-subscribe\n" {
+		t.Fatalf("scrollback = %q, want everything retained at snapshot time, once", text)
 	}
-	if text := batchText(batches[0]); !strings.Contains(text, "before-subscribe") || strings.Contains(text, "after-subscribe") {
-		t.Fatalf("scrollback = %q, want only what existed at subscribe time", text)
+	if batches := s.Drain(); len(batches) != 0 {
+		t.Fatalf("second drain = %+v, want nothing: the history already carried it", batches)
 	}
-	if text := batchText(batches[1]); text != "after-subscribe\n" {
-		t.Fatalf("live batch = %q, want exactly the post-subscribe write (no duplication of the history)", text)
+	p.Write([]byte("live\n"))
+	third := s.Drain()
+	if len(third) != 1 || third[0].Scrollback || batchText(third[0]) != "live\n" {
+		t.Fatalf("third drain = %+v, want exactly the post-snapshot write", third)
 	}
 }
 
@@ -216,7 +228,7 @@ func TestLogStdoutAndStderrShareOneStream(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
 	p.Started(1, ResolvedCommand{})
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 
 	// os/exec assigns the SAME writer to Stdout and Stderr (startProcess), so
 	// this is literally what the two copy goroutines do.
@@ -242,7 +254,7 @@ func TestLogStdoutAndStderrShareOneStream(t *testing.T) {
 // empty-window lie the feature negotiation exists to prevent.
 func TestLogEmptyScrollbackIsStillDelivered(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
-	s.SetWatch([]string{"never-ran"})
+	s.SetWatch([]string{"never-ran"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 {
 		t.Fatalf("drain = %+v, want exactly one (empty) scrollback batch", batches)
@@ -271,7 +283,7 @@ func TestLogEvictionReportsDroppedBytes(t *testing.T) {
 	}
 	p.Write([]byte("TAIL-MARKER"))
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 {
 		t.Fatalf("drain = %d batches, want 1", len(batches))
@@ -303,7 +315,7 @@ func TestLogPendingOverflowReportsDroppedBytes(t *testing.T) {
 	s := newTestLogStore(t, 1<<20, 1<<20)
 	p := s.newProc("spec-a")
 	p.Started(1, ResolvedCommand{})
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	s.Drain() // consume the (empty) scrollback
 
 	chunk := strings.Repeat("b", 32<<10)
@@ -348,7 +360,7 @@ func TestLogTotalCeilingEvictsSpecBuffers(t *testing.T) {
 	third.Started(1, ResolvedCommand{})
 	third.Write([]byte("new-output"))
 
-	s.SetWatch([]string{"old", "mid", "new"})
+	s.SetWatch([]string{"old", "mid", "new"}, nil)
 	batches := s.Drain()
 	got := map[string]string{}
 	for _, b := range batches {
@@ -376,7 +388,7 @@ func TestLogRetainDropsRemovedSpecs(t *testing.T) {
 	}
 	s.Retain([]string{"keep"})
 
-	s.SetWatch([]string{"keep", "drop"})
+	s.SetWatch([]string{"keep", "drop"}, nil)
 	got := map[string]string{}
 	for _, b := range s.Drain() {
 		got[b.SpecID] = batchText(b)
@@ -395,10 +407,10 @@ func TestLogUnwatchStopsQueueing(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
 	p := s.newProc("spec-a")
 	p.Started(1, ResolvedCommand{})
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	p.Write([]byte("watched\n"))
 
-	s.SetWatch(nil) // the last viewer closed the log view
+	s.SetWatch(nil, nil) // the last viewer closed the log view
 	p.Write([]byte("unwatched\n"))
 
 	if got := s.Drain(); got != nil {
@@ -408,7 +420,7 @@ func TestLogUnwatchStopsQueueing(t *testing.T) {
 		t.Fatalf("Watching() = %v, want empty", w)
 	}
 	// Re-subscribing replays from the retention buffer, which kept both.
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("re-subscribe = %+v, want a fresh scrollback", batches)
@@ -423,11 +435,11 @@ func TestLogUnwatchStopsQueueing(t *testing.T) {
 // old one streaming.
 func TestLogWatchIsFullSetNotDelta(t *testing.T) {
 	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes*4)
-	s.SetWatch([]string{"a", "b"})
+	s.SetWatch([]string{"a", "b"}, nil)
 	if got := s.Watching(); len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Fatalf("Watching() = %v, want [a b]", got)
 	}
-	s.SetWatch([]string{"b", "c"})
+	s.SetWatch([]string{"b", "c"}, nil)
 	if got := s.Watching(); len(got) != 2 || got[0] != "b" || got[1] != "c" {
 		t.Fatalf("Watching() = %v, want [b c] -- the set is replaced, never merged", got)
 	}
@@ -455,7 +467,7 @@ func TestLogDrainBudgetIsFairAcrossSpecs(t *testing.T) {
 		p.Started(1, ResolvedCommand{})
 		procs[id] = p
 	}
-	s.SetWatch(ids)
+	s.SetWatch(ids, nil)
 	s.Drain() // consume the empty scrollbacks
 
 	// Three specs each queue more than a third of the per-drain budget, so no
@@ -543,9 +555,9 @@ func TestLogConcurrentWritersAreRaceSafe(t *testing.T) {
 		defer producers.Done()
 		for i := range 200 {
 			if i%2 == 0 {
-				s.SetWatch([]string{"spec-a", "spec-c"})
+				s.SetWatch([]string{"spec-a", "spec-c"}, nil)
 			} else {
-				s.SetWatch(nil)
+				s.SetWatch(nil, nil)
 			}
 		}
 	}()
@@ -572,12 +584,12 @@ func TestLogConcurrentWritersAreRaceSafe(t *testing.T) {
 // it to still has to be reported. Swallowing it would turn a gap back into
 // silence in the one case where there is nothing else to see.
 func TestLogEntriesFromReportsALossWithNoRecords(t *testing.T) {
-	entries := entriesFrom(nil, 512)
-	if len(entries) != 1 || entries[0].DroppedBytes != 512 || entries[0].Text != "" {
-		t.Fatalf("entriesFrom(nil, 512) = %+v, want one entry carrying only the loss", entries)
+	entries, rest, _ := takeChunk("spec-a", nil, 512, maxLogBatchBytes)
+	if len(entries) != 1 || entries[0].DroppedBytes != 512 || entries[0].Text != "" || rest != nil {
+		t.Fatalf("takeChunk(nil, 512) = %+v, %+v, want one entry carrying only the loss", entries, rest)
 	}
-	if got := entriesFrom(nil, 0); len(got) != 0 {
-		t.Fatalf("entriesFrom(nil, 0) = %+v, want no entries", got)
+	if got, rest, _ := takeChunk("spec-a", nil, 0, maxLogBatchBytes); len(got) != 0 || rest != nil {
+		t.Fatalf("takeChunk(nil, 0) = %+v, %+v, want no entries", got, rest)
 	}
 }
 
@@ -585,7 +597,7 @@ func TestLogEntriesFromReportsALossWithNoRecords(t *testing.T) {
 // the nil-safety discipline this module applies to every registry-shaped type.
 func TestLogNilStoreIsSafe(t *testing.T) {
 	var s *LogStore
-	s.SetWatch([]string{"a"})
+	s.SetWatch([]string{"a"}, nil)
 	s.Retain([]string{"a"})
 	if got := s.Drain(); got != nil {
 		t.Errorf("nil Drain = %+v", got)
@@ -642,7 +654,7 @@ func TestLogCommandRidesTheStartedMarker(t *testing.T) {
 	p.Started(4711, testCommand("/opt/llama/llama-server", "54331"))
 	p.Write([]byte("loading weights\n"))
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("drain = %+v, want one scrollback batch", batches)
@@ -690,7 +702,7 @@ func TestLogCommandTravelsWithEachGenerationsOwnMarker(t *testing.T) {
 		}
 	}
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("drain = %+v, want one scrollback batch", batches)
@@ -726,7 +738,7 @@ func TestLogStartFailedMarkerCarriesTheCommandAndNoPID(t *testing.T) {
 	p := s.newProc("spec-a")
 	p.StartFailed(testCommand("/opt/does-not-exist", "54331"))
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("drain = %+v, want one scrollback batch", batches)
@@ -765,7 +777,7 @@ func TestLogCommandIsEvictedWithItsMarker(t *testing.T) {
 		p.Write([]byte(line))
 	}
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 || !batches[0].Scrollback {
 		t.Fatalf("drain = %+v, want one scrollback batch", batches)
@@ -820,7 +832,7 @@ func TestLogCommandIsReleasedWithTheSpec(t *testing.T) {
 
 	s.Retain([]string{"other-spec"})
 
-	s.SetWatch([]string{"spec-a"})
+	s.SetWatch([]string{"spec-a"}, nil)
 	batches := s.Drain()
 	if len(batches) != 1 {
 		t.Fatalf("drain = %+v, want the (now empty) scrollback", batches)

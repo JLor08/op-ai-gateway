@@ -201,11 +201,21 @@ const maxWatchedSpecs = 64
 //
 // This is the whole gateway->agent command surface for logs, and it is
 // deliberately a list of identifiers the gateway ITSELF supplied in the
-// runtime-config document: there is no path, no pattern, and no filter here,
-// so the frame cannot express anything the agent was not already going to do
-// (the same boundary certUpdateFrame's doc draws on the gateway side).
+// runtime-config document, plus a counter per identifier: there is no path, no
+// pattern, and no filter here, so the frame cannot express anything the agent
+// was not already going to do (the same boundary certUpdateFrame's doc draws on
+// the gateway side).
+//
+// Epochs carries the snapshot epoch of each spec in SpecIDs. A value that
+// differs from the one the agent last snapshotted that spec for means "a viewer
+// has arrived; replay the history again even though you are already watching
+// it" -- see LogStore.SetWatch for why a watch-set TRANSITION is the wrong
+// thing to key a replay to, and why the epoch keeps every frame idempotent
+// anyway (re-sending the same one changes nothing). Absent or zero, as an older
+// gateway sends, degrades to the previous behaviour exactly.
 type LogWatchCommand struct {
-	SpecIDs []string `json:"spec_ids"`
+	SpecIDs []string          `json:"spec_ids"`
+	Epochs  map[string]uint64 `json:"epochs,omitempty"`
 }
 
 // SetLogWatch applies a gateway runtime_log_config frame. A nil/empty payload,
@@ -234,7 +244,7 @@ func (d *Driver) SetLogWatch(raw json.RawMessage) {
 			"asked", len(cmd.SpecIDs), "limit", maxWatchedSpecs)
 		cmd.SpecIDs = cmd.SpecIDs[:maxWatchedSpecs]
 	}
-	d.logs.SetWatch(cmd.SpecIDs)
+	d.logs.SetWatch(cmd.SpecIDs, cmd.Epochs)
 }
 
 // DrainLogFrames returns the managed-process output queued since the last

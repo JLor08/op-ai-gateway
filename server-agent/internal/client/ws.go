@@ -27,8 +27,12 @@ import (
 // streamPath is the gateway WebSocket route (mirrors telemetryPath for the POST path).
 const streamPath = "/api/agent/v1/stream"
 
-// wsMaxFrameBytes caps a single frame (symmetry with the gateway's read limit).
-const wsMaxFrameBytes int64 = 1 << 20
+// wsMaxFrameBytes caps a single frame. Not "symmetry with the gateway's read
+// limit" as a matter of taste -- it IS the gateway's read limit, held in one
+// place for the whole agent module (gwapi.MaxWSFrameBytes), because the frames
+// this file writes have to fit through it and internal/runtime has to size them
+// against it.
+const wsMaxFrameBytes = gwapi.MaxWSFrameBytes
 
 // streamFrame mirrors the gateway's typed WebSocket envelope
 // ({"type":"telemetry","data":{…}}); Data is the marshaled sample.
@@ -435,10 +439,22 @@ func (s *WSSender) PostRuntimeReport(ctx context.Context, raw json.RawMessage) e
 // -- the agent instead delivers a fresh scrollback when the gateway re-asks
 // for the spec, which is the one authoritative replay.
 //
-// Called from the SAME goroutine as Post/PostSystemReport/PostRuntimeReport
-// (internal/agent's run loop). That is not incidental: this transport has
-// exactly one writer per connection, and a second goroutine calling
-// wsjson.Write here would race the frames that loop writes.
+// Called from internal/agent's run loop, the same goroutine as Post and
+// PostSystemReport. That is not incidental: the frames this transport writes are
+// meant to come from one goroutine, and this one always does.
+//
+// The BROADER claim that used to sit here -- "this transport has exactly one
+// writer per connection" -- was false, and worth correcting rather than
+// deleting, because a reader relied on it. With transport=websocket AND
+// runtime_source=file (a supported pairing: main.go installs the WSSender as the
+// RuntimeReporter regardless of source), Driver.Sync's file-mode branch calls
+// PostRuntimeReport from the goroutine triggerRuntimeSync spawns, so a second
+// goroutine does write to this connection. coder/websocket serializes frames
+// internally, so nothing is interleaved or corrupted -- but the two writers do
+// contend for that internal lock, and a write that waits out its writeTimeout on
+// it fails and calls dropConn, tearing down a healthy connection. The fix is to
+// move the file-mode report onto the run loop the way resendRuntimeReport
+// already is; it is a behaviour change and is deliberately not made here.
 func (s *WSSender) PostRuntimeLog(ctx context.Context, raw json.RawMessage) error {
 	if len(raw) == 0 {
 		return nil
