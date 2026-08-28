@@ -131,6 +131,7 @@ export function ApplicationSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    | 'subscribeRuntimeLogs'
     // Task 21 (matrix + server limits): forwarded the same way.
     | 'updateServer'
     | 'serverHardware'

@@ -101,6 +101,65 @@ export interface RuntimeStatus {
   last_error?: RuntimeError;
 }
 
+// One unit of a managed model process's output on the live log stream
+// (GET .../runtime/logs?spec_id=…). Mirrors RuntimeLogEntryDTO
+// (gateway/backend/internal/gateway/runtime_logs.go), which in turn mirrors the
+// agent's own runtime.LogEntry.
+//
+// Exactly one of `text` and `event` is meaningful per entry:
+//
+//  - `text` is verbatim process output (stdout and stderr interleaved as the
+//    process produced them). NEVER render it as HTML.
+//  - `event` is a structural boundary between two runs of the same spec, from
+//    a CLOSED set the backend allow-lists: 'started' (with `pid`) and
+//    'exited' (with `exit_code`). The portal owns the wording, which is why the
+//    set is closed -- an agent must not be able to put free text where the
+//    operator reads a portal-authored sentence.
+//
+// `dropped_bytes` is the overflow marker: N bytes the process printed are
+// missing immediately BEFORE this entry. It is produced wherever output can be
+// lost (the agent's retention buffer, the agent's send queue, the gateway's
+// per-subscriber queue) and deliberately does not say which -- the reader only
+// needs to know the gap is there. It must always be rendered: a gap shown as
+// silence is a lie about what the process printed, and silence is what the
+// operator is trying to interpret.
+export interface RuntimeLogEntry {
+  pid?: number;
+  at?: string;
+  text?: string;
+  dropped_bytes?: number;
+  event?: string;
+  exit_code?: number;
+}
+
+// One `log` SSE frame: the entries an agent flushed for one spec.
+//
+// `scrollback: true` marks the one-shot replay of the agent's retained history
+// that a subscribe produces. The view must RESET on it, not append: an agent
+// reconnect delivers a fresh scrollback, and appending would duplicate the
+// history. An EMPTY scrollback is itself an answer -- "the agent's buffer holds
+// nothing", which is what an agent restart leaves behind -- and must be
+// rendered as such rather than looking like "nothing has arrived yet".
+export interface RuntimeLogBatch {
+  spec_id: string;
+  scrollback?: boolean;
+  entries: RuntimeLogEntry[];
+}
+
+// Whether a live log stream is possible for this server right now, from the
+// `status` SSE frame. Three states because an empty log window has three
+// causes needing three different things from the operator:
+//
+//  - 'streaming'   the agent is connected and understands the request, so
+//                  silence from here on genuinely means the process is quiet;
+//  - 'unsupported' the agent is connected but does not declare the
+//                  runtime_logs feature -- an older binary that will never
+//                  answer. Tell the operator to update it;
+//  - 'offline'     no live agent connection at all, so there is nothing to ask
+//                  over. Also the permanent state of an agent configured with
+//                  the POST transport, which has no gateway->agent direction.
+export type RuntimeLogState = 'streaming' | 'unsupported' | 'offline';
+
 // The parsed content of a file-mode agent's runtime report, nested under
 // RuntimeReport.report (see below) -- mirrors the agent's upward
 // `agentRuntimeReport` wire struct (gateway/backend/internal/gateway/
@@ -220,6 +279,53 @@ export function runtimeApi(fetcher: Fetcher) {
       return subscribeSSE(
         `/api/portal/servers/${encodeURIComponent(serverId)}/runtime/events`,
         { snapshot: handle, update: handle },
+        { onOpen: () => onStatus?.('open'), onError: () => onStatus?.('error') },
+      );
+    },
+    // Subscribe to ONE managed process's live stdout+stderr. The stream sends
+    // a `status` frame first (can this even work -- see RuntimeLogState), then
+    // a `log` frame per agent flush: the agent's retained scrollback, then live
+    // output.
+    //
+    // Opening this subscription is what MAKES the agent stream: the gateway
+    // asks it to start on the first viewer and to stop when the last one
+    // leaves. So the returned unsubscribe is not merely cleanup -- calling it
+    // is what turns the stream back off, and failing to call it leaves an agent
+    // producing output nobody is reading.
+    //
+    // Mirrors subscribeRuntimeStatus (withCredentials, named-event listeners,
+    // exp-backoff reconnect, idempotent unsubscribe); a malformed frame is
+    // swallowed.
+    subscribeRuntimeLogs: (
+      serverId: string,
+      specId: string,
+      onBatch: (batch: RuntimeLogBatch) => void,
+      onState: (state: RuntimeLogState) => void,
+      onStatus?: (status: 'open' | 'error') => void,
+    ): (() => void) => {
+      return subscribeSSE(
+        `/api/portal/servers/${encodeURIComponent(serverId)}/runtime/logs?spec_id=${encodeURIComponent(specId)}`,
+        {
+          status: (e: MessageEvent) => {
+            try {
+              const parsed = JSON.parse(e.data) as { state?: RuntimeLogState };
+              if (parsed.state) onState(parsed.state);
+            } catch {
+              // ignore a malformed frame
+            }
+          },
+          log: (e: MessageEvent) => {
+            try {
+              const parsed = JSON.parse(e.data) as RuntimeLogBatch;
+              // `entries` is non-nil on the wire, but a frame that lost it is
+              // still usable as a scrollback RESET signal -- which is the one
+              // thing the view must not miss.
+              onBatch({ ...parsed, entries: parsed.entries ?? [] });
+            } catch {
+              // ignore a malformed frame
+            }
+          },
+        },
         { onOpen: () => onStatus?.('open'), onError: () => onStatus?.('error') },
       );
     },

@@ -65,6 +65,8 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
 | `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. |
+| `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | — (file/env only) | `runtime_log_buffer_bytes` | `1048576` (1 MiB) | How much of each managed model process's stdout+stderr the agent keeps **in memory**, in bytes, so an operator can read it after the fact. The buffer belongs to the **spec**, not the process, so a crashed model's output survives it, and a restart appends after a visible boundary marker rather than wiping the history. Below `65536` is raised to it. Operator-only, like the allowlists: memory on this host is the operator's tradeoff and the gateway can never raise it. **Never written to disk** — this content can include prompt text. |
+| `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | — (file/env only) | `runtime_log_buffer_total_bytes` | `16777216` (16 MiB) | Ceiling on the **sum** of those buffers across every spec, so a server with twenty specs is not twenty times the per-spec number. The agent keeps at most `total / per-spec` buffers, evicting the least-recently-written one nobody is watching. This is the number to reason about when sizing the agent's memory. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
 
 ### Config file
@@ -123,6 +125,8 @@ its **empty** value — means. A checked-in copy of it lives at
   "runtime_allowed_binaries": ["/usr/local/bin/llama-server"],
   "runtime_allowed_dirs": ["/srv/models"],
   "runtime_router_bind": "",
+  "runtime_log_buffer_bytes": 0,
+  "runtime_log_buffer_total_bytes": 0,
   "tls_insecure": false
 }
 ```
@@ -177,6 +181,38 @@ from this local config — never from the gateway:
 `runtime_allowed_dirs` additionally restricts a spec's `work_dir`; it is
 convenience/defence-in-depth, not a boundary (containment is a lexical
 path-prefix check and does not resolve symlinks).
+
+#### Managed-process logs
+
+Every managed process's **stdout and stderr** are captured continuously,
+whether or not anyone is watching — the point is that an operator arrives
+*after* the incident. The buffer belongs to the **spec**, not to the process,
+so it survives a crash: opening the log view on a row that says `crashed`
+shows the output that led to the crash, not an empty window. Restarts
+**append** after a boundary marker carrying the exit code and the new pid, so
+a crash loop reads as a sequence of attempts, which is usually the diagnosis.
+
+Sizing is yours: `runtime_log_buffer_bytes` per spec (default 1 MiB) and
+`runtime_log_buffer_total_bytes` across all of them (default 16 MiB, i.e.
+sixteen retained specs; the least-recently-written unwatched buffer is dropped
+to stay inside it).
+
+**Streaming is on demand.** The gateway asks this agent to stream a spec only
+while a portal log view is open on it, and stops when the last viewer leaves,
+so a fleet nobody is looking at sends no log traffic at all. That direction
+needs the WebSocket transport: under `transport: "post"` there is no
+gateway→agent channel, so nothing can ask, and the portal says so instead of
+showing an empty view.
+
+**Nothing is persisted, anywhere.** Captured output can contain prompt text,
+so it is held in memory, bounded, and never written to disk, never stored in
+the gateway's database, and never put into a log line on either side. It is
+also why retention does not survive an **agent restart** — the portal shows an
+explicit "the agent's buffer is empty" rather than letting that read as "the
+process printed nothing".
+
+Output the buffer had to drop is never a silent gap: the stream carries an
+explicit count of the missing bytes at the point they were lost.
 
 #### Placeholders in `args` and `env` values
 

@@ -208,6 +208,7 @@ export function ServerList({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    | 'subscribeRuntimeLogs'
     | 'serverAdminGroupCandidates'
     | 'serverAvailability'
     | 'serverHardware'

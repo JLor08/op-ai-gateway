@@ -100,6 +100,21 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	defer s.AgentStreams.remove(serverID, sc)
 	go sc.runWriter(done)
 
+	// Restate which specs' output this agent should be streaming, on EVERY
+	// new connection and unconditionally -- including the empty set, which is
+	// the common case and is not a no-op here. Two things depend on it:
+	//
+	//   - an operator whose log view was open across an agent restart or a
+	//     reconnect gets the stream back (with a fresh scrollback) without
+	//     having to close and reopen it;
+	//   - an agent that was streaming before the drop, but whose viewers have
+	//     since gone, is told to stop, so a lost unsubscribe can never leave
+	//     it streaming to nobody for the rest of its uptime.
+	//
+	// This is also why the agent needs no connect-time reset of its own: what
+	// the gateway says on a connection is authoritative for that connection.
+	s.AgentStreams.NotifyRuntimeLogWatch(serverID, s.RuntimeLogs.watched(serverID))
+
 	slog.Debug("agent stream opened", "server_id", serverID)
 	// 5. Read loop. A background context (not s.baseCtx) so a shutdown cancel does not
 	// abruptly tear the connection down before the watcher's GoingAway frame is sent.
@@ -165,6 +180,14 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+		case "runtime_log":
+			// Relay only: parsed, clamped, fanned out to whoever is watching,
+			// and forgotten. NOTHING on this path touches the store, and no
+			// branch of it logs the payload or any fragment of it -- managed
+			// process output can contain prompt text (see runtime_logs.go).
+			// A malformed frame is skipped silently for the same reason a
+			// malformed telemetry frame is: latest-wins, keep streaming.
+			s.ingestRuntimeLog(serverID, f.Data)
 		default:
 			// Unknown frame type: ignore for forward-compat.
 			slog.Debug("agent stream: unknown frame type", "server_id", serverID, "type", f.Type)

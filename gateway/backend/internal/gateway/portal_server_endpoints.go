@@ -102,6 +102,10 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 			s.handleRuntimeReportView(w, r, token, parts[0])
 			return
 		}
+		if len(parts) == 3 && parts[2] == "logs" {
+			s.handleRuntimeLogEvents(w, r, token, parts[0])
+			return
+		}
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServerNotFound, msgServerNotFound, ""))
 		return
 	}

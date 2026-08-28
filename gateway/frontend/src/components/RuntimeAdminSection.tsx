@@ -23,6 +23,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
+import ArticleIcon from '@mui/icons-material/Article';
 import type {
   ApplicationStatus,
   GPUBudget,
@@ -52,6 +53,7 @@ import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
+import { RuntimeLogView } from './RuntimeLogView';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (this task, Task 21) are the
 // co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
@@ -890,6 +892,8 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // T3: the live-status tab's per-row log view.
+    | 'subscribeRuntimeLogs'
     // Task 21 (matrix + server limits): the process-limit field is saved
     // through the general server PATCH, and a new budget row is prefilled
     // from the same live-telemetry hardware report the Hardware tab reads.
@@ -1622,6 +1626,12 @@ export function RuntimeAdminSection({
     return mappingForStatus(row)?.gateway_model_name ?? '';
   }
 
+  // The spec whose managed-process output is being watched, or null. Opening
+  // this is what MAKES the agent stream that spec (the gateway asks on the
+  // first viewer and stops on the last), so it is deliberately per-row state
+  // that clears on close rather than a mounted-but-hidden panel: a hidden
+  // panel would keep an agent streaming output nobody is reading.
+  const [logSpec, setLogSpec] = useState<{ specId: string; title: string } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
   const [restartNotice, setRestartNotice] = useState<
@@ -1661,6 +1671,11 @@ export function RuntimeAdminSection({
     setRestart(null);
     setRestartNotice(null);
     absentSinceRef.current = null;
+    // ...and closes any open log view, which additionally tells the previous
+    // server's agent to stop streaming. A spec id is server-scoped, so leaving
+    // it open would at best show nothing and at worst keep the old server's
+    // agent producing output for a view that has moved on.
+    setLogSpec(null);
   }, [server.id]);
 
   // Bounds the wait. The cleanup clears the timer whenever `restart` changes,
@@ -2461,8 +2476,9 @@ export function RuntimeAdminSection({
       // write, so no live deployment can be in that state.
       //
       // On such a server most rows land here, and since they get no override
-      // actions either, the row SAYS so rather than showing a blank actions
-      // cell.
+      // actions either (T3's log view is the one action such a row still
+      // offers -- reading output is not a write), the row SAYS so rather than
+      // leaving the operator to infer it from a nearly empty actions cell.
       //
       // Search/sort key carries every name a searching operator might type.
       value: (row) => [gatewayNameFor(row), row.model, row.spec_id].filter(Boolean).join(' '),
@@ -2579,18 +2595,35 @@ export function RuntimeAdminSection({
   ];
 
   function statusActions(row: RuntimeStatus): RowAction[] {
+    // The log view comes FIRST, and before every gate below it, deliberately.
+    // Reading what a process printed is not a write, so it is available in
+    // file mode, before the report GET settles, and on a row this application
+    // cannot resolve to one of its own mappings -- all three of which are
+    // states an operator can be stuck in with no other way to find out what is
+    // happening. It is also exactly the row a `crashed` state sends them to.
+    const actions: RowAction[] = [
+      {
+        key: 'logs',
+        label: t.runtimeLogs,
+        icon: <ArticleIcon fontSize="small" />,
+        onClick: () =>
+          setLogSpec({
+            specId: row.spec_id,
+            title: gatewayNameFor(row) || row.model || row.spec_id,
+          }),
+      },
+    ];
     // File mode has no admin override at all (the override lives in the
     // gateway document, which a file-mode agent never consumes -- spec §10.2:
     // "a dead button is worse than none"), and before the report GET settles
     // we do not yet know which mode this is.
-    if (!writesAllowed) return [];
+    if (!writesAllowed) return actions;
     const spec = specByRuntimeId.get(row.spec_id);
     // No loaded spec for this spec_id (a spec created after the list loaded, a
     // spec belonging to another application, a file-mode leftover): render NO
     // buttons rather than synthesizing a full-document body that would
     // overwrite the operator's command line.
-    if (spec === undefined) return [];
-    const actions: RowAction[] = [];
+    if (spec === undefined) return actions;
     if (spec.admin_state !== 'force_running') {
       actions.push({
         key: 'force-start',
@@ -3526,6 +3559,20 @@ export function RuntimeAdminSection({
         onConfirm={() => void confirmDelete()}
         onCancel={() => setConfirmingDeleteId('')}
       />
+
+      {/* Mounted only while a row's log view is open: mounting it means
+          subscribing, and subscribing is what makes the agent stream. */}
+      {logSpec !== null && (
+        <RuntimeLogView
+          open
+          onClose={() => setLogSpec(null)}
+          api={api}
+          t={t}
+          serverId={server.id}
+          specId={logSpec.specId}
+          title={logSpec.title}
+        />
+      )}
     </>
   );
 }

@@ -150,8 +150,18 @@ func main() {
 	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
 	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
-	mgr := runtimectl.NewManager(runtimectl.ManagerOptions{Policy: localPolicy, Getenv: os.Getenv})
+	mgr := runtimectl.NewManager(runtimectl.ManagerOptions{
+		Policy: localPolicy,
+		Getenv: os.Getenv,
+		// Managed-process output retention (T3). Operator-owned, exactly
+		// like the allowlists above: how much of this host's memory goes to
+		// remembering what the models printed is the operator's call, and
+		// the gateway can never raise it. Zero means the documented default.
+		LogBufferBytes:      cfg.RuntimeLogBufferBytes,
+		LogBufferTotalBytes: cfg.RuntimeLogBufferTotalBytes,
+	})
 	defer mgr.Close()
+	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
 	// nvidia-smi is a HARDWARE capability, not a negotiated feature (design
 	// spec §5): NewNvidiaComputeApps returns nil on hosts without it (AMD,
 	// Apple unified memory, no GPU at all), and SetMeasurer(nil) is exactly
@@ -231,7 +241,12 @@ func main() {
 		"runtime_cache_path", cfg.RuntimeCachePath,
 		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
 		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
-		"runtime_router_bind_host", runtimeBindHost)
+		"runtime_router_bind_host", runtimeBindHost,
+		// The RESOLVED capacities, not the configured ones: NewLogStore
+		// clamps a too-small or absent value, and an operator who set one
+		// needs to see what it actually became rather than what they typed.
+		"runtime_log_buffer_bytes", logBufferPerSpec,
+		"runtime_log_buffer_total_bytes", logBufferTotal)
 
 	if err := a.Run(ctx); err != nil {
 		slog.Error("server-agent run failed", "err", err)

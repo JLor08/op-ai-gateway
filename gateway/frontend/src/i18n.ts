@@ -645,6 +645,28 @@ const de = {
     'Teile der gemeldeten Konfiguration haben ein unbekanntes Format und werden nicht angezeigt.',
   runtimeFeatureMismatch:
     'Für diesen Server sind Runtime-Spezifikationen konfiguriert, aber der Agent meldet die Funktion „runtime_manager“ nicht. Die Spezifikationen bleiben wirkungslos, bis der Agent aktualisiert wird.',
+  // T3, Live-Protokoll eines verwalteten Modellprozesses. Jede Meldung sagt,
+  // WARUM das Fenster leer ist -- ein unerklaert leeres Fenster ist von „dieses
+  // Modell gibt nichts aus“ nicht zu unterscheiden, und genau das ist die
+  // Frage, die der Betreiber hier beantworten will.
+  runtimeLogs: 'Protokoll',
+  runtimeLogsTitle: 'Prozessausgabe',
+  runtimeLogsIntro:
+    'Standardausgabe und Standardfehlerausgabe dieses Modellprozesses, so wie er sie geschrieben hat. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
+  runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
+  runtimeLogsEmptyBuffer:
+    'Der Agent hat für diesen Prozess nichts vorgehalten. Das ist keine Aussage darüber, ob der Prozess etwas ausgegeben hat: Der Puffer liegt ausschließlich im Arbeitsspeicher des Agenten und geht bei einem Neustart des Agenten verloren.',
+  runtimeLogsUnsupported:
+    'Der Agent dieses Servers meldet die Funktion „runtime_logs“ nicht. Er wird die Anfrage nie beantworten — dieses Fenster bliebe dauerhaft leer. Den Agenten aktualisieren.',
+  runtimeLogsOffline:
+    'Zu diesem Server besteht derzeit keine Live-Verbindung, über die eine Übertragung angefordert werden könnte. Mögliche Gründe: Der Agent läuft nicht, er ist nicht erreichbar, oder er ist auf die Übertragungsart „post“ eingestellt — die hat keine Gegenrichtung vom Gateway zum Agenten.',
+  runtimeLogsDisconnected:
+    'Die Verbindung zum Datenstrom wurde unterbrochen. Es wird erneut verbunden; danach wird der vorgehaltene Verlauf neu geladen.',
+  runtimeLogsProcessStarted: (pid: number) => `Prozess gestartet (PID ${pid})`,
+  runtimeLogsProcessExited: (code: number) => `Prozess beendet (Exit-Code ${code})`,
+  runtimeLogsDropped: (bytes: number) => `[${bytes} Byte Ausgabe fehlen hier]`,
+  runtimeLogsTrimmed: (bytes: number) =>
+    `Ältere Ausgabe wird in dieser Ansicht nicht mehr angezeigt (${bytes} Byte). Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf wieder vollständig zu laden.`,
   runtimeAgentVersion: 'Agent-Version',
   runtimeAgentFeatures: 'Gemeldete Funktionen',
   runtimeReportCollectedAt: 'Gemeldet am',
@@ -2499,6 +2521,27 @@ const en: PortalMessages = {
     'Parts of the reported configuration have an unrecognised shape and are not shown.',
   runtimeFeatureMismatch:
     'This server has runtime specs configured, but the agent does not declare the "runtime_manager" feature. The specs stay ineffective until the agent is updated.',
+  // T3, live managed-process output. Every message says WHY the window is
+  // empty -- an unexplained empty window is indistinguishable from "this model
+  // prints nothing", which is the question the operator opened it to answer.
+  runtimeLogs: 'Logs',
+  runtimeLogsTitle: 'Process output',
+  runtimeLogsIntro:
+    "This model process's stdout and stderr, as it wrote them. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
+  runtimeLogsWaiting: 'Connecting…',
+  runtimeLogsEmptyBuffer:
+    "The agent has nothing retained for this process. That is not a statement about whether the process printed anything: the buffer lives only in the agent's memory and is lost when the agent restarts.",
+  runtimeLogsUnsupported:
+    'This server\'s agent does not declare the "runtime_logs" feature. It will never answer the request — this window would stay empty forever. Update the agent.',
+  runtimeLogsOffline:
+    'There is no live connection to this server to request a stream over. Possible reasons: the agent is not running, it is unreachable, or it is configured with the "post" transport, which has no gateway-to-agent direction.',
+  runtimeLogsDisconnected:
+    'The stream connection dropped. Reconnecting; the retained history will be reloaded afterwards.',
+  runtimeLogsProcessStarted: (pid: number) => `Process started (pid ${pid})`,
+  runtimeLogsProcessExited: (code: number) => `Process exited (exit code ${code})`,
+  runtimeLogsDropped: (bytes: number) => `[${bytes} bytes of output are missing here]`,
+  runtimeLogsTrimmed: (bytes: number) =>
+    `Older output is no longer shown in this view (${bytes} bytes). Reopen the window to reload the agent's retained history in full.`,
   runtimeAgentVersion: 'Agent version',
   runtimeAgentFeatures: 'Declared features',
   runtimeReportCollectedAt: 'Reported at',

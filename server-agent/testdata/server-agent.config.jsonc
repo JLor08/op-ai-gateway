@@ -132,6 +132,23 @@
   // "127.0.0.1") on any host that is not mesh-only.
   "runtime_router_bind": "",
 
+  // How much of each managed model process's stdout+stderr this agent keeps
+  // in memory, in BYTES, so an operator can read it AFTER the fact -- the
+  // buffer belongs to the SPEC and outlives the process, so a crashed model's
+  // output is still there when its log view is opened, and a restart appends
+  // with a visible boundary marker instead of wiping the history. 0 (the
+  // default) means 1048576 (1 MiB), enough for a full model startup plus its
+  // context; anything below 65536 is raised to it. Kept in RAM only and NEVER
+  // written to disk -- this content can include prompt text.
+  "runtime_log_buffer_bytes": 0,
+
+  // Ceiling on the SUM of those buffers across every spec, in BYTES, so a
+  // server with twenty specs is not twenty times the number above. 0 (the
+  // default) means 16777216 (16 MiB). The agent keeps at most
+  // total/per-spec buffers, evicting the least-recently-written one nobody is
+  // watching to stay inside the ceiling.
+  "runtime_log_buffer_total_bytes": 0,
+
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
   "tls_insecure": false,
 

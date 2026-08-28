@@ -327,6 +327,7 @@ function baseServerListApi(): ServerListApi {
     setServerNetbird: vi.fn(async () => makeServer('srv_1', 'healthy')),
     subscribeBenchmark: vi.fn(() => () => {}),
     subscribeRuntimeStatus: vi.fn(() => () => {}),
+    subscribeRuntimeLogs: vi.fn(() => () => {}),
     subscribeServerPerf: vi.fn(() => () => {}),
     syncApplicationModels: vi.fn(async () => ({
       added: 0,

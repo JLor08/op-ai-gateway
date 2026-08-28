@@ -744,6 +744,34 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/SSE' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/servers/{id}/runtime/logs:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Live stdout+stderr of one managed model process (SSE)
+      description: >
+        text/event-stream. A "status" event states whether a live stream is
+        possible at all -- {"state":"streaming"|"unsupported"|"offline"} -- and
+        is re-sent whenever that changes, so an empty window always carries a
+        reason. Then a "log" event per agent flush:
+        {"spec_id","scrollback","entries":[...]}. The FIRST log event carries
+        scrollback=true and replays the agent's retained history (possibly
+        empty, which means the agent's buffer holds nothing); a consumer must
+        RESET on it, never append, because a reconnect delivers a fresh one.
+        Each entry is either verbatim process output ("text") or a boundary
+        marker from the closed set ("event": started|exited). "dropped_bytes"
+        on an entry means N bytes the process printed are missing immediately
+        before it. Nothing on this path is persisted -- not to disk, not to the
+        database. Subscribing is what makes the agent stream this spec, and
+        unsubscribing is what stops it.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: spec_id, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/SSE' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/portal/agent-binaries:
     get:
       tags: [portal]

@@ -128,6 +128,15 @@ type ManagerOptions struct {
 	// PATH/HOME (see ExpandPlaceholders). os.Getenv in production; injected
 	// in tests so no real environment variable is required.
 	Getenv func(string) string
+	// LogBufferBytes / LogBufferTotalBytes size the per-spec managed-process
+	// output retention and its fleet-wide ceiling (see LogStore). Both are
+	// OPERATOR settings from the agent's own local config -- memory on an AI
+	// server is the operator's tradeoff, and like every other agent-owned
+	// runtime setting these can never be supplied by the gateway. Zero means
+	// "use the documented default", so a Manager built without them (every
+	// test) still gets a working store.
+	LogBufferBytes      int
+	LogBufferTotalBytes int
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -160,6 +169,13 @@ type Manager struct {
 	// required for tests to shrink/restore those vars race-free around
 	// Close.
 	wg sync.WaitGroup
+
+	// logs is the per-spec managed-process output retention plus the
+	// on-demand live fan-out (logs.go). It is a Manager field rather than
+	// owner state because it is written from os/exec's copying goroutines
+	// (never the owner) and read by the Driver's SetWatch/Drain on the
+	// agent's run loop; it carries its own mutex for exactly that reason.
+	logs *LogStore
 }
 
 // NewManager starts the owner goroutine and returns immediately; Apply must
@@ -173,6 +189,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		cmds:        make(chan command),
 		done:        make(chan struct{}),
 		transitions: make(chan struct{}, 1),
+		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
 	o := &owner{
 		m:            m,
@@ -180,6 +197,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		getenv:       getenv,
 		specs:        make(map[string]*specState),
 		allowedPairs: map[[2]string]bool{},
+		logs:         m.logs,
 	}
 	m.wg.Add(1)
 	go func() {
@@ -188,6 +206,11 @@ func NewManager(opts ManagerOptions) *Manager {
 	}()
 	return m
 }
+
+// Logs exposes the managed-process output store so the Driver can apply the
+// gateway's watch command to it and drain what it has queued. Never nil for a
+// Manager built by NewManager.
+func (m *Manager) Logs() *LogStore { return m.logs }
 
 // postCmd sends c to the owner, or drops it silently once the owner has
 // stopped (Close has fully completed) -- at that point there is no state
@@ -551,11 +574,15 @@ type ensureWaiter struct {
 // scheduled/cancelled as the generation's lifecycle progresses) and never
 // touched by anything except the owner goroutine.
 type runningProc struct {
-	specID    string
-	cmd       *exec.Cmd
-	pid       int
-	port      int
-	ring      *ringBuffer
+	specID string
+	cmd    *exec.Cmd
+	pid    int
+	port   int
+	// log is THIS generation's writer into the spec-scoped output store
+	// (logs.go). It is not the buffer: the buffer belongs to the SPEC and
+	// deliberately outlives this process, so opening the log view on a
+	// `crashed` row still shows what led to the crash.
+	log       *procLog
 	startedAt time.Time
 	// exited is closed by waitForExit right before it reports the exit to
 	// the owner, so pollHealth can select on it (a process that dies before
@@ -663,6 +690,10 @@ type owner struct {
 	m      *Manager
 	policy LocalPolicy
 	getenv func(string) string
+	// logs is m.logs, held here so the owner can open a generation's writer
+	// and prune the retention of specs a new config removed. Carries its own
+	// mutex; nothing about it is owner-goroutine-confined.
+	logs *LogStore
 
 	cfg          Config
 	allowedPairs map[[2]string]bool
@@ -825,6 +856,18 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 
 	o.rebuildUpstreamIndex()
+
+	// Retained output follows the SPEC, so a spec the operator deleted takes
+	// its history with it: there is no row left in the portal to open a log
+	// view on, and the buffer would otherwise be memory held for something
+	// that no longer exists. Driven from newIDs (the DESIRED set), not from
+	// o.specs, because a removed-but-still-draining spec is still in o.specs
+	// and its output stops being reachable the moment the spec is gone.
+	retained := make([]string, 0, len(newIDs))
+	for id := range newIDs {
+		retained = append(retained, id)
+	}
+	o.logs.Retain(retained)
 
 	for id, st := range o.specs {
 		if !newIDs[id] {
@@ -1429,14 +1472,19 @@ func (o *owner) startProcess(st *specState) {
 		return
 	}
 
-	ring := &ringBuffer{}
+	// One writer for BOTH streams: the requirement is stdout AND stderr, and
+	// sharing the writer means the interleaving an operator reads back is
+	// the interleaving the process actually produced. os/exec spawns one
+	// copying goroutine per stream against a plain io.Writer, which is why
+	// procLog.Write is concurrency-safe by construction.
+	plog := o.logs.newProc(spec.ID)
 	cmd := exec.Command(spec.Binary, args...) //nolint:gosec // spec.Binary is allowlisted by LocalPolicy.Permit above
 	cmd.Env = env
 	if spec.WorkDir != "" {
 		cmd.Dir = spec.WorkDir
 	}
-	cmd.Stdout = ring
-	cmd.Stderr = ring
+	cmd.Stdout = plog
+	cmd.Stderr = plog
 	setProcGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
@@ -1447,12 +1495,17 @@ func (o *owner) startProcess(st *specState) {
 		return
 	}
 
+	// Records the generation boundary in the spec's own history, in place,
+	// so a crash loop reads as a sequence of attempts rather than one
+	// undifferentiated wall of output.
+	plog.Started(cmd.Process.Pid)
+
 	proc := &runningProc{
 		specID:    spec.ID,
 		cmd:       cmd,
 		pid:       cmd.Process.Pid,
 		port:      port,
-		ring:      ring,
+		log:       plog,
 		startedAt: time.Now(),
 		exited:    make(chan struct{}),
 	}
@@ -1663,7 +1716,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	}
 
 	// c.err is ErrStartTimeout: the child never became healthy in time.
-	tail := c.proc.ring.Tail(2048)
+	tail := c.proc.log.Tail(2048)
 	o.setState(st, StateStartFailed)
 	o.recordFailure(st, "runtime: startup timed out waiting for health", 0, tail)
 	o.failPending(st, ErrStartTimeout)
@@ -1741,6 +1794,12 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	wasHealthy := proc.everHealthy
 
 	slog.Info("runtime: process exited", "spec", st.spec.ID, "intentional", wasIntentional, "exit_code", extractExitCode(exitErr))
+	// Close this generation's section of the spec's retained output, for
+	// EVERY kind of exit -- crash, drain, idle unload, force_stopped,
+	// shutdown. cmd.Wait (waitForExit) has already waited for os/exec's two
+	// copy goroutines, so every byte the process ever wrote is in the buffer
+	// before this marker lands after it.
+	proc.log.Exited(extractExitCode(exitErr))
 
 	// A spec deleted from the config is dropped on this exit however the
 	// process happened to die -- being removed is a property of the SPEC, not
@@ -1819,7 +1878,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	}
 
 	exitCode := extractExitCode(exitErr)
-	tail := proc.ring.Tail(2048)
+	tail := proc.log.Tail(2048)
 	if wasHealthy {
 		o.setState(st, StateCrashed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited unexpectedly (exit code %d)", exitCode), exitCode, tail)

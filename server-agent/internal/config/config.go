@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -211,6 +212,26 @@ type Config struct {
 	// this local config, never from the gateway -- the gateway supplies
 	// only the router's PORT (router_listen), never its bind host.
 	RuntimeRouterBindHost string
+	// RuntimeLogBufferBytes is how much of each managed model process's
+	// stdout+stderr this agent keeps in memory so an operator can read it
+	// AFTER the fact -- the buffer survives the process, so a crashed model's
+	// output is still there when someone opens the log view. 0 (the default)
+	// means the built-in default (runtime.DefaultLogBufferBytes, 1 MiB).
+	//
+	// Same operator-only provenance as RuntimeAllowedBinaries/
+	// RuntimeAllowedDirs, and for the same kind of reason: memory on an AI
+	// server is the operator's tradeoff to make, and the gateway must not be
+	// able to make this host spend more of it.
+	//
+	// Retained content is kept in RAM only and is never written to disk --
+	// it can contain prompt text (see internal/runtime/logs.go).
+	RuntimeLogBufferBytes int
+	// RuntimeLogBufferTotalBytes caps the SUM of those buffers across every
+	// spec, so a server with twenty specs is not twenty times the per-spec
+	// number. 0 (the default) means runtime.DefaultLogBufferTotalBytes
+	// (16 MiB). The agent keeps at most total/per-spec buffers, evicting the
+	// least-recently-written unwatched one.
+	RuntimeLogBufferTotalBytes int
 }
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
@@ -244,6 +265,9 @@ type fileConfig struct {
 	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
 	RuntimeCachePath       string   `json:"runtime_cache"`
 	RuntimeRouterBindHost  string   `json:"runtime_router_bind"`
+
+	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
+	RuntimeLogBufferTotalBytes int `json:"runtime_log_buffer_total_bytes"`
 }
 
 // executable is os.Executable, indirected so tests can control the
@@ -360,6 +384,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
 		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
 		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
+
+		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
+		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -384,6 +411,23 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// resolveInt applies env > file for a plain integer setting that (per the
+// RuntimeAllowedBinaries/CertProxyRoutes precedent this family follows) has
+// no flag layer. An env value that is absent, blank, or not a base-10 integer
+// falls through to the file value rather than failing the whole load: these
+// are byte-size tuning knobs, and refusing to start an agent -- taking every
+// model on the host down with it -- over a fat-fingered buffer size would be
+// wildly out of proportion to the mistake. The consumer clamps whatever
+// arrives (runtime.NewLogStore), so an absurd value is bounded, not obeyed.
+func resolveInt(envVal string, fileVal int) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fileVal
 }
 
 // resolveStringList applies env(if non-empty, comma-separated) > file for a

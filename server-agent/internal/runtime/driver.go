@@ -114,6 +114,11 @@ type Driver struct {
 	// specific host resolved" -- StartRouter then binds all interfaces and
 	// says so at Warn, rather than silently doing the unrestricted thing.
 	bindHost string
+	// logs is the Manager's managed-process output store, held directly
+	// (rather than reached through driverManager) because only the concrete
+	// *Manager has one -- see NewDriver. nil makes SetLogWatch and
+	// DrainLogFrames no-ops.
+	logs *LogStore
 
 	// syncMu serializes Sync's body. internal/agent's own triggerRuntimeSync
 	// already single-flights calls via CompareAndSwap (this package's
@@ -178,6 +183,90 @@ type Driver struct {
 	closed bool
 }
 
+// maxWatchedSpecs bounds how many specs one gateway may ask this agent to
+// stream at once. Each watched spec costs at most logPendingBytes of live
+// queue, so this is the memory bound on the streaming half exactly as
+// LogBufferTotalBytes is the bound on the retention half. Set far above any
+// reachable operator behaviour (a human watches one or two processes), so it
+// is a guard against a malformed or hostile command, not a policy an operator
+// can hit.
+const maxWatchedSpecs = 64
+
+// LogWatchCommand is the gateway->agent runtime_log_config payload: the FULL
+// set of spec IDs whose output the gateway currently wants streamed, never a
+// delta and never an instruction to run anything. Like runtime_config, every
+// frame is self-contained and idempotent, so last-one-wins and a dropped
+// frame costs nothing -- the gateway re-sends the current set on every new
+// agent connection.
+//
+// This is the whole gateway->agent command surface for logs, and it is
+// deliberately a list of identifiers the gateway ITSELF supplied in the
+// runtime-config document: there is no path, no pattern, and no filter here,
+// so the frame cannot express anything the agent was not already going to do
+// (the same boundary certUpdateFrame's doc draws on the gateway side).
+type LogWatchCommand struct {
+	SpecIDs []string `json:"spec_ids"`
+}
+
+// SetLogWatch applies a gateway runtime_log_config frame. A nil/empty payload,
+// a payload that does not parse, and an explicitly empty list all mean the
+// same thing -- watch nothing -- which is also what a fresh connection starts
+// from: the gateway pushes the authoritative set on every connect, so a stale
+// set from a previous connection can never outlive it.
+//
+// Safe to call with no manager and no store (the defensive NewDriver(nil,...)
+// path and driver_test.go's fake manager): it is simply a no-op there.
+func (d *Driver) SetLogWatch(raw json.RawMessage) {
+	if d == nil || d.logs == nil {
+		return
+	}
+	var cmd LogWatchCommand
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cmd); err != nil {
+			// Never log raw: it is gateway-supplied, and this package's
+			// house rule is that nothing on this path reaches a log line.
+			slog.Debug("runtime: malformed runtime_log_config frame; watching nothing")
+			cmd.SpecIDs = nil
+		}
+	}
+	if len(cmd.SpecIDs) > maxWatchedSpecs {
+		slog.Warn("runtime: runtime_log_config named more specs than this agent will stream at once; ignoring the excess",
+			"asked", len(cmd.SpecIDs), "limit", maxWatchedSpecs)
+		cmd.SpecIDs = cmd.SpecIDs[:maxWatchedSpecs]
+	}
+	d.logs.SetWatch(cmd.SpecIDs)
+}
+
+// DrainLogFrames returns the managed-process output queued since the last
+// call, one already-marshaled runtime_log payload per spec, ready for the
+// agent's run loop to hand straight to the WebSocket sender. Returns nil when
+// nothing is watched or nothing was written -- which, on a fleet nobody is
+// looking at, is every time.
+//
+// It marshals here rather than in internal/agent so that package needs to
+// know nothing about the log wire shape, and so the ONE goroutine that writes
+// to the WebSocket does the least work possible per frame.
+func (d *Driver) DrainLogFrames() []json.RawMessage {
+	if d == nil || d.logs == nil {
+		return nil
+	}
+	batches := d.logs.Drain()
+	if len(batches) == 0 {
+		return nil
+	}
+	out := make([]json.RawMessage, 0, len(batches))
+	for _, b := range batches {
+		raw, err := json.Marshal(b)
+		if err != nil {
+			// Unreachable for these field types; never log the batch.
+			slog.Debug("runtime: marshal runtime_log batch failed", "spec", b.SpecID)
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
 // NewDriver builds a Driver over m (never nil in production: main.go always
 // constructs a real *Manager before reaching this call), binding the router
 // to bindHost when it (re)binds (fix round 1, I2) -- "" lets StartRouter
@@ -190,7 +279,12 @@ func NewDriver(m *Manager, src Source, features *FeaturesClient, reporter Runtim
 	if m == nil {
 		return newDriver(nil, src, features, reporter, bindHost)
 	}
-	return newDriver(m, src, features, reporter, bindHost)
+	d := newDriver(m, src, features, reporter, bindHost)
+	// Only the concrete *Manager owns a log store, which is why this is set
+	// here rather than in newDriver: driver_test.go's fake manager has none,
+	// and the log surface degrades to a documented no-op there.
+	d.logs = m.Logs()
+	return d
 }
 
 // newDriver is NewDriver's unexported worker, taking the driverManager

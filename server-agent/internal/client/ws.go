@@ -88,6 +88,29 @@ type WSSender struct {
 	// mu below.
 	runtimeWakeMu sync.Mutex
 
+	// logWatchUpdates carries the gateway's runtime_log_config command (T3
+	// log streaming): the FULL set of spec IDs whose managed-process output
+	// it currently wants streamed. Latest-wins buffered(1), exactly like
+	// runtimeUpdates -- every command is self-contained, so a burst
+	// coalesces into the newest one and nothing is lost that matters.
+	//
+	// Unlike runtimeUpdates there is deliberately NO connect-hook wake here.
+	// A nil on runtimeUpdates means "resync over HTTP", which for a document
+	// the agent can re-fetch is the right idempotent fallback; there is no
+	// equivalent for a command, and a connect-hook nil would race readLoop's
+	// first real frame for the same latest-wins slot (the race
+	// wakeRuntimeConfig documents) with a genuine loss on the losing side.
+	// Instead the GATEWAY re-sends the authoritative set on every new agent
+	// connection, including the empty set, so a stale watch set can never
+	// outlive the connection it was issued on.
+	logWatchUpdates chan json.RawMessage
+	// logWatchMu is logWatchUpdates' own drain-then-send lock. A dedicated
+	// lock rather than a reuse of runtimeWakeMu for the same reason that one
+	// is not a reuse of mu: two independent doorbells that never need to
+	// exclude each other should not be able to contend, and coupling them
+	// would only create a way for a future change to deadlock.
+	logWatchMu sync.Mutex
+
 	mu          sync.Mutex
 	conn        *websocket.Conn
 	connDone    chan struct{} // closed by dropConn when this conn is torn down; stops pingLoop
@@ -131,6 +154,7 @@ func NewWSSender(gatewayURL, token string, httpClient *http.Client) (*WSSender, 
 		certUpdates:     make(chan struct{}, 1),
 		trustUpdates:    make(chan struct{}, 1),
 		runtimeUpdates:  make(chan json.RawMessage, 1),
+		logWatchUpdates: make(chan json.RawMessage, 1),
 	}, nil
 }
 
@@ -234,6 +258,31 @@ func (s *WSSender) wakeRuntimeConfig(data json.RawMessage) {
 	}
 	select {
 	case s.runtimeUpdates <- data:
+	default:
+	}
+}
+
+// LogWatchUpdates returns the channel carrying the gateway's latest
+// runtime_log_config command -- the full set of spec IDs whose managed-process
+// output it wants streamed right now (see the logWatchUpdates field doc).
+// Latest-wins: a command superseded before the consumer read it is simply
+// gone, which is correct, because each one states the whole desired set.
+// Reading this channel is never required to keep the connection alive.
+func (s *WSSender) LogWatchUpdates() <-chan json.RawMessage { return s.logWatchUpdates }
+
+// wakeLogWatch is the latest-wins producer for LogWatchUpdates. Both selects
+// are non-blocking, so readLoop -- which is also what detects a dead peer --
+// can never stall here on a consumer, the load-bearing property
+// wakeRuntimeConfig documents at length for its own channel.
+func (s *WSSender) wakeLogWatch(data json.RawMessage) {
+	s.logWatchMu.Lock()
+	defer s.logWatchMu.Unlock()
+	select {
+	case <-s.logWatchUpdates: // drop the superseded command, if any
+	default:
+	}
+	select {
+	case s.logWatchUpdates <- data:
 	default:
 	}
 }
@@ -371,6 +420,45 @@ func (s *WSSender) PostRuntimeReport(ctx context.Context, raw json.RawMessage) e
 	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_report", Data: raw}); err != nil {
 		s.dropConn(conn, isCleanClose(err))
 		return fmt.Errorf("write runtime report frame: %w", err)
+	}
+	return nil
+}
+
+// PostRuntimeLog writes ONE runtime_log frame: the managed-process output
+// accumulated for one spec since the previous flush, already marshaled by
+// internal/runtime.Driver.DrainLogFrames.
+//
+// Deliberately NOT cached for resend, unlike PostSystemReport/
+// PostRuntimeReport. Those two carry a current STATE that a reconnected
+// gateway needs restated; this carries output that has already happened, and
+// replaying it on reconnect would duplicate history in front of the operator
+// -- the agent instead delivers a fresh scrollback when the gateway re-asks
+// for the spec, which is the one authoritative replay.
+//
+// Called from the SAME goroutine as Post/PostSystemReport/PostRuntimeReport
+// (internal/agent's run loop). That is not incidental: this transport has
+// exactly one writer per connection, and a second goroutine calling
+// wsjson.Write here would race the frames that loop writes.
+func (s *WSSender) PostRuntimeLog(ctx context.Context, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	conn := s.currentConn()
+	if conn == nil {
+		// No dial attempt here, unlike the report posters: log output is
+		// worth nothing once it is late, and the watch command that asked
+		// for it only exists on a live connection anyway. The next connect
+		// re-establishes the subscription from the gateway's side.
+		return errBackingOff
+	}
+	wctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	if err := wsjson.Write(wctx, conn, streamFrame{Type: "runtime_log", Data: raw}); err != nil {
+		s.dropConn(conn, isCleanClose(err))
+		// The error names the frame TYPE only: raw is managed-process output
+		// and may carry prompt text, so it must never reach a log line or an
+		// error string that travels.
+		return fmt.Errorf("write runtime log frame: %w", err)
 	}
 	return nil
 }
@@ -519,6 +607,8 @@ func (s *WSSender) readLoop(conn *websocket.Conn) {
 			s.wakeTrustUpdates()
 		case "runtime_config":
 			s.wakeRuntimeConfig(f.Data)
+		case "runtime_log_config":
+			s.wakeLogWatch(f.Data)
 		}
 		// Any other (including unrecognized future) type is discarded --
 		// forward compatibility.

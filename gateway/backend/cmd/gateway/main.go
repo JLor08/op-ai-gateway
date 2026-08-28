@@ -871,6 +871,14 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// default) precisely so the pruned instance and the written instance are
 	// the same object.
 	agentFeatures := gateway.NewAgentFeaturesRegistry()
+	// runtimeLogs is the live managed-process log relay (T3). Unlike its
+	// siblings above it needs NO app-health pruning: an entry exists only
+	// while a portal log-view SSE request is in flight and the last
+	// unsubscribe removes it, so nothing here can outlive a deleted server.
+	// It is still constructed here rather than left to gateway.New's default
+	// for the same reason as the others -- one instance, visible at the wiring
+	// site, so a future consumer cannot accidentally get a second one.
+	runtimeLogs := gateway.NewRuntimeLogRegistry()
 	// agentStreams is ONE shared registry too: handleAgentStream (ServerDeps)
 	// registers/deregisters each open agent WebSocket connection, and the
 	// OnCertificateIssued hook below pushes a cert_update doorbell to it
@@ -1069,6 +1077,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentProxyStatus:                agentProxyStatus,
 		AgentStreams:                    agentStreams,
 		RuntimeStatus:                   runtimeStatus,
+		RuntimeLogs:                     runtimeLogs,
 		AgentFeatures:                   agentFeatures,
 		Benchmarks:                      gateway.NewBenchmarkRegistry(),
 		Groups:                          groups,

@@ -195,6 +195,11 @@ type ServerDeps struct {
 	// snapshot+subscribe status stream. gateway.New defaults a nil value to
 	// a fresh registry.
 	RuntimeStatus *runtimeStatusRegistry
+	// RuntimeLogs fans live managed-process output out to open portal log
+	// views and, from the set of those views, derives what each agent is
+	// asked to stream (runtime_logs.go); nil-safe. gateway.New defaults a nil
+	// value to a fresh registry and wires its notify hook to AgentStreams.
+	RuntimeLogs *runtimeLogRegistry
 	// SetRuntimeConfigChangedHook, when non-nil, is called ONCE by
 	// cmd/gateway's buildGatewayServer immediately after gateway.New returns,
 	// with the just-built Server's PushRuntimeConfig bound as the argument --
@@ -419,6 +424,10 @@ type Server struct {
 	// (runtime_registry.go); nil-safe. PushRuntimeConfig consults its
 	// file-mode flag.
 	RuntimeStatus *runtimeStatusRegistry
+	// RuntimeLogs relays live managed-process output to portal log views
+	// (runtime_logs.go); nil-safe. Volatile only -- nothing on that path is
+	// ever persisted.
+	RuntimeLogs *runtimeLogRegistry
 	// onAgentReactivated fires on an inactive->active ServerAgent edge; see
 	// ServerDeps.OnAgentReactivated. nil-safe (unset -> no trigger).
 	onAgentReactivated func(serverID string)
@@ -604,6 +613,16 @@ func New(deps ServerDeps) *Server {
 	if runtimeStatus == nil {
 		runtimeStatus = newRuntimeStatusRegistry()
 	}
+	runtimeLogs := deps.RuntimeLogs
+	if runtimeLogs == nil {
+		runtimeLogs = newRuntimeLogRegistry()
+	}
+	// The one place that holds both registries, which is why the "tell the
+	// agent what to stream" hook is bound here rather than in either of them:
+	// the log registry knows WHICH specs are being watched, the agent-stream
+	// registry knows HOW to reach the agent, and neither should have to know
+	// the other's type.
+	runtimeLogs.setNotify(agentStreams.NotifyRuntimeLogWatch)
 	benchmarks := deps.Benchmarks
 	if benchmarks == nil {
 		benchmarks = NewBenchmarkRegistry()
@@ -744,6 +763,7 @@ func New(deps ServerDeps) *Server {
 		AgentStreams:                agentStreams,
 		AgentFeatures:               agentFeatures,
 		RuntimeStatus:               runtimeStatus,
+		RuntimeLogs:                 runtimeLogs,
 		onAgentReactivated:          deps.OnAgentReactivated,
 		Benchmarks:                  benchmarks,
 		Groups:                      groups,

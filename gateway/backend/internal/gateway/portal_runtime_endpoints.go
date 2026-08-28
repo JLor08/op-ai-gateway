@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"strings"
 	"time"
 )
 
@@ -166,6 +167,134 @@ func (s *Server) handleRuntimeEvents(w http.ResponseWriter, r *http.Request, tok
 			}
 			if !writePerfEvent(w, flusher, "update", runtimeStatusEventDTO{Runtimes: nonNilRuntimeStatuses(statuses)}) {
 				return
+			}
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// --- T3: live managed-process log stream ------------------------------------
+
+// runtimeLogStatusEventDTO is the SSE `status` payload: whether this server's
+// agent can actually deliver a live log stream right now, and if not, WHY --
+// see the runtimeLogState* constants (runtime_logs.go). It is sent once before
+// any log frame and again whenever the answer changes, because "the window is
+// empty" needs a reason attached to it: an empty view with no explanation is
+// indistinguishable from a model that prints nothing, which is precisely the
+// question the operator opened it to answer.
+type runtimeLogStatusEventDTO struct {
+	State string `json:"state"`
+}
+
+// runtimeLogStatusInterval is how often an open log stream re-evaluates
+// whether the agent can serve it. Cheap (two in-memory map reads) and worth
+// it: an agent that reconnects, or whose first telemetry sample lands a moment
+// after the view opened, must flip the banner off by itself rather than
+// leaving the operator looking at a stale "offline" over a stream that is now
+// working. A package-level var so tests need not wait it out.
+var runtimeLogStatusInterval = 5 * time.Second
+
+// runtimeLogState answers "can this server's agent stream logs right now", and
+// distinguishes the two silences that need different action from the operator:
+// no live connection at all (a stopped agent, an unreachable one, or one
+// configured with the POST transport, which has no gateway->agent direction)
+// versus a connection whose agent binary does not declare the runtime_logs
+// feature and will therefore ignore the request forever.
+//
+// The connection check comes FIRST deliberately. The feature registry is fed
+// by telemetry, so a server whose agent is long gone can still have a stale
+// declared feature set; reporting "streaming" off that would be the exact
+// empty-window lie this state exists to prevent.
+func (s *Server) runtimeLogState(serverID string) string {
+	if !s.AgentStreams.hasConn(serverID) {
+		return runtimeLogStateOffline
+	}
+	if !s.AgentFeatures.Has(serverID, runtimeLogsFeature) {
+		return runtimeLogStateUnsupported
+	}
+	return runtimeLogStateStreaming
+}
+
+// handleRuntimeLogEvents streams GET
+// /api/portal/servers/{id}/runtime/logs?spec_id=... over SSE: a `status` frame
+// stating whether a live stream is possible at all, then a `log` frame per
+// agent flush -- the spec's retained scrollback first (one batch with
+// scrollback=true, possibly empty), then live output.
+//
+// AUTHORIZATION is the same boundary as the rest of this feature, not a laxer
+// one because it is "just logs": ownership/admin-group via s.Portal.GetServer
+// BEFORE any stream byte, with the 404-no-leak collapse, exactly as
+// handleRuntimeEvents does. spec_id needs no separate check: fan-out is keyed
+// by (server, spec) and an agent only ever reports its OWN server's specs, so
+// a spec id belonging to another server can only ever receive nothing --
+// there is no id an authorized caller could name to reach output they are not
+// already entitled to.
+//
+// SUBSCRIBING IS WHAT STARTS THE STREAM. The registry tells the agent the new
+// watch set on the first subscriber for a spec and again on the last
+// unsubscribe, so the agent produces output only while this handler (or a
+// sibling) is running. The deferred unsubscribe is therefore not merely
+// cleanup: it is the stop command.
+func (s *Server) handleRuntimeLogEvents(w http.ResponseWriter, r *http.Request, token auth.Token, serverID string) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	specID := strings.TrimSpace(r.URL.Query().Get("spec_id"))
+	if specID == "" {
+		writeJSON(w, http.StatusBadRequest, apierror.Response("runtime_logs.spec_required", "spec_id is required", ""))
+		return
+	}
+	if _, err := s.Portal.GetServer(r.Context(), token, serverID); err != nil {
+		writePortalServerError(w, err, "server.not_found")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, apierror.Response("usage.stream_unsupported", "streaming unsupported", ""))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	// Clear the server WriteTimeout for this long-lived response. An unsupported
+	// writer (httptest recorder) returns an error we intentionally ignore.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+
+	sub, unsub := s.RuntimeLogs.subscribe(serverID, specID)
+	defer unsub()
+
+	state := s.runtimeLogState(serverID)
+	if !writePerfEvent(w, flusher, "status", runtimeLogStatusEventDTO{State: state}) {
+		return
+	}
+
+	statusTicker := time.NewTicker(runtimeLogStatusInterval)
+	defer statusTicker.Stop()
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case batch := <-sub.ch:
+			// take() stamps on any bytes this subscriber's own queue lost
+			// while it was behind, so the gap is reported where it happened
+			// rather than showing up as silence.
+			if !writePerfEvent(w, flusher, "log", sub.take(batch)) {
+				return
+			}
+		case <-statusTicker.C:
+			if next := s.runtimeLogState(serverID); next != state {
+				state = next
+				if !writePerfEvent(w, flusher, "status", runtimeLogStatusEventDTO{State: state}) {
+					return
+				}
 			}
 		case <-heartbeat.C:
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {

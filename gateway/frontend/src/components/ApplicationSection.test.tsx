@@ -213,6 +213,7 @@ function renderSection(
     putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
     runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
     subscribeRuntimeStatus: vi.fn(() => () => {}),
+    subscribeRuntimeLogs: vi.fn(() => () => {}),
     // Task 21 (matrix + server limits): unused defaults for every test here
     // (reached only by RuntimeAdminSection's own tests), mirroring the
     // runtime* defaults above.

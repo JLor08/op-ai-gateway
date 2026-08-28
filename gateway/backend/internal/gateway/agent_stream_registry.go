@@ -317,6 +317,83 @@ func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.
 	}
 }
 
+// runtimeLogWatchFrame is the ENTIRE wire payload of a runtime_log_config
+// frame: the full set of spec ids whose managed-process output the gateway
+// currently wants streamed. Full set, never a delta -- the same
+// self-contained/idempotent discipline NotifyRuntimeConfig documents, so
+// last-one-wins and a dropped frame is harmless (the next subscribe or the
+// next agent connection restates it).
+//
+// A list of spec IDS is deliberately the whole expressive power of this frame.
+// The ids name specs the GATEWAY itself already sent in the runtime-config
+// document, so there is nothing here -- no path, no pattern, no command --
+// that could make the agent do something it was not already going to do. That
+// is the same boundary certUpdateFrame draws for its own direction: the
+// gateway must never be able to deliver an executable instruction to an agent.
+type runtimeLogWatchFrame struct {
+	SpecIDs []string `json:"spec_ids"`
+}
+
+// NotifyRuntimeLogWatch tells every open agent connection for serverID which
+// specs' output to stream right now. An EMPTY list is a meaningful command,
+// not a no-op (unlike NotifyRuntimeConfig's empty payload): "the last viewer
+// closed, stop streaming" is precisely the message that keeps an unwatched
+// fleet quiet, and it is also what a fresh connection is sent so a watch set
+// from a previous connection can never outlive it.
+//
+// Deliberately NOT feature-gated, unlike PushRuntimeConfig. An agent that does
+// not understand this frame already discards it (every agent build tolerates
+// an unknown frame type -- forward compatibility, documented on both readers),
+// so sending it costs nothing; whereas gating the SEND on the features
+// registry would silently skip the first connection of a freshly started
+// agent, whose telemetry has not been parsed yet and whose declared features
+// are therefore not yet known. The feature name is checked where it actually
+// changes an outcome instead: the portal's log stream reports `unsupported` so
+// the operator is told to update the agent rather than left watching an empty
+// window.
+//
+// Same shape as NotifyCertUpdate/NotifyRuntimeConfig: marshal (pure CPU) ->
+// snapshot the live connection set under the READ lock -> release -> enqueue
+// (non-blocking) outside it. Best-effort, no error return.
+func (r *AgentStreamRegistry) NotifyRuntimeLogWatch(serverID string, specIDs []string) {
+	if r == nil || serverID == "" {
+		return
+	}
+	if specIDs == nil {
+		specIDs = []string{}
+	}
+	b, err := marshalStreamFrame("runtime_log_config", runtimeLogWatchFrame{SpecIDs: specIDs})
+	if err != nil {
+		slog.Debug("agent stream: runtime_log_config marshal failed", "server_id", serverID, "err", err)
+		return
+	}
+	r.mu.RLock()
+	set := r.conns[serverID]
+	conns := make([]*agentStreamConn, 0, len(set))
+	for c := range set {
+		conns = append(conns, c)
+	}
+	r.mu.RUnlock()
+	for _, c := range conns {
+		if !c.enqueue(b) {
+			slog.Debug("agent stream: runtime_log_config queue full, frame dropped", "server_id", serverID)
+		}
+	}
+}
+
+// hasConn reports whether serverID currently has at least one open agent
+// WebSocket. It is the difference between "this agent cannot do log streaming"
+// and "this agent is not reachable at all", which the portal's log view needs
+// to tell an operator apart -- see runtimeLogStateOffline.
+func (r *AgentStreamRegistry) hasConn(serverID string) bool {
+	if r == nil || serverID == "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.conns[serverID]) > 0
+}
+
 func (r *AgentStreamRegistry) NotifyCAUpdate(fingerprint string) {
 	if r == nil || fingerprint == "" {
 		return

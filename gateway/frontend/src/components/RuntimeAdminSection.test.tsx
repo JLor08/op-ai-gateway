@@ -23,6 +23,8 @@ import type {
   RuntimeReport,
   RuntimeReportContent,
   RuntimeSpec,
+  RuntimeLogBatch,
+  RuntimeLogState,
   RuntimeStatus,
   UpdateMappingRequest,
   UpdateServerRequest,
@@ -273,6 +275,8 @@ function renderSection(
   let onDataCb: ((rows: RuntimeStatus[]) => void) | null = null;
   let onStatusCb: ((status: 'open' | 'error') => void) | null = null;
   let unsubscribeCount = 0;
+  const logSubscriptions: string[] = [];
+  let logUnsubscribeCount = 0;
   let reportCalls = 0;
   let mappingsCalls = 0;
   let coresidencyCalls = 0;
@@ -404,6 +408,22 @@ function renderSection(
         };
       },
     ),
+    // T3's per-row log view. Recorded rather than inert: subscribing is what
+    // makes the agent stream, so a test that wants to prove a view was (or was
+    // not) opened has to be able to see it.
+    subscribeRuntimeLogs: vi.fn(
+      (
+        _serverId: string,
+        specId: string,
+        _onBatch: (batch: RuntimeLogBatch) => void,
+        _onState: (state: RuntimeLogState) => void,
+      ) => {
+        logSubscriptions.push(specId);
+        return () => {
+          logUnsubscribeCount++;
+        };
+      },
+    ),
     updateServer: vi.fn(async (id: string, body: UpdateServerRequest) => {
       updatedServers.push({ id, body });
       // Only runtime_max_processes matters to Area 3's own round trip; the
@@ -446,6 +466,13 @@ function renderSection(
       setStatus: (status: 'open' | 'error') => act(() => onStatusCb?.(status)),
       unsubscribes: () => unsubscribeCount,
       subscribedServerIds,
+    },
+    // T3: which specs a log view was opened for, and how many were closed
+    // again. Closing is what tells the agent to stop streaming, so both halves
+    // are observable.
+    logs: {
+      subscribedSpecIds: logSubscriptions,
+      unsubscribes: () => logUnsubscribeCount,
     },
     /**
      * Unmounts ONLY RuntimeAdminSection, leaving the ToastProvider mounted
@@ -713,6 +740,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         agent_features: [],
       })),
       subscribeRuntimeStatus: vi.fn(() => () => {}),
+      subscribeRuntimeLogs: vi.fn(() => () => {}),
       updateServer: vi.fn(async (id: string, body: UpdateServerRequest) => ({
         ...server,
         id,
@@ -1682,6 +1710,50 @@ describe('RuntimeAdminSection admin overrides', () => {
     // would silently end with a DIFFERENT override than it started with.
     expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
+  });
+
+  // T3, the log view's row action. Two properties, and the second is the one
+  // that matters: the action exists on rows that get NO other action at all
+  // (file mode, an unresolvable spec, a pre-settled report GET), because
+  // reading what a process printed is not a write -- and those are exactly the
+  // states an operator can be stuck in with no other way to find out what is
+  // happening.
+  it('offers the log view on every status row and opens a stream for that row only', async () => {
+    const { logs, stream } = renderSection({
+      statusRows: [
+        makeStatus({ spec_id: 'spec_1', model: 'app-model', state: 'crashed' }),
+        makeStatus({ spec_id: 'spec_2', model: 'other-model', state: 'running' }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+
+    // Nothing is streamed before an operator asks: the subscription IS the
+    // request, so merely rendering the tab must not start one.
+    expect(logs.subscribedSpecIds).toEqual([]);
+
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+    expect(logs.subscribedSpecIds).toEqual(['spec_1']);
+    expect(await screen.findByText(t.runtimeLogsIntro)).toBeInTheDocument();
+
+    // Closing it is what tells the agent to stop.
+    fireEvent.click(screen.getByRole('button', { name: t.captureClose }));
+    await waitFor(() => expect(logs.unsubscribes()).toBe(1));
+  });
+
+  it('offers the log view in file mode, where no override action exists at all', async () => {
+    const { logs, stream } = renderSection({
+      report: fileModeReport({ specs: [] }),
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+
+    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+    expect(logs.subscribedSpecIds).toEqual(['spec_1']);
   });
 
   // Brief: "If no loaded spec matches the row's spec_id ... render NO

@@ -997,12 +997,13 @@ unused for at least that timeout. The exemption set and the zero-in-flight
 precondition are the difference between reclaiming a GPU and killing a live
 model.
 
-**Logs stay local.** Each child's stdout and stderr are captured into one fixed
-64 KiB in-memory ring buffer (mutex-guarded, two concurrent writers); its tail
-is what populates `last_error.stderr_tail`. There is no log streaming to the
-gateway — that is a separate sub-project, for which the `runtime_logs` feature
-flag is reserved — but the capture point exists from the start so adding
-streaming later does not require touching process startup.
+**Logs are retained per spec and streamed on demand.** Each child's stdout and
+stderr are captured into one in-memory record buffer per **spec** — not per
+process — mutex-guarded because `os/exec` writes from two goroutines. Its tail
+is what populates `last_error.stderr_tail`, and a portal log view is what makes
+the agent stream it upward. Capacity is an operator setting
+(`runtime_log_buffer_bytes`, default 1 MiB; `runtime_log_buffer_total_bytes`,
+default 16 MiB). Full description in [§14](#14-managed-process-logs-t3).
 
 **Generation identity.** Every asynchronous report about a child — exited,
 start-result, drain-grace expired, kill-grace expired, stable-run — is keyed on
@@ -1066,8 +1067,22 @@ gateway; a 404 on `/features` reads as ∅ on the agent (an older gateway is not
 failure — and the 404 also resets the tracked ETag, since a 404-returning server
 would ignore a stale validator anyway); a transport error, unparseable body or
 unexpected status returns the last known set with a nil error; unknown names are
-ignored on both sides. One flag per **shipped** capability, not per plan:
-`runtime_manager` for this feature, `runtime_logs` reserved.
+ignored on both sides. One flag per **shipped** capability, not per plan: today
+`runtime_manager` (the managed runtime itself) and `runtime_logs`
+([§14](#14-managed-process-logs-t3)).
+
+`runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
+and the asymmetry is worth stating because it looks like an oversight otherwise.
+`runtime_manager` is checked by the AGENT: it manages nothing unless the gateway
+declares the flag. `runtime_logs` is checked by the GATEWAY, against what the
+agent declared, and it gates nothing the agent does — an agent needs no
+permission to answer a command it was sent, and an agent that does not
+understand the command discards it harmlessly. What it gates is the PORTAL's
+honesty: a log view on a server whose agent lacks the flag says "update the
+agent" instead of showing a window that will never fill. The frame itself is
+sent unconditionally, because feature-gating the send would silently skip the
+first connection of a freshly started agent, whose declared features are not yet
+known.
 
 **Negotiation is continuous, not decided at boot.** The manager, config source
 and driver are constructed unconditionally with no startup-blocking probe, and
@@ -2133,7 +2148,146 @@ operator meets first:
 - **The feature ships no metrics** of its own beyond the telemetry sample and the
   status stream.
 
-## 14. Configuration reference
+## 14. Managed-process logs (T3)
+
+The last piece of the original requirement: the agent streams each running
+model process's stdout **and** stderr to the gateway, and the portal shows it
+per running process. It exists for one job — an operator looking at a row that
+says `crashed`, or at a model that will not finish loading, has to be able to
+see what the process is actually printing.
+
+### 14.1 Collection is unconditional; streaming is on demand
+
+These are two different mechanisms and conflating them is the mistake to avoid.
+
+**Collection always runs.** Every byte a managed process writes goes into an
+in-memory buffer whether or not anyone is watching, because the operator
+normally arrives *after* the incident.
+
+**Streaming runs only while someone is watching.** A portal log view subscribes
+to the gateway; the gateway tells that server's agent, over the existing agent
+WebSocket, the full set of spec ids whose output it should send; the last viewer
+closing makes the gateway send the smaller (often empty) set and the agent
+stops. An unwatched fleet therefore produces **no log traffic at all** — which
+is what makes the feature affordable, and what keeps a continuous flow of
+potentially prompt-bearing text off the wire when nobody has asked for it.
+
+This needs the WebSocket transport. Under `transport: post` there is no
+gateway→agent direction, so nothing can ask; the portal reports `offline`
+rather than showing an empty view.
+
+### 14.2 Retention belongs to the SPEC, not the process
+
+The buffer is per spec and **outlives the process that filled it**. That is the
+whole difference between a usable feature and a useless one: the earlier
+process-scoped buffer was destroyed by `st.proc = nil` on exit, so a crash
+erased the output at exactly the moment it became valuable, leaving only the
+~2 KB copied into `last_error.stderr_tail`.
+
+**A restart appends; it does not replace.** For a crash loop — the case an
+operator is most often staring at — the pattern *across* attempts is the
+diagnosis ("it dies at the same layer every time" versus "the third one got
+further"), and replacing on restart throws that comparison away. The boundary
+stays visible as a **typed marker** carrying the pid and exit code, never as
+synthesized text: the event kind is a closed set (`started`, `exited`) that the
+gateway allow-lists on ingest, so an agent cannot put free text where an
+operator reads a portal-authored sentence.
+
+### 14.3 The memory bound is the operator's to set
+
+Capacity is an agent-local operator setting with the same provenance as
+`runtime_allowed_binaries` — local file or environment, never gateway-supplied.
+Memory on an AI server is the operator's tradeoff, and the gateway must not be
+able to make that host spend more of it.
+
+| Setting | Default | Governs |
+|---|---|---|
+| `runtime_log_buffer_bytes` | 1 MiB | Retention per spec. Values below 64 KiB are raised to it. |
+| `runtime_log_buffer_total_bytes` | 16 MiB | The ceiling across **all** specs. |
+
+1 MiB per spec is sized against what has to fit: the predecessor's 64 KiB was
+chosen for "the one `CUDA error: out of memory` line and its neighbours" and is
+often less than a single vLLM or llama.cpp startup, so the interesting part had
+already scrolled out by the time the failure line appeared.
+
+The **total** is the number to reason about, because the per-spec figure alone
+is not a bound — twenty specs would be twenty times it. The agent keeps at most
+`total / per-spec` buffers and evicts the least-recently-written one nobody is
+watching. Worst case, precisely: the total ceiling, plus at most 64 KiB of live
+queue per **watched** spec, plus — for one 250 ms flush window after a
+subscribe — a scrollback snapshot that shares its strings with the retention
+buffer. With the defaults and the one or two specs an operator watches at a
+time, that is 16 MiB steady-state and under 17 MiB while watching.
+
+### 14.4 The wire
+
+| Frame | Direction | Payload |
+|---|---|---|
+| `runtime_log_config` | gateway → agent | `{"spec_ids":[…]}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing. Re-sent on **every** new agent connection, including the empty set, so a watch set can never outlive the connection it was issued on. |
+| `runtime_log` | agent → gateway | One spec's entries since the previous flush: `{"spec_id", "scrollback", "entries":[{"pid","at","text","dropped_bytes","event","exit_code"}]}`. |
+
+A list of spec ids is deliberately the entire expressive power of the command.
+The ids name specs the gateway itself supplied in the runtime-config document,
+so the frame cannot express anything the agent was not already going to do —
+the same boundary the `cert_update` doorbell draws.
+
+`scrollback: true` marks the one-shot replay of the agent's retained history
+that a subscribe produces. The portal **resets** its view on it rather than
+appending (an agent reconnect delivers a fresh scrollback, and appending would
+duplicate the history), and an **empty** scrollback batch is itself an answer —
+"the agent's buffer holds nothing", which is what an agent restart leaves
+behind.
+
+### 14.5 Overflow is always visible
+
+`dropped_bytes` means one thing everywhere it appears: *N bytes the process
+printed are missing immediately before this entry's text*. It is produced by all
+four places output can be lost — eviction from the agent's retention buffer, the
+agent's per-spec live queue overflowing between flushes, the gateway's
+per-subscriber queue overflowing, and the browser's own display cap — and the
+four are deliberately indistinguishable to the reader, who only needs the one
+fact. A gap rendered as silence would be a lie about what the process printed,
+and silence is exactly what the operator is trying to interpret.
+
+Rate limits, all only in effect while someone is watching: the agent flushes at
+most once per spec per 250 ms, at most 64 KiB per spec per window, and at most
+128 KiB per window across all specs (round-robin, so the budget cannot starve
+whichever spec sorts last). That last bound exists because the agent has exactly
+**one** writer per WebSocket connection and telemetry shares it.
+
+### 14.6 Nothing is persisted, anywhere
+
+Captured output can contain prompt fragments from a chatty model server. It is
+therefore held in memory, bounded, and **never** written to disk, never stored
+in the gateway's database, and never put into a log line on either side — not
+even truncated, not even at debug level. That rule is the reason this feature
+needs no data-retention decision at all: there is nothing retained to decide
+about. Two tests assert it rather than arguing it: one walks the agent's
+sandboxed working tree after a real child process has printed and crashed, and
+one attaches a real SQLite store to the gateway, relays fifty frames carrying a
+needle, closes the store so the WAL is checkpointed, and searches every byte of
+the directory.
+
+The portal's authorization boundary is the ordinary one — server
+ownership/admin-group via the same `authorizeServer` path as the live-status
+stream, with the 404-no-leak collapse — deliberately not a laxer path because it
+is "just logs". `spec_id` needs no separate check: fan-out is keyed by (server,
+spec) and an agent only ever reports its own server's specs.
+
+### 14.7 The accepted boundary
+
+Retention lives in the agent's memory, so **it does not survive an agent
+restart**, and there is nothing to show for a server whose agent is down.
+Covering that would need gateway-side retention, which means continuous
+fleet-wide traffic and prompt-bearing text sitting in gateway memory — a
+materially different decision, deliberately not taken here.
+
+What the design does insist on is that the portal never lets that read as "the
+process printed nothing": an agent with an empty buffer sends an empty
+scrollback, and the view says the buffer is empty. Same rule as the overflow
+markers.
+
+## 15. Configuration reference
 
 Agent settings, all on the agent's existing precedence (flag, then environment,
 then config file — with the list-valued ones having no flag form):
@@ -2146,6 +2300,8 @@ then config file — with the list-valued ones having no flag form):
 | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` | empty | Permitted work/model directories. **Non-empty makes `work_dir` mandatory on every spec.** |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
+| `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
+| `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | 16 MiB | Ceiling on that retention across all specs. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
 variables: `ai_servers.runtime_max_processes`,

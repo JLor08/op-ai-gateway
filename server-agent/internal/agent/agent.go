@@ -175,6 +175,35 @@ type runtimeTransitionsWaker interface {
 	Transitions() <-chan struct{}
 }
 
+// runtimeLogWaker is the optional interface a poster may additionally
+// implement to deliver the gateway's runtime_log_config command (T3): the
+// full set of spec IDs whose managed-process output the gateway currently
+// wants streamed. Only *client.WSSender implements it, and that is the whole
+// story for log streaming under the POST transport: with no server->agent
+// direction there is no way to ask for a stream, so a POST-transport agent
+// never streams and the portal says so rather than showing an empty window.
+type runtimeLogWaker interface {
+	LogWatchUpdates() <-chan json.RawMessage
+}
+
+// runtimeLogPoster is the optional interface a poster may additionally
+// implement to carry one runtime_log frame upward. Deliberately separate from
+// `reporter` so a poster can support the state reports without also
+// supporting live log frames.
+type runtimeLogPoster interface {
+	PostRuntimeLog(ctx context.Context, raw json.RawMessage) error
+}
+
+// runtimeLogPort is the optional interface a runtimeDriver may additionally
+// implement to accept the watch command and hand back the frames queued since
+// the last flush. *runtimectl.Driver implements it; a fake that omits it (or a
+// nil runtimeDriver) simply never gets these calls, and the log-flush ticker
+// below is never even created.
+type runtimeLogPort interface {
+	SetLogWatch(raw json.RawMessage)
+	DrainLogFrames() []json.RawMessage
+}
+
 var trustRefreshInterval = 15 * time.Minute
 
 // runtimePollInterval is the periodic backstop cadence for the runtime
@@ -187,6 +216,20 @@ var trustRefreshInterval = 15 * time.Minute
 // by waiting out this ticker), so unlike this file's other timing knobs it
 // stays a plain const.
 const runtimePollInterval = 60 * time.Second
+
+// runtimeLogFlushInterval is how often Run drains whatever managed-process
+// output has been queued for the specs someone is watching, and writes one
+// frame per spec.
+//
+// It is a var so a test can shrink it, and it is the feature's RATE LIMIT as
+// much as its latency budget. Batching over a window is what keeps a chatty
+// model server from turning into a frame per line on the single WebSocket
+// that telemetry also uses: at most one frame per watched spec per window,
+// and at most logDrainBudget bytes per window across all of them
+// (internal/runtime's Drain). 250 ms is below the threshold at which a human
+// reading a scrolling log perceives lag, and four wakeups a second on a loop
+// that already samples once a second is not a cost worth optimizing.
+var runtimeLogFlushInterval = 250 * time.Millisecond
 
 // certPollIntervalWS/POST are the AUTOMATIC certificate-poll cadences (used
 // when cfg.CertPollInterval == 0) selected by transport. WebSocket already
@@ -332,6 +375,19 @@ type Agent struct {
 	// Invoked from the same reportTicker cadence sendSystemReport already
 	// uses (fix round 1, I5) -- never on its own ticker.
 	runtimeReportResender runtimeReportResender
+
+	// --- T3, live managed-process log streaming -------------------------
+	//
+	// All three are optional and derived by type assertion at construction,
+	// exactly like their cert/runtime siblings. Log streaming happens only
+	// when ALL THREE are present: something to ask for it (runtimeLogWake),
+	// something to produce it (runtimeLogPort), and something to carry it
+	// (runtimeLogPoster). Any one missing -- the POST transport, a driver
+	// fake, a test poster -- disables the whole path, including its ticker,
+	// with no conditional anywhere in the hot loop.
+	runtimeLogWake   <-chan json.RawMessage
+	runtimeLogPort   runtimeLogPort
+	runtimeLogPoster runtimeLogPoster
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -445,6 +501,21 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	if r, ok := d.RuntimeDriver.(runtimeReportResender); ok {
 		a.runtimeReportResender = r
 	}
+	// The log-streaming trio is derived ALL-OR-NOTHING on purpose. Wiring
+	// only the wake channel would leave Run's select ready to fire on a
+	// command with no port to apply it to, and wiring only the ticker would
+	// have it drain frames it has no way to send. Requiring all three makes
+	// every partial combination (a WS poster with a driver fake, a driver
+	// with a POST poster) a complete, panic-free no-op rather than a case
+	// each call site has to guard.
+	logWaker, hasLogWake := d.Poster.(runtimeLogWaker)
+	logPoster, hasLogPoster := d.Poster.(runtimeLogPoster)
+	logPort, hasLogPort := d.RuntimeDriver.(runtimeLogPort)
+	if hasLogWake && hasLogPoster && hasLogPort {
+		a.runtimeLogWake = logWaker.LogWatchUpdates()
+		a.runtimeLogPoster = logPoster
+		a.runtimeLogPort = logPort
+	}
 	return a
 }
 
@@ -498,6 +569,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if runtimeTicker != nil {
 		defer runtimeTicker.Stop()
 	}
+	logTicker, logTickerC := a.newRuntimeLogTicker()
+	if logTicker != nil {
+		defer logTicker.Stop()
+	}
 
 	for {
 		select {
@@ -520,6 +595,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.triggerRuntimeSync(ctx, nil)
 		case data := <-a.runtimeWake:
 			a.triggerRuntimeSync(ctx, data)
+		case data := <-a.runtimeLogWake:
+			// Applying the gateway's watch command is a bounded, purely
+			// in-memory map swap (internal/runtime.LogStore.SetWatch), so
+			// unlike the sync triggers around it there is nothing here worth
+			// a goroutine and a single-flight flag.
+			a.runtimeLogPort.SetLogWatch(data)
+		case <-logTickerC:
+			a.flushRuntimeLogs(ctx)
 		case <-a.runtimeTransitions:
 			// Immediate coalesced sample on a spec state transition (design
 			// spec §7): a portal click should feel like network latency, not
@@ -568,6 +651,54 @@ func (a *Agent) newRuntimeTicker() (*time.Ticker, <-chan time.Time) {
 	}
 	t := time.NewTicker(runtimePollInterval)
 	return t, t.C
+}
+
+// newRuntimeLogTicker builds the managed-process log flush ticker, or a nil
+// ticker and a nil channel when the log-streaming trio is not fully wired
+// (see NewFromDeps). A nil channel in Run's select never becomes ready, so
+// the hot loop needs no conditional branch to keep this case disabled --
+// the same shape as newCertTicker/newRuntimeTicker.
+//
+// The ticker runs unconditionally once wired, even with nothing watched: it
+// is a wakeup, not traffic. Drain returns nil on an unwatched fleet and
+// flushRuntimeLogs writes nothing, so a fleet nobody is looking at produces
+// no frames at all -- which is the point of the on-demand design.
+func (a *Agent) newRuntimeLogTicker() (*time.Ticker, <-chan time.Time) {
+	if a.runtimeLogPort == nil || a.runtimeLogPoster == nil {
+		return nil, nil
+	}
+	t := time.NewTicker(runtimeLogFlushInterval)
+	return t, t.C
+}
+
+// flushRuntimeLogs writes one runtime_log frame per watched spec that has
+// produced output since the last flush.
+//
+// It runs INLINE on Run's goroutine, never in a goroutine of its own, and
+// that is the load-bearing detail: this transport allows exactly one writer
+// per connection, and Post/PostSystemReport/PostRuntimeReport are all written
+// from this same loop. Spawning here would be a second writer racing them --
+// the precise defect class the client package's one-writer rule exists to
+// prevent.
+//
+// A write failure is dropped, not retried and not logged with any content:
+// the frames carry managed-process output, which may include prompt text and
+// must never reach a log line. The connection's own reconnect logic reaps a
+// dead peer, and the gateway re-establishes the subscription (with a fresh
+// scrollback) on the next connect, so a lost frame costs the operator a
+// gap they will see marked rather than silence.
+func (a *Agent) flushRuntimeLogs(ctx context.Context) {
+	if a.runtimeLogPort == nil || a.runtimeLogPoster == nil {
+		return
+	}
+	for _, frame := range a.runtimeLogPort.DrainLogFrames() {
+		if err := a.runtimeLogPoster.PostRuntimeLog(ctx, frame); err != nil {
+			slog.Debug("runtime log frame not delivered", "err", err)
+			// One failure means the connection is gone; the rest of this
+			// batch would fail identically.
+			return
+		}
+	}
 }
 
 // triggerRuntimeSync starts one runtime-config sync in its own goroutine

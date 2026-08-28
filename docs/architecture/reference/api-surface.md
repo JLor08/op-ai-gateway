@@ -160,6 +160,7 @@ semantics.
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
 | `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
 | `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**) |
+| `/api/portal/servers/{id}/runtime/logs?spec_id=…` | GET (SSE) | server | Live stdout+stderr of ONE managed process. Same ownership check, before the first stream byte; `400 runtime_logs.spec_required` without `spec_id`. Subscribing is what makes the agent stream, and unsubscribing is what stops it. |
 
 Conventions worth stating, because each is a judgement call a client depends on:
 
@@ -402,12 +403,18 @@ non-200. The empty document is reserved for the cases that genuinely mean
 
 ### 5.2 WebSocket frames and the runtime report
 
-Two frame types join the existing doorbells on `/api/agent/v1/stream`:
+Four frame types join the existing doorbells on `/api/agent/v1/stream`:
 
 | Frame | Direction | Payload |
 |---|---|---|
 | `runtime_config` | gateway → agent | The **complete** runtime-config document plus its `etag` — the first gateway→agent frame that carries a payload rather than being a content-free doorbell. Never a delta, never a command. Best-effort: a full per-connection queue drops it (logged at Debug) with no error, because the agent's own conditional GET is the authoritative path. |
 | `runtime_report` | agent → gateway | The same payload as the POST below. |
+| `runtime_log_config` | gateway → agent | `{"spec_ids":[…]}` — the **full** set of specs whose managed-process output the gateway currently wants streamed, never a delta. Sent on every subscribe/unsubscribe transition and restated (including as the empty set) on **every** new agent connection, so a watch set cannot outlive the connection it was issued on. A list of ids the gateway itself supplied is the entire expressive power of the frame: it can never carry an instruction. Not feature-gated — an agent that does not understand it discards it, whereas gating the send would skip a freshly started agent whose features are not yet known. |
+| `runtime_log` | agent → gateway | `{"spec_id","scrollback","entries":[{"pid","at","text","dropped_bytes","event","exit_code"}]}` — one spec's output since the previous flush. `event` is a closed, allow-listed set (`started`/`exited`); anything else is stripped on ingest. Relayed to open portal log views in memory and forgotten: **never stored, never logged**. |
+
+`dropped_bytes` means the same thing wherever it appears: *N bytes the process
+printed are missing immediately before this entry's text*. See
+[Agent-Managed Model Runtime §14](../cross-cutting/agent-runtime-manager.md#14-managed-process-logs-t3).
 
 The runtime report has different transport semantics on each path, and the WS
 mapping is a house convention that is easy to get wrong:

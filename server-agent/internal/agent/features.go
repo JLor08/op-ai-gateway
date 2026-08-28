@@ -42,6 +42,23 @@ type Feature struct {
 // Retire a feature by simply having the gateway stop declaring it.
 var Features = []Feature{
 	{Name: "runtime_manager", Since: "0.2.0"},
+	// runtime_logs: this agent understands the gateway's runtime_log_config
+	// command and streams a watched spec's managed-process stdout+stderr back
+	// as runtime_log frames.
+	//
+	// It is declared for the PORTAL's benefit rather than the agent's. An
+	// older agent already ignores an unknown frame type harmlessly, so
+	// nothing breaks without this name -- what breaks is the diagnosis: the
+	// operator opens a log view, nothing ever arrives, and an empty window is
+	// indistinguishable from "this model prints nothing", which is exactly
+	// the question they opened it to answer. The gateway checks this name
+	// before telling the portal a live view is possible.
+	//
+	// Since is 0.2.0, not a further bump, because this repository's rule is
+	// one version bump per SHIPPED CHANGE and not per commit: 0.2.0 is this
+	// feature branch's bump and has not shipped, so the binary that first
+	// carries this name is the same 0.2.0 that first carries runtime_manager.
+	{Name: "runtime_logs", Since: "0.2.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

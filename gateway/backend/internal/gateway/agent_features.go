@@ -19,7 +19,16 @@ import (
 // the agent declare it; each side computes that intersection independently.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
-var gatewayAgentFeatures = []string{"runtime_manager"}
+// runtime_logs is declared here for completeness of the negotiation contract
+// -- this gateway does understand runtime_log frames and does issue
+// runtime_log_config commands -- but note where the decision it gates actually
+// lives. Unlike runtime_manager, which the AGENT checks against this list
+// before managing anything (runtime.Driver.featureActive), runtime_logs is
+// checked in the other direction: the gateway consults the agent's DECLARED
+// set before telling a portal log view that a live stream is possible
+// (Server.runtimeLogState). An agent needs no permission to answer a command
+// it was sent.
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature}
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

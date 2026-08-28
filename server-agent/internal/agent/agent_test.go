@@ -15,6 +15,7 @@ import (
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/sample"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -163,8 +164,11 @@ func TestRunCollectsMergesPushes(t *testing.T) {
 	if err := json.Unmarshal(caps["features"], &features); err != nil {
 		t.Fatalf("Capabilities.features does not decode as a string array: %v (raw=%s)", err, got.Capabilities)
 	}
-	if len(features) != 1 || features[0] != "runtime_manager" {
-		t.Errorf("Capabilities.features = %v, want [runtime_manager]", features)
+	// Derived from the registry, not a second copy of it: what a sample must
+	// carry is exactly what this binary declares, in registry order --
+	// TestFeatureRegistry is what guards the contents of that registry.
+	if !reflect.DeepEqual(features, FeatureNames()) {
+		t.Errorf("Capabilities.features = %v, want %v (the declared registry, in order)", features, FeatureNames())
 	}
 }
 

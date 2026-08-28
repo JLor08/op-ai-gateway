@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,9 +37,18 @@ func TestAgentFeaturesEndpoint(t *testing.T) {
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
+	// Derived from the registry rather than repeating it: a second hand-kept
+	// copy of the feature list is exactly the shape that rots (this
+	// repository has the scar -- see agent.capabilitiesTemplate's doc). What
+	// this pins is the SHAPE -- the declared list verbatim and nothing else,
+	// in particular no in-body etag field -- not which names are in it.
+	wantBody, err := json.Marshal(agentFeaturesDTO{Features: gatewayAgentFeatures})
+	if err != nil {
+		t.Fatalf("marshal expected body: %v", err)
+	}
 	body := strings.TrimSpace(rec.Body.String())
-	if body != `{"features":["runtime_manager"]}` {
-		t.Fatalf("body = %s, want the static feature list, no etag field in-body", body)
+	if body != string(wantBody) {
+		t.Fatalf("body = %s, want the static feature list %s, no etag field in-body", body, wantBody)
 	}
 	etag := rec.Header().Get("ETag")
 	if etag == "" || !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
