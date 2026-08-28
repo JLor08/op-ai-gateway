@@ -1289,6 +1289,17 @@ func TestManagerPendingVRAMUnknownRateLimitsReEvaluation(t *testing.T) {
 	origInterval := notPermittedRetryInterval
 	notPermittedRetryInterval = 2 * time.Second
 	defer func() { notPermittedRetryInterval = origInterval }()
+	// There are now TWO callers of the measurer: this test's subject, the
+	// ADMISSION path (buildSnapshot), and the owner's housekeeping beat, which
+	// measures the live processes independently of any request. shrinkTimings
+	// puts that beat at 30ms, and the pinned spec below declares a GPU, so a
+	// tick landing anywhere in the request loop would add an invocation this
+	// test would read as a rate-limit failure -- a real flake, just a rare
+	// one. Push the beat out past the whole test instead of loosening the
+	// assertion, which is the part with the value in it. Restored by
+	// shrinkTimings' own cleanup, and read once when the Manager below builds
+	// its ticker, so it must be set BEFORE newTestManager.
+	idleTickInterval = 10 * time.Second
 
 	m := newTestManager(t, allowlistPolicy())
 
