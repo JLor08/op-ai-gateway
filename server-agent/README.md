@@ -30,9 +30,13 @@ Copy the token once (it is shown only at creation) and hand it to the agent via
 
 ## Configuration
 
-Every setting can be given three ways. Precedence, highest first:
+Almost every setting can be given three ways. Precedence, highest first:
 **command-line flag > environment variable > config file > built-in default.**
 `OP_AGENT_GATEWAY_URL` and `OP_AGENT_TOKEN` are required (from any source).
+Four settings are narrower, as their rows say: the two `runtime_allowed_*`
+lists have no flag form (env, comma-separated, or the file), and
+`cert_proxy_routes` / `cert_proxy_routes_mode` are structured values with
+**no env or flag form at all** — config file only.
 
 | Env                     | Flag             | Config key     | Default | Description                                                        |
 | ----------------------- | ---------------- | -------------- | ------- | ------------------------------------------------------------------ |
@@ -42,12 +46,16 @@ Every setting can be given three ways. Precedence, highest first:
 | `OP_AGENT_INTERVAL`     | `-interval`      | `interval`     | `1s`    | Collection cadence as a Go duration (e.g. `500ms`, `5s`). Clamped up to a **250ms** floor; a non-positive value falls back to `1s`. |
 | `OP_AGENT_SYSTEM_REPORT_INTERVAL` | `-system-report-interval` | `system_report_interval` | `30m` | POST-mode re-send cadence for the static hardware inventory (self-heals a gateway restart). Floored at `1m`. Ignored under `websocket` (which re-sends on each reconnect). |
 | `OP_AGENT_METRICS_URL`  | `-metrics-url`   | `metrics_url`  | —       | Optional inference `/metrics` (Prometheus text) URL to scrape for active/queued requests. |
+| `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
+| `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. The only Windows CPU-watt path; a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
 | `OP_AGENT_CERT_RELOAD_COMMAND` | `-cert-reload-command` | `cert_reload_command` | — | Local shell command run after a changed certificate is fully installed. Comes **only** from this local setting — the gateway can never deliver a command to run. |
 | `OP_AGENT_CERT_POLL_INTERVAL` | `-cert-poll-interval` | `cert_poll_interval` | automatic | How often the agent checks the gateway for a new certificate, as a Go duration (e.g. `15m`). Empty or `0`/`0s` means automatic (`websocket` transport polls every 6h, `post` every 15m). A configured positive value is floored at **1 minute** (a faster poll against a key-serving endpoint is a self-inflicted DoS). |
+| — (file only) | — (file only) | `cert_proxy_routes` | — (empty) | Local routes for the `cert_mode: proxy` listener, each `{"listen": <port>, "upstream": "http://host:port"}`. Empty means the agent serves only the routes the gateway publishes. Ignored unless `cert_mode` is `proxy`. |
+| — (file only) | — (file only) | `cert_proxy_routes_mode` | `fallback` | How a `cert_proxy_routes` entry is merged with a gateway-published route on the **same** listen port: `fallback` (the local route fills only a port the gateway did not publish) or `override` (the local route wins). |
 | `OP_AGENT_CA_FILE` | `-ca-file` | `ca_file` | — | Optional operator-managed public CA bundle. Read-only: the agent never overwrites it. |
 | `OP_AGENT_CA_CACHE_FILE` | `-ca-cache-file` | `ca_cache_file` | — | Optional agent-managed public CA cache. Generated self-signed mesh configs use `server-agent-ca.pem`. |
 | `OP_AGENT_CA_PEM` | `-ca-pem` | `ca_pem` | — | Optional inline public CA bootstrap bundle, generated only when the currently served gateway leaf uses the internal CA. |
@@ -56,7 +64,7 @@ Every setting can be given three ways. Precedence, highest first:
 | `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
-| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — so the derivation only yields an address when `cert_mode` is not `off` **and** a certificate has actually been installed. Otherwise **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. |
+| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
 
 ### Config file
@@ -88,6 +96,12 @@ with the per-server agent token (the gateway fills `token` from your bearer and
 curl -fL -H "Authorization: Bearer <per-server-agent-token>" \
   https://gw.example/api/agent/v1/download/config -o server-agent.json
 ```
+
+The example below is a hand-written **abbreviation** with a few values filled
+in, not that generated document: the generated one carries *every* key in the
+table above, each at its own default and with a comment on what its value — and
+its **empty** value — means. A checked-in copy of it lives at
+`testdata/server-agent.config.jsonc`.
 
 ```jsonc
 {

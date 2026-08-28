@@ -342,9 +342,23 @@ func requestOrigin(r *http.Request) string {
 }
 
 // buildAgentConfigJSON produces the annotated (JSONC) server-agent.json. The agent's
-// config loader strips whole-line // comments before parsing. Keep the keys/defaults
-// in sync with the server-agent fixture (until Task 4 consumes the trust keys)
-// AND the frontend's buildServerAgentConfig (AgentTokenSection.tsx).
+// config loader strips whole-line // comments before parsing, so the comments are
+// the operator's primary documentation for this file -- an operator who downloads
+// it reads nothing else before starting the agent.
+//
+// Every key the agent can read belongs here, at its own default, with a comment
+// saying what the value does AND what its empty value means -- the two are not the
+// same thing per key, which is the whole reason the comments exist:
+// runtime_allowed_binaries empty means NOTHING may start, while
+// runtime_allowed_dirs empty means ANY work_dir is accepted.
+//
+// This text is duplicated, unavoidably (two languages, two Go modules), in the
+// frontend's buildServerAgentConfig (AgentTokenSection.tsx) behind the portal's
+// download button. Neither copy can import the other, so both are held to one
+// generated golden -- server-agent/testdata/server-agent.config.jsonc -- byte for
+// byte, and that golden's key set is checked against every json tag on the agent's
+// own fileConfig by reflection. See the golden's doc in agent_binaries_test.go for
+// the full chain and how to regenerate it.
 func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
 	gw, _ := json.Marshal(material.GatewayURL)
 	caFile, _ := json.Marshal(material.CAFile)
@@ -394,8 +408,10 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
 
   // Certificate installation mode: "off" (default, never fetch a certificate),
   // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
-  // cert_reload_command on change), or "proxy" (accepted for a future release;
-  // NOT IMPLEMENTED YET, behaves like "files"). Required cert_dir when not "off".
+  // cert_reload_command on change), or "proxy" (everything "files" does, and
+  // additionally runs the agent-side TLS-terminating reverse proxy: it serves
+  // the routes the gateway publishes -- merged with cert_proxy_routes below --
+  // with the installed leaf). cert_dir is required when this is not "off".
   "cert_mode": "off",
 
   // Directory certificate files are written to. Required when cert_mode is not
@@ -412,6 +428,18 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // positive value below "1m" is clamped up to "1m".
   "cert_poll_interval": "",
 
+  // Local routes for the cert_mode "proxy" listener, each an object
+  // {"listen": <port>, "upstream": "http://host:port"}. Config-file only: no
+  // env var, no flag. Empty (the default) means the agent serves only the
+  // routes the gateway publishes. Ignored unless cert_mode is "proxy".
+  "cert_proxy_routes": [],
+
+  // How a cert_proxy_routes entry is merged with a gateway-published route on
+  // the SAME listen port: "fallback" (the default; the local route fills only
+  // a port the gateway did not publish) or "override" (the local route wins).
+  // Empty resolves to "fallback".
+  "cert_proxy_routes_mode": "fallback",
+
   // Optional operator-managed CA bundle. Generated configs leave this empty;
   // the agent never writes this file.
   "ca_file": ` + string(caFile) + `,
@@ -424,16 +452,51 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // currently served leaf is signed by the internal CA.
   "ca_pem": ` + string(caPEM) + `,
 
+  // Where the agent-managed model runtime's launch specs come from: "gateway"
+  // (the default -- fetched from the portal-maintained runtime-config
+  // endpoint) or "file" (read from runtime_config below and reported upward
+  // read-only, so the portal shows them but cannot change them).
+  "runtime_source": "gateway",
+
+  // Path to the local runtime-config JSON file. REQUIRED when runtime_source
+  // is "file"; never read otherwise. Relative to this config file when not
+  // absolute.
+  "runtime_config": "",
+
+  // Absolute paths a launch spec's "binary" must match EXACTLY -- compared
+  // byte for byte, so spell each one as the spec does:
+  // "/opt/llama/llama-server" on POSIX, "C:/llama/llama-server.exe" on
+  // Windows (forward slashes; a backslash would need JSON escaping).
+  // EMPTY (the default) MEANS NOTHING MAY START -- a deliberate hard refusal,
+  // not a permissive default: every spec reports not_permitted until its
+  // binary is listed here. Comes ONLY from this local file, and it is the
+  // operator's half of the contract: the gateway decides when and how a model
+  // process runs, this list decides whether it may run at all.
+  "runtime_allowed_binaries": [],
+
+  // Permitted "work_dir" prefixes for launch specs. Empty (the default) means
+  // ANY work_dir is accepted -- deliberately the inverse of the list above,
+  // so an operator who does not care need not enumerate the filesystem. Once
+  // non-empty, a spec that sets no work_dir is refused too. Containment is a
+  // lexical path-prefix check that does not resolve symlinks: defense in
+  // depth, not the boundary.
+  "runtime_allowed_dirs": [],
+
+  // Where the last known-good runtime-config document from the gateway is
+  // cached, so the agent can start (and keep) model processes before its first
+  // successful gateway contact. Empty (the default) means
+  // "server-agent-runtime.cache.json" next to the agent binary; a relative
+  // value is resolved beside this config file.
+  "runtime_cache": "",
+
   // Bind host for the agent-managed model runtime's router port -- the port the
   // gateway sends inference requests to for a server_agent application. This
   // value comes ONLY from this local file: the gateway supplies the router's
-  // PORT, never its bind host. Empty (the default) means the agent derives one
-  // -- its own mesh identity first, otherwise ALL INTERFACES with a warning in
-  // the agent log. Set it explicitly (e.g. the mesh IP, or "127.0.0.1") to
-  // decide that yourself. The rest of the managed-runtime settings
-  // (runtime_source, runtime_config, runtime_allowed_binaries,
-  // runtime_allowed_dirs, runtime_cache) are documented in the server-agent
-  // README; nothing starts at all until runtime_allowed_binaries is configured.
+  // PORT, never its bind host. Empty (the default) means derive one from the
+  // mesh leaf installed in cert_dir, and ALL INTERFACES -- with a warning in
+  // the agent log -- when there is none, which is what the empty cert_dir this
+  // file ships with gives you. Set it explicitly (the mesh IP, or
+  // "127.0.0.1") on any host that is not mesh-only.
   "runtime_router_bind": "",
 
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.
