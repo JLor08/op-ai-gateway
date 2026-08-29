@@ -85,6 +85,7 @@ function makeApp(overrides: Partial<PortalApplication> = {}): PortalApplication 
     benchmark_schedule_interval_seconds: 0,
     opportunistic_metrics_enabled: false,
     proxy_listen_port: 0,
+    proxy_excluded: false,
     reachable: true,
     last_checked_at: '2026-07-16T12:00:00Z',
     created_at: '2026-07-16T12:00:00Z',
@@ -500,10 +501,12 @@ describe('ApplicationSection reachability indicator', () => {
   });
 });
 
-// P4 Task 11: read-only proxy status, derived CLIENT-SIDE (no new backend
-// field) as scheme==="https" && proxy_listen_port!==0 -- see routing.
-// ApplicationEndpoint's identical derivation in the backend.
-describe('ApplicationSection proxy status indicator (P4 Task 11)', () => {
+// Read-only proxy status. 'proxied' is still derived CLIENT-SIDE as
+// scheme==="https" && proxy_listen_port!==0 (routing.ApplicationEndpoint's
+// identical derivation), but 'excluded' is the operator-owned flag and is
+// tested first, so the chip carries THREE distinct states rather than folding
+// a deliberate choice in with "waiting".
+describe('ApplicationSection proxy status indicator', () => {
   it('shows a proxied chip when scheme is https and a proxy_listen_port is assigned', async () => {
     renderSection({ apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_listen_port: 8601 })] });
     await screen.findByText('https://s1.example.test:8000');
@@ -520,6 +523,263 @@ describe('ApplicationSection proxy status indicator (P4 Task 11)', () => {
     renderSection({ apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_listen_port: 8601 })] });
     await screen.findByText('https://s1.example.test:8000');
     expect(screen.getByText(t.applicationNotProxied)).toBeInTheDocument();
+  });
+
+  it('shows a distinct excluded chip, not the amber not-proxied one', async () => {
+    renderSection({
+      apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_listen_port: 0, proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    expect(screen.getByText(t.applicationProxyChipExcluded)).toBeInTheDocument();
+    expect(screen.queryByText(t.applicationNotProxied)).toBeNull();
+  });
+
+  it('renders all three labels at once, so the enum filter can offer three states', async () => {
+    renderSection({
+      apps: [
+        makeApp({ id: 'app_1', scheme: 'https', proxy_listen_port: 8601 }),
+        makeApp({ id: 'app_2', port: 8002, scheme: 'http', proxy_listen_port: 0 }),
+        makeApp({ id: 'app_3', port: 8003, scheme: 'http', proxy_excluded: true }),
+      ],
+    });
+    await screen.findByText(t.applicationProxied);
+    expect(screen.getByText(t.applicationNotProxied)).toBeInTheDocument();
+    expect(screen.getByText(t.applicationProxyChipExcluded)).toBeInTheDocument();
+  });
+});
+
+// The per-application opt-out from the gateway's TLS proxy.
+describe('ApplicationSection proxy opt-out control', () => {
+  const proxyServer: PortalServer = { ...server, tls_proxy_state: 'proxy' };
+  const proxyCheckbox = () =>
+    screen.getByRole('checkbox', { name: t.applicationProxyExcluded }) as HTMLInputElement;
+
+  // SUBMIT DISCIPLINE. buildBody returns ONE literal reused verbatim for
+  // update, so a field added there is restated on EVERY save. Restating this
+  // one would silently rewrite the operator's opt-out from whatever the form
+  // last read — and return an ordinary 200 with nothing to notice.
+  it('omits proxy_excluded entirely when the operator did not move the checkbox', async () => {
+    const { updated } = renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox().checked).toBe(true);
+
+    fireEvent.change(screen.getByLabelText(t.applicationWeight), { target: { value: '7' } });
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect('proxy_excluded' in updated[0].body).toBe(false);
+    expect(updated[0].body.weight).toBe(7);
+  });
+
+  it('sends proxy_excluded with the moved value, and the scheme rides along in the same request', async () => {
+    const { updated } = renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_listen_port: 8601 })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox().checked).toBe(false);
+
+    fireEvent.click(proxyCheckbox());
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.proxy_excluded).toBe(true);
+    // ONE PATCH. Scheme and participation must land together: an excluded
+    // application on an in-scope server is in neither recovery arm, so a
+    // half-applied state would be permanent, not transient.
+    expect(updated[0].body.scheme).toBe('http');
+  });
+
+  // VISIBILITY. Only out_of_scope hides the control, and it renders an
+  // explanation in the slot rather than a blank.
+  it('renders the control with the proxy-mode sentence when the agent runs the proxy', async () => {
+    renderSection({ server: proxyServer, apps: [makeApp({ id: 'app_1' })] });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox()).toBeInTheDocument();
+    expect(screen.getByText(t.applicationProxyModeActiveNote)).toBeInTheDocument();
+  });
+
+  it('renders the control with the agent-off sentence when the agent reports off/files', async () => {
+    renderSection({
+      server: { ...server, tls_proxy_state: 'agent_off' },
+      apps: [makeApp({ id: 'app_1' })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox()).toBeInTheDocument();
+    expect(screen.getByText(t.applicationProxyModeOffNote)).toBeInTheDocument();
+  });
+
+  it('renders the control with the unknown sentence when nothing has been reported', async () => {
+    renderSection({
+      server: { ...server, tls_proxy_state: 'unknown' },
+      apps: [makeApp({ id: 'app_1' })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox()).toBeInTheDocument();
+    expect(screen.getByText(t.applicationProxyModeUnknownNote)).toBeInTheDocument();
+    expect(screen.queryByText(t.applicationProxyModeOffNote)).toBeNull();
+  });
+
+  // An older backend, or a DTO that lost the field, must SHOW the control.
+  it('defaults a missing tls_proxy_state to unknown rather than hiding the control', async () => {
+    renderSection({ apps: [makeApp({ id: 'app_1' })] });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox()).toBeInTheDocument();
+    expect(screen.getByText(t.applicationProxyModeUnknownNote)).toBeInTheDocument();
+  });
+
+  it('hides the control out of scope and explains why IN ITS PLACE, never a blank', async () => {
+    renderSection({
+      server: { ...server, tls_proxy_state: 'out_of_scope' },
+      apps: [makeApp({ id: 'app_1' })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.queryByRole('checkbox', { name: t.applicationProxyExcluded })).toBeNull();
+    // Asserted on the EXPLANATION, not merely on absence: an absence-only
+    // assertion passes for a blank slot too.
+    expect(screen.getByText(t.applicationProxyOutOfScopeNote)).toBeInTheDocument();
+  });
+
+  // THE OVERRIDE, non-negotiable: an operator must always be able to see and
+  // undo their own setting, even on a server that runs no proxy.
+  it('still renders the control out of scope when the application IS excluded', async () => {
+    renderSection({
+      server: { ...server, tls_proxy_state: 'out_of_scope' },
+      apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(proxyCheckbox().checked).toBe(true);
+  });
+
+  // SCHEME COUPLING.
+  it('disables the scheme select on a participating in-scope application and says why', async () => {
+    renderSection({ server: proxyServer, apps: [makeApp({ id: 'app_1', scheme: 'http' })] });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    const scheme = screen.getByRole('combobox', { name: t.applicationScheme });
+    expect(scheme).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByText(t.applicationSchemeManagedNote)).toBeInTheDocument();
+  });
+
+  it('leaves the scheme select enabled on an out-of-scope server', async () => {
+    renderSection({
+      server: { ...server, tls_proxy_state: 'out_of_scope' },
+      apps: [makeApp({ id: 'app_1', scheme: 'http' })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('combobox', { name: t.applicationScheme })).not.toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+  });
+
+  it('never re-sends http for an already-switched participating https application', async () => {
+    const { updated } = renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_listen_port: 8601 })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    // An unrelated save on a disabled select must re-send the STORED scheme,
+    // so it is a no-op rather than a downgrade window.
+    fireEvent.change(screen.getByLabelText(t.applicationWeight), { target: { value: '3' } });
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.scheme).toBe('https');
+  });
+
+  it('unticking forces http, the only re-entry into the proxy', async () => {
+    const { updated } = renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    fireEvent.click(proxyCheckbox());
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.proxy_excluded).toBe(false);
+    expect(updated[0].body.scheme).toBe('http');
+  });
+
+  it('warns about the operator own-TLS obligation only while excluded AND https', async () => {
+    renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByText(t.applicationProxyOwnTLSWarning(server.domain))).toBeInTheDocument();
+    // Re-entering the proxy forces http, which retires the obligation.
+    fireEvent.click(proxyCheckbox());
+    expect(screen.queryByText(t.applicationProxyOwnTLSWarning(server.domain))).toBeNull();
+  });
+
+  // THE READ-ONLY PORT: static text, never a form control, and 0 never renders
+  // as "0", as a blank, or as a dash.
+  it('renders the assigned proxy port as static text with no control of that name', async () => {
+    renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'https', proxy_listen_port: 8601 })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByText(t.applicationProxyPort(8601))).toBeInTheDocument();
+    expect(screen.queryByLabelText(/proxy.?listen.?port/i)).toBeNull();
+  });
+
+  it('spells out the not-yet-assigned state for a participating application', async () => {
+    renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_listen_port: 0 })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByText(t.applicationProxyPortUnassigned)).toBeInTheDocument();
+  });
+
+  it('says the excluded application holds no port at all', async () => {
+    renderSection({
+      server: proxyServer,
+      apps: [makeApp({ id: 'app_1', scheme: 'http', proxy_excluded: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByText(t.applicationProxyPortExcluded)).toBeInTheDocument();
+  });
+
+  // CREATE. The showProxyControls gate is load-bearing here: an out-of-scope
+  // https create must send NO key so the backend normalizes it, rather than an
+  // explicit false it would refuse.
+  it('sends proxy_excluded on create when the control is visible', async () => {
+    const { created } = renderSection({ server: proxyServer });
+    openCreate();
+    fireEvent.click(proxyCheckbox());
+    // In the form sub-view the submit button reuses the create label and the
+    // list's own create action is no longer rendered, so this is unambiguous.
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].proxy_excluded).toBe(true);
+  });
+
+  it('omits proxy_excluded on create when the control is hidden', async () => {
+    const { created } = renderSection({ server: { ...server, tls_proxy_state: 'out_of_scope' } });
+    openCreate();
+    // In the form sub-view the submit button reuses the create label and the
+    // list's own create action is no longer rendered, so this is unambiguous.
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect('proxy_excluded' in created[0]).toBe(false);
   });
 });
 

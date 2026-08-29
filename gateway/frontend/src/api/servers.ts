@@ -112,6 +112,18 @@ export type PortalServer = {
   // PortalServer literal fixtures across the test suite compile unchanged
   // (mirrors managed_runtime_only above).
   runtime_max_processes?: number;
+  // What the gateway's TLS proxy is doing on this server, so the
+  // per-application proxy opt-out can be rendered with a real reason instead of
+  // appearing out of nowhere: "out_of_scope" (the gateway runs no TLS proxy
+  // here), "proxy" / "agent_off" (the agent said so), "unknown" (nothing
+  // recent enough to say — normal after a gateway restart).
+  //
+  // OPTIONAL here, though the real wire DTO always carries it, so existing
+  // PortalServer fixtures compile unchanged (mirrors managed_runtime_only
+  // above). Consumers MUST default a missing value to "unknown", never to
+  // "out_of_scope": an older backend or a DTO that lost the field must SHOW
+  // the control, never hide it.
+  tls_proxy_state?: 'out_of_scope' | 'unknown' | 'agent_off' | 'proxy';
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
