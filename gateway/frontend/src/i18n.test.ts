@@ -2164,3 +2164,31 @@ describe('resolved-command masking strings state their own scope', () => {
     expect(messages.de.runtimeCommandTrimmedHere).toMatch(/diese Ansicht/i);
   });
 });
+
+describe('one-server_agent-per-server affordance i18n key', () => {
+  it('defines applicationTypeServerAgentTaken in de and en', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(typeof m.applicationTypeServerAgentTaken).toBe('string');
+      expect(m.applicationTypeServerAgentTaken.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('teaches the rule and the remedy rather than restating the 409', () => {
+    // The type field's helper line is read BEFORE the form is filled in, so it
+    // has room the toast does not: why the rule exists (one agent per server)
+    // and what to do instead (edit or delete the existing application). The
+    // 409's own string stays terse because formatPortalError prefixes it with
+    // the raw error code. Reusing that string here would have been one key
+    // fewer and one sentence that teaches nothing.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.applicationTypeServerAgentTaken).not.toBe(m.errorApplicationServerAgentExists);
+      expect(m.applicationTypeServerAgentTaken.length).toBeGreaterThan(
+        m.errorApplicationServerAgentExists.length,
+      );
+    }
+    expect(messages.en.applicationTypeServerAgentTaken).toMatch(/one agent runs per server/i);
+    expect(messages.en.applicationTypeServerAgentTaken).toMatch(/edit or delete/i);
+    expect(messages.de.applicationTypeServerAgentTaken).toMatch(/genau ein Agent/i);
+    expect(messages.de.applicationTypeServerAgentTaken).toMatch(/bearbeiten oder löschen/i);
+  });
+});

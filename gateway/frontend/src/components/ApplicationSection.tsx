@@ -534,6 +534,28 @@ export function ApplicationSection({
     const editing = mode !== 'create';
     // The app being edited (holds api_token_set); undefined on create.
     const editApp = typeof mode !== 'string' && mode.kind === 'edit' ? mode.app : undefined;
+    // One server_agent application per AI server, because only one agent runs
+    // per server. The rule is already enforced three levels down -- migration
+    // 68's partial unique index, the portal service's pre-read, and the 409
+    // application.server_agent_exists -- so this is purely the AFFORDANCE that
+    // says so BEFORE a whole form has been filled in, instead of only after
+    // the submit.
+    //
+    // It is not the enforcement and cannot be: `applications` is this
+    // component's local list, fetched once and never polled, and it reads as
+    // [] both while the first fetch is in flight and after one failed (the
+    // `?? []` above). Whenever it is wrong this gate silently opens; the 409
+    // is what actually holds the line, and submitCreate/submitEdit still
+    // render it.
+    //
+    // The `a.id !== editApp?.id` exclusion mirrors the backend's own
+    // excludeAppID exactly (create passes "", update passes app.ID), so the
+    // server's own server_agent application never collides with itself: its
+    // edit form keeps the type selected, selectable, and re-saveable, and can
+    // switch away and back before saving. Retyping any OTHER application to
+    // server_agent is blocked, which is the second write path the backend
+    // guards with the same sentinel.
+    const serverAgentTaken = serverAgentApps.some((a) => a.id !== editApp?.id);
     return (
       <>
         <Breadcrumbs
@@ -559,9 +581,29 @@ export function ApplicationSection({
               label={t.applicationType}
               value={type}
               onChange={(e) => handleTypeChange(e.target.value as ApplicationType)}
+              // A disabled control must say why -- but the reason rides on the
+              // FIELD, not on the option. MUI leaves `disabledItemsFocusable`
+              // false, so arrow-key navigation skips a disabled option
+              // entirely and anything anchored there (a Tooltip, a title) is
+              // unreachable by keyboard and screen reader -- issue #26's
+              // defect, made worse. `helperText` is wired to the combobox via
+              // aria-describedby, so it is announced on focus, before the menu
+              // is ever opened, and it is legible without a hover. It states
+              // the rule, the reason for it and the remedy; the 409 toast
+              // stays terse because it arrives after the fact and is already
+              // prefixed with its raw error code.
+              helperText={serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined}
             >
               {applicationTypeOptions.map((option) => (
-                <option value={option} key={option}>
+                <option
+                  value={option}
+                  key={option}
+                  // Disabled, never filtered out of the list: openEdit seeds
+                  // `type` from the row, and a value with no matching MenuItem
+                  // renders a BLANK combobox -- which buildBody would then
+                  // submit as a silent retype, since it always sends `type`.
+                  disabled={option === 'server_agent' && serverAgentTaken}
+                >
                   {option}
                 </option>
               ))}

@@ -359,6 +359,8 @@ const de = {
   modelMappings: 'Modell-Zuordnungen',
   modelMappingsIntro: 'Gateway-Modellnamen auf Anwendungs-Modellnamen abbilden.',
   applicationType: 'Typ',
+  applicationTypeServerAgentTaken:
+    'Pro Server läuft genau ein Agent — deshalb ist nur eine server_agent-Anwendung möglich. Dieser Server hat bereits eine: bearbeiten oder löschen Sie diese, statt eine zweite anzulegen.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -2293,6 +2295,8 @@ const en: PortalMessages = {
   modelMappings: 'Model Mappings',
   modelMappingsIntro: 'Map gateway model names to application model names.',
   applicationType: 'Type',
+  applicationTypeServerAgentTaken:
+    'Exactly one agent runs per server — so only one server_agent application is possible. This server already has one: edit or delete it instead of creating a second.',
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',

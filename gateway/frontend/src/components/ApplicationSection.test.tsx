@@ -7,6 +7,7 @@ import { ApplicationSection } from './ApplicationSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { formatDate } from './shared/format';
 import { messages } from '../i18n';
+import { PortalApiError } from '../api';
 import type {
   BenchmarkStatus,
   CreateApplicationRequest,
@@ -247,6 +248,19 @@ async function selectHealthMode(optionText: string) {
 async function selectType(optionText: string) {
   fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
   fireEvent.click(await screen.findByRole('option', { name: optionText }));
+}
+
+// Same, but for an option that may be DISABLED. A disabled MenuItem swallows
+// the click, so the menu stays open -- and an open MUI menu aria-hides the page
+// behind it, which makes the combobox itself unqueryable. Close the menu the
+// way an operator would before asserting on the field. Harmless when the click
+// landed and the menu closed on its own.
+async function attemptSelectType(optionText: string) {
+  fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+  fireEvent.click(await screen.findByRole('option', { name: optionText }));
+  const listbox = screen.queryByRole('listbox');
+  if (listbox !== null) fireEvent.keyDown(listbox, { key: 'Escape' });
+  await waitFor(() => expect(screen.queryByRole('listbox')).not.toBeInTheDocument());
 }
 
 afterEach(cleanup);
@@ -787,6 +801,175 @@ describe('ApplicationSection server_agent drill-down + managed_runtime_only', ()
 
     await screen.findByText(t.runtimeManagedOnlyBanner);
     fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent(
+      'server_agent',
+    );
+  });
+});
+
+// One server_agent application per AI server, because only one agent runs per
+// server. The rule is enforced three levels down (migration 68's partial
+// unique index, the portal service's pre-read, and the 409
+// application.server_agent_exists); what is asserted here is the AFFORDANCE
+// that says so before a whole form has been filled in -- plus, at the end, the
+// 409 itself, which stays the enforcement and must keep rendering.
+describe('ApplicationSection one server_agent application per server', () => {
+  const agentApp = () =>
+    makeApp({
+      id: 'app_agent',
+      type: 'server_agent',
+      port: 9100,
+      endpoint: 'https://s1.example.test:9100',
+    });
+
+  it('disables (rather than removes) the server_agent option once the server has one', async () => {
+    renderSection({ apps: [agentApp()] });
+    // Settling the fetch is load-bearing: the create button is not
+    // loading-gated, so clicking it synchronously would read the still-empty
+    // list and the test would pass for the wrong reason.
+    await screen.findByText('https://s1.example.test:9100');
+    openCreate();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+    const option = await screen.findByRole('option', { name: 'server_agent' });
+    // Still listed, still named, but not choosable -- a vanished option would
+    // teach nothing, and it is what blanks the edit form (see the edit tests).
+    expect(option).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('does not let the create form select a second server_agent', async () => {
+    renderSection({ apps: [agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+    openCreate();
+
+    await attemptSelectType('server_agent');
+
+    // 'ollama' is openCreate's seed on an ordinary server: the click was
+    // swallowed by the disabled item, so the type never moved.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent('ollama');
+  });
+
+  it('carries the reason on the type field, where focus alone reaches it', async () => {
+    renderSection({ apps: [agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+    openCreate();
+
+    // helperText -> aria-describedby on the combobox. A disabled MenuItem is
+    // skipped by the listbox's arrow-key navigation, so a tooltip anchored to
+    // the option would be unreachable by keyboard and screen reader.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveAccessibleDescription(
+      t.applicationTypeServerAgentTaken,
+    );
+  });
+
+  it('leaves the option live, and says nothing, on a server that has no agent application', async () => {
+    renderSection();
+    openCreate();
+
+    // Asserted with the menu shut: an open MUI menu aria-hides the page behind
+    // it, so the combobox is unreachable by role while the listbox is up.
+    expect(
+      screen.getByRole('combobox', { name: t.applicationType }),
+    ).not.toHaveAccessibleDescription();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+    expect(await screen.findByRole('option', { name: 'server_agent' })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+  });
+
+  it('keeps the existing server_agent application editable under its own type', async () => {
+    renderSection({ apps: [agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    // A gate written as "filter server_agent out of the options" leaves
+    // openEdit's setType(app.type) pointing at a value with no matching
+    // MenuItem, and MUI renders that as a BLANK combobox -- which buildBody
+    // would then submit as a retype, since it always sends `type`.
+    expect(combo).toHaveTextContent('server_agent');
+    expect(combo).not.toHaveAccessibleDescription();
+    fireEvent.mouseDown(combo);
+    expect(await screen.findByRole('option', { name: 'server_agent' })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+  });
+
+  it('lets that application switch its type away and back within one unsaved edit', async () => {
+    renderSection({ apps: [agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    await selectType('ollama');
+    await selectType('server_agent');
+
+    // The exclusion is keyed on the edited row's id, not on the form's current
+    // type: keying it on the type would strand this operator on 'ollama'.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent(
+      'server_agent',
+    );
+  });
+
+  it('blocks retyping another application to server_agent while one exists', async () => {
+    renderSection({ apps: [makeApp({ id: 'app_vllm', type: 'vllm' }), agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+
+    const vllmRow = screen.getByText('https://s1.example.test:8000').closest('tr') as HTMLElement;
+    fireEvent.click(within(vllmRow).getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent('vllm');
+
+    await attemptSelectType('server_agent');
+
+    // The second write path to the same violation; the backend guards it with
+    // the same sentinel, so the affordance must cover it too.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent('vllm');
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveAccessibleDescription(
+      t.applicationTypeServerAgentTaken,
+    );
+  });
+
+  it('still shows the type when a pre-invariant server holds two agent applications', async () => {
+    // Only reachable on a database that already held duplicates when migration
+    // 68 ran (the index is skipped there). Both rows stay editable: the option
+    // is disabled -- the OTHER duplicate really would collide -- but MUI
+    // computes the closed combobox's text from the matching child regardless
+    // of its disabled state, so nothing is blanked and nothing is lost.
+    renderSection({ apps: [makeApp({ id: 'app_a', type: 'server_agent' }), agentApp()] });
+    await screen.findByText('https://s1.example.test:9100');
+
+    const firstRow = screen.getByText('https://s1.example.test:8000').closest('tr') as HTMLElement;
+    fireEvent.click(within(firstRow).getByRole('button', { name: t.applicationEdit }));
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    expect(combo).toHaveTextContent('server_agent');
+    expect(combo).toHaveAccessibleDescription(t.applicationTypeServerAgentTaken);
+  });
+
+  it('still renders the 409 when the local list was stale, and keeps the form open', async () => {
+    // The affordance is not the enforcement and cannot be: this list is fetched
+    // once, never polled, and reads as [] both while the first fetch is in
+    // flight and after one failed. Rendered here with no applications at all,
+    // so the UI gate is open and only the backend stands.
+    const { fakeApi } = renderSection();
+    openCreate();
+    await selectType('server_agent');
+    fakeApi.createApplication.mockRejectedValueOnce(
+      new PortalApiError(
+        409,
+        'application.server_agent_exists',
+        'server already has a server_agent application',
+      ),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+
+    expect(
+      await screen.findByText(
+        `application.server_agent_exists: ${t.errorApplicationServerAgentExists}`,
+      ),
+    ).toBeInTheDocument();
+    // Form still open, typed data intact -- submitCreate only leaves on success.
     expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent(
       'server_agent',
     );

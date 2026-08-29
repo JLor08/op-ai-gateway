@@ -1858,6 +1858,44 @@ Four tabs: **launch specs**, the **co-residency matrix**, **server limits**, and
 enforced inside `portal.Service`, never in the gateway handler — see
 [Security, Authentication & Authorization](security-auth-rbac.md).
 
+**The type picker refuses a second `server_agent` before the form is filled in,
+not after.** At most one `server_agent` application may exist per AI server —
+only one agent runs there, and `AgentRuntimeConfig`'s "first match wins" lookup
+is deterministic only because of that. The rule is enforced three levels down
+(migration 68's partial unique index, the service's pre-read, and the 409
+`application.server_agent_exists`), but until it also reached the create/edit
+mask an operator could pick the type, fill in every field, submit, and only then
+be refused. `ApplicationSection` now **disables** the `server_agent` option, and
+states the reason on the field itself as `helperText`, whenever the server
+already holds an agent application other than the row being edited.
+
+Three details there are load-bearing and must not be "simplified":
+
+- **Disabled, never filtered out of the list.** Opening an edit seeds the form's
+  type from the row; a value with no matching menu item renders a *blank*
+  combobox, and the form body always sends `type` — so a filtered option would
+  turn the existing agent application's own edit form into a silent retype. The
+  predicate excludes the edited row's id, mirroring the service's `excludeAppID`
+  exactly (create passes `""`, update passes `app.ID`): that application keeps
+  its type selected, selectable and re-saveable, and can switch away and back
+  before saving, while retyping *any other* application to `server_agent` is
+  blocked — the second write path the backend guards with the same sentinel.
+- **The reason rides on the field, not on the option.** MUI leaves
+  `disabledItemsFocusable` false, so arrow-key navigation skips a disabled
+  option entirely and a tooltip or `title` anchored there would be unreachable
+  by keyboard and screen reader. `helperText` is wired to the combobox through
+  `aria-describedby`, so it is announced on focus, before the menu is opened.
+  Its wording carries the rule, the reason for it, and the remedy (edit or
+  delete the existing application); the 409's own string stays terse because
+  `formatPortalError` prefixes it with the raw error code.
+- **It is an affordance, not the enforcement.** The applications list is fetched
+  once and never polled, and it reads as empty both while the first fetch is in
+  flight and after one failed — and the create button is not loading-gated. In
+  each of those windows the gate silently opens, the operator submits, and the
+  409 is what refuses them, with the form left open and every typed value
+  intact. Neither the error-code mapping nor either store-level backstop may be
+  dropped on the grounds that "the portal prevents this now".
+
 On a server flagged `managed_runtime_only` the applications view steers the
 operator rather than letting them fail: a standing informational banner; the
 create button hidden once the server has its one `server_agent` application; the
