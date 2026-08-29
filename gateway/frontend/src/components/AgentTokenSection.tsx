@@ -185,6 +185,15 @@ export function buildServerAgentConfig(config: AgentConfigMaterial, token: strin
   // does not resolve symlinks: defense in depth, not the boundary.
   "runtime_allowed_dirs": [],
 
+  // When true, each runtime_allowed_binaries entry's PARENT directory is
+  // treated as an allowed work_dir prefix WITHOUT listing it in
+  // runtime_allowed_dirs above -- convenient when a model's work_dir sits
+  // beside its binary. false (the default) leaves work_dir handling unchanged.
+  // NOTE: turning this on while runtime_allowed_dirs is empty flips work_dir
+  // from "any is accepted" to "only the binary directories and their subtrees"
+  // (a spec that sets no work_dir still runs beside its binary either way).
+  "runtime_allow_binary_dirs": false,
+
   // Where the last known-good runtime-config document from the gateway is
   // cached, so the agent can start (and keep) model processes before its first
   // successful gateway contact. Empty (the default) means

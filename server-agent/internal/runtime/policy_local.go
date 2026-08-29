@@ -319,6 +319,19 @@ type LocalPolicy struct {
 	// work_dir is permitted -- unlike AllowedBinaries, an operator who does
 	// not care about work_dir containment is not forced to enumerate one.
 	AllowedDirs []string
+	// AllowBinaryDirs (R3), when true, treats each allowed binary's PARENT
+	// directory as an allowed dir WITHOUT the operator listing it in
+	// AllowedDirs -- so a spec whose work_dir sits under any allowlisted
+	// binary's own directory is permitted. It shares the exact subtree check
+	// (withinDir) that AllowedDirs uses, so an auto-added binary dir and an
+	// explicit AllowedDirs entry mean the same thing.
+	//
+	// FOOTGUN, stated because it is intended: turning this on while AllowedDirs
+	// is empty flips work_dir handling from permissive (any work_dir) to
+	// restrictive (only the binary subtrees, plus R2's empty case) -- exactly as
+	// adding the first AllowedDirs entry does. Same operator-only provenance as
+	// the two allowlists: it comes ONLY from the agent's own config.
+	AllowBinaryDirs bool
 }
 
 // effectiveWorkDir is the directory a spec's child process ACTUALLY runs in
@@ -398,12 +411,29 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	if spec.WorkDir == "" {
 		return nil
 	}
-	if len(p.AllowedDirs) == 0 {
+	// R3: the effective allowed set is AllowedDirs plus, when AllowBinaryDirs is
+	// on, each allowlisted binary's PARENT directory. An entirely empty set --
+	// no AllowedDirs and the toggle off -- means containment was never
+	// configured, so any work_dir is permitted (unchanged from before R3).
+	if len(p.AllowedDirs) == 0 && !p.AllowBinaryDirs {
 		return nil
 	}
 	for _, dir := range p.AllowedDirs {
 		if withinDir(spec.WorkDir, allowedDirBase(dir)) { // R4: <dir>/* is an accepted synonym for the bare subtree
 			return nil
+		}
+	}
+	// The auto-added binary dirs are plain paths handed to the SAME withinDir
+	// subtree check R4's non-wildcard path uses, so R3 and R4 agree on
+	// semantics by construction. AllowedBinaries is guaranteed non-empty here
+	// (the empty-allowlist gate returned early above), so the toggle always has
+	// at least one dir to add. A non-absolute entry can never permit anything
+	// (it was skipped by the binary match above), so it contributes no dir.
+	if p.AllowBinaryDirs {
+		for _, b := range p.AllowedBinaries {
+			if filepath.IsAbs(b) && withinDir(spec.WorkDir, filepath.Dir(b)) {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("runtime: work_dir %q is not within any allowed directory", spec.WorkDir)

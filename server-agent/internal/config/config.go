@@ -196,6 +196,16 @@ type Config struct {
 	// policy, with the same operator-only provenance as
 	// RuntimeAllowedBinaries. Nil (unset) means any work_dir is permitted.
 	RuntimeAllowedDirs []string
+	// RuntimeAllowBinaryDirs, when true, treats each RuntimeAllowedBinaries
+	// entry's PARENT directory as an allowed work_dir prefix WITHOUT the
+	// operator listing it in RuntimeAllowedDirs (see
+	// internal/runtime.LocalPolicy.AllowBinaryDirs). Same operator-only
+	// provenance as the two allowlists: it comes ONLY from this local config.
+	// false (the default) leaves work_dir handling exactly as it was. Turning
+	// it on while RuntimeAllowedDirs is empty flips work_dir from permissive to
+	// restrictive (binary subtrees only), the same flip adding the first
+	// RuntimeAllowedDirs entry causes.
+	RuntimeAllowBinaryDirs bool
 	// RuntimeCachePath is where the runtime process-state cache is
 	// persisted. Defaults to defaultRuntimeCacheName next to the binary. A
 	// relative value from the config file is anchored beside that config
@@ -292,8 +302,12 @@ type fileConfig struct {
 	RuntimeConfigPath      string   `json:"runtime_config"`
 	RuntimeAllowedBinaries []string `json:"runtime_allowed_binaries"`
 	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
-	RuntimeCachePath       string   `json:"runtime_cache"`
-	RuntimeRouterBindHost  string   `json:"runtime_router_bind"`
+	// RuntimeAllowBinaryDirs is a pointer bool (matching TLSInsecure/Verbose)
+	// so an absent key is distinguishable from an explicit false -- required by
+	// the reflection parity test and resolveBool's env>file precedence.
+	RuntimeAllowBinaryDirs *bool  `json:"runtime_allow_binary_dirs"`
+	RuntimeCachePath       string `json:"runtime_cache"`
+	RuntimeRouterBindHost  string `json:"runtime_router_bind"`
 
 	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
 	RuntimeLogBufferTotalBytes int `json:"runtime_log_buffer_total_bytes"`
@@ -411,6 +425,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
 		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
 		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
 		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
 

@@ -410,6 +410,55 @@ func TestPermitWorkDirWildcardEntryWindows(t *testing.T) {
 	}
 }
 
+// TestPermitAllowBinaryDirs is R3's boundary table. With the toggle ON, each
+// allowlisted binary's PARENT directory is treated as an allowed dir without the
+// operator listing it in AllowedDirs; with it OFF, behaviour is exactly as
+// before this field existed. The auto-added dirs go through the SAME withinDir
+// subtree check R4's non-wildcard path uses, so R3 and R4 agree on semantics by
+// construction -- including the separator boundary that keeps a sibling out.
+func TestPermitAllowBinaryDirs(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  LocalPolicy
+		workDir string
+		wantOK  bool
+	}{
+		// Toggle ON, AllowedDirs empty: only the binary subtrees (and R2's
+		// empty case) are permitted -- the intended permissive->restrictive
+		// flip.
+		{"on: work_dir under a binary's own dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin/models", true},
+		{"on: work_dir IS a binary's own dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin", true},
+		{"on: work_dir under a SECOND binary's dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama", "/opt/vllm/bin/vllm"}, AllowBinaryDirs: true}, "/opt/vllm/bin/run", true},
+		{"on: work_dir outside every binary dir is rejected", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/srv/models", false},
+		{"on: sibling of a binary dir with a shared prefix is rejected", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin-evil", false},
+		// Toggle ON, AllowedDirs also set: the effective set is the UNION.
+		{"on: work_dir under an explicit AllowedDirs entry still passes", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}, AllowBinaryDirs: true}, "/srv/models/x", true},
+		{"on: work_dir under the binary dir passes even when AllowedDirs excludes it", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}, AllowBinaryDirs: true}, "/usr/bin/x", true},
+		// A non-absolute allowlist entry contributes no binary dir (it can never
+		// permit anything), so it must not widen the set.
+		{"on: a relative binary entry contributes no dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama", "ollama"}, AllowBinaryDirs: true}, "/anywhere", false},
+
+		// Toggle OFF: behaviour is exactly as today. Empty AllowedDirs => any
+		// work_dir; a set AllowedDirs => only within it; the binary dir gets NO
+		// special treatment.
+		{"off: empty AllowedDirs permits any work_dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}}, "/anywhere/at/all", true},
+		{"off: work_dir under the binary dir is NOT auto-allowed", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}}, "/usr/bin/x", false},
+		{"off: work_dir within AllowedDirs still passes", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}}, "/srv/models/x", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: tc.workDir}
+			err := tc.policy.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(work_dir=%q) = %v, want nil (permitted)", tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(work_dir=%q) = nil, want an error (not permitted)", tc.workDir)
+			}
+		})
+	}
+}
+
 // TestExpandPlaceholdersPort proves ${PORT} in args resolves to the chosen
 // listen port, given as a plain decimal string.
 func TestExpandPlaceholdersPort(t *testing.T) {

@@ -184,6 +184,50 @@ Mid-path globbing, and any convention where `**` would mean a subtree, are
 explicitly not supported: the operator's only need is a trailing star standing
 for the subtree, which the bare entry already delivers, and a real glob would
 move containment off the audited `withinDir` for a capability nobody asked for.
+`runtime_allow_binary_dirs` (§3.1.2) reuses this same `withinDir` subtree check,
+so the auto-added binary directories and the wildcard entries agree on semantics
+by construction.
+
+#### 3.1.2 `runtime_allow_binary_dirs` auto-allows each binary's parent directory
+
+The agent config toggle `runtime_allow_binary_dirs` /
+`OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (a bool, **no flag form**, same
+operator-only provenance as the two allowlists) treats each
+`runtime_allowed_binaries` entry's **parent directory** as an allowed `work_dir`
+prefix without the operator also listing it in `runtime_allowed_dirs`. It is
+consumed inside `Permit`, after the explicit `AllowedDirs` loop: for each
+absolute allowed binary, `withinDir(spec.WorkDir, filepath.Dir(binary))`. A
+non-absolute allowlist entry contributes no directory (it can never permit a
+binary, so it must not widen the work-dir set either), and `AllowedBinaries` is
+guaranteed non-empty at that point because the empty-allowlist gate returned
+early, so the toggle always has at least one directory to add.
+
+Because those auto-added directories are plain paths handed to the **same**
+`withinDir` that the explicit `runtime_allowed_dirs` entries use (§3.1.1), R3 and
+R4 agree on containment by construction — a binary directory permits its subtree
+and rejects a separator-boundary sibling exactly as an explicit entry does.
+
+**Composition (R2/R3/R4).** The three are orthogonal and funnel through the one
+audited primitive:
+
+- **R2 stands alone.** An empty `work_dir` returns `nil` at the top of Permit's
+  work-dir section, before any `AllowedDirs`/`AllowBinaryDirs` logic; the
+  binary's own directory is trusted by `runtime_allowed_binaries` and needs no
+  auto-allow plumbing to pass.
+- **R3 governs a non-empty `work_dir`** that sits under a binary's parent
+  directory; it enlarges the effective allowed set.
+- **R4 governs how each `runtime_allowed_dirs` entry is matched**;
+  `allowedDirBase` normalises the trusted entry and `withinDir` does the
+  untrusted-candidate containment.
+
+All three leave `withinDir` and its symlink/TOCTOU acceptance exactly as audited;
+`runtime_allowed_binaries` (exact, absolute match) remains the real boundary and
+work-dir containment stays defence in depth.
+
+**Footgun, intended:** turning `runtime_allow_binary_dirs` on while
+`runtime_allowed_dirs` is empty flips work-dir handling from permissive (any) to
+restrictive (the binary subtrees, plus R2's empty case) — the same flip adding
+the first `runtime_allowed_dirs` entry causes.
 
 ### 3.2 Placeholders, and why no secret enters the gateway
 
@@ -3349,6 +3393,7 @@ registers, over the authoritative table in
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
 | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
 | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
+| `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
 | `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
