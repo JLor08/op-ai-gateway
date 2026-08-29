@@ -718,9 +718,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
 
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), {
-      target: { value: 'gw-new' },
-    });
+    // Only the app model name is entered on create; the gateway name is derived
+    // from it (see the "derives the gateway name" test for the ownership rule).
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -735,7 +734,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
 
     await waitFor(() => expect(created).toHaveLength(1));
-    expect(created[0].gateway_model_name).toBe('gw-new');
+    // Both names equal the app value: the gateway name is derived, not typed.
+    expect(created[0].gateway_model_name).toBe('app-new');
     expect(created[0].app_model_name).toBe('app-new');
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
@@ -755,7 +755,6 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
   it('rejects a reserved env key before ever calling the API', async () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -781,7 +780,6 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     async (key) => {
       const { created, putSpecs } = renderSection();
       fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-      fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
       fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
       fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
         target: { value: '/usr/bin/llama-server' },
@@ -805,7 +803,6 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
   it('accepts the cache/home redirection keys the agent deliberately does not reserve', async () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -880,7 +877,6 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     );
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -973,7 +969,6 @@ describe('RuntimeAdminSection edit + delete', () => {
 describe('RuntimeAdminSection placeholder validation (mirrors the agent policy)', () => {
   async function openCreateAndFillBase() {
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -1132,7 +1127,6 @@ describe('RuntimeAdminSection arguments field contract (hint + warnings)', () =>
   it('warns rather than refuses: the pasted line still saves if the operator insists', async () => {
     const { created, putSpecs } = renderSection();
     await openCreateForm();
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -1252,7 +1246,6 @@ describe('RuntimeAdminSection arguments field contract (hint + warnings)', () =>
   it('flags meaningful trailing whitespace but never rewrites or blocks it', async () => {
     const { putSpecs } = renderSection();
     await openCreateForm();
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -3338,7 +3331,6 @@ describe('RuntimeAdminSection duplicate GPU index (task 22b, C5)', () => {
     const { putSpecs, created } = renderSection();
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -3815,9 +3807,6 @@ describe('RuntimeAdminSection specsSettled survives a create (fix round 1, C3)',
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), {
-      target: { value: 'gw-new' },
-    });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -3905,7 +3894,6 @@ describe('RuntimeAdminSection mapping delete takes a ticket (fix round 1, M5)', 
     });
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -4334,7 +4322,6 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     });
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -4640,7 +4627,6 @@ describe('RuntimeAdminSection spec GPU picker', () => {
     fireEvent.change(indexField, { target: { value: '2' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecVram), { target: { value: '18000' } });
 
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -4707,7 +4693,6 @@ describe('RuntimeAdminSection set_visible_devices', () => {
   // Returns nothing: every assertion below is about what the form did with it.
   async function openCreateWithVisibleDevices() {
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -4788,7 +4773,6 @@ describe('RuntimeAdminSection set_visible_devices', () => {
   it('accepts a hand-set visibility variable when the option is off', async () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -5185,20 +5169,25 @@ describe('RuntimeAdminSection spec form ownership', () => {
     expect(await screen.findByText(t.statusDisabled)).toBeInTheDocument();
   });
 
-  it('keeps the gateway model name editable on CREATE and sends no status', async () => {
+  it('derives the gateway model name from the app model name on CREATE', async () => {
     const { created } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
 
-    // CREATE is the exception, and not for cosmetic reasons: this form creates
-    // the MAPPING first and keys the spec PUT by the id it returns, the backend
-    // refuses an empty gateway name, and this is the ONLY mapping-create path a
-    // server_agent application has.
-    const gateway = document.querySelector('#runtime-spec-gateway-name');
-    expect(gateway).not.toHaveAttribute('readonly');
-    expect(gateway).toHaveAttribute('required');
+    // CREATE has NO separate gateway field. The operator enters only the
+    // application model name; the gateway name is DERIVED from it (== app name),
+    // exactly as model discovery seeds a new mapping for an ordinary application
+    // (GatewayModelName == AppModelName == the discovered name). A distinct
+    // gateway alias is set LATER on the Modell-Zuordnung tab's edit, where the
+    // gateway name is editable -- the discovery-then-rename flow. So the form
+    // carries one rule here, not a create/edit special case.
+    expect(document.querySelector('#runtime-spec-gateway-name')).toBeNull();
+    expect(screen.queryByLabelText(t.mappingGatewayName)).toBeNull();
+    // The app model name IS present, and it is the only required model field.
+    expect(document.querySelector('#runtime-spec-app-name')).toHaveAttribute('required');
+    // The status select stays gone: the mapping owns status and the spec PUT has
+    // no such field.
     expect(document.querySelector('#runtime-spec-status')).toBeNull();
 
-    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
@@ -5206,8 +5195,10 @@ describe('RuntimeAdminSection spec form ownership', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
 
     await waitFor(() => expect(created).toHaveLength(1));
-    // No status: CreateMapping normalises an absent status to active, which is
-    // byte-for-byte what the removed hard-coded 'active' produced.
-    expect(created[0]).toEqual({ gateway_model_name: 'gw-new', app_model_name: 'app-new' });
+    // The BODY the fake actually received -- gateway == app, both the app value,
+    // and no status (CreateMapping normalises an absent status to active).
+    // Asserting the recorded body rather than a re-derivation is deliberate: an
+    // earlier round found a fake that hid the very bug its test named.
+    expect(created[0]).toEqual({ gateway_model_name: 'app-new', app_model_name: 'app-new' });
   });
 });

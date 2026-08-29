@@ -2232,12 +2232,22 @@ export function RuntimeAdminSection({
       // the removed hard-coded 'active' produced -- so this form carries ONE
       // rule (it never sends status) rather than a create/edit special case.
       //
-      // The gateway name, by contrast, MUST be sent here and must stay
-      // editable: this call creates the mapping whose id keys the spec PUT
-      // below, the backend refuses an empty gateway name, and this form is the
-      // only mapping-create path a server_agent application has.
+      // Gateway name == app model name on CREATE. The operator enters ONLY the
+      // application model name (there is no gateway field on create -- see the
+      // form below); the gateway name is DERIVED from it, exactly as model
+      // discovery seeds a new mapping for an ordinary application
+      // (GatewayModelName == AppModelName == the discovered name,
+      // service_applications.go). The backend requires a non-empty gateway name
+      // (ErrMappingGatewayNameRequired) and sending the app name satisfies it.
+      //
+      // Ownership rule: a DISTINCT gateway alias is set LATER on the
+      // Modell-Zuordnung tab's edit, where the gateway name is editable -- the
+      // same discovery-then-rename flow non-agent applications use. Do NOT
+      // re-add a gateway field to this create form: that would make the operator
+      // enter one name twice and re-create the two-writers hazard the ownership
+      // split removes.
       mapping = await api.createMapping(application.id, {
-        gateway_model_name: gatewayName,
+        gateway_model_name: appName,
         app_model_name: appName,
       });
       setMappings((current) => [mapping, ...(current ?? [])]);
@@ -3103,39 +3113,41 @@ export function RuntimeAdminSection({
                 status; the RUNTIME SPEC owns the application model name,
                 because that name IS the spec's `upstream_model` -- the only
                 thing ${MODEL} expands to when the agent builds the process
-                argv. So the gateway name is shown here (a spec is unreadable
-                without knowing which model it serves) and edited one tab to
-                the left, and the status select is gone entirely: it edited the
-                MAPPING and never reached putRuntimeSpec, whose request type has
-                no status field at all.
+                argv. So on EDIT the gateway name is SHOWN read-only (a spec is
+                unreadable without knowing which model it serves) and edited one
+                tab to the left, and the status select is gone entirely: it
+                edited the MAPPING and never reached putRuntimeSpec, whose
+                request type has no status field at all.
 
-                Do not confuse the removed select with the "Aktiv" checkbox
-                below. That one is `spec.enabled`, which decides whether this
-                spec enters the agent's runtime-config document -- a different
-                question from whether the gateway routes the model. */}
+                On CREATE there is NO gateway field: the operator enters only
+                the application model name and `submitCreate` DERIVES the gateway
+                name from it (gateway == app), exactly as model discovery seeds a
+                new mapping. A distinct gateway alias is set later on the
+                Modell-Zuordnung tab's edit -- the discovery-then-rename flow.
+                Ownership rule: do not re-add a gateway field here, or the
+                operator types one name twice and two screens write it again.
+
+                Do not confuse the removed status select with the "Aktiv"
+                checkbox below. That one is `spec.enabled`, which decides whether
+                this spec enters the agent's runtime-config document -- a
+                different question from whether the gateway routes the model. */}
             <Typography variant="subtitle2" component="h3">
               {t.runtimeSpecModelSection}
             </Typography>
-            <Field
-              id="runtime-spec-gateway-name"
-              label={t.mappingGatewayName}
-              value={gatewayName}
-              // EDIT-only read-only, and the no-op is load-bearing: jsdom fires
-              // `change` on a readOnly input, so a live handler would still
-              // drive state and give a test a false green. CREATE keeps the
-              // field writable -- see `submitCreate`.
-              onChange={editing ? () => {} : (e) => setGatewayName(e.target.value)}
-              required
-              // readOnly, never `disabled`: the value's whole job here is to be
-              // READ, and a readonly input is barred from HTML constraint
-              // validation, so `required` cannot block submit either.
-              {...(editing
-                ? {
-                    inputProps: { readOnly: true },
-                    helperText: t.runtimeSpecGatewayNameReadOnly,
-                  }
-                : {})}
-            />
+            {editing && (
+              <Field
+                id="runtime-spec-gateway-name"
+                label={t.mappingGatewayName}
+                value={gatewayName}
+                // Read-only on EDIT, and the no-op is load-bearing: jsdom fires
+                // `change` on a readOnly input, so a live handler would still
+                // drive state and give a test a false green. The mapping owns
+                // this name; the Modell-Zuordnung tab edits it.
+                onChange={() => {}}
+                inputProps={{ readOnly: true }}
+                helperText={t.runtimeSpecGatewayNameReadOnly}
+              />
+            )}
             <Field
               id="runtime-spec-app-name"
               label={t.mappingAppName}
