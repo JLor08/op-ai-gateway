@@ -2352,10 +2352,13 @@ than any viewport has — scrolling past headers you cannot see while hunting fo
 a cell is how the matrix stops being usable. The mechanism is
 `writing-mode: vertical-rl` plus `transform: rotate(180deg)`, deliberately not a
 bare `rotate(-90deg)`: the writing-mode form gives the label a genuinely
-vertical layout *box*, so ordinary table layout reserves the right footprint and
-each header stays over its own column. A bare transform leaves the box
-horizontal, which is what forces the explicit heights and absolute positioning
-that then drift a few pixels per column. Bottom-to-top is the Western
+vertical layout *box*, where a bare transform leaves the box horizontal, which
+is what forces the explicit heights and absolute positioning that then drift a
+few pixels per column. That vertical box does **not**, by itself, make the table
+column reserve the right footprint — whether it does is an engine-by-engine
+fact, and an earlier revision of this paragraph asserted the opposite. See
+**The column has to be made to measure its own rotated header** below, which is
+the bug that assertion hid. Bottom-to-top is the Western
 data-table/chart-axis convention and it puts the *start* of the name next to the
 cells it labels. The rotation is
 CSS over intact text — never images or per-character markup — so the header's
@@ -2406,6 +2409,59 @@ is equally true of the headers, which keep theirs) but because a row label is
 already horizontal running text, so a tooltip would repeat the same characters
 in the same orientation.
 
+**The column has to be made to measure its own rotated header**, and one box
+shape is what makes every engine do it. A `vertical-rl` label is an *orthogonal
+flow*: its **block** size runs along the table's inline axis, so a column is
+wide enough for a wrapped header only if the layout asks the rotated box for
+that block size. Blink and Gecko ask. **WebKit does not** — Safari on macOS and
+iOS, and every WKWebView, which is where an operator reported column headers
+overprinting each other. Measured with the `<tbody>` removed, so the column is
+sized by its header alone (one 51-character name, three line boxes, rotated box
+72 px, cell padding 4 + 4 px): Chromium 80 px, Firefox 80 px, **WebKit 8 px** —
+the padding, and nothing from the rotated box at all. The column then falls back
+to its only other content, the 46 px checkbox cell, for *any* line count, and
+the rotated box hangs out of it to the right. Two extents cross the column edge
+at different line counts, and which one is meant matters: the label's border box
+is 24 px per line box, while its **ink** — the union of the text-run rects, what
+is actually painted — is 8 px narrower (4 px of half-leading each side).
+Measured in WebKit for a header of *L* ≥ 2 line boxes in a 46 px column, the box
+crosses into the next header's box by `24·L − 46` px (+2 / +26 / +50 / +74 at
+*L* = 2…5) and the ink over the next header's ink by `24·L − 54` px (−6 / +18 /
++42 / +66), both constant at every container width from 1400 px down to 360 px
+and at 5, 8 and 14 specs. So the *box* crosses the boundary from two line boxes
+on and the *glyphs* first overprint at three — a 44-character name at this font
+and this cap. The fix is to wrap the label in a `display: grid` box, whose
+intrinsic sizing does derive an orthogonal child's block size in all three
+engines; `justify-content: center` on that wrapper replaces the `mx: 'auto'`
+that used to centre the label, and correcting that is why Gecko is *not*
+byte-identical before and after: a one-line header sat flush against its
+column's left edge in Firefox (0 px auto margins where Chromium and WebKit
+resolved 7 px) and now sits at 11 px from the cell edge in all three. Blink is
+byte-identical at all 54 configurations sampled. **Grid and not flex**: both are
+right on a freshly loaded page in all three engines, but only grid survives a
+re-render, which this component does on every telemetry poll — measured over 400
+randomised re-renders from one mount, grid failed 0 renders in WebKit and flex
+31 (Chromium and Firefox: 0 for both). Flex's failure is this same defect, not a
+worse one: `overflow` computes to `visible` throughout, every line box is still
+painted, no character is lost, and its ink-over-ink overlap measures identical
+to the unfixed component.
+
+**That fix trades horizontal room for correctness, and only WebKit pays.** Each
+column whose header wraps to *L* ≥ 2 line boxes grows by `24·L − 38` px — 10 px
+at two lines, 34 px at three, 58 px at four — and a single-line header costs
+nothing. Measured in WebKit with the same fourteen realistic specs the
+`width: auto` paragraph below uses (thirteen columns, eight of them two-line
+and five one-line, so 8 × 10 px = 80 px): at a 900 px container or wider the
+table goes from 790 px to 870 px wide with its height unchanged at 828 px; at an
+800 px container the table is pinned at 800 px, the row-label column gives up
+192 → 122 px and the table grows **828 → 1107 px tall** (nothing scrolls in
+either case — `scrollWidth` equals `clientWidth` at 800 px); at 700 px and below
+it goes 707 → 787 px and now overflows the enclosure, which scrolls, with the
+height unchanged at 1287 px. At five specs the same fix costs 376 → 396 px and
+at eight 514 → 564 px. `overflowX: auto` absorbs the growth only where the table
+already exceeds its container; between the two shrink-to-fit widths it is paid
+in row height instead, which is the lossless degradation described above.
+
 **The wrap mode is `overflow-wrap: break-word` on both axes, and specifically
 not `anywhere`.** Both wrap and neither drops a character; they differ only in
 the min-content size the box reports, and on the horizontal axis that difference
@@ -2430,9 +2486,15 @@ the wrap mode (measured: a 43-character hyphen-free name holds at exactly 160 px
 at both 1100 px and 600 px inside a 15-spec grid). On the **vertical** header
 axis the choice is measurably free — `anywhere` and `break-word` give identical
 geometry there (header row 168.5 px, span 160 px, widest header column 56 px,
-two line boxes, at both 1100 px and 600 px), because table layout distributes
-*width* and a `vertical-rl` box's inline size is its height. One declaration is
-used for both axes so the component teaches one rule.
+two line boxes, at both 1100 px and 600 px), and re-measured after the grid
+wrapper landed: identical in Chromium, Firefox and WebKit over 48 comparisons
+(1 to 5 line boxes × 1100 px and 600 px containers × three engines), 0
+differences. That is what was measured, and the earlier gloss on it — "because
+table layout distributes *width* and a `vertical-rl` box's inline size is its
+height" — is dropped rather than kept: it reasons about the axis that was never
+at risk in order to conclude something about the axis that was, which is the
+same false premise the paragraphs above correct. One declaration is used for
+both axes so the component teaches one rule.
 
 **The table shrinks to its content (`width: auto`)**, overriding MUI's
 `width: 100%`, and that is what makes the row-label cap reach the *column*

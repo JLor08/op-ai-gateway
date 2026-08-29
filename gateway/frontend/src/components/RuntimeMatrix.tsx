@@ -132,23 +132,42 @@ function canonicalPair(x: string, y: string): [string, string] {
  * layout reserves the right footprint and the header stays glued to its
  * column". True in Blink and Gecko. False in WebKit -- i.e. Safari on macOS
  * and iOS, and every WKWebView, which is where an operator reported the
- * headers overprinting each other.
+ * headers overprinting each other. The same sentence stood in the canonical
+ * architecture doc (cross-cutting/agent-runtime-manager.md) for one commit
+ * longer than it stood here; it is corrected there now, and the numbers below
+ * are repeated there rather than living only in a commit message.
  *
  * A rotated box is an ORTHOGONAL FLOW: its BLOCK size runs along the table's
  * inline axis, so a column can only be wide enough for a wrapped header if
- * the layout asks the rotated box for that block size. Measured with a
- * header-only column (the checkbox body cell zeroed, one 51-character name,
- * 3 line boxes, rotated box 72px): Chromium 80px, Firefox 80px, WebKit
- * 16.16px -- one character's advance plus padding, i.e. WebKit measures the
- * text as if it had never been rotated and contributes ~nothing. In the real
- * grid the column then falls back to its only other content, the 46px
- * checkbox cell, for ANY line count; the rotated box still lays out at its
- * correct 24px-per-line block size and simply hangs out of the cell to the
- * right, onto the next header's glyphs. Measured overlap 24*L - 54 px at L
- * line boxes: negative (clear) at 1 and 2, +18px at 3, +42px at 4, +66px at
- * 5 -- and constant at every container width (1400 down to 360) and every
- * column count. Three line boxes is a 44-character name at this font and
- * this 160px cap, which real GGUF names reach easily.
+ * the layout asks the rotated box for that block size. Measured with the
+ * <tbody> removed entirely, so the column is sized by its header alone (one
+ * 51-character name, 3 line boxes, rotated box 72px, cell padding 4+4px):
+ *
+ *     Chromium 80px    Firefox 80px    WebKit 8px
+ *
+ * 8px is the padding. WebKit contributes NOTHING from the rotated box -- not
+ * a reduced amount, none. In the real grid the column then falls back to its
+ * only other content, the 46px checkbox cell, for ANY line count; the rotated
+ * box still lays out at its correct 24px-per-line block size and simply hangs
+ * out of the cell to the right, onto the next header's glyphs.
+ *
+ * TWO EXTENTS OVERLAP AT DIFFERENT LINE COUNTS, so say which one you mean.
+ * The label's BORDER BOX is 24px per line box. Its INK -- the union of the
+ * text-run rects, i.e. what is actually painted -- is 8px narrower, 4px of
+ * half-leading on each side. Measured in WebKit for a header of L >= 2 line
+ * boxes in a 46px column, against the NEXT header:
+ *
+ *     box into next header's box   24*L - 46    +2  +26  +50  +74  (L = 2..5)
+ *     ink over next header's ink   24*L - 54    -6  +18  +42  +66  (L = 2..5)
+ *
+ * So the BOX crosses the column boundary from TWO line boxes on, while the
+ * GLYPHS -- the overprinting an operator can see, and the thing that was
+ * reported -- first touch at THREE. Both hold at every container width
+ * measured (1400 down to 360) and at 5, 8 and 14 specs. The one exception is
+ * in the safe direction: a ONE-LINE neighbour's 24px label still fits its
+ * 46px column, so `mx: auto` centres it and buys 7px more clearance. Three
+ * line boxes is a 44-character name at this font and this 160px cap, which
+ * real GGUF names reach easily.
  *
  * `display: grid` on the wrapper is what makes every engine ask. Measured one
  * declaration at a time in WebKit with a 3-line name: grid and flex wrappers
@@ -160,19 +179,64 @@ function canonicalPair(x: string, y: string): [string, string] {
  * reopens the bug.
  *
  * GRID AND NOT FLEX, and that is the one thing here that cannot be guessed
- * from the CSS. Both are correct on a freshly loaded page. Only grid stays
- * correct when the component RE-RENDERS, which this one does on every
- * telemetry poll: measured in WebKit over 400 randomised re-renders (varying
- * name length, spec count and container width on one page), grid failed 0 and
- * flex failed 248. Flex's failure is worse than the bug it was meant to fix --
- * WebKit sizes the rotated box itself from a stale line count, so a 5-line
- * name gets a 2-line box and the extra lines are CLIPPED, i.e. characters
- * lost, the one outcome this component is built to prevent. Chromium and
- * Firefox pass both ways (0 failures in 300 re-renders each), so no amount of
- * testing in those two would have separated them.
+ * from the CSS. Both are correct on a freshly loaded page, in all three
+ * engines. Only grid stays correct when the component RE-RENDERS, which this
+ * one does on every telemetry poll: measured over 400 randomised re-renders
+ * from a SINGLE mount (2-9 specs, 360-1499px container, names of 1 to 6 line
+ * boxes, seeded), in WebKit grid produced 0 bad renders and flex 31 -- 0 and
+ * 32 bad columns out of 1750. Chromium and Firefox: 0 for both, so no amount
+ * of testing in those two would have separated them.
  *
- * The wrapper costs one element and changes nothing in Blink or Gecko
- * (measured byte-identical there, before and after).
+ * FLEX FAILS THE SAME WAY THE BUG DOES, NOT WORSE, and the claim that it
+ * CLIPS characters -- which is what this comment said first -- measures
+ * FALSE. In the failing renders `overflow` computes to `visible` on both the
+ * wrapper and the label, every line box is present and painted (a 5-line name
+ * still reports 5 line-box rects spanning 120px), and no character is lost.
+ * What goes stale is the flex CONTAINER, which keeps the previous render's
+ * width; the rotated label overflows it and hangs out, exactly as it does
+ * unfixed. Measured on the deterministic worst case (mount a 1-line name,
+ * re-render to L lines, 5 specs, 1100px), the wrapper stays 38px wide against
+ * a scrollWidth of 55 to 127, and flex's ink-over-ink overlap is
+ * -6 / +18 / +18 / +42 / +66
+ * at L = 2..6 -- IDENTICAL to the un-fixed component; only the BOX overlap is
+ * smaller (-22px, constant), because the stale box is one line wide. So flex
+ * is this same defect on ~8% of re-renders instead of all of them. That is a
+ * sufficient reason to reject it and it is the TRUE one. A rejected
+ * alternative dismissed for a reason that does not measure is how it gets
+ * reinstated by the next person who checks.
+ *
+ * The wrapper costs one element. In BLINK it changes nothing: measured
+ * byte-identical before and after at all 54 sampled configurations (24 with
+ * the realistic 14-name set at 3 spec counts x 8 container widths, 30 with
+ * uniform names at 1-6 line boxes x 5 container widths) -- column widths, row
+ * heights, header-row height, table box and the label's offset inside its
+ * cell. In GECKO IT IS NOT byte-identical, and the `justify-content` paragraph
+ * below says why: every configuration containing a ONE-LINE header moves,
+ * because that is the second defect this fixes. Everything else in Gecko is
+ * identical.
+ *
+ * THE COST IS HORIZONTAL, ONLY WEBKIT PAYS IT, AND IT IS NOT SMALL. Each
+ * column whose header wraps to L >= 2 line boxes grows by 24*L - 38 px (10px
+ * at 2 lines, 34px at 3, 58px at 4, 82px at 5); a one-line header costs
+ * nothing. Measured in WebKit with fourteen realistic specs -- thirteen
+ * columns, eight of them two-line and five one-line, so 8 x 10px = 80px; the
+ * same set the `width: auto` note below is measured on, and it reproduces
+ * that note's 870 x 828px table in Chromium to the pixel:
+ *
+ *     container >= 900px   table 790 -> 870px wide, height unchanged (828px)
+ *     container    800px   table pinned at 800px; the row-label column gives
+ *                          up 192 -> 122px and the table grows 828 -> 1107px
+ *                          TALL (+34%). Nothing scrolls in either
+ *                          (scrollWidth === clientWidth === 800).
+ *     container <= 700px   table 707 -> 787px, which now overflows the
+ *                          enclosure and scrolls; height unchanged (1287px)
+ *
+ * At five specs it is 376 -> 396px and at eight 514 -> 564px. Do not quote
+ * the five-identical-3-line-names case (376 -> 512px) as "the cost": that is
+ * a synthetic worst case, not a realistic grid. `overflowX: auto` absorbs the
+ * growth only where the table already exceeds its container; in the band
+ * between the two shrink-to-fit widths it is paid in ROW HEIGHT instead,
+ * which is the lossless degradation the row-label note below documents.
  *
  * `justify-content: center` is where the label's centring lives now, and it
  * quietly fixes a second, smaller cross-engine defect. It replaces
@@ -201,10 +265,12 @@ function canonicalPair(x: string, y: string): [string, string] {
  * Wrapping spends the abundant axis instead of characters: a second 24px-wide
  * vertical line beside the first, so the header's own footprint is 24*L plus
  * the cell's 2x4px padding -- 32px at one line, 56px at two -- and the header
- * row is 168.5px. The COLUMN is 46px until two lines, but that floor is the
- * checkbox body cell, not the header, and the distinction is worth keeping
- * straight: "the column is 46px whatever the header needs" is precisely the
- * broken WebKit behaviour described above. Reading order survives, because
+ * row is 168.5px once a name reaches the cap (168px in WebKit, which rounds
+ * the row differently; the column widths above are identical in all three).
+ * The COLUMN is 46px until two lines, but that floor is the checkbox body
+ * cell, not the header, and the distinction is worth keeping straight: "the
+ * column is 46px whatever the header needs" is precisely the broken WebKit
+ * behaviour described above. Reading order survives, because
  * after the 180° turn line 1 is the LEFT vertical line and line 2 the right,
  * i.e. ordinary reading order once your head is tilted the way the rotation
  * already assumes.
@@ -256,8 +322,9 @@ function ColumnHeader({ model }: Readonly<{ model: string }>) {
       <Tooltip title={model}>
         {/* THE SIZING WRAPPER. Not a spacer and not tidiness: it is the one
             box shape every engine measures an orthogonal child through, and
-            `grid` specifically -- `flex` measures it right once and wrong on
-            every re-render. See the doc block above for the measurements. */}
+            `grid` specifically -- `flex` measures it right on a fresh load
+            and stale on 31 of 400 WebKit re-renders, which reopens exactly
+            this bug. See the doc block above for the measurements. */}
         <Box sx={{ display: 'grid', justifyContent: 'center' }}>
           <Box
             component="span"
@@ -275,11 +342,12 @@ function ColumnHeader({ model }: Readonly<{ model: string }>) {
               // the choice is measurably free -- `anywhere` and `break-word`
               // give byte-identical geometry (header row 168.5px, span 160px,
               // widest header column 56px, 2 line boxes, at BOTH a 1100px and
-              // a 600px container), and re-measured after the wrapper landed,
-              // byte-identical in Chromium, Firefox AND WebKit at 1 to 7 line
-              // boxes. The reason is that nothing on this axis is squeezed:
-              // the inline size of a `vertical-rl` box is its HEIGHT, and no
-              // table column, grid track or viewport competes for that.
+              // a 600px container). Re-measured after the wrapper landed:
+              // identical in Chromium, Firefox AND WebKit -- column widths,
+              // header-row height, table box, row heights, line counts and
+              // the label's offset in its cell -- over 48 comparisons (1 to 5
+              // line boxes x 1100px and 600px containers x 3 engines), 0
+              // differences.
               //
               // Say only that. The version of this note that shipped first
               // reasoned "table layout distributes WIDTH" and concluded the

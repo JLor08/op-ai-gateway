@@ -410,10 +410,14 @@ describe('RuntimeMatrix rotated column headers', () => {
   // anywhere else in this file. jsdom performs no layout, so this test cannot
   // see the defect it guards: in WebKit (Safari, and every WKWebView) the
   // table column does not measure a rotated child's block size at all, so a
-  // header wrapped onto three or more vertical lines used to hang out of its
-  // own cell and paint on top of the NEXT column's name -- measured 18px of
-  // overprinting at 3 line boxes, 42px at 4, at every container width. The
-  // pixels live in a real browser; see ColumnHeader's doc block for them.
+  // wrapped header used to hang out of its own cell and paint on top of the
+  // NEXT column's name. Two extents, two thresholds: the label's BORDER BOX
+  // crosses the column boundary from TWO line boxes on (24*L - 46 px: +2 at
+  // 2, +26 at 3, +50 at 4), while its INK -- the painted text run, 8px
+  // narrower -- first overprints at THREE (24*L - 54 px: -6 at 2, +18 at 3,
+  // +42 at 4). Both are constant at every container width and spec count
+  // measured. The pixels live in a real browser; see ColumnHeader's doc block
+  // for them and for the conditions.
   //
   // What this CAN pin is the DOM and CSS shape that measurement blessed, so
   // that flattening the wrapper away -- or "simplifying" grid to flex, which
@@ -421,7 +425,8 @@ describe('RuntimeMatrix rotated column headers', () => {
   // would actually catch a regression is a Playwright assertion comparing
   // each header's ink box against its own <th> IN A WEBKIT PROJECT; the
   // repo's e2e suite runs Chromium, where this bug is invisible in every
-  // configuration tried (0 failures in 4320).
+  // configuration measured (0 bad columns out of 1750 over 400 randomised
+  // re-renders, grid and flex alike, and the same in Firefox).
   it('gives the rotated label a grid parent, the one box shape every engine measures it through', () => {
     const { container } = render(
       <RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
@@ -438,11 +443,13 @@ describe('RuntimeMatrix rotated column headers', () => {
     const style = getComputedStyle(wrapper);
     // `grid`, and NOT `flex`. Both are correct on a freshly painted page.
     // Only grid survives a re-render, which this component does on every
-    // telemetry poll: measured in WebKit over 400 randomised re-renders, grid
-    // failed 0 and flex failed 248 -- and flex's failure mode is worse than
-    // the bug, because it sizes the rotated box from a stale line count and
-    // CLIPS the overflowing lines. Losing characters is the one outcome the
-    // wrapping above exists to prevent.
+    // telemetry poll: measured in WebKit over 400 randomised re-renders from
+    // one mount, grid failed 0 renders and flex 31. Flex's failure is the
+    // BUG BACK, not something worse: nothing is clipped (`overflow` computes
+    // to `visible`, every line box is painted, no character is lost) and its
+    // ink-over-ink overlap measures identical to the un-fixed component. That
+    // is reason enough -- but the reason has to be the true one, or grid gets
+    // "simplified" back to flex by the next reader who checks.
     expect(style.display).toBe('grid');
     // The centring lives on the wrapper now. It used to be `mx: 'auto'` on
     // the label, where the auto margins ran along the label's BLOCK axis and
