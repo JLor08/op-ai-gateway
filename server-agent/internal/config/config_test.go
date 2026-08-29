@@ -1087,6 +1087,49 @@ func TestRuntimeAllowedBinariesAndDirsNilWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestRuntimeAllowBinaryDirsResolution proves the R3 bool follows the no-flag
+// env > file > default(false) precedence of resolveBool (the TLSInsecure/Verbose
+// family), and that the pointer *bool in fileConfig keeps an explicit false in
+// the file distinguishable from "absent" -- both resolve to false, but for
+// different reasons, and the env can override a file true back to false.
+func TestRuntimeAllowBinaryDirsResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// default: off, and absent stays a nil pointer in the file (byte-neutral).
+	if cfg, err := Load(base, noenv); err != nil || cfg.RuntimeAllowBinaryDirs {
+		t.Fatalf("default RuntimeAllowBinaryDirs = %v (err %v), want false", cfg.RuntimeAllowBinaryDirs, err)
+	}
+
+	// file true.
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_allow_binary_dirs":true}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || !cfg.RuntimeAllowBinaryDirs {
+		t.Fatalf("file RuntimeAllowBinaryDirs = %v (err %v), want true", cfg.RuntimeAllowBinaryDirs, err)
+	}
+
+	// env true over an absent file value.
+	envOn := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS" {
+			return "true"
+		}
+		return ""
+	}
+	if cfg, err := Load(base, envOn); err != nil || !cfg.RuntimeAllowBinaryDirs {
+		t.Fatalf("env RuntimeAllowBinaryDirs = %v (err %v), want true", cfg.RuntimeAllowBinaryDirs, err)
+	}
+
+	// env false wins over a file true (env > file).
+	envOff := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS" {
+			return "false"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, envOff); err != nil || cfg.RuntimeAllowBinaryDirs {
+		t.Fatalf("env-over-file RuntimeAllowBinaryDirs = %v (err %v), want false (env > file)", cfg.RuntimeAllowBinaryDirs, err)
+	}
+}
+
 // TestRuntimeCachePathPrecedence proves flag > env > file > the
 // next-to-binary default for RuntimeCachePath, mirroring the defaultConfigName
 // precedent (TestExplicitMissingConfigErrors's use of the executable() seam).
@@ -1332,6 +1375,9 @@ func TestGeneratedAgentConfigLoadsToDocumentedDefaults(t *testing.T) {
 	}
 	if len(cfg.RuntimeAllowedDirs) != 0 {
 		t.Errorf("RuntimeAllowedDirs = %v, want empty -- the generated default must keep accepting any work_dir", cfg.RuntimeAllowedDirs)
+	}
+	if cfg.RuntimeAllowBinaryDirs {
+		t.Error("RuntimeAllowBinaryDirs = true, want false -- the generated default must leave work_dir handling unchanged")
 	}
 	if base := filepath.Base(cfg.RuntimeCachePath); base != defaultRuntimeCacheName {
 		t.Errorf("RuntimeCachePath = %q, want a path ending in %q (an empty runtime_cache must still get the built-in default)", cfg.RuntimeCachePath, defaultRuntimeCacheName)

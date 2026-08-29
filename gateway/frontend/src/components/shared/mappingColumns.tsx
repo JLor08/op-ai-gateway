@@ -29,6 +29,15 @@ import { applicationStatusLabelByKey } from './application';
  * two entries read the same two fields, but the other nine describe a spec.
  * It is a different table that shares two columns.
  */
+// The ListTable persistence key for this table -- column order, visibility,
+// sort and page size. It lives HERE, beside the column definition, for the
+// same reason the columns do: the two screens that render this table must share
+// ONE saved layout, not two that drift. (An earlier version deliberately gave
+// the server_agent mapping tab its own key; the operator asked for the opposite
+// -- "die sollen dieselbe benutzen" -- so the split is retired and cannot
+// silently come back, because both call sites import this one constant.)
+export const MAPPING_TABLE_STORAGE_KEY = 'op.mappings';
+
 export function mappingColumns(t: Translation): ListColumn<PortalModelMapping>[] {
   return [
     {

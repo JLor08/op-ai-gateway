@@ -2717,6 +2717,69 @@ func TestManagerVisibleDevicesOffLeavesTheChildEnvironmentAlone(t *testing.T) {
 	}
 }
 
+// TestManagerEmptyWorkDirRunsBesideTheBinary is R2 proved end to end, on the
+// real Apply -> EnsureRunning -> startProcess -> exec path: a spec with an
+// EMPTY work_dir must launch its child in the binary's OWN directory, not in
+// whatever cwd the agent happens to have. baseSpec sets no work_dir, so this is
+// the ordinary case; the child records its actual os.Getwd() via -cwd-log,
+// which is the only way to observe from the parent where the manager launched
+// it. Before R2 the child inherited the test process's cwd; after R2, cmd.Dir
+// is effectiveWorkDir(spec) = filepath.Dir(spec.Binary).
+func TestManagerEmptyWorkDirRunsBesideTheBinary(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	cwdLog := filepath.Join(t.TempDir(), "cwd")
+	spec := baseSpec("spec-a", "model-a")
+	spec.WorkDir = "" // explicit: an empty work_dir must default to the binary's dir
+	spec.Args = append(stubArgs(0, 0, 0, ""), "-cwd-log", cwdLog)
+
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	defer release()
+
+	want := filepath.Dir(stubchildPath)
+	got := readCwdLog(t, cwdLog)
+	// The stub reports its resolved cwd; compare resolved forms so a symlinked
+	// TMPDIR (e.g. /var -> /private/var on macOS) does not flake the match.
+	if resolve(t, got) != resolve(t, want) {
+		t.Errorf("child ran in %q, want the binary's own directory %q (R2: an empty work_dir runs beside the binary)", got, want)
+	}
+}
+
+// readCwdLog reads a stubchild -cwd-log file, polling until the child has
+// written it during its own startup (a read racing the exec would flake).
+func readCwdLog(t *testing.T, path string) string {
+	t.Helper()
+	var record string
+	waitUntil(t, 5*time.Second, "child to write its cwd log at "+path, func() bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		record = string(data)
+		return record != ""
+	})
+	return record
+}
+
+// resolve returns the symlink-resolved absolute path, falling back to the input
+// when resolution fails (a path that does not exist resolves to itself here).
+func resolve(t *testing.T, p string) string {
+	t.Helper()
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
 // TestManagerVisibleDevicesRefusalIsNotPermitted pins how the two refusals
 // SURFACE to an operator: as StateNotPermitted with the explanation in
 // LastError.Message, on the same path every other ExpandPlaceholders refusal

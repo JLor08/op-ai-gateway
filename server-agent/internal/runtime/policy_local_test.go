@@ -62,36 +62,46 @@ func TestPermitEmptyAllowlistRejectsEverything(t *testing.T) {
 	}
 }
 
-// TestPermitEmptyWorkDirHasItsOwnMessage pins the improved diagnostic: an
-// absent work_dir under a configured AllowedDirs must say so, not render as
-// `work_dir "" is not within any allowed directory` (which reads like a
-// containment near-miss). This text is the only explanation an operator
-// gets -- it surfaces verbatim as Status.LastError.Message next to
-// StateNotPermitted -- so it must name the agent-side setting, and must NOT
-// leak the configured directory VALUES upward to the gateway.
-func TestPermitEmptyWorkDirHasItsOwnMessage(t *testing.T) {
+// TestPermitEmptyWorkDirDefaultsToBinaryDir is R2's Permit half, and the
+// inversion of the old TestPermitEmptyWorkDirHasItsOwnMessage (which asserted
+// an empty work_dir under a configured AllowedDirs was REFUSED). An empty
+// work_dir now means "run beside the binary"; the binary's own directory is
+// trusted by construction because the binary is on the exact AllowedBinaries
+// allowlist, so it is permitted UNCONDITIONALLY -- even when AllowedDirs is
+// configured and does NOT contain the binary's directory. This stands alone,
+// with no dependency on runtime_allow_binary_dirs (R3): the binary dir needs no
+// auto-allow plumbing to be trusted.
+func TestPermitEmptyWorkDirDefaultsToBinaryDir(t *testing.T) {
+	// AllowedDirs is configured and deliberately does NOT include /usr/bin
+	// (where the allowlisted binary lives): the empty work_dir must still pass.
 	p := LocalPolicy{
 		AllowedBinaries: []string{"/usr/bin/ollama"},
 		AllowedDirs:     []string{"/srv/models", "/data/weights"},
 	}
-	err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: ""})
-	if err == nil {
-		t.Fatal("Permit with an empty work_dir under a configured AllowedDirs = nil, want a refusal")
+	if err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: ""}); err != nil {
+		t.Fatalf("Permit with an empty work_dir = %v, want nil (an empty work_dir runs beside the binary, which is trusted by construction)", err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "no work_dir") {
-		t.Errorf("Permit error = %q, want it to state plainly that the spec sets no work_dir", msg)
+
+	// And with no AllowedDirs configured at all, unchanged: still permitted.
+	bare := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}}
+	if err := bare.Permit(Spec{ID: "s2", Binary: "/usr/bin/ollama", WorkDir: ""}); err != nil {
+		t.Fatalf("Permit(empty work_dir, no AllowedDirs) = %v, want nil", err)
 	}
-	if !strings.Contains(msg, "OP_AGENT_RUNTIME_ALLOWED_DIRS") {
-		t.Errorf("Permit error = %q, want it to name the agent-side setting that caused the restriction", msg)
+}
+
+// TestEffectiveWorkDir pins the pure helper the three R2 touch points share: an
+// explicit work_dir is returned verbatim (so the reportable command and cmd.Dir
+// keep matching the spec, and command_test's non-empty case stays green), and
+// an empty one resolves to the binary's own directory.
+func TestEffectiveWorkDir(t *testing.T) {
+	if got := effectiveWorkDir(Spec{Binary: "/usr/bin/ollama", WorkDir: "/srv/models"}); got != "/srv/models" {
+		t.Errorf("effectiveWorkDir(explicit) = %q, want the spec's work_dir verbatim", got)
 	}
-	for _, dir := range p.AllowedDirs {
-		if strings.Contains(msg, dir) {
-			t.Errorf("Permit error = %q leaks the configured allowed directory %q; this message travels to the gateway", msg, dir)
-		}
+	if got := effectiveWorkDir(Spec{Binary: "/usr/bin/ollama", WorkDir: ""}); got != "/usr/bin" {
+		t.Errorf("effectiveWorkDir(empty) = %q, want the binary's directory %q", got, "/usr/bin")
 	}
-	if strings.Contains(msg, `work_dir "" is not within`) {
-		t.Errorf("Permit error = %q is still the generic containment wording", msg)
+	if got := effectiveWorkDir(Spec{Binary: "/opt/vllm/bin/vllm"}); got != "/opt/vllm/bin" {
+		t.Errorf("effectiveWorkDir(empty, nested binary) = %q, want %q", got, "/opt/vllm/bin")
 	}
 }
 
@@ -183,7 +193,10 @@ func TestPermitWorkDirContainment(t *testing.T) {
 		{"dot-dot traversal escaping the allowed dir", "/srv/models/../models-evil", false},
 		{"dot-dot traversal staying inside", "/srv/models/llama3/../llama3", true},
 		{"dot-dot traversal to parent", "/srv/models/..", false},
-		{"empty work_dir", "", false},
+		// R2: an empty work_dir is permitted on its own merit (it runs beside
+		// the binary), independent of AllowedDirs -- so even here, with
+		// /usr/bin/ollama's dir NOT under the configured /srv/models, it passes.
+		{"empty work_dir runs beside the binary", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,6 +252,211 @@ func TestPermitNoAllowedDirsMeansAnyWorkDir(t *testing.T) {
 
 	if err := p.Permit(spec); err != nil {
 		t.Errorf("Permit with no AllowedDirs configured = %v, want nil (any work_dir permitted)", err)
+	}
+}
+
+// TestPermitWorkDirWildcardEntry is R4's security-boundary table, driven through
+// the PUBLIC Permit path so the untrusted candidate takes the exact route it
+// takes in production (filepath.Clean + separator-boundary containment in
+// withinDir), never a glob engine. A trailing whole-segment wildcard
+// ("<dir>/*") is an EXACTLY EQUIVALENT spelling of the bare subtree entry: it
+// must permit the directory and everything strictly beneath it, and must NEVER
+// permit a path outside that tree. The reject rows are the whole point -- a
+// wildcard that admits a sibling, a "..", or a separator jump is a critical
+// defect, not a bug.
+//
+// The POSIX shape is fully exercised here on the Linux CI runner; the Windows
+// backslash/drive/case shape rides on the unchanged withinDir and is pinned in
+// the GOOS-gated TestPermitWorkDirWildcardEntryWindows below (plus, for the
+// pure string reduction of BOTH separators, TestAllowedDirBase).
+func TestPermitWorkDirWildcardEntry(t *testing.T) {
+	base := Spec{ID: "s1", Binary: "/usr/bin/ollama"}
+
+	cases := []struct {
+		name    string
+		entry   string // a single runtime_allowed_dirs entry
+		workDir string
+		wantOK  bool
+	}{
+		// A trailing "/*" now permits the subtree -- the operator's own example
+		// ("der Ordner und alle Unterordner"). Every one of these is a RED row
+		// before allowedDirBase exists (the literal "*" matched nothing useful)
+		// and GREEN after.
+		{"trailing star permits the dir itself", "/srv/llama_cpp/*", "/srv/llama_cpp", true},
+		{"trailing star permits a child", "/srv/llama_cpp/*", "/srv/llama_cpp/models", true},
+		{"trailing star permits a deep descendant", "/srv/llama_cpp/*", "/srv/llama_cpp/a/b/c", true},
+		{"trailing star tolerates a contained traversal", "/srv/llama_cpp/*", "/srv/llama_cpp/x/../y", true},
+
+		// The reject list. These are GREEN both before and after: the matcher
+		// must WIDEN permission to the subtree without EVER widening it to an
+		// escape. The candidate is cleaned before any comparison, so a "*"
+		// never participates in matching and can never swallow a separator.
+		{"trailing star rejects a dot-dot escape", "/srv/llama_cpp/*", "/srv/llama_cpp/../windows", false},
+		{"trailing star rejects a sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil", false},
+		{"trailing star rejects a nested sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil/x", false},
+		{"trailing star rejects an unrelated tree", "/srv/llama_cpp/*", "/srv/other", false},
+		{"trailing star rejects a relative candidate", "/srv/llama_cpp/*", "relative/models", false},
+
+		// A glued star is NOT a wildcard: "/srv/models*" ends in "s*", not
+		// "/*", so it stays literal and matches only a directory really named
+		// that -- it must NOT permit the "/srv/models-evil" sibling. This is
+		// the new rule that keeps option (a) safe, and it is fully testable on
+		// Linux.
+		{"glued star stays literal, rejects the evil sibling", "/srv/models*", "/srv/models-evil", false},
+		{"glued star stays literal, rejects the bare dir", "/srv/models*", "/srv/models", false},
+
+		// A bare "*" reduces to "" -> withinDir permits NOTHING (fail closed),
+		// never the whole filesystem.
+		{"bare star permits nothing", "*", "/srv/anything", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{tc.entry}}
+			spec := base
+			spec.WorkDir = tc.workDir
+			err := p.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = %v, want nil (permitted)", tc.entry, tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = nil, want an error (a wildcard must never permit a path outside its tree)", tc.entry, tc.workDir)
+			}
+		})
+	}
+}
+
+// TestAllowedDirBase pins the pure string reduction directly, which is the ONE
+// piece of R4 that is GOOS-independent and therefore the place the Windows
+// backslash form is proven on the Linux CI runner (see the function's own doc:
+// CI runs no Windows job, so "\*" recognition MUST be observable on a POSIX
+// host). It also pins the two properties the security argument leans on: a
+// glued star is left verbatim (so a sibling can never be permitted), and a bare
+// "*" reduces to "" (fail closed).
+func TestAllowedDirBase(t *testing.T) {
+	cases := []struct {
+		entry string
+		want  string
+	}{
+		// Trailing whole-segment wildcard -> the concrete base, both separators.
+		{"/srv/models/*", "/srv/models"},
+		{`c:\llama_cpp\*`, `c:\llama_cpp`},
+		{"/srv/a/b/*", "/srv/a/b"},
+		// A plain (bare) entry is already a subtree, returned unchanged.
+		{"/srv/models", "/srv/models"},
+		{`c:\llama_cpp`, `c:\llama_cpp`},
+		// NOT a whole trailing segment -> verbatim, so withinDir treats "*" as
+		// an ordinary path character and the entry matches nothing useful.
+		{"/srv/models*", "/srv/models*"},
+		{"/srv/a/*/b", "/srv/a/*/b"},
+		{"/srv/**", "/srv/**"},
+		// A bare "*" fails closed.
+		{"*", ""},
+		// An operator writing ".." in an entry broadens their OWN trusted
+		// allowlist, identical to a bare "/srv/models/.." -- not a
+		// candidate-side escape.
+		{"/srv/models/../*", "/srv/models/.."},
+		// Degenerate roots/volumes an operator should not write, called out so
+		// their reduction is a decision, not a surprise.
+		{"/*", ""},
+		{`c:\*`, "c:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.entry, func(t *testing.T) {
+			if got := allowedDirBase(tc.entry); got != tc.want {
+				t.Errorf("allowedDirBase(%q) = %q, want %q", tc.entry, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPermitWorkDirWildcardEntryWindows is the Windows-gated half of R4: on a
+// real Windows host the operator's own example, c:\llama_cpp\*, must permit the
+// tree and reject every escape, exactly as the POSIX table above does. It adds
+// NO new untested containment behaviour -- allowedDirBase only reduces the
+// trusted entry, and the untrusted candidate still flows through the unchanged,
+// already-audited withinDir, which handles backslashes, drive letters and case
+// natively on Windows. CI runs no Windows job (see the skips throughout this
+// package), so this documents and locks the behaviour for the deployment
+// platform and for `GOOS=windows go vet`.
+func TestPermitWorkDirWildcardEntryWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path containment (backslash/drive/case) is GOOS-native in withinDir; the separator-reduction half is proven cross-platform in TestAllowedDirBase")
+	}
+	base := Spec{ID: "s1", Binary: `c:\bin\ollama.exe`}
+	cases := []struct {
+		name    string
+		entry   string
+		workDir string
+		wantOK  bool
+	}{
+		{"permits the dir itself", `c:\llama_cpp\*`, `c:\llama_cpp`, true},
+		{"permits a child", `c:\llama_cpp\*`, `c:\llama_cpp\models`, true},
+		{"rejects a dot-dot escape", `c:\llama_cpp\*`, `c:\llama_cpp\..\windows`, false},
+		{"rejects a sibling with a shared prefix", `c:\llama_cpp\*`, `c:\llama_cpp_evil`, false},
+		{"rejects a different volume", `c:\llama_cpp\*`, `d:\llama_cpp\x`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := LocalPolicy{AllowedBinaries: []string{`c:\bin\ollama.exe`}, AllowedDirs: []string{tc.entry}}
+			spec := base
+			spec.WorkDir = tc.workDir
+			err := p.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = %v, want nil (permitted)", tc.entry, tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = nil, want an error", tc.entry, tc.workDir)
+			}
+		})
+	}
+}
+
+// TestPermitAllowBinaryDirs is R3's boundary table. With the toggle ON, each
+// allowlisted binary's PARENT directory is treated as an allowed dir without the
+// operator listing it in AllowedDirs; with it OFF, behaviour is exactly as
+// before this field existed. The auto-added dirs go through the SAME withinDir
+// subtree check R4's non-wildcard path uses, so R3 and R4 agree on semantics by
+// construction -- including the separator boundary that keeps a sibling out.
+func TestPermitAllowBinaryDirs(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  LocalPolicy
+		workDir string
+		wantOK  bool
+	}{
+		// Toggle ON, AllowedDirs empty: only the binary subtrees (and R2's
+		// empty case) are permitted -- the intended permissive->restrictive
+		// flip.
+		{"on: work_dir under a binary's own dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin/models", true},
+		{"on: work_dir IS a binary's own dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin", true},
+		{"on: work_dir under a SECOND binary's dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama", "/opt/vllm/bin/vllm"}, AllowBinaryDirs: true}, "/opt/vllm/bin/run", true},
+		{"on: work_dir outside every binary dir is rejected", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/srv/models", false},
+		{"on: sibling of a binary dir with a shared prefix is rejected", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowBinaryDirs: true}, "/usr/bin-evil", false},
+		// Toggle ON, AllowedDirs also set: the effective set is the UNION.
+		{"on: work_dir under an explicit AllowedDirs entry still passes", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}, AllowBinaryDirs: true}, "/srv/models/x", true},
+		{"on: work_dir under the binary dir passes even when AllowedDirs excludes it", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}, AllowBinaryDirs: true}, "/usr/bin/x", true},
+		// A non-absolute allowlist entry contributes no binary dir (it can never
+		// permit anything), so it must not widen the set.
+		{"on: a relative binary entry contributes no dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama", "ollama"}, AllowBinaryDirs: true}, "/anywhere", false},
+
+		// Toggle OFF: behaviour is exactly as today. Empty AllowedDirs => any
+		// work_dir; a set AllowedDirs => only within it; the binary dir gets NO
+		// special treatment.
+		{"off: empty AllowedDirs permits any work_dir", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}}, "/anywhere/at/all", true},
+		{"off: work_dir under the binary dir is NOT auto-allowed", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}}, "/usr/bin/x", false},
+		{"off: work_dir within AllowedDirs still passes", LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{"/srv/models"}}, "/srv/models/x", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: tc.workDir}
+			err := tc.policy.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(work_dir=%q) = %v, want nil (permitted)", tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(work_dir=%q) = nil, want an error (not permitted)", tc.workDir)
+			}
+		})
 	}
 }
 

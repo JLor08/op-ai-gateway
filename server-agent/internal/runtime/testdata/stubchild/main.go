@@ -36,6 +36,7 @@ func main() {
 	invocationLog := flag.String("invocation-log", "", "if set, append one line (this PID) per invocation -- proves how many times the binary was actually exec'd, independent of the manager's own bookkeeping")
 	envLog := flag.String("env-log", "", "if set, write what this process ACTUALLY received for -env-name, as \"set:<value>\" or \"unset\" -- the only way to observe a child's own environment from the parent's test, and it deliberately distinguishes an absent variable from one set to the empty string")
 	envName := flag.String("env-name", "", "the environment variable -env-log reports")
+	cwdLog := flag.String("cwd-log", "", "if set, write this process's ACTUAL working directory (os.Getwd) -- the only way to observe from the parent's test where the manager launched the child, which is what proves R2's empty-work_dir default (cmd.Dir = the binary's own directory)")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	flag.Parse()
 
@@ -72,6 +73,19 @@ func main() {
 		}
 		if err := os.WriteFile(*envLog, []byte(record), 0o644); err != nil {
 			log.Fatalf("stubchild: write env log: %v", err)
+		}
+	}
+
+	// The child's own working directory, so a test can prove where the manager
+	// launched it -- R2's empty-work_dir default resolves cmd.Dir to the
+	// binary's own directory, which is otherwise invisible to the parent.
+	if *cwdLog != "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("stubchild: getwd: %v", err)
+		}
+		if err := os.WriteFile(*cwdLog, []byte(wd), 0o644); err != nil {
+			log.Fatalf("stubchild: write cwd log: %v", err)
 		}
 	}
 

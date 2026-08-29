@@ -4847,6 +4847,27 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     ]);
   });
 
+  it('shares its saved column layout with the ordinary mapping table (one storageKey)', async () => {
+    // The user-facing requirement is "dieselbe config": a column hidden on the
+    // ordinary mapping screen is hidden here too. ListTable persists that under
+    // `table.<storageKey>.hidden`, mirrored to localStorage at `op.pref.` + key.
+    // Seeding the ORDINARY table's key and seeing this tab honour it proves the
+    // two share one key -- and fails against a build where this tab kept its own
+    // (`op.runtimeMappings`), because the seed would not reach it.
+    window.localStorage.setItem('op.pref.table.op.mappings.hidden', JSON.stringify(['app']));
+    try {
+      renderSection({ mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })] });
+      await screen.findByText('gw-model');
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+      // The gateway column stays; the app-model-name column is hidden by the
+      // seed that belongs to the OTHER table.
+      expect(screen.getByRole('columnheader', { name: t.mappingGatewayName })).toBeInTheDocument();
+      expect(screen.queryByRole('columnheader', { name: t.mappingAppName })).toBeNull();
+    } finally {
+      window.localStorage.removeItem('op.pref.table.op.mappings.hidden');
+    }
+  });
+
   it("labels the two tabs' status columns with two different words", async () => {
     renderSection({
       mappings: [makeMapping({ id: 'map_1' })],

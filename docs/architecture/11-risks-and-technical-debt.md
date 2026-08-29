@@ -98,7 +98,15 @@ hidden.
   the guard, and both are tested on any host via the injectable `getenv` seam.
   Until CI grows a Windows step, `GOOS=windows GOARCH={amd64,arm64} go vet ./...`
   is the check, and it belongs in any review that touches path handling,
-  environment variables, filenames, or process control.
+  environment variables, filenames, or process control. In the same vein, the
+  `runtime_allowed_dirs` containment check (`withinDir`) is Windows-native —
+  backslash separators, drive letters, UNC, case — and CI executes it only on
+  POSIX. The wildcard entry added for `<dir>/*` reduces to a pure,
+  GOOS-independent string step (`allowedDirBase`, tested on Linux with
+  Windows-shaped inputs) and hands the untrusted work_dir to the unchanged
+  `withinDir`, so this branch adds no new *Windows-native* code path — but the
+  containment itself, being security-adjacent, stays proven only by out-of-band
+  Windows-semantics testing, not by CI, until that Windows step exists.
 - **"Pre-existing" means present on `main`, never "present at an earlier commit
   of this branch".** A finding on the agent-managed runtime was dismissed as
   pre-existing at an intermediate commit of its own feature branch — for a

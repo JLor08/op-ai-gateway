@@ -118,7 +118,7 @@ deliberate:
 | Check | Rule | Empty list means |
 |---|---|---|
 | Binary allowlist | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES`. `spec.binary` must be absolute (`filepath.IsAbs`) and match an entry **exactly**; non-absolute allowlist entries are skipped when scanning. | **Nothing starts.** An unconfigured agent refuses every spec — enabling the feature is an explicit act on each host. |
-| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. | **Any `work_dir` permitted.** The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
+| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. A bare entry is already a subtree; `allowedDirBase` accepts a trailing whole-segment wildcard (`<dir>/*` or `<dir>\*`) as an exactly-equivalent synonym by stripping it to `<dir>` before that same check (see §3.1.1). | **Any `work_dir` permitted.** The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
 | Placeholder expansion | §3.2. | — |
 
 Three details are one line away from a bypass and must not be "simplified":
@@ -128,21 +128,106 @@ such as `runtime_allowed_binaries: [""]` would otherwise exactly-match an empty
 `spec.binary`); and the separator boundary in the containment check (a bare
 `strings.HasPrefix` admits `/srv/models-evil` against a `/srv/models` rule).
 
-**A non-empty `runtime_allowed_dirs` makes `work_dir` mandatory on every spec.**
-A spec with an empty `work_dir` is refused outright and lands in
-`not_permitted`, every time. Setting both allowlists without also giving every
-spec a `work_dir` inside one of the permitted paths therefore refuses
-everything — a total failure with no obvious connection between the two
-settings.
+**An empty `work_dir` runs the child beside its binary (R2).** A spec that sets
+no `work_dir` is *permitted* — `effectiveWorkDir` resolves it to
+`filepath.Dir(spec.Binary)`, the directory the allowlisted binary lives in, and
+the child actually launches there (`cmd.Dir` at exec) and is reported as running
+there (the log panel's `ResolvedCommand.WorkDir`). This holds **independent of
+`runtime_allowed_dirs`**: the binary is on the exact `runtime_allowed_binaries`
+boundary, so its own directory is trusted by construction, and Permit returns
+`nil` for an empty `work_dir` before it consults `AllowedDirs` at all — a narrow
+`runtime_allowed_dirs` cannot reject the binary's directory. `effectiveWorkDir`
+is a pure read at each of the three call sites, never a write-back into
+`spec.WorkDir`: `reconcile` diffs the stored spec with `reflect.DeepEqual`, so a
+rewrite would read as a changed spec and could trigger a needless restart.
 
-A refusal message names the *setting* and the *count* of configured paths, never
-the paths themselves, because the text travels to the gateway as
-`last_error.message` and the allowlist is the agent operator's local filesystem
-layout. "Make the error more helpful by listing the allowed directories" leaks
-it.
+A non-empty `runtime_allowed_dirs` still contains every spec that *does* set a
+`work_dir`: such a `work_dir` must sit inside one of the permitted subtrees, or
+the spec lands in `not_permitted`. That refusal message names the *setting* and
+the *count* of configured paths, never the paths themselves, because the text
+travels to the gateway as `last_error.message` and the allowlist is the agent
+operator's local filesystem layout. "Make the error more helpful by listing the
+allowed directories" leaks it.
 
 There is no shell interpreter anywhere on this path: the agent `exec`s directly
 with an argv array, as an unprivileged user, in its own process group on unix.
+
+#### 3.1.1 Wildcards in `runtime_allowed_dirs` are subtree synonyms, not a glob
+
+`withinDir` already makes a **bare** entry mean "the directory itself and
+everything strictly beneath it". A trailing whole-segment wildcard — `<dir>/*`
+or `<dir>\*` — is therefore not a new capability; it is an **exactly
+equivalent** spelling that an operator naturally reaches for ("`c:\llama_cpp\*`
+= der Ordner und alle Unterordner"). `allowedDirBase`
+(`server-agent/internal/runtime/policy_local.go`) strips that trailing
+separator-plus-`*` from the entry and hands the concrete base to the unchanged
+`withinDir`. Both separators are recognised on every GOOS, deliberately: this
+is a Windows deployment and CI runs no Windows job, so the backslash form is
+handled — and unit-tested — on the Linux runner (`TestAllowedDirBase`).
+
+It is emphatically **not** a glob, and that is the security decision:
+
+- The untrusted `work_dir` is never matched against a wildcard. There is no
+  glob engine. `allowedDirBase` only ever **shortens the trusted operator
+  config entry**; the candidate still flows through `filepath.Clean` and the
+  separator-boundary check in `withinDir`. A `*` never participates in
+  matching, so it can never swallow a separator to jump levels — `c:\llama_cpp\*`
+  rejects `c:\llama_cpp\..\windows` and the sibling `c:\llama_cpp_evil`, exactly
+  as a bare `c:\llama_cpp` does.
+- A `*` that is not a whole trailing segment (`/srv/models*`, `a/*/b`, `**`) is
+  left verbatim, so it stays an ordinary path character and matches nothing
+  useful — `/srv/models*` does **not** permit `/srv/models-evil`.
+- A bare `*` reduces to `""`, which `withinDir` treats as "permits nothing"
+  (fail closed), never the whole filesystem.
+
+Mid-path globbing, and any convention where `**` would mean a subtree, are
+explicitly not supported: the operator's only need is a trailing star standing
+for the subtree, which the bare entry already delivers, and a real glob would
+move containment off the audited `withinDir` for a capability nobody asked for.
+`runtime_allow_binary_dirs` (§3.1.2) reuses this same `withinDir` subtree check,
+so the auto-added binary directories and the wildcard entries agree on semantics
+by construction.
+
+#### 3.1.2 `runtime_allow_binary_dirs` auto-allows each binary's parent directory
+
+The agent config toggle `runtime_allow_binary_dirs` /
+`OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (a bool, **no flag form**, same
+operator-only provenance as the two allowlists) treats each
+`runtime_allowed_binaries` entry's **parent directory** as an allowed `work_dir`
+prefix without the operator also listing it in `runtime_allowed_dirs`. It is
+consumed inside `Permit`, after the explicit `AllowedDirs` loop: for each
+absolute allowed binary, `withinDir(spec.WorkDir, filepath.Dir(binary))`. A
+non-absolute allowlist entry contributes no directory (it can never permit a
+binary, so it must not widen the work-dir set either), and `AllowedBinaries` is
+guaranteed non-empty at that point because the empty-allowlist gate returned
+early, so the toggle always has at least one directory to add.
+
+Because those auto-added directories are plain paths handed to the **same**
+`withinDir` that the explicit `runtime_allowed_dirs` entries use (§3.1.1), R3 and
+R4 agree on containment by construction — a binary directory permits its subtree
+and rejects a separator-boundary sibling exactly as an explicit entry does.
+
+**Composition (R2/R3/R4).** The three are orthogonal and funnel through the one
+audited primitive:
+
+- **R2 stands alone.** An empty `work_dir` returns `nil` at the top of Permit's
+  work-dir section, before any `AllowedDirs`/`AllowBinaryDirs` logic; the
+  binary's own directory is trusted by `runtime_allowed_binaries` and needs no
+  auto-allow plumbing to pass.
+- **R3 governs a non-empty `work_dir`** that sits under a binary's parent
+  directory; it enlarges the effective allowed set.
+- **R4 governs how each `runtime_allowed_dirs` entry is matched**;
+  `allowedDirBase` normalises the trusted entry and `withinDir` does the
+  untrusted-candidate containment.
+
+All three leave `withinDir` and its symlink/TOCTOU acceptance exactly as audited;
+`runtime_allowed_binaries` (exact, absolute match) remains the real boundary and
+work-dir containment stays defence in depth.
+
+**Footgun, intended:** turning `runtime_allow_binary_dirs` on while
+`runtime_allowed_dirs` is empty flips work-dir handling from permissive (any) to
+restrictive (the binary subtrees, plus R2's empty case) — the same flip adding
+the first `runtime_allowed_dirs` entry causes.
 
 ### 3.2 Placeholders, and why no secret enters the gateway
 
@@ -3307,7 +3392,8 @@ registers, over the authoritative table in
 | `runtime_source` / `OP_AGENT_RUNTIME_SOURCE` | `gateway` | `gateway` or `file` (§8). |
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
 | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
-| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories. **Non-empty makes `work_dir` mandatory on every spec.** |
+| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
+| `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
 | `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |

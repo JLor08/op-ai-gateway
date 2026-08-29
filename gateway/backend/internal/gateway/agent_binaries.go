@@ -476,11 +476,23 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
 
   // Permitted "work_dir" prefixes for launch specs. Empty (the default) means
   // ANY work_dir is accepted -- deliberately the inverse of the list above,
-  // so an operator who does not care need not enumerate the filesystem. Once
-  // non-empty, a spec that sets no work_dir is refused too. Containment is a
-  // lexical path-prefix check that does not resolve symlinks: defense in
-  // depth, not the boundary.
+  // so an operator who does not care need not enumerate the filesystem. A
+  // spec that sets no work_dir runs in the directory its binary lives in
+  // (which is on the allowlist above, so it is trusted), whether or not this
+  // list is set. A bare entry, or a trailing "/*" ("/srv/models" and
+  // "/srv/models/*" are the same), permits that directory and its whole
+  // subtree; it is not a glob. Containment is a lexical path-prefix check that
+  // does not resolve symlinks: defense in depth, not the boundary.
   "runtime_allowed_dirs": [],
+
+  // When true, each runtime_allowed_binaries entry's PARENT directory is
+  // treated as an allowed work_dir prefix WITHOUT listing it in
+  // runtime_allowed_dirs above -- convenient when a model's work_dir sits
+  // beside its binary. false (the default) leaves work_dir handling unchanged.
+  // NOTE: turning this on while runtime_allowed_dirs is empty flips work_dir
+  // from "any is accepted" to "only the binary directories and their subtrees"
+  // (a spec that sets no work_dir still runs beside its binary either way).
+  "runtime_allow_binary_dirs": false,
 
   // Where the last known-good runtime-config document from the gateway is
   // cached, so the agent can start (and keep) model processes before its first

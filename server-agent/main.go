@@ -156,7 +156,7 @@ func main() {
 	// cfg.Validate and this process would have exited at startup
 	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
-	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs}
+	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs, AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs}
 	// The GPU vendor comes from the SAME detection the telemetry collectors
 	// use (gpus, above): DetectGPUCollectors probes nvidia-smi, then
 	// rocm-smi, then Apple's ioreg, in that fixed order and keeps whichever
@@ -278,6 +278,7 @@ func main() {
 		"runtime_cache_path", cfg.RuntimeCachePath,
 		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
 		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
+		"runtime_allow_binary_dirs", cfg.RuntimeAllowBinaryDirs,
 		"runtime_router_bind_host", runtimeBindHost,
 		// The RESOLVED capacities, not the configured ones: NewLogStore
 		// clamps a too-small or absent value, and an operator who set one
