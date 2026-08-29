@@ -295,6 +295,7 @@ func TestPermitWorkDirWildcardEntry(t *testing.T) {
 		{"trailing star rejects a sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil", false},
 		{"trailing star rejects a nested sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil/x", false},
 		{"trailing star rejects an unrelated tree", "/srv/llama_cpp/*", "/srv/other", false},
+		{"trailing star rejects a relative candidate", "/srv/llama_cpp/*", "relative/models", false},
 
 		// A glued star is NOT a wildcard: "/srv/models*" ends in "s*", not
 		// "/*", so it stays literal and matches only a directory really named
