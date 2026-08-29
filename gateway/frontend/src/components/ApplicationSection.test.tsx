@@ -975,3 +975,270 @@ describe('ApplicationSection one server_agent application per server', () => {
     );
   });
 });
+
+// managed_runtime_only is the SECOND gate on this same control, and it is
+// CREATE-ONLY: the backend reads Server.ManagedRuntimeOnly inside
+// CreateApplication and nowhere else -- UpdateApplication never looks at it.
+// So an edit on such a server must keep offering all six types; a portal that
+// disabled them there would refuse writes the backend accepts, silently.
+describe('ApplicationSection managed_runtime_only type gate', () => {
+  const managedServer: PortalServer = { ...server, managed_runtime_only: true };
+  const allTypes = ['ollama', 'vllm', 'llama_cpp', 'llama_swap', 'litellm', 'server_agent'];
+  const refusedTypes = allTypes.filter((type) => type !== 'server_agent');
+
+  // THE point of the change. A naive `managedRuntimeOnly` predicate (no
+  // `&& !editing`) turns this red: the five options come back aria-disabled
+  // and the field grows a description it must not have here.
+  it('offers every type, and disables none, when EDITING on such a server', async () => {
+    renderSection({ server: managedServer, apps: [makeApp({ id: 'app_vllm', type: 'vllm' })] });
+    // No server_agent application, so no auto-drill: the list renders.
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    expect(combo).toHaveTextContent('vllm');
+    // Asserted with the menu SHUT: an open MUI menu aria-hides the page behind
+    // it, so the combobox is unreachable by role while the listbox is up.
+    expect(combo).not.toHaveAccessibleDescription();
+
+    fireEvent.mouseDown(combo);
+    for (const option of allTypes) {
+      expect(await screen.findByRole('option', { name: option })).not.toHaveAttribute(
+        'aria-disabled',
+      );
+    }
+  });
+
+  // The same fact asserted behaviourally rather than through ARIA: the write
+  // the backend accepts actually goes out.
+  it('saves an edit that retypes an application on such a server', async () => {
+    const { updated } = renderSection({
+      server: managedServer,
+      apps: [makeApp({ id: 'app_vllm', type: 'vllm' })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    await selectType('ollama');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.type).toBe('ollama');
+  });
+
+  it('disables the five types the backend refuses when CREATING on such a server', async () => {
+    renderSection({ server: managedServer, apps: [] });
+    await screen.findByText(t.runtimeManagedOnlyBanner);
+    openCreate();
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    expect(combo).toHaveTextContent('server_agent');
+    // helperText -> aria-describedby on the combobox, so the reason is
+    // announced on focus, before the menu is ever opened, and is legible
+    // without a hover. A tooltip on the disabled options would not be:
+    // MUI leaves disabledItemsFocusable false, so arrow-key navigation
+    // skips them entirely.
+    expect(combo).toHaveAccessibleDescription(t.applicationTypeManagedRuntimeOnly);
+
+    fireEvent.mouseDown(combo);
+    expect(await screen.findByRole('option', { name: 'server_agent' })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+    for (const option of refusedTypes) {
+      expect(await screen.findByRole('option', { name: option })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    }
+  });
+
+  it('does not let the create form leave server_agent on such a server', async () => {
+    renderSection({ server: managedServer, apps: [] });
+    await screen.findByText(t.runtimeManagedOnlyBanner);
+    openCreate();
+
+    await attemptSelectType('ollama');
+
+    // The click was swallowed by the disabled item, so the type never moved
+    // off openCreate's managed_runtime_only seed.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent(
+      'server_agent',
+    );
+  });
+
+  it('says nothing and disables nothing on a server without the flag', async () => {
+    renderSection({ apps: [] });
+    openCreate();
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    expect(combo).not.toHaveAccessibleDescription();
+    fireEvent.mouseDown(combo);
+    for (const option of allTypes) {
+      expect(await screen.findByRole('option', { name: option })).not.toHaveAttribute(
+        'aria-disabled',
+      );
+    }
+  });
+
+  // CO-REACHABILITY of the two reasons, which decides whether composing them
+  // is behaviour or dead defence. In the SETTLED state they cannot co-occur:
+  // on a managed server with an agent application the create button is not
+  // rendered at all, so the create form -- the only place the managed reason
+  // applies -- cannot be opened. The one window where both bite is the first
+  // fetch: `applications` reads [] while it is in flight and the create button
+  // is NOT loading-gated, so the operator can open the form before the list
+  // that would have hidden the button arrives. Two agent applications rather
+  // than one on purpose: with exactly one, the auto-drill effect fires on that
+  // same settle and yanks the form away, so the composed state is real but
+  // transient; with two there is no unambiguous drill target and it persists.
+  it('states both reasons when the create form was opened during the first fetch', async () => {
+    renderSection({
+      server: managedServer,
+      apps: [
+        makeApp({ id: 'app_a', type: 'server_agent' }),
+        makeApp({
+          id: 'app_b',
+          type: 'server_agent',
+          port: 9100,
+          endpoint: 'https://s1.example.test:9100',
+        }),
+      ],
+    });
+    // Synchronous, before the fetch settles -- the list still reads [], so the
+    // create button is still on screen.
+    openCreate();
+
+    const combo = screen.getByRole('combobox', { name: t.applicationType });
+    expect(combo).toHaveAccessibleDescription(t.applicationTypeManagedRuntimeOnly);
+
+    await waitFor(() =>
+      expect(combo).toHaveAccessibleDescription(
+        `${t.applicationTypeManagedRuntimeOnly} ${t.applicationTypeServerAgentTaken}`,
+      ),
+    );
+
+    // openCreate's seed is still shown even though its own option is now
+    // disabled too -- a closed MUI select computes its text from the matching
+    // item regardless of that item's disabled state, so the field is not blank.
+    expect(combo).toHaveTextContent('server_agent');
+
+    // The two gates intersect to the empty set: nothing here is choosable, and
+    // the backend would refuse every one of the six.
+    fireEvent.mouseDown(combo);
+    for (const option of allTypes) {
+      expect(await screen.findByRole('option', { name: option })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    }
+  });
+
+  it('still renders the 409 when the server DTO was stale, and keeps the form open', async () => {
+    // This gate reads `managed_runtime_only` off the server DTO the PARENT
+    // fetched; ApplicationSection never refetches the server. A PATCH that
+    // sets the flag after that fetch leaves this form offering all six types
+    // and the backend is what refuses the write -- rendered here with the flag
+    // absent, so the portal gate is open and only the 409 stands.
+    const { fakeApi } = renderSection();
+    openCreate();
+    await selectType('vllm');
+    fakeApi.createApplication.mockRejectedValueOnce(
+      new PortalApiError(
+        409,
+        'application.managed_runtime_only',
+        'server only accepts agent-managed applications',
+      ),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+
+    expect(
+      await screen.findByText(
+        `application.managed_runtime_only: ${t.errorApplicationManagedRuntimeOnly}`,
+      ),
+    ).toBeInTheDocument();
+    // Form still open, typed data intact -- submitCreate only leaves on success.
+    expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveTextContent('vllm');
+  });
+});
+
+// Part 2: the create button does not merely vanish on such a server, it says
+// why. Hidden rather than disabled-with-a-tooltip: a disabled MUI Button is
+// removed from the tab order and sets pointer-events:none, so a tooltip on it
+// needs a wrapper span and is unreachable by keyboard -- issue #26 again. The
+// alert is plain text in the reading order and needs no hover.
+describe('ApplicationSection managed_runtime_only create button reason', () => {
+  const managedServer: PortalServer = { ...server, managed_runtime_only: true };
+  const twoAgents = () => [
+    makeApp({ id: 'app_a', type: 'server_agent' }),
+    makeApp({
+      id: 'app_b',
+      type: 'server_agent',
+      port: 9100,
+      endpoint: 'https://s1.example.test:9100',
+    }),
+  ];
+
+  it('explains the vanished create button once the server has its agent application', async () => {
+    renderSection({ server: managedServer, apps: twoAgents() });
+
+    expect(await screen.findByText(t.runtimeManagedOnlyBanner)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeManagedOnlyCreateBlocked)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.applicationCreate })).not.toBeInTheDocument();
+  });
+
+  it('stays silent about it while the create button is still offered', async () => {
+    renderSection({ server: managedServer, apps: [] });
+
+    expect(await screen.findByText(t.runtimeManagedOnlyBanner)).toBeInTheDocument();
+    // An unconditional second sentence would state a restriction that is not
+    // in force: this server can still be given its one agent application.
+    expect(screen.queryByText(t.runtimeManagedOnlyCreateBlocked)).toBeNull();
+    expect(screen.getByRole('button', { name: t.applicationCreate })).toBeInTheDocument();
+  });
+
+  // The everyday path to that sentence, end to end: the operator's own create
+  // is what makes the button disappear. submitCreate pushes the new row into
+  // local state and returns to the list, and the auto-drill has already latched
+  // from the first load, so it does not fire on this 0->1 transition -- the
+  // operator lands back on a list whose create button is gone, and the alert
+  // is the only thing that can tell them why.
+  it('explains it the moment the operator has created the one agent application', async () => {
+    const { created } = renderSection({ server: managedServer, apps: [] });
+    await screen.findByText(t.runtimeManagedOnlyBanner);
+    expect(screen.queryByText(t.runtimeManagedOnlyCreateBlocked)).toBeNull();
+
+    openCreate();
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    // openCreate seeded the only type this server accepts.
+    expect(created[0].type).toBe('server_agent');
+
+    expect(await screen.findByText(t.runtimeManagedOnlyCreateBlocked)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.applicationCreate })).not.toBeInTheDocument();
+    // Still on the list, not bounced into the runtime admin.
+    expect(screen.getByText(t.runtimeManagedOnlyBanner)).toBeInTheDocument();
+  });
+
+  it('says neither thing on a server without the flag, agent application or not', async () => {
+    renderSection({ apps: [makeApp({ id: 'app_agent', type: 'server_agent' })] });
+    await screen.findByText('https://s1.example.test:8000');
+
+    expect(screen.queryByText(t.runtimeManagedOnlyBanner)).toBeNull();
+    expect(screen.queryByText(t.runtimeManagedOnlyCreateBlocked)).toBeNull();
+    expect(screen.getByRole('button', { name: t.applicationCreate })).toBeInTheDocument();
+  });
+
+  // STRUCTURAL, deliberately: it pins the two sentences as separate sibling
+  // elements rather than one concatenated string, which is what keeps the
+  // pinned findByText(runtimeManagedOnlyBanner) above matching an exact text
+  // node (getNodeText reads only an element's DIRECT text children).
+  it('keeps the two sentences as separate text nodes inside one alert', async () => {
+    renderSection({ server: managedServer, apps: twoAgents() });
+
+    const banner = await screen.findByText(t.runtimeManagedOnlyBanner);
+    const blocked = screen.getByText(t.runtimeManagedOnlyCreateBlocked);
+    expect(banner).not.toContainElement(blocked);
+    expect(banner.parentElement).toBe(blocked.parentElement);
+  });
+});

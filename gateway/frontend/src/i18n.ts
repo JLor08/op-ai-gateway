@@ -361,6 +361,8 @@ const de = {
   applicationType: 'Typ',
   applicationTypeServerAgentTaken:
     'Pro Server läuft genau ein Agent — deshalb ist nur eine server_agent-Anwendung möglich. Dieser Server hat bereits eine: bearbeiten oder löschen Sie diese, statt eine zweite anzulegen.',
+  applicationTypeManagedRuntimeOnly:
+    'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen — beim Anlegen ist deshalb nur server_agent möglich; das Formular ist bereits darauf eingestellt. Die Beschränkung gilt ausschließlich fürs Anlegen: bestehende Anwendungen dieses Servers bleiben auf jeden Typ änderbar.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -521,6 +523,8 @@ const de = {
   runtimeClearOverride: 'Übersteuerung aufheben',
   runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
   runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
+  runtimeManagedOnlyCreateBlocked:
+    'Die server_agent-Anwendung dieses Servers ist bereits angelegt, und pro Server läuft genau ein Agent — es lässt sich hier also keine weitere Anwendung mehr anlegen. Bearbeiten oder löschen Sie die vorhandene.',
   runtimeIneffectiveSpecs:
     'Diese Runtime-Spezifikationen liegen im Gateway (Reiter „Runtime-Spezifikationen“ dieser Anwendung) und haben keine Wirkung, solange der Agent seine Prozesse aus seiner eigenen lokalen Datei verwaltet. Sie werden nicht gelöscht und greifen wieder, sobald die Konfigurationsquelle des Agenten zurück auf „Gateway“ gestellt wird. Im Datei-Modus sind sie hier weder einsehbar noch bearbeitbar.',
   runtimeTimeoutWarning:
@@ -2301,6 +2305,8 @@ const en: PortalMessages = {
   applicationType: 'Type',
   applicationTypeServerAgentTaken:
     'Exactly one agent runs per server — so only one server_agent application is possible. This server already has one: edit or delete it instead of creating a second.',
+  applicationTypeManagedRuntimeOnly:
+    "This server only accepts agent-managed applications — so server_agent is the only type it can be created with, and the form is already set to it. The restriction applies to creating only: this server's existing applications stay editable to any type.",
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -2455,6 +2461,8 @@ const en: PortalMessages = {
   runtimeClearOverride: 'Clear override',
   runtimeManagedLocally: 'Managed locally by the agent (file mode)',
   runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
+  runtimeManagedOnlyCreateBlocked:
+    "This server's server_agent application already exists, and exactly one agent runs per server — so there is no further application left to create here. Edit or delete the existing one instead.",
   runtimeIneffectiveSpecs:
     'These runtime specs live in the gateway (the "Runtime specs" tab of this application) and have no effect while the agent manages its processes from its own local file. They are not deleted, and they take effect again as soon as the agent\'s configuration source is switched back to "gateway". While file mode is active they can neither be viewed nor edited here.',
   runtimeTimeoutWarning:

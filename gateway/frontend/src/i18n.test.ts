@@ -2192,3 +2192,53 @@ describe('one-server_agent-per-server affordance i18n key', () => {
     expect(messages.de.applicationTypeServerAgentTaken).toMatch(/bearbeiten oder löschen/i);
   });
 });
+
+describe('managed_runtime_only affordance i18n keys', () => {
+  it('defines applicationTypeManagedRuntimeOnly and runtimeManagedOnlyCreateBlocked in de and en', () => {
+    const keys = ['applicationTypeManagedRuntimeOnly', 'runtimeManagedOnlyCreateBlocked'] as const;
+    for (const m of [messages.de, messages.en]) {
+      for (const k of keys) {
+        expect(typeof m[k]).toBe('string');
+        expect(m[k].length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('says on the type field that the gate is create-only, and does not restate the 409', () => {
+    // The backend reads ManagedRuntimeOnly inside CreateApplication only;
+    // UpdateApplication never reads it. The helper line is the one place an
+    // operator can be told that, so it must say it -- otherwise the edit form
+    // offering all six types reads as a portal bug rather than as the rule.
+    // The 409's own string stays terse (formatPortalError prefixes it with the
+    // raw error code); reusing it here would teach nothing.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.applicationTypeManagedRuntimeOnly).not.toBe(m.errorApplicationManagedRuntimeOnly);
+      expect(m.applicationTypeManagedRuntimeOnly.length).toBeGreaterThan(
+        m.errorApplicationManagedRuntimeOnly.length,
+      );
+    }
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/server_agent/);
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/creating only/i);
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/stay editable/i);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/server_agent/);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/fürs Anlegen/i);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/änderbar/i);
+  });
+
+  it('gives the vanished create button its own sentence, separate from the standing banner', () => {
+    // The banner states the server's mode and is always on; this second
+    // sentence states a restriction that is only in force once the one
+    // server_agent application exists, so it must be a different string --
+    // folding them into one would assert the restriction unconditionally.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.runtimeManagedOnlyCreateBlocked).not.toBe(m.runtimeManagedOnlyBanner);
+      expect(m.runtimeManagedOnlyCreateBlocked.length).toBeGreaterThan(
+        m.runtimeManagedOnlyBanner.length,
+      );
+    }
+    expect(messages.en.runtimeManagedOnlyCreateBlocked).toMatch(/already exists/i);
+    expect(messages.en.runtimeManagedOnlyCreateBlocked).toMatch(/edit or delete/i);
+    expect(messages.de.runtimeManagedOnlyCreateBlocked).toMatch(/bereits angelegt/i);
+    expect(messages.de.runtimeManagedOnlyCreateBlocked).toMatch(/bearbeiten oder löschen/i);
+  });
+});

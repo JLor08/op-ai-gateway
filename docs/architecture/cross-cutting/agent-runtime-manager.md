@@ -1904,13 +1904,58 @@ Three details there are load-bearing and must not be "simplified":
 On a server flagged `managed_runtime_only` the applications view steers the
 operator rather than letting them fail: a standing informational banner; the
 create button hidden once the server has its one `server_agent` application; the
-create form seeded to type `server_agent` so the only type that can succeed is
-the default (backed by the backend's own 409); and an auto-drill into the single
-`server_agent` application the first time the list resolves. That drill
+create form seeded to type `server_agent`; the other five types **disabled on
+that create form**, with the reason on the field; and an auto-drill into the
+single `server_agent` application the first time the list resolves. That drill
 **latches once per mount** on purpose — the 0→1 transition caused by the
 operator's own create does *not* bounce them out of the form they just
 submitted, and the latch also stops the drill re-firing on the parent list's
 poll.
+
+**That type gate is CREATE-ONLY, and the `&& !editing` in its predicate is
+load-bearing.** `Server.ManagedRuntimeOnly` is read in exactly one place in the
+service — inside `CreateApplication`, against the raw requested type — and
+`UpdateApplication` never looks at it. A portal gate written as plain
+`managedRuntimeOnly` would therefore refuse, on an *edit*, writes the backend
+accepts, and refuse them **silently**: a disabled option produces no error code
+to look up, so the operator has nothing to search for. That is a worse failure
+than the one the affordance closes. The gate follows the backend's own scope or
+it is a defect. Unlike the `server_agent` gate above this one reads the *server*
+DTO rather than the applications list, so no fetch window opens it — but that
+DTO is fetched by the parent list and never refreshed here, so a `PATCH` that
+sets the flag afterwards still leaves the form offering all six types, and the
+409 remains the enforcement.
+
+**Two reasons share one `helperText` slot, and they are co-reachable — through
+exactly one window.** In the settled state they cannot co-occur: on a managed
+server that already holds an agent application the create button is not rendered
+at all, so the create form — the only place the managed reason applies — cannot
+be opened. While the *first fetch* is in flight `applications` reads `[]` and the
+create button is not loading-gated, so it can, and both reasons then bite at
+once. Composed narrowest-first ("only `server_agent` is creatable here", then
+"and that one is taken"), which together say the intersection is empty — exactly
+what the then-fully-disabled option list shows. With one agent application that
+composed state is transient (the auto-drill fires on the same settle and
+replaces the form); with two — the pre-migration-68 duplicate case — it
+persists, which is the state the suite pins.
+
+**The vanished create button says why, and stays hidden rather than becoming a
+disabled one.** Once the server holds its agent application the two backend
+gates intersect to the empty set — `managed_runtime_only` permits only
+`server_agent`, and the one-agent rule refuses a second of it — so no create of
+any type can succeed and the button is not offered. A second sentence in the
+existing info banner, rendered on the *same* condition as the button rather than
+restated, gives the reason. This is deliberately the opposite call to the one
+made for the type option, because the alternatives are not the same: removing an
+option from a select blanks the combobox (the form's `type` is seeded from the
+row whether or not a menu item matches it), whereas removing a button costs
+nothing structurally — and the reason must be readable without a hover.
+`helperText` gave the field such a carrier via `aria-describedby`; a disabled MUI
+`Button` is out of the tab order and sets `pointer-events: none`, so its only
+reason-carrier would be a `Tooltip` on a wrapper span, unreachable by keyboard
+and screen reader — issue #26 again. Plain text in the reading order, where the
+button was, beats both. The banner keeps its own text node so it stays matchable
+exactly.
 
 **The flag itself is API-only today: nothing in the portal sets it.** Everything
 above is driven by `managed_runtime_only` as it arrives on the server DTO, and
