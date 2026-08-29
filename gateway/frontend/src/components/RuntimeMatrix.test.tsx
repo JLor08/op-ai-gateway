@@ -406,6 +406,51 @@ describe('RuntimeMatrix rotated column headers', () => {
     expect(getComputedStyle(rowLabel as HTMLElement).writingMode).not.toBe('vertical-rl');
   });
 
+  // A STRUCTURE PIN, NOT PROOF -- and the distinction matters more here than
+  // anywhere else in this file. jsdom performs no layout, so this test cannot
+  // see the defect it guards: in WebKit (Safari, and every WKWebView) the
+  // table column does not measure a rotated child's block size at all, so a
+  // header wrapped onto three or more vertical lines used to hang out of its
+  // own cell and paint on top of the NEXT column's name -- measured 18px of
+  // overprinting at 3 line boxes, 42px at 4, at every container width. The
+  // pixels live in a real browser; see ColumnHeader's doc block for them.
+  //
+  // What this CAN pin is the DOM and CSS shape that measurement blessed, so
+  // that flattening the wrapper away -- or "simplifying" grid to flex, which
+  // looks equivalent and is not -- fails here rather than in Safari. What
+  // would actually catch a regression is a Playwright assertion comparing
+  // each header's ink box against its own <th> IN A WEBKIT PROJECT; the
+  // repo's e2e suite runs Chromium, where this bug is invisible in every
+  // configuration tried (0 failures in 4320).
+  it('gives the rotated label a grid parent, the one box shape every engine measures it through', () => {
+    const { container } = render(
+      <RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
+    );
+    const label = rotatedLabel(container, 0);
+    const wrapper = label.parentElement;
+    if (wrapper === null) throw new Error('the rotated label has no parent');
+
+    // Direct parent of the label AND direct child of the cell. Anything
+    // inserted between them puts the rotated box back inside ordinary block
+    // layout, which is exactly the layout WebKit declines to measure.
+    expect(wrapper.parentElement).toBe(headerCells(container)[1]);
+
+    const style = getComputedStyle(wrapper);
+    // `grid`, and NOT `flex`. Both are correct on a freshly painted page.
+    // Only grid survives a re-render, which this component does on every
+    // telemetry poll: measured in WebKit over 400 randomised re-renders, grid
+    // failed 0 and flex failed 248 -- and flex's failure mode is worse than
+    // the bug, because it sizes the rotated box from a stale line count and
+    // CLIPS the overflowing lines. Losing characters is the one outcome the
+    // wrapping above exists to prevent.
+    expect(style.display).toBe('grid');
+    // The centring lives on the wrapper now. It used to be `mx: 'auto'` on
+    // the label, where the auto margins ran along the label's BLOCK axis and
+    // the engines disagreed: Chromium and WebKit centred, Firefox left the
+    // label flush against its column's left edge (measured).
+    expect(style.justifyContent).toBe('center');
+  });
+
   it('keeps each model name as plain text in its header, so screen readers and getByText still find it', () => {
     const { container } = render(
       <RuntimeMatrix t={t} specs={specs} pairs={[]} onToggle={vi.fn()} budgets={{}} />,
@@ -462,12 +507,18 @@ describe('RuntimeMatrix rotated column headers', () => {
     expect(style.maxHeight).toBe('160px');
     expect(style.whiteSpace).toBe('normal');
     // The SAME wrap mode the row label uses -- one declaration, one meaning.
-    // Measured in Chromium, `anywhere` and `break-word` give byte-identical
-    // geometry on this axis (header row 168.5px, span 160px, widest header
-    // column 56px, 2 line boxes, at a 1100px AND a 600px container), because
-    // table layout distributes WIDTH and a `vertical-rl` box's inline size is
-    // its height. So there is nothing here to justify differing from the row
-    // label, where the choice is load-bearing.
+    // `anywhere` and `break-word` give byte-identical geometry on this axis
+    // (header row 168.5px, span 160px, widest header column 56px, 2 line
+    // boxes, at a 1100px AND a 600px container), re-measured in Chromium,
+    // Firefox and WebKit at 1 to 7 line boxes. Nothing competes for this
+    // axis: a `vertical-rl` box's inline size is its HEIGHT. So there is
+    // nothing here to justify differing from the row label, where the choice
+    // is load-bearing.
+    //
+    // The clause deleted from this note claimed the header was safe "because
+    // table layout distributes WIDTH". That reasons about the OTHER axis, and
+    // it was false: WebKit never gave this column the width the header
+    // needed. See the grid-wrapper test above.
     expect(style.overflowWrap).toBe('break-word');
     expect(style.textOverflow).not.toBe('ellipsis');
     expect(style.overflow).not.toBe('hidden');
