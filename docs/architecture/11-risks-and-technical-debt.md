@@ -12,6 +12,7 @@ hidden.
 | **Payload capture holds plaintext in RAM** in the volatile mode | OS swap or a core dump could place prompt/response plaintext on disk | Documented as out of scope; the guarantee is "never written to disk by the application" (see [ADR-008](09-architecture-decisions.md#adr-008--payload-capture-opt-in-encrypted-or-volatile-redacted)). |
 | **Privileged telemetry sources absent** when the agent runs unprivileged | Some power/temperature/per-DIMM data is unavailable | By design; the agent degrades gracefully and reports what it can. |
 | **Public ACME / SMTP / OTLP unavailable** in air-gapped setups | Edge certs, e-mail invites, and trace export are unavailable | All are opt-in; the system runs without them. |
+| **A proxy-switched application whose agent reports `tls_active:false` stays `https` and is unreachable** | An expired leaf, a taken proxy port or a failed bind takes that application out of service until TLS is restored — the gateway no longer degrades it to plaintext | Deliberate operator decision: never answer an environment failure by turning encryption off ([ADR-017](09-architecture-decisions.md#adr-017--agent-tls-proxy--https-auto-switch-scope-exit-revert-but-no-downgrade-on-broken-tls)). Made non-silent in two independent places — a `Warn` on **every** reconcile pass naming server, application, port, the agent's own `RouteState` reason and the remedy, and `Service.HTTPSSwitchUnreachableApps`, returned by `GET /api/system/certificates` under `https_switch.unreachable_apps` and rendered as an **error** alert by the portal's certificate view. Self-healing: the application was never moved, so it works again the moment the listener returns — there is no forward switch to re-run and no window in which it is briefly plaintext. The **scope-exit** revert to `http` is the one automatic move to plaintext that deliberately survives this ([certificates-tls §7.1](cross-cutting/certificates-tls.md#71-no-automatic-downgrade-to-plaintext)). |
 | **The agent is a SPOF for its server's managed models** ([agent-managed model runtime](cross-cutting/agent-runtime-manager.md)) | If the agent dies, every model it manages becomes unreachable — the router is the only way in | Accepted by construction; the mitigation is the migration path, since classic non-managed applications may coexist on the same server, so llama-swap and the managed runtime can run side by side. |
 | **A portal admin with server-management rights effectively chooses what runs on the AI servers** | Portal write access selects binary, argv, env and working directory for a process on the AI server | Bounded **only** by the agent-local binary allowlist, which is operator-controlled on each host and starts nothing when empty ([ADR-024](09-architecture-decisions.md#adr-024--managed-runtime-the-gateway-specifies-the-launch-the-ai-server-permits-it)). Enabling the feature is an explicit act per host and the gateway cannot widen it. |
 | **The agent's model-runtime router authenticates nothing, and its shipped default binds all interfaces** | Every managed model on that host is reachable from any interface that can reach the port | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` is the operator's control (mesh IP, or `127.0.0.1`). The empty-value fallback derives a mesh address from the installed leaf certificate, but `DeriveBindHost` takes `cert_dir` as its single argument and **never consults `cert_mode`** — so what it needs is a loadable leaf with a usable SAN in that directory, and a populated `cert_dir` left behind after the mode was switched to `"off"` still derives one. The portal's generated agent config ships `cert_mode: "off"` with an **empty `cert_dir`**, and that empty directory — not the mode — is why **the shipped default always falls through to all interfaces**, logged at Warn. Set it explicitly. |
@@ -62,6 +63,19 @@ hidden.
   any of them; the e2e fixture Go modules are likewise outside `make lint`,
   `make test-go` and Sonar's sources. See
   [Development Tooling & Quality Gates §6](cross-cutting/development-and-quality.md).
+- **No gate in this repository can see a browser-engine-specific layout defect.**
+  The frontend Vitest suite runs in `jsdom` (`gateway/frontend/vite.config.ts`,
+  `environment: 'jsdom'`), which performs no layout at all, and no Playwright
+  config under `gateway/e2e/` declares `projects`, `browserName` or `devices`, so
+  every scenario suite runs in the default Chromium. A defect that exists only in
+  another engine is therefore invisible to every gate at once. This is not
+  hypothetical: the co-residency matrix shipped multi-line column headers that
+  overlapped their neighbours in **WebKit only** — WebKit does not contribute a
+  `writing-mode: vertical-rl` child's block size to its table column, so the column
+  never widened, while Chromium and Firefox were correct. It reached an operator on
+  Safari, and the code comment asserting the opposite had genuinely been measured —
+  in Chromium. See
+  [Agent-managed model runtime §11.3](cross-cutting/agent-runtime-manager.md).
 - **A comment that names a collaborator or asserts a cross-layer guarantee is a
   claim to verify, not documentation** — several have shipped false, and a
   guarantee that differs per driver must be stated per driver. The instances and

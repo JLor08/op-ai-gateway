@@ -650,6 +650,15 @@ interfaces.** Deriving a mesh address is the unusual case, not the default. An
 operator who does not want an unauthenticated inference port on every interface
 must set the value explicitly (the mesh IP, or `127.0.0.1`).
 
+**The resolution runs once, at process start.** `main.go` resolves the bind host
+before the runtime driver is built (`runtimeBindHost := cfg.RuntimeRouterBindHost`,
+falling back to `proxy.DeriveBindHost(cfg.CertDir)`) and the driver stores the
+result, so an agent that boots before its first leaf is installed binds all
+interfaces until it is restarted, however many certificates arrive afterwards, and
+a renewed certificate with a different SAN does not move the router. The every-sync
+`StartRouter` described below re-binds `d.bindHost` — the value stored at
+construction — so it retries a failed *bind*, it never re-derives the *host*.
+
 Binding all interfaces is also the only way "router behind the agent's own proxy
 listener, loopback only" is expressible as *unavailable*: that deployment needs
 the explicit setting.
