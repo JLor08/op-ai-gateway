@@ -55,7 +55,6 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { mappingColumns } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
-import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 import { RuntimeLogView } from './RuntimeLogView';
@@ -1986,7 +1985,6 @@ export function RuntimeAdminSection({
   // ---- create/edit form state -----------------------------------------
   const [gatewayName, setGatewayName] = useState('');
   const [appName, setAppName] = useState('');
-  const [status, setStatus] = useState<ApplicationStatus>('active');
   const [enabled, setEnabled] = useState(true);
   const [binary, setBinary] = useState('');
   const [argsText, setArgsText] = useState('');
@@ -2052,7 +2050,6 @@ export function RuntimeAdminSection({
   function openCreate() {
     setGatewayName('');
     setAppName('');
-    setStatus('active');
     resetSpecFields();
     setSpecMode('create');
   }
@@ -2068,7 +2065,6 @@ export function RuntimeAdminSection({
   async function openEdit(mapping: PortalModelMapping) {
     setGatewayName(mapping.gateway_model_name);
     setAppName(mapping.app_model_name);
-    setStatus(mapping.status);
     setLoadingEditFor(mapping.id);
     const seen = beginSpecRead(mapping.id);
     try {
@@ -2202,10 +2198,18 @@ export function RuntimeAdminSection({
     setBusy(true);
     let mapping: PortalModelMapping;
     try {
+      // No `status`: the mapping owns it and the Modell-Zuordnung tab edits it.
+      // CreateMapping normalises an absent status to active, byte-for-byte what
+      // the removed hard-coded 'active' produced -- so this form carries ONE
+      // rule (it never sends status) rather than a create/edit special case.
+      //
+      // The gateway name, by contrast, MUST be sent here and must stay
+      // editable: this call creates the mapping whose id keys the spec PUT
+      // below, the backend refuses an empty gateway name, and this form is the
+      // only mapping-create path a server_agent application has.
       mapping = await api.createMapping(application.id, {
         gateway_model_name: gatewayName,
         app_model_name: appName,
-        status,
       });
       setMappings((current) => [mapping, ...(current ?? [])]);
       // Pre-seeding `loadedIdsRef` keeps the lazy loader off a row we are about
@@ -2273,11 +2277,21 @@ export function RuntimeAdminSection({
     }
     setBusy(true);
     try {
-      const updated = await api.updateMapping(id, {
-        gateway_model_name: gatewayName,
-        app_model_name: appName,
-        status,
-      });
+      // A form does not send a field it does not let you edit. Read-only here
+      // => not sent from here: the gateway name and the status belong to the
+      // mapping and are edited on the Modell-Zuordnung tab, and this form owns
+      // only `app_model_name` (the spec's upstream_model).
+      //
+      // OMITTED, not echoed. The PATCH is pointer-gated per field, so an absent
+      // key leaves that field byte-for-byte alone -- which is what makes the two
+      // screens non-overlapping writers instead of two writers racing. Echoing
+      // `status` here would be worse than redundant: it is a snapshot taken when
+      // this form opened, so a spec save would silently PATCH a deliberately
+      // DISABLED model back into service, with no error and no column on the
+      // specs tab that contradicts it. (The gateway name is the milder case --
+      // no 409 hazard, the conflict check self-excludes -- but the same
+      // lost-update argument applies, so it goes for the same reason.)
+      const updated = await api.updateMapping(id, { app_model_name: appName });
       setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
     } catch (err) {
       showError(formatPortalError(err, t));
@@ -2533,7 +2547,12 @@ export function RuntimeAdminSection({
       // spec the agent has never reported, is "unknown": deliberately NOT
       // "stopped", which would be a claim we cannot make.
       id: 'live_status',
-      label: t.tableStatus,
+      // NOT `t.tableStatus` any more: the tab immediately to the left now
+      // carries a "Status" column meaning the MAPPING's active/disabled, while
+      // this one means the process's running/stopped/unknown. Two adjacent tabs
+      // must not label two different facts with one word. The column `id` is
+      // unchanged, so persisted column preferences survive.
+      label: t.runtimeLiveStatus,
       value: (m) => statusLabelForMapping(m),
       filter: 'enum',
       sortable: false,
@@ -2994,15 +3013,43 @@ export function RuntimeAdminSection({
             onSubmit={editing ? submitEdit : submitCreate}
             sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 560px)', gap: 2.25 }}
           >
+            {/* Two model NAMES, and this form owns exactly one of them.
+                The MAPPING owns the gateway-facing name and the active/disabled
+                status; the RUNTIME SPEC owns the application model name,
+                because that name IS the spec's `upstream_model` -- the only
+                thing ${MODEL} expands to when the agent builds the process
+                argv. So the gateway name is shown here (a spec is unreadable
+                without knowing which model it serves) and edited one tab to
+                the left, and the status select is gone entirely: it edited the
+                MAPPING and never reached putRuntimeSpec, whose request type has
+                no status field at all.
+
+                Do not confuse the removed select with the "Aktiv" checkbox
+                below. That one is `spec.enabled`, which decides whether this
+                spec enters the agent's runtime-config document -- a different
+                question from whether the gateway routes the model. */}
             <Typography variant="subtitle2" component="h3">
-              {t.runtimeSpecMappingSection}
+              {t.runtimeSpecModelSection}
             </Typography>
             <Field
               id="runtime-spec-gateway-name"
               label={t.mappingGatewayName}
               value={gatewayName}
-              onChange={(e) => setGatewayName(e.target.value)}
+              // EDIT-only read-only, and the no-op is load-bearing: jsdom fires
+              // `change` on a readOnly input, so a live handler would still
+              // drive state and give a test a false green. CREATE keeps the
+              // field writable -- see `submitCreate`.
+              onChange={editing ? () => {} : (e) => setGatewayName(e.target.value)}
               required
+              // readOnly, never `disabled`: the value's whole job here is to be
+              // READ, and a readonly input is barred from HTML constraint
+              // validation, so `required` cannot block submit either.
+              {...(editing
+                ? {
+                    inputProps: { readOnly: true },
+                    helperText: t.runtimeSpecGatewayNameReadOnly,
+                  }
+                : {})}
             />
             <Field
               id="runtime-spec-app-name"
@@ -3011,18 +3058,6 @@ export function RuntimeAdminSection({
               onChange={(e) => setAppName(e.target.value)}
               required
             />
-            <SelectField
-              id="runtime-spec-status"
-              label={t.tableStatus}
-              value={status}
-              onChange={(e) => setStatus(e.target.value as ApplicationStatus)}
-            >
-              {applicationStatusOptions.map((s) => (
-                <option value={s} key={s}>
-                  {t[applicationStatusLabelByKey[s]]}
-                </option>
-              ))}
-            </SelectField>
 
             <Typography variant="subtitle2" component="h3" sx={{ mt: 1 }}>
               {t.runtimeSpecConfigSection}

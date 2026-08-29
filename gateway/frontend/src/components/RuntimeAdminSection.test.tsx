@@ -315,7 +315,13 @@ function renderSection(
     }),
     updateMapping: vi.fn(async (id: string, body: UpdateMappingRequest) => {
       updatedMappings.push({ id, body });
-      return makeMapping({ id, ...(body as Partial<PortalModelMapping>) });
+      // Models the real PATCH: every field is a pointer, so an ABSENT key
+      // leaves the stored value alone. Merging onto makeMapping()'s DEFAULTS
+      // instead made an omitted `status` come back as 'active' -- the fake
+      // itself performing the silent re-enable this screen exists to prevent,
+      // and hiding it from the test that asks about it.
+      const current = mappings.find((m) => m.id === id) ?? makeMapping({ id });
+      return { ...current, id, ...(body as Partial<PortalModelMapping>) };
     }),
     deleteMapping: vi.fn(async (id: string) => {
       deletedMappingIds.push(id);
@@ -600,7 +606,11 @@ describe('RuntimeAdminSection tab strip', () => {
     expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
     expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
-    expect(screen.getByText(t.runtimeLiveStatus)).toBeInTheDocument();
+    // Scoped to the tab role like `runtimeSpecs` above: since the model-mapping
+    // tab arrived, the specs table's live-state column is labelled
+    // `runtimeLiveStatus` too (it used to say `tableStatus`, which now means
+    // the MAPPING's status one tab to the left), so the bare text matches twice.
+    expect(screen.getByRole('tab', { name: t.runtimeLiveStatus })).toBeInTheDocument();
 
     // Matrix: with zero launch specs (default renderSection), the "need two"
     // hint renders instead of a table -- proves this tab is wired to real
@@ -616,7 +626,7 @@ describe('RuntimeAdminSection tab strip', () => {
     // Status: the live table renders its own empty state (the stream is open
     // and reports nothing), no longer the generic area placeholder.
     stream.setStatus('open');
-    fireEvent.click(screen.getByText(t.runtimeLiveStatus));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     expect(await screen.findByText(t.runtimeStatusEmpty)).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeAreaPlaceholder)).not.toBeInTheDocument();
   });
@@ -4947,5 +4957,104 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     // before its own GET" governs full-document PUTs; the mapping PATCH merges.
     expect(await screen.findByRole('button', { name: t.mappingEdit })).toBeEnabled();
     expect(screen.getByRole('button', { name: t.tokenActionDisable })).toBeEnabled();
+  });
+});
+
+/**
+ * The other half of the same boundary: the launch-spec form stops pretending to
+ * own the two mapping fields it never wrote through its own endpoint.
+ */
+describe('RuntimeAdminSection spec form ownership', () => {
+  it('locks the gateway model name on EDIT and drops the status select entirely', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1' }) },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    // Await something that proves the form rendered before asserting a NEGATIVE.
+    await screen.findByLabelText(t.runtimeSpecBinary);
+
+    expect(document.querySelector('#runtime-spec-gateway-name')).toHaveAttribute('readonly');
+    expect(screen.getByText(t.runtimeSpecGatewayNameReadOnly)).toBeInTheDocument();
+    // The application model name is the spec's `upstream_model`; this form owns it.
+    expect(document.querySelector('#runtime-spec-app-name')).not.toHaveAttribute('readonly');
+    // By ID, not by the `t.tableStatus` label: that string also labels the
+    // specs table's live-state column and the mapping tab's status column.
+    expect(document.querySelector('#runtime-spec-status')).toBeNull();
+  });
+
+  it('sends ONLY the application model name to the mapping on a spec edit', async () => {
+    const { updatedMappings, putSpecs } = renderSection({
+      mappings: [
+        makeMapping({ id: 'map_1', gateway_model_name: 'gw-model', app_model_name: 'app-old' }),
+      ],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/old' }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/new' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    // BEHAVIOURAL: one key. The gateway name is read-only here and the status
+    // is not shown at all -- a form does not send a field it does not let you
+    // edit, or it silently reverts whatever the other screen just did.
+    expect(updatedMappings[0].body).toEqual({ app_model_name: 'app-old' });
+  });
+
+  it('does NOT re-enable a disabled mapping when only the launch config changes', async () => {
+    const { updatedMappings } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', status: 'disabled' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/old' }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/new' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+    // THE regression guard. `status` defaults to 'active' in this component,
+    // so leaving the key in the body while removing the control would PATCH a
+    // deliberately disabled model back into service on the next spec save --
+    // no error, no diff, and no column on the specs tab that contradicts it.
+    // Survives the future cleanup that deletes the hydration line as dead code.
+    expect(Object.prototype.hasOwnProperty.call(updatedMappings[0].body, 'status')).toBe(false);
+    // ...and it is still disabled on the tab that owns that field.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    expect(await screen.findByText(t.statusDisabled)).toBeInTheDocument();
+  });
+
+  it('keeps the gateway model name editable on CREATE and sends no status', async () => {
+    const { created } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    // CREATE is the exception, and not for cosmetic reasons: this form creates
+    // the MAPPING first and keys the spec PUT by the id it returns, the backend
+    // refuses an empty gateway name, and this is the ONLY mapping-create path a
+    // server_agent application has.
+    const gateway = document.querySelector('#runtime-spec-gateway-name');
+    expect(gateway).not.toHaveAttribute('readonly');
+    expect(gateway).toHaveAttribute('required');
+    expect(document.querySelector('#runtime-spec-status')).toBeNull();
+
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'gw-new' } });
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    // No status: CreateMapping normalises an absent status to active, which is
+    // byte-for-byte what the removed hard-coded 'active' produced.
+    expect(created[0]).toEqual({ gateway_model_name: 'gw-new', app_model_name: 'app-new' });
   });
 });

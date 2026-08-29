@@ -1024,9 +1024,16 @@ describe('ApplicationSection server_agent drill-down + managed_runtime_only', ()
 
     // RuntimeAdminSection's tab strip, not MappingSection's list heading.
     expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: t.runtimeMappingTab })).toBeInTheDocument();
     expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
-    expect(screen.getByText(t.runtimeLiveStatus)).toBeInTheDocument();
+    // Scoped to the tab role: since the model-mapping tab arrived, the specs
+    // table's live-state column carries this label too (it used to say
+    // `tableStatus`, which now means the MAPPING's status one tab to the left).
+    expect(screen.getByRole('tab', { name: t.runtimeLiveStatus })).toBeInTheDocument();
+    // MappingSection's own panel heading. RuntimeAdminSection has a panel by
+    // that name too now, but only inside its model-mapping tab -- and 'specs'
+    // is the tab this screen opens on.
     expect(screen.queryByText(t.modelMappings)).not.toBeInTheDocument();
   });
 

@@ -575,7 +575,11 @@ const de = {
   runtimeMappingTab: 'Modell-Zuordnung',
   runtimeMappingCreateHint:
     'Neue Modelle werden im Reiter „Runtime-Spezifikationen“ angelegt — Zuordnung und Spezifikation entstehen dort zusammen.',
-  runtimeSpecMappingSection: 'Modell-Zuordnung',
+  // The spec form's first heading. It is no longer "the mapping": the status
+  // select moved to the Modell-Zuordnung tab and the gateway name is
+  // read-only here, so what is left in that block are two model NAMES.
+  runtimeSpecModelSection: 'Modell-Namen',
+  runtimeSpecGatewayNameReadOnly: 'Wird im Reiter „Modell-Zuordnung“ bearbeitet.',
   runtimeSpecConfigSection: 'Startkonfiguration',
   runtimeSpecListenPort: 'Listen-Port',
   runtimeSpecListenPortHelp: '0 = automatisch einen freien Port wählen',
@@ -2540,7 +2544,8 @@ const en: PortalMessages = {
   runtimeMappingTab: 'Model mapping',
   runtimeMappingCreateHint:
     'New models are created on the Runtime specs tab — the mapping and its specification are written together there.',
-  runtimeSpecMappingSection: 'Model mapping',
+  runtimeSpecModelSection: 'Model names',
+  runtimeSpecGatewayNameReadOnly: 'Edited on the Model mapping tab.',
   runtimeSpecConfigSection: 'Launch configuration',
   runtimeSpecListenPort: 'Listen port',
   runtimeSpecListenPortHelp: '0 = choose a free port automatically',
