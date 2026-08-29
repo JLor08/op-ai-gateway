@@ -474,6 +474,15 @@ function renderSection(
     activeBenchmarks: opts.activeBenchmarks ?? vi.fn(async () => []),
     benchmarkStatus: opts.benchmarkStatus ?? vi.fn(async () => idleBenchmark),
     probeMappingContext: opts.probeMappingContext ?? vi.fn(async () => idleBenchmark),
+    // The per-row benchmark action opens `BenchmarkSection`, which loads the
+    // server's apps + the scoped mapping's history on mount and subscribes to
+    // its live SSE. Exactly the six methods it calls beyond the two above.
+    applications: vi.fn(async () => ({ data: [applicationForTest] })),
+    benchmarkServer: vi.fn(async () => idleBenchmark),
+    benchmarkApplication: vi.fn(async () => idleBenchmark),
+    benchmarkMapping: vi.fn(async () => idleBenchmark),
+    mappingBenchmarks: vi.fn(async () => []),
+    subscribeBenchmark: vi.fn(() => () => {}),
   };
 
   const view = render(
@@ -854,6 +863,14 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       activeBenchmarks: vi.fn(async () => []),
       benchmarkStatus: vi.fn(async () => idleBenchmark),
       probeMappingContext: vi.fn(async () => idleBenchmark),
+      // Structural only: the widened api Pick makes these part of the shape this
+      // fake must satisfy. This test never opens the benchmark sub-view.
+      applications: vi.fn(async () => ({ data: [] })),
+      benchmarkServer: vi.fn(async () => idleBenchmark),
+      benchmarkApplication: vi.fn(async () => idleBenchmark),
+      benchmarkMapping: vi.fn(async () => idleBenchmark),
+      mappingBenchmarks: vi.fn(async () => []),
+      subscribeBenchmark: vi.fn(() => () => {}),
     };
 
     render(
@@ -4883,18 +4900,46 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     expect(screen.getByText(t.statusActive)).toBeInTheDocument();
     expect(screen.queryByRole('columnheader', { name: t.runtimeSpecBinary })).toBeNull();
 
-    // BEHAVIOURAL: edit and the status toggle are offered...
+    // BEHAVIOURAL: edit, the status toggle AND the per-row benchmark are offered...
     expect(screen.getByRole('button', { name: t.mappingEdit })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: t.tokenActionDisable })).toBeInTheDocument();
+    // "Benchmark bleibt": it comes back as a row action because, unlike
+    // create/sync/delete, it neither creates nor destroys a row -- it only
+    // MEASURES one -- so the argument that dropped those never reached it.
+    expect(screen.getByRole('button', { name: t.runBenchmark })).toBeInTheDocument();
     // ...and nothing that creates or destroys a row. Delete is what the
-    // operator asked to drop; create/sync/benchmark are the same argument
-    // (a mapping created here would have no spec, a sync disables every
-    // mapping whose app model name the agent does not list).
+    // operator asked to drop; create/sync are the same argument (a mapping
+    // created here would have no spec, a sync disables every mapping whose app
+    // model name the agent does not list).
     expect(screen.queryByRole('button', { name: t.mappingDelete })).toBeNull();
     expect(screen.queryByRole('button', { name: t.mappingCreate })).toBeNull();
     expect(screen.queryByRole('button', { name: t.syncModels })).toBeNull();
-    expect(screen.queryByRole('button', { name: t.runBenchmark })).toBeNull();
     expect(screen.getByText(t.runtimeMappingCreateHint)).toBeInTheDocument();
+  });
+
+  it('drills into the benchmark sub-view from a row, under ONE breadcrumb bar', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+
+    // The row action opens the CONSOLIDATED benchmark area (BenchmarkSection),
+    // pre-scoped to this mapping. Its panel heading carries the server name.
+    fireEvent.click(await screen.findByRole('button', { name: t.runBenchmark }));
+    expect(
+      await screen.findByRole('heading', { name: `${t.benchmarkArea} — ${server.name}` }),
+    ).toBeInTheDocument();
+
+    // THE hazard this sub-view exists to avoid: BenchmarkSection must NOT carry
+    // its own breadcrumb wrapper on top of the one RuntimeAdminSection already
+    // renders. Exactly one <nav> trail, extending the section's own.
+    expect(screen.getAllByRole('navigation', { name: t.breadcrumb })).toHaveLength(1);
+
+    // The trail's clickable ancestor returns to the tabbed view, on the tab we
+    // came from -- proving it is the section's trail, not a second bar.
+    fireEvent.click(screen.getByRole('button', { name: application.endpoint }));
+    expect(await screen.findByRole('button', { name: t.mappingEdit })).toBeInTheDocument();
   });
 
   it('edits the two fields the mapping owns and never sends the one the spec owns', async () => {

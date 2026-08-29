@@ -26,6 +26,7 @@ import StopIcon from '@mui/icons-material/Stop';
 import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
 import ArticleIcon from '@mui/icons-material/Article';
+import SpeedIcon from '@mui/icons-material/Speed';
 import type {
   ApplicationStatus,
   GPUBudget,
@@ -56,6 +57,7 @@ import { mappingColumns } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { MappingForm, type MappingFormValues } from './MappingForm';
+import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 import { RuntimeLogView } from './RuntimeLogView';
 
@@ -976,6 +978,16 @@ export function RuntimeAdminSection({
     | 'activeBenchmarks'
     | 'benchmarkStatus'
     | 'probeMappingContext'
+    // The mapping tab's per-row "Benchmark" action opens the consolidated
+    // benchmark sub-view (`BenchmarkSection`), which needs its OWN slice of the
+    // api. Exactly the methods it calls -- `mappings` and `benchmarkStatus` are
+    // already listed above, so this adds only the remaining six.
+    | 'applications'
+    | 'benchmarkApplication'
+    | 'benchmarkMapping'
+    | 'benchmarkServer'
+    | 'mappingBenchmarks'
+    | 'subscribeBenchmark'
   >;
   server: PortalServer;
   application: PortalApplication;
@@ -1004,6 +1016,10 @@ export function RuntimeAdminSection({
   // documents, and the tab strip is hidden while either is open, so neither can
   // start the other.
   const [mappingEdit, setMappingEdit] = useState<PortalModelMapping | null>(null);
+  // When set, the consolidated benchmark sub-view is shown, pre-scoped to the
+  // clicked mapping row's model. A third mutually-exclusive sub-view alongside
+  // `mappingEdit` and `specMode`; the tab strip is hidden while any is open.
+  const [benchmarkScope, setBenchmarkScope] = useState<BenchmarkScope | null>(null);
 
   const {
     data: mappingsData,
@@ -2436,6 +2452,17 @@ export function RuntimeAdminSection({
       icon: <EditIcon fontSize="small" />,
       onClick: () => setMappingEdit(row),
     },
+    // "Benchmark bleibt": measures a model, never creates or destroys a row, so
+    // the argument that dropped Delete/create/sync from this tab does not reach
+    // it. Opens the consolidated benchmark sub-view scoped to this mapping,
+    // exactly as `MappingSection`'s own row action does.
+    {
+      key: 'benchmark',
+      label: t.runBenchmark,
+      icon: <SpeedIcon fontSize="small" />,
+      onClick: () =>
+        setBenchmarkScope({ kind: 'mapping', id: row.id, name: row.gateway_model_name }),
+    },
     {
       key: 'toggle',
       label: row.status === 'active' ? t.tokenActionDisable : t.tokenActionEnable,
@@ -2969,6 +2996,41 @@ export function RuntimeAdminSection({
       : streamStatus === 'error'
         ? { status: 'standby', label: t.runtimeStreamOffline }
         : { status: 'watch', label: t.runtimeStreamConnecting };
+
+  // Consolidated benchmark sub-view, pre-scoped to the clicked mapping row's
+  // model. Same full-render-takeover convention as the two sub-views below.
+  //
+  // The one hazard the copy from `MappingSection` must NOT reproduce: that
+  // component's benchmark wrapper renders its OWN <Breadcrumbs> bar, and this
+  // section already renders one -- a naive copy stacks two. So the bar here is
+  // built from THIS section's `trail` (the single source every sub-view uses)
+  // and `BenchmarkSection` carries no bar of its own, which leaves exactly one.
+  if (benchmarkScope) {
+    return (
+      <>
+        <Breadcrumbs
+          ariaLabel={t.breadcrumb}
+          backLabel={t.back}
+          items={[
+            ...trail,
+            { label: application.endpoint, onClick: () => setBenchmarkScope(null) },
+            { label: t.benchmarkArea },
+          ]}
+        />
+        <BenchmarkSection
+          key={`bench-${server.id}`}
+          t={t}
+          api={api}
+          server={server}
+          initialScope={benchmarkScope}
+          // A completed run may have discovered a model's context size, so the
+          // one copy of the mappings these tabs share is refreshed on completion.
+          onModelsChanged={() => void reloadMappings()}
+          pollIntervalMs={pollIntervalMs}
+        />
+      </>
+    );
+  }
 
   // Model-mapping edit sub-view. Same full-render-takeover convention as the
   // spec form below, and the SAME mask an ordinary application's model screen
