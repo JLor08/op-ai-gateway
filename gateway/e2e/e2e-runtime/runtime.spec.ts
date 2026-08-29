@@ -360,10 +360,29 @@ function stateBadge(model: string, label: string): Locator {
 }
 
 /**
- * Fills and submits the runtime-spec create form. "Spezifikation anlegen"
- * creates BOTH the model mapping and its launch spec (submitCreate:
- * createMapping then putRuntimeSpec), so the PUT is what says the whole thing
- * landed.
+ * Creates one launch spec end to end, as the feature's create flow now
+ * requires: CREATE, then RENAME.
+ *
+ * The create form no longer carries a gateway-name field. `submitCreate`
+ * DERIVES the gateway name from the app model name (createMapping with
+ * gateway == app), exactly as model discovery seeds a new mapping. So a create
+ * on its own can only produce a mapping whose gateway name EQUALS its upstream
+ * name -- and every scenario below needs them DISTINCT (`opts.model` is the
+ * gateway-facing name the gateway routes on; `opts.upstream` is the
+ * app_model_name the agent's router routes on and reports as loaded). The
+ * distinct gateway alias is therefore set AFTERWARDS by editing the mapping on
+ * the Modell-Zuordnung tab, whose form reuses `MappingForm` with the
+ * gateway-name field editable and the app-name field read-only -- the same
+ * discovery-then-rename flow an ordinary application uses.
+ *
+ * Step 1 (specs tab) enters ONLY the app model name plus the binary/args/vram.
+ * "Spezifikation anlegen" creates BOTH the model mapping and its launch spec
+ * (submitCreate: createMapping then putRuntimeSpec), so the runtime-spec PUT is
+ * what says the whole thing landed; the row then reads gateway == app ==
+ * opts.upstream. Step 2 (Modell-Zuordnung tab) opens that mapping's edit and
+ * renames the gateway name to opts.model, saved via the mapping PATCH. The
+ * helper ends with gateway_model_name == opts.model and app_model_name ==
+ * opts.upstream, the distinction the routing assertions below depend on.
  */
 async function createSpec(opts: {
   model: string;
@@ -375,7 +394,8 @@ async function createSpec(opts: {
   await openRuntimeTab(t.runtimeSpecs);
   await page.getByRole("button", { name: t.runtimeSpecCreate }).click();
 
-  await page.locator("#runtime-spec-gateway-name").fill(opts.model);
+  // No gateway-name field on create: the gateway name is derived from this one
+  // (gateway == app == opts.upstream), and made distinct by the rename below.
   await page.locator("#runtime-spec-app-name").fill(opts.upstream);
   await page.locator("#runtime-spec-binary").fill(RUNTIME_STUB_BIN);
   // One argument per line. ${PORT} is resolved by the AGENT to the loopback
@@ -401,7 +421,27 @@ async function createSpec(opts: {
     page.waitForResponse((r) => /\/api\/portal\/mappings\/[^/]+\/runtime-spec$/.test(new URL(r.url()).pathname) && r.request().method() === "PUT"),
     page.getByRole("button", { name: t.runtimeSpecCreate }).click()
   ]);
-  expect(resp.ok(), `saving the runtime spec for ${opts.model}: ${resp.status()} ${await resp.text()}`).toBe(true);
+  expect(resp.ok(), `saving the runtime spec for ${opts.upstream}: ${resp.status()} ${await resp.text()}`).toBe(true);
+  // Created with gateway == app == opts.upstream: the distinct alias is not set
+  // yet, so the row is addressable only by the upstream name at this point.
+  await expect(row(opts.upstream)).toBeVisible();
+
+  // Step 2 -- rename the gateway name to opts.model on the Modell-Zuordnung
+  // tab (the tab left of the specs tab). Its edit reuses MappingForm: the
+  // gateway-name field (#mapping-gateway-name) is editable and the app-name
+  // field is read-only (the spec owns the upstream name). The row is located by
+  // opts.upstream, the only name it carries until this rename lands -- which
+  // stays unambiguous even when an earlier spec is already renamed (that row
+  // carries neither of THIS spec's names; the suite's names are deliberately
+  // non-substring-colliding).
+  await openRuntimeTab(t.runtimeMappingTab);
+  await row(opts.upstream).getByRole("button", { name: t.mappingEdit }).click();
+  await page.locator("#mapping-gateway-name").fill(opts.model);
+  const [renamed] = await Promise.all([
+    page.waitForResponse((r) => /^\/api\/portal\/mappings\/[^/]+$/.test(new URL(r.url()).pathname) && r.request().method() === "PATCH"),
+    page.getByRole("button", { name: t.mappingSave }).click()
+  ]);
+  expect(renamed.ok(), `renaming the gateway model to ${opts.model}: ${renamed.status()} ${await renamed.text()}`).toBe(true);
   await expect(row(opts.model)).toBeVisible();
 }
 
