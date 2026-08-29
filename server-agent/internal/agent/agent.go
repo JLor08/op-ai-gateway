@@ -33,11 +33,18 @@ import (
 
 // Version is the agent's self-reported version, sent as agent_version.
 // Bump rule (design spec §9, feature negotiation): MINOR when Features
-// gains a new entry (as here -- 0.1.0 -> 0.2.0 for "runtime_manager"),
-// PATCH for anything else. TestFeatureRegistry enforces the MINOR case by
-// failing if any Feature.Since outruns Version; it cannot catch a forgotten
-// PATCH bump after a plain bugfix, which stays a process rule.
-const Version = "0.2.1"
+// gains a new entry (as with 0.1.0 -> 0.2.0 for "runtime_manager"), PATCH
+// for anything else. TestFeatureRegistry enforces the MINOR case by failing
+// if any Feature.Since outruns Version; it cannot catch a forgotten PATCH
+// bump after a plain bugfix, which stays a process rule.
+//
+// 0.2.1 -> 0.2.2 is the single PATCH bump for the runtime-policy-and-mapping
+// branch: LocalPolicy's work_dir handling changed observably (an empty
+// work_dir now runs beside the binary; a trailing "<dir>/*" is accepted as a
+// subtree synonym; a new runtime_allow_binary_dirs toggle auto-allows each
+// allowed binary's parent directory), but no agent.Features entry was added,
+// so it is PATCH, not MINOR.
+const Version = "0.2.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

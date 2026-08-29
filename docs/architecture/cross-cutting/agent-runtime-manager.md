@@ -118,7 +118,7 @@ deliberate:
 | Check | Rule | Empty list means |
 |---|---|---|
 | Binary allowlist | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES`. `spec.binary` must be absolute (`filepath.IsAbs`) and match an entry **exactly**; non-absolute allowlist entries are skipped when scanning. | **Nothing starts.** An unconfigured agent refuses every spec — enabling the feature is an explicit act on each host. |
-| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. | **Any `work_dir` permitted.** The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
+| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. A bare entry is already a subtree; `allowedDirBase` accepts a trailing whole-segment wildcard (`<dir>/*` or `<dir>\*`) as an exactly-equivalent synonym by stripping it to `<dir>` before that same check (see §3.1.1). | **Any `work_dir` permitted.** The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
 | Placeholder expansion | §3.2. | — |
 
 Three details are one line away from a bypass and must not be "simplified":
@@ -143,6 +143,39 @@ it.
 
 There is no shell interpreter anywhere on this path: the agent `exec`s directly
 with an argv array, as an unprivileged user, in its own process group on unix.
+
+#### 3.1.1 Wildcards in `runtime_allowed_dirs` are subtree synonyms, not a glob
+
+`withinDir` already makes a **bare** entry mean "the directory itself and
+everything strictly beneath it". A trailing whole-segment wildcard — `<dir>/*`
+or `<dir>\*` — is therefore not a new capability; it is an **exactly
+equivalent** spelling that an operator naturally reaches for ("`c:\llama_cpp\*`
+= der Ordner und alle Unterordner"). `allowedDirBase`
+(`server-agent/internal/runtime/policy_local.go`) strips that trailing
+separator-plus-`*` from the entry and hands the concrete base to the unchanged
+`withinDir`. Both separators are recognised on every GOOS, deliberately: this
+is a Windows deployment and CI runs no Windows job, so the backslash form is
+handled — and unit-tested — on the Linux runner (`TestAllowedDirBase`).
+
+It is emphatically **not** a glob, and that is the security decision:
+
+- The untrusted `work_dir` is never matched against a wildcard. There is no
+  glob engine. `allowedDirBase` only ever **shortens the trusted operator
+  config entry**; the candidate still flows through `filepath.Clean` and the
+  separator-boundary check in `withinDir`. A `*` never participates in
+  matching, so it can never swallow a separator to jump levels — `c:\llama_cpp\*`
+  rejects `c:\llama_cpp\..\windows` and the sibling `c:\llama_cpp_evil`, exactly
+  as a bare `c:\llama_cpp` does.
+- A `*` that is not a whole trailing segment (`/srv/models*`, `a/*/b`, `**`) is
+  left verbatim, so it stays an ordinary path character and matches nothing
+  useful — `/srv/models*` does **not** permit `/srv/models-evil`.
+- A bare `*` reduces to `""`, which `withinDir` treats as "permits nothing"
+  (fail closed), never the whole filesystem.
+
+Mid-path globbing, and any convention where `**` would mean a subtree, are
+explicitly not supported: the operator's only need is a trailing star standing
+for the subtree, which the bare entry already delivers, and a real glob would
+move containment off the audited `withinDir` for a capability nobody asked for.
 
 ### 3.2 Placeholders, and why no secret enters the gateway
 

@@ -242,6 +242,161 @@ func TestPermitNoAllowedDirsMeansAnyWorkDir(t *testing.T) {
 	}
 }
 
+// TestPermitWorkDirWildcardEntry is R4's security-boundary table, driven through
+// the PUBLIC Permit path so the untrusted candidate takes the exact route it
+// takes in production (filepath.Clean + separator-boundary containment in
+// withinDir), never a glob engine. A trailing whole-segment wildcard
+// ("<dir>/*") is an EXACTLY EQUIVALENT spelling of the bare subtree entry: it
+// must permit the directory and everything strictly beneath it, and must NEVER
+// permit a path outside that tree. The reject rows are the whole point -- a
+// wildcard that admits a sibling, a "..", or a separator jump is a critical
+// defect, not a bug.
+//
+// The POSIX shape is fully exercised here on the Linux CI runner; the Windows
+// backslash/drive/case shape rides on the unchanged withinDir and is pinned in
+// the GOOS-gated TestPermitWorkDirWildcardEntryWindows below (plus, for the
+// pure string reduction of BOTH separators, TestAllowedDirBase).
+func TestPermitWorkDirWildcardEntry(t *testing.T) {
+	base := Spec{ID: "s1", Binary: "/usr/bin/ollama"}
+
+	cases := []struct {
+		name    string
+		entry   string // a single runtime_allowed_dirs entry
+		workDir string
+		wantOK  bool
+	}{
+		// A trailing "/*" now permits the subtree -- the operator's own example
+		// ("der Ordner und alle Unterordner"). Every one of these is a RED row
+		// before allowedDirBase exists (the literal "*" matched nothing useful)
+		// and GREEN after.
+		{"trailing star permits the dir itself", "/srv/llama_cpp/*", "/srv/llama_cpp", true},
+		{"trailing star permits a child", "/srv/llama_cpp/*", "/srv/llama_cpp/models", true},
+		{"trailing star permits a deep descendant", "/srv/llama_cpp/*", "/srv/llama_cpp/a/b/c", true},
+		{"trailing star tolerates a contained traversal", "/srv/llama_cpp/*", "/srv/llama_cpp/x/../y", true},
+
+		// The reject list. These are GREEN both before and after: the matcher
+		// must WIDEN permission to the subtree without EVER widening it to an
+		// escape. The candidate is cleaned before any comparison, so a "*"
+		// never participates in matching and can never swallow a separator.
+		{"trailing star rejects a dot-dot escape", "/srv/llama_cpp/*", "/srv/llama_cpp/../windows", false},
+		{"trailing star rejects a sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil", false},
+		{"trailing star rejects a nested sibling with a shared prefix", "/srv/llama_cpp/*", "/srv/llama_cpp-evil/x", false},
+		{"trailing star rejects an unrelated tree", "/srv/llama_cpp/*", "/srv/other", false},
+
+		// A glued star is NOT a wildcard: "/srv/models*" ends in "s*", not
+		// "/*", so it stays literal and matches only a directory really named
+		// that -- it must NOT permit the "/srv/models-evil" sibling. This is
+		// the new rule that keeps option (a) safe, and it is fully testable on
+		// Linux.
+		{"glued star stays literal, rejects the evil sibling", "/srv/models*", "/srv/models-evil", false},
+		{"glued star stays literal, rejects the bare dir", "/srv/models*", "/srv/models", false},
+
+		// A bare "*" reduces to "" -> withinDir permits NOTHING (fail closed),
+		// never the whole filesystem.
+		{"bare star permits nothing", "*", "/srv/anything", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}, AllowedDirs: []string{tc.entry}}
+			spec := base
+			spec.WorkDir = tc.workDir
+			err := p.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = %v, want nil (permitted)", tc.entry, tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = nil, want an error (a wildcard must never permit a path outside its tree)", tc.entry, tc.workDir)
+			}
+		})
+	}
+}
+
+// TestAllowedDirBase pins the pure string reduction directly, which is the ONE
+// piece of R4 that is GOOS-independent and therefore the place the Windows
+// backslash form is proven on the Linux CI runner (see the function's own doc:
+// CI runs no Windows job, so "\*" recognition MUST be observable on a POSIX
+// host). It also pins the two properties the security argument leans on: a
+// glued star is left verbatim (so a sibling can never be permitted), and a bare
+// "*" reduces to "" (fail closed).
+func TestAllowedDirBase(t *testing.T) {
+	cases := []struct {
+		entry string
+		want  string
+	}{
+		// Trailing whole-segment wildcard -> the concrete base, both separators.
+		{"/srv/models/*", "/srv/models"},
+		{`c:\llama_cpp\*`, `c:\llama_cpp`},
+		{"/srv/a/b/*", "/srv/a/b"},
+		// A plain (bare) entry is already a subtree, returned unchanged.
+		{"/srv/models", "/srv/models"},
+		{`c:\llama_cpp`, `c:\llama_cpp`},
+		// NOT a whole trailing segment -> verbatim, so withinDir treats "*" as
+		// an ordinary path character and the entry matches nothing useful.
+		{"/srv/models*", "/srv/models*"},
+		{"/srv/a/*/b", "/srv/a/*/b"},
+		{"/srv/**", "/srv/**"},
+		// A bare "*" fails closed.
+		{"*", ""},
+		// An operator writing ".." in an entry broadens their OWN trusted
+		// allowlist, identical to a bare "/srv/models/.." -- not a
+		// candidate-side escape.
+		{"/srv/models/../*", "/srv/models/.."},
+		// Degenerate roots/volumes an operator should not write, called out so
+		// their reduction is a decision, not a surprise.
+		{"/*", ""},
+		{`c:\*`, "c:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.entry, func(t *testing.T) {
+			if got := allowedDirBase(tc.entry); got != tc.want {
+				t.Errorf("allowedDirBase(%q) = %q, want %q", tc.entry, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPermitWorkDirWildcardEntryWindows is the Windows-gated half of R4: on a
+// real Windows host the operator's own example, c:\llama_cpp\*, must permit the
+// tree and reject every escape, exactly as the POSIX table above does. It adds
+// NO new untested containment behaviour -- allowedDirBase only reduces the
+// trusted entry, and the untrusted candidate still flows through the unchanged,
+// already-audited withinDir, which handles backslashes, drive letters and case
+// natively on Windows. CI runs no Windows job (see the skips throughout this
+// package), so this documents and locks the behaviour for the deployment
+// platform and for `GOOS=windows go vet`.
+func TestPermitWorkDirWildcardEntryWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path containment (backslash/drive/case) is GOOS-native in withinDir; the separator-reduction half is proven cross-platform in TestAllowedDirBase")
+	}
+	base := Spec{ID: "s1", Binary: `c:\bin\ollama.exe`}
+	cases := []struct {
+		name    string
+		entry   string
+		workDir string
+		wantOK  bool
+	}{
+		{"permits the dir itself", `c:\llama_cpp\*`, `c:\llama_cpp`, true},
+		{"permits a child", `c:\llama_cpp\*`, `c:\llama_cpp\models`, true},
+		{"rejects a dot-dot escape", `c:\llama_cpp\*`, `c:\llama_cpp\..\windows`, false},
+		{"rejects a sibling with a shared prefix", `c:\llama_cpp\*`, `c:\llama_cpp_evil`, false},
+		{"rejects a different volume", `c:\llama_cpp\*`, `d:\llama_cpp\x`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := LocalPolicy{AllowedBinaries: []string{`c:\bin\ollama.exe`}, AllowedDirs: []string{tc.entry}}
+			spec := base
+			spec.WorkDir = tc.workDir
+			err := p.Permit(spec)
+			if tc.wantOK && err != nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = %v, want nil (permitted)", tc.entry, tc.workDir, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("Permit(entry=%q, work_dir=%q) = nil, want an error", tc.entry, tc.workDir)
+			}
+		})
+	}
+}
+
 // TestExpandPlaceholdersPort proves ${PORT} in args resolves to the chosen
 // listen port, given as a plain decimal string.
 func TestExpandPlaceholdersPort(t *testing.T) {

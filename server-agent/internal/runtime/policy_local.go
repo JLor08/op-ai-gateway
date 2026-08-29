@@ -372,7 +372,7 @@ func (p LocalPolicy) Permit(spec Spec) error {
 		return fmt.Errorf("runtime: spec sets no work_dir, but this agent restricts work directories to %d configured path(s) (runtime_allowed_dirs / OP_AGENT_RUNTIME_ALLOWED_DIRS); set the spec's work_dir to a path inside one of them", len(p.AllowedDirs))
 	}
 	for _, dir := range p.AllowedDirs {
-		if withinDir(spec.WorkDir, dir) {
+		if withinDir(spec.WorkDir, allowedDirBase(dir)) { // R4: <dir>/* is an accepted synonym for the bare subtree
 			return nil
 		}
 	}
@@ -433,6 +433,41 @@ func withinDir(candidate, dir string) bool {
 		return true
 	}
 	return strings.HasPrefix(cleanCandidate, cleanDir+string(filepath.Separator))
+}
+
+// allowedDirBase reduces a runtime_allowed_dirs entry to the concrete
+// directory whose subtree it permits. A bare entry is already a subtree
+// (withinDir permits the dir and everything strictly beneath it), so it is
+// returned unchanged. A trailing whole-segment wildcard -- "<dir>/*" or
+// "<dir>\*" -- is an accepted, EXACTLY EQUIVALENT spelling of that subtree:
+// the trailing separator+"*" is dropped and the base is returned. Both
+// separators are recognised on EVERY GOOS (this is a Windows deployment and
+// CI runs no Windows job, so the backslash form must be handled -- and
+// unit-tested -- on a POSIX host); recognising either separator can only make
+// the base SHORTER, never longer, so it can never widen the permitted set.
+//
+// A '*' that is not a whole trailing segment ("name*", "a/*/b", "**") is NOT a
+// wildcard here and is returned verbatim; withinDir then treats it as an
+// ordinary path character (filepath.Clean leaves it untouched), so the entry
+// matches only a real directory literally named that -- nothing useful -- and
+// "/srv/models*" does NOT permit "/srv/models-evil". A bare "*" reduces to ""
+// so withinDir permits NOTHING (fail closed), never the whole filesystem.
+//
+// This is the ENTIRETY of R4's wildcard support, and deliberately so: the
+// untrusted candidate is never matched against a glob -- there is no glob
+// engine. This function only ever SHORTENS the trusted operator config entry
+// to a concrete base, which is then handed to the unchanged, audited withinDir
+// (filepath.Clean + separator boundary). A '*' therefore never participates in
+// matching and can never swallow a separator to jump levels. Mid-path globbing
+// is explicitly not supported.
+func allowedDirBase(entry string) string {
+	if entry == "*" {
+		return ""
+	}
+	if strings.HasSuffix(entry, "/*") || strings.HasSuffix(entry, `\*`) {
+		return entry[:len(entry)-2]
+	}
+	return entry
 }
 
 // placeholderPattern matches ANY "${...}" shape, including an empty body
