@@ -2350,9 +2350,12 @@ func (s *Service) ListServers(ctx context.Context, principal auth.Token) (Server
 			}
 		}
 	}
+	// ONE settings read for the whole list -- see serverDTO's doc for why this is
+	// a consistency property and not a micro-optimisation.
+	values, settingsOK := s.systemSettingsSnapshot(ctx)
 	out := make([]ServerDTO, 0, len(servers))
 	for _, srv := range servers {
-		dto, err := s.serverDTO(ctx, srv)
+		dto, err := s.serverDTOWith(ctx, srv, values, settingsOK)
 		if err != nil {
 			return ServerListResponse{}, err
 		}
@@ -3160,7 +3163,41 @@ func (s *Service) validateAdminGroupScope(ctx context.Context, principal auth.To
 	return ids, systemGroupID, nil
 }
 
+// serverDTO renders ONE server, reading the system settings for itself. Every
+// single-server path uses this; ListServers uses serverDTOWith so that N servers
+// share ONE settings read.
+//
+// The settings are threaded rather than re-read per server for a reason that is
+// not performance (one read is ~33 us): ListServers rendered N servers from N
+// independent reads, so a concurrent Save could land mid-loop and the response
+// would describe server #1 under the old cert_https_switch_mode and server #100
+// under the new one. One read per request makes the list internally consistent.
+// cmd/gateway/app_health.go already takes exactly this shape per pass, and says
+// in its own comment that it mirrors serverDTO; this makes that true.
 func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (ServerDTO, error) {
+	values, ok := s.systemSettingsSnapshot(ctx)
+	return s.serverDTOWith(ctx, server, values, ok)
+}
+
+// systemSettingsSnapshot reads the settings once, returning ok=false when there
+// is no reader or the read failed. The BOOLEAN IS LOAD-BEARING and must not be
+// collapsed into a nil map: tlsProxyState turns "no settings" into "unknown"
+// (which keeps the operator's control visible) and would turn an empty map into
+// "out_of_scope" (which hides it), because DefaultCertHTTPSSwitchMode is
+// "manual". A read glitch must never hide a control -- see tlsProxyState's own
+// doc and TestTLSProxyState.
+func (s *Service) systemSettingsSnapshot(ctx context.Context) (map[string]string, bool) {
+	if s.settings == nil {
+		return nil, false
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		return nil, false
+	}
+	return values, true
+}
+
+func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, values map[string]string, settingsOK bool) (ServerDTO, error) {
 	ownerIDs, err := s.routes.ServerOwners(ctx, server.ID)
 	if err != nil {
 		return ServerDTO{}, err
@@ -3206,8 +3243,8 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 		NetbirdPingExclude:          server.NetbirdPingExclude,
 		CertificateOverride:         server.CertificateOverride,
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
-		AgentStatus:                 s.agentStatus(ctx, server),
-		TLSProxyState:               s.tlsProxyState(ctx, server),
+		AgentStatus:                 s.agentStatus(ctx, server, values, settingsOK),
+		TLSProxyState:               s.tlsProxyState(server, values, settingsOK),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
 		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
@@ -3230,13 +3267,19 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 // "unconfigured" (no agent token at all). Nil-safe throughout — a nil
 // AgentPresence reader or an AgentTokenByServer error/miss never escalates
 // past "unconfigured"/"inactive".
-func (s *Service) agentStatus(ctx context.Context, server routing.AIServer) string {
+func (s *Service) agentStatus(ctx context.Context, server routing.AIServer, values map[string]string, settingsOK bool) string {
 	status := "unconfigured"
 	if _, hasToken, _ := s.routes.AgentTokenByServer(ctx, server.ID); hasToken {
 		status = "inactive"
 	}
 	if s.agentPresence != nil {
-		sysDefault := s.activeAgentPresenceTimeoutSeconds(ctx)
+		// The caller's snapshot, so a list of N servers does not read the settings
+		// N times. Without it, this is the SECOND per-server read (tlsProxyState is
+		// the other) -- and unlike that one, this one predates it.
+		sysDefault := s.agentPresenceTimeoutDefault
+		if settingsOK {
+			sysDefault = s.AgentPresenceTimeoutSeconds(values)
+		}
 		window := time.Duration(routing.EffectiveAgentPresenceTimeoutSeconds(server, sysDefault, MinAgentPresenceTimeoutSeconds, MaxAgentPresenceTimeoutSeconds)) * time.Second
 		if s.agentPresence.ReportingWithin(server.ID, window) {
 			status = "active"
@@ -3275,13 +3318,12 @@ func (s *Service) agentStatus(ctx context.Context, server routing.AIServer) stri
 // when an operator is most likely to be reaching for this control. Hence
 // "agent_off" and "unknown" are POSITIVE/ABSENT observations that change the
 // sentence shown, never the visibility.
-func (s *Service) tlsProxyState(ctx context.Context, server routing.AIServer) string {
-	if s.settings == nil {
-		return "unknown"
-	}
-	values, err := s.settings.SystemSettings(ctx)
-	if err != nil {
-		// A read glitch must NEVER hide a control.
+func (s *Service) tlsProxyState(server routing.AIServer, values map[string]string, settingsOK bool) string {
+	// settingsOK false covers BOTH "no reader" and "the read failed" -- kept as an
+	// explicit boolean rather than a nil map, because an empty map would resolve
+	// to the "manual" default and hence to "out_of_scope", hiding the control on a
+	// transient glitch. A read glitch must NEVER hide a control.
+	if !settingsOK {
 		return "unknown"
 	}
 	if !httpsSwitchInScope(server, CertHTTPSSwitchMode(values)) {

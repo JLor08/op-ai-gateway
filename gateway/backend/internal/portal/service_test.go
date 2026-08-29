@@ -2200,7 +2200,11 @@ func TestTLSProxyState(t *testing.T) {
 	}
 	for _, c := range cases {
 		svc := newSvc(t, c.mode, c.reports)
-		if got := svc.tlsProxyState(ctx, c.server); got != c.want {
+		// Through systemSettingsSnapshot, exactly as serverDTO and ListServers
+		// reach it: the read and the derivation are now separate, and it is the
+		// PAIR that carries the "a glitch must not hide the control" property.
+		values, ok := svc.systemSettingsSnapshot(ctx)
+		if got := svc.tlsProxyState(c.server, values, ok); got != c.want {
 			t.Errorf("%s: tlsProxyState = %q, want %q", c.name, got, c.want)
 		}
 	}
@@ -2210,12 +2214,27 @@ func TestTLSProxyState(t *testing.T) {
 	// nil settings reader.
 	svc := newSvc(t, "auto", reportsWithMode("proxy"))
 	svc.settings = alwaysFailingSystemSettings{}
-	if got := svc.tlsProxyState(ctx, outOfScope); got != "unknown" {
+	values, ok := svc.systemSettingsSnapshot(ctx)
+	if got := svc.tlsProxyState(outOfScope, values, ok); got != "unknown" {
 		t.Fatalf("settings error on an out-of-scope server: tlsProxyState = %q, want unknown", got)
 	}
 	svc.settings = nil
-	if got := svc.tlsProxyState(ctx, outOfScope); got != "unknown" {
+	values, ok = svc.systemSettingsSnapshot(ctx)
+	if got := svc.tlsProxyState(outOfScope, values, ok); got != "unknown" {
 		t.Fatalf("nil settings reader: tlsProxyState = %q, want unknown", got)
+	}
+
+	// The hoist's own hazard, pinned: an EMPTY map with settingsOK=true is a
+	// legitimate state (a fresh install), and it must resolve through the
+	// documented "manual" default — while settingsOK=false must NOT, or a read
+	// glitch would hide the control. Same map, opposite answers, which is why the
+	// boolean exists rather than a nil sentinel.
+	svc = newSvc(t, "auto", reportsWithMode("proxy"))
+	if got := svc.tlsProxyState(inScope, map[string]string{}, true); got != "out_of_scope" {
+		t.Fatalf("empty settings, read OK: tlsProxyState = %q, want out_of_scope", got)
+	}
+	if got := svc.tlsProxyState(inScope, map[string]string{}, false); got != "unknown" {
+		t.Fatalf("empty settings, read FAILED: tlsProxyState = %q, want unknown", got)
 	}
 }
 
