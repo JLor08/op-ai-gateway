@@ -1350,6 +1350,40 @@ describe('ServerList NetBird', () => {
     };
   }
 
+  // Opens the create form only once the netbirdEnabled() fetch's state has been
+  // COMMITTED -- which "it has been called" does not imply, and which every
+  // assertion below about the create form's INITIAL state depends on.
+  //
+  // openCreate SNAPSHOTS netbird_only, manage_policies, the effective scope and
+  // deny-by-default into the form's own state (setNetbirdChecked,
+  // setCreatePolicyOverride) at click time. A click dispatched before that
+  // fetch's setStates are committed therefore runs the PRE-fetch render's
+  // closure, where netbird_only is still false: the box opens unchecked and the
+  // override falls to ''. No later commit repairs either -- openCreate never
+  // runs again -- so a `waitFor` placed AFTER the click cannot rescue it; it can
+  // only burn its timeout and fail.
+  //
+  // `waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled())` was not a
+  // synchronisation point for any of that: the call happens at mount, one
+  // microtask before the fake resolves and one macrotask before React's
+  // Scheduler commits the update, while waitFor returns the moment its callback
+  // passes. The two race. Measured on a reproduction that changes nothing but
+  // the clock React's scheduler reads -- +6 ms per reading, so every unit of
+  // work blows the 5 ms frame budget and the concurrent render yields and
+  // re-schedules, which is what CPU load does to it -- six tests in this file
+  // fail, the SYSTEM-admin case at `expect(checkbox.checked).toBe(true)`.
+  //
+  // The list's NetBird column renders on netbirdModuleEnabled, which lands in
+  // the SAME batched commit as the other four values, so its header is a
+  // committed-state proxy for all of them and strictly stronger than the call
+  // count (it also proves the response said enabled). It exists only under
+  // moduleEnabled: true; the module-disabled cases have no positive marker to
+  // wait for and keep the call-count wait.
+  async function openCreateOnceNetbirdFlagsCommitted() {
+    await screen.findByRole('columnheader', { name: t.settingsNetbirdTitle });
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+  }
+
   it('hides the create checkbox when the module is disabled', async () => {
     const { fakeApi } = renderNb({ moduleEnabled: false });
     await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
@@ -1395,14 +1429,13 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
     expect(checkbox).toBeDisabled();
@@ -1420,14 +1453,13 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
     expect(checkbox).not.toBeDisabled();
@@ -1444,9 +1476,8 @@ describe('ServerList NetBird', () => {
   });
 
   it('leaves the create checkbox unchecked + editable + note-free when netbird_only is off', async () => {
-    const { fakeApi } = renderNb({ moduleEnabled: true, netbirdOnly: false });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    renderNb({ moduleEnabled: true, netbirdOnly: false });
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
     expect(checkbox).not.toBeDisabled();
@@ -2311,14 +2342,27 @@ describe('ServerList NetBird', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: t.listRowMenu }));
     fireEvent.click(await screen.findByRole('menuitem', { name: t.serverActionEdit }));
+    // Same cause as the create-form sites above, other fetch: getSystemSettings
+    // having been CALLED says nothing about its rejection having been committed,
+    // and under a slow commit this test failed with the include control still on
+    // screen. It renders from the netbirdEnabled scope ('selected', renderNb's
+    // default) the moment the edit form opens and the failure can only clear it a
+    // microtask later, so asserting it PRESENT first is also what stops the
+    // absence assertions from passing vacuously -- before the scope lands the
+    // control is absent for the wrong reason.
+    expect(
+      screen.getByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
+    ).toBeInTheDocument();
     await waitFor(() => expect(getSystemSettings).toHaveBeenCalled());
     // The rest of the linkage editor still renders (never blocked by the failure).
     expect(screen.getByRole('button', { name: t.serverNetbirdLinkSave })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
+      ).not.toBeInTheDocument(),
+    );
     expect(
       screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyExclude }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
     ).not.toBeInTheDocument();
   });
 
@@ -2416,7 +2460,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2425,12 +2469,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state (manage/scope/deny) to flush into the DOM before the
-    // policy assertions — the netbird checkbox becomes checked once the fetch lands.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once manage/scope/deny are
+    // committed: the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box).toBeDisabled();
@@ -2446,7 +2489,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2455,11 +2498,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box).not.toBeDisabled();
@@ -2477,7 +2520,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2486,11 +2529,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(false);
     expect(box).not.toBeDisabled();
@@ -2508,7 +2551,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2517,11 +2560,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyExclude)) as HTMLInputElement;
     expect(box.checked).toBe(false);
     expect(screen.getByText(t.serverNetbirdPolicyOptOutDenyNote)).toBeInTheDocument();
@@ -2533,7 +2576,7 @@ describe('ServerList NetBird', () => {
   });
 
   it('shows NO policy control for a NORMAL admin under all scope on create (netbird still forced on)', async () => {
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2541,19 +2584,18 @@ describe('ServerList NetBird', () => {
       denyByDefault: true,
       isSystemAdmin: false,
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     // The netbird checkbox is forced on for a normal admin under netbird_only, but the
-    // all-scope opt-out is system-admin-only → neither policy control renders. Wait for the
-    // mount-effect state to flush (checkbox checked) before the absence assertions.
+    // all-scope opt-out is system-admin-only → neither policy control renders. Synchronous
+    // now that the form is opened only once the flags are committed.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     expect(screen.queryByLabelText(t.serverNetbirdPolicyExclude)).toBeNull();
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
   });
 
   it('shows NO policy control when manage_policies is off on create', async () => {
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: false,
@@ -2561,11 +2603,11 @@ describe('ServerList NetBird', () => {
       denyByDefault: true,
       isSystemAdmin: true,
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
   });
 
@@ -2576,7 +2618,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: false,
@@ -2585,11 +2627,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     // No policy control (manage off).
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
     fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
