@@ -1672,6 +1672,15 @@ test.describe("Szenario 8 — separater verschlüsselter Agent-Port (cert_mesh_t
 // auto-switches that Application to https and routes over the proxy port --
 // end-to-end, verified against the internal CA, with NO tls_insecure anywhere.
 //
+// It is also the only place in the repo where ADR-017's two OPPOSITE automatic
+// moves are decided against a real agent rather than a fake status snapshot: a
+// SCOPE EXIT reverts the application to plain http unconditionally (the operator
+// asked, and the gateway itself withdrew the routes), while a broken TLS listener
+// -- an explicit tls_active:false -- is DECLINED: the application stays https and
+// unreachable, is named in https_switch.unreachable_apps with the agent's own
+// reason, and recovers with no operator action, because it was never moved
+// (docs/architecture/cross-cutting/certificates-tls.md §7.1).
+//
 // Why this scenario needs a REAL upstream (and thus its own fixture): every
 // other "applications" suite in this repo uses the gateway's in-process mock
 // provider, which never makes a real outbound TCP connection -- so it cannot
@@ -1721,6 +1730,22 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
 
   type AppDTO = { id: string; scheme: string; endpoint: string; proxy_listen_port: number; port: number };
   type ProxyRoute = { listen: number; upstream: string; app_id: string };
+  /**
+   * One entry of https_switch.unreachable_apps -- an application the gateway is
+   * REFUSING to downgrade to plaintext: proxy-switched to https, its agent
+   * explicitly reporting the proxy listener not terminating TLS. `route_state` is
+   * the agent's own proxy.RouteState verbatim, `action` the remedy
+   * (portal.HTTPSSwitchUnreachableDTO / frontend HTTPSSwitchUnreachableApp).
+   */
+  type UnreachableAppDTO = {
+    server_id: string;
+    server_name: string;
+    app_id: string;
+    app_type: string;
+    proxy_listen_port: number;
+    route_state?: string;
+    action: string;
+  };
 
   async function fetchApplications(page: Page, serverId: string): Promise<AppDTO[]> {
     const resp = await page.request.get(`/api/portal/servers/${serverId}/applications`);
@@ -1744,6 +1769,21 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
     });
     expect(resp.ok(), `expected proxy-routes success, got ${resp.status()}: ${await resp.text()}`).toBe(true);
     return (await resp.json()) as { routes: ProxyRoute[]; etag: string };
+  }
+
+  /**
+   * Reads https_switch.unreachable_apps off the SAME portal endpoint the certificate
+   * view renders (`GET /api/system/certificates`, session-cookie authenticated as the
+   * elevated system_admin). The list is DERIVED from mode + applications + the agent's
+   * proxy-route status snapshot, so it needs no reconcile pass to become accurate --
+   * which is exactly why the recovery leg can poll it read-only. Absent/omitted reads
+   * as empty, never as a failure: a healthy deployment has nothing to report here.
+   */
+  async function fetchUnreachableApps(page: Page): Promise<UnreachableAppDTO[]> {
+    const resp = await page.request.get("/api/system/certificates");
+    expect(resp.ok(), `expected success reading certificates, got ${resp.status()}: ${await resp.text()}`).toBe(true);
+    const body = (await resp.json()) as { https_switch?: { unreachable_apps?: UnreachableAppDTO[] } };
+    return body.https_switch?.unreachable_apps ?? [];
   }
 
   /** Sets cert_https_switch_mode via the same settings PUT pattern the rest of the suite uses. */
@@ -1788,20 +1828,23 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
   }
 
   /**
-   * Occupies 127.0.0.1:<port> from the TEST itself. This is the deterministic
-   * revert lever: once this listener holds the port, a freshly (re)started agent's
-   * proxy.Manager cannot net.Listen it, so startProxyLocked leaves the route
-   * PENDING and Manager.Status() reports {listen, tls_active:false} WITH the route
-   * still present -- the explicit tls_active=false the switch reconcile needs to
-   * revert (a merely-silent agent never reverts, by design). Poll-binds because the
-   * previous agent generation releases the port asynchronously on shutdown.
+   * Occupies 127.0.0.1:<port> from the TEST itself. This is the deterministic lever
+   * for a REAL broken TLS listener: once this listener holds the port, a freshly
+   * (re)started agent's proxy.Manager cannot net.Listen it, so startProxyLocked leaves
+   * the route PENDING in state "bind_failed" and Manager.Status() reports
+   * {listen, tls_active:false} WITH the route still present -- the EXPLICIT
+   * tls_active=false, as opposed to the missing route a merely-silent agent produces
+   * (which the reconcile deliberately treats as neither a forward nor a revert).
+   * Poll-binds because the previous agent generation releases the port asynchronously
+   * on shutdown.
    *
    * NOTE (verified against server-agent/internal/proxy/proxy.go): squatting a port
    * a STILL-RUNNING agent already holds does NOT work -- the agent owns it and the
    * bind simply fails on the test side; and on a stable route the agent gets 304s
    * and never re-Applies, so it never re-attempts the bind. Forcing a fresh bind
    * attempt against the already-squatted port is what makes the false deterministic,
-   * hence: stop the agent -> squat -> restart the agent.
+   * hence: stop the agent -> squat -> restart the agent. The same 304 property is why
+   * the recovery leg restarts the agent once more after releasing the port.
    */
   async function bindSquat(port: number, deadlineMs: number): Promise<net.Server> {
     const start = Date.now();
@@ -1884,7 +1927,7 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
   });
 
-  test("cert_mode=proxy: manual liefert keine Route, auto -> TLS-Proxy aktiv -> Application auf https (gegen interne CA verifiziert), Proxy aus -> zurück auf http", async ({
+  test("cert_mode=proxy: manual liefert keine Route, auto -> TLS-Proxy aktiv -> Application auf https (gegen interne CA verifiziert), Scope-Exit -> zurück auf http, defektes TLS -> kein Rückfall auf Klartext, sondern https + Meldung als unerreichbar, Erholung ohne Eingriff", async ({
     page
   }) => {
     test.setTimeout(600000);
@@ -2025,10 +2068,12 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
     // status snapshot, because the gateway ITSELF withdrew the route. Before the fix
     // the app stayed https on a now-dead proxy port (connection-refused for every
     // request and the health probe -> dropped from routing); here routing must
-    // return to the plaintext upstream. This is DISTINCT from the explicit
-    // tls_active:false revert below (which keeps the server in scope and drives the
-    // false via a port squat). Re-PUTting manual inside the poll fires an immediate
-    // reconcile (touchesCert), matching the forward leg's convergence pattern. ---
+    // return to the plaintext upstream. This is the ONE automatic move to plaintext
+    // ADR-017 keeps, and it is deliberately the OPPOSITE decision from the explicit
+    // tls_active:false leg below (same-looking move, but there nobody asked for
+    // anything; here the operator did, and the gateway itself withdrew the routes).
+    // Re-PUTting manual inside the poll fires an immediate reconcile (touchesCert),
+    // matching the forward leg's convergence pattern. ---
     await expect
       .poll(
         async () => {
@@ -2045,9 +2090,16 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
     ).toBe(`http://127.0.0.1:${fakeAppPort}`);
 
     // --- Re-arm for the explicit-tls_active:false leg below: flip back to auto so the
-    // route reappears, the still-running agent re-binds the (now free, same) proxy
-    // port and reports tls_active:true, and the app forwards to https again. This
-    // restores the https precondition the port-squat revert leg starts from. ---
+    // route reappears and the app forwards to https again on a reported
+    // tls_active:true for the (same, idempotently reassigned) proxy port. This
+    // restores the switched-and-serving https precondition the port-squat leg starts
+    // from -- that leg only means anything against an app that IS on https.
+    //
+    // This usually converges within a poll or two rather than waiting for the agent
+    // to rebind: SyncRoutes rides the certificate-poll cadence, which config floors at
+    // 60s, so the scope exit above has typically not yet reached the agent and its
+    // listener is still up and still reported tls_active:true. Either way the
+    // precondition is the same; only the speed differs. ---
     await expect
       .poll(
         async () => {
@@ -2062,32 +2114,125 @@ test.describe("Szenario 9 — echter ServerAgent terminiert TLS als Reverse-Prox
       "re-arm must reuse the same proxy port (idempotent assignment)"
     ).toBe(proxyPort);
 
-    // --- Assert (revert on explicit tls_active:false): stop the agent (releasing the
-    // proxy port), squat that port from the test, then restart the agent. The
-    // restarted agent's proxy cannot bind the squatted port, so it reports the route
-    // tls_active:false WITH the route still present -- the explicit false the reconcile
-    // needs -- and the app reverts to http. (A merely-killed/silent agent would NOT
-    // revert, by design; this is why the port-squat + restart is the deterministic
-    // lever, verified against proxy.go's Manager.Status/startProxyLocked.) ---
+    // --- Assert (NO automatic downgrade on explicit tls_active:false — ADR-017 /
+    // certificates-tls §7.1): stop the agent (releasing the proxy port), squat that
+    // port from the test, then restart the agent. The restarted agent's proxy cannot
+    // bind the squatted port, so it reports the route tls_active:false WITH the route
+    // still present -- the EXPLICIT false, which is exactly the input the reconcile
+    // used to answer by flipping the app back to plain http. It must not: an
+    // automatic switch to unencrypted is a security problem, not a mitigation. The
+    // app stays https and becomes UNREACHABLE, and the gateway says so out loud.
+    // (A merely-killed/silent agent reports a MISSING route, which is never either
+    // a forward or a revert; this is why the port-squat + restart is the
+    // deterministic lever, verified against proxy.go's
+    // Manager.Status/startProxyLocked.) ---
     await stopAgent(agent);
     squat = await bindSquat(proxyPort, 30000);
     agent = spawn(agentBin, [], { env: agentEnv(tokenE), stdio: "inherit" });
+
+    // Each poll iteration re-PUTs auto, which fires an immediate reconcile pass
+    // (touchesCert) — so this waits for the failure to be OBSERVED BY THE RECONCILE,
+    // not merely reported. That is what makes the poll a real assertion of the
+    // policy: under the old downgrade behaviour one of these passes would flip the
+    // app to http, and an http app can never appear in unreachable_apps (the view's
+    // predicate requires a proxy-switched https app), so this would never converge.
     await expect
       .poll(
         async () => {
           await putHttpsSwitchMode(page, "auto");
-          return (await fetchApplication(page, serverEId, appId))?.scheme;
+          const app = await fetchApplication(page, serverEId, appId);
+          const entry = (await fetchUnreachableApps(page)).find((u) => u.app_id === appId);
+          return { scheme: app?.scheme, unreachablePort: entry?.proxy_listen_port };
         },
         { timeout: 180000, intervals: [3000] }
       )
-      .toBe("http");
-    const reverted = await fetchApplication(page, serverEId, appId);
-    expect(reverted?.endpoint, "routing must return to the plaintext upstream port after the revert").toBe(
-      `http://127.0.0.1:${fakeAppPort}`
+      .toEqual({ scheme: "https", unreachablePort: proxyPort });
+
+    // (1) The application stayed https and still points at the proxy port: it was
+    // never moved, so there is nothing to move back later.
+    const declined = await fetchApplication(page, serverEId, appId);
+    expect(declined?.scheme, "a broken TLS listener must NEVER downgrade the app to plaintext http").toBe("https");
+    expect(declined?.proxy_listen_port, "the declined revert must leave the assigned proxy port alone").toBe(proxyPort);
+    expect(declined?.endpoint, "routing must still target the agent's TLS proxy port, not the plaintext upstream").toBe(
+      `https://127.0.0.1:${proxyPort}`
     );
 
-    // Release the squatted port for test hygiene; afterAll also closes it defensively.
+    // (2) The outage is SURFACED, not silent -- the whole justification for paying
+    // availability here. GET /api/system/certificates carries the application under
+    // https_switch.unreachable_apps, identified by server + app, with the AGENT'S OWN
+    // RouteState as the reason ("bind_failed": the port is held by this test's squat,
+    // the leaf is installed and its 127.0.0.1 SAN gives a bind host, so bind is the
+    // only step left to fail) and a non-empty remedy.
+    const unreachable = (await fetchUnreachableApps(page)).find((u) => u.app_id === appId);
+    expect(unreachable, "the refusing gateway must name the unreachable application in the certificates view").toBeTruthy();
+    expect(unreachable!.server_id, "the alert must name the server the application lives on").toBe(serverEId);
+    expect(unreachable!.server_name, "the alert must carry the server's display name").toBe(SERVER_E_NAME);
+    expect(unreachable!.app_type, "the alert must carry the application's type").toBe("vllm");
+    expect(unreachable!.proxy_listen_port, "the alert must name the port whose listener is down").toBe(proxyPort);
+    expect(unreachable!.route_state, "the reason must be the agent's own RouteState, relayed verbatim").toBe(
+      "bind_failed"
+    );
+    expect(unreachable!.action, "the alert must say what to do, not only what happened").toBeTruthy();
+
+    // --- Assert (3) (recovery needs NO operator action): release the squatted port
+    // and let the agent bind it again. Nothing is told to the gateway, no switch mode
+    // is touched and the application is never edited -- the property the no-downgrade
+    // policy buys in exchange for the outage is precisely that there is no forward
+    // switch to re-run and no window in which the app is briefly plaintext.
+    //
+    // The agent generation is restarted because proxy.Manager only re-attempts a
+    // bind_failed route when a route set is re-APPLIED, and Driver.SyncRoutes returns
+    // early on the 304 an unchanged topology answers (verified against
+    // routes_client.go) -- a restart runs its immediate startup sync against an empty
+    // ETag cache, so the retry is deterministic instead of waiting for an unrelated
+    // topology change. That is the ENVIRONMENT healing, the same class of event as
+    // the operator freeing the port; it is not a gateway-side re-switch. ---
     await new Promise<void>((resolve) => squat!.close(() => resolve()));
     squat = undefined;
+    await stopAgent(agent);
+    agent = spawn(agentBin, [], { env: agentEnv(tokenE), stdio: "inherit" });
+
+    // Polls READ-ONLY -- no settings PUT, no reconcile nudge, nothing that could be
+    // mistaken for an operator re-switching the application. Both halves must hold in
+    // the SAME iteration: the derived alert has cleared AND a CA-verified dial gets
+    // the fake app's body back through the rebuilt TLS terminator. Requiring the dial
+    // is not decoration -- an agent generation that has restarted but not yet applied
+    // its routes reports NO route for that port, which alone would clear the alert
+    // (missing != explicitly false) before the listener is actually serving. The dial
+    // is caught rather than thrown, because expect.poll evaluates the callback OUTSIDE
+    // its retry try/catch: an ECONNREFUSED on an early attempt must retry, not fail.
+    const hitsBeforeRecovery = fakeAppHits;
+    let redialed: { status: number; body: string; peerFingerprint256: string } | undefined;
+    await expect
+      .poll(
+        async () => {
+          if ((await fetchUnreachableApps(page)).some((u) => u.app_id === appId)) return "still reported unreachable";
+          try {
+            redialed = await caDial(proxyPort, bundle_pem, "/probe-after-recovery");
+          } catch (err) {
+            return `proxy not serving yet: ${String(err)}`;
+          }
+          return redialed.body;
+        },
+        { timeout: 180000, intervals: [3000] }
+      )
+      .toBe(FAKE_APP_BODY);
+    expect(redialed!.status, "the CA-verified request must reach the fake app again after recovery").toBe(200);
+    expect(fakeAppHits, "the fake app must have recorded the post-recovery hit").toBeGreaterThan(hitsBeforeRecovery);
+    expect(
+      redialed!.peerFingerprint256.replace(/:/g, "").toLowerCase(),
+      "the recovered proxy must still present exactly the internally-issued server leaf"
+    ).toBe(issuedFingerprint);
+
+    // The app is exactly where it was before the outage -- proof that recovery needed
+    // no re-switch, because nothing was ever switched away.
+    const recovered = await fetchApplication(page, serverEId, appId);
+    expect(recovered?.scheme, "recovery must not have required a re-switch: the app was https the whole time").toBe(
+      "https"
+    );
+    expect(recovered?.proxy_listen_port, "recovery must reuse the very same proxy port").toBe(proxyPort);
+    expect(recovered?.endpoint, "routing must still target the agent's TLS proxy port").toBe(
+      `https://127.0.0.1:${proxyPort}`
+    );
   });
 });
