@@ -18,6 +18,8 @@ import {
 import AddIcon from '@mui/icons-material/Add';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
+import BlockIcon from '@mui/icons-material/Block';
+import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
@@ -36,6 +38,7 @@ import type {
   RuntimeSpec,
   RuntimeSpecGPU,
   RuntimeStatus,
+  UpdateMappingRequest,
 } from '../api';
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
@@ -49,9 +52,11 @@ import { SelectField } from './shared/SelectField';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
+import { mappingColumns } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
+import { MappingForm, type MappingFormValues } from './MappingForm';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 import { RuntimeLogView } from './RuntimeLogView';
 
@@ -59,7 +64,7 @@ import { RuntimeLogView } from './RuntimeLogView';
 // co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
 // still a stub rendered from the same tab strip so the whole section's
 // navigation is visible/testable now.
-type Tab = 'specs' | 'matrix' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'matrix' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -964,6 +969,13 @@ export function RuntimeAdminSection({
     // from the same live-telemetry hardware report the Hardware tab reads.
     | 'updateServer'
     | 'serverHardware'
+    // The model-mapping tab renders the SAME edit mask an ordinary application
+    // gets (`MappingForm`), context-size probe included -- "der selbe Edit" was
+    // the requirement, and the probe fills a field IN that form rather than
+    // navigating away from it. These three serve only that.
+    | 'activeBenchmarks'
+    | 'benchmarkStatus'
+    | 'probeMappingContext'
   >;
   server: PortalServer;
   application: PortalApplication;
@@ -975,6 +987,11 @@ export function RuntimeAdminSection({
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
   const [loadingEditFor, setLoadingEditFor] = useState('');
+  // The mapping row the model-mapping tab is editing, or null. Kept separate
+  // from `specMode`: they are two different sub-views over two different
+  // documents, and the tab strip is hidden while either is open, so neither can
+  // start the other.
+  const [mappingEdit, setMappingEdit] = useState<PortalModelMapping | null>(null);
 
   const {
     data: mappingsData,
@@ -2362,6 +2379,82 @@ export function RuntimeAdminSection({
     }
   }
 
+  // ---- model-mapping tab ------------------------------------------------
+  //
+  // WHO OWNS WHAT, and why this tab exists at all. A mapping and its launch
+  // spec are two documents with one id, and the two model names are NOT
+  // interchangeable:
+  //
+  //   the MAPPING owns `gateway_model_name` (the name the gateway routes and
+  //     offers) and `status` (whether it routes it at all -- the runtime-config
+  //     document never reads that field);
+  //   the RUNTIME SPEC owns `app_model_name`, because it IS the spec's
+  //     `upstream_model` -- the only thing `${MODEL}` expands to when the agent
+  //     builds the process argv, and re-keying it under a live process points
+  //     the agent's upstream route at a name that process does not serve.
+  //
+  // So each screen shows both names and edits only its own. Read-only is that
+  // boundary, not a convenience: nothing server-side enforces it (the mapping
+  // PATCH accepts all three fields from anyone, and the spec PUT accepts none
+  // of them), so re-enabling a field here silently recreates two writers of one
+  // value with no error to show for it.
+  const mappingRowActions = (row: PortalModelMapping): RowAction[] => [
+    {
+      key: 'edit',
+      label: t.mappingEdit,
+      icon: <EditIcon fontSize="small" />,
+      onClick: () => setMappingEdit(row),
+    },
+    {
+      key: 'toggle',
+      label: row.status === 'active' ? t.tokenActionDisable : t.tokenActionEnable,
+      icon:
+        row.status === 'active' ? (
+          <BlockIcon fontSize="small" />
+        ) : (
+          <CheckCircleIcon fontSize="small" />
+        ),
+      onClick: () => void toggleMappingStatus(row),
+    },
+    // No Delete, and not only because it was asked for: `agent_runtime_specs`
+    // references the mapping ON DELETE CASCADE, so deleting a row here would
+    // silently destroy a launch spec the operator never saw. The specs tab
+    // already answers that question properly (`deleteMeaning` refuses to guess
+    // while the spec state is unknown); a second, dumber answer beside it is
+    // worse than none.
+  ];
+
+  async function toggleMappingStatus(row: PortalModelMapping) {
+    const next: ApplicationStatus = row.status === 'active' ? 'disabled' : 'active';
+    try {
+      const updated = await api.updateMapping(row.id, { status: next });
+      setMappings((current) => (current ?? []).map((m) => (m.id === row.id ? updated : m)));
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    }
+  }
+
+  async function saveMappingFromTab(id: string, values: MappingFormValues) {
+    setBusy(true);
+    try {
+      // Read-only here => not sent from here. `app_model_name` belongs to the
+      // runtime spec (see the ownership note above) and the mapping PATCH is
+      // pointer-gated per field, so an ABSENT key leaves it byte-for-byte
+      // alone. Re-stating the value we happen to hold is not equivalent: it is
+      // a snapshot from when this form opened, and it would overwrite a spec
+      // edit made in between with no error and nothing on screen to show it.
+      const body: UpdateMappingRequest = { ...values };
+      delete body.app_model_name;
+      const updated = await api.updateMapping(id, body);
+      setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
+      setMappingEdit(null);
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const statusBySpecId = new Map(statusRows.map((row) => [row.spec_id, row]));
   function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
     const specId = specsById[m.id]?.id;
@@ -2835,6 +2928,43 @@ export function RuntimeAdminSection({
       : streamStatus === 'error'
         ? { status: 'standby', label: t.runtimeStreamOffline }
         : { status: 'watch', label: t.runtimeStreamConnecting };
+
+  // Model-mapping edit sub-view. Same full-render-takeover convention as the
+  // spec form below, and the SAME mask an ordinary application's model screen
+  // uses -- one definition (`MappingForm`), so "die selbe Tabelle / der selbe
+  // Edit" is enforced rather than merely intended.
+  if (mappingEdit) {
+    return (
+      <>
+        <Breadcrumbs
+          ariaLabel={t.breadcrumb}
+          backLabel={t.back}
+          items={[
+            ...trail,
+            { label: application.endpoint, onClick: () => setMappingEdit(null) },
+            { label: t.mappingEditTitle },
+          ]}
+        />
+        <Panel titleId="runtime-mapping-form-heading" title={t.mappingEditTitle}>
+          <MappingForm
+            key={mappingEdit.id}
+            t={t}
+            api={api}
+            serverId={server.id}
+            contextProbePath={application.context_probe_path ?? ''}
+            row={mappingEdit}
+            // The one difference from the ordinary mapping screen, and it is an
+            // ownership boundary: this application HAS a runtime spec, and the
+            // spec owns the application model name (its `upstream_model`).
+            appNameReadOnly
+            busy={busy}
+            onSubmit={(values) => void saveMappingFromTab(mappingEdit.id, values)}
+            onCancel={() => setMappingEdit(null)}
+          />
+        </Panel>
+      </>
+    );
+  }
 
   // Create / edit sub-view (input mask) -- replaces the tabbed view entirely,
   // matching the rest of the portal's drill-down/sub-view convention.
@@ -3319,12 +3449,43 @@ export function RuntimeAdminSection({
         aria-label={t.runtimeAdmin}
         sx={{ mb: 2.5 }}
       >
+        <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
         <Tab label={t.runtimeMatrix} value="matrix" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
 
+      {tab === 'mapping' && (
+        <Panel
+          titleId="runtime-mapping-heading"
+          title={t.modelMappings}
+          subtitle={t.modelMappingsIntro}
+        >
+          {/* Deliberately NOT gated on `writesAllowed`. ADR-029's "no write
+              control before its own GET has resolved" governs the FULL-DOCUMENT
+              replaces (spec PUT, co-residency PUT, budget PUT); the mapping
+              PATCH merges per field and is exempt. Substantively: a mapping is
+              a gateway ROUTE, so on a file-mode server the specs are
+              ineffective but taking a model out of service still matters --
+              copying the gate would leave an operator unable to do it. */}
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+            {t.runtimeMappingCreateHint}
+          </Typography>
+          <ListTable
+            rows={mappings}
+            columns={mappingColumns(t)}
+            rowKey={(m) => m.id}
+            actions={mappingRowActions}
+            // NOT 'op.mappings': ListTable persists column order/visibility,
+            // sort and page size under this key, and sharing it would fuse this
+            // tab's layout with the ordinary mapping screen's into one setting.
+            storageKey="op.runtimeMappings"
+            labels={listTableLabels(t)}
+            loading={mappingsStatus === 'loading'}
+          />
+        </Panel>
+      )}
       {tab === 'specs' && (
         <Panel
           titleId="runtime-specs-heading"

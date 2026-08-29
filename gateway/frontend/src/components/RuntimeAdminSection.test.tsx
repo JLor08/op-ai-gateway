@@ -10,8 +10,10 @@ import {
   RuntimeAdminSection,
 } from './RuntimeAdminSection';
 import { ToastProvider } from './shared/ToastProvider';
+import { PortalApiError } from '../api/transport';
 import { messages } from '../i18n';
 import type {
+  BenchmarkStatus,
   CreateMappingRequest,
   GPUBudget,
   HardwareGPU,
@@ -184,6 +186,16 @@ function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
 // The default (gateway-source) runtime report: nothing ever reported, so the
 // screen stays writable. agent_version/agent_features are always present on
 // this DTO (they come from the latest telemetry row, not the report).
+// An idle benchmark status. The model-mapping tab's edit mask polls the
+// server's active runs to gate its context-size probe button.
+const idleBenchmark: BenchmarkStatus = {
+  running: false,
+  server_id: 'srv_1',
+  scope: 'application',
+  total: 0,
+  done: 0,
+};
+
 function makeReport(overrides: Partial<RuntimeReport> = {}): RuntimeReport {
   return { available: false, agent_version: '', agent_features: [], ...overrides };
 }
@@ -435,6 +447,13 @@ function renderSection(
       return { ...serverForTest, id, runtime_max_processes: body.runtime_max_processes };
     }),
     serverHardware: vi.fn(async () => opts.hardware ?? ({ available: false } as HardwareResponse)),
+    // The model-mapping tab reuses `MappingForm`, whose context-size probe polls
+    // the server's running benchmarks to gate its button. `activeBenchmarks`
+    // must RESOLVE (to an empty list) rather than be absent: a rejection lands
+    // in the poll's own catch and leaves the button in the wrong state.
+    activeBenchmarks: vi.fn(async () => []),
+    benchmarkStatus: vi.fn(async () => idleBenchmark),
+    probeMappingContext: vi.fn(async () => idleBenchmark),
   };
 
   const view = render(
@@ -476,6 +495,13 @@ function renderSection(
       subscribedSpecIds: logSubscriptions,
       unsubscribes: () => logUnsubscribeCount,
     },
+    /**
+     * How many times the mapping list was GET. The model-mapping tab and the
+     * three tabs beside it read ONE copy of these rows, so a write on the tab
+     * must be visible everywhere WITHOUT a refetch -- that is the property
+     * this counter pins.
+     */
+    mappingsCallCount: () => mappingsCalls,
     /**
      * Unmounts ONLY RuntimeAdminSection, leaving the ToastProvider mounted
      * above it. `view.unmount()` tears the provider down too, so a toast
@@ -790,6 +816,9 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         runtime_max_processes: body.runtime_max_processes,
       })),
       serverHardware: vi.fn(async () => ({ available: false }) as HardwareResponse),
+      activeBenchmarks: vi.fn(async () => []),
+      benchmarkStatus: vi.fn(async () => idleBenchmark),
+      probeMappingContext: vi.fn(async () => idleBenchmark),
     };
 
     render(
@@ -4758,5 +4787,165 @@ describe('RuntimeAdminSection set_visible_devices', () => {
     });
     const checkbox = screen.getByLabelText(t.runtimeSpecSetVisibleDevices) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
+  });
+});
+
+/**
+ * The model-mapping tab: the SAME table and the SAME edit mask an ordinary
+ * application gets (`MappingSection`), minus the actions that would mint or
+ * destroy rows the launch specs depend on -- and with the ownership boundary
+ * enforced in the one direction the spec form does not enforce it.
+ */
+describe('RuntimeAdminSection model-mapping tab', () => {
+  it('places the model-mapping tab to the LEFT of the runtime specs', async () => {
+    renderSection({ mappings: [makeMapping({ id: 'map_1' })] });
+    await screen.findByText('gw-model');
+    // STRUCTURAL: pins the tab's existence AND its position, which is what was
+    // asked for ("links vom RUNTIME-SPEZIFIKATIONEN").
+    expect(screen.getAllByRole('tab').map((el) => el.textContent)).toEqual([
+      t.runtimeMappingTab,
+      t.runtimeSpecs,
+      t.runtimeMatrix,
+      t.runtimeLimits,
+      t.runtimeLiveStatus,
+    ]);
+  });
+
+  it('shows the mapping table without the actions that would break a launch spec', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
+      specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+
+    // The mapping table's own columns, and NOT the specs table's.
+    expect(await screen.findByRole('columnheader', { name: t.mappingAppName })).toBeInTheDocument();
+    expect(screen.getByText(t.statusActive)).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: t.runtimeSpecBinary })).toBeNull();
+
+    // BEHAVIOURAL: edit and the status toggle are offered...
+    expect(screen.getByRole('button', { name: t.mappingEdit })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.tokenActionDisable })).toBeInTheDocument();
+    // ...and nothing that creates or destroys a row. Delete is what the
+    // operator asked to drop; create/sync/benchmark are the same argument
+    // (a mapping created here would have no spec, a sync disables every
+    // mapping whose app model name the agent does not list).
+    expect(screen.queryByRole('button', { name: t.mappingDelete })).toBeNull();
+    expect(screen.queryByRole('button', { name: t.mappingCreate })).toBeNull();
+    expect(screen.queryByRole('button', { name: t.syncModels })).toBeNull();
+    expect(screen.queryByRole('button', { name: t.runBenchmark })).toBeNull();
+    expect(screen.getByText(t.runtimeMappingCreateHint)).toBeInTheDocument();
+  });
+
+  it('edits the two fields the mapping owns and never sends the one the spec owns', async () => {
+    const { updatedMappings } = renderSection({
+      mappings: [
+        makeMapping({ id: 'map_1', gateway_model_name: 'gw-model', app_model_name: 'app-old' }),
+      ],
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+    await screen.findByLabelText(t.mappingGatewayName);
+
+    // STRUCTURAL: the ownership boundary, read off the DOM attribute rather
+    // than by typing -- jsdom accepts fireEvent.change on a readOnly input.
+    expect(document.querySelector('#mapping-app-name')).toHaveAttribute('readonly');
+    expect(document.querySelector('#mapping-gateway-name')).not.toHaveAttribute('readonly');
+    expect(screen.getByText(t.mappingAppNameReadOnly)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), {
+      target: { value: 'gw-renamed' },
+    });
+    // A non-native MUI Select: open it, then click the option. `fireEvent.change`
+    // has no value setter to drive here.
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.tableStatus }));
+    fireEvent.click(await screen.findByRole('option', { name: t.statusDisabled }));
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+    // BEHAVIOURAL: the PATCH is pointer-gated per field, so an ABSENT key is
+    // "leave it alone" -- which is what makes the two screens non-overlapping
+    // writers instead of two writers racing over one field.
+    expect(updatedMappings[0].body.gateway_model_name).toBe('gw-renamed');
+    expect(updatedMappings[0].body.status).toBe('disabled');
+    expect(updatedMappings[0].body).not.toHaveProperty('app_model_name');
+  });
+
+  it('toggles a mapping status with a status-only PATCH', async () => {
+    const { updatedMappings } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', status: 'active' })],
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.tokenActionDisable }));
+
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+    expect(updatedMappings[0].body).toEqual({ status: 'disabled' });
+    expect(await screen.findByText(t.statusDisabled)).toBeInTheDocument();
+  });
+
+  it('shares ONE copy of the rows with the specs tab -- no refetch, no stale name', async () => {
+    const { updatedMappings, mappingsCallCount } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
+      specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+    await screen.findByLabelText(t.mappingGatewayName);
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), {
+      target: { value: 'gw-renamed' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+
+    // BEHAVIOURAL: the specs table beside it joins against the same rows, so
+    // the rename is there immediately -- and no second GET was needed to get
+    // it there. Both halves fail if the tab keeps its own copy of the list.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    expect(await screen.findByText('gw-renamed')).toBeInTheDocument();
+    expect(mappingsCallCount()).toBe(1);
+  });
+
+  it('reports a gateway-name conflict and keeps the form open', async () => {
+    const { fakeApi } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+    });
+    await screen.findByText('gw-model');
+    fakeApi.updateMapping.mockRejectedValueOnce(
+      new PortalApiError(409, 'mapping.gateway_name_conflict', 'taken'),
+    );
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+    await screen.findByLabelText(t.mappingGatewayName);
+    fireEvent.change(screen.getByLabelText(t.mappingGatewayName), { target: { value: 'taken' } });
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+
+    // This tab is now the ONLY place an existing mapping's gateway name can be
+    // renamed, so its 409 has to be readable here.
+    expect(
+      await screen.findByText(t.errorMappingGatewayNameConflict, { exact: false }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText(t.mappingGatewayName)).toBeInTheDocument();
+  });
+
+  it('stays writable in file mode, where every other tab is read-only', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      report: fileModeReport({ specs: [] }),
+    });
+    await screen.findByText(t.runtimeManagedLocally);
+    // Existing behaviour: no spec create button in file mode.
+    expect(screen.queryByRole('button', { name: t.runtimeSpecCreate })).toBeNull();
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    // DELIBERATE non-gating: a mapping is a gateway ROUTE and exists whether or
+    // not the agent manages its processes from a local file, so taking a model
+    // out of service must stay possible here. ADR-029's "no write control
+    // before its own GET" governs full-document PUTs; the mapping PATCH merges.
+    expect(await screen.findByRole('button', { name: t.mappingEdit })).toBeEnabled();
+    expect(screen.getByRole('button', { name: t.tokenActionDisable })).toBeEnabled();
   });
 });

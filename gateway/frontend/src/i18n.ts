@@ -569,6 +569,12 @@ const de = {
     'Löschen ist gesperrt, solange noch nicht bekannt ist, ob für diese Zuordnung eine Runtime-Spezifikation existiert – die Abfrage läuft noch.',
   runtimeSpecDeleteStateUnknown:
     'Löschen ist gesperrt: Die Runtime-Spezifikation dieser Zuordnung konnte nicht geladen werden, daher ist unbekannt, ob eine existiert. Über „Bearbeiten“ erneut laden.',
+  // The Modell-Zuordnung TAB label. Same string as the spec form's section
+  // heading below, and deliberately so: it is the operator's own word for the
+  // mapping table, which now has its own tab left of the launch specs.
+  runtimeMappingTab: 'Modell-Zuordnung',
+  runtimeMappingCreateHint:
+    'Neue Modelle werden im Reiter „Runtime-Spezifikationen“ angelegt — Zuordnung und Spezifikation entstehen dort zusammen.',
   runtimeSpecMappingSection: 'Modell-Zuordnung',
   runtimeSpecConfigSection: 'Startkonfiguration',
   runtimeSpecListenPort: 'Listen-Port',
@@ -2531,6 +2537,9 @@ const en: PortalMessages = {
     'Deleting is locked while it is not yet known whether this mapping has a runtime spec — the query is still running.',
   runtimeSpecDeleteStateUnknown:
     'Deleting is locked: this mapping\'s runtime spec could not be loaded, so whether one exists is unknown. Use "Edit" to load it again.',
+  runtimeMappingTab: 'Model mapping',
+  runtimeMappingCreateHint:
+    'New models are created on the Runtime specs tab — the mapping and its specification are written together there.',
   runtimeSpecMappingSection: 'Model mapping',
   runtimeSpecConfigSection: 'Launch configuration',
   runtimeSpecListenPort: 'Listen port',
