@@ -367,3 +367,59 @@ func TestApplicationProxyExclusionInvariantHoldsAtEveryServiceWritePath(t *testi
 		}
 	}
 }
+
+// TestApplicationProxyExclusionInvariantSurvivesASecondPatch closes the hole the
+// sweep above cannot see: it seeds every case from a FRESH application, so the
+// only requests it ever makes are first writes. The invariant's real exposure is
+// a SEQUENCE — exclude, then set a port in a request that says nothing about
+// participation.
+//
+// applyProxyExclusion branches on the PRESENCE of proxy_excluded in the request.
+// Rule 1 refuses an explicit port only when the SAME request also excludes; rule
+// 3 (the "said nothing" arm) is guarded on !app.ProxyExcluded and so does nothing
+// at all for an already-excluded row. Neither arm looks at the resolved state, so
+// two ordinary PATCHes reach ProxyExcluded=true WITH a port.
+//
+// That state is a silent total outage rather than a cosmetic inconsistency:
+// ApplicationEndpoint sees https + a non-zero port and routes to
+// https://<domain>:<port>, while isProxySwitchCandidate is false, so
+// AgentProxyRoutes publishes nothing, the agent opens no listener there, and
+// HTTPSSwitchUnreachableApps cannot name the row because its filter begins with
+// the candidate predicate. Nothing reports it and nothing repairs it, short of a
+// later scope exit.
+func TestApplicationProxyExclusionInvariantSurvivesASecondPatch(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routes := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	created, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8123, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	excluded := true
+	if _, err := svc.UpdateApplication(ctx, ownerToken(), created.ID, UpdateApplicationRequest{
+		ProxyExcluded: &excluded,
+	}); err != nil {
+		t.Fatalf("first patch (exclude): %v", err)
+	}
+
+	// Says NOTHING about participation, so rule 3 is the arm that runs.
+	scheme := "https"
+	proxyPort := 9100
+	_, secondErr := svc.UpdateApplication(ctx, ownerToken(), created.ID, UpdateApplicationRequest{
+		Scheme: &scheme, ProxyListenPort: &proxyPort,
+	})
+
+	stored, err := routes.ApplicationByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if stored.ProxyExcluded && stored.ProxyListenPort != 0 {
+		t.Fatalf("the invariant is violated through the public API: ProxyExcluded=%v ProxyListenPort=%d (second patch err=%v)",
+			stored.ProxyExcluded, stored.ProxyListenPort, secondErr)
+	}
+}

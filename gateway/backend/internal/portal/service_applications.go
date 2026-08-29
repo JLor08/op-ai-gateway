@@ -1009,6 +1009,32 @@ func applyProxyExclusion(app *routing.Application, requested *bool, explicitProx
 			app.ProxyExcluded = true
 		}
 	}
+
+	// RULE 4 -- THE POST-STATE CHECK, and the reason it cannot be folded into the
+	// arms above: every one of them branches on the SHAPE OF THE REQUEST, and the
+	// invariant is a property of the RESOLVED ROW. Rule 1 refuses an explicit port
+	// only when the same request also excludes; rule 3 is guarded on
+	// !app.ProxyExcluded and therefore does nothing at all for an already-excluded
+	// row. So two ordinary PATCHes -- exclude, then set a port while saying
+	// nothing about participation -- reached ProxyExcluded=true WITH a port, and
+	// the earlier claim that only a direct store write could do that was wrong.
+	//
+	// That state is a silent total outage rather than an inconsistency:
+	// ApplicationEndpoint routes to https://<domain>:<port> while
+	// isProxySwitchCandidate is false, so no route is published, no listener
+	// exists there, and HTTPSSwitchUnreachableApps cannot even name the row --
+	// its filter begins with the candidate predicate. Nothing reports it and
+	// nothing repairs it short of a later scope exit.
+	//
+	// Refuse when the caller NAMED the port (rule 1's own reasoning: zeroing a
+	// port someone asked for in the same breath would be a lie), clear it
+	// otherwise (the completion of an instruction, not a contradiction of one).
+	if app.ProxyExcluded && app.ProxyListenPort != 0 {
+		if explicitProxyListenPort != 0 {
+			return ErrApplicationProxyExcludedPortConflict
+		}
+		app.ProxyListenPort = 0
+	}
 	return nil
 }
 
