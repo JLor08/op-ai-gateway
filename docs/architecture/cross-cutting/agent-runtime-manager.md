@@ -1873,8 +1873,13 @@ Three details there are load-bearing and must not be "simplified":
 
 - **Disabled, never filtered out of the list.** Opening an edit seeds the form's
   type from the row; a value with no matching menu item renders a *blank*
-  combobox, and the form body always sends `type` — so a filtered option would
-  turn the existing agent application's own edit form into a silent retype. The
+  combobox, so the operator cannot see what the application is while editing it.
+  That is a usability defect, **not** a data-integrity one: an earlier version of
+  this paragraph claimed a filtered option would make the edit form "a silent
+  retype", and that is false — probed against a filtering variant, the save path
+  still sends `type: server_agent`, because the form holds the seeded value
+  whether or not a menu item matches it. The blank field is reason enough; the
+  overstatement is what invites the "fix" that brings it back. The
   predicate excludes the edited row's id, mirroring the service's `excludeAppID`
   exactly (create passes `""`, update passes `app.ID`): that application keeps
   its type selected, selectable and re-saveable, and can switch away and back

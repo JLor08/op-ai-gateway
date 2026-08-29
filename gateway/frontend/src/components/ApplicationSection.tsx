@@ -600,8 +600,16 @@ export function ApplicationSection({
                   key={option}
                   // Disabled, never filtered out of the list: openEdit seeds
                   // `type` from the row, and a value with no matching MenuItem
-                  // renders a BLANK combobox -- which buildBody would then
-                  // submit as a silent retype, since it always sends `type`.
+                  // renders a BLANK combobox -- the operator cannot see what
+                  // the application IS while editing it.
+                  //
+                  // It is NOT a data-integrity problem, and an earlier version
+                  // of this comment said it was ("buildBody would submit a
+                  // silent retype"). Probed: under a filtering variant the save
+                  // path still sends `type: 'server_agent'`, because `type`
+                  // holds the seeded value whether or not a MenuItem matches
+                  // it. Overstating the reason is what invites the "fix" that
+                  // reintroduces the blank field.
                   disabled={option === 'server_agent' && serverAgentTaken}
                 >
                   {option}
