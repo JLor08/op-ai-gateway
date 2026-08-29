@@ -57,6 +57,10 @@ export type PortalApplication = {
   // Gateway-managed TLS proxy-listen port (P4 HTTPS switch); 0 = not yet
   // assigned (the gateway auto-assigns it). Not user-editable in the portal UI.
   proxy_listen_port: number;
+  // The operator's opt-out from the gateway-guided TLS proxy (migration 70).
+  // When true the gateway opens no proxy listener for this application and
+  // never changes its scheme; proxy_listen_port is then guaranteed to be 0.
+  proxy_excluded: boolean;
   reachable: boolean;
   last_checked_at: string | null;
   created_at: string;
@@ -93,6 +97,11 @@ export type CreateApplicationRequest = {
   opportunistic_metrics_enabled?: boolean;
   // Gateway-managed; omit to auto-assign (0).
   proxy_listen_port?: number;
+  // Participation in the gateway TLS proxy. OMITTING it is not the same as
+  // sending false: absent lets the backend normalize an https-with-no-proxy-port
+  // create into the excluded state (the pre-flag encoding), while an explicit
+  // false is a request to PARTICIPATE and is refused for that shape.
+  proxy_excluded?: boolean;
 };
 
 export type UpdateApplicationRequest = {
@@ -124,6 +133,11 @@ export type UpdateApplicationRequest = {
   opportunistic_metrics_enabled?: boolean;
   // Gateway-managed; omit to keep the stored value.
   proxy_listen_port?: number;
+  // Participation in the gateway TLS proxy; omit to keep the stored decision.
+  // Sending it on every save would restate — and on a hidden control, clear —
+  // an opt-out the operator never touched, so the form only sends it when the
+  // checkbox actually moved (see ApplicationSection's seed-diff).
+  proxy_excluded?: boolean;
 };
 
 export type PortalModelMapping = {

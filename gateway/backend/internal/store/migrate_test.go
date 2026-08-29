@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"op-ai-gateway/internal/routing"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -545,4 +546,186 @@ func TestAddColumnIfMissingSQLite(t *testing.T) {
 	if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		t.Fatalf("addColumnIfMissing on a nonexistent table was mistaken for a duplicate-column error: %v", err)
 	}
+}
+
+// TestMigration70BackfillsProxyExcluded proves migration 70's backfill selects
+// EXACTLY the retired implicit own-TLS encoding — (scheme='https' AND
+// proxy_listen_port=0) — and nothing else, on BOTH dialects.
+//
+// It verifies the backfill in both directions rather than asserting it: every
+// stored shape is seeded, the database is then put back into its genuine
+// PRE-70 state (proxy_excluded cleared to the column default 0 on every row,
+// and version 70 un-stamped so Migrate has it pending again), Migrate is run,
+// and every row's resulting value is checked — the ones that must flip AND the
+// ones that must not.
+//
+// The four shapes and why each lands where it does are spelled out on
+// migration70Up itself. The two extra rows here are the ones a "just backfill
+// the obvious case" implementation gets wrong: a DISABLED own-TLS application
+// (which must still be excluded, so re-enabling it does not silently hand it
+// to the proxy) and an EMPTY-scheme row (unreachable through the API, resolving
+// to http everywhere it is read, so it must stay a participant at 0).
+func TestMigration70BackfillsProxyExcluded(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_m70", Name: "M70", Domain: "m70.example.test", Provider: routing.ProviderVLLM,
+			Endpoint: "http://m70.example.test:8000", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		seeds := []struct {
+			id     string
+			scheme string
+			port   int
+			status string
+			want   int64
+			why    string
+		}{
+			{"app_m70_http_unassigned", "http", 0, routing.ServerStatusActive, 0, "plain http, no listener yet: a candidate before and after"},
+			{"app_m70_http_assigned", "http", 8601, routing.ServerStatusActive, 0, "http holding a released listener (the resting state after a scope exit): still a candidate"},
+			{"app_m70_https_proxied", "https", 8602, routing.ServerStatusActive, 0, "actually proxied: the reconcile still owns its scheme"},
+			{"app_m70_https_own_tls", "https", 0, routing.ServerStatusActive, 1, "the retired own-TLS encoding: this is the set the flag renames"},
+			{"app_m70_https_own_tls_disabled", "https", 0, routing.ServerStatusDisabled, 1, "own TLS AND disabled: keeps the participation it would have had if re-enabled"},
+			{"app_m70_empty_scheme", "", 0, routing.ServerStatusActive, 0, "empty scheme resolves to http everywhere it is read, so it is a participant"},
+		}
+		for i, seed := range seeds {
+			if err := s.CreateApplication(ctx, routing.Application{
+				ID: seed.id, ServerID: "srv_m70", Type: routing.ProviderVLLM,
+				Port: 9200 + i, Scheme: seed.scheme,
+				APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+				TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: seed.status,
+				HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+				ProxyListenPort: seed.port,
+				CreatedAt:       now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("seed %s: %v", seed.id, err)
+			}
+		}
+
+		readExcluded := func(id string) int64 {
+			t.Helper()
+			var v int64
+			if err := s.db.QueryRowContext(ctx, s.dl.rebind(
+				`select proxy_excluded from applications where id = ?`), id).Scan(&v); err != nil {
+				t.Fatalf("select proxy_excluded for %s: %v", id, err)
+			}
+			return v
+		}
+
+		// BEFORE: put the table back into its genuine pre-70 state. Every row
+		// carries the column's DEFAULT 0 — which is exactly what a database
+		// migrated by an older binary holds, and what a pre-70 API client's
+		// insert (which never names the column) would produce.
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`update applications set proxy_excluded = 0`)); err != nil {
+			t.Fatalf("clear proxy_excluded: %v", err)
+		}
+		for _, seed := range seeds {
+			if got := readExcluded(seed.id); got != 0 {
+				t.Fatalf("pre-migration %s: proxy_excluded = %d, want 0", seed.id, got)
+			}
+		}
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`delete from schema_migrations where version = ?`), 70); err != nil {
+			t.Fatalf("un-stamp migration 70: %v", err)
+		}
+
+		// AFTER.
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		for _, seed := range seeds {
+			if got := readExcluded(seed.id); got != seed.want {
+				t.Fatalf("%s: proxy_excluded = %d, want %d (%s)", seed.id, got, seed.want, seed.why)
+			}
+		}
+		var stamped int
+		if err := s.db.QueryRowContext(ctx, s.dl.rebind(
+			`select count(*) from schema_migrations where version = ?`), 70).Scan(&stamped); err != nil {
+			t.Fatalf("count schema_migrations v70: %v", err)
+		}
+		if stamped != 1 {
+			t.Fatalf("schema_migrations version 70 count = %d, want 1", stamped)
+		}
+
+		// RE-RUNNING Migrate is a no-op: version 70 is stamped, so the backfill
+		// does not run again. Proven with a row the backfill WOULD have
+		// flipped — an operator who deliberately puts an own-TLS application
+		// back into the proxy must not have that decision undone on the next
+		// boot.
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(
+			`update applications set proxy_excluded = 0 where id = ?`), "app_m70_https_own_tls"); err != nil {
+			t.Fatalf("re-clear own-TLS row: %v", err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate (second run): %v", err)
+		}
+		if got := readExcluded("app_m70_https_own_tls"); got != 0 {
+			t.Fatalf("after re-running Migrate: proxy_excluded = %d, want 0 — the backfill re-ran on an already-stamped migration", got)
+		}
+	})
+}
+
+// TestMigration70RoundTripsThroughTheStoreReaders is the other half of the
+// backfill evidence: the values migration 70 wrote must be what the store
+// READERS return, not merely what a raw select shows. It re-reads the rows the
+// migration test above seeded through ApplicationsByServer, so a backfill that
+// wrote the right column in the wrong place would still be caught.
+func TestMigration70RoundTripsThroughTheStoreReaders(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_m70r", Name: "M70R", Domain: "m70r.example.test", Provider: routing.ProviderVLLM,
+			Endpoint: "http://m70r.example.test:8000", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		shapes := []struct {
+			id     string
+			scheme string
+			port   int
+			want   bool
+		}{
+			{"app_m70r_http", "http", 0, false},
+			{"app_m70r_proxied", "https", 8702, false},
+			{"app_m70r_own_tls", "https", 0, true},
+		}
+		for i, shape := range shapes {
+			if err := s.CreateApplication(ctx, routing.Application{
+				ID: shape.id, ServerID: "srv_m70r", Type: routing.ProviderVLLM,
+				Port: 9300 + i, Scheme: shape.scheme,
+				APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+				HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+				ProxyListenPort: shape.port, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("seed %s: %v", shape.id, err)
+			}
+		}
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`update applications set proxy_excluded = 0`)); err != nil {
+			t.Fatalf("clear proxy_excluded: %v", err)
+		}
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`delete from schema_migrations where version = ?`), 70); err != nil {
+			t.Fatalf("un-stamp migration 70: %v", err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		apps, err := s.ApplicationsByServer(ctx, "srv_m70r")
+		if err != nil {
+			t.Fatalf("ApplicationsByServer: %v", err)
+		}
+		got := map[string]bool{}
+		for _, app := range apps {
+			got[app.ID] = app.ProxyExcluded
+		}
+		for _, shape := range shapes {
+			if got[shape.id] != shape.want {
+				t.Fatalf("%s: ApplicationsByServer reports ProxyExcluded=%v, want %v", shape.id, got[shape.id], shape.want)
+			}
+		}
+	})
 }

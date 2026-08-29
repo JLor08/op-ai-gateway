@@ -833,6 +833,7 @@ beforeEach(() => {
           benchmark_schedule_interval_seconds?: number;
           opportunistic_metrics_enabled?: boolean;
           proxy_listen_port?: number;
+          proxy_excluded?: boolean;
         };
         const application: PortalApplication = {
           id: `app_${apiState.applicationRows.length + 1}`,
@@ -864,6 +865,7 @@ beforeEach(() => {
           benchmark_schedule_interval_seconds: body.benchmark_schedule_interval_seconds ?? 0,
           opportunistic_metrics_enabled: body.opportunistic_metrics_enabled ?? false,
           proxy_listen_port: body.proxy_listen_port ?? 0,
+          proxy_excluded: body.proxy_excluded ?? false,
           reachable: true,
           last_checked_at: null,
           created_at: '2026-07-11T10:00:00Z',
@@ -2018,6 +2020,7 @@ describe('App', () => {
         benchmark_schedule_interval_seconds: 0,
         opportunistic_metrics_enabled: false,
         proxy_listen_port: 0,
+        proxy_excluded: false,
         reachable: true,
         last_checked_at: null,
         created_at: '2026-07-11T09:00:00Z',
@@ -2090,6 +2093,7 @@ describe('App', () => {
         benchmark_schedule_interval_seconds: 0,
         opportunistic_metrics_enabled: false,
         proxy_listen_port: 0,
+        proxy_excluded: false,
         reachable: true,
         last_checked_at: null,
         created_at: '2026-07-11T09:00:00Z',
@@ -2154,6 +2158,7 @@ describe('App', () => {
         benchmark_schedule_interval_seconds: 0,
         opportunistic_metrics_enabled: false,
         proxy_listen_port: 0,
+        proxy_excluded: false,
         reachable: true,
         last_checked_at: null,
         created_at: '2026-07-11T09:00:00Z',
@@ -2188,6 +2193,7 @@ describe('App', () => {
         benchmark_schedule_interval_seconds: 0,
         opportunistic_metrics_enabled: false,
         proxy_listen_port: 0,
+        proxy_excluded: false,
         reachable: true,
         last_checked_at: null,
         created_at: '2026-07-11T09:01:00Z',
@@ -2252,6 +2258,7 @@ describe('App', () => {
         benchmark_schedule_interval_seconds: 0,
         opportunistic_metrics_enabled: false,
         proxy_listen_port: 0,
+        proxy_excluded: false,
         reachable: true,
         last_checked_at: null,
         created_at: '2026-07-11T09:00:00Z',

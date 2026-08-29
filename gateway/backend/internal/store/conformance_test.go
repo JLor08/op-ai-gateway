@@ -7965,3 +7965,96 @@ func seedRuntimeParents(t *testing.T, s *SQLStore, now time.Time) {
 		}
 	}
 }
+
+// TestConformanceApplicationProxyExcluded verifies applications.proxy_excluded
+// (migration 70 -- the operator's opt-out from the gateway-guided TLS proxy)
+// round-trips through create, update-flip, and ALL THREE readers on both
+// dialects.
+//
+// ActiveMappingsForModel is the one that matters most and the one no portal
+// test can ever reach: every portal test runs on routing.NewMemoryStore(), so a
+// column missed from the ROUTING join's select list would read back as a clean
+// `false` there and pass the entire portal suite -- an opt-out that works in
+// the UI and is silently ignored the moment traffic is actually routed.
+func TestConformanceApplicationProxyExcluded(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "Server 1", Domain: "srv1.local", Provider: routing.ProviderVLLM,
+			Endpoint: "http://srv1.local:8000", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		// Created EXCLUDED, and with ProxyListenPort 0 -- the invariant the
+		// portal enforces (excluded => no listener). The flip below moves it
+		// back to participating, which is the round trip an operator makes.
+		app := routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "vllm", Port: 8000, Scheme: "https",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+			ProxyExcluded:   true,
+			CreatedAt:       now, UpdatedAt: now,
+		}
+		if err := s.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+
+		got, err := s.ApplicationByID(ctx, "app1")
+		if err != nil {
+			t.Fatalf("application by id: %v", err)
+		}
+		if !got.ProxyExcluded {
+			t.Fatalf("after create: ProxyExcluded=%v, want true", got.ProxyExcluded)
+		}
+		byServer, err := s.ApplicationsByServer(ctx, "srv1")
+		if err != nil || len(byServer) != 1 {
+			t.Fatalf("applications by server: err=%v n=%d", err, len(byServer))
+		}
+		if !byServer[0].ProxyExcluded {
+			t.Fatalf("after create (by server): ProxyExcluded=%v, want true", byServer[0].ProxyExcluded)
+		}
+
+		// Flip back to participating (http, so the state is a legal one).
+		got.ProxyExcluded = false
+		got.Scheme = "http"
+		got.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateApplication(ctx, got); err != nil {
+			t.Fatalf("update application: %v", err)
+		}
+		got, err = s.ApplicationByID(ctx, "app1")
+		if err != nil {
+			t.Fatalf("application by id (2): %v", err)
+		}
+		if got.ProxyExcluded {
+			t.Fatalf("after update: ProxyExcluded=%v, want false", got.ProxyExcluded)
+		}
+
+		// And flip forward again, so the join below observes a TRUE value: a
+		// join that dropped the column would read the false zero and a
+		// false-only assertion could not tell the two apart.
+		got.ProxyExcluded = true
+		got.Scheme = "https"
+		got.ProxyListenPort = 0
+		got.UpdatedAt = now.Add(2 * time.Minute)
+		if err := s.UpdateApplication(ctx, got); err != nil {
+			t.Fatalf("update application (2): %v", err)
+		}
+
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map1", ApplicationID: "app1", GatewayModelName: "gpt", AppModelName: "m",
+			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+		candidates, err := s.ActiveMappingsForModel(ctx, "gpt", routing.APIFlavorOpenAI)
+		if err != nil || len(candidates) != 1 {
+			t.Fatalf("active mappings: err=%v n=%d", err, len(candidates))
+		}
+		if !candidates[0].Application.ProxyExcluded {
+			t.Fatalf("routing join lost proxy_excluded: ProxyExcluded=%v, want true", candidates[0].Application.ProxyExcluded)
+		}
+	})
+}

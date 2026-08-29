@@ -2294,3 +2294,60 @@ describe('managed_runtime_only server-form control i18n keys', () => {
     }
   });
 });
+
+describe('per-application TLS-proxy opt-out i18n keys', () => {
+  const stringKeys = [
+    'applicationProxyChipExcluded',
+    'applicationProxyLegend',
+    'applicationProxyExcluded',
+    'applicationProxyExcludedNote',
+    'applicationProxyModeActiveNote',
+    'applicationProxyModeOffNote',
+    'applicationProxyModeUnknownNote',
+    'applicationProxyOutOfScopeNote',
+    'applicationSchemeManagedNote',
+    'applicationProxyPortExcluded',
+    'applicationProxyPortUnassigned',
+  ] as const;
+
+  it('defines every new key in de and en', () => {
+    for (const k of stringKeys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('gives the three proxy-state sentences three DISTINCT texts, in both locales', () => {
+    // Reusing one sentence across the states would tell the operator "the
+    // control is here" without telling them why, which is the whole point of
+    // rendering the third state at all.
+    for (const locale of ['de', 'en'] as const) {
+      const notes = new Set([
+        messages[locale].applicationProxyModeActiveNote,
+        messages[locale].applicationProxyModeOffNote,
+        messages[locale].applicationProxyModeUnknownNote,
+        messages[locale].applicationProxyOutOfScopeNote,
+      ]);
+      expect(notes.size).toBe(4);
+    }
+  });
+
+  it('interpolates the assigned port and the server domain in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].applicationProxyPort(8601)).toContain('8601');
+      expect(messages[locale].applicationProxyOwnTLSWarning('srv.example.test')).toContain(
+        'srv.example.test',
+      );
+    }
+  });
+
+  it('never renders an unassigned port as a bare 0, a blank or a dash', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].applicationProxyPortUnassigned;
+      expect(text.length).toBeGreaterThan(20);
+      expect(text).not.toMatch(/:\s*(0|-|—)\s*$/);
+    }
+  });
+});

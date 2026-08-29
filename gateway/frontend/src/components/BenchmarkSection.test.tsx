@@ -83,6 +83,7 @@ function makeApp(over: Partial<PortalApplication> = {}): PortalApplication {
     benchmark_schedule_interval_seconds: 0,
     opportunistic_metrics_enabled: false,
     proxy_listen_port: 0,
+    proxy_excluded: false,
     reachable: true,
     last_checked_at: '2026-07-24T12:00:00Z',
     created_at: '2026-07-24T12:00:00Z',

@@ -289,3 +289,46 @@ whole budget set. The canonical rendering is the four-state
 `loading | error | stale-error | ready` fallback, and a not-ready tab renders a
 loading line *instead of* the form rather than a disabled form.
 → [Agent-Managed Model Runtime §11.1](cross-cutting/agent-runtime-manager.md).
+
+## ADR-030 — Proxy participation is an operator-owned flag with a port invariant, not an encoding
+**Context:** whether an application takes part in the gateway-guided TLS proxy
+was encoded IMPLICITLY as `scheme == "https" && proxy_listen_port == 0`. That
+encoding could not express the one thing the operator asked for — take a
+**plain-http** application out of the proxy — because an enabled `http`
+application is a candidate unconditionally, is assigned a port on the agent's
+next fetch and is flipped to `https` on the next reconcile. **Decision:** a new
+operator-owned column, `applications.proxy_excluded` (migration 70), is the
+**authoritative and only** representation of participation, orthogonal to
+`scheme`; migration 70 **backfills** the retired encoding into it, so the two do
+not coexist. The backfill is not the only reader of that encoding: the write path
+re-applies the same translation on **every** write (a request that says nothing
+about participation and resolves to `https` with no proxy port is normalized to
+excluded), which is what keeps the column authoritative for a row a pre-70 client
+writes in the old spelling. Three fields carry one meaning each — participation,
+transport, listener identity — held together by the invariant
+**`ProxyExcluded == true` implies `ProxyListenPort == 0`**, enforced at the end of
+the mutation block in both `CreateApplication` and `UpdateApplication` by a rule
+that tests the POST-MUTATION row, because every rule that branches on the shape of
+the request alone lets a two-request sequence through. **Consequence:** four other
+derivations (`ApplicationEndpoint`, `activePortStrings`, `revertScopeExit`,
+`HTTPSSwitchUnreachableApps`) each test `https && ProxyListenPort != 0`, which an
+excluded application can never satisfy, so none of them changes; the candidate
+predicate keeps its `https` arm as a **physical** guard (the proxy only fronts a
+plaintext upstream) rather than as a second representation of intent. Rejected:
+a `proxy_listen_port = -1` sentinel (two facts in one field, and an old binary
+composes `https://domain:-1` — a silent permanent outage on exactly the
+applications an operator excluded deliberately); and deriving participation
+forever without a backfill (one fact, two storage states, reconciled only by a
+review rule). Excluding an application **releases** its proxy port to the free
+pool, which is a strict improvement on a non-candidate reserving a port against
+every sibling forever; its accepted cost is that re-including later draws a
+fresh number, so the exclusion is logged at `Warn` naming the released port.
+This is **not** a reinstated automatic downgrade (ADR-017): the gateway never
+writes a scheme on this path — it stores the scheme the operator sent — and
+`revertScopeExit` is left unguarded on purpose so it remains the repair path for
+an invariant-violating row. The portal's visibility gate is the server's
+https-switch **scope**, which is durable, and never the agent's reported
+`cert_mode`, whose absence is reachable twice (after every gateway restart, and
+on a proxy-mode agent before its first leaf) — a control that hid on it would
+vanish exactly while an operator was provisioning.
+→ [Certificates & TLS §7](cross-cutting/certificates-tls.md), [Data Model](reference/data-model.md).

@@ -148,7 +148,7 @@ flowchart TB
 ## 3. The migration runner
 
 `internal/store/migrate.go` holds an append-only, ordered slice `migrations`
-of 69 entries (see [Data Model (Reference)](../reference/data-model.md) for
+of 70 entries (see [Data Model (Reference)](../reference/data-model.md) for
 the full list). `(*SQLStore).Migrate(ctx)`:
 
 1. Creates `schema_migrations (version integer primary key, name text, applied_at timestamp)`
@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 69 migrations in order, same as
+- **Only-pending.** A fresh install runs all 70 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -382,7 +382,7 @@ else when they bite:
 
 ## 6. Adding to the schema: the recurring traps
 
-Six defect classes recurred often enough on this schema to be worth stating as
+Seven defect classes recurred often enough on this schema to be worth stating as
 rules rather than rediscovering.
 
 **A reserved-word or otherwise dialect-specific DDL defect is invisible on the
@@ -414,6 +414,29 @@ distinct non-zero value in every field, checked field-by-field against one reade
 and then required to be **identical** across the other three. (The loud-failure
 argument was once used to justify skipping coverage for one of the four readers;
 it addresses only half the failure mode.)
+
+**Adding a column to `applications` requires seven edit sites in
+`internal/store/sqlite_applications.go`, and unlike the `ai_servers` family they
+feed TWO differently shaped scanners:** `CreateApplication` (columns,
+placeholders, args), `UpdateApplication` (set-list, args), `ApplicationByID`,
+`ApplicationsByServer`, `ActiveMappingsForModel`, `scanApplication` and
+`scanMappingCandidate`. Three hand-maintained select lists, two scanners — so the
+"a reordered pair of same-typed columns fails silently" hazard above applies here
+**twice over**.
+
+**The `ActiveMappingsForModel` routing join is the dangerous one.**
+`routing.MemoryStore` holds `Application` by value and `copyApplication` copies the
+whole struct, so a new Go field reaches the memory driver for free — the converse
+of §7's "what the memory driver must match by hand". That is exactly why a column
+missed from the routing join's select list reads back as a clean zero value in the
+memory-backed portal suite and passes it entirely, while live routing silently
+ignores the column: an opt-out that works in the UI and is ignored the moment
+traffic is actually routed. `forEachDialect` is the right harness for this (not
+`forEachRoutingStore`, which would run the memory driver that cannot see the
+defect), and `TestConformanceApplicationReadersAgreeOnEveryColumn` plus
+`application_column_parity_test.go` are the only guards. Before migration 70 no
+`*_test.go` in the store package so much as mentioned `proxy_listen_port`, so
+migration 59's column had never been read back through SQL by any suite at all.
 
 **Store reads must return non-nil empty slices**, because a nil slice marshals to
 JSON `null` instead of `[]` and breaks API clients. Two shapes produce nil where
@@ -563,4 +586,4 @@ itself is never returned to a client.
 ## See also
 
 - [Data Model (Reference)](../reference/data-model.md) — the concrete
-  tables, the domain types they back, and the full 69-migration history.
+  tables, the domain types they back, and the full 70-migration history.

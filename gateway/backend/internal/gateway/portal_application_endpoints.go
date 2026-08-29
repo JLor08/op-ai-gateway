@@ -208,6 +208,18 @@ var portalApplicationErrRows = []errRow{
 	// conflicts with the server's existing configuration (it already has the
 	// one server_agent application it is allowed).
 	{err: portal.ErrServerAgentApplicationExists, status: http.StatusConflict, code: "application.server_agent_exists", msg: "server already has a server_agent application"},
+	// The first two are a PRE-EXISTING defect, fixed here because this change
+	// adds the third and fourth beside them: ErrApplicationProxyListenPortInvalid
+	// and ErrApplicationProxyListenPortConflict have been returned by the
+	// application service since migration 59 and appear in NEITHER this list nor
+	// sharedErrorMap, so both fell through to the 500 "application.request_failed"
+	// fallback -- a caller's own bad port reported as a server fault.
+	{err: portal.ErrApplicationProxyListenPortInvalid, status: http.StatusBadRequest, code: "application.proxy_listen_port_invalid", msg: "application proxy listen port is invalid"},
+	{err: portal.ErrApplicationProxyListenPortConflict, status: http.StatusConflict, code: "application.proxy_listen_port_conflict", msg: "proxy listen port already in use on this server"},
+	// 409 for the last three for the reason ErrServerManagedRuntimeOnly records
+	// above: the request SHAPE is fine, it conflicts with the target's own state.
+	{err: portal.ErrApplicationProxyExcludedPortConflict, status: http.StatusConflict, code: "application.proxy_excluded_port_conflict", msg: "an excluded application cannot hold a proxy listen port"},
+	{err: portal.ErrApplicationProxyEntryScheme, status: http.StatusConflict, code: "application.proxy_entry_scheme", msg: "a proxied application must serve plaintext http on its own port"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 

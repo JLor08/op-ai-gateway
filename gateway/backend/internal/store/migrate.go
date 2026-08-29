@@ -100,6 +100,7 @@ var migrations = []migration{
 	{version: 67, name: "server_runtime_reports", up: migration67Up},
 	{version: 68, name: "application_single_server_agent", up: migration68Up},
 	{version: 69, name: "runtime_spec_set_visible_devices", up: migration69Up},
+	{version: 70, name: "application_proxy_excluded", up: migration70Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3034,4 +3035,48 @@ func migration68Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 func migration69Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
 		"set_visible_devices integer not null default 0")
+}
+
+// migration70Up adds applications.proxy_excluded (integer boolean, default 0):
+// the operator's explicit opt-out from the gateway-guided TLS proxy, orthogonal
+// to the scheme. It answers exactly one question -- "did the operator take this
+// application out of the gateway's TLS proxy?" -- and it is the AUTHORITATIVE
+// answer, which is what the backfill below establishes.
+//
+// THE BACKFILL, and why it is a rename rather than a behaviour change. Before
+// this column the own-TLS state was encoded IMPLICITLY as
+// (scheme = 'https' AND proxy_listen_port = 0): an application the operator had
+// put on its own TLS, which portal.isProxySwitchCandidate skipped via its https
+// arm. Those rows -- and only those -- become proxy_excluded = 1. They were
+// skipped by the candidate predicate before this migration and are skipped by it
+// after, from a different clause. Every other stored shape stays 0:
+//
+//	(http,  0)          -> 0. A candidate before, a candidate after.
+//	(http,  port != 0)  -> 0. The resting state after a scope exit; still a candidate.
+//	(https, port != 0)  -> 0. Actually proxied; the reconcile still owns its scheme.
+//	(https, 0)          -> 1. Today's own-TLS set, and only that.
+//
+// Disabled rows are backfilled by the same predicate on purpose: they keep the
+// participation they would have had if re-enabled. An EMPTY scheme is
+// unreachable through the API (portal.normalizeApplicationScheme admits only
+// http/https) and the predicate leaves such a row at 0, which is the right
+// answer -- an empty scheme resolves to http, which is a participating shape.
+//
+// It ABORTS the boot on failure rather than skipping, unlike migration68Up. That
+// migration's skip-rather-than-abort policy is scoped to a CONSTRAINT over
+// possibly-dirty data that an enforcement layer already guards. This is a
+// deterministic UPDATE with no pre-check to fail, and skipping it would leave the
+// column and the retired implicit encoding disagreeing on every legacy row --
+// exactly the two-representations defect the column exists to remove.
+//
+// It does NOT touch baselineCreateStatements, which is FROZEN as of v60: a fresh
+// install gets the column by replaying this migration, and the backfill is a
+// no-op there because the table is empty.
+func migration70Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "applications",
+		"proxy_excluded integer not null default 0"); err != nil {
+		return err
+	}
+	return execTx(ctx, tx, dl, `update applications set proxy_excluded = 1
+		where scheme = 'https' and proxy_listen_port = 0`)
 }

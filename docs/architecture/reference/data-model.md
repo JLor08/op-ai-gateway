@@ -36,7 +36,7 @@ not route-based).
 |---|---|
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
-| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, native-passthrough flags, health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port. At most **one** row per server may have `type = 'server_agent'` (migration 68). |
+| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, native-passthrough flags, health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (69 migrations)
+## 4. Migration history (70 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -391,6 +391,7 @@ catch-all `model_override`, which has its own column).
 | 67 | `server_runtime_reports` | Creates `server_runtime_reports` — 1:1 latest runtime-config report per server (PK `server_id`, upsert-overwrite), shaped column-for-column like migration 29's `server_hardware`: `report_json` is a validated opaque blob the store never parses. |
 | 68 | `application_single_server_agent` | A **partial unique index only, no columns**: `applications(server_id) where type = 'server_agent'`, enforcing at most one `server_agent` application per server. Skips index creation (while still recording version 68) on a database that already holds duplicates — see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runner) for why that is a deliberate policy rather than an incomplete migration. |
 | 69 | `runtime_spec_set_visible_devices` | Adds `agent_runtime_specs.set_visible_devices` (integer boolean, default `0`): the agent sets the vendor-appropriate GPU visibility variable (`CUDA_VISIBLE_DEVICES` on NVIDIA, `ROCR_VISIBLE_DEVICES` on AMD) for that spec's child from that spec's own GPU indices. Appended rather than folded into migration 65 — which created the table on the same unreleased branch — because 65 had already run against every developer database and both CI conformance legs. |
+| 70 | `application_proxy_excluded` | Adds `applications.proxy_excluded` (integer boolean, default `0`): the operator's explicit opt-out from the gateway-guided TLS proxy, orthogonal to `scheme`. **Backfills** it to `1` for exactly `scheme = 'https' AND proxy_listen_port = 0` — the retired IMPLICIT encoding of "this application runs its own TLS", which the portal's candidate predicate already skipped — so the column becomes the single authoritative representation of that decision and no reader has to re-derive it. Every other stored shape stays `0`, including a disabled own-TLS row (it keeps the participation it would have had if re-enabled) and an empty-scheme row (an empty scheme resolves to http, which is a participating shape). Aborts the boot on failure rather than skipping like migration 68: a deterministic backfill has no pre-check to fail, and skipping it would leave the column and the retired encoding disagreeing forever. |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
@@ -472,6 +473,19 @@ plausible-looking validation rule would break the normal case:
   redaction happen in the gateway's ingest before the upsert, so anyone adding a
   second writer of this table must repeat them — the store will happily persist
   unredacted secrets.
+- **`applications.proxy_excluded = 1` implies `proxy_listen_port = 0`.**
+  Participation in the gateway TLS proxy is operator-owned and orthogonal to
+  `scheme`. The invariant is enforced **only** by `applyProxyExclusion` in the
+  portal service — never by SQL (migration 70 adds no CHECK, index or trigger) and
+  never by the memory driver. Note what it does **not** say: `proxy_excluded = 0`
+  together with `proxy_listen_port = 0` is the normal **pre-assignment** state of a
+  participating `http` application, and a validation rule that rejected it would
+  break every application between creation and the agent's next routes fetch. See
+  [ADR-030](../09-architecture-decisions.md#adr-030--proxy-participation-is-an-operator-owned-flag-with-a-port-invariant-not-an-encoding),
+  [Certificates & TLS §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)
+  for the three-way write contract, and
+  [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks) for what a
+  violating row costs.
 
 Read shapes and store-level behaviour worth knowing:
 
@@ -499,3 +513,10 @@ Read shapes and store-level behaviour worth knowing:
 - [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) —
   what the runtime tables are *for*: the admission rule they feed, the document
   assembled from them, and the portal screen that edits them.
+- [Certificates & TLS §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)
+  — the automatic HTTPS switch, and the write contract behind
+  `applications.proxy_excluded` / `proxy_listen_port`.
+- [ADR-030](../09-architecture-decisions.md#adr-030--proxy-participation-is-an-operator-owned-flag-with-a-port-invariant-not-an-encoding)
+  — why participation is its own column rather than an encoding, and why
+  migration 70 backfills rather than deriving forever. It links *to* this file;
+  this is the way back.

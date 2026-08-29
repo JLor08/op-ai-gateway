@@ -17,7 +17,7 @@ import type {
   PortalServer,
   UpdateApplicationRequest,
 } from '../api';
-import type { Translation, PortalApi } from './shared/types';
+import type { BadgeStatus, Translation, PortalApi } from './shared/types';
 import { formatPortalError, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
 import { StatusChip } from './shared/StatusChip';
@@ -46,12 +46,41 @@ const applicationTypeOptions: ApplicationType[] = [
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 const applicationFlavorOptions = ['openai', 'anthropic'];
 
-// P4 Task 11: "is this application proxied" mirrors the backend's
-// routing.ApplicationEndpoint derivation exactly (scheme=="https" &&
-// ProxyListenPort!=0) -- computed client-side, no new backend field needed.
-function isProxied(app: PortalApplication): boolean {
-  return app.scheme === 'https' && app.proxy_listen_port !== 0;
+// Three states, not two. The previous binary derivation rendered four
+// materially different situations as one amber "Not proxied" -- waiting for a
+// port, waiting for the switch, running its own TLS, and on a server that runs
+// no proxy at all -- and the operator's opt-out would have made it five.
+//
+// 'proxied' still mirrors routing.ApplicationEndpoint's own branch exactly
+// (scheme=="https" && proxy_listen_port!=0), which is a statement about the
+// LISTENER. 'excluded' is the separate, operator-owned fact, so it is read from
+// the flag and tested first.
+//
+// Known residual, deliberately out of scope: 'pending' still merges "waiting
+// for a port" with "this server runs no proxy".
+type ApplicationProxyState = 'excluded' | 'proxied' | 'pending';
+
+function applicationProxyState(app: PortalApplication): ApplicationProxyState {
+  if (app.proxy_excluded) return 'excluded';
+  return app.scheme === 'https' && app.proxy_listen_port !== 0 ? 'proxied' : 'pending';
 }
+
+const applicationProxyStateLabelByKey: Record<
+  ApplicationProxyState,
+  'applicationProxyChipExcluded' | 'applicationProxied' | 'applicationNotProxied'
+> = {
+  excluded: 'applicationProxyChipExcluded',
+  proxied: 'applicationProxied',
+  // Reused on purpose so no existing string is orphaned.
+  pending: 'applicationNotProxied',
+};
+
+const applicationProxyStateChipStatus: Record<ApplicationProxyState, BadgeStatus> = {
+  // Grey, not amber: a deliberate operator choice is not a warning.
+  excluded: 'standby',
+  proxied: 'success',
+  pending: 'watch',
+};
 
 const defaultApplicationAffinityTtlSeconds = 1800;
 const defaultApplicationAdmissionQueueTimeoutSeconds = 0;
@@ -205,8 +234,29 @@ export function ApplicationSection({
   // a typed value = replace, cleared flag = send "" (clear).
   const [tokenInput, setTokenInput] = useState('');
   const [tokenCleared, setTokenCleared] = useState(false);
+  // The operator's opt-out, plus the value the form OPENED with. The seed is
+  // what submitEdit diffs against so an unrelated save never restates it -- see
+  // submitEdit below, and ServerList's managed_runtime_only for the same
+  // reasoning at length.
+  const [proxyExcluded, setProxyExcluded] = useState(false);
+  const [proxyExcludedSeed, setProxyExcludedSeed] = useState(false);
   const [benchmarkScheduleEnabled, setBenchmarkScheduleEnabled] = useState(false);
   const [opportunisticMetricsEnabled, setOpportunisticMetricsEnabled] = useState(false);
+  // What the gateway's TLS proxy is doing on THIS server. The `?? 'unknown'`
+  // default is load-bearing: an older backend, or a DTO that lost the field,
+  // must SHOW the control, never hide it.
+  const serverProxyState = server.tls_proxy_state ?? 'unknown';
+  // Only 'out_of_scope' hides the control, because only 'out_of_scope' is
+  // derived from DURABLE state (a stored server column plus a stored setting)
+  // and so cannot appear out of nowhere after a gateway restart. 'agent_off'
+  // and 'unknown' change the SENTENCE shown, never the visibility -- the
+  // agent's cert report is in-RAM and is absent both after every restart and on
+  // a proxy-mode agent before its first certificate.
+  //
+  // OVERRIDE, non-negotiable: an application that IS excluded renders the
+  // control in every state, out_of_scope included. An operator must always be
+  // able to see and undo their own setting.
+  const showProxyControls = serverProxyState !== 'out_of_scope' || proxyExcluded;
   const [benchmarkIntervalSeconds, setBenchmarkIntervalSeconds] = useState(
     defaultBenchmarkIntervalSeconds,
   );
@@ -259,6 +309,8 @@ export function ApplicationSection({
     setApiTokenHeader('');
     setTokenInput('');
     setTokenCleared(false);
+    setProxyExcluded(false);
+    setProxyExcludedSeed(false);
     setBenchmarkScheduleEnabled(false);
     setOpportunisticMetricsEnabled(false);
     setBenchmarkIntervalSeconds(defaultBenchmarkIntervalSeconds);
@@ -315,6 +367,8 @@ export function ApplicationSection({
     setApiTokenHeader(app.api_token_header ?? '');
     setTokenInput('');
     setTokenCleared(false);
+    setProxyExcluded(app.proxy_excluded);
+    setProxyExcludedSeed(app.proxy_excluded);
     setBenchmarkScheduleEnabled(app.benchmark_schedule_enabled);
     setOpportunisticMetricsEnabled(app.opportunistic_metrics_enabled);
     setBenchmarkIntervalSeconds(
@@ -357,6 +411,12 @@ export function ApplicationSection({
       app_path_suffix: appPathSuffix.trim(),
       api_token_header: apiTokenHeader.trim(),
       ...(apiToken !== undefined ? { api_token: apiToken } : {}),
+      // The showProxyControls gate is load-bearing on CREATE: on an
+      // out-of-scope server the checkbox is not rendered, and an https create
+      // must then send NO key at all so the backend normalizes it into the
+      // excluded state -- an explicit `false` there is a request to PARTICIPATE
+      // and is refused (application.proxy_entry_scheme).
+      ...(showProxyControls ? { proxy_excluded: proxyExcluded } : {}),
       benchmark_schedule_enabled: benchmarkScheduleEnabled,
       opportunistic_metrics_enabled: opportunisticMetricsEnabled,
       // "off" stores 0 so an unscheduled app keeps a clean interval.
@@ -384,6 +444,15 @@ export function ApplicationSection({
     setBusy(true);
     try {
       const body: UpdateApplicationRequest = buildBody();
+      // buildBody returns ONE literal reused verbatim for update, so a field
+      // added there is restated on every save. proxy_excluded must not be:
+      // sending it unconditionally would compile, pass a "the switch works"
+      // test, and still be a defect -- every save made for an unrelated reason
+      // would restate the operator's opt-out from whatever this form last read,
+      // and on a hidden control would CLEAR it, returning an ordinary 200 with
+      // nothing to notice. Compared against the seed captured when the form
+      // OPENED, not against mode.app, which a refresh can replace mid-edit.
+      if (proxyExcluded === proxyExcludedSeed) delete body.proxy_excluded;
       const updated = await api.updateApplication(mode.app.id, body);
       setApplications((current) =>
         (current ?? []).map((row) => (row.id === updated.id ? updated : row)),
@@ -454,22 +523,22 @@ export function ApplicationSection({
         </Box>
       ),
     },
-    // P4 Task 11: read-only https-auto-switch status. Derived CLIENT-SIDE from
-    // fields already on the DTO (no new backend field) -- mirrors the backend's
-    // own routing.ApplicationEndpoint derivation exactly: an application is
-    // "proxied" only once it is https AND the gateway has actually assigned it
-    // a proxy_listen_port.
+    // Read-only https-auto-switch status, derived CLIENT-SIDE from fields
+    // already on the DTO. The value/enumLabel take the same three keys as the
+    // chip so the enum filter offers all three states rather than collapsing
+    // two of them.
     {
       id: 'proxy_status',
       label: t.applicationProxyStatus,
-      value: (a) => (isProxied(a) ? 'proxied' : 'not_proxied'),
+      value: (a) => applicationProxyState(a),
       filter: 'enum',
       searchable: false,
-      enumLabel: (v) => (v === 'proxied' ? t.applicationProxied : t.applicationNotProxied),
+      enumLabel: (v) =>
+        t[applicationProxyStateLabelByKey[v as ApplicationProxyState] ?? 'applicationNotProxied'],
       render: (a) => (
         <StatusChip
-          status={isProxied(a) ? 'success' : 'watch'}
-          label={isProxied(a) ? t.applicationProxied : t.applicationNotProxied}
+          status={applicationProxyStateChipStatus[applicationProxyState(a)]}
+          label={t[applicationProxyStateLabelByKey[applicationProxyState(a)]]}
         />
       ),
     },
@@ -582,6 +651,37 @@ export function ApplicationSection({
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
     ].filter((reason): reason is string => reason !== undefined);
+    // The scheme is the GATEWAY's field only while the application actually
+    // takes part in the proxy on a server that runs one. In every other case --
+    // excluded, or a server out of scope -- it is the operator's, and the
+    // select is enabled.
+    //
+    // Disabled, its VALUE stays the STORED scheme, so an unrelated save on an
+    // already-switched https application re-sends `https` and is a no-op. It
+    // must never re-send `http`: that would open a downgrade window on every
+    // save made for an unrelated reason.
+    //
+    // The reason rides in helperText rather than a tooltip, for the same
+    // accessibility reason the type select already records: a disabled MUI
+    // control is out of the tab order and sets pointer-events:none, so anything
+    // anchored on hover is unreachable by keyboard and screen reader.
+    const schemeManaged = showProxyControls && !proxyExcluded;
+    // Three distinct sentences, never one reused. On an out-of-scope server the
+    // control is only visible through the already-excluded OVERRIDE, and the
+    // out-of-scope explanation is then the honest thing to say next to it.
+    let proxyModeNote = t.applicationProxyModeUnknownNote;
+    if (serverProxyState === 'proxy') proxyModeNote = t.applicationProxyModeActiveNote;
+    else if (serverProxyState === 'agent_off') proxyModeNote = t.applicationProxyModeOffNote;
+    else if (serverProxyState === 'out_of_scope') proxyModeNote = t.applicationProxyOutOfScopeNote;
+    // The assigned proxy port, as STATIC TEXT and never a form control: the
+    // gateway owns it, and buildBody must go on never sending
+    // proxy_listen_port. 0 must never render as "0", as a blank or as a dash --
+    // the not-yet state is spelled out as a wait with a bound.
+    let proxyPortNote = t.applicationProxyPortUnassigned;
+    if (proxyExcluded) proxyPortNote = t.applicationProxyPortExcluded;
+    else if (editApp && editApp.proxy_listen_port > 0) {
+      proxyPortNote = t.applicationProxyPort(editApp.proxy_listen_port);
+    }
     return (
       <>
         <Breadcrumbs
@@ -665,6 +765,8 @@ export function ApplicationSection({
               label={t.applicationScheme}
               value={scheme}
               onChange={(e) => setScheme(e.target.value as ApplicationScheme)}
+              disabled={schemeManaged}
+              helperText={schemeManaged ? t.applicationSchemeManagedNote : undefined}
             >
               {applicationSchemeOptions.map((option) => (
                 <option value={option} key={option}>
@@ -672,6 +774,54 @@ export function ApplicationSection({
                 </option>
               ))}
             </SelectField>
+            {showProxyControls ? (
+              <>
+                <CheckboxGroup
+                  legend={t.applicationProxyLegend}
+                  options={[{ value: 'excluded', label: t.applicationProxyExcluded }]}
+                  selected={proxyExcluded ? ['excluded'] : []}
+                  onToggle={() => {
+                    const next = !proxyExcluded;
+                    setProxyExcluded(next);
+                    if (!next) {
+                      // Unticking. http is the ONLY re-entry: the candidate
+                      // predicate's https arm needs a proxy port, only the
+                      // gateway assigns one, and only to candidates. It is also
+                      // what the backend requires, so forcing it here turns a
+                      // 409 into a save that works.
+                      setScheme('http');
+                    } else if (editApp?.scheme === 'https' && editApp.proxy_listen_port !== 0) {
+                      // Ticking on an already-proxied application. That `https`
+                      // described the AGENT'S listener, not the upstream --
+                      // AgentProxyRoutes publishes http://127.0.0.1:<Port>, so
+                      // the application itself speaks plaintext on its own port.
+                      // Pre-setting http is what keeps it reachable the instant
+                      // the PATCH lands. The operator may still choose https in
+                      // the same save; that is the whole point of the feature.
+                      setScheme('http');
+                    }
+                  }}
+                />
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {t.applicationProxyExcludedNote}
+                </Typography>
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {proxyModeNote}
+                </Typography>
+                {proxyExcluded && scheme === 'https' ? (
+                  <Alert severity="warning">{t.applicationProxyOwnTLSWarning(server.domain)}</Alert>
+                ) : null}
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {proxyPortNote}
+                </Typography>
+              </>
+            ) : (
+              // Never a blank: the slot the control would have occupied still
+              // explains why there is nothing to set here.
+              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                {t.applicationProxyOutOfScopeNote}
+              </Typography>
+            )}
             <CheckboxGroup
               legend={t.applicationFlavors}
               options={applicationFlavorOptions.map((f) => ({ value: f, label: f }))}

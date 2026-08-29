@@ -1022,6 +1022,13 @@ type ServerDTO struct {
 	// within the effective window), "inactive" (an agent token is configured but
 	// not currently reporting), or "unconfigured" (no agent token at all).
 	AgentStatus string `json:"agent_status"`
+	// TLSProxyState says what the gateway's TLS proxy is doing on this server,
+	// so the per-application proxy opt-out can be rendered with a true reason
+	// instead of appearing out of nowhere: "out_of_scope" | "unknown" |
+	// "agent_off" | "proxy". Derived, never stored — see tlsProxyState for the
+	// durable-floor/volatile-upgrade rule and why only "out_of_scope" may hide
+	// the control.
+	TLSProxyState string `json:"tls_proxy_state"`
 	// AgentPresenceTimeoutSeconds is the per-server override (seconds) for "the
 	// agent is delivering values"; 0 = follow the system-wide default.
 	AgentPresenceTimeoutSeconds int `json:"agent_presence_timeout_seconds"`
@@ -2343,9 +2350,12 @@ func (s *Service) ListServers(ctx context.Context, principal auth.Token) (Server
 			}
 		}
 	}
+	// ONE settings read for the whole list -- see serverDTO's doc for why this is
+	// a consistency property and not a micro-optimisation.
+	values, settingsOK := s.systemSettingsSnapshot(ctx)
 	out := make([]ServerDTO, 0, len(servers))
 	for _, srv := range servers {
-		dto, err := s.serverDTO(ctx, srv)
+		dto, err := s.serverDTOWith(ctx, srv, values, settingsOK)
 		if err != nil {
 			return ServerListResponse{}, err
 		}
@@ -3153,7 +3163,41 @@ func (s *Service) validateAdminGroupScope(ctx context.Context, principal auth.To
 	return ids, systemGroupID, nil
 }
 
+// serverDTO renders ONE server, reading the system settings for itself. Every
+// single-server path uses this; ListServers uses serverDTOWith so that N servers
+// share ONE settings read.
+//
+// The settings are threaded rather than re-read per server for a reason that is
+// not performance (one read is ~33 us): ListServers rendered N servers from N
+// independent reads, so a concurrent Save could land mid-loop and the response
+// would describe server #1 under the old cert_https_switch_mode and server #100
+// under the new one. One read per request makes the list internally consistent.
+// cmd/gateway/app_health.go already takes exactly this shape per pass, and says
+// in its own comment that it mirrors serverDTO; this makes that true.
 func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (ServerDTO, error) {
+	values, ok := s.systemSettingsSnapshot(ctx)
+	return s.serverDTOWith(ctx, server, values, ok)
+}
+
+// systemSettingsSnapshot reads the settings once, returning ok=false when there
+// is no reader or the read failed. The BOOLEAN IS LOAD-BEARING and must not be
+// collapsed into a nil map: tlsProxyState turns "no settings" into "unknown"
+// (which keeps the operator's control visible) and would turn an empty map into
+// "out_of_scope" (which hides it), because DefaultCertHTTPSSwitchMode is
+// "manual". A read glitch must never hide a control -- see tlsProxyState's own
+// doc and TestTLSProxyState.
+func (s *Service) systemSettingsSnapshot(ctx context.Context) (map[string]string, bool) {
+	if s.settings == nil {
+		return nil, false
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		return nil, false
+	}
+	return values, true
+}
+
+func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, values map[string]string, settingsOK bool) (ServerDTO, error) {
 	ownerIDs, err := s.routes.ServerOwners(ctx, server.ID)
 	if err != nil {
 		return ServerDTO{}, err
@@ -3199,7 +3243,8 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 		NetbirdPingExclude:          server.NetbirdPingExclude,
 		CertificateOverride:         server.CertificateOverride,
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
-		AgentStatus:                 s.agentStatus(ctx, server),
+		AgentStatus:                 s.agentStatus(ctx, server, values, settingsOK),
+		TLSProxyState:               s.tlsProxyState(server, values, settingsOK),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
 		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
@@ -3222,19 +3267,85 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 // "unconfigured" (no agent token at all). Nil-safe throughout — a nil
 // AgentPresence reader or an AgentTokenByServer error/miss never escalates
 // past "unconfigured"/"inactive".
-func (s *Service) agentStatus(ctx context.Context, server routing.AIServer) string {
+func (s *Service) agentStatus(ctx context.Context, server routing.AIServer, values map[string]string, settingsOK bool) string {
 	status := "unconfigured"
 	if _, hasToken, _ := s.routes.AgentTokenByServer(ctx, server.ID); hasToken {
 		status = "inactive"
 	}
 	if s.agentPresence != nil {
-		sysDefault := s.activeAgentPresenceTimeoutSeconds(ctx)
+		// The caller's snapshot, so a list of N servers does not read the settings
+		// N times. Without it, this is the SECOND per-server read (tlsProxyState is
+		// the other) -- and unlike that one, this one predates it.
+		sysDefault := s.agentPresenceTimeoutDefault
+		if settingsOK {
+			sysDefault = s.AgentPresenceTimeoutSeconds(values)
+		}
 		window := time.Duration(routing.EffectiveAgentPresenceTimeoutSeconds(server, sysDefault, MinAgentPresenceTimeoutSeconds, MaxAgentPresenceTimeoutSeconds)) * time.Second
 		if s.agentPresence.ReportingWithin(server.ID, window) {
 			status = "active"
 		}
 	}
 	return status
+}
+
+// tlsProxyState derives the four-valued tls_proxy_state for a server:
+// "out_of_scope" (the gateway runs no TLS proxy here at all), "proxy" (the
+// agent reports it is running one), "agent_off" (the agent reports it is not),
+// or "unknown" (nothing recent enough to say).
+//
+// It is a DURABLE FLOOR with a VOLATILE UPGRADE, shaped like agentStatus and
+// MeshTLSPendingServers: the stored scope (a server column plus a stored
+// setting) establishes what can be known across a restart, and the in-RAM
+// certificate report only ever refines the WORDING on top of it.
+//
+// THE NIL-SAFETY RULE IS INVERTED relative to agentStatus, and that inversion
+// is the point rather than an oversight. There the pessimistic floor is the
+// RESTRICTIVE value; here the pessimistic floor ("unknown") is the one that
+// KEEPS THE CONTROL VISIBLE. A missing reader, a settings glitch, an
+// unrecognised mode — none of them may hide an operator's own switch, so every
+// one of them returns "unknown" and never "out_of_scope".
+//
+// WHY SCOPE IS THE GATE AND cert_mode IS NOT. Only "out_of_scope" hides the
+// control in the portal, and it is the only value that can be trusted to:
+// AgentProxyRoutes returns an empty route set for an out-of-scope server
+// whatever the agent's mode, and both of httpsSwitchInScope's inputs
+// (server.HTTPSSwitchOverride, cert_https_switch_mode) are stored, so the gate
+// cannot vanish after a restart. The cert report cannot carry that weight —
+// AgentCertReportRegistry is an in-RAM map built empty at startup, and it DROPS
+// a report carrying neither a leaf nor CA fingerprints unless the mode is
+// "off". So absence is reachable twice: after every gateway restart, and on a
+// freshly-provisioned proxy-mode agent before its first certificate — precisely
+// when an operator is most likely to be reaching for this control. Hence
+// "agent_off" and "unknown" are POSITIVE/ABSENT observations that change the
+// sentence shown, never the visibility.
+func (s *Service) tlsProxyState(server routing.AIServer, values map[string]string, settingsOK bool) string {
+	// settingsOK false covers BOTH "no reader" and "the read failed" -- kept as an
+	// explicit boolean rather than a nil map, because an empty map would resolve
+	// to the "manual" default and hence to "out_of_scope", hiding the control on a
+	// transient glitch. A read glitch must NEVER hide a control.
+	if !settingsOK {
+		return "unknown"
+	}
+	if !httpsSwitchInScope(server, CertHTTPSSwitchMode(values)) {
+		return "out_of_scope"
+	}
+	if s.agentCertReports == nil {
+		return "unknown"
+	}
+	_, _, mode, _, _, ok := s.agentCertReports.CertReport(server.ID)
+	if !ok {
+		return "unknown"
+	}
+	switch mode {
+	case "proxy":
+		return "proxy"
+	case "off", "files":
+		return "agent_off"
+	default:
+		// A report whose mode the ingest sanitizer dropped, or that carried none,
+		// says nothing ABOUT the mode. It is not evidence of "off".
+		return "unknown"
+	}
 }
 
 // decodeNetbirdGroupIDs tolerantly decodes the opaque netbird_group_ids column

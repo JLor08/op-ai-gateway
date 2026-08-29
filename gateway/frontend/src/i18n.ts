@@ -431,6 +431,27 @@ const de = {
   applicationProxyStatus: 'HTTPS-Proxy',
   applicationProxied: 'Proxied',
   applicationNotProxied: 'Nicht proxied',
+  applicationProxyChipExcluded: 'Ausgenommen',
+  applicationProxyLegend: 'HTTPS-Proxy',
+  applicationProxyExcluded: 'Nicht Teil des Proxys (http/https verwalte ich selbst)',
+  applicationProxyExcludedNote:
+    'Das Gateway richtet für diese Anwendung keinen TLS-Proxy-Listener ein und ändert ihr Schema nie. http oder https wählen Sie oben selbst.',
+  applicationProxyModeActiveNote: 'Der Agent dieses Servers betreibt den TLS-Proxy des Gateways.',
+  applicationProxyModeOffNote:
+    'Der Agent meldet cert_mode=off/files: er betreibt zurzeit keinen TLS-Proxy. Die Einstellung wird gespeichert und wirkt, sobald er in den Proxy-Modus wechselt.',
+  applicationProxyModeUnknownNote:
+    'Der Agent hat seinen cert_mode noch nicht gemeldet — normal kurz nach einem Gateway-Neustart oder bevor sein erstes Zertifikat installiert ist. Die Einstellung wird unabhängig davon gespeichert.',
+  applicationProxyOutOfScopeNote:
+    'Dieser Server ist nicht im Geltungsbereich des HTTPS-Umschalters — das Gateway betreibt hier keinen TLS-Proxy und ändert kein Anwendungsschema. (Zertifikate → HTTPS-Umschaltung, oder die Include/Exclude-Einstellung des Servers.)',
+  applicationSchemeManagedNote:
+    'Das Gateway setzt dieses Feld selbst: http, bis der TLS-Proxy des Agents bestätigt ist, danach https.',
+  applicationProxyOwnTLSWarning: (domain: string) =>
+    `Das Gateway prüft Ihr Zertifikat gegen den System-Truststore und die interne CA und erwartet es gültig für ${domain}.`,
+  applicationProxyPortExcluded:
+    'TLS-Proxy-Port: keiner — diese Anwendung ist vom Proxy ausgenommen.',
+  applicationProxyPort: (port: number) => `TLS-Proxy-Port: ${port} (vom Gateway vergeben).`,
+  applicationProxyPortUnassigned:
+    'TLS-Proxy-Port: noch nicht vergeben — das Gateway vergibt ihn, sobald der Agent das nächste Mal seine Routen abruft (bis zu 15 min über POST, bis zu 6 h über WebSocket).',
   mappingGatewayName: 'Gateway-Modellname',
   mappingAppName: 'Anwendungs-Modellname',
   tableEndpoint: 'Endpoint',
@@ -1179,7 +1200,7 @@ const de = {
   certificatesHTTPSSwitchModeSelected: 'Ausgewählt (nur einbezogene Server)',
   certificatesHTTPSSwitchModeConfirmTitle: 'Auf automatisches Umschalten wechseln?',
   certificatesHTTPSSwitchModeConfirmBody:
-    'Im Automatik-Modus schaltet der Gateway die Anwendungen berechtigter Server künftig selbstständig von http auf https um (sofern nicht einzeln ausgeschlossen). Das kann bestehende Verbindungen kurzzeitig unterbrechen.',
+    'Im Automatik-Modus schaltet der Gateway die Anwendungen berechtigter Server künftig selbstständig von http auf https um (sofern nicht einzelne Server ausgeschlossen sind). Das kann bestehende Verbindungen kurzzeitig unterbrechen.',
   certificatesHTTPSSwitchUnreachableTitle:
     'Anwendungen nicht erreichbar (TLS defekt, kein automatischer Rückfall)',
   certificatesHTTPSSwitchUnreachableBody:
@@ -2378,6 +2399,27 @@ const en: PortalMessages = {
   applicationProxyStatus: 'HTTPS proxy',
   applicationProxied: 'Proxied',
   applicationNotProxied: 'Not proxied',
+  applicationProxyChipExcluded: 'Excluded',
+  applicationProxyLegend: 'HTTPS proxy',
+  applicationProxyExcluded: 'Not part of the TLS proxy (I manage http/https myself)',
+  applicationProxyExcludedNote:
+    'The gateway will not open a TLS proxy listener for this application and will never change its scheme. Choose http or https above yourself.',
+  applicationProxyModeActiveNote: "This server's agent is running the gateway's TLS proxy.",
+  applicationProxyModeOffNote:
+    'The agent reports cert_mode=off/files: it is not running a TLS proxy at the moment. The setting is stored and takes effect as soon as it switches to proxy mode.',
+  applicationProxyModeUnknownNote:
+    'The agent has not reported its cert_mode yet — normal shortly after a gateway restart, or before its first certificate is installed. The setting is stored either way.',
+  applicationProxyOutOfScopeNote:
+    "This server is not in scope for the HTTPS auto-switch — the gateway runs no TLS proxy here and changes no application scheme. (Certificates → HTTPS auto-switch, or the server's include/exclude setting.)",
+  applicationSchemeManagedNote:
+    "The gateway sets this field itself: http until the agent's TLS proxy is confirmed, https afterwards.",
+  applicationProxyOwnTLSWarning: (domain: string) =>
+    `The gateway verifies your certificate against the system trust store and the internal CA, and expects it to be valid for ${domain}.`,
+  applicationProxyPortExcluded:
+    'TLS proxy port: none — this application is excluded from the proxy.',
+  applicationProxyPort: (port: number) => `TLS proxy port: ${port} (assigned by the gateway).`,
+  applicationProxyPortUnassigned:
+    'TLS proxy port: not assigned yet — the gateway assigns it the next time the agent fetches its routes (up to 15 min over POST, up to 6 h over WebSocket).',
   mappingGatewayName: 'Gateway model name',
   mappingAppName: 'Application model name',
   tableEndpoint: 'Endpoint',
@@ -3103,7 +3145,7 @@ const en: PortalMessages = {
   certificatesHTTPSSwitchModeSelected: 'Selected (only included servers)',
   certificatesHTTPSSwitchModeConfirmTitle: 'Switch to automatic mode?',
   certificatesHTTPSSwitchModeConfirmBody:
-    "In auto mode the gateway will automatically switch eligible servers' applications from http to https going forward (unless individually excluded). This may briefly interrupt existing connections.",
+    "In auto mode the gateway will automatically switch eligible servers' applications from http to https going forward (unless individual servers are excluded). This may briefly interrupt existing connections.",
   certificatesHTTPSSwitchUnreachableTitle:
     'Applications unreachable (TLS down, no automatic fallback)',
   certificatesHTTPSSwitchUnreachableBody:

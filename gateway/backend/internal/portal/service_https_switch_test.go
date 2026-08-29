@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -31,11 +32,11 @@ func schemeOf(t *testing.T, svc *Service, ctx context.Context, appID string) str
 	return app.Scheme
 }
 
-// TestIsProxySwitchCandidate pins the eligibility rule: an ENABLED app that is
-// currently http, OR already proxy-switched (https with a non-zero
-// ProxyListenPort), is a candidate. An enabled https app with NO proxy port
-// (its own TLS, non-proxy) is left alone, and a disabled app is never a
-// candidate regardless of scheme/port.
+// TestIsProxySwitchCandidate pins the eligibility rule: a NOT-EXCLUDED, ENABLED
+// app that is currently http, OR already proxy-switched (https with a non-zero
+// ProxyListenPort), is a candidate. A disabled app is never a candidate
+// regardless of scheme/port, and an https app with NO proxy port is refused by
+// the physical guard (the proxy can only front a plaintext upstream).
 func TestIsProxySwitchCandidate(t *testing.T) {
 	cases := []struct {
 		name string
@@ -46,13 +47,144 @@ func TestIsProxySwitchCandidate(t *testing.T) {
 		{"enabled http, empty status is active", routing.Application{Scheme: "http"}, true},
 		{"enabled empty scheme (defaults http)", routing.Application{Status: routing.ServerStatusActive}, true},
 		{"enabled proxy-switched https", routing.Application{Status: routing.ServerStatusActive, Scheme: "https", ProxyListenPort: 8600}, true},
-		{"enabled own-tls https (no proxy port)", routing.Application{Status: routing.ServerStatusActive, Scheme: "https", ProxyListenPort: 0}, false},
 		{"disabled http", routing.Application{Status: routing.ServerStatusDisabled, Scheme: "http"}, false},
 		{"disabled proxy-switched https", routing.Application{Status: routing.ServerStatusDisabled, Scheme: "https", ProxyListenPort: 8600}, false},
+		// The DEFENCE-IN-DEPTH arm, not a second representation of "excluded":
+		// migration 70 backfilled every stored row of this shape into the flag,
+		// so a row that still reads false here reached the store without passing
+		// through the portal's normalization (a pre-70 binary's insert, whose
+		// omitted column takes the DEFAULT 0, or a direct store write). It must
+		// still be refused -- the agent's proxy publishes an
+		// http://127.0.0.1:<Port> upstream, so making this a candidate would
+		// point it at an https upstream as if it were plaintext.
+		{"legacy own-tls https with the flag false (no proxy port)", routing.Application{Status: routing.ServerStatusActive, Scheme: "https", ProxyListenPort: 0}, false},
+	}
+	// The exclusion is tested FIRST and independently of scheme and status, so
+	// it holds across EVERY combination -- including the one that makes the
+	// feature exist at all: ENABLED, scheme http, which is a candidate
+	// unconditionally without the flag and which no value of
+	// (Scheme, ProxyListenPort) could ever exclude.
+	for _, status := range []string{routing.ServerStatusActive, routing.ServerStatusDisabled, ""} {
+		for _, scheme := range []string{"http", "https", "", "gopher"} {
+			for _, port := range []int{0, 8600} {
+				cases = append(cases, struct {
+					name string
+					app  routing.Application
+					want bool
+				}{
+					name: "excluded status=" + status + " scheme=" + scheme + " port=" + strconv.Itoa(port),
+					app: routing.Application{
+						Status: status, Scheme: scheme, ProxyListenPort: port, ProxyExcluded: true,
+					},
+					want: false,
+				})
+			}
+		}
 	}
 	for _, c := range cases {
 		if got := isProxySwitchCandidate(c.app); got != c.want {
 			t.Errorf("%s: isProxySwitchCandidate = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestHTTPSSwitchNeverTouchesAnExcludedApplication is the ADR-017 regression
+// guard, and it must never be deleted: it pins that this feature reinstated no
+// automatic move to plaintext, and that both recovery arms leave an excluded
+// application entirely alone.
+//
+// The two arms fail in OPPOSITE directions, so both are asserted:
+//
+//   - OUT OF SCOPE: revertScopeExit is unconditional and consults no snapshot.
+//     An excluded https application must not be flipped to http by it, on this
+//     pass or any later one -- the operator, not the gateway, owns that scheme
+//     now. An ORDINARY proxy-switched application on the SAME server still is,
+//     so the guard cannot pass by the revert simply having stopped working.
+//   - IN SCOPE: an excluded http application must stay http across a pass in
+//     which the agent reports tls_active=true for every port, and must never be
+//     named by HTTPSSwitchUnreachableApps.
+func TestHTTPSSwitchNeverTouchesAnExcludedApplication(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+
+	// OUT OF SCOPE via the per-server exclude override.
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-out", "exclude")
+	excluded := mustCreateSwitchTestApp(t, svc, ctx, "app-excluded", "srv-out", 8080, 0)
+	excluded.Scheme = "https"
+	excluded.ProxyExcluded = true
+	if err := svc.routes.UpdateApplication(ctx, excluded); err != nil {
+		t.Fatalf("mark excluded: %v", err)
+	}
+	// The control: an ordinary proxy-switched app on the same out-of-scope
+	// server, which the scope-exit revert MUST still move.
+	ordinary := mustCreateSwitchTestApp(t, svc, ctx, "app-ordinary", "srv-out", 8081, 8601)
+	ordinary.Scheme = "https"
+	if err := svc.routes.UpdateApplication(ctx, ordinary); err != nil {
+		t.Fatalf("mark ordinary proxied: %v", err)
+	}
+
+	// IN SCOPE, with an agent reporting TLS up on every port it could possibly
+	// have: an excluded http app must not be forwarded.
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-in", "")
+	inScope := mustCreateSwitchTestApp(t, svc, ctx, "app-in-excluded", "srv-in", 8090, 0)
+	inScope.ProxyExcluded = true
+	if err := svc.routes.UpdateApplication(ctx, inScope); err != nil {
+		t.Fatalf("mark in-scope app excluded: %v", err)
+	}
+	// The row that makes the in-scope arm a REAL guard rather than a vacuous
+	// one. An excluded application with ProxyListenPort 0 is skipped by the
+	// reconcile's own "no port assigned yet" clause, so it would stay http even
+	// if this feature did not exist -- the port is what AgentProxyRoutes
+	// withholds, and that is covered by its own test. This row carries a
+	// NON-ZERO port (reachable only by a direct store write, since the portal's
+	// invariant forbids it) with the agent reporting tls_active=true for it, so
+	// the ONLY thing standing between it and a forward flip to https is
+	// isProxySwitchCandidate's ProxyExcluded clause.
+	held := mustCreateSwitchTestApp(t, svc, ctx, "app-in-excluded-holding-port", "srv-in", 8091, 8602)
+	held.ProxyExcluded = true
+	if err := svc.routes.UpdateApplication(ctx, held); err != nil {
+		t.Fatalf("mark port-holding app excluded: %v", err)
+	}
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-in": {
+			{Listen: 8600, TLSActive: true},
+			{Listen: 8601, TLSActive: true},
+			{Listen: 8602, TLSActive: true},
+		},
+	}}
+
+	// Several passes: a guard that only holds on the first one is not a guard.
+	for pass := 0; pass < 3; pass++ {
+		svc.ReconcileHTTPSSwitch(ctx)
+	}
+
+	if got := schemeOf(t, svc, ctx, "app-excluded"); got != "https" {
+		t.Fatalf("out-of-scope excluded app: scheme = %q, want https (the gateway must never write a scheme on this path)", got)
+	}
+	if got := schemeOf(t, svc, ctx, "app-ordinary"); got != "http" {
+		t.Fatalf("out-of-scope ORDINARY proxied app: scheme = %q, want http -- the scope-exit revert must still work", got)
+	}
+	if got := schemeOf(t, svc, ctx, "app-in-excluded"); got != "http" {
+		t.Fatalf("in-scope excluded http app: scheme = %q, want http (never forwarded)", got)
+	}
+	if got := schemeOf(t, svc, ctx, "app-in-excluded-holding-port"); got != "http" {
+		t.Fatalf("in-scope excluded app HOLDING a port whose listener reports tls_active=true: scheme = %q, want http -- the forward arm must be stopped by the exclusion alone", got)
+	}
+	after, err := svc.routes.ApplicationByID(ctx, "app-in-excluded")
+	if err != nil {
+		t.Fatalf("read app-in-excluded: %v", err)
+	}
+	if after.ProxyListenPort != 0 {
+		t.Fatalf("in-scope excluded app got ProxyListenPort = %d, want 0", after.ProxyListenPort)
+	}
+
+	// And it is structurally invisible to the unreachable-apps view: the filter
+	// starts with isProxySwitchCandidate. That is correct -- the gateway is not
+	// managing this application -- but it is asserted so the silence is a
+	// pinned property rather than an accident.
+	for _, row := range svc.HTTPSSwitchUnreachableApps(ctx) {
+		if row.AppID == "app-excluded" || row.AppID == "app-in-excluded" || row.AppID == "app-in-excluded-holding-port" {
+			t.Fatalf("HTTPSSwitchUnreachableApps named an excluded application: %+v", row)
 		}
 	}
 }
@@ -422,5 +554,69 @@ func TestHTTPSSwitchManualNoProxySwitchedAppsWritesNothing(t *testing.T) {
 	svc.ReconcileHTTPSSwitch(ctx)
 	if counter.updates != 0 {
 		t.Fatalf("manual mode with no proxy-switched apps did %d UpdateApplication writes, want 0", counter.updates)
+	}
+}
+
+// TestMigration70BackfillIsBehaviourPreserving proves — mechanically, over
+// every pre-70 stored shape rather than by example — that migration 70 changed
+// no application's participation.
+//
+// It reimplements the PRE-70 predicate verbatim (that is the point: the real
+// one has moved on, so the old answer has to come from somewhere) and the
+// backfill's own SQL predicate, then asserts for every (scheme x
+// proxy_listen_port x status) row that
+//
+//	old(row) == new(backfill(row))
+//
+// The interesting rows are the ones the backfill actually flips: `https` with
+// no proxy port. They failed the old predicate's https arm and fail the new
+// flag clause — the same skip, reached from a different clause, which is what
+// makes this a rename of an existing state rather than a behaviour change.
+func TestMigration70BackfillIsBehaviourPreserving(t *testing.T) {
+	// The candidate predicate exactly as it stood before this change.
+	preFlagCandidate := func(app routing.Application) bool {
+		if app.Status == routing.ServerStatusDisabled {
+			return false
+		}
+		switch effectiveScheme(app) {
+		case "http":
+			return true
+		case "https":
+			return app.ProxyListenPort != 0
+		default:
+			return false
+		}
+	}
+	// migration70Up's UPDATE predicate:
+	//   set proxy_excluded = 1 where scheme = 'https' and proxy_listen_port = 0
+	// Note it tests the RAW scheme column, not the http-defaulted one.
+	backfill := func(app routing.Application) routing.Application {
+		if app.Scheme == "https" && app.ProxyListenPort == 0 {
+			app.ProxyExcluded = true
+		}
+		return app
+	}
+
+	flipped := 0
+	for _, scheme := range []string{"http", "https", ""} {
+		for _, port := range []int{0, 8600} {
+			for _, status := range []string{routing.ServerStatusActive, routing.ServerStatusDisabled, ""} {
+				before := routing.Application{Scheme: scheme, ProxyListenPort: port, Status: status}
+				after := backfill(before)
+				if after.ProxyExcluded {
+					flipped++
+				}
+				if got, want := isProxySwitchCandidate(after), preFlagCandidate(before); got != want {
+					t.Errorf("scheme=%q port=%d status=%q: candidate after the backfill = %v, before = %v",
+						scheme, port, status, got, want)
+				}
+			}
+		}
+	}
+	// Guard against a vacuous pass: if the backfill flipped nothing, the loop
+	// above would be comparing the new predicate against the old one on rows
+	// where the flag is uniformly false, which proves nothing about the flip.
+	if flipped != 3 {
+		t.Fatalf("the backfill flipped %d of the seeded rows, want 3 (https + port 0, one per status)", flipped)
 	}
 }

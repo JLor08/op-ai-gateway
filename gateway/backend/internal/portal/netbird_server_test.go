@@ -408,6 +408,22 @@ func (f *fakeNetbird) createdPolicyByName(name string) map[string]any {
 	return nil
 }
 
+// updatedPolicyByName returns the raw body of the last PUT /api/policies/{id}
+// whose "name" equals name (nil if none) — the PUT counterpart of
+// createdPolicyByName above, for a pass that touches several distinct policies
+// (a per-server op-gw-access-<id> AND the account-wide op-gw-agent-ingest) and
+// must be asserted per policy rather than on whichever one happened to go last.
+func (f *fakeNetbird) updatedPolicyByName(name string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.updatedPolicy) - 1; i >= 0; i-- {
+		if bn, _ := f.updatedPolicy[i]["name"].(string); bn == name {
+			return f.updatedPolicy[i]
+		}
+	}
+	return nil
+}
+
 // lastUpdatedPolicy returns the raw body of the last PUT /api/policies/{id} (nil if none).
 func (f *fakeNetbird) lastUpdatedPolicy() map[string]any {
 	f.mu.Lock()
