@@ -53,7 +53,7 @@ import { SelectField } from './shared/SelectField';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
-import { mappingColumns } from './shared/mappingColumns';
+import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { MappingForm, type MappingFormValues } from './MappingForm';
@@ -3609,10 +3609,10 @@ export function RuntimeAdminSection({
             columns={mappingColumns(t)}
             rowKey={(m) => m.id}
             actions={mappingRowActions}
-            // NOT 'op.mappings': ListTable persists column order/visibility,
-            // sort and page size under this key, and sharing it would fuse this
-            // tab's layout with the ordinary mapping screen's into one setting.
-            storageKey="op.runtimeMappings"
+            // Shares the ordinary mapping screen's saved layout on purpose --
+            // see MAPPING_TABLE_STORAGE_KEY. The operator wants one config for
+            // both tables (column order and which columns show), not two.
+            storageKey={MAPPING_TABLE_STORAGE_KEY}
             labels={listTableLabels(t)}
             loading={mappingsStatus === 'loading'}
           />

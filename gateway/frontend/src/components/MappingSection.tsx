@@ -25,7 +25,7 @@ import { RowActions } from './shared/RowActions';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels } from './shared/ListTable';
-import { mappingColumns } from './shared/mappingColumns';
+import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
@@ -353,7 +353,7 @@ export function MappingSection({
           rowKey={(m) => m.id}
           actions={rowActions}
           maxInlineActions={4}
-          storageKey="op.mappings"
+          storageKey={MAPPING_TABLE_STORAGE_KEY}
           labels={listTableLabels(t)}
           loading={loading || mappingsData === null}
         />
