@@ -1957,15 +1957,54 @@ and screen reader — issue #26 again. Plain text in the reading order, where th
 button was, beats both. The banner keeps its own text node so it stays matchable
 exactly.
 
-**The flag itself is API-only today: nothing in the portal sets it.** Everything
-above is driven by `managed_runtime_only` as it arrives on the server DTO, and
-all of it works the moment the flag is true — but no portal control writes it.
-Both `POST /api/portal/servers` and `PATCH /api/portal/servers/{id}` already
-accept `"managed_runtime_only": true`, so an operator sets it with an API call;
-the server form does not offer it, and the server-limits tab's PATCH carries
-`runtime_max_processes` alone. Whether to add a toggle is the operator's product
-decision, not a defect to close silently — see
-[§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks).
+**The flag is written from the server form, not from this screen.** Everything
+above is driven by `managed_runtime_only` as it arrives on the server DTO; the
+control that sets it is a checkbox in `ServerList`'s create/edit mask, beside
+name, domain, status and owners, and it is on **both** paths because
+`portal.CreateServerRequest` carries the field too — a managed-only server can
+be provisioned in one `POST` rather than created and then `PATCH`ed. It is
+deliberately **not** on the server-limits tab beside `runtime_max_processes`,
+where it would look at home: that tab is reachable only through an existing
+`server_agent` application's manage-models action, so a control there could
+first be set only *after* creating the very application the flag governs, which
+is not when an operator wants it.
+
+**Its authorization is the plain server-update rule, and the control must not
+invent a stricter one.** `UpdateServer` runs `authorizeServer` (system scope, or
+a server owner, or a manager of one of the server's admin groups) and then adds
+exactly one field-level check — `req.OwnerIDs != nil && !isAdmin(principal)` →
+`ErrServerForbidden`. `ManagedRuntimeOnly` has no such check, and the HTTP layer
+asks only for `scopeGatewayUse`, so a **server owner** may flip it. The owners
+field sitting directly below it in the same form *is* gated on `isAdmin`,
+mirroring that one backend check; copying that gate onto this checkbox would
+hide a control the backend accepts, and is the obvious wrong move for anyone
+reading the two fields side by side.
+
+**The `*bool` is load-bearing on the edit path.** `UpdateServer` applies the
+field under `if req.ManagedRuntimeOnly != nil`, so the wire has three states,
+not two: absent = leave unchanged, `true` = restrict, `false` = lift the
+restriction. `submitEdit` therefore sends the key **only when the checkbox
+differs from the value the form was seeded with**, and then in whichever
+direction it moved. Sending the checkbox state unconditionally compiles, passes
+a "the switch works" test, and is still a defect: every save made for an
+unrelated reason — a rename, a status change — would restate the policy from
+whatever this form last read, and on a server another operator flipped in the
+meantime it would restate it wrong, clear the flag, and return an ordinary 200
+with nothing to notice. The seed is captured once per form open and is not
+re-synced by `applyServerUpdate`, so a panel save that brings back a fresher DTO
+cannot turn an untouched checkbox into a policy write. Create has no such case —
+a row that does not exist has no value to leave unchanged — so the create body
+states the value outright.
+
+**The checkbox's caption carries two consequences the label cannot.** Both are
+invisible from the control and neither is guessable: the flag is **not
+retroactive** (the service reads `Server.ManagedRuntimeOnly` inside
+`CreateApplication` only, so applications that already exist keep running and
+stay editable to any type), and once the server holds its one `server_agent`
+application the applications view stops offering a create button **at all**. The
+caption is a real element wired to the checkbox through `aria-describedby`, not
+a `title` or a `Tooltip` — announced on focus, reachable by keyboard, the same
+call `helperText` makes on the type field above and what issue #26 asks for.
 
 ### 11.1 Writes are full-document replaces, gated on their own GET
 

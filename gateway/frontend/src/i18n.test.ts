@@ -2242,3 +2242,55 @@ describe('managed_runtime_only affordance i18n keys', () => {
     expect(messages.de.runtimeManagedOnlyCreateBlocked).toMatch(/bearbeiten oder löschen/i);
   });
 });
+
+describe('managed_runtime_only server-form control i18n keys', () => {
+  it('defines serverManagedRuntimeOnlyLabel and serverManagedRuntimeOnlyHelp in de and en', () => {
+    const keys = ['serverManagedRuntimeOnlyLabel', 'serverManagedRuntimeOnlyHelp'] as const;
+    for (const m of [messages.de, messages.en]) {
+      for (const k of keys) {
+        expect(typeof m[k]).toBe('string');
+        expect(m[k].length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('states the two consequences an operator cannot guess: not retroactive, and the create button vanishes', () => {
+    // This checkbox turns a server into one that refuses most application
+    // creates. Neither consequence is visible from the label, and both are
+    // reachable only from this one string -- an operator who reads only the
+    // label would expect the flag to disable the applications that already
+    // exist (it does not: the backend reads it inside CreateApplication only),
+    // and would not expect the create button to disappear once the server's
+    // one server_agent application exists (managed_runtime_only permits only
+    // that type and the one-agent-per-server rule refuses a second of it, so
+    // the two gates intersect to the empty set).
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/server_agent/);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/not retroactive/i);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/stay editable/i);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/create button/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/server_agent/);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/nicht rückwirkend/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/änderbar/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/Schaltfläche zum Anlegen/i);
+  });
+
+  it('does not contradict the application-side affordance strings', () => {
+    // Three strings now describe the same rule from two screens. The server
+    // form's help is the only one that must carry BOTH consequences (it is the
+    // control that causes them), so it is the longest; the other two are read
+    // in a context that already supplies half the answer. If a future edit
+    // shortens this one below either, a consequence was dropped.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.serverManagedRuntimeOnlyHelp.length).toBeGreaterThan(
+        m.applicationTypeManagedRuntimeOnly.length,
+      );
+      expect(m.serverManagedRuntimeOnlyHelp.length).toBeGreaterThan(
+        m.runtimeManagedOnlyCreateBlocked.length,
+      );
+      // The label names the restriction; it must not itself be the explanation.
+      expect(m.serverManagedRuntimeOnlyLabel.length).toBeLessThan(
+        m.serverManagedRuntimeOnlyHelp.length,
+      );
+    }
+  });
+});

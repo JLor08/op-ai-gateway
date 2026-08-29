@@ -82,6 +82,12 @@ const serverStatusOptions = ['active', 'disabled', 'maintenance'] as const;
 // loops, so 5s already leads the underlying changes).
 const SERVER_LIST_POLL_MS = 5000;
 
+// Id of the caption that explains the managed_runtime_only checkbox, referenced
+// from the checkbox's own input via aria-describedby. A checkbox has no
+// helperText slot of its own, so the two halves are wired by id -- the reason
+// must be announced on focus, not hidden behind a hover.
+const MANAGED_RUNTIME_ONLY_HELP_ID = 'server-managed-runtime-only-help';
+
 const serverStatusClassByKey: Record<ServerStatus, BadgeStatus> = {
   active: 'active',
   disabled: 'standby',
@@ -263,6 +269,16 @@ export function ServerList({
   const [serverPathSuffix, setServerPathSuffix] = useState('');
   const [status, setStatus] = useState('active');
   const [ownerIds, setOwnerIds] = useState<string[]>([]);
+  // managed_runtime_only (Task 6, migration 66; issue #25): the form's checkbox
+  // state, plus the value it was SEEDED with. Two variables and not one,
+  // because the Go UpdateServerRequest.ManagedRuntimeOnly is a `*bool` and
+  // submitEdit has to be able to say nothing at all about it -- see the comment
+  // there. `Seed` is captured once per open (openCreate/openEdit set both) and
+  // is deliberately NOT re-synced by applyServerUpdate: a panel save that
+  // happens to bring back a fresher DTO must not turn an untouched checkbox
+  // into a policy write.
+  const [managedRuntimeOnly, setManagedRuntimeOnly] = useState(false);
+  const [managedRuntimeOnlySeed, setManagedRuntimeOnlySeed] = useState(false);
   // Admin-group linkage (Phase B, spec 2026-08-10): the admin-tier groups the
   // caller may create/link a server into. Fetched once (mirrors adminUsers,
   // gated on isAdmin -- only an admin/system_admin ever reaches the create
@@ -536,6 +552,8 @@ export function ServerList({
     setServerPathSuffix('');
     setStatus('active');
     setOwnerIds([]);
+    setManagedRuntimeOnly(false);
+    setManagedRuntimeOnlySeed(false);
     setCreateSystemGroupId('');
     setCreateAdminGroupIds([]);
     setNetbirdChecked(netbirdOnly);
@@ -557,6 +575,11 @@ export function ServerList({
     setServerPathSuffix(server.server_path_suffix ?? '');
     setStatus(server.status);
     setOwnerIds(server.owners.map((owner) => owner.id));
+    // Optional on PortalServer (so the suite's server fixtures compile), never
+    // omitted on the real wire DTO -- Boolean() so an absent field reads as
+    // "off" rather than leaking undefined into a controlled checkbox.
+    setManagedRuntimeOnly(Boolean(server.managed_runtime_only));
+    setManagedRuntimeOnlySeed(Boolean(server.managed_runtime_only));
     setEditAdminGroupIds(server.admin_groups.map((g) => g.id));
     setEditSystemGroupId('');
     setMode({ kind: 'edit', server });
@@ -596,6 +619,12 @@ export function ServerList({
         price_unit: energy?.price_unit ?? 'eur_cent',
         pue: energy?.pue ?? 0,
         admin_group_ids: createEffectiveAdminGroupIds,
+        // Stated outright, unlike on edit: a row that does not exist yet has no
+        // value to leave unchanged, so `false` and "omitted" both mean the
+        // column's default. Offering it on create at all is the point of
+        // putting the control here — a managed-only server can be provisioned
+        // in one call instead of created and then PATCHed.
+        managed_runtime_only: managedRuntimeOnly,
       };
       if (isAdmin) body.owner_ids = ownerIds;
       if (useNetbird) {
@@ -688,6 +717,23 @@ export function ServerList({
         status,
       };
       if (isAdmin) body.owner_ids = ownerIds;
+      // managed_runtime_only is the one field in this body whose absence and
+      // whose `false` mean DIFFERENT things: the Go request struct holds it as
+      // a `*bool` and UpdateServer applies it under `if != nil`. So it is sent
+      // only when the operator actually moved the checkbox, and then in the
+      // direction they moved it -- `false` included, which is how the
+      // restriction gets lifted.
+      //
+      // Sending it unconditionally would compile, pass a "the switch works"
+      // test, and still be a defect: every save made for an unrelated reason
+      // would restate the policy from whatever this form last read. On a server
+      // another operator flipped in the meantime that restates it WRONG, clears
+      // the flag, and returns an ordinary 200 with nothing to notice. The
+      // comparison is against the seed captured when the form opened, not
+      // against mode.server, which applyServerUpdate can replace mid-edit.
+      if (managedRuntimeOnly !== managedRuntimeOnlySeed) {
+        body.managed_runtime_only = managedRuntimeOnly;
+      }
       const updated = await api.updateServer(mode.server.id, body);
       setServers((current) => current.map((row) => (row.id === updated.id ? updated : row)));
       setMode('list');
@@ -1201,6 +1247,49 @@ export function ServerList({
                 </option>
               ))}
             </SelectField>
+            {/* managed_runtime_only (Task 6, migration 66; issue #25). Shown on
+                BOTH paths and to EVERY caller who reached this form.
+
+                Not gated on isAdmin, deliberately, even though the owners field
+                directly below it is: that gate exists because UpdateServer has a
+                matching one (`req.OwnerIDs != nil && !isAdmin(principal)` ->
+                ErrServerForbidden). ManagedRuntimeOnly has no field-level check
+                at all -- authorizeServer (system scope OR a server owner OR an
+                admin-group manager) is the whole rule, and the HTTP layer asks
+                only for scopeGatewayUse -- so a server owner, who reaches this
+                form through the ungated row action, may set it. Copying the
+                owners gate here would hide a control the backend accepts;
+                inventing a stricter one would be a portal-only rule nothing
+                enforces.
+
+                The reason line is a real caption wired through aria-describedby
+                rather than a `title` or a Tooltip, so it is announced on focus
+                and reachable by keyboard -- the same call ApplicationSection's
+                type field makes with its helperText, and what issue #26 asks
+                for. It has to carry two things the label cannot: the flag is
+                NOT retroactive (the backend reads it inside CreateApplication
+                only), and once the server's one server_agent application exists
+                the applications view stops offering a create button at all. */}
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={managedRuntimeOnly}
+                    onChange={(e) => setManagedRuntimeOnly(e.target.checked)}
+                    slotProps={{ input: { 'aria-describedby': MANAGED_RUNTIME_ONLY_HELP_ID } }}
+                  />
+                }
+                label={t.serverManagedRuntimeOnlyLabel}
+              />
+              <Typography
+                id={MANAGED_RUNTIME_ONLY_HELP_ID}
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block' }}
+              >
+                {t.serverManagedRuntimeOnlyHelp}
+              </Typography>
+            </Box>
             {isAdmin && (
               <MultiSelectField
                 id="server-owners"

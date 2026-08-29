@@ -340,6 +340,9 @@ const de = {
   serverNetbirdAllowPing: 'Ping erlauben',
   serverNetbirdPingExclude: 'Ping für diesen Server NICHT erlauben',
   serverStatusLabel: 'Status',
+  serverManagedRuntimeOnlyLabel: 'Nur agent-gesteuerte Anwendungen zulassen',
+  serverManagedRuntimeOnlyHelp:
+    'Solange aktiv, lässt sich auf diesem Server nur eine server_agent-Anwendung anlegen; jeder andere Typ wird beim Anlegen abgelehnt. Zwei Punkte, die daraus nicht ersichtlich sind: Die Einstellung wirkt NICHT rückwirkend — bereits vorhandene Anwendungen dieses Servers laufen weiter und bleiben auf jeden Typ änderbar. Und sobald die eine server_agent-Anwendung existiert, verschwindet die Schaltfläche zum Anlegen dort vollständig, denn pro Server läuft genau ein Agent — es bleibt dann kein anlegbarer Typ übrig.',
   serverOwnersLabel: 'Besitzer',
   serverActionEdit: 'Bearbeiten',
   serverActionSave: 'Speichern',
@@ -2284,6 +2287,9 @@ const en: PortalMessages = {
   serverNetbirdAllowPing: 'Allow ping',
   serverNetbirdPingExclude: 'Do not allow ping for this server',
   serverStatusLabel: 'Status',
+  serverManagedRuntimeOnlyLabel: 'Accept only agent-managed applications',
+  serverManagedRuntimeOnlyHelp:
+    "While on, only a server_agent application can be created on this server; every other type is refused at creation. Two things that does not tell you: the setting is NOT retroactive — this server's existing applications keep running and stay editable to any type. And once the one server_agent application exists, the create button there disappears entirely, because exactly one agent runs per server — no creatable type is left.",
   serverOwnersLabel: 'Owners',
   serverActionEdit: 'Edit',
   serverActionSave: 'Save',

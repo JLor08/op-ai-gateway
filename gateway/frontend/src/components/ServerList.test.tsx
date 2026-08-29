@@ -17,6 +17,7 @@ import type {
   RuntimeSpec,
   ServerHealthStatus,
   SystemSettings as SystemSettingsDTO,
+  UpdateServerRequest,
 } from '../api';
 import type { PortalApi } from './shared/types';
 import type { CurrencyUnit } from '../currency';
@@ -2931,5 +2932,213 @@ describe('ServerList live poll', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// managed_runtime_only (issue #25): the server form's own control for the flag
+// whose downstream effects ApplicationSection already implements. It lives HERE
+// and not on RuntimeAdminSection's "server limits" tab -- that tab is reached
+// only through an existing server_agent application's manage-models action, so a
+// control there could not be set before provisioning the very application the
+// flag governs.
+describe('ServerList managed_runtime_only control', () => {
+  function managedApi(over: Partial<ServerListApi> = {}): ServerListApi {
+    return {
+      ...baseServerListApi(),
+      adminUsers: vi.fn(async () => ({ data: [] })),
+      activeBenchmarks: vi.fn(async () => []),
+      serverAdminGroupCandidates: vi.fn(async () => defaultAdminGroupCandidates),
+      ...over,
+    };
+  }
+
+  function renderForm(api: ServerListApi, servers: PortalServer[], role = 'admin') {
+    render(
+      <ToastProvider>
+        <ServerList t={t} api={api} servers={servers} setServers={vi.fn()} role={role} />
+      </ToastProvider>,
+    );
+  }
+
+  // NetBird stays off in every test here, so the row has 9 actions and
+  // ListTable renders them inline -- the edit action is a plain button, with no
+  // menu to open (and hence no aria-hidden overlay over the form behind it).
+  function openEditForm() {
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionEdit }));
+  }
+
+  // A PATCH stub whose response is a valid PortalServer. Deliberately NOT
+  // `{...server, ...body}`: UpdateServerRequest types `status` as a plain
+  // string, so spreading it over the DTO widens PortalServer's ServerStatus
+  // union. Nothing here reads the response back, so echoing the two fields
+  // these tests vary is enough -- the assertions are all on the request.
+  function echoUpdate(server: PortalServer) {
+    return vi.fn(async (_id: string, body: UpdateServerRequest): Promise<PortalServer> => ({
+      ...server,
+      name: body.name ?? server.name,
+      managed_runtime_only: body.managed_runtime_only ?? server.managed_runtime_only,
+    }));
+  }
+
+  it('renders the checkbox unchecked on create and carries its reason as an accessible description', async () => {
+    renderForm(managedApi(), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    expect(box).not.toBeChecked();
+    // The reason must be reachable without a hover: it rides on the input via
+    // aria-describedby, announced on focus, exactly as ApplicationSection's
+    // type-field helperText does (and as issue #26 asks for). A title/Tooltip
+    // would be unreachable by keyboard and screen reader.
+    expect(box).toHaveAccessibleDescription(t.serverManagedRuntimeOnlyHelp);
+  });
+
+  it('reflects the edited server current value in both directions', async () => {
+    const on = { ...makeServer('srv-on', 'healthy'), managed_runtime_only: true };
+    renderForm(managedApi(), [on]);
+    openEditForm();
+    expect(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel })).toBeChecked();
+    cleanup();
+
+    // A server DTO that omits the field entirely (the optional-for-fixtures
+    // case) must read as "off", never as undefined-ish checked.
+    renderForm(managedApi(), [makeServer('srv-off', 'healthy')]);
+    openEditForm();
+    expect(
+      screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }),
+    ).not.toBeChecked();
+  });
+
+  it('sends managed_runtime_only on create', async () => {
+    const createServer = vi.fn(
+      async (body: CreateServerRequest) =>
+        ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
+    );
+    renderForm(managedApi({ createServer }), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
+    fireEvent.change(screen.getByLabelText(t.serverDomainLabel), {
+      target: { value: 'd.example.test' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    await screen.findByText(t.serverAdminGroupAuto('Default Admin Group'));
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await waitFor(() => expect(createServer).toHaveBeenCalledTimes(1));
+    // portal.CreateServerRequest carries the field, so provisioning a
+    // managed-only server takes one call -- the point of offering it on create
+    // as well as on edit.
+    expect(createServer.mock.calls[0][0].managed_runtime_only).toBe(true);
+  });
+
+  it('sends managed_runtime_only: false on a create where the box was left alone', async () => {
+    const createServer = vi.fn(
+      async (body: CreateServerRequest) =>
+        ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
+    );
+    renderForm(managedApi({ createServer }), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
+    fireEvent.change(screen.getByLabelText(t.serverDomainLabel), {
+      target: { value: 'd.example.test' },
+    });
+    await screen.findByText(t.serverAdminGroupAuto('Default Admin Group'));
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await waitFor(() => expect(createServer).toHaveBeenCalledTimes(1));
+    // Create has no "leave unchanged" case -- a new row's column defaults to
+    // false either way -- so the create body states the value outright.
+    expect(createServer.mock.calls[0][0].managed_runtime_only).toBe(false);
+  });
+
+  it('turning it ON in the edit form sends managed_runtime_only: true', async () => {
+    const server = makeServer('srv-e', 'healthy');
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1].managed_runtime_only).toBe(true);
+  });
+
+  it('turning it OFF sends an explicit managed_runtime_only: false, not an omission', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    // The other half of the Go *bool: omission means "leave unchanged", so
+    // turning the policy OFF has to put `false` on the wire. An implementation
+    // that only ever sends the field when it is true cannot clear the flag at
+    // all, and the operator's uncheck would silently do nothing.
+    const body = updateServer.mock.calls[0][1];
+    expect(body).toHaveProperty('managed_runtime_only');
+    expect(body.managed_runtime_only).toBe(false);
+  });
+
+  // THE test. portal.UpdateServerRequest.ManagedRuntimeOnly is a *bool:
+  // undefined = "leave unchanged", false = "turn off". A save that touches only
+  // the name must not decide the policy question at all -- if it puts `false`
+  // on the wire because the form state defaulted there (an unseeded checkbox,
+  // or one hidden behind a role gate), it silently destroys an operator's
+  // configuration and the response looks like a perfectly ordinary 200.
+  it('a save that changes only the name omits managed_runtime_only entirely', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    const body = updateServer.mock.calls[0][1];
+    expect(body.name).toBe('renamed');
+    expect(body).not.toHaveProperty('managed_runtime_only');
+  });
+
+  it('toggling the box and toggling it back also omits the field', async () => {
+    const server = makeServer('srv-e', 'healthy');
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    fireEvent.click(box);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1]).not.toHaveProperty('managed_runtime_only');
+  });
+
+  // Authorization, pinned both ways. UpdateServer runs authorizeServer (system
+  // scope OR a server owner OR an admin-group manager) and then adds exactly
+  // ONE field-level gate: `req.OwnerIDs != nil && !isAdmin(principal)` ->
+  // ErrServerForbidden. ManagedRuntimeOnly has no such gate, and the HTTP layer
+  // requires only scopeGatewayUse -- so a server OWNER may flip it, and gating
+  // this control on isAdmin the way the owners field is gated would hide a
+  // control the backend accepts.
+  it('offers the control to a non-admin server owner, who gets no owners field', async () => {
+    const server = { ...makeServer('srv-own', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server], 'user');
+    openEditForm();
+    // Present and correctly seeded for role="user"...
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    expect(box).toBeChecked();
+    // ...while the owners field -- the one that DOES have a backend isAdmin
+    // gate -- is absent. The two are deliberately not gated alike.
+    expect(screen.queryByLabelText(t.serverOwnersLabel)).not.toBeInTheDocument();
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    const body = updateServer.mock.calls[0][1];
+    expect(body.managed_runtime_only).toBe(false);
+    expect(body).not.toHaveProperty('owner_ids');
+  });
+
+  it('offers the control to an admin as well', async () => {
+    renderForm(managedApi(), [makeServer('srv-adm', 'healthy')], 'admin');
+    openEditForm();
+    expect(
+      screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }),
+    ).toBeInTheDocument();
   });
 });
