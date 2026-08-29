@@ -552,6 +552,7 @@ describe('model-mapping performance-metric i18n keys', () => {
       'mappingMaxConcurrency',
       'mappingRecommendedConcurrency',
       'mappingGenTpsAtCapacity',
+      'mappingAppNameReadOnly',
       'mappingProbeContext',
       'mappingProbeContextRunning',
       'mappingProbeContextFailed',

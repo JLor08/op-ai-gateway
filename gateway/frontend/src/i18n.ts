@@ -454,6 +454,10 @@ const de = {
     'TLS-Proxy-Port: noch nicht vergeben — das Gateway vergibt ihn, sobald der Agent das nächste Mal seine Routen abruft (bis zu 15 min über POST, bis zu 6 h über WebSocket).',
   mappingGatewayName: 'Gateway-Modellname',
   mappingAppName: 'Anwendungs-Modellname',
+  // Helper text under the read-only Anwendungs-Modellname on the agent runtime's
+  // Modell-Zuordnung tab: the runtime spec owns that name (it is the spec's
+  // upstream_model, what ${MODEL} expands to), so it is edited there.
+  mappingAppNameReadOnly: 'Wird in der Runtime-Spezifikation bearbeitet (${MODEL}).',
   tableEndpoint: 'Endpoint',
   applicationCreate: 'Anwendung anlegen',
   applicationEdit: 'Bearbeiten',
@@ -2422,6 +2426,7 @@ const en: PortalMessages = {
     'TLS proxy port: not assigned yet — the gateway assigns it the next time the agent fetches its routes (up to 15 min over POST, up to 6 h over WebSocket).',
   mappingGatewayName: 'Gateway model name',
   mappingAppName: 'Application model name',
+  mappingAppNameReadOnly: 'Edited in the runtime specification (${MODEL}).',
   tableEndpoint: 'Endpoint',
   applicationCreate: 'Create application',
   applicationEdit: 'Edit',
