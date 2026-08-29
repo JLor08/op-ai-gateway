@@ -1520,9 +1520,14 @@ func (o *owner) startProcess(st *specState) {
 	plog := o.logs.newProc(spec.ID)
 	cmd := exec.Command(spec.Binary, args...) //nolint:gosec // spec.Binary is allowlisted by LocalPolicy.Permit above
 	cmd.Env = env
-	if spec.WorkDir != "" {
-		cmd.Dir = spec.WorkDir
-	}
+	// R2: an empty work_dir runs beside the binary. effectiveWorkDir returns
+	// spec.WorkDir verbatim when set, else filepath.Dir(spec.Binary) -- which,
+	// for an allowlisted (absolute) binary, is never empty, so cmd.Dir is now
+	// always set. The reported ResolvedCommand (command.go) reads the same
+	// helper, so the log panel always names the directory the child really ran
+	// in. Never write this back into st.spec.WorkDir: reconcile diffs the stored
+	// spec with reflect.DeepEqual, and a rewrite would read as a changed spec.
+	cmd.Dir = effectiveWorkDir(spec)
 	cmd.Stdout = plog
 	cmd.Stderr = plog
 	setProcGroup(cmd)

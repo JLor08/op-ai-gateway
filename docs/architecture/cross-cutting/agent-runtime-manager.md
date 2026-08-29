@@ -128,18 +128,26 @@ such as `runtime_allowed_binaries: [""]` would otherwise exactly-match an empty
 `spec.binary`); and the separator boundary in the containment check (a bare
 `strings.HasPrefix` admits `/srv/models-evil` against a `/srv/models` rule).
 
-**A non-empty `runtime_allowed_dirs` makes `work_dir` mandatory on every spec.**
-A spec with an empty `work_dir` is refused outright and lands in
-`not_permitted`, every time. Setting both allowlists without also giving every
-spec a `work_dir` inside one of the permitted paths therefore refuses
-everything — a total failure with no obvious connection between the two
-settings.
+**An empty `work_dir` runs the child beside its binary (R2).** A spec that sets
+no `work_dir` is *permitted* — `effectiveWorkDir` resolves it to
+`filepath.Dir(spec.Binary)`, the directory the allowlisted binary lives in, and
+the child actually launches there (`cmd.Dir` at exec) and is reported as running
+there (the log panel's `ResolvedCommand.WorkDir`). This holds **independent of
+`runtime_allowed_dirs`**: the binary is on the exact `runtime_allowed_binaries`
+boundary, so its own directory is trusted by construction, and Permit returns
+`nil` for an empty `work_dir` before it consults `AllowedDirs` at all — a narrow
+`runtime_allowed_dirs` cannot reject the binary's directory. `effectiveWorkDir`
+is a pure read at each of the three call sites, never a write-back into
+`spec.WorkDir`: `reconcile` diffs the stored spec with `reflect.DeepEqual`, so a
+rewrite would read as a changed spec and could trigger a needless restart.
 
-A refusal message names the *setting* and the *count* of configured paths, never
-the paths themselves, because the text travels to the gateway as
-`last_error.message` and the allowlist is the agent operator's local filesystem
-layout. "Make the error more helpful by listing the allowed directories" leaks
-it.
+A non-empty `runtime_allowed_dirs` still contains every spec that *does* set a
+`work_dir`: such a `work_dir` must sit inside one of the permitted subtrees, or
+the spec lands in `not_permitted`. That refusal message names the *setting* and
+the *count* of configured paths, never the paths themselves, because the text
+travels to the gateway as `last_error.message` and the allowlist is the agent
+operator's local filesystem layout. "Make the error more helpful by listing the
+allowed directories" leaks it.
 
 There is no shell interpreter anywhere on this path: the agent `exec`s directly
 with an argv array, as an unprivileged user, in its own process group on unix.
@@ -3340,7 +3348,7 @@ registers, over the authoritative table in
 | `runtime_source` / `OP_AGENT_RUNTIME_SOURCE` | `gateway` | `gateway` or `file` (§8). |
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
 | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
-| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories. **Non-empty makes `work_dir` mandatory on every spec.** |
+| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
 | `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |

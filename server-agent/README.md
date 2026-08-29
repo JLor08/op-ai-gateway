@@ -208,6 +208,13 @@ path-prefix check and does not resolve symlinks). A bare entry already means
 of that subtree — it is not a glob, so a glued `/srv/models*` stays literal and
 a bare `*` permits nothing.
 
+A spec that sets **no** `work_dir` runs in **the directory its binary lives in**,
+whether or not `runtime_allowed_dirs` is set: the binary is on the exact
+`runtime_allowed_binaries` allowlist, so its own directory is trusted by
+construction, and the spec is permitted on that basis alone — a narrow
+`runtime_allowed_dirs` never rejects it. Only a spec that *does* set a `work_dir`
+has to place it inside a permitted subtree.
+
 #### Managed-process logs
 
 Every managed process's **stdout and stderr** are captured continuously,

@@ -209,12 +209,15 @@ const maxResolvedCommandBytes = 16 << 10
 // is fixed at startup and belongs to the Manager that was built for it, not to
 // this function.
 //
-// spec is read for the fields that need no expansion at all -- binary and
-// work_dir are used verbatim by startProcess, so they are verbatim here too.
+// spec is read for the fields that need no expansion at all -- binary is used
+// verbatim by startProcess, so it is verbatim here too. WorkDir goes through
+// effectiveWorkDir (R2) so the reported directory is the one the child ACTUALLY
+// runs in: an empty spec.WorkDir is reported as the binary's own directory,
+// matching cmd.Dir at exec rather than reporting an empty string.
 func (ex expandedSpec) resolvedCommand(spec Spec, maskSpecEnv bool) ResolvedCommand {
 	out := ResolvedCommand{
 		Binary:  spec.Binary,
-		WorkDir: spec.WorkDir,
+		WorkDir: effectiveWorkDir(spec),
 		Args:    make([]string, 0, len(ex.args)),
 		Env:     make([]string, 0, len(ex.env)),
 	}

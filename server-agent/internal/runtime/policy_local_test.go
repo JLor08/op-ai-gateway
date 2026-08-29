@@ -62,36 +62,46 @@ func TestPermitEmptyAllowlistRejectsEverything(t *testing.T) {
 	}
 }
 
-// TestPermitEmptyWorkDirHasItsOwnMessage pins the improved diagnostic: an
-// absent work_dir under a configured AllowedDirs must say so, not render as
-// `work_dir "" is not within any allowed directory` (which reads like a
-// containment near-miss). This text is the only explanation an operator
-// gets -- it surfaces verbatim as Status.LastError.Message next to
-// StateNotPermitted -- so it must name the agent-side setting, and must NOT
-// leak the configured directory VALUES upward to the gateway.
-func TestPermitEmptyWorkDirHasItsOwnMessage(t *testing.T) {
+// TestPermitEmptyWorkDirDefaultsToBinaryDir is R2's Permit half, and the
+// inversion of the old TestPermitEmptyWorkDirHasItsOwnMessage (which asserted
+// an empty work_dir under a configured AllowedDirs was REFUSED). An empty
+// work_dir now means "run beside the binary"; the binary's own directory is
+// trusted by construction because the binary is on the exact AllowedBinaries
+// allowlist, so it is permitted UNCONDITIONALLY -- even when AllowedDirs is
+// configured and does NOT contain the binary's directory. This stands alone,
+// with no dependency on runtime_allow_binary_dirs (R3): the binary dir needs no
+// auto-allow plumbing to be trusted.
+func TestPermitEmptyWorkDirDefaultsToBinaryDir(t *testing.T) {
+	// AllowedDirs is configured and deliberately does NOT include /usr/bin
+	// (where the allowlisted binary lives): the empty work_dir must still pass.
 	p := LocalPolicy{
 		AllowedBinaries: []string{"/usr/bin/ollama"},
 		AllowedDirs:     []string{"/srv/models", "/data/weights"},
 	}
-	err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: ""})
-	if err == nil {
-		t.Fatal("Permit with an empty work_dir under a configured AllowedDirs = nil, want a refusal")
+	if err := p.Permit(Spec{ID: "s1", Binary: "/usr/bin/ollama", WorkDir: ""}); err != nil {
+		t.Fatalf("Permit with an empty work_dir = %v, want nil (an empty work_dir runs beside the binary, which is trusted by construction)", err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "no work_dir") {
-		t.Errorf("Permit error = %q, want it to state plainly that the spec sets no work_dir", msg)
+
+	// And with no AllowedDirs configured at all, unchanged: still permitted.
+	bare := LocalPolicy{AllowedBinaries: []string{"/usr/bin/ollama"}}
+	if err := bare.Permit(Spec{ID: "s2", Binary: "/usr/bin/ollama", WorkDir: ""}); err != nil {
+		t.Fatalf("Permit(empty work_dir, no AllowedDirs) = %v, want nil", err)
 	}
-	if !strings.Contains(msg, "OP_AGENT_RUNTIME_ALLOWED_DIRS") {
-		t.Errorf("Permit error = %q, want it to name the agent-side setting that caused the restriction", msg)
+}
+
+// TestEffectiveWorkDir pins the pure helper the three R2 touch points share: an
+// explicit work_dir is returned verbatim (so the reportable command and cmd.Dir
+// keep matching the spec, and command_test's non-empty case stays green), and
+// an empty one resolves to the binary's own directory.
+func TestEffectiveWorkDir(t *testing.T) {
+	if got := effectiveWorkDir(Spec{Binary: "/usr/bin/ollama", WorkDir: "/srv/models"}); got != "/srv/models" {
+		t.Errorf("effectiveWorkDir(explicit) = %q, want the spec's work_dir verbatim", got)
 	}
-	for _, dir := range p.AllowedDirs {
-		if strings.Contains(msg, dir) {
-			t.Errorf("Permit error = %q leaks the configured allowed directory %q; this message travels to the gateway", msg, dir)
-		}
+	if got := effectiveWorkDir(Spec{Binary: "/usr/bin/ollama", WorkDir: ""}); got != "/usr/bin" {
+		t.Errorf("effectiveWorkDir(empty) = %q, want the binary's directory %q", got, "/usr/bin")
 	}
-	if strings.Contains(msg, `work_dir "" is not within`) {
-		t.Errorf("Permit error = %q is still the generic containment wording", msg)
+	if got := effectiveWorkDir(Spec{Binary: "/opt/vllm/bin/vllm"}); got != "/opt/vllm/bin" {
+		t.Errorf("effectiveWorkDir(empty, nested binary) = %q, want %q", got, "/opt/vllm/bin")
 	}
 }
 
@@ -183,7 +193,10 @@ func TestPermitWorkDirContainment(t *testing.T) {
 		{"dot-dot traversal escaping the allowed dir", "/srv/models/../models-evil", false},
 		{"dot-dot traversal staying inside", "/srv/models/llama3/../llama3", true},
 		{"dot-dot traversal to parent", "/srv/models/..", false},
-		{"empty work_dir", "", false},
+		// R2: an empty work_dir is permitted on its own merit (it runs beside
+		// the binary), independent of AllowedDirs -- so even here, with
+		// /usr/bin/ollama's dir NOT under the configured /srv/models, it passes.
+		{"empty work_dir runs beside the binary", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

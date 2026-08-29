@@ -109,10 +109,13 @@
 
   // Permitted "work_dir" prefixes for launch specs. Empty (the default) means
   // ANY work_dir is accepted -- deliberately the inverse of the list above,
-  // so an operator who does not care need not enumerate the filesystem. Once
-  // non-empty, a spec that sets no work_dir is refused too. Containment is a
-  // lexical path-prefix check that does not resolve symlinks: defense in
-  // depth, not the boundary.
+  // so an operator who does not care need not enumerate the filesystem. A
+  // spec that sets no work_dir runs in the directory its binary lives in
+  // (which is on the allowlist above, so it is trusted), whether or not this
+  // list is set. A bare entry, or a trailing "/*" ("/srv/models" and
+  // "/srv/models/*" are the same), permits that directory and its whole
+  // subtree; it is not a glob. Containment is a lexical path-prefix check that
+  // does not resolve symlinks: defense in depth, not the boundary.
   "runtime_allowed_dirs": [],
 
   // Where the last known-good runtime-config document from the gateway is

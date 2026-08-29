@@ -82,6 +82,19 @@ func TestResolvedCommandReportsPlaceholdersExpanded(t *testing.T) {
 	}
 }
 
+// TestResolvedCommandEmptyWorkDirReportsBinaryDir is R2's reporting half: the
+// log panel's ResolvedCommand.WorkDir must be the directory the child ACTUALLY
+// runs in, so an empty spec.WorkDir is reported as the binary's own directory
+// (effectiveWorkDir), matching cmd.Dir at exec -- not as an empty string, which
+// would tell an operator the child ran in the agent's cwd when it did not.
+func TestResolvedCommandEmptyWorkDirReportsBinaryDir(t *testing.T) {
+	spec := Spec{Binary: "/opt/llama/llama-server"} // no WorkDir
+	cmd := commandFor(t, spec, 8080, GPUVendorNVIDIA, func(string) string { return "" }, false)
+	if cmd.WorkDir != "/opt/llama" {
+		t.Errorf("WorkDir = %q, want the binary's directory %q (an empty work_dir runs beside the binary)", cmd.WorkDir, "/opt/llama")
+	}
+}
+
 // TestResolvedCommandMasksASecretInAnArgument is the narrowing this feature
 // exists to deliver. ${AGENT_ENV:NAME} resolves in args exactly as it does in
 // env, and until now nothing masked args at all -- so a secret in an argument

@@ -321,6 +321,34 @@ type LocalPolicy struct {
 	AllowedDirs []string
 }
 
+// effectiveWorkDir is the directory a spec's child process ACTUALLY runs in
+// (R2). An explicit spec.WorkDir is returned verbatim; an EMPTY one means "run
+// beside the binary" and resolves to filepath.Dir(spec.Binary).
+//
+// This is a pure READ, never a write-back: reconcile diffs the stored spec with
+// reflect.DeepEqual (manager.go), so rewriting an empty spec.WorkDir to the
+// binary dir would read as a changed spec and could trigger a needless restart.
+// The three call sites that need the concrete directory -- Permit (below), the
+// exec (cmd.Dir in the manager) and the reported ResolvedCommand (command.go)
+// -- each call this helper instead of mutating the spec, so all three agree on
+// one value.
+//
+// The binary directory is trusted BY CONSTRUCTION, independent of AllowedDirs:
+// trust comes from AllowedBinaries (the exact, absolute-path boundary), so the
+// directory an allowlisted binary lives in is inherently a permitted place to
+// run. This is why Permit returns nil for an empty work_dir on its own merit
+// and does NOT run the binary dir through withinDir against AllowedDirs -- a
+// narrow AllowedDirs must not be able to reject the binary's own directory.
+//
+// For an allowlisted binary the value is never empty (Permit requires
+// filepath.IsAbs(spec.Binary), so filepath.Dir is a real absolute directory).
+func effectiveWorkDir(spec Spec) string {
+	if spec.WorkDir != "" {
+		return spec.WorkDir
+	}
+	return filepath.Dir(spec.Binary)
+}
+
 // Permit reports whether spec may be launched under p: nil when permitted,
 // otherwise an error naming the violated rule. The error text names only
 // the binary path or work_dir and the rule violated -- never a value from
@@ -352,24 +380,26 @@ func (p LocalPolicy) Permit(spec Spec) error {
 		return fmt.Errorf("runtime: binary %q is not in the allowed-binaries list", spec.Binary)
 	}
 
-	if len(p.AllowedDirs) == 0 {
+	// R2: an EMPTY work_dir means "run beside the binary" (effectiveWorkDir),
+	// and is permitted UNCONDITIONALLY here -- before, and independent of, any
+	// AllowedDirs containment. The binary's own directory is trusted BY
+	// CONSTRUCTION: trust comes from AllowedBinaries (the exact, absolute-path
+	// boundary this function already enforced above), so the directory an
+	// allowlisted binary lives in is inherently a permitted place to run. It is
+	// deliberately NOT run through withinDir against AllowedDirs -- a narrow
+	// AllowedDirs must not be able to reject the binary's own directory, which
+	// would defeat the stand-alone property (R2 does not depend on R3's
+	// runtime_allow_binary_dirs). The child ACTUALLY runs there because the exec
+	// (cmd.Dir in the manager) and the reported ResolvedCommand (command.go)
+	// both read effectiveWorkDir(spec). Before R2 an empty work_dir under a
+	// configured AllowedDirs was refused with its own message; that refusal is
+	// gone, and the inherited-agent-cwd behaviour it described (typically "/")
+	// is replaced by the strictly more useful binary directory.
+	if spec.WorkDir == "" {
 		return nil
 	}
-	// An empty work_dir gets its own message. It falls out of withinDir as
-	// "not contained" (correctly -- the child would inherit the AGENT's
-	// working directory, which is typically "/" for a service and is
-	// certainly not inside a permitted model directory), but the generic
-	// wording rendered as `work_dir "" is not within any allowed
-	// directory`, which reads like a containment near-miss rather than
-	// "the spec never set one". This message surfaces verbatim in the
-	// portal as Status.LastError.Message next to StateNotPermitted, so it
-	// is the only explanation an operator gets. It names the agent-side
-	// setting (as the empty-allowlist message above already does) but
-	// deliberately NOT the configured directory VALUES: the allowlist is
-	// the agent operator's local filesystem layout, and this text travels
-	// upward to the gateway.
-	if spec.WorkDir == "" {
-		return fmt.Errorf("runtime: spec sets no work_dir, but this agent restricts work directories to %d configured path(s) (runtime_allowed_dirs / OP_AGENT_RUNTIME_ALLOWED_DIRS); set the spec's work_dir to a path inside one of them", len(p.AllowedDirs))
+	if len(p.AllowedDirs) == 0 {
+		return nil
 	}
 	for _, dir := range p.AllowedDirs {
 		if withinDir(spec.WorkDir, allowedDirBase(dir)) { // R4: <dir>/* is an accepted synonym for the bare subtree
