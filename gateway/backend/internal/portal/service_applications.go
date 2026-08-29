@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/provider"
@@ -55,6 +56,19 @@ var (
 	// ErrApplicationProxyListenPortConflict rejects a non-zero ProxyListenPort
 	// already used by another application on the same server.
 	ErrApplicationProxyListenPortConflict = errors.New("application.proxy_listen_port_conflict")
+	// ErrApplicationProxyExcludedPortConflict rejects proxy_excluded:true sent
+	// together with an EXPLICIT non-zero proxy_listen_port. Silently zeroing
+	// what the caller asked for in the same breath would be a lie; the STORED
+	// port is a different matter and IS cleared, because that is the completion
+	// of the instruction rather than a contradiction of it.
+	ErrApplicationProxyExcludedPortConflict = errors.New("application.proxy_excluded_port_conflict")
+	// ErrApplicationProxyEntryScheme rejects an EXPLICIT proxy_excluded:false
+	// whose resulting state is https with no proxy port. The agent's proxy
+	// forwards decrypted traffic to http://127.0.0.1:<Port>, so a PARTICIPATING
+	// application must serve plaintext on its own port. Set scheme http; the
+	// gateway flips it to https itself once the agent's TLS listener is
+	// confirmed.
+	ErrApplicationProxyEntryScheme = errors.New("application.proxy_entry_scheme")
 
 	// CodeMappingNotFound is ErrMappingNotFound's API error code, exported for
 	// the same reason as CodeApplicationNotFound above (portal_mapping_endpoints.go).
@@ -145,6 +159,11 @@ type ApplicationDTO struct {
 	// (the gateway auto-assigns it once the app needs one). Not user-editable
 	// in the portal UI — surfaced read-only for operator visibility.
 	ProxyListenPort int `json:"proxy_listen_port"`
+	// ProxyExcluded is the operator's opt-out from the gateway-guided TLS proxy
+	// (migration 70). Set from the RAW column, never derived: the backfill plus
+	// the normalization in Create/UpdateApplication make the column
+	// authoritative for every row this service can produce.
+	ProxyExcluded bool `json:"proxy_excluded"`
 	// Reachable + LastCheckedAt are operational reachability metadata enriched
 	// from the app-health registry on the servers/applications endpoints (not on
 	// model DTOs). A nil reader or a never-probed application reports
@@ -188,6 +207,13 @@ type CreateApplicationRequest struct {
 	// ProxyListenPort: 0 = auto-assign (default; gateway-managed). A caller may
 	// set it explicitly, validated unique per server + in the TCP port range.
 	ProxyListenPort int `json:"proxy_listen_port"`
+	// ProxyExcluded opts the application out of the gateway-guided TLS proxy.
+	//
+	// A POINTER, unlike NativeResponses and the other create-path bools beside
+	// it, and deliberately so: the normalization below must distinguish "the
+	// caller said false" from "the caller said nothing", which is what keeps a
+	// pre-70 API client producing exactly the state it always produced.
+	ProxyExcluded *bool `json:"proxy_excluded,omitempty"`
 }
 
 type UpdateApplicationRequest struct {
@@ -224,6 +250,9 @@ type UpdateApplicationRequest struct {
 	// UI never sends this). 0 resets to auto-assign; a positive value sets it
 	// explicitly, validated unique per server + in the TCP port range.
 	ProxyListenPort *int `json:"proxy_listen_port,omitempty"`
+	// ProxyExcluded: nil = keep the stored value, the house sentinel. See the
+	// create request's field for why participation is a pointer on BOTH paths.
+	ProxyExcluded *bool `json:"proxy_excluded,omitempty"`
 }
 
 // ListApplications returns every application on serverID for an owner-or-admin principal.
@@ -376,6 +405,12 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		CreatedAt:                        now,
 		UpdatedAt:                        now,
 	}
+	// LAST, after every other field is settled, so no field ordering above can
+	// bypass the invariant it establishes. req.ProxyListenPort is a plain int on
+	// this path, so "explicitly requested" is simply "non-zero".
+	if err := applyProxyExclusion(&app, req.ProxyExcluded, req.ProxyListenPort); err != nil {
+		return ApplicationDTO{}, err
+	}
 	if err := s.routes.CreateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, "")
@@ -415,6 +450,9 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// notifyRuntimeChangedForApplication -- retyping AWAY from server_agent
 	// must notify too).
 	previousType := app.Type
+	// Captured for the same reason, and read only by the warning below: once
+	// applyProxyExclusion has run, the port it released is gone from app.
+	previousProxyListenPort := app.ProxyListenPort
 	// Validate everything that can fail BEFORE mutating the loaded application.
 	var appType, scheme, status, healthCheckPath string
 	var port int
@@ -623,6 +661,18 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 			app.HealthCheckMode = routing.HealthCheckModeHealthPath
 		}
 	}
+	// LAST in the mutation block, after health_check_mode and everything else,
+	// so no field ordering above can bypass the invariant it establishes. An
+	// explicitly requested port is nil-or-value here, and only a non-zero value
+	// contradicts an exclusion.
+	explicitProxyListenPort := 0
+	if req.ProxyListenPort != nil {
+		explicitProxyListenPort = proxyListenPort
+	}
+	if err := applyProxyExclusion(&app, req.ProxyExcluded, explicitProxyListenPort); err != nil {
+		return ApplicationDTO{}, err
+	}
+	warnProxyExclusionOwnTLS(server, app, previousProxyListenPort)
 	app.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -724,6 +774,7 @@ func applicationDTO(server routing.AIServer, app routing.Application) Applicatio
 		BenchmarkScheduleIntervalSeconds: app.BenchmarkScheduleIntervalSeconds,
 		OpportunisticMetricsEnabled:      app.OpportunisticMetricsEnabled,
 		ProxyListenPort:                  app.ProxyListenPort,
+		ProxyExcluded:                    app.ProxyExcluded,
 		// Default to reachable; enrichReachability overrides it only when the
 		// registry has actually probed this application.
 		Reachable:     true,
@@ -894,6 +945,102 @@ func normalizeApplicationPort(port int) (int, error) {
 		return 0, ErrApplicationPortInvalid
 	}
 	return port, nil
+}
+
+// applyProxyExclusion resolves the operator's PARTICIPATION decision and
+// establishes the invariant the rest of this change rests on:
+//
+//	ProxyExcluded == true  =>  ProxyListenPort == 0
+//
+// It is called LAST in the mutation block of BOTH CreateApplication and
+// UpdateApplication -- one function rather than two copies, so the two paths
+// cannot drift -- and it is the ONLY place in the tree that writes
+// Application.ProxyExcluded outside a direct store write.
+//
+// The invariant is what keeps this change small. Every other spelling of
+// "proxied" in the tree tests scheme == "https" && ProxyListenPort != 0 --
+// routing.ApplicationEndpoint, activePortStrings, revertScopeExit,
+// HTTPSSwitchUnreachableApps -- and an excluded application can satisfy none of
+// them, so none of them needs to learn about this field.
+//
+// requested is the caller's proxy_excluded (nil = said nothing).
+// explicitProxyListenPort is the port the SAME request explicitly asked for (0
+// when it asked for none), which is not the same thing as the port already
+// stored on app.
+func applyProxyExclusion(app *routing.Application, requested *bool, explicitProxyListenPort int) error {
+	switch {
+	case requested != nil && *requested:
+		// RULE 1 -- EXPLICIT EXCLUSION. Refuse a request that asks for both a
+		// non-participating application and a listener for it: silently zeroing
+		// a port the caller named in the same breath would be a lie. Clearing
+		// the STORED port is a different matter and is done here, because that
+		// is the completion of the instruction rather than a contradiction of
+		// it -- and it is what releases the port back to the free pool.
+		if explicitProxyListenPort != 0 {
+			return ErrApplicationProxyExcludedPortConflict
+		}
+		app.ProxyExcluded = true
+		app.ProxyListenPort = 0
+	case requested != nil:
+		// RULE 2 -- EXPLICIT PARTICIPATION. Validated before it is applied, so a
+		// refused request leaves nothing half-written. A participating
+		// application must serve PLAINTEXT on its own port: the agent's proxy
+		// terminates TLS and forwards to http://127.0.0.1:<Port>, so https with
+		// no proxy port describes an application the proxy cannot front. Only
+		// the gateway assigns a proxy port, and only to candidates, so http is
+		// the only re-entry.
+		if effectiveScheme(*app) == "https" && app.ProxyListenPort == 0 {
+			return ErrApplicationProxyEntryScheme
+		}
+		app.ProxyExcluded = false
+	default:
+		// RULE 3 -- NORMALIZATION, the one back-compat translation, and the ONLY
+		// place the retired implicit encoding is read anywhere in the tree. A
+		// caller that says NOTHING about participation and asks for https with
+		// no proxy port is describing the own-TLS state, which is exactly what
+		// the flag now names -- the same shape of translation the
+		// always_reachable -> health_check_mode back-compat above carries.
+		//
+		// Applying it on every write (rather than inferring at the API edge
+		// forever) is what keeps the column authoritative for every stored row:
+		// a pre-70 client can go on speaking the old encoding and still produce
+		// a row every reader understands without re-deriving anything.
+		if effectiveScheme(*app) == "https" && app.ProxyListenPort == 0 && !app.ProxyExcluded {
+			app.ProxyExcluded = true
+		}
+	}
+	return nil
+}
+
+// warnProxyExclusionOwnTLS is loud about the one genuinely dangerous shape this
+// feature can produce: an application that WAS behind the gateway's TLS proxy,
+// is now excluded, and is left on https. The gateway addresses it on its own
+// port from this moment on and expects it to terminate TLS there itself -- and
+// nothing reverts that, by design (the gateway never writes a scheme on the
+// exclusion path; see ADR-030).
+//
+// A refusal was considered and rejected: the portal always sends scheme, so a
+// "participation change must carry a scheme" rule would be ceremony there, and
+// an API caller could only satisfy it by re-sending what it already has. Being
+// loud on the dangerous shape is this branch's posture instead.
+//
+// It also names the RELEASED port, which is not decoration: the port goes back
+// to the free pool immediately (a sibling can draw it on the next routes fetch)
+// and re-including this application later draws a fresh lowest-free port, not
+// this one. An operator with a hand-written firewall rule pinned to it has to
+// know the number.
+func warnProxyExclusionOwnTLS(server routing.AIServer, app routing.Application, previousProxyListenPort int) {
+	if !app.ProxyExcluded || previousProxyListenPort == 0 || effectiveScheme(app) != "https" {
+		return
+	}
+	slog.Warn("application excluded from the gateway TLS proxy while staying on https; the gateway now addresses it on its OWN port and expects it to terminate TLS there",
+		"server", server.ID,
+		"server_name", server.Name,
+		"app", app.ID,
+		"app_type", app.Type,
+		"released_proxy_listen_port", previousProxyListenPort,
+		"app_port", app.Port,
+		"action", "serve TLS on this application's own port with a leaf valid for "+server.Domain+", trusted by the system store or the gateway's internal CA; the released proxy port returns to the free pool and re-including the application later draws a fresh one")
 }
 
 // normalizeApplicationProxyListenPort validates the gateway-managed TLS

@@ -1022,6 +1022,13 @@ type ServerDTO struct {
 	// within the effective window), "inactive" (an agent token is configured but
 	// not currently reporting), or "unconfigured" (no agent token at all).
 	AgentStatus string `json:"agent_status"`
+	// TLSProxyState says what the gateway's TLS proxy is doing on this server,
+	// so the per-application proxy opt-out can be rendered with a true reason
+	// instead of appearing out of nowhere: "out_of_scope" | "unknown" |
+	// "agent_off" | "proxy". Derived, never stored — see tlsProxyState for the
+	// durable-floor/volatile-upgrade rule and why only "out_of_scope" may hide
+	// the control.
+	TLSProxyState string `json:"tls_proxy_state"`
 	// AgentPresenceTimeoutSeconds is the per-server override (seconds) for "the
 	// agent is delivering values"; 0 = follow the system-wide default.
 	AgentPresenceTimeoutSeconds int `json:"agent_presence_timeout_seconds"`
@@ -3200,6 +3207,7 @@ func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (Serve
 		CertificateOverride:         server.CertificateOverride,
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
 		AgentStatus:                 s.agentStatus(ctx, server),
+		TLSProxyState:               s.tlsProxyState(ctx, server),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
 		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
@@ -3235,6 +3243,67 @@ func (s *Service) agentStatus(ctx context.Context, server routing.AIServer) stri
 		}
 	}
 	return status
+}
+
+// tlsProxyState derives the four-valued tls_proxy_state for a server:
+// "out_of_scope" (the gateway runs no TLS proxy here at all), "proxy" (the
+// agent reports it is running one), "agent_off" (the agent reports it is not),
+// or "unknown" (nothing recent enough to say).
+//
+// It is a DURABLE FLOOR with a VOLATILE UPGRADE, shaped like agentStatus and
+// MeshTLSPendingServers: the stored scope (a server column plus a stored
+// setting) establishes what can be known across a restart, and the in-RAM
+// certificate report only ever refines the WORDING on top of it.
+//
+// THE NIL-SAFETY RULE IS INVERTED relative to agentStatus, and that inversion
+// is the point rather than an oversight. There the pessimistic floor is the
+// RESTRICTIVE value; here the pessimistic floor ("unknown") is the one that
+// KEEPS THE CONTROL VISIBLE. A missing reader, a settings glitch, an
+// unrecognised mode — none of them may hide an operator's own switch, so every
+// one of them returns "unknown" and never "out_of_scope".
+//
+// WHY SCOPE IS THE GATE AND cert_mode IS NOT. Only "out_of_scope" hides the
+// control in the portal, and it is the only value that can be trusted to:
+// AgentProxyRoutes returns an empty route set for an out-of-scope server
+// whatever the agent's mode, and both of httpsSwitchInScope's inputs
+// (server.HTTPSSwitchOverride, cert_https_switch_mode) are stored, so the gate
+// cannot vanish after a restart. The cert report cannot carry that weight —
+// AgentCertReportRegistry is an in-RAM map built empty at startup, and it DROPS
+// a report carrying neither a leaf nor CA fingerprints unless the mode is
+// "off". So absence is reachable twice: after every gateway restart, and on a
+// freshly-provisioned proxy-mode agent before its first certificate — precisely
+// when an operator is most likely to be reaching for this control. Hence
+// "agent_off" and "unknown" are POSITIVE/ABSENT observations that change the
+// sentence shown, never the visibility.
+func (s *Service) tlsProxyState(ctx context.Context, server routing.AIServer) string {
+	if s.settings == nil {
+		return "unknown"
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		// A read glitch must NEVER hide a control.
+		return "unknown"
+	}
+	if !httpsSwitchInScope(server, CertHTTPSSwitchMode(values)) {
+		return "out_of_scope"
+	}
+	if s.agentCertReports == nil {
+		return "unknown"
+	}
+	_, _, mode, _, _, ok := s.agentCertReports.CertReport(server.ID)
+	if !ok {
+		return "unknown"
+	}
+	switch mode {
+	case "proxy":
+		return "proxy"
+	case "off", "files":
+		return "agent_off"
+	default:
+		// A report whose mode the ingest sanitizer dropped, or that carried none,
+		// says nothing ABOUT the mode. It is not evidence of "off".
+		return "unknown"
+	}
 }
 
 // decodeNetbirdGroupIDs tolerantly decodes the opaque netbird_group_ids column

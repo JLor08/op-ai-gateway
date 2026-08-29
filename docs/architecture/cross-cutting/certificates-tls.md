@@ -310,11 +310,71 @@ per server:
   can never forward, but it must still be able to revert a switch a prior
   `auto`/`selected` run left standing.
 
-An application is only ever a **candidate** for this machinery when it is
-enabled and either plain `http`, or already proxy-switched `https` with a
-non-zero `ProxyListenPort` — an application manually set to `https` with no
-proxy port runs its own TLS and is left alone by both the route derivation
-(§6) and this reconcile.
+An application is only ever a **candidate** for this machinery when the
+operator has **not excluded it** (`applications.proxy_excluded`, migration 70),
+it is enabled, and it is either plain `http` or already proxy-switched `https`
+with a non-zero `ProxyListenPort`.
+
+`proxy_excluded` is the **authoritative and only** representation of "the
+operator took this application out of the gateway's TLS proxy". It used to be
+an *implicit* encoding — `https` with `ProxyListenPort == 0` — and this document
+asserted that encoding as a contract; it no longer is one. Migration 70
+backfilled every such row into the flag, and the candidate predicate's `https`
+arm is now a **physical guard** rather than a statement about the operator's
+intent: the agent's proxy publishes an `http://127.0.0.1:<Port>` upstream, so an
+`https` application with no proxy port has nothing the proxy can sit in front
+of. It defends a row that reached the store without passing through the
+portal's normalization (a pre-70 binary's insert takes the column default `0`).
+
+The exclusion is one clause in one predicate, and that predicate gates route
+publication AND the lazy port assignment in the same loop — so an excluded
+application gets no route, no listener, no port and no store write, and both
+recovery arms skip it. It is also the first way this system can say "leave this
+one alone" about a **plain-http** application: before the flag, an enabled
+`http` application was a candidate unconditionally, was assigned a port on the
+agent's next fetch and was flipped to `https` on the next reconcile, so "http
+and left alone" was unreachable through any interface.
+
+Three fields, one meaning each: `ProxyExcluded` is PARTICIPATION (operator-
+owned), `Scheme` is TRANSPORT (gateway-driven while participating, the
+operator's own choice while excluded), and `ProxyListenPort` is LISTENER
+IDENTITY (gateway-owned). They are held together by one invariant, enforced at
+the end of the mutation block in both `CreateApplication` and
+`UpdateApplication`:
+
+> `ProxyExcluded == true` implies `ProxyListenPort == 0`.
+
+That invariant is why `ApplicationEndpoint`, `activePortStrings`,
+`revertScopeExit` and `HTTPSSwitchUnreachableApps` need no knowledge of the
+flag at all: each tests `scheme == "https" && ProxyListenPort != 0`, which an
+excluded application can never satisfy.
+
+Excluding an already-proxied application is **one PATCH and one store write**
+(`{scheme, proxy_excluded}` together). Routing moves back to the application's
+own plaintext port with no outage — that is the port the agent's proxy had been
+forwarding decrypted traffic to all along — and the synchronous NetBird policy
+reconcile drops the released proxy port from `op-gw-access` at once, so the door
+closes before the listener does. The agent stops listening only on its next
+certificate poll (up to 15 min over POST, up to 6 h over WebSocket); until then
+that listener is orphaned but harmless, since nothing routes to it and the
+firewall no longer admits it. The released port returns to the free pool
+immediately, so re-including the application later draws a fresh lowest-free
+port rather than the old number — which is why the `Warn` line names the
+released port.
+
+Two things the gateway's opt-out does **not** do. It never writes a scheme on
+this path: if the operator chooses `https` for an excluded application, that
+application must terminate TLS on its own port with a leaf valid for the
+server's domain and trusted by the system store or the internal CA, and nothing
+reverts that. And it cannot guarantee that no listener exists — a local
+`cert_proxy_routes` entry on the agent survives all of this (in `override` it
+wins outright, and in the default `fallback` the gateway's route is simply gone,
+so the local one fills exactly the listen the gateway withdrew).
+
+An excluded application is also **structurally invisible** to
+`HTTPSSwitchUnreachableApps`, whose filter starts with the candidate predicate.
+That is correct — the gateway is not managing it — but it has to be said out
+loud, because otherwise the silence reads as health.
 
 ### 7.1 No automatic downgrade to plaintext
 
@@ -375,10 +435,21 @@ the gateway-guided TLS proxy": the gateway itself then withdrew the routes and
 the agent tore the listeners down, so the revert completes the operator's own
 instruction. And the alternative is strictly worse here — left on `https` the
 application points at a port that is genuinely gone, with **no path back** (the
-status-driven pass does not run for an out-of-scope server, a torn-down route
-is *missing* rather than an explicit false, and there is no `proxy_listen_port`
-field in the portal UI, so the rescue is API-only). That is a permanent outage
-from a routine narrowing action, not a recoverable one. It is no longer silent
+status-driven pass does not run for an out-of-scope server, and a torn-down
+route is *missing* rather than an explicit false). The portal now has a rescue
+for the **in-scope** case — `proxy_excluded` plus `scheme` in one PATCH — but it
+does not reach here: the form still never sets `proxy_listen_port`, and an
+out-of-scope server has neither a portal path back nor a status observation to
+act on. That is a permanent outage from a routine narrowing action, not a
+recoverable one.
+
+`revertScopeExit` is deliberately **not** guarded on `proxy_excluded`. Under the
+invariant an excluded application holds no proxy port and is already skipped by
+the existing predicate; leaving the revert unguarded is what makes it the
+*repair* path for an invariant-violating row (reachable only by a direct store
+write), flipping such a row back to `http` so it is reachable on its own port
+again. Guarding it would strand that row on a dead port with
+`HTTPSSwitchUnreachableApps` structurally unable to name it. It is no longer silent
 either: it logs a `Warn` naming the application and saying that its traffic is
 now unencrypted.
 

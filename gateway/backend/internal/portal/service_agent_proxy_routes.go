@@ -112,13 +112,29 @@ func (s *Service) AgentProxyRoutes(ctx context.Context, serverID string) (AgentP
 	base := CertProxyListenPortBase(values)
 	out := make([]AgentProxyRouteDTO, 0, len(apps))
 	for i, app := range apps {
-		// Only real proxy-switch candidates get a listener: an ENABLED app that is
-		// http or already proxy-switched (see isProxySwitchCandidate). This is the
-		// per-app filter the Task-7 derivation deferred -- it previously emitted a
-		// route (and burned a ProxyListenPort) for EVERY app on an in-scope server,
-		// including disabled and own-TLS-https ones the switch reconcile can never
-		// flip. AssignProxyListenPort still sees the FULL app set for uniqueness, so
-		// skipping a non-candidate never lets its (possibly explicit) port be reused.
+		// Only real proxy-switch candidates get a listener: a NOT-EXCLUDED,
+		// ENABLED app that is http or already proxy-switched (see
+		// isProxySwitchCandidate). This is the per-app filter the Task-7
+		// derivation deferred -- it previously emitted a route (and burned a
+		// ProxyListenPort) for EVERY app on an in-scope server, including
+		// disabled and own-TLS-https ones the switch reconcile can never flip.
+		//
+		// It is also the ONE clause that implements the per-application opt-out
+		// end to end: skipping here means no route published, so no listener
+		// opened, AND no AssignProxyListenPort call, so no port assigned and no
+		// UpdateApplication write. An excluded http application on an in-scope
+		// server stays http and stays untouched, forever.
+		//
+		// AssignProxyListenPort still sees the FULL app set for uniqueness, so
+		// skipping a non-candidate never lets a port it still HOLDS be reused.
+		// A port a non-candidate no longer holds is a different matter and is
+		// deliberately reusable: excluding an application clears its
+		// ProxyListenPort to 0 (the invariant on routing.Application), which
+		// drops it out of AssignProxyListenPort's `taken` set and returns it to
+		// the free pool for a sibling. That is a strict improvement on the
+		// earlier behaviour, where a non-candidate's port stayed reserved
+		// against every sibling forever; its cost is that re-including the
+		// application later draws a fresh lowest-free port, not the old one.
 		if !isProxySwitchCandidate(app) {
 			continue
 		}

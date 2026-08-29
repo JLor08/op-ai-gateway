@@ -2134,3 +2134,113 @@ func TestServerAvailabilityDefaultsWindow(t *testing.T) {
 		t.Fatalf("got[0].ReportedAt = %v, want %v", got[0].ReportedAt, inWindow)
 	}
 }
+
+// alwaysFailingSystemSettings is a SystemSettingsStore whose read ALWAYS fails,
+// for the one case tlsProxyState must get right on pain of hiding an operator's
+// switch: a settings glitch may report "unknown", never "out_of_scope".
+type alwaysFailingSystemSettings struct {
+	SystemSettingsStore
+}
+
+func (alwaysFailingSystemSettings) SystemSettings(context.Context) (map[string]string, error) {
+	return nil, errors.New("boom: settings unreadable")
+}
+
+// TestTLSProxyState pins the four-valued visibility signal, and in particular
+// the DIRECTION of its nil-safety, which is INVERTED relative to agentStatus and
+// is the whole reason the function exists in this shape: there the pessimistic
+// floor is the restrictive value, here the pessimistic floor ("unknown") is the
+// one that KEEPS the per-application proxy control visible in the portal.
+//
+// Only "out_of_scope" hides that control, and only "out_of_scope" is derived
+// purely from DURABLE state (a stored server column plus a stored setting), so
+// it cannot appear out of nowhere after a restart. Everything volatile —
+// including a missing reader, a missing report and an unrecognised mode — lands
+// on "unknown" instead, because the agent's cert report is an in-RAM map built
+// empty at startup and is therefore absent twice over: after every gateway
+// restart, and on a freshly-provisioned proxy-mode agent before its first
+// certificate. Those are exactly the moments an operator is most likely to be
+// reaching for the control.
+func TestTLSProxyState(t *testing.T) {
+	ctx := context.Background()
+	inScope := routing.AIServer{ID: "srv-in", Name: "In"}
+	outOfScope := routing.AIServer{ID: "srv-out", Name: "Out", HTTPSSwitchOverride: "exclude"}
+
+	newSvc := func(t *testing.T, mode string, reports AgentCertReportReader) *Service {
+		t.Helper()
+		svc, _ := newServerTestService(t, time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC))
+		svc.settings = NewMemorySystemSettings()
+		if _, err := svc.UpdateSystemSettings(ctx, systemToken(), UpdateSystemSettingsRequest{CertHTTPSSwitchMode: &mode}); err != nil {
+			t.Fatalf("set https switch mode: %v", err)
+		}
+		svc.agentCertReports = reports
+		return svc
+	}
+	reportsWithMode := func(mode string) AgentCertReportReader {
+		return &fakeCertReports{byServer: map[string]fakeCertReport{"srv-in": {mode: mode}, "srv-out": {mode: mode}}}
+	}
+
+	cases := []struct {
+		name    string
+		mode    string
+		server  routing.AIServer
+		reports AgentCertReportReader
+		want    string
+	}{
+		{"out of scope wins over a proxy report", "auto", outOfScope, reportsWithMode("proxy"), "out_of_scope"},
+		{"out of scope with no report at all", "auto", outOfScope, nil, "out_of_scope"},
+		{"manual mode puts the whole fleet out of scope", "manual", inScope, reportsWithMode("proxy"), "out_of_scope"},
+		{"in scope, agent reports proxy", "auto", inScope, reportsWithMode("proxy"), "proxy"},
+		{"in scope, agent reports off", "auto", inScope, reportsWithMode("off"), "agent_off"},
+		{"in scope, agent reports files", "auto", inScope, reportsWithMode("files"), "agent_off"},
+		{"in scope, no report (post-restart, or before the first leaf)", "auto", inScope, &fakeCertReports{byServer: map[string]fakeCertReport{}}, "unknown"},
+		{"in scope, nil reader", "auto", inScope, nil, "unknown"},
+		{"in scope, empty mode says nothing ABOUT the mode", "auto", inScope, reportsWithMode(""), "unknown"},
+		{"in scope, unrecognised mode says nothing ABOUT the mode", "auto", inScope, reportsWithMode("sideways"), "unknown"},
+	}
+	for _, c := range cases {
+		svc := newSvc(t, c.mode, c.reports)
+		if got := svc.tlsProxyState(ctx, c.server); got != c.want {
+			t.Errorf("%s: tlsProxyState = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// A settings READ ERROR must report "unknown" — never "out_of_scope", which
+	// would hide the control on a transient glitch — and the same holds for a
+	// nil settings reader.
+	svc := newSvc(t, "auto", reportsWithMode("proxy"))
+	svc.settings = alwaysFailingSystemSettings{}
+	if got := svc.tlsProxyState(ctx, outOfScope); got != "unknown" {
+		t.Fatalf("settings error on an out-of-scope server: tlsProxyState = %q, want unknown", got)
+	}
+	svc.settings = nil
+	if got := svc.tlsProxyState(ctx, outOfScope); got != "unknown" {
+		t.Fatalf("nil settings reader: tlsProxyState = %q, want unknown", got)
+	}
+}
+
+// TestServerDTOCarriesTLSProxyState pins that the derived state actually
+// reaches the wire, on the ordinary read path, and that a service with no
+// settings reader at all still emits the control-preserving "unknown" rather
+// than an empty string the frontend would have to guess about.
+func TestServerDTOCarriesTLSProxyState(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	if server.TLSProxyState != "unknown" {
+		t.Fatalf("tls_proxy_state = %q, want unknown when nothing can be read", server.TLSProxyState)
+	}
+
+	mode := "manual"
+	svc.settings = NewMemorySystemSettings()
+	if _, err := svc.UpdateSystemSettings(context.Background(), systemToken(), UpdateSystemSettingsRequest{CertHTTPSSwitchMode: &mode}); err != nil {
+		t.Fatalf("set mode: %v", err)
+	}
+	got, err := svc.GetServer(context.Background(), ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("GetServer: %v", err)
+	}
+	if got.TLSProxyState != "out_of_scope" {
+		t.Fatalf("tls_proxy_state = %q, want out_of_scope in manual mode", got.TLSProxyState)
+	}
+}

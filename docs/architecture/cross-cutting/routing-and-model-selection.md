@@ -70,6 +70,13 @@ TLS-terminating proxy listener instead of the plain upstream `Port`; this is
 transparent to routing (`Target.Endpoint` is already resolved) and detailed in
 [Certificates & TLS](certificates-tls.md).
 
+That `Scheme=="https" && ProxyListenPort != 0` test is a statement about the
+LISTENER, not about the operator's intent. Whether an application takes part in
+the gateway's TLS proxy at all is the separate `proxy_excluded` flag (migration
+70); this derivation needs no knowledge of it, because an excluded application
+is guaranteed to hold no proxy port — see the invariant in
+[Certificates & TLS §7](certificates-tls.md).
+
 Applications also carry the routing-tuning fields used below: `Priority` and
 `Weight` (scoring), `TimeoutMS` (per-request upstream timeout), a routing
 tuning validation rejects negative values for all of them at write time. The

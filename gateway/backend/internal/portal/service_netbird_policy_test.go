@@ -962,3 +962,102 @@ func TestReconcileAllServerNetbirdConcurrentWithAppCRUDNoDuplicate(t *testing.T)
 		t.Fatalf("op-gw-access-srv-conc creates = %d, want exactly 1 (duplicate-create race)", got)
 	}
 }
+
+// TestActivePortStringsIgnoresTheInvariantViolatingRow documents what the ONE
+// residue this design accepts actually does, rather than leaving it to be
+// discovered. A row with ProxyExcluded=true, https AND a non-zero
+// ProxyListenPort is unreachable through the API by construction — the portal's
+// applyProxyExclusion clears the port on every write that sets the flag — so it
+// can only come from a direct store write.
+//
+// If one exists, activePortStrings still opens its proxy port, because it
+// derives from (scheme, ProxyListenPort) and knows nothing about the flag. That
+// is the deliberate trade: the flag is worth exactly as much as the invariant
+// that backs it, and the alternative — teaching four separate derivations about
+// participation — is the cost this design avoids. The repair path is
+// revertScopeExit, which is left unguarded precisely so it can rescue this row.
+func TestActivePortStringsIgnoresTheInvariantViolatingRow(t *testing.T) {
+	apps := []routing.Application{
+		// Reachable only by a direct store write; the flag is ignored here.
+		{Port: 8080, Scheme: "https", ProxyListenPort: 8601, ProxyExcluded: true, Status: routing.ServerStatusActive},
+		// The shape the API can actually produce: excluded => port 0.
+		{Port: 9090, Scheme: "https", ProxyListenPort: 0, ProxyExcluded: true, Status: routing.ServerStatusActive},
+		{Port: 7070, Scheme: "http", ProxyListenPort: 0, ProxyExcluded: true, Status: routing.ServerStatusActive},
+	}
+	got := activePortStrings(apps)
+	want := []string{"7070", "8080", "8601", "9090"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("activePortStrings = %v, want %v", got, want)
+	}
+}
+
+// TestExcludingAnApplicationClosesItsProxyPortSynchronously drives the
+// exclusion through UpdateApplication so the SAME synchronous
+// reconcileServerPolicy the real update path runs actually fires, and asserts
+// the door closes BEFORE the listener goes rather than after: the released
+// proxy port drops out of the managed op-gw-access policy on the update call
+// itself, while the agent only stops listening on its next certificate poll (up
+// to 15 minutes over POST, up to 6 hours over WebSocket). The orphaned listener
+// is harmless precisely because this ordering holds.
+func TestExcludingAnApplicationClosesItsProxyPortSynchronously(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newNetbirdServerTestService(t, now)
+	fake := newFakeNetbird(t)
+	fake.seedGroup("gw-portal", "op-gw-portal")
+
+	server := createTestServer(t, svc, "Proxy Server", "proxy.example.test")
+	stored, err := routeStore.AIServerByID(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("read server: %v", err)
+	}
+	stored.NetbirdEnabled = true
+	stored.NetbirdGroupID = "track-proxy"
+	if err := routeStore.UpdateAIServer(ctx, stored); err != nil {
+		t.Fatalf("mark server managed: %v", err)
+	}
+
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8080, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	// The proxied steady state, as the gateway itself would have produced it.
+	row, err := routeStore.ApplicationByID(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("read app: %v", err)
+	}
+	row.Scheme = "https"
+	row.ProxyListenPort = 8601
+	if err := routeStore.UpdateApplication(ctx, row); err != nil {
+		t.Fatalf("seed proxied state: %v", err)
+	}
+
+	enableNetbirdPolicies(t, svc, fake.srv.URL, "all", false, false)
+	svc.reconcileServerPolicy(ctx, server.ID)
+	policyName := "op-gw-access-" + server.ID
+	before := fake.createdPolicyByName(policyName)
+	if before == nil {
+		t.Fatalf("no %s policy created for the proxied application", policyName)
+	}
+	if ports := policyRuleField(t, before, "ports"); !reflect.DeepEqual(ports, []string{"8080", "8601"}) {
+		t.Fatalf("proxied policy ports = %v, want [8080 8601]", ports)
+	}
+
+	scheme := "http"
+	if _, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{
+		Scheme: &scheme, ProxyExcluded: boolPtr(true),
+	}); err != nil {
+		t.Fatalf("exclude: %v", err)
+	}
+
+	after := fake.updatedPolicyByName(policyName)
+	if after == nil {
+		t.Fatalf("the exclusion did not update %s at all", policyName)
+	}
+	ports := policyRuleField(t, after, "ports")
+	if !reflect.DeepEqual(ports, []string{"8080"}) {
+		t.Fatalf("policy ports after exclusion = %v, want [8080] -- the released proxy port must close at once", ports)
+	}
+}

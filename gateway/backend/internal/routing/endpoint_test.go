@@ -58,3 +58,38 @@ func TestApplicationEndpointProxyHTTPS(t *testing.T) {
 		}
 	}
 }
+
+// TestApplicationEndpointIsUnchangedByProxyExclusion pins that
+// ApplicationEndpoint needs NO knowledge of ProxyExcluded, which is the whole
+// economy of the design: the invariant (excluded => ProxyListenPort == 0) makes
+// the existing "https AND a non-zero proxy port" branch unreachable for an
+// excluded application, so the derivation stays exactly as it was.
+//
+// The last case is the ONE residue this design accepts, stated out loud rather
+// than left to be discovered: a row with the flag set AND a proxy port is
+// unreachable through the API by construction (portal applyProxyExclusion
+// clears the port on every write that sets the flag), and if a direct store
+// write produces one anyway, the endpoint still points at the proxy listener —
+// which the agent has been told to close. revertScopeExit is deliberately left
+// unguarded so it can repair exactly that row.
+func TestApplicationEndpointIsUnchangedByProxyExclusion(t *testing.T) {
+	cases := []struct {
+		name string
+		app  Application
+		want string
+	}{
+		{"excluded http", Application{Scheme: "http", Port: 8080, ProxyExcluded: true}, "http://host:8080"},
+		{"excluded https on its own port", Application{Scheme: "https", Port: 8080, ProxyExcluded: true}, "https://host:8080"},
+		{"excluded empty scheme still defaults to http", Application{Port: 8080, ProxyExcluded: true}, "http://host:8080"},
+		{
+			"THE RESIDUE: invariant-violating row (direct store write only)",
+			Application{Scheme: "https", Port: 8080, ProxyListenPort: 8601, ProxyExcluded: true},
+			"https://host:8601",
+		},
+	}
+	for _, c := range cases {
+		if got := ApplicationEndpoint(AIServer{Domain: "host"}, c.app); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}

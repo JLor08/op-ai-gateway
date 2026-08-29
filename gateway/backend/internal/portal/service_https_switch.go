@@ -39,14 +39,25 @@ type ProxyRouteStatusReader interface {
 }
 
 // isProxySwitchCandidate reports whether app is eligible for proxy-HTTPS
-// switching: it must be ENABLED (not disabled) AND either currently http, or
-// already proxy-switched (https with a non-zero ProxyListenPort). An app
-// manually set to https with NO proxy port (ProxyListenPort == 0) runs its own
-// TLS and is deliberately NOT a candidate -- the reconcile leaves it alone.
-// AgentProxyRoutes uses the same predicate so the agent only ever opens proxy
-// listeners for apps the reconcile could actually switch (never for a disabled
-// or own-TLS app).
+// switching: the operator must not have EXCLUDED it, it must be ENABLED (not
+// disabled), and it must be either currently http or already proxy-switched
+// (https with a non-zero ProxyListenPort). AgentProxyRoutes uses the same
+// predicate, so the agent only ever opens proxy listeners for apps the
+// reconcile could actually switch.
+//
+// That single predicate is also what makes the opt-out one clause rather than
+// five: it gates route publication AND the lazy port assignment in the same
+// loop, so an excluded application gets no route, no listener, no port, and no
+// store write, and both recovery arms skip it — the reconcile continues on a
+// non-candidate, and revertScopeExit is filtered out by the port being 0.
 func isProxySwitchCandidate(app routing.Application) bool {
+	// The operator's explicit opt-out, tested FIRST and independently of the
+	// scheme: this single clause is what makes a plain-http application
+	// excludable at all, which no value of (Scheme, ProxyListenPort) can
+	// express.
+	if app.ProxyExcluded {
+		return false
+	}
 	if app.Status == routing.ServerStatusDisabled {
 		return false
 	}
@@ -54,6 +65,17 @@ func isProxySwitchCandidate(app routing.Application) bool {
 	case "http":
 		return true
 	case "https":
+		// NOT a second representation of "excluded" -- the flag owns that, and
+		// migration 70 backfilled these rows into it. This is a PHYSICAL guard:
+		// the agent's proxy only ever fronts a plaintext upstream
+		// (AgentProxyRoutes emits http://127.0.0.1:<Port>), so an https
+		// application with no proxy port has nothing this proxy can sit in
+		// front of. Defence in depth for any row that reached the store without
+		// passing through the normalization in CreateApplication /
+		// UpdateApplication -- notably a pre-70 binary's insert, which omits the
+		// column so the DEFAULT 0 applies. Dropping this arm would make such a
+		// row a candidate and point the agent's proxy at an https upstream as if
+		// it were plaintext.
 		return app.ProxyListenPort != 0
 	default:
 		return false
@@ -232,11 +254,23 @@ func (s *Service) ReconcileHTTPSSwitch(ctx context.Context) {
 //
 // And the alternative is worse in a way the other case is not. Left on https,
 // the application points at a port that is genuinely gone, with NO path back:
-// the status-driven pass does not run for an out-of-scope server, a torn-down
-// route is MISSING from the snapshot rather than an explicit false, and there
-// is no proxy_listen_port field in the portal UI, so the rescue is API-only and
-// has to set scheme and port in one PATCH. That is a permanent outage produced
-// by a routine narrowing action -- fleet-wide, on a single auto->manual toggle.
+// the status-driven pass does not run for an out-of-scope server, and a
+// torn-down route is MISSING from the snapshot rather than an explicit false.
+// The portal now HAS a rescue for the in-scope case -- proxy_excluded plus
+// scheme in one PATCH -- but it does not reach here: the form still never sets
+// proxy_listen_port, and an out-of-scope server has neither a portal path back
+// nor a status observation to act on. That is a permanent outage produced by a
+// routine narrowing action -- fleet-wide, on a single auto->manual toggle.
+//
+// It is deliberately NOT guarded on ProxyExcluded. Under the invariant an
+// excluded application has ProxyListenPort == 0 and is already skipped by the
+// predicate below. Leaving it unguarded is also the REPAIR path for an
+// invariant-violating row (reachable only by a direct store write): it flips the
+// scheme to http, loudly, and the application becomes reachable on app.Port
+// again. Guarding it would strand that row on a dead port with
+// HTTPSSwitchUnreachableApps structurally unable to name it, since that filter
+// starts with isProxySwitchCandidate, which the row fails. It does not flap:
+// after the flip effectiveScheme != "https" skips it.
 //
 // What it is NOT allowed to be is silent, which until now it was: the write
 // went through persistApplicationSchemeSwitch with a log line only on FAILURE.
@@ -256,7 +290,7 @@ func (s *Service) revertScopeExit(ctx context.Context, server routing.AIServer, 
 			"app", app.ID,
 			"app_type", app.Type,
 			"proxy_listen_port", app.ProxyListenPort,
-			"action", "traffic to this application is now UNENCRYPTED; put the server back in https-auto-switch scope, or give the application its own TLS (set scheme https with proxy_listen_port 0)")
+			"action", "traffic to this application is now UNENCRYPTED; put the server back in https-auto-switch scope, or take the application out of the proxy for good and run TLS on its own port (PATCH proxy_excluded true with scheme https)")
 	}
 }
 

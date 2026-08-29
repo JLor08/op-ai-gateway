@@ -361,3 +361,71 @@ func TestAgentProxyRoutesPropagatesApplicationReadAndWriteFailures(t *testing.T)
 		}
 	})
 }
+
+// TestAgentProxyRoutesSkipsExcludedApplicationEntirely is the route-publication
+// half of the per-application opt-out, and it asserts the ABSENCE of a write,
+// not merely the absence of a route.
+//
+// One clause in isProxySwitchCandidate stops all of it: no route published (so
+// no listener opened), and no AssignProxyListenPort call (so no port assigned
+// and no UpdateApplication write). The write matters independently — a version
+// that filtered the ROUTE but still assigned the port would look correct in the
+// response and quietly churn the row on every agent fetch, forever.
+//
+// It also pins that the released port is deliberately REUSABLE: the sibling
+// draws exactly the number the excluded application gave up. That is a
+// behaviour change from "a non-candidate's port stays reserved against every
+// sibling forever", and it is intended, so it is asserted rather than left to
+// be rediscovered as a bug.
+func TestAgentProxyRoutesSkipsExcludedApplicationEntirely(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-a", "")
+
+	// The excluded application HELD 8600 before the operator excluded it; the
+	// exclusion cleared it to 0 (the invariant), so 8600 is free again.
+	excluded := mustCreateSwitchTestApp(t, svc, ctx, "app-excluded", "srv-a", 8080, 0)
+	excluded.ProxyExcluded = true
+	excluded.UpdatedAt = excluded.UpdatedAt.Add(time.Minute)
+	if err := svc.routes.UpdateApplication(ctx, excluded); err != nil {
+		t.Fatalf("mark excluded: %v", err)
+	}
+	before, err := svc.routes.ApplicationByID(ctx, "app-excluded")
+	if err != nil {
+		t.Fatalf("read app-excluded: %v", err)
+	}
+	mustCreateSwitchTestApp(t, svc, ctx, "app-sibling", "srv-a", 8081, 0)
+
+	// Repeated fetches, like a real agent's poll: a per-fetch write would show
+	// up as a moved UpdatedAt even if the first pass happened to look clean.
+	for fetch := 0; fetch < 3; fetch++ {
+		dto, err := svc.AgentProxyRoutes(ctx, "srv-a")
+		if err != nil {
+			t.Fatalf("AgentProxyRoutes (fetch %d): %v", fetch, err)
+		}
+		if len(dto.Routes) != 1 {
+			t.Fatalf("fetch %d: routes = %+v, want exactly the sibling's", fetch, dto.Routes)
+		}
+		if dto.Routes[0].AppID != "app-sibling" {
+			t.Fatalf("fetch %d: route published for %q, want app-sibling", fetch, dto.Routes[0].AppID)
+		}
+		if dto.Routes[0].Listen != 8600 {
+			t.Fatalf("fetch %d: sibling listen = %d, want 8600 -- the port the excluded application released must return to the free pool",
+				fetch, dto.Routes[0].Listen)
+		}
+	}
+
+	after, err := svc.routes.ApplicationByID(ctx, "app-excluded")
+	if err != nil {
+		t.Fatalf("read app-excluded (after): %v", err)
+	}
+	if after.ProxyListenPort != 0 {
+		t.Fatalf("excluded application was assigned ProxyListenPort = %d, want 0", after.ProxyListenPort)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("excluded application was WRITTEN by the routes derivation: UpdatedAt %v -> %v", before.UpdatedAt, after.UpdatedAt)
+	}
+	if after.ProxyExcluded != true || after.Scheme != "http" {
+		t.Fatalf("excluded application changed shape: %+v", after)
+	}
+}
