@@ -793,7 +793,7 @@ A spec `S` may start alongside the running set `R` only if **all three** hold:
    compete" as a general exemption is the misreading this rule attracts, and a
    real operator hit it — they concluded two models on separate GPUs needed no
    permission and could not be granted one. The portal's cell tooltip now
-   states the consequence at the cell (§11.3).
+   states the consequence at the cell (§11.5).
 2. **Process limit** — `|R| + 1 ≤ runtime_max_processes` (`0` = unlimited).
 3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches *and that has a
    budget* (`budget(g) > 0`; an absent row or a `0` is unconstrained and not
@@ -1860,10 +1860,14 @@ action's label is deliberately unchanged; only the destination differs — so an
 operator or maintainer looking for the runtime admin will not find it under a
 runtime-shaped menu, and a UI contributor must not "fix" the shared entry point.
 Because that section replaces `MappingSection`, it also owns the plain mapping
-CRUD an agent-managed server needs.
+CRUD an agent-managed server needs — on a **dedicated tab**, and split from the
+launch-spec form by ownership rather than by convenience (§11.4).
 
-Four tabs: **launch specs**, the **co-residency matrix**, **server limits**, and
-**live status**. Authorization is exactly the model-mapping write rule and is
+Five tabs: **model mapping**, **launch specs**, the **co-residency matrix**,
+**server limits**, and **live status**. The mapping tab is leftmost because a
+mapping is the parent row: a spec's id IS its mapping's id, `mapping_id` is
+`unique` and `on delete cascade`, and a mapping can exist with no spec while a
+spec can never exist without a mapping. Authorization is exactly the model-mapping write rule and is
 enforced inside `portal.Service`, never in the gateway handler — see
 [Security, Authentication & Authorization](security-auth-rbac.md).
 
@@ -2178,6 +2182,96 @@ missable. They are cleared by any successful spec write that lands an empty
 the operator who reaches the specs tab has just performed the remediation.
 
 ### 11.3 What each tab shows
+
+**Model mapping.** The same table and the same create/edit mask an ordinary
+application's model screen shows — one definition of each
+(`shared/mappingColumns.tsx`, `MappingForm.tsx`), rendered by both screens, so
+"the same table" is enforced rather than intended. A missing column is visible
+on screen; a metric field added to one *copy* of the mask and not the other
+would not be, which is why the form is shared and not merely imitated.
+
+Four things the ordinary screen offers are **absent here**, each because it
+would break something specific to an agent-managed server:
+
+- **Delete** — `agent_runtime_specs.mapping_id` cascades, so deleting a row
+  here would silently destroy a launch spec the operator never saw. The specs
+  tab already decides between "delete the spec" and "delete the mapping" and
+  refuses to guess while the spec state is unknown.
+- **Create** — creating a model here is two sequenced writes (mapping, then its
+  spec); a plain mapping create would mint a route the agent can never start.
+  The panel says where creation lives instead.
+- **Modelle synchronisieren** — a sync disables every mapping whose
+  `app_model_name` the agent's `/v1/models` does not list, and the agent lists
+  only *enabled* specs, so one click would take every cold-configured model out
+  of service. (The background `model_sync` health mode can still do this; the
+  button is what is removed, not the coupling — §13.)
+- **Benchmark** — it is navigation, not a table action: it replaces the whole
+  render with the benchmark area and its own breadcrumb bar inside a screen
+  that already has one. Per-model runs stay reachable from the server's
+  benchmark area, whose scope selector offers each mapping.
+
+The tab is deliberately **not** gated on `writesAllowed`. §11.1's rule exists
+for full-document replaces; the mapping PATCH merges per field. Substantively, a
+mapping is a gateway route and stays real on a file-mode server — the specs are
+ineffective there, but taking a model out of service still matters.
+
+The rows are the screen's single copy of the mapping list, shared with the specs
+table, the matrix's spec set and the live-status `spec_id` → mapping join, so a
+rename or a status flip here is immediately true on every other tab with no
+refetch.
+
+### 11.4 Which screen owns which field
+
+The two model names are **not interchangeable**, and after the split each screen
+shows both but edits only its own:
+
+| field | model-mapping tab | launch-spec form (edit) | launch-spec form (create) |
+|---|---|---|---|
+| `gateway_model_name` | editable | read-only | editable, required |
+| `app_model_name` | read-only | editable, required | editable, required |
+| `status` | editable (form + row toggle) | not shown | not shown |
+| metrics, `is_mtp`, `vision_capable`, `metrics_locked` | editable | not shown | not shown |
+
+The **mapping** owns the gateway-facing name and the active/disabled status:
+`status` gates whether the gateway routes the model at all, and the
+runtime-config document never reads it (§8.1). The **runtime spec** owns the
+application model name, because that name *is* the spec's `upstream_model` — the
+only thing `${MODEL}` expands to when the agent builds the process argv (§3.2),
+and the gateway-facing name has no placeholder at all. Changing it under a live
+process re-keys the agent's upstream index to a name that process does not
+serve, which is a decision that belongs behind the form showing the args, not on
+a tab an operator visits casually. It stays *visible* (read-only) on the mapping
+tab because the portal never warns about `${MODEL}` with an empty upstream name.
+
+Read-only is that boundary, not a convenience, and **a form does not send a
+field it does not let you edit**: the spec form's mapping call is
+`{ app_model_name }` alone, and the mapping tab's omits `app_model_name`. Every
+field of the mapping PATCH is a pointer, so an omitted key means "leave it
+byte-for-byte alone"; re-stating a value the form captured when it opened is how
+a second writer silently reverts the first. The `status` case is the sharp one:
+the spec form's state defaulted to `active`, so leaving the key in the body
+while removing the control would make every launch-config save re-enable a model
+an operator deliberately took out of service — no error, no diff, and no column
+on the specs tab that contradicts it.
+
+**Nothing server-side enforces this.** No mapping endpoint special-cases
+`server_agent` (the type is read only to decide whether to push a runtime-config
+notification), and `PutRuntimeSpecRequest` has no name and no status member at
+all — the spec endpoint is *physically incapable* of writing any of the three.
+Those fields ever appeared on the spec form only because submit makes a second
+call to the mapping endpoint. The split is therefore a portal-side convention
+held up by the comments at both call sites and by the regression test named
+after its failure ("a spec edit on a disabled mapping does not re-enable it").
+
+**Create is the deliberate exception** and keeps `gateway_model_name` editable
+and required: that call creates the mapping whose returned id keys the spec PUT,
+the backend refuses an empty gateway name, and the spec form is the only
+mapping-create path a `server_agent` application has — the mapping tab has no
+create button. `status` is dropped from create too, with no behaviour change
+(`CreateMapping` normalises an absent status to active), so the form carries one
+rule rather than a create/edit special case.
+
+### 11.5 What each remaining tab shows
 
 **Launch specs.** One form maintains the mapping and its spec together, so
 creating an agent-managed model is **two sequenced writes** with the partial
@@ -2698,7 +2792,7 @@ startup budget and a 2 s probe timeout instead. A model server whose health
 endpoint answers slowly under load is where that difference shows.
 
 The portal's one cross-field warning
-(`timeout_ms_below_startup_timeout`, §11.3) exists because the gateway's total
+(`timeout_ms_below_startup_timeout`, §11.5) exists because the gateway's total
 deadline keeps running while the agent's router holds the request: **the agent
 runtime alone does not heal the 30 s case.**
 

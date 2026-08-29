@@ -349,7 +349,7 @@ async function openRuntimeStream(): Promise<{
   };
 }
 
-/** Switches the runtime admin to one of its four tabs. */
+/** Switches the runtime admin to one of its five tabs. */
 async function openRuntimeTab(name: string): Promise<void> {
   await page.getByRole("tab", { name }).click();
 }
