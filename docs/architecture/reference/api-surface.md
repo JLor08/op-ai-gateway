@@ -238,7 +238,21 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.application_not_server_agent` | 400 |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
+| `application.proxy_listen_port_invalid` | 400 |
+| `application.proxy_excluded_port_conflict`, `application.proxy_entry_scheme`, `application.proxy_listen_port_conflict` | **409** — the request shape is valid, it conflicts with the target's own state |
 | unmapped | 500 `runtime_spec.request_failed` |
+
+The application endpoints' unmapped fallback is **500 `application.request_failed`**
+(`writePortalApplicationError`), not the `runtime_spec.request_failed` in the row
+above. `application.proxy_listen_port_invalid` and
+`application.proxy_listen_port_conflict` have existed as service sentinels since
+migration 59 but appeared in neither `portalApplicationErrRows` nor
+`sharedErrorMap`, so both fell through to that 500 until this branch mapped them
+— a caller's own bad port reported as a server fault. A direct API consumer that
+sends `proxy_listen_port` therefore sees 400/409 where it used to see 500; the
+portal form never sends the field, so no first-party consumer changes.
+`proxy_excluded_port_conflict` and `proxy_entry_scheme` are new with the
+per-application proxy opt-out ([certificates-tls §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)).
 
 `application.server_agent_exists` (message `server already has a server_agent
 application`) is returned by both the application **create** (POST) and
