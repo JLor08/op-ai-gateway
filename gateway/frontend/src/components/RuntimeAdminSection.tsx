@@ -18,12 +18,15 @@ import {
 import AddIcon from '@mui/icons-material/Add';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
+import BlockIcon from '@mui/icons-material/Block';
+import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
 import ArticleIcon from '@mui/icons-material/Article';
+import SpeedIcon from '@mui/icons-material/Speed';
 import type {
   ApplicationStatus,
   GPUBudget,
@@ -36,6 +39,7 @@ import type {
   RuntimeSpec,
   RuntimeSpecGPU,
   RuntimeStatus,
+  UpdateMappingRequest,
 } from '../api';
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
@@ -49,9 +53,11 @@ import { SelectField } from './shared/SelectField';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
+import { mappingColumns } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
-import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
+import { MappingForm, type MappingFormValues } from './MappingForm';
+import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
 import { RuntimeLogView } from './RuntimeLogView';
 
@@ -59,7 +65,7 @@ import { RuntimeLogView } from './RuntimeLogView';
 // co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
 // still a stub rendered from the same tab strip so the whole section's
 // navigation is visible/testable now.
-type Tab = 'specs' | 'matrix' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'matrix' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -939,6 +945,7 @@ export function RuntimeAdminSection({
   server,
   application,
   trail = [],
+  pollIntervalMs,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -964,10 +971,39 @@ export function RuntimeAdminSection({
     // from the same live-telemetry hardware report the Hardware tab reads.
     | 'updateServer'
     | 'serverHardware'
+    // The model-mapping tab renders the SAME edit mask an ordinary application
+    // gets (`MappingForm`), context-size probe included -- "der selbe Edit" was
+    // the requirement, and the probe fills a field IN that form rather than
+    // navigating away from it. These three serve only that.
+    | 'activeBenchmarks'
+    | 'benchmarkStatus'
+    | 'probeMappingContext'
+    // The mapping tab's per-row "Benchmark" action opens the consolidated
+    // benchmark sub-view (`BenchmarkSection`), which needs its OWN slice of the
+    // api. Exactly the methods it calls -- `mappings` and `benchmarkStatus` are
+    // already listed above, so this adds only the remaining six.
+    | 'applications'
+    | 'benchmarkApplication'
+    | 'benchmarkMapping'
+    | 'benchmarkServer'
+    | 'mappingBenchmarks'
+    | 'subscribeBenchmark'
   >;
   server: PortalServer;
   application: PortalApplication;
   trail?: BreadcrumbItem[];
+  /**
+   * Cadence (ms) of the context probe's benchmark-status poll, forwarded
+   * verbatim to `MappingForm`. Exactly the prop `MappingSection` carries for
+   * the same reason and with the same reach: nothing in the render tree above
+   * either screen passes it, so in the running portal it is `undefined` and the
+   * shared helper's ~2 s cadence applies. It exists so a test can drive the
+   * probe to completion without a real wait -- and the probe is the one part of
+   * the shared mask with an async loop, so without it that loop is reachable on
+   * the ordinary screen's tests and not on this tab's, which is a coverage gap
+   * rather than a saved prop.
+   */
+  pollIntervalMs?: number;
 }>) {
   const { showError, showSuccess } = useToast();
   const [tab, setTab] = useState<Tab>('specs');
@@ -975,6 +1011,15 @@ export function RuntimeAdminSection({
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
   const [loadingEditFor, setLoadingEditFor] = useState('');
+  // The mapping row the model-mapping tab is editing, or null. Kept separate
+  // from `specMode`: they are two different sub-views over two different
+  // documents, and the tab strip is hidden while either is open, so neither can
+  // start the other.
+  const [mappingEdit, setMappingEdit] = useState<PortalModelMapping | null>(null);
+  // When set, the consolidated benchmark sub-view is shown, pre-scoped to the
+  // clicked mapping row's model. A third mutually-exclusive sub-view alongside
+  // `mappingEdit` and `specMode`; the tab strip is hidden while any is open.
+  const [benchmarkScope, setBenchmarkScope] = useState<BenchmarkScope | null>(null);
 
   const {
     data: mappingsData,
@@ -1969,7 +2014,6 @@ export function RuntimeAdminSection({
   // ---- create/edit form state -----------------------------------------
   const [gatewayName, setGatewayName] = useState('');
   const [appName, setAppName] = useState('');
-  const [status, setStatus] = useState<ApplicationStatus>('active');
   const [enabled, setEnabled] = useState(true);
   const [binary, setBinary] = useState('');
   const [argsText, setArgsText] = useState('');
@@ -2035,7 +2079,6 @@ export function RuntimeAdminSection({
   function openCreate() {
     setGatewayName('');
     setAppName('');
-    setStatus('active');
     resetSpecFields();
     setSpecMode('create');
   }
@@ -2051,7 +2094,6 @@ export function RuntimeAdminSection({
   async function openEdit(mapping: PortalModelMapping) {
     setGatewayName(mapping.gateway_model_name);
     setAppName(mapping.app_model_name);
-    setStatus(mapping.status);
     setLoadingEditFor(mapping.id);
     const seen = beginSpecRead(mapping.id);
     try {
@@ -2185,10 +2227,28 @@ export function RuntimeAdminSection({
     setBusy(true);
     let mapping: PortalModelMapping;
     try {
+      // No `status`: the mapping owns it and the Modell-Zuordnung tab edits it.
+      // CreateMapping normalises an absent status to active, byte-for-byte what
+      // the removed hard-coded 'active' produced -- so this form carries ONE
+      // rule (it never sends status) rather than a create/edit special case.
+      //
+      // Gateway name == app model name on CREATE. The operator enters ONLY the
+      // application model name (there is no gateway field on create -- see the
+      // form below); the gateway name is DERIVED from it, exactly as model
+      // discovery seeds a new mapping for an ordinary application
+      // (GatewayModelName == AppModelName == the discovered name,
+      // service_applications.go). The backend requires a non-empty gateway name
+      // (ErrMappingGatewayNameRequired) and sending the app name satisfies it.
+      //
+      // Ownership rule: a DISTINCT gateway alias is set LATER on the
+      // Modell-Zuordnung tab's edit, where the gateway name is editable -- the
+      // same discovery-then-rename flow non-agent applications use. Do NOT
+      // re-add a gateway field to this create form: that would make the operator
+      // enter one name twice and re-create the two-writers hazard the ownership
+      // split removes.
       mapping = await api.createMapping(application.id, {
-        gateway_model_name: gatewayName,
+        gateway_model_name: appName,
         app_model_name: appName,
-        status,
       });
       setMappings((current) => [mapping, ...(current ?? [])]);
       // Pre-seeding `loadedIdsRef` keeps the lazy loader off a row we are about
@@ -2256,11 +2316,25 @@ export function RuntimeAdminSection({
     }
     setBusy(true);
     try {
-      const updated = await api.updateMapping(id, {
-        gateway_model_name: gatewayName,
-        app_model_name: appName,
-        status,
-      });
+      // A form does not send a field it does not let you edit. Read-only here
+      // => not sent from here: the gateway name and the status belong to the
+      // mapping and are edited on the Modell-Zuordnung tab, and this form owns
+      // only `app_model_name` (the spec's upstream_model).
+      //
+      // OMITTED, not echoed. The PATCH is pointer-gated per field, so an absent
+      // key carries no value for that field -- which is what makes the two
+      // screens non-overlapping WRITERS. It does not make the write atomic:
+      // `Service.UpdateMapping` re-writes the whole row it loaded, with no
+      // compare-and-set, so a mapping-tab PATCH landing between this one's read
+      // and its write is still lost. Omission removes the routine clobber, not
+      // the race (11-risks-and-technical-debt.md §11.1). Echoing
+      // `status` here would be worse than redundant: it is a snapshot taken when
+      // this form opened, so a spec save would silently PATCH a deliberately
+      // DISABLED model back into service, with no error and no column on the
+      // specs tab that contradicts it. (The gateway name is the milder case --
+      // no 409 hazard, the conflict check self-excludes -- but the same
+      // lost-update argument applies, so it goes for the same reason.)
+      const updated = await api.updateMapping(id, { app_model_name: appName });
       setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
     } catch (err) {
       showError(formatPortalError(err, t));
@@ -2362,6 +2436,98 @@ export function RuntimeAdminSection({
     }
   }
 
+  // ---- model-mapping tab ------------------------------------------------
+  //
+  // WHO OWNS WHAT, and why this tab exists at all. A mapping and its launch
+  // spec are two documents with one id, and the two model names are NOT
+  // interchangeable:
+  //
+  //   the MAPPING owns `gateway_model_name` (the name the gateway routes and
+  //     offers) and `status` (whether it routes it at all -- the runtime-config
+  //     document never reads that field);
+  //   the RUNTIME SPEC owns `app_model_name`, because it IS the spec's
+  //     `upstream_model` -- the only thing `${MODEL}` expands to when the agent
+  //     builds the process argv, and re-keying it under a live process points
+  //     the agent's upstream route at a name that process does not serve.
+  //
+  // So each screen shows both names and edits only its own. Read-only is that
+  // boundary, not a convenience: nothing server-side enforces it (the mapping
+  // PATCH accepts all three fields from anyone, and the spec PUT accepts none
+  // of them), so re-enabling a field here silently recreates two writers of one
+  // value with no error to show for it.
+  const mappingRowActions = (row: PortalModelMapping): RowAction[] => [
+    {
+      key: 'edit',
+      label: t.mappingEdit,
+      icon: <EditIcon fontSize="small" />,
+      onClick: () => setMappingEdit(row),
+    },
+    // "Benchmark bleibt": measures a model, never creates or destroys a row, so
+    // the argument that dropped Delete/create/sync from this tab does not reach
+    // it. Opens the consolidated benchmark sub-view scoped to this mapping,
+    // exactly as `MappingSection`'s own row action does.
+    {
+      key: 'benchmark',
+      label: t.runBenchmark,
+      icon: <SpeedIcon fontSize="small" />,
+      onClick: () =>
+        setBenchmarkScope({ kind: 'mapping', id: row.id, name: row.gateway_model_name }),
+    },
+    {
+      key: 'toggle',
+      label: row.status === 'active' ? t.tokenActionDisable : t.tokenActionEnable,
+      icon:
+        row.status === 'active' ? (
+          <BlockIcon fontSize="small" />
+        ) : (
+          <CheckCircleIcon fontSize="small" />
+        ),
+      onClick: () => void toggleMappingStatus(row),
+    },
+    // No Delete, and not only because it was asked for: `agent_runtime_specs`
+    // references the mapping ON DELETE CASCADE, so deleting a row here would
+    // silently destroy a launch spec the operator never saw. The specs tab
+    // already answers that question properly (`deleteMeaning` refuses to guess
+    // while the spec state is unknown); a second, dumber answer beside it is
+    // worse than none.
+  ];
+
+  async function toggleMappingStatus(row: PortalModelMapping) {
+    const next: ApplicationStatus = row.status === 'active' ? 'disabled' : 'active';
+    try {
+      const updated = await api.updateMapping(row.id, { status: next });
+      setMappings((current) => (current ?? []).map((m) => (m.id === row.id ? updated : m)));
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    }
+  }
+
+  async function saveMappingFromTab(id: string, values: MappingFormValues) {
+    setBusy(true);
+    try {
+      // Read-only here => not sent from here. `app_model_name` belongs to the
+      // runtime spec (see the ownership note above) and the mapping PATCH is
+      // pointer-gated per field, so an ABSENT key carries no value for it.
+      // Re-stating the value we happen to hold is not equivalent: it is a
+      // snapshot from when this form opened, and it would overwrite a spec edit
+      // made in between with no error and nothing on screen to show it.
+      //
+      // That is the CLOBBER, and omission is what removes it. The RACE is still
+      // open and is not ours to close here: the backend re-writes the whole row
+      // it loaded, so a spec-form PATCH that lands between this call's read and
+      // its write is reverted anyway (11-risks-and-technical-debt.md §11.1).
+      const body: UpdateMappingRequest = { ...values };
+      delete body.app_model_name;
+      const updated = await api.updateMapping(id, body);
+      setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
+      setMappingEdit(null);
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const statusBySpecId = new Map(statusRows.map((row) => [row.spec_id, row]));
   function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
     const specId = specsById[m.id]?.id;
@@ -2440,7 +2606,12 @@ export function RuntimeAdminSection({
       // spec the agent has never reported, is "unknown": deliberately NOT
       // "stopped", which would be a claim we cannot make.
       id: 'live_status',
-      label: t.tableStatus,
+      // NOT `t.tableStatus` any more: the tab immediately to the left now
+      // carries a "Status" column meaning the MAPPING's active/disabled, while
+      // this one means the process's running/stopped/unknown. Two adjacent tabs
+      // must not label two different facts with one word. The column `id` is
+      // unchanged, so persisted column preferences survive.
+      label: t.runtimeLiveStatus,
       value: (m) => statusLabelForMapping(m),
       filter: 'enum',
       sortable: false,
@@ -2836,6 +3007,79 @@ export function RuntimeAdminSection({
         ? { status: 'standby', label: t.runtimeStreamOffline }
         : { status: 'watch', label: t.runtimeStreamConnecting };
 
+  // Consolidated benchmark sub-view, pre-scoped to the clicked mapping row's
+  // model. Same full-render-takeover convention as the two sub-views below.
+  //
+  // The one hazard the copy from `MappingSection` must NOT reproduce: that
+  // component's benchmark wrapper renders its OWN <Breadcrumbs> bar, and this
+  // section already renders one -- a naive copy stacks two. So the bar here is
+  // built from THIS section's `trail` (the single source every sub-view uses)
+  // and `BenchmarkSection` carries no bar of its own, which leaves exactly one.
+  if (benchmarkScope) {
+    return (
+      <>
+        <Breadcrumbs
+          ariaLabel={t.breadcrumb}
+          backLabel={t.back}
+          items={[
+            ...trail,
+            { label: application.endpoint, onClick: () => setBenchmarkScope(null) },
+            { label: t.benchmarkArea },
+          ]}
+        />
+        <BenchmarkSection
+          key={`bench-${server.id}`}
+          t={t}
+          api={api}
+          server={server}
+          initialScope={benchmarkScope}
+          // A completed run may have discovered a model's context size, so the
+          // one copy of the mappings these tabs share is refreshed on completion.
+          onModelsChanged={() => void reloadMappings()}
+          pollIntervalMs={pollIntervalMs}
+        />
+      </>
+    );
+  }
+
+  // Model-mapping edit sub-view. Same full-render-takeover convention as the
+  // spec form below, and the SAME mask an ordinary application's model screen
+  // uses -- one definition (`MappingForm`), so "die selbe Tabelle / der selbe
+  // Edit" is enforced rather than merely intended.
+  if (mappingEdit) {
+    return (
+      <>
+        <Breadcrumbs
+          ariaLabel={t.breadcrumb}
+          backLabel={t.back}
+          items={[
+            ...trail,
+            { label: application.endpoint, onClick: () => setMappingEdit(null) },
+            { label: t.mappingEditTitle },
+          ]}
+        />
+        <Panel titleId="runtime-mapping-form-heading" title={t.mappingEditTitle}>
+          <MappingForm
+            key={mappingEdit.id}
+            t={t}
+            api={api}
+            serverId={server.id}
+            contextProbePath={application.context_probe_path ?? ''}
+            row={mappingEdit}
+            // The one difference from the ordinary mapping screen, and it is an
+            // ownership boundary: this application HAS a runtime spec, and the
+            // spec owns the application model name (its `upstream_model`).
+            appNameReadOnly
+            busy={busy}
+            onSubmit={(values) => void saveMappingFromTab(mappingEdit.id, values)}
+            onCancel={() => setMappingEdit(null)}
+            pollIntervalMs={pollIntervalMs}
+          />
+        </Panel>
+      </>
+    );
+  }
+
   // Create / edit sub-view (input mask) -- replaces the tabbed view entirely,
   // matching the rest of the portal's drill-down/sub-view convention.
   if (specMode !== 'list') {
@@ -2864,16 +3108,46 @@ export function RuntimeAdminSection({
             onSubmit={editing ? submitEdit : submitCreate}
             sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 560px)', gap: 2.25 }}
           >
+            {/* Two model NAMES, and this form owns exactly one of them.
+                The MAPPING owns the gateway-facing name and the active/disabled
+                status; the RUNTIME SPEC owns the application model name,
+                because that name IS the spec's `upstream_model` -- the only
+                thing ${MODEL} expands to when the agent builds the process
+                argv. So on EDIT the gateway name is SHOWN read-only (a spec is
+                unreadable without knowing which model it serves) and edited one
+                tab to the left, and the status select is gone entirely: it
+                edited the MAPPING and never reached putRuntimeSpec, whose
+                request type has no status field at all.
+
+                On CREATE there is NO gateway field: the operator enters only
+                the application model name and `submitCreate` DERIVES the gateway
+                name from it (gateway == app), exactly as model discovery seeds a
+                new mapping. A distinct gateway alias is set later on the
+                Modell-Zuordnung tab's edit -- the discovery-then-rename flow.
+                Ownership rule: do not re-add a gateway field here, or the
+                operator types one name twice and two screens write it again.
+
+                Do not confuse the removed status select with the "Aktiv"
+                checkbox below. That one is `spec.enabled`, which decides whether
+                this spec enters the agent's runtime-config document -- a
+                different question from whether the gateway routes the model. */}
             <Typography variant="subtitle2" component="h3">
-              {t.runtimeSpecMappingSection}
+              {t.runtimeSpecModelSection}
             </Typography>
-            <Field
-              id="runtime-spec-gateway-name"
-              label={t.mappingGatewayName}
-              value={gatewayName}
-              onChange={(e) => setGatewayName(e.target.value)}
-              required
-            />
+            {editing && (
+              <Field
+                id="runtime-spec-gateway-name"
+                label={t.mappingGatewayName}
+                value={gatewayName}
+                // Read-only on EDIT, and the no-op is load-bearing: jsdom fires
+                // `change` on a readOnly input, so a live handler would still
+                // drive state and give a test a false green. The mapping owns
+                // this name; the Modell-Zuordnung tab edits it.
+                onChange={() => {}}
+                inputProps={{ readOnly: true }}
+                helperText={t.runtimeSpecGatewayNameReadOnly}
+              />
+            )}
             <Field
               id="runtime-spec-app-name"
               label={t.mappingAppName}
@@ -2881,18 +3155,6 @@ export function RuntimeAdminSection({
               onChange={(e) => setAppName(e.target.value)}
               required
             />
-            <SelectField
-              id="runtime-spec-status"
-              label={t.tableStatus}
-              value={status}
-              onChange={(e) => setStatus(e.target.value as ApplicationStatus)}
-            >
-              {applicationStatusOptions.map((s) => (
-                <option value={s} key={s}>
-                  {t[applicationStatusLabelByKey[s]]}
-                </option>
-              ))}
-            </SelectField>
 
             <Typography variant="subtitle2" component="h3" sx={{ mt: 1 }}>
               {t.runtimeSpecConfigSection}
@@ -3319,12 +3581,43 @@ export function RuntimeAdminSection({
         aria-label={t.runtimeAdmin}
         sx={{ mb: 2.5 }}
       >
+        <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
         <Tab label={t.runtimeMatrix} value="matrix" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
 
+      {tab === 'mapping' && (
+        <Panel
+          titleId="runtime-mapping-heading"
+          title={t.modelMappings}
+          subtitle={t.modelMappingsIntro}
+        >
+          {/* Deliberately NOT gated on `writesAllowed`. ADR-029's "no write
+              control before its own GET has resolved" governs the FULL-DOCUMENT
+              replaces (spec PUT, co-residency PUT, budget PUT); the mapping
+              PATCH merges per field and is exempt. Substantively: a mapping is
+              a gateway ROUTE, so on a file-mode server the specs are
+              ineffective but taking a model out of service still matters --
+              copying the gate would leave an operator unable to do it. */}
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+            {t.runtimeMappingCreateHint}
+          </Typography>
+          <ListTable
+            rows={mappings}
+            columns={mappingColumns(t)}
+            rowKey={(m) => m.id}
+            actions={mappingRowActions}
+            // NOT 'op.mappings': ListTable persists column order/visibility,
+            // sort and page size under this key, and sharing it would fuse this
+            // tab's layout with the ordinary mapping screen's into one setting.
+            storageKey="op.runtimeMappings"
+            labels={listTableLabels(t)}
+            loading={mappingsStatus === 'loading'}
+          />
+        </Panel>
+      )}
       {tab === 'specs' && (
         <Panel
           titleId="runtime-specs-heading"

@@ -454,6 +454,10 @@ const de = {
     'TLS-Proxy-Port: noch nicht vergeben — das Gateway vergibt ihn, sobald der Agent das nächste Mal seine Routen abruft (bis zu 15 min über POST, bis zu 6 h über WebSocket).',
   mappingGatewayName: 'Gateway-Modellname',
   mappingAppName: 'Anwendungs-Modellname',
+  // Helper text under the read-only Anwendungs-Modellname on the agent runtime's
+  // Modell-Zuordnung tab: the runtime spec owns that name (it is the spec's
+  // upstream_model, what ${MODEL} expands to), so it is edited there.
+  mappingAppNameReadOnly: 'Wird in der Runtime-Spezifikation bearbeitet (${MODEL}).',
   tableEndpoint: 'Endpoint',
   applicationCreate: 'Anwendung anlegen',
   applicationEdit: 'Bearbeiten',
@@ -565,7 +569,17 @@ const de = {
     'Löschen ist gesperrt, solange noch nicht bekannt ist, ob für diese Zuordnung eine Runtime-Spezifikation existiert – die Abfrage läuft noch.',
   runtimeSpecDeleteStateUnknown:
     'Löschen ist gesperrt: Die Runtime-Spezifikation dieser Zuordnung konnte nicht geladen werden, daher ist unbekannt, ob eine existiert. Über „Bearbeiten“ erneut laden.',
-  runtimeSpecMappingSection: 'Modell-Zuordnung',
+  // The Modell-Zuordnung TAB label. Same string as the spec form's section
+  // heading below, and deliberately so: it is the operator's own word for the
+  // mapping table, which now has its own tab left of the launch specs.
+  runtimeMappingTab: 'Modell-Zuordnung',
+  runtimeMappingCreateHint:
+    'Neue Modelle werden im Reiter „Runtime-Spezifikationen“ angelegt — Zuordnung und Spezifikation entstehen dort zusammen.',
+  // The spec form's first heading. It is no longer "the mapping": the status
+  // select moved to the Modell-Zuordnung tab and the gateway name is
+  // read-only here, so what is left in that block are two model NAMES.
+  runtimeSpecModelSection: 'Modell-Namen',
+  runtimeSpecGatewayNameReadOnly: 'Wird im Reiter „Modell-Zuordnung“ bearbeitet.',
   runtimeSpecConfigSection: 'Startkonfiguration',
   runtimeSpecListenPort: 'Listen-Port',
   runtimeSpecListenPortHelp: '0 = automatisch einen freien Port wählen',
@@ -2422,6 +2436,7 @@ const en: PortalMessages = {
     'TLS proxy port: not assigned yet — the gateway assigns it the next time the agent fetches its routes (up to 15 min over POST, up to 6 h over WebSocket).',
   mappingGatewayName: 'Gateway model name',
   mappingAppName: 'Application model name',
+  mappingAppNameReadOnly: 'Edited in the runtime specification (${MODEL}).',
   tableEndpoint: 'Endpoint',
   applicationCreate: 'Create application',
   applicationEdit: 'Edit',
@@ -2526,7 +2541,11 @@ const en: PortalMessages = {
     'Deleting is locked while it is not yet known whether this mapping has a runtime spec — the query is still running.',
   runtimeSpecDeleteStateUnknown:
     'Deleting is locked: this mapping\'s runtime spec could not be loaded, so whether one exists is unknown. Use "Edit" to load it again.',
-  runtimeSpecMappingSection: 'Model mapping',
+  runtimeMappingTab: 'Model mapping',
+  runtimeMappingCreateHint:
+    'New models are created on the Runtime specs tab — the mapping and its specification are written together there.',
+  runtimeSpecModelSection: 'Model names',
+  runtimeSpecGatewayNameReadOnly: 'Edited on the Model mapping tab.',
   runtimeSpecConfigSection: 'Launch configuration',
   runtimeSpecListenPort: 'Listen port',
   runtimeSpecListenPortHelp: '0 = choose a free port automatically',

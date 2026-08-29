@@ -168,7 +168,14 @@ Two additions worth knowing when looking for code on this side:
   **instead of** `MappingSection` — same row-action label, only the destination
   differs — which is why that section must also cover the plain mapping CRUD
   `MappingSection` would otherwise have provided, and why a reader looking for
-  the mapping editor on an agent-managed server will not find it. A shared
+  the mapping editor on an agent-managed server will not find it. It covers it
+  on its leftmost **model mapping** tab, rendering the *same* table and the
+  *same* edit mask through two shared definitions —
+  `components/shared/mappingColumns.tsx` and `components/MappingForm.tsx`,
+  both also used by `MappingSection`. Which screen may WRITE which field is an
+  ownership split, not a UI preference; it is specified in
+  [`agent-runtime-manager.md` §11.4](cross-cutting/agent-runtime-manager.md#114-which-screen-owns-which-field).
+  A shared
   `components/shared/ResourceFallback.tsx` (`resourceState()` +
   `<ResourceFallback>`) was extracted there as the canonical
   loading/error/stale-error/ready rendering for `useResource` call sites.
