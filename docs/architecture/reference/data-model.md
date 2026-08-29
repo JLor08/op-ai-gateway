@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (69 migrations)
+## 4. Migration history (70 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -473,6 +473,19 @@ plausible-looking validation rule would break the normal case:
   redaction happen in the gateway's ingest before the upsert, so anyone adding a
   second writer of this table must repeat them — the store will happily persist
   unredacted secrets.
+- **`applications.proxy_excluded = 1` implies `proxy_listen_port = 0`.**
+  Participation in the gateway TLS proxy is operator-owned and orthogonal to
+  `scheme`. The invariant is enforced **only** by `applyProxyExclusion` in the
+  portal service — never by SQL (migration 70 adds no CHECK, index or trigger) and
+  never by the memory driver. Note what it does **not** say: `proxy_excluded = 0`
+  together with `proxy_listen_port = 0` is the normal **pre-assignment** state of a
+  participating `http` application, and a validation rule that rejected it would
+  break every application between creation and the agent's next routes fetch. See
+  [ADR-030](../09-architecture-decisions.md#adr-030--proxy-participation-is-an-operator-owned-flag-with-a-port-invariant-not-an-encoding),
+  [Certificates & TLS §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)
+  for the three-way write contract, and
+  [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks) for what a
+  violating row costs.
 
 Read shapes and store-level behaviour worth knowing:
 
@@ -500,3 +513,10 @@ Read shapes and store-level behaviour worth knowing:
 - [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md) —
   what the runtime tables are *for*: the admission rule they feed, the document
   assembled from them, and the portal screen that edits them.
+- [Certificates & TLS §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)
+  — the automatic HTTPS switch, and the write contract behind
+  `applications.proxy_excluded` / `proxy_listen_port`.
+- [ADR-030](../09-architecture-decisions.md#adr-030--proxy-participation-is-an-operator-owned-flag-with-a-port-invariant-not-an-encoding)
+  — why participation is its own column rather than an encoding, and why
+  migration 70 backfills rather than deriving forever. It links *to* this file;
+  this is the way back.
