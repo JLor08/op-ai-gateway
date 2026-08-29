@@ -344,6 +344,51 @@ the end of the mutation block in both `CreateApplication` and
 
 > `ProxyExcluded == true` implies `ProxyListenPort == 0`.
 
+That enforcement point is `applyProxyExclusion`
+(`internal/portal/service_applications.go`), and it is worth reading as a **write
+contract**. Its first three rules branch on the **presence** of the request field
+`proxy_excluded` (`*bool`, `omitempty`), not on its value, so the three arms answer
+the same *resolved* shape differently:
+
+- **Explicit `true`** with a non-zero `proxy_listen_port` named in the **same**
+  request → refused, **409 `application.proxy_excluded_port_conflict`**. Silently
+  zeroing a port the caller asked for in the same breath would be a lie. Explicit
+  `true` **alone** clears the *stored* port, which is the completion of the
+  instruction rather than a contradiction of it — and it is what releases the port
+  to the free pool.
+- **Explicit `false`** whose resolved shape is `effectiveScheme == "https"` with
+  `ProxyListenPort == 0` → refused, **409 `application.proxy_entry_scheme`**. A
+  participating application must serve plaintext on its own port, because the
+  agent's proxy forwards decrypted traffic to `http://127.0.0.1:<Port>`; only the
+  gateway assigns a proxy port, and only to candidates, so `http` is the only
+  re-entry.
+- **Omitted** for that identical resolved shape → normalized to
+  `proxy_excluded = true`, silently, and the request **succeeds**. This is the
+  retired implicit encoding's only reader anywhere in the tree, and it runs on
+  **every** write, not only in migration 70's backfill. That is deliberate: it is
+  what keeps the column authoritative for a row a *pre-70* client wrote in the old
+  encoding, with no reader re-deriving anything. The consequence worth knowing is
+  that such a row — `https`, port `0`, `proxy_excluded = 0`, which post-70 arises
+  only from a pre-70 writer or a direct store write — flips to excluded on the next
+  PATCH of **any** field, without the caller asking.
+
+So the same stored shape answers 200 or 409 depending purely on whether the caller
+mentioned the field. The repository documents an omission-versus-explicit-value
+distinction of the same class for `climb_speed_margin_percent`
+([Routing & Model Selection §5](routing-and-model-selection.md#5-model-groups)):
+an unset field and a deliberate value are not the same thing.
+
+A fourth rule closes what the first three cannot. Each of them reasons about the
+**shape of the request** while the invariant is a property of the **resolved
+row**, so a sequence of two ordinary PATCHes — exclude, then set a port while
+saying nothing about participation — slipped past all three: rule 1 refuses an
+explicit port only when the *same* request also excludes, and rule 3 is guarded on
+`!ProxyExcluded` and so does nothing at all for an already-excluded row. Rule 4
+therefore tests the **post-mutation** state: refuse when the caller named the port,
+clear it otherwise. It is the whole reason the paragraph below can say "never", and
+it must not be folded back into the arms above it. There is no backstop behind it
+on any driver — see [§11.1](../11-risks-and-technical-debt.md#111-operational-risks).
+
 That invariant is why `ApplicationEndpoint`, `activePortStrings`,
 `revertScopeExit` and `HTTPSSwitchUnreachableApps` need no knowledge of the
 flag at all: each tests `scheme == "https" && ProxyListenPort != 0`, which an
@@ -375,6 +420,41 @@ An excluded application is also **structurally invisible** to
 `HTTPSSwitchUnreachableApps`, whose filter starts with the candidate predicate.
 That is correct — the gateway is not managing it — but it has to be said out
 loud, because otherwise the silence reads as health.
+
+#### The `tls_proxy_state` field on the server DTO
+
+`ServerDTO.tls_proxy_state` (`internal/portal/service.go`, no `omitempty`) is
+derived per request by `Service.tlsProxyState` and is always one of four values:
+
+- `out_of_scope` — the server is outside https-switch scope (`httpsSwitchInScope`
+  against `cert_https_switch_mode`). Derived from **durable** state only: a stored
+  server column plus a stored setting.
+- `proxy` — the agent's in-RAM cert report says `cert_mode: "proxy"`.
+- `agent_off` — that report says `"off"` or `"files"`.
+- `unknown` — no settings read succeeded, no cert report, or a report whose mode
+  the ingest sanitizer dropped. A dropped mode says nothing *about* the mode; it
+  is not evidence of `"off"`.
+
+**A missing or unreadable value MUST default to `unknown`, never to
+`out_of_scope`.** Only `out_of_scope` hides the per-application proxy opt-out
+control in the portal; `agent_off` and `unknown` change only the sentence shown.
+The reason is that the cert report is in-RAM and legitimately absent twice — after
+every gateway restart, and on a proxy-mode agent before its first leaf — so a
+control gated on it would vanish exactly while an operator was provisioning. A
+failed settings read resolves to `unknown` for the same reason: the "settings were
+readable" flag is carried as an explicit boolean rather than a nil map, which would
+fall through to the `manual` default and hence to `out_of_scope`. The portal
+applies the same default on its side (`server.tls_proxy_state ?? 'unknown'`), so an
+older backend or a DTO that lost the field shows the control rather than hiding it.
+**Override, non-negotiable:** an application that *is* excluded renders the control
+in **every** state, `out_of_scope` included — an operator must always be able to
+see and undo their own setting.
+
+The state is resolved from **one** settings read per list response
+(`ListServers` threads a single snapshot through `serverDTOWith`), not one read per
+row, so a single `ListServers` response can never describe server #1 under the old
+`cert_https_switch_mode` and server #100 under the new one. That is a read-consistency
+property, not a micro-optimisation.
 
 ### 7.1 No automatic downgrade to plaintext
 

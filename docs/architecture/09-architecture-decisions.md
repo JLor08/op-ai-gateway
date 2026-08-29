@@ -300,10 +300,16 @@ next fetch and is flipped to `https` on the next reconcile. **Decision:** a new
 operator-owned column, `applications.proxy_excluded` (migration 70), is the
 **authoritative and only** representation of participation, orthogonal to
 `scheme`; migration 70 **backfills** the retired encoding into it, so the two do
-not coexist. Three fields carry one meaning each — participation, transport,
-listener identity — held together by the invariant **`ProxyExcluded == true`
-implies `ProxyListenPort == 0`**, enforced at the end of the mutation block in
-both `CreateApplication` and `UpdateApplication`. **Consequence:** four other
+not coexist. The backfill is not the only reader of that encoding: the write path
+re-applies the same translation on **every** write (a request that says nothing
+about participation and resolves to `https` with no proxy port is normalized to
+excluded), which is what keeps the column authoritative for a row a pre-70 client
+writes in the old spelling. Three fields carry one meaning each — participation,
+transport, listener identity — held together by the invariant
+**`ProxyExcluded == true` implies `ProxyListenPort == 0`**, enforced at the end of
+the mutation block in both `CreateApplication` and `UpdateApplication` by a rule
+that tests the POST-MUTATION row, because every rule that branches on the shape of
+the request alone lets a two-request sequence through. **Consequence:** four other
 derivations (`ApplicationEndpoint`, `activePortStrings`, `revertScopeExit`,
 `HTTPSSwitchUnreachableApps`) each test `https && ProxyListenPort != 0`, which an
 excluded application can never satisfy, so none of them changes; the candidate
