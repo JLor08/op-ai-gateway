@@ -131,6 +131,20 @@ func TestHTTPSSwitchNeverTouchesAnExcludedApplication(t *testing.T) {
 	if err := svc.routes.UpdateApplication(ctx, inScope); err != nil {
 		t.Fatalf("mark in-scope app excluded: %v", err)
 	}
+	// The row that makes the in-scope arm a REAL guard rather than a vacuous
+	// one. An excluded application with ProxyListenPort 0 is skipped by the
+	// reconcile's own "no port assigned yet" clause, so it would stay http even
+	// if this feature did not exist -- the port is what AgentProxyRoutes
+	// withholds, and that is covered by its own test. This row carries a
+	// NON-ZERO port (reachable only by a direct store write, since the portal's
+	// invariant forbids it) with the agent reporting tls_active=true for it, so
+	// the ONLY thing standing between it and a forward flip to https is
+	// isProxySwitchCandidate's ProxyExcluded clause.
+	held := mustCreateSwitchTestApp(t, svc, ctx, "app-in-excluded-holding-port", "srv-in", 8091, 8602)
+	held.ProxyExcluded = true
+	if err := svc.routes.UpdateApplication(ctx, held); err != nil {
+		t.Fatalf("mark port-holding app excluded: %v", err)
+	}
 	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
 		"srv-in": {
 			{Listen: 8600, TLSActive: true},
@@ -153,6 +167,9 @@ func TestHTTPSSwitchNeverTouchesAnExcludedApplication(t *testing.T) {
 	if got := schemeOf(t, svc, ctx, "app-in-excluded"); got != "http" {
 		t.Fatalf("in-scope excluded http app: scheme = %q, want http (never forwarded)", got)
 	}
+	if got := schemeOf(t, svc, ctx, "app-in-excluded-holding-port"); got != "http" {
+		t.Fatalf("in-scope excluded app HOLDING a port whose listener reports tls_active=true: scheme = %q, want http -- the forward arm must be stopped by the exclusion alone", got)
+	}
 	after, err := svc.routes.ApplicationByID(ctx, "app-in-excluded")
 	if err != nil {
 		t.Fatalf("read app-in-excluded: %v", err)
@@ -166,7 +183,7 @@ func TestHTTPSSwitchNeverTouchesAnExcludedApplication(t *testing.T) {
 	// managing this application -- but it is asserted so the silence is a
 	// pinned property rather than an accident.
 	for _, row := range svc.HTTPSSwitchUnreachableApps(ctx) {
-		if row.AppID == "app-excluded" || row.AppID == "app-in-excluded" {
+		if row.AppID == "app-excluded" || row.AppID == "app-in-excluded" || row.AppID == "app-in-excluded-holding-port" {
 			t.Fatalf("HTTPSSwitchUnreachableApps named an excluded application: %+v", row)
 		}
 	}
