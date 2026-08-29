@@ -17,6 +17,7 @@ import type {
   RuntimeSpec,
   ServerHealthStatus,
   SystemSettings as SystemSettingsDTO,
+  UpdateServerRequest,
 } from '../api';
 import type { PortalApi } from './shared/types';
 import type { CurrencyUnit } from '../currency';
@@ -1349,6 +1350,40 @@ describe('ServerList NetBird', () => {
     };
   }
 
+  // Opens the create form only once the netbirdEnabled() fetch's state has been
+  // COMMITTED -- which "it has been called" does not imply, and which every
+  // assertion below about the create form's INITIAL state depends on.
+  //
+  // openCreate SNAPSHOTS netbird_only, manage_policies, the effective scope and
+  // deny-by-default into the form's own state (setNetbirdChecked,
+  // setCreatePolicyOverride) at click time. A click dispatched before that
+  // fetch's setStates are committed therefore runs the PRE-fetch render's
+  // closure, where netbird_only is still false: the box opens unchecked and the
+  // override falls to ''. No later commit repairs either -- openCreate never
+  // runs again -- so a `waitFor` placed AFTER the click cannot rescue it; it can
+  // only burn its timeout and fail.
+  //
+  // `waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled())` was not a
+  // synchronisation point for any of that: the call happens at mount, one
+  // microtask before the fake resolves and one macrotask before React's
+  // Scheduler commits the update, while waitFor returns the moment its callback
+  // passes. The two race. Measured on a reproduction that changes nothing but
+  // the clock React's scheduler reads -- +6 ms per reading, so every unit of
+  // work blows the 5 ms frame budget and the concurrent render yields and
+  // re-schedules, which is what CPU load does to it -- six tests in this file
+  // fail, the SYSTEM-admin case at `expect(checkbox.checked).toBe(true)`.
+  //
+  // The list's NetBird column renders on netbirdModuleEnabled, which lands in
+  // the SAME batched commit as the other four values, so its header is a
+  // committed-state proxy for all of them and strictly stronger than the call
+  // count (it also proves the response said enabled). It exists only under
+  // moduleEnabled: true; the module-disabled cases have no positive marker to
+  // wait for and keep the call-count wait.
+  async function openCreateOnceNetbirdFlagsCommitted() {
+    await screen.findByRole('columnheader', { name: t.settingsNetbirdTitle });
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+  }
+
   it('hides the create checkbox when the module is disabled', async () => {
     const { fakeApi } = renderNb({ moduleEnabled: false });
     await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
@@ -1394,14 +1429,13 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
     expect(checkbox).toBeDisabled();
@@ -1419,14 +1453,13 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
     expect(checkbox).not.toBeDisabled();
@@ -1443,9 +1476,8 @@ describe('ServerList NetBird', () => {
   });
 
   it('leaves the create checkbox unchecked + editable + note-free when netbird_only is off', async () => {
-    const { fakeApi } = renderNb({ moduleEnabled: true, netbirdOnly: false });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    renderNb({ moduleEnabled: true, netbirdOnly: false });
+    await openCreateOnceNetbirdFlagsCommitted();
     const checkbox = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
     expect(checkbox).not.toBeDisabled();
@@ -2310,14 +2342,27 @@ describe('ServerList NetBird', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: t.listRowMenu }));
     fireEvent.click(await screen.findByRole('menuitem', { name: t.serverActionEdit }));
+    // Same cause as the create-form sites above, other fetch: getSystemSettings
+    // having been CALLED says nothing about its rejection having been committed,
+    // and under a slow commit this test failed with the include control still on
+    // screen. It renders from the netbirdEnabled scope ('selected', renderNb's
+    // default) the moment the edit form opens and the failure can only clear it a
+    // microtask later, so asserting it PRESENT first is also what stops the
+    // absence assertions from passing vacuously -- before the scope lands the
+    // control is absent for the wrong reason.
+    expect(
+      screen.getByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
+    ).toBeInTheDocument();
     await waitFor(() => expect(getSystemSettings).toHaveBeenCalled());
     // The rest of the linkage editor still renders (never blocked by the failure).
     expect(screen.getByRole('button', { name: t.serverNetbirdLinkSave })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
+      ).not.toBeInTheDocument(),
+    );
     expect(
       screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyExclude }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole('checkbox', { name: t.serverNetbirdPolicyInclude }),
     ).not.toBeInTheDocument();
   });
 
@@ -2415,7 +2460,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2424,12 +2469,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state (manage/scope/deny) to flush into the DOM before the
-    // policy assertions — the netbird checkbox becomes checked once the fetch lands.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once manage/scope/deny are
+    // committed: the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box).toBeDisabled();
@@ -2445,7 +2489,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2454,11 +2498,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box).not.toBeDisabled();
@@ -2476,7 +2520,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2485,11 +2529,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: false,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyInclude)) as HTMLInputElement;
     expect(box.checked).toBe(false);
     expect(box).not.toBeDisabled();
@@ -2507,7 +2551,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2516,11 +2560,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     const box = (await screen.findByLabelText(t.serverNetbirdPolicyExclude)) as HTMLInputElement;
     expect(box.checked).toBe(false);
     expect(screen.getByText(t.serverNetbirdPolicyOptOutDenyNote)).toBeInTheDocument();
@@ -2532,7 +2576,7 @@ describe('ServerList NetBird', () => {
   });
 
   it('shows NO policy control for a NORMAL admin under all scope on create (netbird still forced on)', async () => {
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: true,
@@ -2540,19 +2584,18 @@ describe('ServerList NetBird', () => {
       denyByDefault: true,
       isSystemAdmin: false,
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await openCreateOnceNetbirdFlagsCommitted();
     // The netbird checkbox is forced on for a normal admin under netbird_only, but the
-    // all-scope opt-out is system-admin-only → neither policy control renders. Wait for the
-    // mount-effect state to flush (checkbox checked) before the absence assertions.
+    // all-scope opt-out is system-admin-only → neither policy control renders. Synchronous
+    // now that the form is opened only once the flags are committed.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     expect(screen.queryByLabelText(t.serverNetbirdPolicyExclude)).toBeNull();
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
   });
 
   it('shows NO policy control when manage_policies is off on create', async () => {
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: false,
@@ -2560,11 +2603,11 @@ describe('ServerList NetBird', () => {
       denyByDefault: true,
       isSystemAdmin: true,
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
   });
 
@@ -2575,7 +2618,7 @@ describe('ServerList NetBird', () => {
       async (body: CreateServerRequest) =>
         ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
     );
-    const { fakeApi } = renderNb({
+    renderNb({
       moduleEnabled: true,
       netbirdOnly: true,
       managePolicies: false,
@@ -2584,11 +2627,11 @@ describe('ServerList NetBird', () => {
       isSystemAdmin: true,
       createServer: createServer as unknown as PortalApi['createServer'],
     });
-    await waitFor(() => expect(fakeApi.netbirdEnabled).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
-    // Wait for the mount-effect state to flush (netbird checkbox checked) before asserting.
+    await openCreateOnceNetbirdFlagsCommitted();
+    // Synchronous now that the form is opened only once the flags are committed:
+    // the pre-selection is decided at openCreate and cannot arrive later.
     const nb = (await screen.findByLabelText(t.serverNetbirdEnable)) as HTMLInputElement;
-    await waitFor(() => expect(nb.checked).toBe(true));
+    expect(nb.checked).toBe(true);
     // No policy control (manage off).
     expect(screen.queryByLabelText(t.serverNetbirdPolicyInclude)).toBeNull();
     fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
@@ -2931,5 +2974,213 @@ describe('ServerList live poll', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// managed_runtime_only (issue #25): the server form's own control for the flag
+// whose downstream effects ApplicationSection already implements. It lives HERE
+// and not on RuntimeAdminSection's "server limits" tab -- that tab is reached
+// only through an existing server_agent application's manage-models action, so a
+// control there could not be set before provisioning the very application the
+// flag governs.
+describe('ServerList managed_runtime_only control', () => {
+  function managedApi(over: Partial<ServerListApi> = {}): ServerListApi {
+    return {
+      ...baseServerListApi(),
+      adminUsers: vi.fn(async () => ({ data: [] })),
+      activeBenchmarks: vi.fn(async () => []),
+      serverAdminGroupCandidates: vi.fn(async () => defaultAdminGroupCandidates),
+      ...over,
+    };
+  }
+
+  function renderForm(api: ServerListApi, servers: PortalServer[], role = 'admin') {
+    render(
+      <ToastProvider>
+        <ServerList t={t} api={api} servers={servers} setServers={vi.fn()} role={role} />
+      </ToastProvider>,
+    );
+  }
+
+  // NetBird stays off in every test here, so the row has 9 actions and
+  // ListTable renders them inline -- the edit action is a plain button, with no
+  // menu to open (and hence no aria-hidden overlay over the form behind it).
+  function openEditForm() {
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionEdit }));
+  }
+
+  // A PATCH stub whose response is a valid PortalServer. Deliberately NOT
+  // `{...server, ...body}`: UpdateServerRequest types `status` as a plain
+  // string, so spreading it over the DTO widens PortalServer's ServerStatus
+  // union. Nothing here reads the response back, so echoing the two fields
+  // these tests vary is enough -- the assertions are all on the request.
+  function echoUpdate(server: PortalServer) {
+    return vi.fn(async (_id: string, body: UpdateServerRequest): Promise<PortalServer> => ({
+      ...server,
+      name: body.name ?? server.name,
+      managed_runtime_only: body.managed_runtime_only ?? server.managed_runtime_only,
+    }));
+  }
+
+  it('renders the checkbox unchecked on create and carries its reason as an accessible description', async () => {
+    renderForm(managedApi(), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    expect(box).not.toBeChecked();
+    // The reason must be reachable without a hover: it rides on the input via
+    // aria-describedby, announced on focus, exactly as ApplicationSection's
+    // type-field helperText does (and as issue #26 asks for). A title/Tooltip
+    // would be unreachable by keyboard and screen reader.
+    expect(box).toHaveAccessibleDescription(t.serverManagedRuntimeOnlyHelp);
+  });
+
+  it('reflects the edited server current value in both directions', async () => {
+    const on = { ...makeServer('srv-on', 'healthy'), managed_runtime_only: true };
+    renderForm(managedApi(), [on]);
+    openEditForm();
+    expect(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel })).toBeChecked();
+    cleanup();
+
+    // A server DTO that omits the field entirely (the optional-for-fixtures
+    // case) must read as "off", never as undefined-ish checked.
+    renderForm(managedApi(), [makeServer('srv-off', 'healthy')]);
+    openEditForm();
+    expect(
+      screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }),
+    ).not.toBeChecked();
+  });
+
+  it('sends managed_runtime_only on create', async () => {
+    const createServer = vi.fn(
+      async (body: CreateServerRequest) =>
+        ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
+    );
+    renderForm(managedApi({ createServer }), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
+    fireEvent.change(screen.getByLabelText(t.serverDomainLabel), {
+      target: { value: 'd.example.test' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    await screen.findByText(t.serverAdminGroupAuto('Default Admin Group'));
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await waitFor(() => expect(createServer).toHaveBeenCalledTimes(1));
+    // portal.CreateServerRequest carries the field, so provisioning a
+    // managed-only server takes one call -- the point of offering it on create
+    // as well as on edit.
+    expect(createServer.mock.calls[0][0].managed_runtime_only).toBe(true);
+  });
+
+  it('sends managed_runtime_only: false on a create where the box was left alone', async () => {
+    const createServer = vi.fn(
+      async (body: CreateServerRequest) =>
+        ({ ...makeServer('new', 'healthy'), ...body }) as CreateServerResponse,
+    );
+    renderForm(managedApi({ createServer }), []);
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'srv' } });
+    fireEvent.change(screen.getByLabelText(t.serverDomainLabel), {
+      target: { value: 'd.example.test' },
+    });
+    await screen.findByText(t.serverAdminGroupAuto('Default Admin Group'));
+    fireEvent.click(screen.getByRole('button', { name: t.serverCreate }));
+    await waitFor(() => expect(createServer).toHaveBeenCalledTimes(1));
+    // Create has no "leave unchanged" case -- a new row's column defaults to
+    // false either way -- so the create body states the value outright.
+    expect(createServer.mock.calls[0][0].managed_runtime_only).toBe(false);
+  });
+
+  it('turning it ON in the edit form sends managed_runtime_only: true', async () => {
+    const server = makeServer('srv-e', 'healthy');
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1].managed_runtime_only).toBe(true);
+  });
+
+  it('turning it OFF sends an explicit managed_runtime_only: false, not an omission', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }));
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    // The other half of the Go *bool: omission means "leave unchanged", so
+    // turning the policy OFF has to put `false` on the wire. An implementation
+    // that only ever sends the field when it is true cannot clear the flag at
+    // all, and the operator's uncheck would silently do nothing.
+    const body = updateServer.mock.calls[0][1];
+    expect(body).toHaveProperty('managed_runtime_only');
+    expect(body.managed_runtime_only).toBe(false);
+  });
+
+  // THE test. portal.UpdateServerRequest.ManagedRuntimeOnly is a *bool:
+  // undefined = "leave unchanged", false = "turn off". A save that touches only
+  // the name must not decide the policy question at all -- if it puts `false`
+  // on the wire because the form state defaulted there (an unseeded checkbox,
+  // or one hidden behind a role gate), it silently destroys an operator's
+  // configuration and the response looks like a perfectly ordinary 200.
+  it('a save that changes only the name omits managed_runtime_only entirely', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.change(screen.getByLabelText(t.serverNameLabel), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    const body = updateServer.mock.calls[0][1];
+    expect(body.name).toBe('renamed');
+    expect(body).not.toHaveProperty('managed_runtime_only');
+  });
+
+  it('toggling the box and toggling it back also omits the field', async () => {
+    const server = makeServer('srv-e', 'healthy');
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    fireEvent.click(box);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1]).not.toHaveProperty('managed_runtime_only');
+  });
+
+  // Authorization, pinned both ways. UpdateServer runs authorizeServer (system
+  // scope OR a server owner OR an admin-group manager) and then adds exactly
+  // ONE field-level gate: `req.OwnerIDs != nil && !isAdmin(principal)` ->
+  // ErrServerForbidden. ManagedRuntimeOnly has no such gate, and the HTTP layer
+  // requires only scopeGatewayUse -- so a server OWNER may flip it, and gating
+  // this control on isAdmin the way the owners field is gated would hide a
+  // control the backend accepts.
+  it('offers the control to a non-admin server owner, who gets no owners field', async () => {
+    const server = { ...makeServer('srv-own', 'healthy'), managed_runtime_only: true };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server], 'user');
+    openEditForm();
+    // Present and correctly seeded for role="user"...
+    const box = screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel });
+    expect(box).toBeChecked();
+    // ...while the owners field -- the one that DOES have a backend isAdmin
+    // gate -- is absent. The two are deliberately not gated alike.
+    expect(screen.queryByLabelText(t.serverOwnersLabel)).not.toBeInTheDocument();
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    const body = updateServer.mock.calls[0][1];
+    expect(body.managed_runtime_only).toBe(false);
+    expect(body).not.toHaveProperty('owner_ids');
+  });
+
+  it('offers the control to an admin as well', async () => {
+    renderForm(managedApi(), [makeServer('srv-adm', 'healthy')], 'admin');
+    openEditForm();
+    expect(
+      screen.getByRole('checkbox', { name: t.serverManagedRuntimeOnlyLabel }),
+    ).toBeInTheDocument();
   });
 });

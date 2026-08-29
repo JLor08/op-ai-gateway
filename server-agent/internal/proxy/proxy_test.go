@@ -611,6 +611,70 @@ func TestDeriveBindHost(t *testing.T) {
 	}
 }
 
+// TestDeriveBindHostResolvesTheMeshIdentityNotLoopback pins the claim the
+// runtime_router_bind documentation now makes explicitly: with a leaf actually
+// installed in cert_dir -- which cert_mode=proxy MAKES MANDATORY
+// (config.Validate; pinned by config_test.go's proxy/empty-cert-dir case) --
+// an empty runtime_router_bind resolves to the leaf's MESH address. Not
+// loopback, and not all interfaces. That is the opposite of the shipped
+// default (cert_mode=off with an empty cert_dir, which derives nothing), and
+// it is the whole reason the setting is a trap worth documenting.
+//
+// TestDeriveBindHost above cannot show this: writeTestLeaf's SAN is 127.0.0.1,
+// so its expected value is indistinguishable from a loopback default. This one
+// uses a routable SAN so only the real derivation can produce it.
+func TestDeriveBindHostResolvesTheMeshIdentityNotLoopback(t *testing.T) {
+	certDir := t.TempDir()
+	writeTestLeafWithSANs(t, certDir, []net.IP{net.ParseIP("10.42.0.7")}, []string{"ai-01.mesh.test"})
+
+	if got := DeriveBindHost(certDir); got != "10.42.0.7" {
+		t.Fatalf("DeriveBindHost(mesh leaf) = %q, want 10.42.0.7 (the leaf's own mesh identity)", got)
+	}
+
+	// DNS-only leaf: still the mesh identity, just the name form.
+	dnsOnly := t.TempDir()
+	writeTestLeafWithSANs(t, dnsOnly, nil, []string{"ai-02.mesh.test"})
+	if got := DeriveBindHost(dnsOnly); got != "ai-02.mesh.test" {
+		t.Fatalf("DeriveBindHost(dns-only mesh leaf) = %q, want ai-02.mesh.test", got)
+	}
+}
+
+// writeTestLeafWithSANs is writeTestLeaf with caller-chosen SANs, so a test can
+// distinguish a derived mesh address from a hard-coded loopback one.
+func writeTestLeafWithSANs(t testing.TB, certDir string, ips []net.IP, dnsNames []string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: "op-agent-mesh-test"},
+		DNSNames:              dnsNames,
+		IPAddresses:           ips,
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "fullchain.pem"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write fullchain: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "privkey.pem"), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write privkey: %v", err)
+	}
+}
+
 // TestManagerStopDrainsOffLock proves stopProxyLocked frees the port fd under the
 // lock but drains in-flight connections OFF-LOCK: removing a route with an
 // in-flight (blocked) request must not stall Apply/Status for the shutdown grace,

@@ -64,7 +64,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
-| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. |
+| `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. **Under `cert_mode: "proxy"` it is the other way round** — that mode makes `cert_dir` mandatory, so the empty default resolves to the leaf's mesh address, never all interfaces and never loopback. **Resolved once at process start**, so a boot before the first certificate install binds all interfaces until the agent restarts. See [Managed model runtime](#managed-model-runtime). |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | — (file/env only) | `runtime_log_buffer_bytes` | `1048576` (1 MiB) | How much of each managed model process's stdout+stderr the agent keeps **in memory**, in bytes, so an operator can read it after the fact. The buffer belongs to the **spec**, not the process, so a crashed model's output survives it, and a restart appends after a visible boundary marker rather than wiping the history. Below `65536` is raised to it. Operator-only, like the allowlists: memory on this host is the operator's tradeoff and the gateway can never raise it. **Never written to disk** — this content can include prompt text. |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | — (file/env only) | `runtime_log_buffer_total_bytes` | `16777216` (16 MiB) | Ceiling on the **sum** of those buffers across every spec, so a server with twenty specs is not twenty times the per-spec number. The agent keeps at most `total / per-spec` buffers, evicting the least-recently-written one nobody is watching. This is the number to reason about when sizing the agent's memory. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
@@ -177,6 +177,28 @@ from this local config — never from the gateway:
   **empty `cert_dir`**, and it is that empty directory, not the mode, that
   makes the shipped default bind all interfaces. On a host that is not
   mesh-only, set this explicitly.
+
+  **Under `cert_mode: "proxy"` the empty default is the opposite.** That mode
+  makes `cert_dir` mandatory, so once a leaf is installed there the empty
+  default resolves to that leaf's **mesh address** — its first IP SAN, else
+  its first DNS SAN. Not all interfaces, and not loopback. Read the paragraph
+  above as describing `cert_mode: "off"`, which is where the all-interfaces
+  fallback actually lives.
+
+  **It is resolved once, at process start.** The value is computed before the
+  runtime driver is built and is then fixed for the life of the process. So a
+  first boot whose `cert_dir` is still empty binds **all interfaces until the
+  agent is restarted**, no matter how many certificates arrive in between —
+  and a renewal that changes the leaf's SAN does not move the router until a
+  restart either.
+
+  **The proxied path no longer depends on it.** A `server_agent` application
+  reached through the agent's own TLS proxy is served by the router **in
+  process**, so `runtime_router_bind` cannot make that path unreachable any
+  more (it used to: the proxy dialled `http://127.0.0.1:<router port>`, which
+  a mesh-derived bind never answered). What still depends on it is where the
+  router **listens** — an application routed as plain `http`, and anything
+  else that reaches the router directly.
 
 `runtime_allowed_dirs` additionally restricts a spec's `work_dir`; it is
 convenience/defence-in-depth, not a boundary (containment is a lexical

@@ -175,6 +175,14 @@ type Driver struct {
 	routerMu     sync.Mutex
 	routerListen int
 	routerSrv    *http.Server
+	// localRouter is the router the agent's OWN TLS proxy resolves against
+	// when a gateway-published route's upstream turns out to be this
+	// router's port on loopback (see local_router.go). It is written only
+	// under routerMu, beside the listener lifecycle it tracks, but read
+	// lock-free on every proxied request -- hence an atomic pointer rather
+	// than a routerMu-guarded field: a proxied request must never queue
+	// behind a router rebind.
+	localRouter atomic.Pointer[localRouterRef]
 	// closed is set by Close and checked by StartRouter, both under
 	// routerMu (fix round 1, M3): Run returns on context cancellation
 	// without waiting for an in-flight triggerRuntimeSync goroutine, so a
@@ -578,7 +586,38 @@ func (d *Driver) StartRouter(listen int) error {
 	d.stopRouterLocked()
 	d.routerListen = listen
 	if listen <= 0 {
+		// No server_agent application on this server: the router is not
+		// served at all, so the in-process path must stop resolving too and
+		// let a loopback-upstream route fall back to its dialled semantics.
+		d.publishLocalRouter(0, nil)
 		return nil
+	}
+
+	// Build the router ONCE and publish it BEFORE the bind. Two deliberate
+	// properties, both of which the rest of this feature depends on:
+	//
+	//  1. ONE handler instance serves BOTH paths -- the mesh listener below
+	//     and the agent's own TLS proxy in process (local_router.go). One
+	//     instance means one http.Transport and one connection pool to the
+	//     managed child processes; two would silently split keep-alives and
+	//     double the pool, which is the bug, not the optimisation.
+	//  2. Publishing BEFORE net.Listen decouples the in-process path from
+	//     the socket: a failed mesh bind (port taken, or a derived mesh
+	//     address this host does not own) still leaves the PROXIED path
+	//     serving. That is a deliberate departure from "the router is up
+	//     exactly when its listener is up" -- the listener is one of two
+	//     ways in, and the other one does not need it.
+	//
+	// A retry reuses whatever is already published for this exact port
+	// instead of building a fresh router: StartRouter is called on every
+	// active Sync (60s) and a persistently failing bind falls through to
+	// here each time, so building a new router per retry would churn the
+	// very connection pool the in-process path is actively using -- and
+	// would blink the reference for as long as the bind keeps failing.
+	rt := d.LocalRouter(listen)
+	if rt == nil {
+		rt = newRouter(d.mgr)
+		d.publishLocalRouter(listen, rt)
 	}
 
 	addr := net.JoinHostPort(d.bindHost, strconv.Itoa(listen))
@@ -589,7 +628,7 @@ func (d *Driver) StartRouter(listen int) error {
 	if d.bindHost == "" {
 		slog.Warn("runtime: router bind host not configured/derivable; listening on ALL interfaces (unauthenticated) -- set OP_AGENT_RUNTIME_ROUTER_BIND to restrict it", "listen", listen)
 	}
-	srv := &http.Server{Handler: newRouter(d.mgr)}
+	srv := &http.Server{Handler: rt}
 	d.routerSrv = srv
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -625,9 +664,16 @@ func (d *Driver) stopRouterLocked() {
 // `defer mgr.Close()`, right where the Manager is constructed), since the
 // Manager exists independently of whether a Driver happens to wrap it at
 // any given moment.
+// It also unpublishes the in-process router (local_router.go) so a proxied
+// request arriving during shutdown falls back to the dialled upstream rather
+// than being served by a router whose Manager main.go is about to close.
+// The clear lives HERE, under routerMu, and deliberately NOT inside
+// stopRouterLocked: StartRouter calls that on every 60s retry, where clearing
+// would open a nil window on a path that has no reason to blink.
 func (d *Driver) Close() {
 	d.routerMu.Lock()
 	d.closed = true
+	d.publishLocalRouter(0, nil)
 	d.stopRouterLocked()
 	d.routerMu.Unlock()
 }

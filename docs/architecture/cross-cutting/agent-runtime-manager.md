@@ -650,6 +650,15 @@ interfaces.** Deriving a mesh address is the unusual case, not the default. An
 operator who does not want an unauthenticated inference port on every interface
 must set the value explicitly (the mesh IP, or `127.0.0.1`).
 
+**The resolution runs once, at process start.** `main.go` resolves the bind host
+before the runtime driver is built (`runtimeBindHost := cfg.RuntimeRouterBindHost`,
+falling back to `proxy.DeriveBindHost(cfg.CertDir)`) and the driver stores the
+result, so an agent that boots before its first leaf is installed binds all
+interfaces until it is restarted, however many certificates arrive afterwards, and
+a renewed certificate with a different SAN does not move the router. The every-sync
+`StartRouter` described below re-binds `d.bindHost` — the value stored at
+construction — so it retries a failed *bind*, it never re-derives the *host*.
+
 Binding all interfaces is also the only way "router behind the agent's own proxy
 listener, loopback only" is expressible as *unavailable*: that deployment needs
 the explicit setting.
@@ -660,6 +669,48 @@ idempotent in the desired state, so this costs nothing — and it is the only
 thing that ever retries a bind that failed once, for example a port still held
 by a previous process at boot. Symmetrically, after `Close` a late in-flight
 sync must not resurrect the listener.
+
+### 4.7 The router has two ways in, and only one of them is a socket
+
+Under `cert_mode=proxy` the mesh listener above is *not* how the gateway
+reaches this router. The gateway publishes the agent's TLS-proxy route for the
+`server_agent` application with a hard-wired `http://127.0.0.1:<app.Port>`
+upstream, while §4.6's derivation binds the router on the agent's **mesh
+identity** instead — so the dial had nothing to reach and every proxied
+request was a `502`. The agent-side fix keeps the proxy terminating TLS exactly
+as before and hands the request to the router's `http.Handler` **in process**
+whenever the route's upstream is a loopback target on the router's currently
+published port. See
+[`certificates-tls.md` §6](certificates-tls.md#6-the-agent-side-tls-terminating-reverse-proxy-cert_modeproxy)
+for the proxy half and the predicate that guards it.
+
+Two properties of the publish site (`runtime.Driver.publishLocalRouter`,
+`local_router.go`) are load-bearing:
+
+- **One router instance serves both paths.** One `http.Transport`, one
+  connection pool to the managed children. Two instances would silently split
+  keep-alives and double the pool.
+- **The publish happens *before* `net.Listen`**, and a failed bind does not
+  retract it. This is a deliberate departure from "the router is up exactly
+  when its listener is up": the socket is one of two ways in, and the other
+  does not need it, so a mesh bind that fails still leaves the proxied path
+  serving. Consequently the clear lives in `Close` (and in `StartRouter(0)`,
+  which means *no `server_agent` application*), **not** in `stopRouterLocked`
+  — `StartRouter` calls that on every 60 s retry, where clearing would blink
+  the in-process path off once a minute for as long as a bind kept failing.
+  A retry also **reuses** the already-published handler rather than building a
+  fresh router, so the connection pool survives it.
+
+The port and the handler live in **one** reference swapped atomically, so a
+reader can never observe a fresh port beside a stale handler. `StartRouter(0)`
+clears it, which is what lets a disabled runtime fall back cleanly to the
+dialled upstream's pre-existing semantics.
+
+Note the consequence for `runtime_router_bind`: after this change a loopback
+override is no longer needed to make the *proxied* path work, and it is no
+longer free — it confines the router to loopback, so an application routed as
+plain `http` to that same port becomes unreachable from the gateway. The agent
+says so at Warn on startup when it sees that combination.
 
 ## 5. Admission control
 
@@ -1816,26 +1867,153 @@ Four tabs: **launch specs**, the **co-residency matrix**, **server limits**, and
 enforced inside `portal.Service`, never in the gateway handler — see
 [Security, Authentication & Authorization](security-auth-rbac.md).
 
+**The type picker refuses a second `server_agent` before the form is filled in,
+not after.** At most one `server_agent` application may exist per AI server —
+only one agent runs there, and `AgentRuntimeConfig`'s "first match wins" lookup
+is deterministic only because of that. The rule is enforced three levels down
+(migration 68's partial unique index, the service's pre-read, and the 409
+`application.server_agent_exists`), but until it also reached the create/edit
+mask an operator could pick the type, fill in every field, submit, and only then
+be refused. `ApplicationSection` now **disables** the `server_agent` option, and
+states the reason on the field itself as `helperText`, whenever the server
+already holds an agent application other than the row being edited.
+
+Three details there are load-bearing and must not be "simplified":
+
+- **Disabled, never filtered out of the list.** Opening an edit seeds the form's
+  type from the row; a value with no matching menu item renders a *blank*
+  combobox, so the operator cannot see what the application is while editing it.
+  That is a usability defect, **not** a data-integrity one: an earlier version of
+  this paragraph claimed a filtered option would make the edit form "a silent
+  retype", and that is false — probed against a filtering variant, the save path
+  still sends `type: server_agent`, because the form holds the seeded value
+  whether or not a menu item matches it. The blank field is reason enough; the
+  overstatement is what invites the "fix" that brings it back. The
+  predicate excludes the edited row's id, mirroring the service's `excludeAppID`
+  exactly (create passes `""`, update passes `app.ID`): that application keeps
+  its type selected, selectable and re-saveable, and can switch away and back
+  before saving, while retyping *any other* application to `server_agent` is
+  blocked — the second write path the backend guards with the same sentinel.
+- **The reason rides on the field, not on the option.** MUI leaves
+  `disabledItemsFocusable` false, so arrow-key navigation skips a disabled
+  option entirely and a tooltip or `title` anchored there would be unreachable
+  by keyboard and screen reader. `helperText` is wired to the combobox through
+  `aria-describedby`, so it is announced on focus, before the menu is opened.
+  Its wording carries the rule, the reason for it, and the remedy (edit or
+  delete the existing application); the 409's own string stays terse because
+  `formatPortalError` prefixes it with the raw error code.
+- **It is an affordance, not the enforcement.** The applications list is fetched
+  once and never polled, and it reads as empty both while the first fetch is in
+  flight and after one failed — and the create button is not loading-gated. In
+  each of those windows the gate silently opens, the operator submits, and the
+  409 is what refuses them, with the form left open and every typed value
+  intact. Neither the error-code mapping nor either store-level backstop may be
+  dropped on the grounds that "the portal prevents this now".
+
 On a server flagged `managed_runtime_only` the applications view steers the
 operator rather than letting them fail: a standing informational banner; the
 create button hidden once the server has its one `server_agent` application; the
-create form seeded to type `server_agent` so the only type that can succeed is
-the default (backed by the backend's own 409); and an auto-drill into the single
-`server_agent` application the first time the list resolves. That drill
+create form seeded to type `server_agent`; the other five types **disabled on
+that create form**, with the reason on the field; and an auto-drill into the
+single `server_agent` application the first time the list resolves. That drill
 **latches once per mount** on purpose — the 0→1 transition caused by the
 operator's own create does *not* bounce them out of the form they just
 submitted, and the latch also stops the drill re-firing on the parent list's
 poll.
 
-**The flag itself is API-only today: nothing in the portal sets it.** Everything
-above is driven by `managed_runtime_only` as it arrives on the server DTO, and
-all of it works the moment the flag is true — but no portal control writes it.
-Both `POST /api/portal/servers` and `PATCH /api/portal/servers/{id}` already
-accept `"managed_runtime_only": true`, so an operator sets it with an API call;
-the server form does not offer it, and the server-limits tab's PATCH carries
-`runtime_max_processes` alone. Whether to add a toggle is the operator's product
-decision, not a defect to close silently — see
-[§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks).
+**That type gate is CREATE-ONLY, and the `&& !editing` in its predicate is
+load-bearing.** `Server.ManagedRuntimeOnly` is read in exactly one place in the
+service — inside `CreateApplication`, against the raw requested type — and
+`UpdateApplication` never looks at it. A portal gate written as plain
+`managedRuntimeOnly` would therefore refuse, on an *edit*, writes the backend
+accepts, and refuse them **silently**: a disabled option produces no error code
+to look up, so the operator has nothing to search for. That is a worse failure
+than the one the affordance closes. The gate follows the backend's own scope or
+it is a defect. Unlike the `server_agent` gate above this one reads the *server*
+DTO rather than the applications list, so no fetch window opens it — but that
+DTO is fetched by the parent list and never refreshed here, so a `PATCH` that
+sets the flag afterwards still leaves the form offering all six types, and the
+409 remains the enforcement.
+
+**Two reasons share one `helperText` slot, and they are co-reachable — through
+exactly one window.** In the settled state they cannot co-occur: on a managed
+server that already holds an agent application the create button is not rendered
+at all, so the create form — the only place the managed reason applies — cannot
+be opened. While the *first fetch* is in flight `applications` reads `[]` and the
+create button is not loading-gated, so it can, and both reasons then bite at
+once. Composed narrowest-first ("only `server_agent` is creatable here", then
+"and that one is taken"), which together say the intersection is empty — exactly
+what the then-fully-disabled option list shows. With one agent application that
+composed state is transient (the auto-drill fires on the same settle and
+replaces the form); with two — the pre-migration-68 duplicate case — it
+persists, which is the state the suite pins.
+
+**The vanished create button says why, and stays hidden rather than becoming a
+disabled one.** Once the server holds its agent application the two backend
+gates intersect to the empty set — `managed_runtime_only` permits only
+`server_agent`, and the one-agent rule refuses a second of it — so no create of
+any type can succeed and the button is not offered. A second sentence in the
+existing info banner, rendered on the *same* condition as the button rather than
+restated, gives the reason. This is deliberately the opposite call to the one
+made for the type option, because the alternatives are not the same: removing an
+option from a select blanks the combobox (the form's `type` is seeded from the
+row whether or not a menu item matches it), whereas removing a button costs
+nothing structurally — and the reason must be readable without a hover.
+`helperText` gave the field such a carrier via `aria-describedby`; a disabled MUI
+`Button` is out of the tab order and sets `pointer-events: none`, so its only
+reason-carrier would be a `Tooltip` on a wrapper span, unreachable by keyboard
+and screen reader — issue #26 again. Plain text in the reading order, where the
+button was, beats both. The banner keeps its own text node so it stays matchable
+exactly.
+
+**The flag is written from the server form, not from this screen.** Everything
+above is driven by `managed_runtime_only` as it arrives on the server DTO; the
+control that sets it is a checkbox in `ServerList`'s create/edit mask, beside
+name, domain, status and owners, and it is on **both** paths because
+`portal.CreateServerRequest` carries the field too — a managed-only server can
+be provisioned in one `POST` rather than created and then `PATCH`ed. It is
+deliberately **not** on the server-limits tab beside `runtime_max_processes`,
+where it would look at home: that tab is reachable only through an existing
+`server_agent` application's manage-models action, so a control there could
+first be set only *after* creating the very application the flag governs, which
+is not when an operator wants it.
+
+**Its authorization is the plain server-update rule, and the control must not
+invent a stricter one.** `UpdateServer` runs `authorizeServer` (system scope, or
+a server owner, or a manager of one of the server's admin groups) and then adds
+exactly one field-level check — `req.OwnerIDs != nil && !isAdmin(principal)` →
+`ErrServerForbidden`. `ManagedRuntimeOnly` has no such check, and the HTTP layer
+asks only for `scopeGatewayUse`, so a **server owner** may flip it. The owners
+field sitting directly below it in the same form *is* gated on `isAdmin`,
+mirroring that one backend check; copying that gate onto this checkbox would
+hide a control the backend accepts, and is the obvious wrong move for anyone
+reading the two fields side by side.
+
+**The `*bool` is load-bearing on the edit path.** `UpdateServer` applies the
+field under `if req.ManagedRuntimeOnly != nil`, so the wire has three states,
+not two: absent = leave unchanged, `true` = restrict, `false` = lift the
+restriction. `submitEdit` therefore sends the key **only when the checkbox
+differs from the value the form was seeded with**, and then in whichever
+direction it moved. Sending the checkbox state unconditionally compiles, passes
+a "the switch works" test, and is still a defect: every save made for an
+unrelated reason — a rename, a status change — would restate the policy from
+whatever this form last read, and on a server another operator flipped in the
+meantime it would restate it wrong, clear the flag, and return an ordinary 200
+with nothing to notice. The seed is captured once per form open and is not
+re-synced by `applyServerUpdate`, so a panel save that brings back a fresher DTO
+cannot turn an untouched checkbox into a policy write. Create has no such case —
+a row that does not exist has no value to leave unchanged — so the create body
+states the value outright.
+
+**The checkbox's caption carries two consequences the label cannot.** Both are
+invisible from the control and neither is guessable: the flag is **not
+retroactive** (the service reads `Server.ManagedRuntimeOnly` inside
+`CreateApplication` only, so applications that already exist keep running and
+stay editable to any type), and once the server holds its one `server_agent`
+application the applications view stops offering a create button **at all**. The
+caption is a real element wired to the checkbox through `aria-describedby`, not
+a `title` or a `Tooltip` — announced on focus, reachable by keyboard, the same
+call `helperText` makes on the type field above and what issue #26 asks for.
 
 ### 11.1 Writes are full-document replaces, gated on their own GET
 
@@ -2183,10 +2361,13 @@ than any viewport has — scrolling past headers you cannot see while hunting fo
 a cell is how the matrix stops being usable. The mechanism is
 `writing-mode: vertical-rl` plus `transform: rotate(180deg)`, deliberately not a
 bare `rotate(-90deg)`: the writing-mode form gives the label a genuinely
-vertical layout *box*, so ordinary table layout reserves the right footprint and
-each header stays over its own column. A bare transform leaves the box
-horizontal, which is what forces the explicit heights and absolute positioning
-that then drift a few pixels per column. Bottom-to-top is the Western
+vertical layout *box*, where a bare transform leaves the box horizontal, which
+is what forces the explicit heights and absolute positioning that then drift a
+few pixels per column. That vertical box does **not**, by itself, make the table
+column reserve the right footprint — whether it does is an engine-by-engine
+fact, and an earlier revision of this paragraph asserted the opposite. See
+**The column has to be made to measure its own rotated header** below, which is
+the bug that assertion hid. Bottom-to-top is the Western
 data-table/chart-axis convention and it puts the *start* of the name next to the
 cells it labels. The rotation is
 CSS over intact text — never images or per-character markup — so the header's
@@ -2237,6 +2418,59 @@ is equally true of the headers, which keep theirs) but because a row label is
 already horizontal running text, so a tooltip would repeat the same characters
 in the same orientation.
 
+**The column has to be made to measure its own rotated header**, and one box
+shape is what makes every engine do it. A `vertical-rl` label is an *orthogonal
+flow*: its **block** size runs along the table's inline axis, so a column is
+wide enough for a wrapped header only if the layout asks the rotated box for
+that block size. Blink and Gecko ask. **WebKit does not** — Safari on macOS and
+iOS, and every WKWebView, which is where an operator reported column headers
+overprinting each other. Measured with the `<tbody>` removed, so the column is
+sized by its header alone (one 51-character name, three line boxes, rotated box
+72 px, cell padding 4 + 4 px): Chromium 80 px, Firefox 80 px, **WebKit 8 px** —
+the padding, and nothing from the rotated box at all. The column then falls back
+to its only other content, the 46 px checkbox cell, for *any* line count, and
+the rotated box hangs out of it to the right. Two extents cross the column edge
+at different line counts, and which one is meant matters: the label's border box
+is 24 px per line box, while its **ink** — the union of the text-run rects, what
+is actually painted — is 8 px narrower (4 px of half-leading each side).
+Measured in WebKit for a header of *L* ≥ 2 line boxes in a 46 px column, the box
+crosses into the next header's box by `24·L − 46` px (+2 / +26 / +50 / +74 at
+*L* = 2…5) and the ink over the next header's ink by `24·L − 54` px (−6 / +18 /
++42 / +66), both constant at every container width from 1400 px down to 360 px
+and at 5, 8 and 14 specs. So the *box* crosses the boundary from two line boxes
+on and the *glyphs* first overprint at three — a 44-character name at this font
+and this cap. The fix is to wrap the label in a `display: grid` box, whose
+intrinsic sizing does derive an orthogonal child's block size in all three
+engines; `justify-content: center` on that wrapper replaces the `mx: 'auto'`
+that used to centre the label, and correcting that is why Gecko is *not*
+byte-identical before and after: a one-line header sat flush against its
+column's left edge in Firefox (0 px auto margins where Chromium and WebKit
+resolved 7 px) and now sits at 11 px from the cell edge in all three. Blink is
+byte-identical at all 54 configurations sampled. **Grid and not flex**: both are
+right on a freshly loaded page in all three engines, but only grid survives a
+re-render, which this component does on every telemetry poll — measured over 400
+randomised re-renders from one mount, grid failed 0 renders in WebKit and flex
+31 (Chromium and Firefox: 0 for both). Flex's failure is this same defect, not a
+worse one: `overflow` computes to `visible` throughout, every line box is still
+painted, no character is lost, and its ink-over-ink overlap measures identical
+to the unfixed component.
+
+**That fix trades horizontal room for correctness, and only WebKit pays.** Each
+column whose header wraps to *L* ≥ 2 line boxes grows by `24·L − 38` px — 10 px
+at two lines, 34 px at three, 58 px at four — and a single-line header costs
+nothing. Measured in WebKit with the same fourteen realistic specs the
+`width: auto` paragraph below uses (thirteen columns, eight of them two-line
+and five one-line, so 8 × 10 px = 80 px): at a 900 px container or wider the
+table goes from 790 px to 870 px wide with its height unchanged at 828 px; at an
+800 px container the table is pinned at 800 px, the row-label column gives up
+192 → 122 px and the table grows **828 → 1107 px tall** (nothing scrolls in
+either case — `scrollWidth` equals `clientWidth` at 800 px); at 700 px and below
+it goes 707 → 787 px and now overflows the enclosure, which scrolls, with the
+height unchanged at 1287 px. At five specs the same fix costs 376 → 396 px and
+at eight 514 → 564 px. `overflowX: auto` absorbs the growth only where the table
+already exceeds its container; between the two shrink-to-fit widths it is paid
+in row height instead, which is the lossless degradation described above.
+
 **The wrap mode is `overflow-wrap: break-word` on both axes, and specifically
 not `anywhere`.** Both wrap and neither drops a character; they differ only in
 the min-content size the box reports, and on the horizontal axis that difference
@@ -2261,9 +2495,15 @@ the wrap mode (measured: a 43-character hyphen-free name holds at exactly 160 px
 at both 1100 px and 600 px inside a 15-spec grid). On the **vertical** header
 axis the choice is measurably free — `anywhere` and `break-word` give identical
 geometry there (header row 168.5 px, span 160 px, widest header column 56 px,
-two line boxes, at both 1100 px and 600 px), because table layout distributes
-*width* and a `vertical-rl` box's inline size is its height. One declaration is
-used for both axes so the component teaches one rule.
+two line boxes, at both 1100 px and 600 px), and re-measured after the grid
+wrapper landed: identical in Chromium, Firefox and WebKit over 48 comparisons
+(1 to 5 line boxes × 1100 px and 600 px containers × three engines), 0
+differences. That is what was measured, and the earlier gloss on it — "because
+table layout distributes *width* and a `vertical-rl` box's inline size is its
+height" — is dropped rather than kept: it reasons about the axis that was never
+at risk in order to conclude something about the axis that was, which is the
+same false premise the paragraphs above correct. One declaration is used for
+both axes so the component teaches one rule.
 
 **The table shrinks to its content (`width: auto`)**, overriding MUI's
 `width: 100%`, and that is what makes the row-label cap reach the *column*

@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"op-ai-server-agent/internal/agent"
@@ -113,11 +114,17 @@ func main() {
 	// installed leaf's SAN -- New's empty host selects that derivation, never
 	// all interfaces (the agent has no other explicit mesh-IP source, and the
 	// leaf is exactly the identity the proxy terminates).
+	//
+	// proxyManager is declared OUTSIDE the block (nil in every other cert
+	// mode) because it has to outlive it: the runtime driver constructed
+	// further down is what resolves the in-process router upstream, and the
+	// two are wired together only once both exist.
+	var proxyManager *proxy.Manager
 	if cfg.CertMode == config.CertModeProxy {
-		manager := proxy.New(cfg.CertDir, "")
-		defer manager.Close()
+		proxyManager = proxy.New(cfg.CertDir, "")
+		defer proxyManager.Close()
 		routesClient := proxy.NewRoutesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
-		deps.ProxyDriver = proxy.NewDriver(manager, routesClient, proxyRoutes(cfg.CertProxyRoutes), cfg.CertProxyRoutesMode)
+		deps.ProxyDriver = proxy.NewDriver(proxyManager, routesClient, proxyRoutes(cfg.CertProxyRoutes), cfg.CertProxyRoutesMode)
 	}
 
 	switch cfg.Transport {
@@ -209,6 +216,19 @@ func main() {
 	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter, runtimeBindHost)
 	defer drv.Close()
 	deps.RuntimeDriver = drv
+	// The one wire that closes the cert_mode=proxy gap: the gateway publishes
+	// every proxy route with a hard-wired "http://127.0.0.1:<app.Port>"
+	// upstream, but under cert_mode=proxy the router above binds the agent's
+	// MESH identity (runtimeBindHost, derived from the leaf's SAN), so nothing
+	// ever listened on that loopback address and every proxied request was a
+	// 502 that could not self-heal. With this, a route whose upstream is a
+	// loopback target on the router's CURRENT listen port is handed to the
+	// router's http.Handler in process instead of being dialled. Only that one
+	// port resolves (drv.LocalRouter), and only loopback upstreams are ever
+	// offered to it (proxy.loopbackUpstreamPort); everything else still dials.
+	if proxyManager != nil {
+		proxyManager.SetLocalUpstream(drv.LocalRouter)
+	}
 
 	a := agent.NewFromDeps(cfg, deps)
 
@@ -264,12 +284,41 @@ func main() {
 		// needs to see what it actually became rather than what they typed.
 		"runtime_log_buffer_bytes", logBufferPerSpec,
 		"runtime_log_buffer_total_bytes", logBufferTotal)
+	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
+	// operators used to repair the proxied path before the in-process wiring
+	// above existed. It is no longer needed, and it is no longer free: it
+	// confines the router to loopback, so an application that is NOT
+	// proxy-switched -- routed as plain http to this same port -- becomes
+	// unreachable from the gateway with no other symptom. Said here, at
+	// startup, rather than only in a release note, because the hosts that
+	// carry the workaround are exactly the ones nobody will re-read the notes
+	// for.
+	if cfg.CertMode == config.CertModeProxy && isLoopbackHost(runtimeBindHost) {
+		slog.Warn("runtime_router_bind is a loopback address under cert_mode=proxy; the proxied path no longer needs it (the agent serves its own router in process) and it makes a plain-http route to this server unreachable -- consider clearing it",
+			"runtime_router_bind", runtimeBindHost)
+	}
 
 	if err := a.Run(ctx); err != nil {
 		slog.Error("server-agent run failed", "err", err)
 		os.Exit(1) //nolint:gocritic // process is exiting; defer cleanup is moot
 	}
 	slog.Info("server-agent shutdown complete")
+}
+
+// isLoopbackHost reports whether host is the exact name "localhost" or an IP
+// literal on the loopback interface. Used ONLY for the startup advisory above
+// -- it decides what to say, never what to route. The routing-side predicate
+// is proxy.loopbackUpstreamPort, which is deliberately stricter because a
+// mistake there diverts traffic rather than printing a needless line.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // proxyRoutes converts the config's local TLS-proxy routes into the proxy

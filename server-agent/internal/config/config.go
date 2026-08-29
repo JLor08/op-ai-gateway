@@ -211,6 +211,35 @@ type Config struct {
 	// RuntimeAllowedBinaries/RuntimeAllowedDirs: this value comes ONLY from
 	// this local config, never from the gateway -- the gateway supplies
 	// only the router's PORT (router_listen), never its bind host.
+	//
+	// WHAT THE EMPTY DEFAULT ACTUALLY RESOLVES TO. "Derive a default" reads
+	// as a mild preference; under CertModeProxy it is not one. CertDir is
+	// MANDATORY in that mode (see Validate below), so proxy.DeriveBindHost
+	// has a directory to read, and as soon as a leaf is installed there the
+	// empty default resolves to that leaf's MESH identity -- its first IP
+	// SAN, else its first DNS SAN. Not loopback, and not all interfaces.
+	// The all-interfaces fallback everything else about this setting warns
+	// about is the CertModeOff case (the portal's generated config ships
+	// cert_mode "off" with an empty cert_dir); under proxy it is close to
+	// unreachable, and the reader who most needs to know that is the one
+	// running proxy mode.
+	//
+	// AND IT IS RESOLVED ONCE, at process start. main.go computes it before
+	// constructing the runtime driver and the value is fixed for the
+	// lifetime of the process. Two consequences worth knowing: a first boot
+	// whose cert_dir has no loadable leaf yet derives "" and therefore binds
+	// ALL INTERFACES until the agent is restarted, however many certificates
+	// are installed in the meantime; and a renewal that changes the leaf's
+	// SAN does not move the router until a restart either.
+	//
+	// WHAT NO LONGER DEPENDS ON IT. The gateway-published TLS-proxy route
+	// for a server_agent application used to be dialled at
+	// http://127.0.0.1:<router port>, which this derivation could silently
+	// make unreachable. The agent now serves its own router IN PROCESS for
+	// exactly that route (proxy.Manager.SetLocalUpstream), so the proxied
+	// path no longer depends on this value at all. It still decides where
+	// the router LISTENS, which is what an application routed as plain http
+	// -- and anything else reaching the router directly -- depends on.
 	RuntimeRouterBindHost string
 	// RuntimeLogBufferBytes is how much of each managed model process's
 	// stdout+stderr this agent keeps in memory so an operator can read it

@@ -225,6 +225,30 @@ additionally runs its own TLS-terminating reverse proxy
   changed, or that is no longer desired, drains off-lock (bounded 3s grace)
   while the accept loop for a replacement can rebind the just-freed port
   immediately.
+- **The in-process upstream.** One upstream is *not* dialled: a route whose
+  upstream is a **loopback** target (`http://127.0.0.1:<port>`, no path, no
+  query) on the port the agent's **own runtime router** is currently published
+  on is handed to that router's `http.Handler` **in process**
+  (`proxy.Manager.SetLocalUpstream`, wired in `server-agent/main.go` to
+  `runtime.Driver.LocalRouter`). For that one route the upstream string stops
+  being an *address* and becomes a *route key* the agent resolves locally.
+  This exists because the two ends disagreed: the gateway hard-wires every
+  upstream to `http://127.0.0.1:<app.Port>`, while under `cert_mode=proxy` the
+  runtime router binds the agent's **mesh identity** (§4.6 of
+  [`agent-runtime-manager.md`](agent-runtime-manager.md)), so nothing listened
+  on that loopback address and every proxied request to a `server_agent`
+  application was a `502` — one that could never self-heal, because the proxy
+  listener itself *was* up, so the agent kept reporting `tls_active=true` and
+  the switch reconcile never reverted. The predicate
+  (`proxy.loopbackUpstreamPort`) is a **security boundary** and is deliberately
+  narrow — plaintext `http`, no opaque/userinfo/fragment, empty or `/` path, no
+  query, host exactly `localhost` or a loopback IP literal, an explicit port in
+  1..65535 — because a false positive diverts a request meant for another host
+  into this agent's router, while a false negative merely dials, as before.
+  The resolution happens **per request**, not once at listener start: the route
+  set arrives on the certificate cadence and the router port on the runtime
+  cadence, so a one-shot decision would freeze whichever won that race. No
+  gateway change, no wire-format change, no feature negotiation.
 - **Local override.** `cert_proxy_routes` + `cert_proxy_routes_mode`
   (`fallback`/`override`) let an operator add or override routes the gateway
   did not send, merged by listen port.
@@ -252,7 +276,7 @@ mode flip can never resurrect a stale flag from the opposite mode.
 stateDiagram-v2
     [*] --> http: application created (scheme=http)
     http --> https: agent reports tls_active=true\nfor this app's ProxyListenPort\n(server IN scope)
-    https --> http: agent reports tls_active=false\nfor this app's ProxyListenPort\n(server IN scope)
+    https --> https: agent reports tls_active=false\n(server IN scope) — DECLINED:\nno automatic downgrade,\napp stays https and is UNREACHABLE
     https --> http: server leaves switch scope\n(mode change / override flip) —\nUNCONDITIONAL scope-exit revert
     http --> http: missing/absent route report\n(never forwards, never reverts)
     https --> https: missing/absent route report\n(never reverts on silence)
@@ -263,11 +287,11 @@ same cadence as the certificate pass, own short deadline) implements this
 per server:
 
 - **In scope**: forward `http → https` only on an **explicit** reported
-  `tls_active:true` for the app's exact `ProxyListenPort`; revert
-  `https → http` only on an **explicit** reported `tls_active:false`. A
-  *missing* route in the snapshot (the agent never reported, or reported an
-  empty set) is neither — an agent that merely went quiet must never have its
-  already-working switch torn down.
+  `tls_active:true` for the app's exact `ProxyListenPort`. An explicit
+  `tls_active:false` is **declined, never reverted** (§7.1). A *missing* route
+  in the snapshot (the agent never reported, or reported an empty set) is
+  neither — an agent that merely went quiet must never have its already-working
+  switch torn down.
 - **Out of scope** (an excluded/non-included server, or the whole fleet
   under `manual`): every proxy-switched `https` application is reverted to
   `http` **unconditionally**, without consulting the proxy-status snapshot at
@@ -291,6 +315,72 @@ enabled and either plain `http`, or already proxy-switched `https` with a
 non-zero `ProxyListenPort` — an application manually set to `https` with no
 proxy port runs its own TLS and is left alone by both the route derivation
 (§6) and this reconcile.
+
+### 7.1 No automatic downgrade to plaintext
+
+**The gateway never switches an application to unencrypted `http` because TLS
+broke.** An explicit `tls_active:false` for a proxy-switched application's
+`ProxyListenPort` leaves it on `https`. It becomes unreachable until TLS works
+again or an operator changes it deliberately.
+
+This reverses the original behaviour, which flipped the application back to
+plaintext so a broken certificate degraded instead of outaging — and did it
+with **no log line, no audit event and nothing in the portal**: the only
+evidence was the scheme column. Operator decision, and the right one for a
+system whose whole point is that inference traffic is encrypted: an automatic
+switch to unencrypted is a security problem, not a mitigation.
+
+The price is availability, and it is paid honestly. The failure is **not**
+allowed to be silent either — swapping a silent downgrade for a silent outage
+is the same defect facing the other way — so the declined revert is loud in two
+independent places:
+
+- a `Warn` on **every** pass that observes it, naming the server, the
+  application, the port, the agent's own reason and the remedy. Every pass, not
+  only the first: the reconcile cadence is 15 minutes by default, so this is a
+  recurring reminder rather than one line that scrolls away, and it needs no
+  transition state that could get stuck in "already reported".
+- `Service.HTTPSSwitchUnreachableApps`, returned by `GET
+  /api/system/certificates` under `https_switch.unreachable_apps` and rendered
+  by the portal's certificate view as an **error** alert. It is *derived* from
+  the same three inputs the reconcile reads (mode, applications, proxy-route
+  status) rather than from a side table the reconcile writes — the same
+  reasoning `GatewayCARotationPendingServers` gives for reusing
+  `gatewayTrustPropagation`: a view and a reconcile with separate opinions of
+  one condition eventually disagree, and the operator cannot tell which is
+  lying.
+
+The reason comes from the agent's own `RouteState` vocabulary
+(`pending_leaf`, `bind_failed`, `pending_bind_host`, `invalid_upstream`),
+relayed verbatim and never re-invented gateway-side. The agent had always sent
+it in `proxy_routes[].state`; the gateway decoded only `listen` + `tls_active`
+and dropped it. It is decoded now, because once the gateway refuses to
+downgrade, *why* the listener is down is the whole content of the alert it
+raises instead. Each state maps to an instruction
+(`httpsSwitchUnreachableAction`) so the message says what to do, not only what
+happened; an unrecognised or absent state falls back to a generic remedy rather
+than to silence.
+
+Recovery needs no action: the application was never moved, so when the agent's
+listener returns it simply works again. There is no forward switch to re-run
+and no window in which it is briefly plaintext.
+
+**The scope-exit revert (§7, out of scope) is the one automatic move to
+plaintext that survives this, and it is kept on purpose.** The difference is
+the operator. On a `tls_active:false` report nobody asked for anything — a leaf
+expired, a port got taken — and answering an environment failure by turning
+encryption off is exactly what the policy forbids. A scope exit is an explicit
+portal action whose documented and only effect is "this server no longer runs
+the gateway-guided TLS proxy": the gateway itself then withdrew the routes and
+the agent tore the listeners down, so the revert completes the operator's own
+instruction. And the alternative is strictly worse here — left on `https` the
+application points at a port that is genuinely gone, with **no path back** (the
+status-driven pass does not run for an out-of-scope server, a torn-down route
+is *missing* rather than an explicit false, and there is no `proxy_listen_port`
+field in the portal UI, so the rescue is API-only). That is a permanent outage
+from a routine narrowing action, not a recoverable one. It is no longer silent
+either: it logs a `Warn` naming the application and saying that its traffic is
+now unencrypted.
 
 ## 8. CA-trusting outbound transport (server-agent)
 

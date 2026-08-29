@@ -17,6 +17,12 @@ import "sync"
 type ProxyRouteStatus struct {
 	Listen    int
 	TLSActive bool
+	// State is the agent's own proxy.RouteState for this route, relayed
+	// verbatim and never interpreted here: "pending_leaf",
+	// "invalid_upstream", "pending_bind_host", "bind_failed", "active".
+	// Empty means the agent did not report one. It is what turns a
+	// TLSActive=false into something an operator can act on.
+	State string
 }
 
 // AgentProxyStatusRegistry remembers, per server, the most recently reported

@@ -117,13 +117,26 @@ authorization independently. **Consequence:** certificate reconcilers keep a hea
 certificate on a transient dependency error (only a definitive empty result tears
 it down).
 
-## ADR-017 — Agent TLS proxy + HTTPS auto-switch with scope-exit revert
+## ADR-017 — Agent TLS proxy + HTTPS auto-switch: scope-exit revert, but no downgrade on broken TLS
 **Decision:** `cert_mode=proxy` runs an agent-side TLS-terminating proxy in front of
 the AI server; the gateway assigns a proxy listen port and reconciles an automatic
 HTTP→HTTPS application switch (modes manual/auto/selected + a three-valued
-per-server override). **Consequence:** when a server leaves switch scope, the
-reconcile must **revert** it to `http` (a scope-exit that only skips would strand an
-application on `https` against a torn-down proxy port).
+per-server override). An explicit reported `tls_active:false` is **declined, never
+reverted** — the gateway never answers a broken certificate or a dead listener by
+putting inference traffic back on plaintext. **Consequence:** two automatic moves
+that look alike are decided oppositely, and the difference is whether an operator
+asked for anything. A `tls_active:false` report leaves the application on `https`
+and **unreachable** until TLS works again; that availability is paid on purpose and
+is not allowed to be silent — a `Warn` on **every** reconcile pass plus
+`https_switch.unreachable_apps` in `GET /api/system/certificates`, rendered as an
+error in the portal's certificate view — and recovery needs no action, because the
+application was never moved. A **scope exit** still reverts to `http`
+unconditionally, deliberately kept: the gateway itself withdrew the routes, so the
+revert completes the operator's own action, and skipping it would strand the
+application on `https` against a torn-down proxy port with no path back. Do not
+"restore symmetry" by reinstating the downgrade; ADR-022's general keep-healthy rule
+is deliberately not applied to plaintext downgrade.
+→ [Certificates & TLS §7.1](cross-cutting/certificates-tls.md#71-no-automatic-downgrade-to-plaintext).
 
 ## ADR-018 — OpenTelemetry decorators via the global provider
 **Decision:** tracing decorators are generated (gowrap) and live in their own

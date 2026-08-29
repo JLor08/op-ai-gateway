@@ -275,6 +275,27 @@ export type CertificateMeshStatus = {
   tls_pending_servers?: Array<{ id: string; name: string }>;
 };
 
+// One application the gateway is REFUSING to downgrade to plaintext http: it is
+// proxy-switched to https on a server in https-auto-switch scope, and its agent
+// explicitly reports the proxy listener not terminating TLS. The application is
+// unreachable until that is fixed. `route_state` is the agent's own reason
+// (pending_leaf / bind_failed / pending_bind_host / invalid_upstream; absent if
+// the agent reported none) and `action` is the remedy, both composed by the
+// backend so the portal and the gateway log say the same thing.
+export type HTTPSSwitchUnreachableApp = {
+  server_id: string;
+  server_name: string;
+  app_id: string;
+  app_type: string;
+  proxy_listen_port: number;
+  route_state?: string;
+  action: string;
+};
+
+export type HTTPSSwitchStatus = {
+  unreachable_apps: HTTPSSwitchUnreachableApp[];
+};
+
 // The gateway's internal CA (self_signed issuer mode). present=false means no
 // CA has been generated yet; the other fields are then meaningless placeholders.
 // previous_fingerprint/_not_after are populated only right after a rotation,
@@ -579,10 +600,11 @@ export function systemApi(fetcher: Fetcher) {
     // computed client-side from not_after so it never goes stale. mesh is
     // optional so a rolling upgrade against an older backend stays typable.
     certificates: () =>
-      request<{ data: CertificateRow[]; mesh?: CertificateMeshStatus }>(
-        fetcher,
-        '/api/system/certificates',
-      ),
+      request<{
+        data: CertificateRow[];
+        mesh?: CertificateMeshStatus;
+        https_switch?: HTTPSSwitchStatus;
+      }>(fetcher, '/api/system/certificates'),
     // Trigger an immediate renewal attempt for one certificate by domain (system
     // scope). 404 certificate.not_found for an unknown domain.
     renewCertificate: (domain: string) =>

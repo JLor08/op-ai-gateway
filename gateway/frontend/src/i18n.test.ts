@@ -2164,3 +2164,133 @@ describe('resolved-command masking strings state their own scope', () => {
     expect(messages.de.runtimeCommandTrimmedHere).toMatch(/diese Ansicht/i);
   });
 });
+
+describe('one-server_agent-per-server affordance i18n key', () => {
+  it('defines applicationTypeServerAgentTaken in de and en', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(typeof m.applicationTypeServerAgentTaken).toBe('string');
+      expect(m.applicationTypeServerAgentTaken.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('teaches the rule and the remedy rather than restating the 409', () => {
+    // The type field's helper line is read BEFORE the form is filled in, so it
+    // has room the toast does not: why the rule exists (one agent per server)
+    // and what to do instead (edit or delete the existing application). The
+    // 409's own string stays terse because formatPortalError prefixes it with
+    // the raw error code. Reusing that string here would have been one key
+    // fewer and one sentence that teaches nothing.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.applicationTypeServerAgentTaken).not.toBe(m.errorApplicationServerAgentExists);
+      expect(m.applicationTypeServerAgentTaken.length).toBeGreaterThan(
+        m.errorApplicationServerAgentExists.length,
+      );
+    }
+    expect(messages.en.applicationTypeServerAgentTaken).toMatch(/one agent runs per server/i);
+    expect(messages.en.applicationTypeServerAgentTaken).toMatch(/edit or delete/i);
+    expect(messages.de.applicationTypeServerAgentTaken).toMatch(/genau ein Agent/i);
+    expect(messages.de.applicationTypeServerAgentTaken).toMatch(/bearbeiten oder löschen/i);
+  });
+});
+
+describe('managed_runtime_only affordance i18n keys', () => {
+  it('defines applicationTypeManagedRuntimeOnly and runtimeManagedOnlyCreateBlocked in de and en', () => {
+    const keys = ['applicationTypeManagedRuntimeOnly', 'runtimeManagedOnlyCreateBlocked'] as const;
+    for (const m of [messages.de, messages.en]) {
+      for (const k of keys) {
+        expect(typeof m[k]).toBe('string');
+        expect(m[k].length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('says on the type field that the gate is create-only, and does not restate the 409', () => {
+    // The backend reads ManagedRuntimeOnly inside CreateApplication only;
+    // UpdateApplication never reads it. The helper line is the one place an
+    // operator can be told that, so it must say it -- otherwise the edit form
+    // offering all six types reads as a portal bug rather than as the rule.
+    // The 409's own string stays terse (formatPortalError prefixes it with the
+    // raw error code); reusing it here would teach nothing.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.applicationTypeManagedRuntimeOnly).not.toBe(m.errorApplicationManagedRuntimeOnly);
+      expect(m.applicationTypeManagedRuntimeOnly.length).toBeGreaterThan(
+        m.errorApplicationManagedRuntimeOnly.length,
+      );
+    }
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/server_agent/);
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/creating only/i);
+    expect(messages.en.applicationTypeManagedRuntimeOnly).toMatch(/stay editable/i);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/server_agent/);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/fürs Anlegen/i);
+    expect(messages.de.applicationTypeManagedRuntimeOnly).toMatch(/änderbar/i);
+  });
+
+  it('gives the vanished create button its own sentence, separate from the standing banner', () => {
+    // The banner states the server's mode and is always on; this second
+    // sentence states a restriction that is only in force once the one
+    // server_agent application exists, so it must be a different string --
+    // folding them into one would assert the restriction unconditionally.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.runtimeManagedOnlyCreateBlocked).not.toBe(m.runtimeManagedOnlyBanner);
+      expect(m.runtimeManagedOnlyCreateBlocked.length).toBeGreaterThan(
+        m.runtimeManagedOnlyBanner.length,
+      );
+    }
+    expect(messages.en.runtimeManagedOnlyCreateBlocked).toMatch(/already exists/i);
+    expect(messages.en.runtimeManagedOnlyCreateBlocked).toMatch(/edit or delete/i);
+    expect(messages.de.runtimeManagedOnlyCreateBlocked).toMatch(/bereits angelegt/i);
+    expect(messages.de.runtimeManagedOnlyCreateBlocked).toMatch(/bearbeiten oder löschen/i);
+  });
+});
+
+describe('managed_runtime_only server-form control i18n keys', () => {
+  it('defines serverManagedRuntimeOnlyLabel and serverManagedRuntimeOnlyHelp in de and en', () => {
+    const keys = ['serverManagedRuntimeOnlyLabel', 'serverManagedRuntimeOnlyHelp'] as const;
+    for (const m of [messages.de, messages.en]) {
+      for (const k of keys) {
+        expect(typeof m[k]).toBe('string');
+        expect(m[k].length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('states the two consequences an operator cannot guess: not retroactive, and the create button vanishes', () => {
+    // This checkbox turns a server into one that refuses most application
+    // creates. Neither consequence is visible from the label, and both are
+    // reachable only from this one string -- an operator who reads only the
+    // label would expect the flag to disable the applications that already
+    // exist (it does not: the backend reads it inside CreateApplication only),
+    // and would not expect the create button to disappear once the server's
+    // one server_agent application exists (managed_runtime_only permits only
+    // that type and the one-agent-per-server rule refuses a second of it, so
+    // the two gates intersect to the empty set).
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/server_agent/);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/not retroactive/i);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/stay editable/i);
+    expect(messages.en.serverManagedRuntimeOnlyHelp).toMatch(/create button/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/server_agent/);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/nicht rückwirkend/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/änderbar/i);
+    expect(messages.de.serverManagedRuntimeOnlyHelp).toMatch(/Schaltfläche zum Anlegen/i);
+  });
+
+  it('does not contradict the application-side affordance strings', () => {
+    // Three strings now describe the same rule from two screens. The server
+    // form's help is the only one that must carry BOTH consequences (it is the
+    // control that causes them), so it is the longest; the other two are read
+    // in a context that already supplies half the answer. If a future edit
+    // shortens this one below either, a consequence was dropped.
+    for (const m of [messages.de, messages.en]) {
+      expect(m.serverManagedRuntimeOnlyHelp.length).toBeGreaterThan(
+        m.applicationTypeManagedRuntimeOnly.length,
+      );
+      expect(m.serverManagedRuntimeOnlyHelp.length).toBeGreaterThan(
+        m.runtimeManagedOnlyCreateBlocked.length,
+      );
+      // The label names the restriction; it must not itself be the explanation.
+      expect(m.serverManagedRuntimeOnlyLabel.length).toBeLessThan(
+        m.serverManagedRuntimeOnlyHelp.length,
+      );
+    }
+  });
+});

@@ -187,6 +187,14 @@ export type CreateServerRequest = {
   // set, every chosen admin_group_ids entry's parent must equal it, or the
   // create is rejected (server.admin_group_parent_mismatch).
   system_group_id?: string;
+  // Restrict the new server to server_agent applications (Task 6, migration 66;
+  // the server form's checkbox, issue #25). Mirrors the Go
+  // CreateServerRequest.ManagedRuntimeOnly `*bool`, but create has no
+  // "leave unchanged" case: a brand-new row's column defaults to false, so nil
+  // and false land in the same place. The form therefore always states it. The
+  // reason to accept it here at all is provisioning: an operator who wants a
+  // managed-only server should not have to create it and then PATCH it.
+  managed_runtime_only?: boolean;
 };
 
 export type UpdateServerRequest = {
@@ -212,6 +220,19 @@ export type UpdateServerRequest = {
   // "leave unchanged", matching every other optional field in this request).
   // Must be >= 0 (else server.runtime_limit_invalid).
   runtime_max_processes?: number;
+  // Restrict this server to server_agent applications (Task 6, migration 66;
+  // the server form's checkbox, issue #25). Mirrors the Go
+  // UpdateServerRequest.ManagedRuntimeOnly `*bool` -- and here, unlike on
+  // create, ALL THREE states are distinct and reachable: undefined = "leave
+  // unchanged", true = restrict, false = LIFT the restriction. The distinction
+  // is not decorative. UpdateServer applies `if req.ManagedRuntimeOnly != nil`,
+  // so a PATCH sent for some unrelated reason -- a rename, a status change --
+  // that carries a `false` it never meant to state silently clears the
+  // operator's policy and returns an ordinary 200. Any sender must therefore
+  // leave this key OUT unless it is deliberately answering the question; see
+  // submitEdit in ServerList.tsx, which compares against the value the form was
+  // seeded with rather than sending its checkbox state unconditionally.
+  managed_runtime_only?: boolean;
 };
 
 // One resource group a server OWNER may enter their server into (spec

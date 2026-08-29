@@ -340,6 +340,9 @@ const de = {
   serverNetbirdAllowPing: 'Ping erlauben',
   serverNetbirdPingExclude: 'Ping für diesen Server NICHT erlauben',
   serverStatusLabel: 'Status',
+  serverManagedRuntimeOnlyLabel: 'Nur agent-gesteuerte Anwendungen zulassen',
+  serverManagedRuntimeOnlyHelp:
+    'Solange aktiv, lässt sich auf diesem Server nur eine server_agent-Anwendung anlegen; jeder andere Typ wird beim Anlegen abgelehnt. Zwei Punkte, die daraus nicht ersichtlich sind: Die Einstellung wirkt NICHT rückwirkend — bereits vorhandene Anwendungen dieses Servers laufen weiter und bleiben auf jeden Typ änderbar. Und sobald die eine server_agent-Anwendung existiert, verschwindet die Schaltfläche zum Anlegen dort vollständig, denn pro Server läuft genau ein Agent — es bleibt dann kein anlegbarer Typ übrig.',
   serverOwnersLabel: 'Besitzer',
   serverActionEdit: 'Bearbeiten',
   serverActionSave: 'Speichern',
@@ -359,6 +362,10 @@ const de = {
   modelMappings: 'Modell-Zuordnungen',
   modelMappingsIntro: 'Gateway-Modellnamen auf Anwendungs-Modellnamen abbilden.',
   applicationType: 'Typ',
+  applicationTypeServerAgentTaken:
+    'Pro Server läuft genau ein Agent — deshalb ist nur eine server_agent-Anwendung möglich. Dieser Server hat bereits eine: bearbeiten oder löschen Sie diese, statt eine zweite anzulegen.',
+  applicationTypeManagedRuntimeOnly:
+    'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen — beim Anlegen ist deshalb nur server_agent möglich; das Formular ist bereits darauf eingestellt. Die Beschränkung gilt ausschließlich fürs Anlegen: bestehende Anwendungen dieses Servers bleiben auf jeden Typ änderbar.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -519,6 +526,8 @@ const de = {
   runtimeClearOverride: 'Übersteuerung aufheben',
   runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
   runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
+  runtimeManagedOnlyCreateBlocked:
+    'Die server_agent-Anwendung dieses Servers ist bereits angelegt, und pro Server läuft genau ein Agent — es lässt sich hier also keine weitere Anwendung mehr anlegen. Bearbeiten oder löschen Sie die vorhandene.',
   runtimeIneffectiveSpecs:
     'Diese Runtime-Spezifikationen liegen im Gateway (Reiter „Runtime-Spezifikationen“ dieser Anwendung) und haben keine Wirkung, solange der Agent seine Prozesse aus seiner eigenen lokalen Datei verwaltet. Sie werden nicht gelöscht und greifen wieder, sobald die Konfigurationsquelle des Agenten zurück auf „Gateway“ gestellt wird. Im Datei-Modus sind sie hier weder einsehbar noch bearbeitbar.',
   runtimeTimeoutWarning:
@@ -1171,6 +1180,10 @@ const de = {
   certificatesHTTPSSwitchModeConfirmTitle: 'Auf automatisches Umschalten wechseln?',
   certificatesHTTPSSwitchModeConfirmBody:
     'Im Automatik-Modus schaltet der Gateway die Anwendungen berechtigter Server künftig selbstständig von http auf https um (sofern nicht einzeln ausgeschlossen). Das kann bestehende Verbindungen kurzzeitig unterbrechen.',
+  certificatesHTTPSSwitchUnreachableTitle:
+    'Anwendungen nicht erreichbar (TLS defekt, kein automatischer Rückfall)',
+  certificatesHTTPSSwitchUnreachableBody:
+    'Der TLS-Listener des Agenten meldet sich für diese Anwendungen als nicht aktiv. Der Gateway schaltet sie NICHT automatisch auf unverschlüsseltes http zurück — sie bleiben auf https und sind bis zur Behebung nicht erreichbar:',
   certificatesProxyListenPortBase: 'Proxy-Listen-Port (Startwert)',
   settingsCertEnabled: 'Zertifikatsverwaltung aktiv',
   settingsAcmeEmail: 'ACME-E-Mail',
@@ -2274,6 +2287,9 @@ const en: PortalMessages = {
   serverNetbirdAllowPing: 'Allow ping',
   serverNetbirdPingExclude: 'Do not allow ping for this server',
   serverStatusLabel: 'Status',
+  serverManagedRuntimeOnlyLabel: 'Accept only agent-managed applications',
+  serverManagedRuntimeOnlyHelp:
+    "While on, only a server_agent application can be created on this server; every other type is refused at creation. Two things that does not tell you: the setting is NOT retroactive — this server's existing applications keep running and stay editable to any type. And once the one server_agent application exists, the create button there disappears entirely, because exactly one agent runs per server — no creatable type is left.",
   serverOwnersLabel: 'Owners',
   serverActionEdit: 'Edit',
   serverActionSave: 'Save',
@@ -2293,6 +2309,10 @@ const en: PortalMessages = {
   modelMappings: 'Model Mappings',
   modelMappingsIntro: 'Map gateway model names to application model names.',
   applicationType: 'Type',
+  applicationTypeServerAgentTaken:
+    'Exactly one agent runs per server — so only one server_agent application is possible. This server already has one: edit or delete it instead of creating a second.',
+  applicationTypeManagedRuntimeOnly:
+    "This server only accepts agent-managed applications — so server_agent is the only type it can be created with, and the form is already set to it. The restriction applies to creating only: this server's existing applications stay editable to any type.",
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -2447,6 +2467,8 @@ const en: PortalMessages = {
   runtimeClearOverride: 'Clear override',
   runtimeManagedLocally: 'Managed locally by the agent (file mode)',
   runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
+  runtimeManagedOnlyCreateBlocked:
+    "This server's server_agent application already exists, and exactly one agent runs per server — so there is no further application left to create here. Edit or delete the existing one instead.",
   runtimeIneffectiveSpecs:
     'These runtime specs live in the gateway (the "Runtime specs" tab of this application) and have no effect while the agent manages its processes from its own local file. They are not deleted, and they take effect again as soon as the agent\'s configuration source is switched back to "gateway". While file mode is active they can neither be viewed nor edited here.',
   runtimeTimeoutWarning:
@@ -3082,6 +3104,10 @@ const en: PortalMessages = {
   certificatesHTTPSSwitchModeConfirmTitle: 'Switch to automatic mode?',
   certificatesHTTPSSwitchModeConfirmBody:
     "In auto mode the gateway will automatically switch eligible servers' applications from http to https going forward (unless individually excluded). This may briefly interrupt existing connections.",
+  certificatesHTTPSSwitchUnreachableTitle:
+    'Applications unreachable (TLS down, no automatic fallback)',
+  certificatesHTTPSSwitchUnreachableBody:
+    'The agent reports its TLS listener as not active for these applications. The gateway does NOT switch them back to unencrypted http — they stay on https and are unreachable until this is fixed:',
   certificatesProxyListenPortBase: 'Proxy listen port (base)',
   settingsCertEnabled: 'Certificate management active',
   settingsAcmeEmail: 'ACME email',

@@ -534,6 +534,54 @@ export function ApplicationSection({
     const editing = mode !== 'create';
     // The app being edited (holds api_token_set); undefined on create.
     const editApp = typeof mode !== 'string' && mode.kind === 'edit' ? mode.app : undefined;
+    // One server_agent application per AI server, because only one agent runs
+    // per server. The rule is already enforced three levels down -- migration
+    // 68's partial unique index, the portal service's pre-read, and the 409
+    // application.server_agent_exists -- so this is purely the AFFORDANCE that
+    // says so BEFORE a whole form has been filled in, instead of only after
+    // the submit.
+    //
+    // It is not the enforcement and cannot be: `applications` is this
+    // component's local list, fetched once and never polled, and it reads as
+    // [] both while the first fetch is in flight and after one failed (the
+    // `?? []` above). Whenever it is wrong this gate silently opens; the 409
+    // is what actually holds the line, and submitCreate/submitEdit still
+    // render it.
+    //
+    // The `a.id !== editApp?.id` exclusion mirrors the backend's own
+    // excludeAppID exactly (create passes "", update passes app.ID), so the
+    // server's own server_agent application never collides with itself: its
+    // edit form keeps the type selected, selectable, and re-saveable, and can
+    // switch away and back before saving. Retyping any OTHER application to
+    // server_agent is blocked, which is the second write path the backend
+    // guards with the same sentinel.
+    const serverAgentTaken = serverAgentApps.some((a) => a.id !== editApp?.id);
+    // The SECOND gate on this control, and it is CREATE-ONLY. The backend reads
+    // Server.ManagedRuntimeOnly in exactly one place -- inside CreateApplication,
+    // against the RAW requested type -- and UpdateApplication never looks at it.
+    // So `&& !editing` is not a nicety: without it the portal would refuse, on
+    // an edit, writes the backend accepts, and refuse them SILENTLY (a disabled
+    // option gives no error to look up). That is a worse failure than the one
+    // this closes. The gate follows the backend's own scope or it is a bug.
+    //
+    // Unlike serverAgentTaken this reads the SERVER dto, not the applications
+    // list, so no fetch window opens it -- but the server dto is itself fetched
+    // by the parent list and never refreshed here, so a PATCH that sets the flag
+    // afterwards leaves this form offering all six types. The 409 is still the
+    // enforcement; a test fires that path so the mapping is not dropped.
+    const managedRuntimeOnlyCreate = managedRuntimeOnly && !editing;
+    // One helperText slot, two reasons. They are co-reachable -- but only
+    // through the first-fetch window: on a settled managed server that already
+    // holds an agent application the create button is not rendered at all
+    // (see the list view below), so the create form cannot be opened; while
+    // that first fetch is in flight `applications` reads [] and the button is
+    // not loading-gated, so it can. Composed narrowest-first: "only server_agent
+    // is creatable here", then "and that one is taken" -- which together say
+    // the intersection is empty, exactly what the disabled options then show.
+    const typeReasons = [
+      managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
+      serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
+    ].filter((reason): reason is string => reason !== undefined);
     return (
       <>
         <Breadcrumbs
@@ -559,9 +607,46 @@ export function ApplicationSection({
               label={t.applicationType}
               value={type}
               onChange={(e) => handleTypeChange(e.target.value as ApplicationType)}
+              // A disabled control must say why -- but the reason rides on the
+              // FIELD, not on the option. MUI leaves `disabledItemsFocusable`
+              // false, so arrow-key navigation skips a disabled option
+              // entirely and anything anchored there (a Tooltip, a title) is
+              // unreachable by keyboard and screen reader -- issue #26's
+              // defect, made worse. `helperText` is wired to the combobox via
+              // aria-describedby, so it is announced on focus, before the menu
+              // is ever opened, and it is legible without a hover. It states
+              // the rule, the reason for it and the remedy; the 409 toast
+              // stays terse because it arrives after the fact and is already
+              // prefixed with its raw error code.
+              helperText={typeReasons.length > 0 ? typeReasons.join(' ') : undefined}
             >
               {applicationTypeOptions.map((option) => (
-                <option value={option} key={option}>
+                <option
+                  value={option}
+                  key={option}
+                  // Disabled, never filtered out of the list: openEdit seeds
+                  // `type` from the row, and a value with no matching MenuItem
+                  // renders a BLANK combobox -- the operator cannot see what
+                  // the application IS while editing it.
+                  //
+                  // It is NOT a data-integrity problem, and an earlier version
+                  // of this comment said it was ("buildBody would submit a
+                  // silent retype"). Probed: under a filtering variant the save
+                  // path still sends `type: 'server_agent'`, because `type`
+                  // holds the seeded value whether or not a MenuItem matches
+                  // it. Overstating the reason is what invites the "fix" that
+                  // reintroduces the blank field.
+                  //
+                  // The managed_runtime_only half disables the complementary
+                  // five, and only while creating -- see managedRuntimeOnlyCreate
+                  // above. Same reasoning against filtering: openEdit seeds the
+                  // type from the row, and an edit is precisely where this gate
+                  // must not apply at all.
+                  disabled={
+                    (option === 'server_agent' && serverAgentTaken) ||
+                    (managedRuntimeOnlyCreate && option !== 'server_agent')
+                  }
+                >
                   {option}
                 </option>
               ))}
@@ -872,6 +957,22 @@ export function ApplicationSection({
     );
   }
 
+  // On a managed_runtime_only server the two backend gates intersect to the
+  // empty set once the one server_agent application exists: managed_runtime_only
+  // permits only that type, and the one-agent-per-server rule refuses a second
+  // of it. No create of any type can succeed, so the button is not offered.
+  //
+  // HIDDEN, not disabled -- and deliberately the opposite call to the one made
+  // for the type option, because the alternatives are not the same. Removing an
+  // option from a select blanks the combobox, since the form's `type` is seeded
+  // from the row whether or not a menu item matches it; removing a button costs
+  // nothing structurally. And the reason has to be readable without a hover:
+  // helperText gave the field one (aria-describedby, announced on focus), but a
+  // disabled MUI Button is out of the tab order and sets pointer-events: none,
+  // so the only reason-carrier left for it is a Tooltip on a wrapper span --
+  // unreachable by keyboard and screen reader, which is issue #26 exactly.
+  // Plain text in the reading order, right where the button was, beats both.
+  const canCreateApplication = !managedRuntimeOnly || serverAgentApps.length === 0;
   return (
     <>
       <Breadcrumbs
@@ -884,7 +985,7 @@ export function ApplicationSection({
         title={t.applications}
         subtitle={t.applicationsIntro}
         actions={
-          (!managedRuntimeOnly || serverAgentApps.length === 0) && (
+          canCreateApplication && (
             <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
               {t.applicationCreate}
             </Button>
@@ -893,7 +994,19 @@ export function ApplicationSection({
       >
         {managedRuntimeOnly && (
           <Alert severity="info" sx={{ mb: 2 }}>
-            {t.runtimeManagedOnlyBanner}
+            {/* Two sentences, two elements. The banner keeps its own text node
+                so it stays matchable exactly, and the second sentence is bound
+                to the same condition as the button rather than restated, so the
+                two can never drift into claiming a restriction that is not in
+                force. */}
+            <Box component="span" sx={{ display: 'block' }}>
+              {t.runtimeManagedOnlyBanner}
+            </Box>
+            {!canCreateApplication && (
+              <Box component="span" sx={{ display: 'block', mt: 0.5 }}>
+                {t.runtimeManagedOnlyCreateBlocked}
+              </Box>
+            )}
           </Alert>
         )}
         <ListTable

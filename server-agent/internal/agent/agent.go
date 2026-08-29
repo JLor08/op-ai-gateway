@@ -37,7 +37,7 @@ import (
 // PATCH for anything else. TestFeatureRegistry enforces the MINOR case by
 // failing if any Feature.Since outruns Version; it cannot catch a forgotten
 // PATCH bump after a plain bugfix, which stays a process rule.
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

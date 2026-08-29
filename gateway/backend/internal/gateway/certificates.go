@@ -37,6 +37,7 @@ type certPortal interface {
 	GatewayCARotationPendingServers(context.Context) []portal.CertificateServerRefDTO
 	CertMeshRequireTLSChecked(context.Context) bool
 	MeshTLSPendingServers(context.Context) []portal.CertificateServerRefDTO
+	HTTPSSwitchUnreachableApps(context.Context) []portal.HTTPSSwitchUnreachableDTO
 	RenewCertificateNow(context.Context, auth.Token, string) error
 	SetServerCertificateOverride(context.Context, auth.Token, string, string) (portal.ServerDTO, error)
 	SetServerHTTPSSwitchOverride(context.Context, auth.Token, string, string) (portal.ServerDTO, error)
@@ -167,7 +168,19 @@ func (s *Server) handleSystemCertificates(w http.ResponseWriter, r *http.Request
 			mesh.NotAfter = &notAfter
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": certs, "mesh": mesh})
+	// https_switch is a SIBLING of mesh, not part of it: the https-auto-switch
+	// is its own P4 feature (agent TLS proxy + scheme switch) and the portal
+	// already renders it in its own box, independent of the agent-mesh-port
+	// topology mesh describes. The list is empty in the overwhelmingly common
+	// case; it is non-empty exactly when the gateway is refusing to downgrade
+	// an application to plaintext and that application is therefore down.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data": certs,
+		"mesh": mesh,
+		"https_switch": map[string]any{
+			"unreachable_apps": s.certPortal().HTTPSSwitchUnreachableApps(r.Context()),
+		},
+	})
 }
 
 // handleSystemCertificateRenew clears one domain's backoff so the next reconcile
