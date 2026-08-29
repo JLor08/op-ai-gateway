@@ -943,6 +943,7 @@ export function RuntimeAdminSection({
   server,
   application,
   trail = [],
+  pollIntervalMs,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -979,6 +980,18 @@ export function RuntimeAdminSection({
   server: PortalServer;
   application: PortalApplication;
   trail?: BreadcrumbItem[];
+  /**
+   * Cadence (ms) of the context probe's benchmark-status poll, forwarded
+   * verbatim to `MappingForm`. Exactly the prop `MappingSection` carries for
+   * the same reason and with the same reach: nothing in the render tree above
+   * either screen passes it, so in the running portal it is `undefined` and the
+   * shared helper's ~2 s cadence applies. It exists so a test can drive the
+   * probe to completion without a real wait -- and the probe is the one part of
+   * the shared mask with an async loop, so without it that loop is reachable on
+   * the ordinary screen's tests and not on this tab's, which is a coverage gap
+   * rather than a saved prop.
+   */
+  pollIntervalMs?: number;
 }>) {
   const { showError, showSuccess } = useToast();
   const [tab, setTab] = useState<Tab>('specs');
@@ -2283,8 +2296,12 @@ export function RuntimeAdminSection({
       // only `app_model_name` (the spec's upstream_model).
       //
       // OMITTED, not echoed. The PATCH is pointer-gated per field, so an absent
-      // key leaves that field byte-for-byte alone -- which is what makes the two
-      // screens non-overlapping writers instead of two writers racing. Echoing
+      // key carries no value for that field -- which is what makes the two
+      // screens non-overlapping WRITERS. It does not make the write atomic:
+      // `Service.UpdateMapping` re-writes the whole row it loaded, with no
+      // compare-and-set, so a mapping-tab PATCH landing between this one's read
+      // and its write is still lost. Omission removes the routine clobber, not
+      // the race (11-risks-and-technical-debt.md §11.1). Echoing
       // `status` here would be worse than redundant: it is a snapshot taken when
       // this form opened, so a spec save would silently PATCH a deliberately
       // DISABLED model back into service, with no error and no column on the
@@ -2453,10 +2470,15 @@ export function RuntimeAdminSection({
     try {
       // Read-only here => not sent from here. `app_model_name` belongs to the
       // runtime spec (see the ownership note above) and the mapping PATCH is
-      // pointer-gated per field, so an ABSENT key leaves it byte-for-byte
-      // alone. Re-stating the value we happen to hold is not equivalent: it is
-      // a snapshot from when this form opened, and it would overwrite a spec
-      // edit made in between with no error and nothing on screen to show it.
+      // pointer-gated per field, so an ABSENT key carries no value for it.
+      // Re-stating the value we happen to hold is not equivalent: it is a
+      // snapshot from when this form opened, and it would overwrite a spec edit
+      // made in between with no error and nothing on screen to show it.
+      //
+      // That is the CLOBBER, and omission is what removes it. The RACE is still
+      // open and is not ours to close here: the backend re-writes the whole row
+      // it loaded, so a spec-form PATCH that lands between this call's read and
+      // its write is reverted anyway (11-risks-and-technical-debt.md §11.1).
       const body: UpdateMappingRequest = { ...values };
       delete body.app_model_name;
       const updated = await api.updateMapping(id, body);
@@ -2979,6 +3001,7 @@ export function RuntimeAdminSection({
             busy={busy}
             onSubmit={(values) => void saveMappingFromTab(mappingEdit.id, values)}
             onCancel={() => setMappingEdit(null)}
+            pollIntervalMs={pollIntervalMs}
           />
         </Panel>
       </>

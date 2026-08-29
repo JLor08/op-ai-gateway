@@ -104,9 +104,16 @@ export function MappingForm({
    * portal never warns about `${MODEL}` with an empty upstream name) but not
    * edited, and the caller OMITS it from the PATCH.
    *
-   * Do not "helpfully" re-enable it: two screens editing one field is exactly
-   * the lost-update race this split removes, and nothing server-side enforces
-   * the boundary -- no mapping endpoint special-cases `server_agent`.
+   * Do not "helpfully" re-enable it. Be precise about what that buys, though:
+   * the split removes the routine CLOBBER, not the race. `Service.UpdateMapping`
+   * loads the row, applies the pointer fields and writes the WHOLE struct back
+   * with no compare-and-set, so two PATCHes in flight at once still lose an
+   * update -- the later writer reverts the earlier writer's field even though it
+   * never sent that key. Omission means this form stops overwriting the spec
+   * form's field on EVERY save; the residual lost update is a backend contract
+   * gap, recorded in `docs/architecture/11-risks-and-technical-debt.md` §11.1.
+   * Nothing server-side enforces the boundary either -- no mapping endpoint
+   * special-cases `server_agent`.
    */
   appNameReadOnly?: boolean;
   busy: boolean;

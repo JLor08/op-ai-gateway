@@ -11,6 +11,7 @@ import {
 } from './RuntimeAdminSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { PortalApiError } from '../api/transport';
+import type { PortalApi } from './shared/types';
 import { messages } from '../i18n';
 import type {
   BenchmarkStatus,
@@ -223,6 +224,15 @@ function renderSection(
   opts: {
     mappings?: PortalModelMapping[];
     specsByMappingId?: Record<string, RuntimeSpec>;
+    // The owning application, for the few tests that need a field of it other
+    // than the module default -- e.g. a non-empty `context_probe_path`, which
+    // is what enables the shared mask's context-probe button.
+    application?: PortalApplication;
+    // The three calls `MappingForm`'s context probe makes, overridable exactly
+    // as MappingSection's own tests override them.
+    activeBenchmarks?: PortalApi['activeBenchmarks'];
+    benchmarkStatus?: PortalApi['benchmarkStatus'];
+    probeMappingContext?: PortalApi['probeMappingContext'];
     warnings?: string[];
     coresidencyPairs?: [string, string][];
     // Never resolves -- simulates the GET still being in flight, for the
@@ -272,6 +282,10 @@ function renderSection(
 ) {
   const mappings = opts.mappings ?? [];
   const specsByMappingId = opts.specsByMappingId ?? {};
+  // One value for the initial render AND both rerender helpers: a helper that
+  // silently swapped the application back to the module default would make a
+  // mid-flow rerender change a fact the test did not mean to change.
+  const applicationForTest = opts.application ?? application;
   const created: CreateMappingRequest[] = [];
   const updatedMappings: { id: string; body: UpdateMappingRequest }[] = [];
   const putSpecs: { mappingId: string; body: PutRuntimeSpecRequest }[] = [];
@@ -457,14 +471,23 @@ function renderSection(
     // the server's running benchmarks to gate its button. `activeBenchmarks`
     // must RESOLVE (to an empty list) rather than be absent: a rejection lands
     // in the poll's own catch and leaves the button in the wrong state.
-    activeBenchmarks: vi.fn(async () => []),
-    benchmarkStatus: vi.fn(async () => idleBenchmark),
-    probeMappingContext: vi.fn(async () => idleBenchmark),
+    activeBenchmarks: opts.activeBenchmarks ?? vi.fn(async () => []),
+    benchmarkStatus: opts.benchmarkStatus ?? vi.fn(async () => idleBenchmark),
+    probeMappingContext: opts.probeMappingContext ?? vi.fn(async () => idleBenchmark),
   };
 
   const view = render(
     <ToastProvider>
-      <RuntimeAdminSection t={t} api={fakeApi} server={serverForTest} application={application} />
+      <RuntimeAdminSection
+        t={t}
+        api={fakeApi}
+        server={serverForTest}
+        application={applicationForTest}
+        // Drives the probe's status poll immediately, like MappingSection's own
+        // tests. Without it forwarded, the shared mask's one async loop is
+        // testable on the ordinary screen and not on this tab.
+        pollIntervalMs={0}
+      />
     </ToastProvider>,
   );
   return {
@@ -524,7 +547,7 @@ function renderSection(
             t={t}
             api={fakeApi}
             server={{ ...serverForTest, id }}
-            application={application}
+            application={applicationForTest}
           />
         </ToastProvider>,
       ),
@@ -548,7 +571,7 @@ function renderSection(
             t={next}
             api={fakeApi}
             server={serverForTest}
-            application={application}
+            application={applicationForTest}
           />
         </ToastProvider>,
       ),
@@ -606,10 +629,12 @@ describe('RuntimeAdminSection tab strip', () => {
     expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
     expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
-    // Scoped to the tab role like `runtimeSpecs` above: since the model-mapping
-    // tab arrived, the specs table's live-state column is labelled
-    // `runtimeLiveStatus` too (it used to say `tableStatus`, which now means
-    // the MAPPING's status one tab to the left), so the bare text matches twice.
+    // Scoped to the tab role like `runtimeSpecs` above, because the specs
+    // table's live-state column now carries this label too and a bare text
+    // query would match twice. NOT coverage for that relabel: this reads the
+    // TAB's label, which the relabel did not touch, and it passes whichever
+    // label the column carries. The relabel is pinned by "labels the two tabs'
+    // status columns with two different words" below.
     expect(screen.getByRole('tab', { name: t.runtimeLiveStatus })).toBeInTheDocument();
 
     // Matrix: with zero launch specs (default renderSection), the "need two"
@@ -4821,6 +4846,30 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     ]);
   });
 
+  it("labels the two tabs' status columns with two different words", async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+
+    // The specs tab is open on mount. Its status column means the PROCESS's
+    // running/stopped/unknown, so it must NOT be the bare `Status` the tab one
+    // to the left uses for the MAPPING's active/disabled -- two adjacent tabs
+    // must not label two different facts with one word. Both directions are
+    // asserted on purpose: only the negative fails if the column is relabelled
+    // back to `tableStatus`, and only the positive fails if it drifts to some
+    // third string.
+    expect(
+      await screen.findByRole('columnheader', { name: t.runtimeLiveStatus }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: t.tableStatus })).toBeNull();
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    expect(await screen.findByRole('columnheader', { name: t.tableStatus })).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: t.runtimeLiveStatus })).toBeNull();
+  });
+
   it('shows the mapping table without the actions that would break a launch spec', async () => {
     renderSection({
       mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
@@ -4875,12 +4924,71 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
 
     await waitFor(() => expect(updatedMappings).toHaveLength(1));
-    // BEHAVIOURAL: the PATCH is pointer-gated per field, so an ABSENT key is
-    // "leave it alone" -- which is what makes the two screens non-overlapping
-    // writers instead of two writers racing over one field.
+    // BEHAVIOURAL: the PATCH is pointer-gated per field, so an ABSENT key
+    // carries no value for that field -- which is what makes the two screens
+    // non-overlapping WRITERS. This pins the BODY, and nothing more: the
+    // backend re-writes the whole row it loaded, so two PATCHes in flight at
+    // once still lose an update no matter which keys each one names
+    // (11-risks-and-technical-debt.md §11.1). Do not read a green here as
+    // "the race is closed".
     expect(updatedMappings[0].body.gateway_model_name).toBe('gw-renamed');
     expect(updatedMappings[0].body.status).toBe('disabled');
     expect(updatedMappings[0].body).not.toHaveProperty('app_model_name');
+  });
+
+  it("runs the shared mask's context probe on this tab and fills the field", async () => {
+    const probeMappingContext = vi.fn(async () => ({
+      running: true,
+      server_id: 'srv_1',
+      scope: 'context-probe',
+      total: 1,
+      done: 0,
+    })) as unknown as PortalApi['probeMappingContext'];
+    const benchmarkStatus = vi.fn(async () => ({
+      running: false,
+      server_id: 'srv_1',
+      scope: 'context-probe',
+      total: 1,
+      done: 1,
+      results: [
+        {
+          mapping_id: 'map_1',
+          gateway_model_name: 'gw-model',
+          gen_tokens_per_second: 0,
+          prompt_tokens_per_second: 0,
+          load_time_ms: 0,
+          context_size: 8192,
+        },
+      ],
+    })) as unknown as PortalApi['benchmarkStatus'];
+
+    const { updatedMappings } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      // The probe button is gated on the APPLICATION's probe path, and the
+      // module default has none.
+      application: { ...application, context_probe_path: '/props' },
+      probeMappingContext,
+      benchmarkStatus,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+
+    // "Der selbe Edit" includes the probe, and the probe is the one part of the
+    // shared mask with an async loop -- which is why `pollIntervalMs` is
+    // forwarded to `MappingForm` from here as well as from `MappingSection`.
+    // Without that forward this test cannot exist: the poll falls back to the
+    // shared helper's ~2 s cadence and the assertion below times out.
+    const probeBtn = await screen.findByRole('button', { name: t.mappingProbeContext });
+    await waitFor(() => expect(probeBtn).toBeEnabled());
+    fireEvent.click(probeBtn);
+
+    await waitFor(() => expect(probeMappingContext).toHaveBeenCalledWith('map_1'));
+    await waitFor(() =>
+      expect((screen.getByLabelText(t.mappingContextSize) as HTMLInputElement).value).toBe('8192'),
+    );
+    // Fill only -- the operator still saves. Identical to the ordinary screen.
+    expect(updatedMappings).toHaveLength(0);
   });
 
   it('toggles a mapping status with a status-only PATCH', async () => {

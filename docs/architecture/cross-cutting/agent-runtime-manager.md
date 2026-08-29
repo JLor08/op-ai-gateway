@@ -2246,13 +2246,27 @@ tab because the portal never warns about `${MODEL}` with an empty upstream name.
 Read-only is that boundary, not a convenience, and **a form does not send a
 field it does not let you edit**: the spec form's mapping call is
 `{ app_model_name }` alone, and the mapping tab's omits `app_model_name`. Every
-field of the mapping PATCH is a pointer, so an omitted key means "leave it
-byte-for-byte alone"; re-stating a value the form captured when it opened is how
-a second writer silently reverts the first. The `status` case is the sharp one:
-the spec form's state defaulted to `active`, so leaving the key in the body
-while removing the control would make every launch-config save re-enable a model
-an operator deliberately took out of service — no error, no diff, and no column
-on the specs tab that contradicts it.
+field of the mapping PATCH is a pointer, so an omitted key carries no value for
+that field; re-stating a value the form captured when it opened is how a second
+writer silently reverts the first *on every save*. The `status` case is the
+sharp one: the spec form's state defaulted to `active`, so leaving the key in
+the body while removing the control would make every launch-config save
+re-enable a model an operator deliberately took out of service — no error, no
+diff, and no column on the specs tab that contradicts it.
+
+**Omission removes the clobber, not the race, and this split is the first thing
+that makes two simultaneous mapping writers a designed workflow.**
+`Service.UpdateMapping` loads the row, applies the pointer fields and writes the
+**whole struct** back with no compare-and-set, so two PATCHes in flight at once
+still lose an update — the later writer reverts the earlier writer's field even
+though it never sent that key. The split shrinks the fields both screens send
+from three to zero, which is what stops the overwrite happening on *every*
+submit; it does not close the window. That is a **backend contract gap** (the
+endpoint has no `If-Match` and the row has no version column), recorded as its
+own entry in [§11.1 Operational
+risks](../11-risks-and-technical-debt.md#111-operational-risks) rather than
+worked around here. Nothing below should be read as saying the two screens
+cannot race.
 
 **Nothing server-side enforces this.** No mapping endpoint special-cases
 `server_agent` (the type is read only to decide whether to push a runtime-config
@@ -2282,6 +2296,19 @@ contextual for the same reason — a configured row's delete removes the spec on
 (keeping the mapping for re-sync), an unconfigured row's delete removes the
 mapping, which is safe because the spec's `mapping_id` foreign key is
 `on delete cascade`.
+
+The specs table's live-state column is labelled **`runtimeLiveStatus`
+("Live-Status"), not `tableStatus` ("Status")**, and that is a rule rather than a
+preference: the mapping tab immediately to its left carries a "Status" column
+meaning the mapping's *active/disabled*, while this one means the process's
+*running/stopped/unknown*. **Two adjacent tabs must not label two different facts
+with one word.** The column `id` is deliberately unchanged (`live_status`), so
+stored column preferences survive the relabel. It is pinned by
+`RuntimeAdminSection.test.tsx`'s *"labels the two tabs' status columns with two
+different words"* — which asserts the **column headers on both tabs**, in both
+directions. The tab-strip assertions that scope `getByRole('tab', …)` because the
+label now matches twice are **not** coverage for it: they read the tab's label,
+which the relabel did not touch, and they pass either way.
 
 Three field semantics the form encodes rather than leaving to guesswork:
 `vram_measured_mb` is agent-owned and always ignored on write, so it renders as

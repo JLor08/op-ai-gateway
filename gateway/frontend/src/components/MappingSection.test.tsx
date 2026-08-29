@@ -293,6 +293,35 @@ describe('MappingSection performance metrics', () => {
   });
 });
 
+describe('MappingSection status field', () => {
+  it('keeps the status control on the ordinary form and sends the chosen value', async () => {
+    const { updated } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', status: 'active' })],
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('button', { name: t.mappingEdit }));
+
+    // The pin the agent-runtime tab's own tests cannot stand in for. `MappingForm`
+    // is shared, and the launch-spec form beside that tab deliberately dropped its
+    // status control (the mapping owns the field; the tab one to the left edits
+    // it) -- which gives a later "nothing needs status on a form any more"
+    // cleanup a plausible wrong target. Gate the select behind the tab's own flag
+    // and every test on that tab still passes, while an ORDINARY application --
+    // which has no runtime spec and no second tab -- silently loses the only way
+    // to take one of its models out of service from the portal.
+    const select = screen.getByRole('combobox', { name: t.tableStatus });
+    // A non-native MUI Select (shared/SelectField): open it, then click the
+    // option. `fireEvent.change` has no value setter to drive here.
+    fireEvent.mouseDown(select);
+    fireEvent.click(await screen.findByRole('option', { name: t.statusDisabled }));
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].id).toBe('map_1');
+    expect(updated[0].body.status).toBe('disabled');
+  });
+});
+
 describe('MappingSection vision column', () => {
   it('renders the Vision column value per row (visible by default)', async () => {
     renderSection({
