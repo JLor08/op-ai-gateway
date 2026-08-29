@@ -539,3 +539,67 @@ func TestHTTPSSwitchManualNoProxySwitchedAppsWritesNothing(t *testing.T) {
 		t.Fatalf("manual mode with no proxy-switched apps did %d UpdateApplication writes, want 0", counter.updates)
 	}
 }
+
+// TestMigration70BackfillIsBehaviourPreserving proves — mechanically, over
+// every pre-70 stored shape rather than by example — that migration 70 changed
+// no application's participation.
+//
+// It reimplements the PRE-70 predicate verbatim (that is the point: the real
+// one has moved on, so the old answer has to come from somewhere) and the
+// backfill's own SQL predicate, then asserts for every (scheme x
+// proxy_listen_port x status) row that
+//
+//	old(row) == new(backfill(row))
+//
+// The interesting rows are the ones the backfill actually flips: `https` with
+// no proxy port. They failed the old predicate's https arm and fail the new
+// flag clause — the same skip, reached from a different clause, which is what
+// makes this a rename of an existing state rather than a behaviour change.
+func TestMigration70BackfillIsBehaviourPreserving(t *testing.T) {
+	// The candidate predicate exactly as it stood before this change.
+	preFlagCandidate := func(app routing.Application) bool {
+		if app.Status == routing.ServerStatusDisabled {
+			return false
+		}
+		switch effectiveScheme(app) {
+		case "http":
+			return true
+		case "https":
+			return app.ProxyListenPort != 0
+		default:
+			return false
+		}
+	}
+	// migration70Up's UPDATE predicate:
+	//   set proxy_excluded = 1 where scheme = 'https' and proxy_listen_port = 0
+	// Note it tests the RAW scheme column, not the http-defaulted one.
+	backfill := func(app routing.Application) routing.Application {
+		if app.Scheme == "https" && app.ProxyListenPort == 0 {
+			app.ProxyExcluded = true
+		}
+		return app
+	}
+
+	flipped := 0
+	for _, scheme := range []string{"http", "https", ""} {
+		for _, port := range []int{0, 8600} {
+			for _, status := range []string{routing.ServerStatusActive, routing.ServerStatusDisabled, ""} {
+				before := routing.Application{Scheme: scheme, ProxyListenPort: port, Status: status}
+				after := backfill(before)
+				if after.ProxyExcluded {
+					flipped++
+				}
+				if got, want := isProxySwitchCandidate(after), preFlagCandidate(before); got != want {
+					t.Errorf("scheme=%q port=%d status=%q: candidate after the backfill = %v, before = %v",
+						scheme, port, status, got, want)
+				}
+			}
+		}
+	}
+	// Guard against a vacuous pass: if the backfill flipped nothing, the loop
+	// above would be comparing the new predicate against the old one on rows
+	// where the flag is uniformly false, which proves nothing about the flip.
+	if flipped != 3 {
+		t.Fatalf("the backfill flipped %d of the seeded rows, want 3 (https + port 0, one per status)", flipped)
+	}
+}
