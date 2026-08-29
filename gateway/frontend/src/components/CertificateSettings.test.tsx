@@ -264,6 +264,54 @@ describe('CertificateSettings', () => {
     expect(pending).toHaveTextContent('Zulu GPU');
   });
 
+  it('macht eine wegen defektem TLS unerreichbare Anwendung sichtbar, statt still auf http zurückzufallen', async () => {
+    renderCertificateSettings(
+      makeApi({
+        certificates: vi.fn(async () => ({
+          data: [],
+          mesh: { tls_active: true, ca_rotation_pending_servers: [] },
+          https_switch: {
+            unreachable_apps: [
+              {
+                server_id: 'srv-a',
+                server_name: 'Alpha GPU',
+                app_id: 'app-1',
+                app_type: 'openai_compatible',
+                proxy_listen_port: 8600,
+                route_state: 'bind_failed',
+                action: 'find what else is holding that port',
+              },
+            ],
+          },
+        })),
+      }),
+    );
+
+    const alert = await screen.findByTestId('certificate-https-switch-unreachable');
+    expect(alert).toHaveTextContent(de.certificatesHTTPSSwitchUnreachableTitle);
+    expect(alert).toHaveTextContent('Alpha GPU');
+    expect(alert).toHaveTextContent('8600');
+    // The agent's own reason, and the remedy -- the alert has to say what to do,
+    // not only that something is wrong.
+    expect(alert).toHaveTextContent('bind_failed');
+    expect(alert).toHaveTextContent('find what else is holding that port');
+  });
+
+  it('zeigt keine Unerreichbar-Warnung, wenn nichts unerreichbar ist', async () => {
+    renderCertificateSettings(
+      makeApi({
+        certificates: vi.fn(async () => ({
+          data: [],
+          mesh: { tls_active: true, ca_rotation_pending_servers: [] },
+          https_switch: { unreachable_apps: [] },
+        })),
+      }),
+    );
+
+    await screen.findByTestId('certificate-mesh-status');
+    expect(screen.queryByTestId('certificate-https-switch-unreachable')).not.toBeInTheDocument();
+  });
+
   it('zeigt einen inaktiven Mesh-Listener ohne erfundenes Zertifikatsmaterial', async () => {
     renderCertificateSettings(
       makeApi({

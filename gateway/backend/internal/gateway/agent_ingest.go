@@ -407,11 +407,25 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's
-// sample.ProxyRouteSample wire type (Listen, TLSActive only — no certificate
-// material or upstream address).
+// sample.ProxyRouteSample wire type — no certificate material and no upstream
+// address, just the listen port, whether TLS is currently active on it, and
+// (State) WHY when it is not.
+//
+// State is the agent's own proxy.RouteState vocabulary relayed verbatim:
+// "pending_leaf", "invalid_upstream", "pending_bind_host", "bind_failed",
+// "active". The gateway does not interpret it — it carries it to the operator,
+// who is the one who can act on the difference between "no certificate yet"
+// and "something else already holds that port". It was dropped at this
+// boundary until the https-auto-switch stopped reverting to plaintext on
+// tls_active=false: once the gateway declines to downgrade, the reason the
+// listener is down is the whole content of the alert it raises instead.
+//
+// omitempty on the agent side means an older agent simply reports no state;
+// every consumer treats "" as "not reported" rather than as a distinct cause.
 type ProxyRouteSample struct {
-	Listen    int  `json:"listen"`
-	TLSActive bool `json:"tls_active"`
+	Listen    int    `json:"listen"`
+	TLSActive bool   `json:"tls_active"`
+	State     string `json:"state,omitempty"`
 }
 
 type agentHostReport struct {

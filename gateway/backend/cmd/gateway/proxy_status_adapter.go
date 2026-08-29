@@ -26,7 +26,7 @@ func (p proxyStatusReader) ProxyRouteStatuses(serverID string) []portal.ProxyRou
 	}
 	out := make([]portal.ProxyRouteStatus, len(src))
 	for i, st := range src {
-		out[i] = portal.ProxyRouteStatus{Listen: st.Listen, TLSActive: st.TLSActive}
+		out[i] = portal.ProxyRouteStatus{Listen: st.Listen, TLSActive: st.TLSActive, State: st.State}
 	}
 	return out
 }

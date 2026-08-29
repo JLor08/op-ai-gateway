@@ -82,6 +82,7 @@ type API interface {
 	GenerateAgentToken(context.Context, auth.Token, string) (GenerateAgentTokenResponse, error)
 	GatewayCARotationPendingServers(context.Context) []CertificateServerRefDTO
 	MeshTLSPendingServers(context.Context) []CertificateServerRefDTO
+	HTTPSSwitchUnreachableApps(context.Context) []HTTPSSwitchUnreachableDTO
 	PublicCertificateBundlePEM(context.Context, string) (string, error)
 	PublicCertificateKeyPEM(context.Context, string) (string, error)
 	GatewayMeshCertificate(context.Context) (GatewayMeshCertificateMaterial, error)

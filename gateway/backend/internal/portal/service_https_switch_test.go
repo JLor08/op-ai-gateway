@@ -57,11 +57,14 @@ func TestIsProxySwitchCandidate(t *testing.T) {
 	}
 }
 
-// TestHTTPSSwitchForwardAndRevert drives the reconcile through every transition
-// in the brief: forward on an explicit tls_active=true, revert ONLY on an
-// explicit tls_active=false, NO revert on a missing report, and no change at
-// all in manual mode or for an out-of-scope (excluded) server.
-func TestHTTPSSwitchForwardAndRevert(t *testing.T) {
+// TestHTTPSSwitchForwardAndDeclinedRevert drives the reconcile through every
+// status-driven transition: forward on an explicit tls_active=true, NO revert
+// on a missing report, and -- since the no-automatic-downgrade policy -- no
+// revert on an explicit tls_active=false either. The application stays https
+// and becomes unreachable until TLS is restored or an operator moves it
+// deliberately; see TestHTTPSSwitchDeclinedRevertIsObservable for the signals
+// that make that state visible.
+func TestHTTPSSwitchForwardAndDeclinedRevert(t *testing.T) {
 	svc, ctx := certEnv(t)
 	setHTTPSSwitchMode(t, svc, ctx, "auto")
 	mustCreateSwitchTestServer(t, svc, ctx, "srv-a", "")
@@ -97,11 +100,169 @@ func TestHTTPSSwitchForwardAndRevert(t *testing.T) {
 		t.Fatalf("other-listen report: scheme = %q, want https (no revert)", got)
 	}
 
-	// REVERT: an EXPLICIT per-route tls_active=false flips it back to http.
-	stub.byServer["srv-a"] = []ProxyRouteStatus{{Listen: 8600, TLSActive: false}}
+	// DECLINED REVERT: an EXPLICIT per-route tls_active=false used to flip the
+	// application back to plaintext http. It must not any more -- answering a
+	// broken certificate by turning off encryption is the security problem, not
+	// the mitigation. The app stays https.
+	stub.byServer["srv-a"] = []ProxyRouteStatus{{Listen: 8600, TLSActive: false, State: "pending_leaf"}}
+	svc.ReconcileHTTPSSwitch(ctx)
+	if got := schemeOf(t, svc, ctx, "app-1"); got != "https" {
+		t.Fatalf("tls_active=false: scheme = %q, want https (never an automatic downgrade)", got)
+	}
+	// And it stays declined on every later pass -- no eventual give-up.
+	svc.ReconcileHTTPSSwitch(ctx)
+	if got := schemeOf(t, svc, ctx, "app-1"); got != "https" {
+		t.Fatalf("tls_active=false (2nd pass): scheme = %q, want https", got)
+	}
+
+	// RECOVERY: once TLS is back the application simply works again -- it was
+	// never moved, so there is nothing to switch forward.
+	stub.byServer["srv-a"] = []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}
+	svc.ReconcileHTTPSSwitch(ctx)
+	if got := schemeOf(t, svc, ctx, "app-1"); got != "https" {
+		t.Fatalf("recovery: scheme = %q, want https", got)
+	}
+	if len(svc.HTTPSSwitchUnreachableApps(ctx)) != 0 {
+		t.Fatalf("recovery: still reported unreachable: %+v", svc.HTTPSSwitchUnreachableApps(ctx))
+	}
+}
+
+// TestHTTPSSwitchDeclinedRevertIsObservable is the other half of the policy:
+// removing the automatic downgrade must not trade a SILENT DOWNGRADE for a
+// SILENT OUTAGE. The declined revert has to be visible without an operator
+// knowing to go looking, so this asserts the portal-facing signal (which the
+// certificates view renders as an alert) and not merely the absence of a write.
+func TestHTTPSSwitchDeclinedRevertIsObservable(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-a", "")
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-1", "srv-a", 8080, 8600)
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-a": {{Listen: 8600, TLSActive: false, State: "bind_failed"}},
+	}}
+
+	counter := &countingUpdateApplicationStore{Store: svc.routes}
+	svc.routes = counter
+	svc.ReconcileHTTPSSwitch(ctx)
+	if counter.updates != 0 {
+		t.Fatalf("declined revert did %d UpdateApplication writes, want 0", counter.updates)
+	}
+
+	got := svc.HTTPSSwitchUnreachableApps(ctx)
+	if len(got) != 1 {
+		t.Fatalf("HTTPSSwitchUnreachableApps = %+v, want exactly one entry", got)
+	}
+	if got[0].AppID != "app-1" || got[0].ServerID != "srv-a" || got[0].ProxyListenPort != 8600 {
+		t.Fatalf("unreachable entry = %+v, want app-1 on srv-a:8600", got[0])
+	}
+	// The REASON is the agent's own reported RouteState, relayed rather than
+	// re-invented gateway-side: an operator reading "bind_failed" knows to look
+	// for whatever else holds that port.
+	if got[0].RouteState != "bind_failed" {
+		t.Fatalf("unreachable entry RouteState = %q, want %q (the agent's reported state)", got[0].RouteState, "bind_failed")
+	}
+	if got[0].ServerName == "" {
+		t.Fatal("unreachable entry carries no server name; the alert has to name the server")
+	}
+}
+
+// TestHTTPSSwitchUnreachableAppsExcludesEverythingElse pins the negative space
+// around that signal. It must fire ONLY for the state it names -- a
+// proxy-switched app whose agent explicitly reports its proxy listener not
+// terminating TLS -- or the alert becomes noise an operator learns to ignore.
+func TestHTTPSSwitchUnreachableAppsExcludesEverythingElse(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-a", "")
+	// healthy: TLS is up
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-ok", "srv-a", 8080, 8600)
+	// own-TLS https (no proxy port): not a proxy switch at all
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-own", "srv-a", 8081, 0)
+	// plain http: nothing to be unreachable about
+	mustCreateSwitchTestApp(t, svc, ctx, "app-http", "srv-a", 8082, 8602)
+	// proxy-switched but the agent reports NOTHING for its port (silent agent):
+	// deliberately not a revert, and deliberately not an alert either.
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-silent", "srv-a", 8083, 8603)
+
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-a": {
+			{Listen: 8600, TLSActive: true},
+			{Listen: 8602, TLSActive: false, State: "pending_leaf"},
+		},
+	}}
+	svc.ReconcileHTTPSSwitch(ctx)
+	if got := svc.HTTPSSwitchUnreachableApps(ctx); len(got) != 0 {
+		t.Fatalf("HTTPSSwitchUnreachableApps = %+v, want none", got)
+	}
+
+	// A disabled app is not a candidate either: the operator turned it off.
+	app, err := svc.routes.ApplicationByID(ctx, "app-ok")
+	if err != nil {
+		t.Fatalf("read app-ok: %v", err)
+	}
+	app.Status = routing.ServerStatusDisabled
+	if err := svc.routes.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("disable app-ok: %v", err)
+	}
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-a": {{Listen: 8600, TLSActive: false, State: "pending_leaf"}},
+	}}
+	if got := svc.HTTPSSwitchUnreachableApps(ctx); len(got) != 0 {
+		t.Fatalf("disabled app reported unreachable: %+v", got)
+	}
+}
+
+// TestHTTPSSwitchUnreachableAppsIgnoresOutOfScopeServer: an out-of-scope
+// server's proxy-switched apps are reverted by the scope-exit arm (see
+// TestHTTPSSwitchScopeExitStillRevertsAfterTheNoDowngradePolicy), so they are
+// never left in the unreachable state and must never be alerted about. The
+// alert names a condition the operator has to ACT on; a state the gateway
+// resolves by itself on the same pass is not one.
+func TestHTTPSSwitchUnreachableAppsIgnoresOutOfScopeServer(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-x", "exclude")
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-x", "srv-x", 8080, 8600)
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-x": {{Listen: 8600, TLSActive: false, State: "pending_leaf"}},
+	}}
+
+	if got := svc.HTTPSSwitchUnreachableApps(ctx); len(got) != 0 {
+		t.Fatalf("out-of-scope server reported unreachable: %+v", got)
+	}
+}
+
+// TestHTTPSSwitchScopeExitStillRevertsAfterTheNoDowngradePolicy is the pin on
+// the ONE automatic move to plaintext that survives the policy change, so that
+// it can never be scoped out by accident later.
+//
+// It is a different case from a tls_active=false report and the difference is
+// the operator. There, nothing was asked for: a leaf expired, a port got taken,
+// a file went missing, and answering that by turning off encryption is exactly
+// the security problem. Here the operator performed an explicit portal action
+// whose documented and only effect is "this server no longer runs the
+// gateway-guided TLS proxy" -- the gateway ITSELF then withdrew the routes
+// (AgentProxyRoutes returns [] for an out-of-scope server) and the agent tore
+// its listeners down. Leaving the app on https would point it at a port that is
+// genuinely gone, with NO path back: the status-driven pass does not run for an
+// out-of-scope server, and there is no proxy_listen_port field in the portal
+// UI, so the rescue would be API-only. That is a permanent outage, not a
+// recoverable one.
+func TestHTTPSSwitchScopeExitStillRevertsAfterTheNoDowngradePolicy(t *testing.T) {
+	svc, ctx := certEnv(t)
+	setHTTPSSwitchMode(t, svc, ctx, "auto")
+	mustCreateSwitchTestServer(t, svc, ctx, "srv-a", "")
+	mustCreateProxySwitchedApp(t, svc, ctx, "app-1", "srv-a", 8080, 8600)
+	// Even with the agent explicitly reporting TLS DOWN -- the exact report that
+	// no longer reverts an in-scope app -- the scope exit still reverts.
+	svc.proxyStatus = &stubProxyStatus{byServer: map[string][]ProxyRouteStatus{
+		"srv-a": {{Listen: 8600, TLSActive: false, State: "pending_leaf"}},
+	}}
+
+	setHTTPSSwitchMode(t, svc, ctx, "manual")
 	svc.ReconcileHTTPSSwitch(ctx)
 	if got := schemeOf(t, svc, ctx, "app-1"); got != "http" {
-		t.Fatalf("revert: scheme = %q, want http", got)
+		t.Fatalf("scope exit: scheme = %q, want http (the one surviving automatic revert)", got)
 	}
 }
 

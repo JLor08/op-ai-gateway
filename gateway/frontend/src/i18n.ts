@@ -1173,6 +1173,10 @@ const de = {
   certificatesHTTPSSwitchModeConfirmTitle: 'Auf automatisches Umschalten wechseln?',
   certificatesHTTPSSwitchModeConfirmBody:
     'Im Automatik-Modus schaltet der Gateway die Anwendungen berechtigter Server künftig selbstständig von http auf https um (sofern nicht einzeln ausgeschlossen). Das kann bestehende Verbindungen kurzzeitig unterbrechen.',
+  certificatesHTTPSSwitchUnreachableTitle:
+    'Anwendungen nicht erreichbar (TLS defekt, kein automatischer Rückfall)',
+  certificatesHTTPSSwitchUnreachableBody:
+    'Der TLS-Listener des Agenten meldet sich für diese Anwendungen als nicht aktiv. Der Gateway schaltet sie NICHT automatisch auf unverschlüsseltes http zurück — sie bleiben auf https und sind bis zur Behebung nicht erreichbar:',
   certificatesProxyListenPortBase: 'Proxy-Listen-Port (Startwert)',
   settingsCertEnabled: 'Zertifikatsverwaltung aktiv',
   settingsAcmeEmail: 'ACME-E-Mail',
@@ -3086,6 +3090,10 @@ const en: PortalMessages = {
   certificatesHTTPSSwitchModeConfirmTitle: 'Switch to automatic mode?',
   certificatesHTTPSSwitchModeConfirmBody:
     "In auto mode the gateway will automatically switch eligible servers' applications from http to https going forward (unless individually excluded). This may briefly interrupt existing connections.",
+  certificatesHTTPSSwitchUnreachableTitle:
+    'Applications unreachable (TLS down, no automatic fallback)',
+  certificatesHTTPSSwitchUnreachableBody:
+    'The agent reports its TLS listener as not active for these applications. The gateway does NOT switch them back to unencrypted http — they stay on https and are unreachable until this is fixed:',
   certificatesProxyListenPortBase: 'Proxy listen port (base)',
   settingsCertEnabled: 'Certificate management active',
   settingsAcmeEmail: 'ACME email',

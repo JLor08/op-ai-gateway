@@ -881,6 +881,12 @@ func (_d *APIWithTracing) GroupMembers(ctx context.Context, t1 auth.Token, s1 st
 	return _d.API.GroupMembers(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) HTTPSSwitchUnreachableApps(ctx context.Context) (ha1 []HTTPSSwitchUnreachableDTO) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.HTTPSSwitchUnreachableApps")
+	defer span.End()
+	return _d.API.HTTPSSwitchUnreachableApps(ctx)
+}
+
 func (_d *APIWithTracing) HealthCheckIntervalSeconds(ctx context.Context) (i1 int) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.HealthCheckIntervalSeconds")
 	defer span.End()

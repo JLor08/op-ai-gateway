@@ -14,7 +14,13 @@ import {
 } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
-import type { CertificateCA, CertificateMeshStatus, CertificateRow, PortalServer } from '../api';
+import type {
+  CertificateCA,
+  CertificateMeshStatus,
+  CertificateRow,
+  HTTPSSwitchUnreachableApp,
+  PortalServer,
+} from '../api';
 import type { Translation, PortalApi, BadgeStatus } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
@@ -448,6 +454,9 @@ export function CertificateSettings({
   // any action that changes them.
   const [certificates, setCertificates] = useState<CertificateRow[]>([]);
   const [mesh, setMesh] = useState<CertificateMeshStatus>(emptyCertificateMeshStatus);
+  // P4: applications the gateway is refusing to downgrade to plaintext http and
+  // that are therefore DOWN. Normally empty; non-empty is an outage.
+  const [unreachableApps, setUnreachableApps] = useState<HTTPSSwitchUnreachableApp[]>([]);
   const [certificatesLoading, setCertificatesLoading] = useState(true);
   const [ca, setCa] = useState<CertificateCA | null>(null);
   const [bundlePem, setBundlePem] = useState('');
@@ -464,9 +473,11 @@ export function CertificateSettings({
       // The fallback keeps tests/rolling upgrades tolerant of an older response;
       // the live gateway always supplies mesh in the additive P3 contract.
       setMesh(res.mesh ?? emptyCertificateMeshStatus());
+      setUnreachableApps(res.https_switch?.unreachable_apps ?? []);
     } catch {
       setCertificates([]);
       setMesh(emptyCertificateMeshStatus());
+      setUnreachableApps([]);
     } finally {
       setCertificatesLoading(false);
     }
@@ -922,6 +933,28 @@ export function CertificateSettings({
           </Typography>
         </Box>
       </Box>
+      {/* The gateway never downgrades an application to plaintext http on its
+          own, so a broken agent TLS listener is an OUTAGE rather than a silent
+          switch to unencrypted inference. That trade is only defensible if the
+          outage is visible without anyone knowing to look for it, which is what
+          this alert is. severity="error", not "warning": these applications are
+          down right now. */}
+      {unreachableApps.length > 0 && (
+        <Alert severity="error" data-testid="certificate-https-switch-unreachable" sx={{ mb: 2.5 }}>
+          <AlertTitle>{t.certificatesHTTPSSwitchUnreachableTitle}</AlertTitle>
+          {t.certificatesHTTPSSwitchUnreachableBody}
+          <ul style={{ margin: '0.5em 0 0', paddingInlineStart: '1.25em' }}>
+            {unreachableApps.map((app) => (
+              <li key={`${app.server_id}:${app.app_id}`}>
+                <strong>
+                  {app.server_name || app.server_id} — {app.app_type} :{app.proxy_listen_port}
+                </strong>
+                {app.route_state ? ` (${app.route_state})` : ''} — {app.action}
+              </li>
+            ))}
+          </ul>
+        </Alert>
+      )}
       {/* P4 Task 11: global https-auto-switch mode + the proxy-listen-port
           floor, alongside it. Independent of the mesh box above -- this is a
           separate P4 feature (agent TLS proxy + scheme auto-switch), not the
