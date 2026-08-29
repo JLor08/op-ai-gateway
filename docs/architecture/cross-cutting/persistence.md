@@ -148,7 +148,7 @@ flowchart TB
 ## 3. The migration runner
 
 `internal/store/migrate.go` holds an append-only, ordered slice `migrations`
-of 69 entries (see [Data Model (Reference)](../reference/data-model.md) for
+of 70 entries (see [Data Model (Reference)](../reference/data-model.md) for
 the full list). `(*SQLStore).Migrate(ctx)`:
 
 1. Creates `schema_migrations (version integer primary key, name text, applied_at timestamp)`
@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 69 migrations in order, same as
+- **Only-pending.** A fresh install runs all 70 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,

@@ -26,9 +26,9 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
-			proxy_listen_port,
+			proxy_listen_port, proxy_excluded,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		app.ID,
 		app.ServerID,
 		app.Type,
@@ -58,6 +58,7 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 		app.BenchmarkScheduleIntervalSeconds,
 		app.OpportunisticMetricsEnabled,
 		app.ProxyListenPort,
+		app.ProxyExcluded,
 		app.CreatedAt,
 		app.UpdatedAt,
 	)
@@ -91,7 +92,7 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 			app_path_suffix = ?, api_token = ?, api_token_header = ?,
 			benchmark_schedule_enabled = ?, benchmark_schedule_interval_seconds = ?,
 			opportunistic_metrics_enabled = ?,
-			proxy_listen_port = ?,
+			proxy_listen_port = ?, proxy_excluded = ?,
 			updated_at = ?
 		where id = ?`,
 		app.ServerID,
@@ -122,6 +123,7 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 		app.BenchmarkScheduleIntervalSeconds,
 		app.OpportunisticMetricsEnabled,
 		app.ProxyListenPort,
+		app.ProxyExcluded,
 		app.UpdatedAt,
 		app.ID,
 	)
@@ -145,7 +147,7 @@ func (s *SQLiteStore) ApplicationByID(ctx context.Context, id string) (routing.A
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
-			proxy_listen_port,
+			proxy_listen_port, proxy_excluded,
 			created_at, updated_at
 		from applications
 		where id = ?`, id)
@@ -160,7 +162,7 @@ func (s *SQLiteStore) ApplicationsByServer(ctx context.Context, serverID string)
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
-			proxy_listen_port,
+			proxy_listen_port, proxy_excluded,
 			created_at, updated_at
 		from applications
 		where server_id = ?
@@ -478,7 +480,7 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			a.context_probe_path, a.capacity_probe_path,
 			a.app_path_suffix, a.api_token, a.api_token_header,
 			a.benchmark_schedule_enabled, a.benchmark_schedule_interval_seconds, a.opportunistic_metrics_enabled,
-			a.proxy_listen_port,
+			a.proxy_listen_port, a.proxy_excluded,
 			a.created_at, a.updated_at,
 			m.id, m.application_id, m.gateway_model_name, m.app_model_name, m.status,
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
@@ -521,6 +523,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		nativeMessages       int64
 		benchScheduleEnabled int64
 		oppMetricsEnabled    int64
+		proxyExcluded        int64
 		mapIsMTP             int64
 		mapVisionCapable     int64
 		mapLocked            int64
@@ -538,7 +541,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Application.ContextProbePath, &c.Application.CapacityProbePath,
 		&c.Application.AppPathSuffix, &c.Application.APIToken, &c.Application.APITokenHeader,
 		&benchScheduleEnabled, &c.Application.BenchmarkScheduleIntervalSeconds, &oppMetricsEnabled,
-		&c.Application.ProxyListenPort,
+		&c.Application.ProxyListenPort, &proxyExcluded,
 		&c.Application.CreatedAt, &c.Application.UpdatedAt,
 		&c.Mapping.ID, &c.Mapping.ApplicationID, &c.Mapping.GatewayModelName, &c.Mapping.AppModelName,
 		&c.Mapping.Status,
@@ -555,6 +558,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	c.Application.NativeMessages = nativeMessages != 0
 	c.Application.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
+	c.Application.ProxyExcluded = proxyExcluded != 0
 	c.Mapping.IsMTP = mapIsMTP != 0
 	c.Mapping.VisionCapable = mapVisionCapable != 0
 	c.Mapping.MetricsLocked = mapLocked != 0
@@ -597,6 +601,7 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 	var alwaysReachable int64
 	var nativeResponses, nativeMessages int64
 	var benchScheduleEnabled, oppMetricsEnabled int64
+	var proxyExcluded int64
 	err := row.Scan(
 		&app.ID,
 		&app.ServerID,
@@ -627,6 +632,7 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 		&app.BenchmarkScheduleIntervalSeconds,
 		&oppMetricsEnabled,
 		&app.ProxyListenPort,
+		&proxyExcluded,
 		&app.CreatedAt,
 		&app.UpdatedAt,
 	)
@@ -641,6 +647,7 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 	app.NativeMessages = nativeMessages != 0
 	app.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	app.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
+	app.ProxyExcluded = proxyExcluded != 0
 	flavors, err := decodeAPIFlavors(apiFlavors)
 	if err != nil {
 		return routing.Application{}, err

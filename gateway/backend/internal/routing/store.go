@@ -553,8 +553,28 @@ type Application struct {
 	// needs one. An operator may also set it explicitly (validated unique per
 	// server, same as Port).
 	ProxyListenPort int
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// ProxyExcluded is the operator's explicit opt-out from the gateway-guided
+	// TLS proxy, orthogonal to Scheme: an excluded application is never given a
+	// proxy listener and the gateway never changes its scheme -- the operator
+	// runs it on http or https themselves. It is the first expression this
+	// system has of "leave this application alone", which no combination of
+	// (Scheme, ProxyListenPort) could state for a PLAIN-HTTP application.
+	//
+	// AUTHORITATIVE: this is the ONLY representation of that decision.
+	// Migration 70 backfilled the retired implicit encoding (https with
+	// ProxyListenPort == 0) into it, so no reader anywhere needs to consult
+	// that encoding to learn participation.
+	//
+	// INVARIANT: ProxyExcluded == true implies ProxyListenPort == 0, enforced
+	// at the end of the mutation block in portal CreateApplication and
+	// UpdateApplication. That invariant is why ApplicationEndpoint,
+	// activePortStrings, revertScopeExit and HTTPSSwitchUnreachableApps need no
+	// knowledge of this field: each of them tests
+	// scheme == "https" && ProxyListenPort != 0, which an excluded application
+	// can never satisfy.
+	ProxyExcluded bool
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 type ModelMapping struct {
