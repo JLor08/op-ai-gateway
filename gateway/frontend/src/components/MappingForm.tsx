@@ -262,9 +262,7 @@ export function MappingForm({
         // (a spec's args are written against this name), and a readonly input is
         // barred from HTML constraint validation, so `required` cannot block
         // submit either.
-        {...(appNameReadOnly
-          ? { inputProps: { readOnly: true }, helperText: t.mappingAppNameReadOnly }
-          : {})}
+        {...(appNameReadOnly ? { readOnly: true, helperText: t.mappingAppNameReadOnly } : {})}
       />
       <SelectField
         id="mapping-status"
