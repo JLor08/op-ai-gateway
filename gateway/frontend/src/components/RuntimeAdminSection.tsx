@@ -3144,7 +3144,7 @@ export function RuntimeAdminSection({
                 // drive state and give a test a false green. The mapping owns
                 // this name; the Modell-Zuordnung tab edits it.
                 onChange={() => {}}
-                inputProps={{ readOnly: true }}
+                readOnly
                 helperText={t.runtimeSpecGatewayNameReadOnly}
               />
             )}
