@@ -332,3 +332,82 @@ https-switch **scope**, which is durable, and never the agent's reported
 on a proxy-mode agent before its first leaf) — a control that hid on it would
 vanish exactly while an operator was provisioning.
 → [Certificates & TLS §7](cross-cutting/certificates-tls.md), [Data Model](reference/data-model.md).
+
+## ADR-031 — Per-process VRAM on Windows: PDH counters plus a D3DKMT LUID bridge
+**Context:** co-residency admission charges a managed process its *measured*
+VRAM wherever a measurement exists, and on Windows there was none to be had:
+under the **WDDM** driver model the OS, not the NVIDIA driver, owns GPU memory,
+so `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory` answers `[N/A]`
+for `used_memory`. The failure was not benign — `[N/A]` parses to `0`, the
+measurer returned a *non-nil* map of zeros, and a present key outranks the
+operator's estimate, so every managed process on every Windows host was admitted
+as needing **0 MB** and each GPU's budget read as entirely free. **Decision:**
+measure Windows through the `\GPU Process Memory(*)\Dedicated Usage` **PDH**
+counter, whose instance names carry the PID and the display-adapter **LUID**;
+bridge that LUID to a PCI address with the user-mode-callable gdi32 **D3DKMT**
+exports (`D3DKMTOpenAdapterFromLuid` +
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS)`); and join the PCI address
+to the GPU index specs and budgets are written in terms of via
+`nvidia-smi --query-gpu=index,pci.bus_id`. The measurer is chosen by **build
+tag** (`collector.NewVRAMMeasurer`), the compute-apps measurer is **never**
+installed on Windows, and a measured `<= 0` no longer overrides an estimate on
+**any** platform. All grammars, arithmetic and cache decisions live in a
+build-tag-free file so Linux CI exercises the code Windows runs; only the
+syscalls sit behind `//go:build windows`, pinned by compile-time struct-layout
+assertions. **Rejected:** the **TCC** driver model, which does restore
+per-process reporting but disables the adapter's display output and is
+unavailable on most GeForce parts — these are workstation-class hosts;
+installing compute-apps on Windows regardless (a non-nil map of zeros is *worse*
+than no measurer, because `0` overrides the estimate while `nil` falls back to
+it); reading the neighbouring `Shared Usage` / `Non Local Usage` counters as
+VRAM-spillover detection (they read identically on all three GPUs of the probe
+host, so they are not per-adapter figures); and a second `PdhCollectQueryData`
+with a settling delay (the counter is a raw gauge — one collection already
+returned correct values, and the delay would be spent on the manager's
+serialized owner goroutine during an admission). **Consequence:** Windows
+admission now runs on real numbers — within 0.04–0.8 % of
+`nvidia-smi memory.used` per GPU, with attribution agreeing with `nvidia-smi`'s
+own PID→GPU mapping for 15 of 15 PIDs on a 3-GPU host — but the syscall half is
+verified by review, the compile-time assertions and out-of-band Windows runs
+only, because CI builds nothing for Windows
+([§11.3](11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
+Two rules follow and must not be relaxed: the **negative** LUID cache may record
+only durable findings (a D3DKMT refusal, or a *fresh and complete* `nvidia-smi`
+reading with no GPU at that address), since a wrongly cached adapter loses its
+measurement silently for the life of the process; and a PCI address claimed by
+two cards is refused rather than resolved to the last row, because
+`D3DKMT_ADAPTERADDRESS` reports no PCI domain and a confident wrong GPU index is
+worse than none.
+→ [Agent-Managed Model Runtime §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
+
+## ADR-032 — Known VRAM demand outranks unknown: the unknown side blocks, never evicts
+**Context:** the unknown-VRAM rule is symmetric — a candidate whose own demand
+is unknown may start only *alone* on its GPUs (rule 4), and an occupant of
+unknown demand blocks the cards it holds (rule 5, added alongside the Windows
+measurer so that "alone" survives the next admission). Symmetric **eviction
+rights** do not converge. With one spec estimated and one left blank on the same
+card, rule 5 evicts the blank incumbent for the estimated candidate while rule 4
+evicts the estimated incumbent for the blank candidate: alternating requests are
+each served only after destroying the other's loaded model, forever.
+**Decision:** make the two rules a **total order — known demand beats unknown
+demand.** Rule 5 keeps its eviction right unchanged. Rule 4 gives its up: a
+candidate whose own demand is unknown no longer evicts an occupant of **known**
+demand, it *blocks* — `Wait` while that occupant could still drain, and the
+existing terminal `pending_vram_unknown` when it is pinned and can never leave.
+**Rejected:** giving rule 4 the priority instead (it hands a misconfigured spec
+the power to kill correctly configured ones, which is the wrong side of the trade
+in every direction); charging an unknown demand the whole budget inside the
+per-GPU arithmetic instead of naming the contention (the eviction loop releases
+the same `0`, so the sum never comes down — that version evicts every idle
+process on the card *and* still answers `Wait`); and breaking the tie on age or
+`last_used` (still lets a blank spec destroy a configured one, and makes the
+outcome depend on request order). **Consequence:** an unknown-demand spec may
+still have a card to itself — that is rule 4's stated intent — but only a card
+it can *get* to itself; what it loses is the privilege of evicting a working
+model to get there, and the spec that loses the contest is always the
+misconfigured one, named in the other's `last_error`. Where **both** sides are
+unknown neither outranks the other, and the pre-existing behaviour stands (rule 5
+still evicts an evictable unknown occupant). The way out of a block is the same
+as ever: a measurement, or — on a host with no measurer — the operator's
+estimate.
+→ [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
