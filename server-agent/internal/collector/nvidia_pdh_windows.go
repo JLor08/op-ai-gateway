@@ -265,48 +265,34 @@ func newNvidiaPDHMeasurer() func(pids []int) map[int]map[int]int {
 	return m.measure
 }
 
-// nvidiaPDHMeasurer holds the LUID -> GPU-index bridge across measurement
+// nvidiaPDHMeasurer carries the LUID -> GPU-index bridge across measurement
 // cycles. The bridge costs three D3DKMT syscalls plus (once) an nvidia-smi
-// spawn per adapter, and it describes the host's fixed GPU topology, which does
-// not change between one cycle and the next -- so it is cached, modelled on
-// nvidiaComputeAppsMeasurer's uuidToIndex cache.
+// spawn per adapter, and it describes the host's fixed GPU topology, which
+// does not change between one cycle and the next -- so it is cached, modelled
+// on nvidiaComputeAppsMeasurer's uuidToIndex cache. Both halves are cached,
+// including the negative one; the rules for what may enter it are with
+// resolvePDHLUIDs, in the build-tag-free nvidia_pdh.go, because CI can test
+// them there and cannot here.
 //
-// Both halves are cached, and the NEGATIVE half is not an optimisation detail:
-// on the probe host one adapter LUID (0x0_0x16026, with no NVIDIA GPU behind
-// it) failed D3DKMTOpenAdapterFromLuid with STATUS_INVALID_PARAMETER, and
-// without a negative cache it was retried once per counter instance -- six
-// wasted syscalls per cycle on the Manager's serialized owner goroutine, for a
-// result that will never change. Unresolvable adapters are NORMAL (integrated
-// GPUs, software/render adapters, stale counter instances), so their cost has
-// to be paid once, not per cycle.
-//
-// The maps are copy-on-write: replaced wholesale under mu, never mutated in
-// place. SetMeasurer's contract allows two overlapping calls (buildSnapshot on
-// the owner goroutine and the recurring dispatchMeasurement off it), and the
-// worst a lost update can cost is one repeated resolution on the next cycle.
+// This struct's only job is the mutex. The caches are copy-on-write: whole
+// maps in, whole maps out, never mutated in place, because SetMeasurer's
+// contract allows two overlapping calls (buildSnapshot on the owner goroutine
+// and the recurring dispatchMeasurement off it) and the worst a lost update
+// can cost is one repeated resolution on the next cycle.
 type nvidiaPDHMeasurer struct {
-	mu sync.Mutex
-	// luidToIndex is the positive half: adapters that resolved to an
-	// nvidia-smi GPU index. nil until the first successful resolution.
-	luidToIndex map[pdhLUID]int
-	// unresolvable is the negative half: adapters that could not be opened,
-	// or that resolved to a PCI address no NVIDIA GPU sits at. Values are
-	// never needed -- membership IS the answer.
-	unresolvable map[pdhLUID]struct{}
-	// pciToIndex is the last nvidia-smi PCI-address -> index mapping. nil
-	// until the first successful fetch.
-	pciToIndex map[pciAddress]int
+	mu     sync.Mutex
+	cached pdhLUIDCaches
 }
 
-func (m *nvidiaPDHMeasurer) caches() (map[pdhLUID]int, map[pdhLUID]struct{}, map[pciAddress]int) {
+func (m *nvidiaPDHMeasurer) caches() pdhLUIDCaches {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.luidToIndex, m.unresolvable, m.pciToIndex
+	return m.cached
 }
 
-func (m *nvidiaPDHMeasurer) setCaches(luidToIndex map[pdhLUID]int, unresolvable map[pdhLUID]struct{}, pciToIndex map[pciAddress]int) {
+func (m *nvidiaPDHMeasurer) setCaches(c pdhLUIDCaches) {
 	m.mu.Lock()
-	m.luidToIndex, m.unresolvable, m.pciToIndex = luidToIndex, unresolvable, pciToIndex
+	m.cached = c
 	m.mu.Unlock()
 }
 
@@ -364,95 +350,43 @@ func (m *nvidiaPDHMeasurer) measure(pids []int) map[int]map[int]int {
 	return attributePDHDedicated(instances, luidToIndex, pids)
 }
 
-// resolveLUIDs maps each needed adapter LUID to its nvidia-smi GPU index,
-// consulting and extending both halves of the cache. It spawns nvidia-smi at
-// most once per call, and not at all when every needed adapter is already
-// known either way.
+// resolveLUIDs maps each needed adapter LUID to its nvidia-smi GPU index via
+// resolvePDHLUIDs, supplying the two platform-specific calls that logic needs
+// and installing the caches it returns. The decision logic itself is
+// deliberately NOT here: it is pure, it is where a wrong negative conclusion
+// silently costs a GPU its measurement for the life of the process, and this
+// file is the one CI never compiles, vets or tests.
 func (m *nvidiaPDHMeasurer) resolveLUIDs(need []pdhLUID) map[pdhLUID]int {
-	pos, neg, pci := m.caches()
-
-	out := make(map[pdhLUID]int, len(need))
-	var unknown []pdhLUID
-	for _, l := range need {
-		if idx, ok := pos[l]; ok {
-			out[l] = idx
-			continue
-		}
-		if _, ok := neg[l]; ok {
-			continue // known to lead to no NVIDIA GPU; do not pay for it again
-		}
-		unknown = append(unknown, l)
-	}
-	if len(unknown) == 0 {
-		return out // the steady state: no syscall, no subprocess, no cache write
-	}
-
-	newPos := make(map[pdhLUID]int, len(pos)+len(unknown))
-	for k, v := range pos {
-		newPos[k] = v
-	}
-	newNeg := make(map[pdhLUID]struct{}, len(neg)+len(unknown))
-	for k, v := range neg {
-		newNeg[k] = v
-	}
-
-	refetched := false
-	for _, l := range unknown {
-		addr, err := luidPCIAddress(l)
-		if err != nil {
-			// Normal, not a fault: an adapter with no NVIDIA GPU behind it, or
-			// a counter instance left over from a process that has exited.
-			slog.Debug("d3dkmt adapter address lookup failed",
-				"luid_high", l.HighPart, "luid_low", l.LowPart, "err", err)
-			newNeg[l] = struct{}{}
-			continue
-		}
-		idx, ok := pci[addr]
-		if !ok && !refetched {
-			// The one case a stale PCI mapping actually matters: an adapter
-			// resolved to an address the cached mapping does not know, i.e. a
-			// GPU added, removed or reindexed since the last fetch (a driver
-			// reset, for instance). Refetch once -- the same invalidation rule
-			// nvidiaComputeAppsMeasurer applies to its uuidToIndex cache.
-			refetched = true
-			if fresh := nvidiaPCIIndex(); len(fresh) > 0 {
-				pci = fresh
-				// A changed topology is the only thing that can turn a
-				// previously unresolvable adapter into a real GPU, so the
-				// negative half is discarded along with the mapping it was
-				// derived from. Anything still unresolvable is re-learned on
-				// the next cycle, at the cost of one round of syscalls.
-				newNeg = make(map[pdhLUID]struct{}, len(unknown))
-				idx, ok = pci[addr]
-			}
-		}
-		if !ok {
-			if len(pci) == 0 {
-				// nvidia-smi has never answered. Resolve nothing and cache
-				// nothing: a transient subprocess failure must not poison a
-				// perfectly good adapter for the rest of the process's life.
-				continue
-			}
-			newNeg[l] = struct{}{}
-			continue
-		}
-		newPos[l] = idx
-		out[l] = idx
-	}
-
-	m.setCaches(newPos, newNeg, pci)
+	out, next := resolvePDHLUIDs(need, m.caches(), luidPCIAddressLogged, nvidiaPCIIndex)
+	m.setCaches(next)
 	return out
 }
 
+// luidPCIAddressLogged is luidPCIAddress plus the debug line resolvePDHLUIDs
+// cannot emit (it takes no logger, and a pure function should not). An error
+// here is normal, not a fault: an adapter with no NVIDIA GPU behind it, or a
+// counter instance left over from a process that has exited.
+func luidPCIAddressLogged(l pdhLUID) (pciAddress, error) {
+	addr, err := luidPCIAddress(l)
+	if err != nil {
+		slog.Debug("d3dkmt adapter address lookup failed",
+			"luid_high", l.HighPart, "luid_low", l.LowPart, "err", err)
+	}
+	return addr, err
+}
+
 // nvidiaPCIIndex fetches the PCI-address -> GPU-index mapping from nvidia-smi.
-// nil on any failure, which resolveLUIDs treats as "learn nothing this cycle".
+// (nil, false) on any failure, which resolvePDHLUIDs treats as "learn nothing
+// this cycle" -- pointedly NOT as "no GPU sits at that address", which is the
+// conclusion the second return value licenses and a failed spawn cannot
+// support.
 //
 // Bounded by nvidiaMeasureTimeout, the same knob the compute-apps measurer
 // uses, and for the same load-bearing reason: this runs on the Manager's
 // serialized owner goroutine during an admission, so a wedged nvidia-smi would
 // stall every other lifecycle operation, not just this measurement. One spawn
 // per cache miss, none in the steady state.
-func nvidiaPCIIndex() map[pciAddress]int {
+func nvidiaPCIIndex() (map[pciAddress]int, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), nvidiaMeasureTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, nvidiaSMI,
@@ -461,7 +395,7 @@ func nvidiaPCIIndex() map[pciAddress]int {
 	).Output()
 	if err != nil {
 		slog.Debug("nvidia-smi pci.bus_id query failed", "err", err)
-		return nil
+		return nil, false
 	}
 	return parseNvidiaPCIIndexCSV(out)
 }

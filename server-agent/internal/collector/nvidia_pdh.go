@@ -4,6 +4,7 @@
 package collector
 
 import (
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -175,19 +176,195 @@ func parseNvidiaBusID(s string) (pciAddress, bool) {
 //
 // pci.bus_id is safe to carry through a comma-split: its form is
 // `00000000:21:00.0` -- colons and a dot, never a comma.
-func parseNvidiaPCIIndexCSV(data []byte) map[pciAddress]int {
+//
+// AN AMBIGUOUS ADDRESS RESOLVES TO NOTHING. parseNvidiaBusID discards the PCI
+// DOMAIN, and it has to: D3DKMT_ADAPTERADDRESS reports no domain, so the join
+// key cannot carry one (see pciAddress). Two GPUs in different PCI segments
+// therefore land on the same bus:device.function key. Letting the last row win
+// would make the join key non-unique and attribute every adapter D3DKMT
+// reports at that address to whichever card happened to come last in the CSV
+// -- a confident wrong GPU index, which this module's whole error strategy
+// rejects (see attributePDHDedicated's "skip rather than guess an index").
+// D3DKMT genuinely cannot tell the two cards apart, so there is no right
+// answer and the honest one is to refuse: the address is removed and stays
+// removed, both adapters fall through to the operator's estimate, and no
+// measurement is misfiled.
+//
+// The second return value reports whether this reading is COMPLETE: every row
+// parsed, and no address claimed twice. It is NOT a health signal for the
+// caller to log -- it is the licence to draw a PERMANENT negative conclusion.
+// resolvePDHLUIDs may cache "no NVIDIA GPU sits at that address" only from a
+// complete reading, because an address missing from a reading that is itself
+// missing rows says nothing at all. A row that DID parse stays usable either
+// way: incompleteness withholds the negative conclusion, never a positive one.
+func parseNvidiaPCIIndexCSV(data []byte) (map[pciAddress]int, bool) {
 	out := make(map[pciAddress]int)
+	// ambiguous remembers refused addresses so a THIRD row at the same
+	// address cannot re-insert one that a second row already removed.
+	var ambiguous map[pciAddress]bool
+	complete := true
 	for _, row := range splitNvidiaCSVRows(data) {
 		if len(row) < 2 {
+			complete = false
 			continue
 		}
 		addr, ok := parseNvidiaBusID(row[1])
 		if !ok {
+			complete = false // e.g. `[N/A]` from a card in ERR! state
+			continue
+		}
+		if ambiguous[addr] {
+			continue
+		}
+		if _, dup := out[addr]; dup {
+			if ambiguous == nil {
+				ambiguous = make(map[pciAddress]bool)
+			}
+			ambiguous[addr] = true
+			delete(out, addr)
+			complete = false
 			continue
 		}
 		out[addr] = naInt(row[0])
 	}
-	return out
+	return out, complete
+}
+
+// pdhLUIDCaches is the adapter-LUID -> GPU-index bridge the Windows measurer
+// carries across measurement cycles: both halves of the LUID cache, plus the
+// nvidia-smi PCI mapping they were derived from. Passed and returned by value
+// and never mutated in place -- the measurer swaps whole maps under its mutex,
+// so an overlapping buildSnapshot and dispatchMeasurement can at worst lose an
+// update and repeat one resolution next cycle.
+type pdhLUIDCaches struct {
+	// LUIDToIndex is the POSITIVE half: adapters that resolved to an
+	// nvidia-smi GPU index. nil until the first successful resolution.
+	LUIDToIndex map[pdhLUID]int
+	// Unresolvable is the NEGATIVE half: adapters that will never resolve.
+	// Membership IS the answer, so the values are never read. Only two
+	// findings may enter it, and both are durable facts rather than the
+	// absence of an answer -- see resolvePDHLUIDs.
+	Unresolvable map[pdhLUID]struct{}
+	// PCIToIndex is the last nvidia-smi reading. nil until the first
+	// successful fetch.
+	PCIToIndex map[pciAddress]int
+}
+
+// resolvePDHLUIDs maps each needed adapter LUID to its nvidia-smi GPU index,
+// consulting and extending both halves of the cache, and returns the caches to
+// install. adapterAddress is the D3DKMT lookup and fetchPCIIndex the nvidia-smi
+// spawn; both are parameters so this decision logic is testable on Linux CI.
+//
+// It lived inside nvidia_pdh_windows.go and was moved here after review: a
+// permanent negative-cache poisoning had gone unnoticed in it precisely
+// because `//go:build windows` code is never compiled, vetted or tested by CI
+// (ubuntu-latest), so review was its only guard. Everything here is a
+// decision; only the two calls it makes are platform-specific.
+//
+// WHEN AN ADAPTER MAY BE WRITTEN OFF PERMANENTLY. The negative half must hold
+// only durable facts, because it is consulted BEFORE the unknown set is built:
+// a LUID in it can no longer trigger the refetch that is its only escape, so a
+// wrong entry is wrong until the agent process restarts, and its cost is
+// silent -- attributePDHDedicated omits the (pid, gpu) pair, buildSnapshot
+// charges the operator's estimate instead, and nothing above debug level says
+// so. Exactly two findings qualify:
+//
+//   - D3DKMT REFUSED THE ADAPTER. A property of the adapter itself, and the
+//     measured reason this cache exists at all: on the probe host LUID
+//     0x0_0x16026 failed D3DKMTOpenAdapterFromLuid with
+//     STATUS_INVALID_PARAMETER and was retried once per counter instance --
+//     six wasted syscalls per cycle on the Manager's serialized owner
+//     goroutine for an answer that cannot change.
+//   - A FRESH AND COMPLETE nvidia-smi READING HAS NO GPU AT THE ADAPTER'S PCI
+//     ADDRESS. A property of the host's topology: an integrated GPU, or a
+//     software/render adapter.
+//
+// Everything else -- nvidia-smi failing, timing out, or answering with rows
+// missing (see parseNvidiaPCIIndexCSV) -- is the ABSENCE of an answer, not a
+// negative one, and is retried on the next cycle. That distinction is the
+// whole fix: the earlier guard asked only whether nvidia-smi had EVER
+// answered, so on a warm cache a single 2s timeout (routine while a driver is
+// reinitialising, and correlated with the very topology change that produced
+// the unknown LUID) wrote a perfectly good GPU off for good.
+//
+// The retry is bounded: at most one nvidia-smi spawn per call however many
+// adapters miss, and none at all in the steady state where every needed
+// adapter is already in one half of the cache.
+func resolvePDHLUIDs(
+	need []pdhLUID,
+	in pdhLUIDCaches,
+	adapterAddress func(pdhLUID) (pciAddress, error),
+	fetchPCIIndex func() (map[pciAddress]int, bool),
+) (map[pdhLUID]int, pdhLUIDCaches) {
+	out := make(map[pdhLUID]int, len(need))
+	var unknown []pdhLUID
+	for _, l := range need {
+		if idx, ok := in.LUIDToIndex[l]; ok {
+			out[l] = idx
+			continue
+		}
+		if _, ok := in.Unresolvable[l]; ok {
+			continue // a durable finding; do not pay for it again
+		}
+		unknown = append(unknown, l)
+	}
+	if len(unknown) == 0 {
+		return out, in // the steady state: no syscall, no subprocess, no cache write
+	}
+
+	next := pdhLUIDCaches{
+		LUIDToIndex:  make(map[pdhLUID]int, len(in.LUIDToIndex)+len(unknown)),
+		Unresolvable: make(map[pdhLUID]struct{}, len(in.Unresolvable)+len(unknown)),
+		PCIToIndex:   in.PCIToIndex,
+	}
+	maps.Copy(next.LUIDToIndex, in.LUIDToIndex)
+	maps.Copy(next.Unresolvable, in.Unresolvable)
+
+	// trustNegative is the licence described above: true only once THIS call
+	// has obtained a fresh, complete reading. Deliberately not derived from
+	// the cached reading -- a miss always attempts a refetch first, so by the
+	// time a negative conclusion is on the table the freshest obtainable
+	// reading is already in hand.
+	trustNegative := false
+	refetched := false
+	for _, l := range unknown {
+		addr, err := adapterAddress(l)
+		if err != nil {
+			// A refusal by the adapter, not a missing answer: durable.
+			next.Unresolvable[l] = struct{}{}
+			continue
+		}
+		idx, ok := next.PCIToIndex[addr]
+		if !ok && !refetched {
+			// The one case a stale reading actually matters: an adapter at an
+			// address the cached reading does not know, i.e. a GPU added,
+			// removed or reindexed since the last fetch (a driver reset, for
+			// instance). Refetch once -- the same invalidation rule
+			// nvidiaComputeAppsMeasurer applies to its uuidToIndex cache.
+			refetched = true
+			if fresh, complete := fetchPCIIndex(); len(fresh) > 0 {
+				next.PCIToIndex = fresh
+				trustNegative = complete
+				// A changed topology is the only thing that can turn a
+				// previously unresolvable adapter into a real GPU, so the
+				// negative half is discarded along with the reading it was
+				// derived from. Anything still unresolvable is re-learned on
+				// the next cycle, at the cost of one round of syscalls.
+				next.Unresolvable = make(map[pdhLUID]struct{}, len(unknown))
+				idx, ok = fresh[addr]
+			}
+		}
+		if !ok {
+			if !trustNegative {
+				continue // no answer obtained this cycle; ask again next cycle
+			}
+			next.Unresolvable[l] = struct{}{}
+			continue
+		}
+		next.LUIDToIndex[l] = idx
+		out[l] = idx
+	}
+	return out, next
 }
 
 // attributePDHDedicated is the aggregation the measurer contract needs: filter

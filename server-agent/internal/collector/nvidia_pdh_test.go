@@ -118,9 +118,12 @@ const canned3GPUBusIDCSV = "0, 00000000:21:00.0\n" +
 	"2, 00000000:4a:00.0\n"
 
 func TestParseNvidiaPCIIndexCSV(t *testing.T) {
-	got := parseNvidiaPCIIndexCSV([]byte(canned3GPUBusIDCSV))
+	got, complete := parseNvidiaPCIIndexCSV([]byte(canned3GPUBusIDCSV))
 	if len(got) != 3 {
 		t.Fatalf("got %d entries, want 3: %#v", len(got), got)
+	}
+	if !complete {
+		t.Error("complete = false, want true -- every row of this reading parsed")
 	}
 	if idx, ok := got[pciAddress{Bus: 0x49}]; !ok || idx != 1 {
 		t.Errorf("bus 0x49 -> (%d, %v), want (1, true)", idx, ok)
@@ -131,9 +134,14 @@ func TestParseNvidiaPCIIndexCSV(t *testing.T) {
 }
 
 func TestParseNvidiaPCIIndexCSVSkipsBadRows(t *testing.T) {
-	got := parseNvidiaPCIIndexCSV([]byte("0\n1, [N/A]\n2, 00000000:4a:00.0\n\n"))
+	got, complete := parseNvidiaPCIIndexCSV([]byte("0\n1, [N/A]\n2, 00000000:4a:00.0\n\n"))
 	if len(got) != 1 {
 		t.Fatalf("got %#v, want only the one parseable row", got)
+	}
+	// Two rows were unreadable, so this reading must NOT license a permanent
+	// "no GPU sits at that address" conclusion -- see resolvePDHLUIDs.
+	if complete {
+		t.Error("complete = true, want false -- two rows did not parse")
 	}
 	if idx := got[pciAddress{Bus: 0x4a}]; idx != 2 {
 		t.Errorf("bus 0x4a -> %d, want 2", idx)
