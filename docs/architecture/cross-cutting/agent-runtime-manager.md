@@ -3289,8 +3289,11 @@ operator meets first:
 - **Three smaller accepted risks in the agent.** When a spec does not pin a
   listen port the agent binds `127.0.0.1:0`, reads the port back and closes the
   listener — an accepted TOCTOU window before the child's own bind. Measured VRAM
-  freshness is **admission-driven, not polled**, so a long-idle host reports
-  stale measurements. And work-directory containment is **lexical**: a symlink
+  is **beat-fresh, not continuously fresh**: it is dispatched from the 15 s
+  housekeeping beat, from a child's first health pass, and synchronously from
+  every admission snapshot (§5.3) — so a reported figure can be up to one beat
+  old, and a target the measurer says nothing about keeps its previous value
+  until the process exits. And work-directory containment is **lexical**: a symlink
   inside an allowed directory can point outside it — the binary allowlist, not
   the directory check, is the boundary.
 - **The feature ships no metrics** of its own beyond the telemetry sample and the
