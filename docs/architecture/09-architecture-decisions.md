@@ -392,8 +392,12 @@ each served only after destroying the other's loaded model, forever.
 **Decision:** make the two rules a **total order — known demand beats unknown
 demand.** Rule 5 keeps its eviction right unchanged. Rule 4 gives its up: a
 candidate whose own demand is unknown no longer evicts an occupant of **known**
-demand, it *blocks* — `Wait` while that occupant could still drain, and the
-existing terminal `pending_vram_unknown` when it is pinned and can never leave.
+demand, it *blocks* — the existing terminal `pending_vram_unknown` when that
+occupant is **pinned** and can never leave, and `Wait` for every other one. The
+block is **unconditional**: it stands even where the matrix or the arithmetic
+would have evicted that same occupant anyway, because honouring the order only
+where no other reason exists leaves those pairs evicting in both directions —
+the same defect, one rule over.
 **Rejected:** giving rule 4 the priority instead (it hands a misconfigured spec
 the power to kill correctly configured ones, which is the wrong side of the trade
 in every direction); charging an unknown demand the whole budget inside the
@@ -406,8 +410,12 @@ still have a card to itself — that is rule 4's stated intent — but only a ca
 it can *get* to itself; what it loses is the privilege of evicting a working
 model to get there, and the spec that loses the contest is always the
 misconfigured one, named in the other's `last_error`. Where **both** sides are
-unknown neither outranks the other, and the pre-existing behaviour stands (rule 5
-still evicts an evictable unknown occupant). The way out of a block is the same
-as ever: a measurement, or — on a host with no measurer — the operator's
-estimate.
+unknown neither outranks the other, and the pre-existing mutual eviction stands
+(rule 5 still evicts an evictable unknown occupant) — unchanged by this decision
+rather than fixed by it, and recorded as an acceptance in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). The
+price of the order is a `Wait` returned while an idle victim was plainly
+available, and that wait is only as short as the occupant's own
+`idle_timeout_seconds` (a `0` there means *never unload*): the ways out are a
+measurement, or the operator's estimate on the spec that is missing one.
 → [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
