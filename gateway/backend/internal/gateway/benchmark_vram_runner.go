@@ -119,7 +119,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// written, so it runs on every exit from here on -- including a panic
 	// mid-unwind -- and before the terminal defer publishes the report.
 	defer func() {
-		report.RestoreFailed = s.vramRestore(ctx, pendingRestore)
+		report.RestoreFailed, report.RestoreTakenOver = s.vramRestore(ctx, pendingRestore)
 	}()
 	if drainErr != nil {
 		// The write itself failed -- a concurrent operator override, a spec
@@ -212,14 +212,55 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 		return
 	}
 
-	measured := s.vramAwaitMeasured(ctx, serverID, plan.targetSpecID, watched)
-	report.GPUs = vramReportItems(watched, attributable, plan, baseline, after, measured)
-	if vramHeadlineDeltaMB(report.GPUs) < vramFloorMB(watched, after) {
+	measured := s.vramAwaitMeasured(ctx, serverID, plan.targetSpecID)
+
+	// (8) Isolation again, at the END. Step 3 proved it once, before the
+	// baseline, and every window since only ever constrained movement INSIDE
+	// itself -- so a sibling started anywhere in between (a portal "Force
+	// start", a request straight to the agent's own router) left both windows
+	// individually stable and had its whole allocation added to delta_mb.
+	lost := s.vramIsolationLost(serverID, plan)
+	for _, specID := range lost {
+		// evidence IS report.IsolationEvidence, so the stored payload names
+		// what broke the isolation rather than only saying that it broke.
+		evidence[specID] = vramEvidenceRestartedDuringRun
+	}
+	// Recomputed through the one function that owns this field, so the boolean
+	// and the evidence behind it cannot drift. The lost-set conjunct is what
+	// covers a spec created AFTER the enumeration: that one is in no list
+	// vramIsolationConfirmed reads.
+	report.Isolated = len(lost) == 0 && vramIsolationConfirmed(plan.specIDs, evidence)
+	if len(lost) > 0 {
+		report.Inconclusive = vramInconclusiveIsolationLost
+		return
+	}
+
+	// (9) The two numbers, the floor gate, and the cross-check between them.
+	items := vramReportItems(watched, attributable, plan, baseline, after, measured)
+	if undeclared := vramUndeclaredAllocations(watched, baseline, after, measured); len(undeclared) > 0 {
+		// A card the spec does not declare that nonetheless allocated: the
+		// per-card numbers stay correct, the MODEL's total was the half being
+		// silently halved, and the spec's GPU rows are what the operator has
+		// to fix. Reported and warned, not refused -- see the warning's doc.
+		items = append(items, vramReportItems(undeclared, false, plan, baseline, after, measured)...)
+		report.Warnings = append(report.Warnings, vramWarningUndeclaredGPUAllocation)
+	}
+	if vramHeadlineDeltaMB(items) < vramFloorMB(watched, after) {
 		// No model costs ~0 MB, so a sub-floor headline can only mean the
 		// window missed the allocation or something else absorbed it. 0 means
 		// UNKNOWN everywhere else in this feature and must mean it here too.
 		report.Inconclusive = vramInconclusiveBelowFloor
 		report.GPUs = nil
+		return
+	}
+	report.GPUs = vramVisibleItems(items)
+	if vramStrategiesDisagree(report.GPUs, after) {
+		// The one contaminant no other gate can see: a neighbour the gateway
+		// cannot stop, allocating during the load, with the managed fleet
+		// provably isolated the whole time. The two disagreeing numbers STAY
+		// on the report -- unlike below_floor, where there is nothing to show,
+		// here they are the evidence for the reason.
+		report.Inconclusive = vramInconclusiveStrategyDisagreement
 	}
 }
 
@@ -245,24 +286,26 @@ func vramWithout(ids []string, drop string) []string {
 // legitimately differ, and a host without a per-process measurer only ever
 // has the delta.
 //
-// When the spec declares its own GPU rows, EVERY declared index is reported
-// even if it did not move -- a declared card that showed nothing is
-// information the operator asked for. When it declares none, only the indexes
-// whose delta clears the floor are reported: there is no row to attribute
-// them to, so a list of every quiet card in the host would be noise.
+// EVERY index handed in is reported, unfiltered: the headline gate is applied
+// to the SUM of these deltas, so dropping a card here would decide the floor
+// question before the sum that the floor is meant to judge. Trimming the quiet
+// unattributable cards back out is vramVisibleItems' job, and it runs AFTER
+// that gate.
+//
+// The FINGERPRINT is read from the post-load window's own sample rather than
+// from the trigger-time one, because that is the sample the numbers came from.
+// Recording the trigger-time identity beside a window-time number means that
+// if the cards were renumbered in between -- the exact event a fingerprint
+// exists to detect -- the item pairs the OLD card's uuid with the NEW card's
+// figure, which is worse than recording no identity at all.
 func vramReportItems(watched []int, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[int]int) []VRAMGPUItem {
 	beforeByIndex := vramGPUByIndex(baseline)
 	afterByIndex := vramGPUByIndex(after)
-	fingerprintByIndex := vramGPUByIndex(plan.baseline)
-	floor := vramFloorMB(watched, after)
 
 	items := make([]VRAMGPUItem, 0, len(watched))
 	for _, index := range watched {
 		delta := vramDeltaMB(beforeByIndex[index].MemUsedBytes, afterByIndex[index].MemUsedBytes)
-		if !attributable && delta < floor {
-			continue
-		}
-		fingerprint, kind := vramFingerprintOf(fingerprintByIndex[index])
+		fingerprint, kind := vramFingerprintOf(afterByIndex[index])
 		items = append(items, VRAMGPUItem{
 			Index:           index,
 			Fingerprint:     fingerprint,
@@ -344,14 +387,19 @@ func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched 
 // produced. An empty result is the honest answer on a host with no
 // per-process measurer, which is the case the delta strategy exists for --
 // strategy (a) reports nothing rather than something stale.
-func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string, watched []int) map[int]int {
+//
+// IT RETURNS THE AGENT'S WHOLE PER-CARD MAP, unfiltered by the watched set.
+// Filtering it to the spec's declared indexes discarded exactly the reading
+// that mattered most: `set_visible_devices` defaults to false, so a model can
+// allocate on a card its spec does not declare, and the agent's measurement on
+// that card is the strongest available evidence of it -- while dropping it made
+// the remaining half agree with the declared-card delta and so reinforced
+// confidence in half a number. The caller decides which indexes have a row to
+// be applied to; that is not this function's question.
+func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string) map[int]int {
 	_, frames, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()
 
-	wanted := make(map[int]bool, len(watched))
-	for _, index := range watched {
-		wanted[index] = true
-	}
 	timer := time.NewTimer(vramMeasuredWaitBound)
 	defer timer.Stop()
 	for {
@@ -372,7 +420,7 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string,
 				for _, gpu := range status.GPUs {
 					// A measured 0 is UNKNOWN, the same rule the ingest and
 					// the write-back apply to this very array.
-					if gpu.VRAMMeasuredMB <= 0 || !wanted[gpu.Index] {
+					if gpu.VRAMMeasuredMB <= 0 {
 						continue
 					}
 					out[gpu.Index] = gpu.VRAMMeasuredMB

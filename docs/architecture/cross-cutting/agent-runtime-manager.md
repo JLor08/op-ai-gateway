@@ -3348,6 +3348,7 @@ reserved, so a refused run writes nothing and reserves nothing:
 | [File mode](#82-file-mode), or an agent that has not declared `runtime_manager` | `benchmark.vram_isolation_unavailable` |
 | The server's latest telemetry carries no GPU sample | `benchmark.vram_no_gpu_samples` |
 | A spec already carries an operator override, or a spec *other than the target* is pinned (the message names it) | `benchmark.vram_isolation_blocked` |
+| The target's launch spec declares a GPU index this host does not report (the message names it) | `benchmark.vram_declared_gpu_missing` |
 
 The override refusal is what makes the restore unambiguous: the run only ever
 restores to exactly `""`, so it never has to reconstruct what an operator's
@@ -3356,6 +3357,28 @@ refusal is not because a pinned spec cannot be drained (`force_stopped`
 outranks `pinned`) but because pinned is a standing instruction that a model
 stays up, and silently breaking it for a benchmark is a worse surprise than
 refusing. A pinned **target** proceeds: stopping the target is the point.
+
+The **declared-GPU** refusal exists because the alternative is a run that
+cannot succeed and drains the fleet first. The stability gate requires every
+watched card to be present in every sample — the run cannot difference what it
+cannot see — so a spec declaring index 3 on a two-GPU host burns each window's
+full bound and reports `baseline_unstable`, whose stated next action ("something
+on the card was moving; retry once the server is quiet") is wrong and can never
+work. The host's whole card list is already in hand at trigger time, so naming
+the missing index costs nothing.
+
+**A launch-spec write is refused while a run holds the server.** The
+launch-spec endpoint is a full-document replace with `admin_state` among its
+fields, so it is an override action as much as an edit: one "Force start" on a
+spec the run has drained puts a sibling's allocation inside the measurement
+window. `PUT /api/portal/mappings/{id}/runtime-spec` therefore answers **409
+`runtime_spec.server_benchmarking`** whenever the benchmark reservation is held
+for that mapping's server — the same reservation that already excludes the
+server from gateway routing, checked *after* authorization so it leaks nothing,
+and only on the principal-carrying path: the run's own drain and restore go
+through the benchmark writer and must not refuse themselves. A write to another
+server, and a DELETE (which drains a spec rather than starting one, and which
+the restore already treats as restored), are not gated.
 
 Two conditions **warn** instead of refusing, and ride the result as
 `warnings[]`: a server that also hosts active applications the agent does not
@@ -3366,7 +3389,8 @@ make the feature unusable on exactly the
 and an agent with no open WebSocket (`post_transport_agent` — nothing the run
 writes reaches it before its next runtime poll, so the drain does not even
 begin until then and the server is held for correspondingly longer; the run
-says so rather than refusing).
+says so rather than refusing). A third warns on a result rather than before
+it: `undeclared_gpu_allocation` — see *Which cards are watched* below.
 
 **`isolated` is evidence, never a 200.** In file mode every `admin_state` write
 succeeds and stops nothing, so a write's success proves nothing anywhere. The
@@ -3420,6 +3444,28 @@ file-mode defect the rule exists to prevent. A state this gateway does not
 recognize (a future agent build) counts as neither, so the run reports an
 isolation timeout rather than claiming an isolation it cannot justify.
 
+**And it is proved twice, because one proof covers the wrong half of the run.**
+The drain proof happens *before* the baseline; everything after it — the
+settle, the baseline window, the whole load (bounded only by the spec's startup
+timeout, by far the longest part of a run), the post-load settle — was
+unmonitored, and the stability gate only ever constrains movement *inside* one
+window. A sibling started anywhere in between therefore left both windows
+individually stable and had its whole allocation added to `delta_mb`, reported
+as definitive with `isolated: true`. So the run re-reads the runtime-status
+snapshot after the post-load window and requires every **non-target** spec to
+still be in a no-process state — the target's own process is the point of the
+run, and no spec *outside* the trigger-time enumeration may hold one either,
+since a spec created after that enumeration was never drained and carries no
+evidence. A spec that fails this is recorded with the third evidence value,
+`restarted_during_run`, which is the one value that is *not* evidence of
+isolation: it sits outside the closed set, so it flips `isolated` through the
+same function that computes that field, and it NAMES the spec in the stored
+payload rather than only saying that something broke. The result is
+`isolation_lost` and no number. The snapshot is up to one telemetry interval
+old, so this is a contamination *detector*, not a proof about the final
+instant — which is why the cross-check below stands beside it rather than
+behind it.
+
 **The watermark is channel ordering, not a clock.** A `stopped` frame that
 predates the run's write proves nothing, and no status frame carries an arrival
 time of its own. So the run subscribes to the live status stream *after* its
@@ -3451,13 +3497,32 @@ The two are different quantities and may legitimately differ; the portal shows
 both and never a mean. `0` keeps its house meaning throughout: **unknown, never
 a real zero.**
 
+**They are also CROSS-CHECKED, which is half the reason to run both.** Where a
+card carries both figures they must agree within an allowance, and a gap past
+it means one of them measured something the other did not — which for the delta
+means something else allocated inside the window. That is the only gate that
+can catch the one contaminant nothing else sees: a **non-managed** neighbour
+allocating during the load leaves both windows individually stable *and* the
+managed fleet provably isolated, so no other check has any reason to doubt the
+delta, while the agent's own figure counts only the target's own pages. A
+disagreement is `strategy_disagreement`, and the two numbers **stay on the
+report** — unlike `below_floor`, where there is nothing to show, here they are
+the evidence for the reason. The allowance is
+`max(the card's stability tolerance, 512 MB, 10 % of the agent's figure)`,
+because the delta legitimately carries the process's CUDA context and the
+driver reserve that a per-process measurer attributes to neither — a difference
+that is absolute rather than proportional, hence both halves. A card with only
+one figure is not checked: demanding a second opinion on AMD or Apple, where no
+measurer exists, would refuse every run on exactly the hosts the delta strategy
+exists for.
+
 **Honesty gates, and what each catches.** Each phase requires `K` consecutive
 samples (default 3, ~3 s at the 1 s cadence) in which every watched card varies
 by no more than `max(1 % of the card, 64 MiB)`. A result that reached no number
 says **why**, because the operator's next action differs per reason:
 `isolation_timeout`, `baseline_unstable`, `post_load_unstable`,
-`already_resident`, `below_floor`, `no_samples`. Two of them are worth naming
-here:
+`already_resident`, `below_floor`, `no_samples`, `isolation_lost`,
+`strategy_disagreement`. Four of them are worth naming here:
 
 - **`already_resident`** — after a *confirmed* drain, a model that still
   reports resident is being served by something the gateway could not stop
@@ -3466,6 +3531,10 @@ here:
 - **`below_floor`** — no model costs ~0 MB, so a headline delta under the noise
   floor can only mean the window missed the allocation or something else
   absorbed it.
+- **`isolation_lost`** — a spec the run had drained held a live process again
+  by the end of the measurement, so the isolation did not cover the whole run.
+- **`strategy_disagreement`** — the delta and the agent's own per-process
+  figure are further apart than the difference in the quantities can explain.
 
 `K`, the tolerance, the per-phase settles and the strategy-(a) wait are
 **reasoned, not measured**; they are package-level `var`s so tests shorten
@@ -3481,7 +3550,13 @@ figures and this feature claims nothing about spillover.
 **The card fingerprint degrades, and says how far.** A stored VRAM number
 attributed to index 1 after the cards were renumbered is worse than no number,
 so each per-GPU item carries what identified the card *and* which field did it:
-`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere —
+`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere,
+read from the **post-load window's own sample** rather than the trigger-time
+one, because that is the sample the numbers came from: recording the
+trigger-time identity beside a window-time figure pairs the OLD card's uuid
+with the NEW card's number if the cards were renumbered in between, which is
+the exact event a fingerprint exists to detect and is worse than recording no
+identity at all —
 which catches a swap between *unlike* cards only, since two identical cards
 trading indices are indistinguishable. `GPUSample.UUID` is populated only by
 the NVIDIA parse, so a UUID-only detector would silently verify nothing on
@@ -3495,7 +3570,47 @@ must be labelled wherever it is shown.
 any — that is the index set admission actually uses, so a number measured there
 has a row the operator can apply it to (`attributable: true`). A spec that
 declares none has no such row anywhere: the run watches every card and reports
-only the indexes whose delta clears the floor, marked **unattributable**.
+the indexes that contributed, marked **unattributable**.
+
+**A card the spec does NOT declare is still reported when it allocated.**
+`set_visible_devices` defaults to false, so the child process sees every card
+on the host whatever its spec declares, and a model that splits onto an
+undeclared card used to produce a per-card delta that was individually correct
+and, as the model's total cost, silently half the answer — with the agent's own
+measurement on that card, the one figure that proved it, filtered out of
+strategy (a) before anything could compare them. So the agent's per-card map is
+now kept whole, and any card outside the watched set that either moved by more
+than its own tolerance or carries a positive per-process figure is reported as
+an item of its own (unattributable — there is no row to apply it to yet),
+counts toward the headline, and raises `undeclared_gpu_allocation`.
+
+It **warns rather than refusing** because every per-card number on the report
+is still correct; what is wrong is the *spec*, and the operator's action is to
+add the missing GPU row — which refusing would withhold the very numbers for.
+The undeclared figures are deliberately not stability-gated: the two windows
+only ever held the *declared* cards still, and widening the gate to every card
+in the host would make the feature unusable on exactly the deployments that
+coexist with a non-managed neighbour, which
+[§13 blesses](#13-known-limitations-and-accepted-risks).
+
+**The floor gate is applied to the SUM, before anything is trimmed.** The
+per-card threshold for hiding a quiet unattributable card is that card's own
+tolerance rather than the headline floor — the headline floor is deliberately
+the *largest* tolerance among the watched cards, and reusing it per card
+discards a genuine allocation on a small card whenever a big one is watched
+beside it — and the trim runs *after* the headline gate, not before it.
+Filtering first is what made one identical measurement definitive with declared
+GPU rows and `below_floor` without them, contradicting the very rationale the
+headline exists for: a model split over two cards costs the sum of both deltas.
+The trim's own test is "contributed nothing", not "below this card's
+tolerance", because a card under its own tolerance can still be part of a
+headline that cleared the floor — two cards at 300 MB each on 48 GiB cards —
+and dropping it would leave a *definitive* report with zero GPU items, which
+the result contract reads as a measurement of nothing. What remains fail-closed
+and is not fixed here: a lone allocation on a small card, with a much larger
+card also watched, is still below the headline floor and still reports
+`below_floor`. That floor is one of the knobs the section below marks as
+reasoned rather than measured.
 
 **The result is REPORTED. The run writes neither VRAM field.** Not
 `vram_measured_mb`: it is agent-owned, it feeds admission arithmetic as the

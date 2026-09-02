@@ -27,11 +27,14 @@ const inconclusiveLabelKeys: Readonly<Record<string, MessageKey>> = {
   below_floor: 'benchmarkVramInconclusiveBelowFloor',
   no_samples: 'benchmarkVramInconclusiveNoSamples',
   run_failed: 'benchmarkVramInconclusiveRunFailed',
+  isolation_lost: 'benchmarkVramInconclusiveIsolationLost',
+  strategy_disagreement: 'benchmarkVramInconclusiveStrategyDisagreement',
 };
 
 const warningLabelKeys: Readonly<Record<string, MessageKey>> = {
   non_managed_applications: 'benchmarkVramWarningNonManaged',
   post_transport_agent: 'benchmarkVramWarningPostTransport',
+  undeclared_gpu_allocation: 'benchmarkVramWarningUndeclaredGpu',
 };
 
 // What the run actually COMPARED to decide the number belongs to this card.

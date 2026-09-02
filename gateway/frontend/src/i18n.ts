@@ -900,6 +900,8 @@ const de = {
     'Dieser Server betreibt außerdem aktive Anwendungen, die der Agent nicht anhalten kann. Solange deren Verbrauch konstant bleibt, fällt er aus der Differenz heraus; ändert er sich während der Messung, ist die Zahl unzuverlässig.',
   benchmarkVramWarningPostTransport:
     'Der Agent hat keine offene WebSocket-Verbindung. Jeder Override erreicht ihn deshalb erst mit seiner nächsten Abfrage: das Anhalten der Modelle hat entsprechend später überhaupt erst begonnen, und der Server war dadurch länger blockiert.',
+  benchmarkVramWarningUndeclaredGpu:
+    'Das Modell hat auch auf einer GPU Speicher belegt, die diese Launch-Spec nicht deklariert – ohne set_visible_devices sieht der Prozess alle Karten. Die Zahlen je Karte sind korrekt, aber die Spec beschreibt das Modell unvollständig: legen Sie die fehlende GPU-Zeile an und messen Sie erneut.',
   benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Basis (MB)',
@@ -929,6 +931,10 @@ const de = {
     'Während des Laufs kamen keine GPU-Werte mehr an. Prüfen Sie den Agenten dieses Servers und messen Sie erneut.',
   benchmarkVramInconclusiveRunFailed:
     'Der Lauf brach mit einem Fehler ab, nachdem er die Specs bereits angehalten hatte. Die Fehlermeldung steht darunter; prüfen Sie außerdem die unten genannten Specs.',
+  benchmarkVramInconclusiveIsolationLost:
+    'Eine der für die Messung angehaltenen Launch-Specs lief am Ende des Laufs wieder. Damit hat die Isolation nicht über die ganze Messung gehalten, und die Differenz enthielte den Speicher dieses zweiten Prozesses. Halten Sie ihn an und messen Sie erneut.',
+  benchmarkVramInconclusiveStrategyDisagreement:
+    'Die beiden unabhängig gemessenen Zahlen weichen zu weit voneinander ab: die Differenz über das Zeitfenster ist deutlich größer als die Messung des Agenten am Prozess selbst. Etwas anderes hat also während des Ladens Speicher belegt – meist eine Anwendung, die der Gateway nicht anhalten kann. Messen Sie erneut, wenn der Server ruhig ist.',
   benchmarkVramInconclusiveUnknown:
     'Kein Ergebnis, und dieser Portal-Build kennt den gemeldeten Grund nicht.',
   modelServerTitle: 'Angeboten auf Servern',
@@ -1023,6 +1029,10 @@ const de = {
     'Dieser Server meldet keine GPU, es gibt also kein VRAM zu messen.',
   errorBenchmarkVramIsolationBlocked:
     'Eine Startvorgabe steht der Isolierung im Weg (bestehende Admin-Übersteuerung oder ein angepinntes Nachbarmodell). Die Meldung nennt die betroffene Startvorgabe.',
+  errorBenchmarkVramDeclaredGpuMissing:
+    'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
+  errorRuntimeSpecServerBenchmarking:
+    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -2933,6 +2943,8 @@ const en: PortalMessages = {
     'This server also hosts active applications the agent cannot stop. As long as their usage stays constant it cancels out of the delta; if it changes during the measurement the number is unreliable.',
   benchmarkVramWarningPostTransport:
     'The agent has no open WebSocket. Every override therefore reaches it only on its next poll, so stopping the models did not even begin until then and the server was held for correspondingly longer.',
+  benchmarkVramWarningUndeclaredGpu:
+    'The model also allocated on a GPU this launch spec does not declare — without set_visible_devices the process sees every card. The per-card numbers are correct, but the spec describes the model incompletely: add the missing GPU row, then measure again.',
   benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Baseline (MB)',
@@ -2962,6 +2974,10 @@ const en: PortalMessages = {
     'GPU readings stopped arriving during the run. Check the agent on this server, then measure again.',
   benchmarkVramInconclusiveRunFailed:
     'The run stopped on an error after it had already force-stopped the specs. The error is below; also check the specs named there.',
+  benchmarkVramInconclusiveIsolationLost:
+    'One of the launch specs this run had stopped for the measurement was running again by the end of it. The isolation therefore did not hold for the whole run, and the delta would carry that second process\'s memory. Stop it, then measure again.',
+  benchmarkVramInconclusiveStrategyDisagreement:
+    'The two independently measured numbers are too far apart: the delta across the window is much larger than the agent\'s own measurement of the process itself. So something else allocated memory during the load — most likely an application this gateway cannot stop. Measure again once the server is quiet.',
   benchmarkVramInconclusiveUnknown:
     'No result, and this portal build does not know the reason it reported.',
   modelServerTitle: 'Offered on servers',
@@ -3053,6 +3069,10 @@ const en: PortalMessages = {
   errorBenchmarkVramNoGpuSamples: 'This server reports no GPU, so there is no VRAM to measure.',
   errorBenchmarkVramIsolationBlocked:
     'A launch spec blocks the isolation (an existing admin override, or a pinned neighbouring model). The message names the spec.',
+  errorBenchmarkVramDeclaredGpuMissing:
+    'The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec\'s GPU rows.',
+  errorRuntimeSpecServerBenchmarking:
+    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",

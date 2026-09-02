@@ -263,6 +263,14 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMNotAgentManaged, msg: msgBenchmarkVRAMNotAgentManaged}
 	}
 
+	// P5: a declared GPU index this host does not report can never hold still,
+	// so every stability window would burn its bound and the run would report
+	// baseline_unstable -- after draining the fleet, and with a next action
+	// that can never work. See codeBenchmarkVRAMDeclaredGPUMissing.
+	if err := s.vramDeclaredGPUMissing(ctx, planned.targetSpecID, baseline); err != nil {
+		return vramRunPlanned{}, err
+	}
+
 	// The binding delay is the agent's guaranteed poll interval, WHATEVER the
 	// transport looks like -- an unacknowledged push cannot shorten it (see
 	// vramIsolationBindDelay). Q10's answer therefore reduces to its warning

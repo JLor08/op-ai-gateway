@@ -192,7 +192,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   write-back stops **and** the agent is served `vram_estimate_mb` in its
   runtime-config document. It is the documented recovery for a spec that a
   measurement above its GPU budget has left permanently `not_permitted`.
-- **The VRAM benchmark writes neither of those two fields**, and its four
+- **The VRAM benchmark writes neither of those two fields**, and its five
   refusals are all `409` — none of them is a malformed request; each is a
   conflict with the server's current state. They are checked **before** the
   server is reserved, so a refused run writes no spec and reserves nothing:
@@ -203,6 +203,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   | `benchmark.vram_isolation_unavailable` | File mode, or an agent that has not declared `runtime_manager`: every `admin_state` write would return 200 and stop nothing |
   | `benchmark.vram_no_gpu_samples` | The server's latest telemetry carries no GPU sample, so there is nothing to difference and no per-process measurer either |
   | `benchmark.vram_isolation_blocked` | A spec already carries an operator override (the target's own included), or a spec *other than the target* is pinned. The message names the spec |
+  | `benchmark.vram_declared_gpu_missing` | The target's launch spec declares a GPU index the host does not report. A card the run cannot see never holds still, so every stability window would burn its bound and the run could reach no number. The message names the index |
 
   The result rides `BenchmarkStatus.results[].vram`, and `vram` **absent** means
   the run never reached the measurement phase, while `vram` **present** with
@@ -210,6 +211,15 @@ Conventions worth stating, because each is a judgement call a client depends on:
   actions for the operator, so a client must not collapse them. `gpus` is
   always an array (never `null`), and `0` means *unknown* in both `delta_mb`
   and `measured_mb`, never a real zero.
+- **`PUT /api/portal/mappings/{id}/runtime-spec` answers `409
+  runtime_spec.server_benchmarking` while a benchmark run holds that mapping's
+  server.** The endpoint is a full-document replace with `admin_state` among
+  its fields, so it is an override action as much as an edit, and one
+  "Force start" on a spec a VRAM run has drained puts a sibling's allocation
+  inside the measurement window. The gate is the benchmark reservation — the
+  same fact that already excludes the server from routing — checked after
+  authorization, so an unauthorized caller learns nothing from it. `GET` and
+  `DELETE` are ungated, and so is a write to any other server.
 - **The SSE stream wraps every frame as `{"runtimes":[…]}` — not `{"data":[…]}`**
   like the model-servers and performance streams on this same portal. Both the
   initial `snapshot` frame and every later `update` frame carry the **complete**

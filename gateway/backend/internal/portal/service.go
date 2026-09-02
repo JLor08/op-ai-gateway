@@ -592,10 +592,14 @@ type Service struct {
 	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
 	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
 	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
-	runtimeChanged  func(serverID string)
-	clock           func() time.Time
-	secretGenerator func() (string, error)
-	idGenerator     func() string
+	runtimeChanged func(serverID string)
+	// benchmarkReserved answers "is a benchmark run holding this server right
+	// now" (see SetBenchmarkReservationHook). nil-safe: read only through
+	// serverIsBenchmarking (service_runtime.go), where nil means no.
+	benchmarkReserved func(serverID string) bool
+	clock             func() time.Time
+	secretGenerator   func() (string, error)
+	idGenerator       func() string
 	// themes is the loaded external-theme registry (see ServiceDeps.Themes).
 	// Always non-nil after NewService -- a nil deps.Themes is defaulted to an
 	// empty *theme.Registry so every reader can call its methods unguarded.
@@ -715,6 +719,20 @@ func NewService(deps ServiceDeps) *Service {
 // the gateway Server exists instead of restructuring construction order.
 func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string)) {
 	s.runtimeChanged = fn
+}
+
+// SetBenchmarkReservationHook sets (or replaces) the predicate that answers
+// whether a benchmark run currently holds a server's reservation. It gates the
+// launch-spec write (PutRuntimeSpec) -- see serverIsBenchmarking for why that
+// write and not the others.
+//
+// A setter for the same reason as SetRuntimeConfigChangedHook: the
+// BenchmarkRegistry belongs to the gateway Server, which cmd/gateway builds
+// AFTER the portal Service. nil (a Service nobody wired it into, i.e. every
+// test that does not care) means no run is holding anything, which is the
+// direction that leaves existing behaviour untouched.
+func (s *Service) SetBenchmarkReservationHook(fn func(serverID string) bool) {
+	s.benchmarkReserved = fn
 }
 
 type CurrentUser struct {
