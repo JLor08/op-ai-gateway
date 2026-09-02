@@ -308,6 +308,7 @@ function baseServerListApi(): ServerListApi {
     netbirdGroups: vi.fn(async () => ({ data: [] })),
     netbirdPeers: vi.fn(async () => ({ data: [] })),
     probeMappingContext: vi.fn(async () => idleBenchmarkStatus),
+    probeMappingVram: vi.fn(async () => idleBenchmarkStatus),
     putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
     putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
     putRuntimeSpec: vi.fn(async () => defaultRuntimeSpec()),

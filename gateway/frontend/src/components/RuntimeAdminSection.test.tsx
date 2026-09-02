@@ -233,6 +233,7 @@ function renderSection(
     activeBenchmarks?: PortalApi['activeBenchmarks'];
     benchmarkStatus?: PortalApi['benchmarkStatus'];
     probeMappingContext?: PortalApi['probeMappingContext'];
+    probeMappingVram?: PortalApi['probeMappingVram'];
     warnings?: string[];
     coresidencyPairs?: [string, string][];
     // Never resolves -- simulates the GET still being in flight, for the
@@ -474,6 +475,7 @@ function renderSection(
     activeBenchmarks: opts.activeBenchmarks ?? vi.fn(async () => []),
     benchmarkStatus: opts.benchmarkStatus ?? vi.fn(async () => idleBenchmark),
     probeMappingContext: opts.probeMappingContext ?? vi.fn(async () => idleBenchmark),
+    probeMappingVram: opts.probeMappingVram ?? vi.fn(async () => idleBenchmark),
     // The per-row benchmark action opens `BenchmarkSection`, which loads the
     // server's apps + the scoped mapping's history on mount and subscribes to
     // its live SSE. Exactly the six methods it calls beyond the two above.
@@ -860,6 +862,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       activeBenchmarks: vi.fn(async () => []),
       benchmarkStatus: vi.fn(async () => idleBenchmark),
       probeMappingContext: vi.fn(async () => idleBenchmark),
+      probeMappingVram: vi.fn(async () => idleBenchmark),
       // Structural only: the widened api Pick makes these part of the shape this
       // fake must satisfy. This test never opens the benchmark sub-view.
       applications: vi.fn(async () => ({ data: [] })),

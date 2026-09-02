@@ -3471,6 +3471,41 @@ isolation — **evidence, not authority** (see
 for the row, and [the data model](../reference/data-model.md) for its
 `vram_json` column).
 
+**Where an operator meets it, and what the surface must not round off.** The
+run starts where every other run kind starts — the server's benchmark area
+(`BenchmarkSection`) — but it is **not** a fourth entry in that form's `?mode=`
+list: the type selector offers it **only while the scope is "model"**, and its
+hint is rendered unconditionally, in every scope, because that hint is the only
+place the scope restriction and the drain are stated. Leaving the model scope
+with it selected **drops back to `speed`** rather than leaving the form holding
+a run type the scope cannot start. While it runs, the live panel says in words
+that every agent-managed model on the server is `force_stopped` for the
+duration; an operator must not learn that from a routing failure.
+
+**The outcome stays on screen after the run, and that is the named risk's only
+mitigation in the UI.** The live panel disappears the moment `running` flips
+false, which is exactly when a VRAM run produces its single result (the runner
+publishes it in its terminal defer), so the finished result is rendered in the
+panel's place: the two numbers side by side, the isolation claim, and — always
+— the **drained set** plus any `restore_failed`. If the gateway dies between the
+drain and the restore, those spec ids are what an operator needs, and no other
+screen shows them.
+
+**"No result" is a first-class outcome with two distinct shapes.** An
+inconclusive report renders its **reason as the next action** (`info`, not an
+error) and renders **no per-GPU table at all**, so there is no cell that could
+read `0 MB` — `0` means unknown here as everywhere. An **absent** report is the
+other shape and reads differently: the run never reached the measurement phase,
+nothing was stopped and nothing measured, so the operator is sent to the
+trigger's refusal instead of to a neighbouring process. `BenchmarkResult.vram`
+being nullable is the whole of that distinction.
+
+**The history section decodes the payload for `kind == "vram"` only**, and the
+plain speed table **excludes** that kind explicitly — a VRAM row falling into it
+renders as four dashes and a green tick, which reads as a successful speed run
+that measured nothing. The rule is one list (`isNonSpeedKind`), so a fifth kind
+cannot be added without deciding where it belongs.
+
 **The writer, and the principal it does not have.** A benchmark run holds no
 `auth.Token`: the trigger's principal is consumed by
 `AuthorizeBenchmarkScope` and dropped, and `benchmarkTarget`/`benchmarkRun`

@@ -200,6 +200,7 @@ export function ServerList({
     | 'netbirdGroups'
     | 'netbirdPeers'
     | 'probeMappingContext'
+    | 'probeMappingVram'
     | 'regenerateNetbirdKey'
     | 'revokeAgentToken'
     // Agent-runtime-manager (Task 20): forwarded on to ApplicationSection ->

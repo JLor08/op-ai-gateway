@@ -978,6 +978,7 @@ export function RuntimeAdminSection({
     | 'activeBenchmarks'
     | 'benchmarkStatus'
     | 'probeMappingContext'
+    | 'probeMappingVram'
     // The mapping tab's per-row "Benchmark" action opens the consolidated
     // benchmark sub-view (`BenchmarkSection`), which needs its OWN slice of the
     // api. Exactly the methods it calls -- `mappings` and `benchmarkStatus` are

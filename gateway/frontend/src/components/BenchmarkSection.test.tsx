@@ -7,11 +7,13 @@ import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { messages } from '../i18n';
 import {
   PortalApiError,
+  type BenchmarkResult,
   type BenchmarkRunDTO,
   type BenchmarkStatus,
   type PortalApplication,
   type PortalModelMapping,
   type PortalServer,
+  type VRAMReportDTO,
 } from '../api';
 import type { PortalApi } from './shared/types';
 
@@ -132,6 +134,7 @@ type Overrides = {
   benchmarkApplication?: PortalApi['benchmarkApplication'];
   benchmarkMapping?: PortalApi['benchmarkMapping'];
   benchmarkStatus?: PortalApi['benchmarkStatus'];
+  probeMappingVram?: PortalApi['probeMappingVram'];
   subscribeBenchmark?: PortalApi['subscribeBenchmark'];
 };
 
@@ -160,6 +163,9 @@ function makeApi(over: Overrides = {}) {
     benchmarkMapping:
       over.benchmarkMapping ??
       (vi.fn(async () => idle) as unknown as PortalApi['benchmarkMapping']),
+    probeMappingVram:
+      over.probeMappingVram ??
+      (vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram']),
     // Never resolves by default so a running frame keeps the live panel visible
     // (completion tests override it).
     benchmarkStatus:
@@ -507,5 +513,287 @@ describe('BenchmarkSection', () => {
     // Recovered: completion fired AND the area is unstuck (Start form back).
     await waitFor(() => expect(onModelsChanged).toHaveBeenCalled());
     await screen.findByRole('button', { name: t.benchmarkStart });
+  });
+});
+
+// The VRAM measurement is the fourth run kind, and the only one that is not a
+// `?mode=` value: it drains the whole server once and then loads exactly ONE
+// model, so it exists only on the MODEL scope and goes through its own
+// endpoint. These tests pin the four things D4/D5 say the surface must not do:
+// offer it where it cannot run, start it through a mode, render a "no result"
+// as a zero, and hide the fleet it force-stopped.
+describe('BenchmarkSection VRAM run', () => {
+  const vramReport = (over: Partial<VRAMReportDTO> = {}): VRAMReportDTO => ({
+    isolated: true,
+    gpus: [
+      {
+        index: 0,
+        baseline_used_mb: 1024,
+        delta_mb: 22528,
+        measured_mb: 21000,
+        fingerprint_kind: 'uuid',
+        attributable: true,
+      },
+    ],
+    ...over,
+  });
+
+  // A terminal SSE frame for a finished VRAM run: `running: false` with the
+  // result attached, exactly as the runner publishes it in its terminal defer.
+  function finishedVramRun(result: Partial<BenchmarkResult>): Overrides {
+    return {
+      subscribeBenchmark: vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+        onStatus({
+          running: false,
+          server_id: 'srv_1',
+          scope: 'vram-probe',
+          mode: 'vram',
+          total: 1,
+          done: 1,
+          results: [
+            {
+              mapping_id: 'map_1',
+              gateway_model_name: 'gw-model',
+              gen_tokens_per_second: 0,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+              ...result,
+            },
+          ],
+        });
+        return () => {};
+      }) as unknown as PortalApi['subscribeBenchmark'],
+    };
+  }
+
+  const withMapping: Overrides = {
+    apps: [makeApp({ id: 'app_1' })],
+    mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
+  };
+
+  it('offers the VRAM type ONLY on the model scope, and says where it lives', async () => {
+    renderSection({ kind: 'server' }, withMapping);
+    await screen.findByRole('combobox', { name: t.benchmarkType });
+    // The hint is unconditional: it is the only place the scope restriction and
+    // the drain are stated, so it must be readable before the option appears.
+    expect(screen.getByText(t.benchmarkTypeVramHint)).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.benchmarkType }));
+    expect(await screen.findByRole('option', { name: t.benchmarkTypeSpeed })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: t.benchmarkTypeVram })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+    await pickOption(t.benchmarkScope, t.benchmarkScopeMapping);
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.benchmarkType }));
+    expect(await screen.findByRole('option', { name: t.benchmarkTypeVram })).toBeInTheDocument();
+  });
+
+  it('starts it through probeMappingVram, never through a benchmark mode', async () => {
+    const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+    const { api } = renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        probeMappingVram,
+      },
+    );
+    await screen.findByRole('combobox', { name: t.benchmarkType });
+    await pickOption(t.benchmarkType, t.benchmarkTypeVram);
+    fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
+    await waitFor(() => expect(probeMappingVram).toHaveBeenCalledWith('map_1'));
+    // Not a mode: the three ?mode= starters stay untouched.
+    expect(api.benchmarkMapping).not.toHaveBeenCalled();
+    expect(api.benchmarkServer).not.toHaveBeenCalled();
+    expect(api.benchmarkApplication).not.toHaveBeenCalled();
+  });
+
+  it('drops the VRAM type when the scope leaves the model scope', async () => {
+    // Otherwise the type select keeps a value this scope cannot start, and
+    // Start would silently probe some mapping the operator never chose.
+    const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+    const { api } = renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        probeMappingVram,
+      },
+    );
+    await screen.findByRole('combobox', { name: t.benchmarkType });
+    await pickOption(t.benchmarkType, t.benchmarkTypeVram);
+    await pickOption(t.benchmarkScope, t.benchmarkScopeServer);
+    fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
+    await waitFor(() => expect(api.benchmarkServer).toHaveBeenCalledWith('srv_1', 'speed'));
+    expect(probeMappingVram).not.toHaveBeenCalled();
+  });
+
+  it('localizes a precondition refusal instead of showing the raw code alone', async () => {
+    const probeMappingVram = vi.fn(async () => {
+      throw new PortalApiError(409, 'benchmark.vram_isolation_unavailable', 'file mode');
+    }) as unknown as PortalApi['probeMappingVram'];
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        probeMappingVram,
+      },
+    );
+    await screen.findByRole('combobox', { name: t.benchmarkType });
+    await pickOption(t.benchmarkType, t.benchmarkTypeVram);
+    fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      t.errorBenchmarkVramIsolationUnavailable,
+    );
+  });
+
+  it('warns, while the run is live, that the whole server is force-stopped', async () => {
+    const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+      onStatus({
+        running: true,
+        server_id: 'srv_1',
+        scope: 'vram-probe',
+        mode: 'vram',
+        total: 1,
+        done: 0,
+      });
+      return () => {};
+    }) as unknown as PortalApi['subscribeBenchmark'];
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        subscribeBenchmark,
+      },
+    );
+    expect(await screen.findByText(t.benchmarkVramRunningNote)).toBeInTheDocument();
+  });
+
+  it('reports the numbers, the isolation and the drained fleet of a finished run', async () => {
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        ...finishedVramRun({
+          vram: vramReport({
+            drained_spec_ids: ['spec_a', 'spec_b'],
+            isolation_evidence: { spec_a: 'stopped_after_write', spec_b: 'no_process_at_write' },
+          }),
+        }),
+      },
+    );
+    await screen.findByText(t.benchmarkVramResultTitle, { exact: false });
+    expect(screen.getByText(t.benchmarkVramIsolationConfirmed)).toBeInTheDocument();
+    // Both numbers, side by side and never averaged.
+    expect(screen.getByText('22528')).toBeInTheDocument();
+    expect(screen.getByText('21000')).toBeInTheDocument();
+    expect(screen.getByText(t.benchmarkVramFingerprintUuid)).toBeInTheDocument();
+    // The named risk: what the run force-stopped is on screen, so an operator
+    // whose gateway died mid-run knows which specs to clear by hand.
+    expect(screen.getByText(/spec_a/)).toHaveTextContent('spec_b');
+    expect(screen.getByText(t.benchmarkVramDrainedNote)).toBeInTheDocument();
+  });
+
+  it('names the specs it could NOT restore as something to clear by hand', async () => {
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        ...finishedVramRun({
+          vram: vramReport({ drained_spec_ids: ['spec_a'], restore_failed: ['spec_a'] }),
+        }),
+      },
+    );
+    const alert = await screen.findByText(t.benchmarkVramRestoreFailed, { exact: false });
+    expect(alert).toHaveTextContent('spec_a');
+  });
+
+  it('renders an inconclusive outcome as its REASON, never as a 0', async () => {
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        ...finishedVramRun({
+          vram: vramReport({ inconclusive: 'already_resident', gpus: [] }),
+        }),
+      },
+    );
+    await screen.findByText(t.benchmarkVramInconclusiveAlreadyResident, { exact: false });
+    // Not an error, and not a measurement of nothing: no per-GPU table at all,
+    // so there is no cell that could read 0 MB.
+    expect(screen.queryByText(t.benchmarkVramColDelta)).not.toBeInTheDocument();
+    expect(screen.queryByText('0')).not.toBeInTheDocument();
+  });
+
+  it('distinguishes "no result" from "never reached the measurement phase"', async () => {
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      { ...withMapping, ...finishedVramRun({ error: 'benchmark.vram_isolation_blocked' }) },
+    );
+    // An ABSENT report is the other outcome: nothing was stopped and nothing
+    // measured, so it must not read like a run that measured and failed.
+    await screen.findByText(t.benchmarkVramNoReport);
+    expect(screen.getByText('benchmark.vram_isolation_blocked')).toBeInTheDocument();
+    expect(screen.queryByText(t.benchmarkVramInconclusiveTitle)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.benchmarkVramIsolationConfirmed)).not.toBeInTheDocument();
+  });
+
+  it('renders the vram history rows as evidence, outside the speed table', async () => {
+    const vramRun: BenchmarkRunDTO = {
+      id: 'run_vram',
+      mapping_id: 'map_1',
+      server_id: 'srv_1',
+      created_at: '2026-09-01T10:00:00Z',
+      gen_tokens_per_second: 0,
+      prompt_tokens_per_second: 0,
+      load_time_ms: 0,
+      context_size: 0,
+      error: '',
+      kind: 'vram',
+      vram: vramReport({
+        gpus: [
+          {
+            index: 1,
+            baseline_used_mb: 2048,
+            delta_mb: 0,
+            measured_mb: 19000,
+            fingerprint_kind: 'name_total',
+            unified_memory: true,
+            attributable: false,
+          },
+        ],
+      }),
+    };
+    renderSection({ kind: 'server' }, { ...withMapping, runs: [vramRun] });
+    await screen.findByText(t.benchmarkVramRuns);
+    expect(screen.getByText('19000')).toBeInTheDocument();
+    // An unknown number is a dash. 0 means UNKNOWN throughout this feature, so
+    // rendering the missing delta as "0" would invent a measurement.
+    expect(screen.getByText('—')).toBeInTheDocument();
+    expect(screen.getByText(t.benchmarkVramFingerprintNameTotal)).toBeInTheDocument();
+    expect(screen.getByText(t.benchmarkVramUnifiedMemory)).toBeInTheDocument();
+    expect(screen.getByText(t.benchmarkVramNotAttributable)).toBeInTheDocument();
+    // A vram row is NOT a speed row: the speed table would render it as four
+    // dashes and a green tick.
+    expect(screen.queryByText(t.benchmarkRunAt)).not.toBeInTheDocument();
+  });
+
+  it('renders a vram history row that reached no number as its reason', async () => {
+    const vramRun: BenchmarkRunDTO = {
+      id: 'run_vram_inconclusive',
+      mapping_id: 'map_1',
+      server_id: 'srv_1',
+      created_at: '2026-09-01T10:00:00Z',
+      gen_tokens_per_second: 0,
+      prompt_tokens_per_second: 0,
+      load_time_ms: 0,
+      context_size: 0,
+      error: '',
+      kind: 'vram',
+      vram: vramReport({ inconclusive: 'baseline_unstable', gpus: [] }),
+    };
+    renderSection({ kind: 'server' }, { ...withMapping, runs: [vramRun] });
+    await screen.findByText(t.benchmarkVramRuns);
+    expect(
+      screen.getByText(t.benchmarkVramInconclusiveBaselineUnstable, { exact: false }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(t.benchmarkVramColDelta)).not.toBeInTheDocument();
   });
 });
