@@ -3735,6 +3735,36 @@ nothing was stopped and nothing measured, so the operator is sent to the
 trigger's refusal instead of to a neighbouring process. `BenchmarkResult.vram`
 being nullable is the whole of that distinction.
 
+**Every wire value the portal renders is declared once, and the mapping is
+pinned in both directions.** The inconclusive reasons, the confidence warnings
+and the fingerprint kinds are closed vocabularies that travel as free-form
+strings inside a persisted `vram_json`, so the portal has to hold a localized
+sentence for each and an honest fallback for a value it does not know. It
+declares each vocabulary **once**, in `components/shared/vram.ts`, and keys
+each label map by that declaration's own type — a declared value with no
+sentence and a mapped key for a value nobody declares are both compile errors.
+The tests then **derive** from the declaration instead of restating it:
+`vram.test.ts` requires every declared value to reach a distinct, non-fallback
+sentence in German *and* English, and `i18n.test.ts` requires every message key
+under those prefixes to be claimed by a declared value or named as structural
+(the panel heading, the unknown fallback), so a reason whose sentence lands in
+`i18n.ts` while the mapping is forgotten fails as an **orphan**. That
+discipline exists because the alternative failed inside one branch: two reasons
+(`isolation_lost`, `strategy_disagreement`) and two warnings
+(`undeclared_gpu_allocation`, `residency_unknown`) shipped while the tests
+still asserted "the seven reasons" against a hand-written list of seven, and a
+test that names a property it does not enforce is worse than no test. What no
+portal test can close is the **cross-language** half — the Go constants are the
+source, the values appear in no schema, and the portal's suite does not read
+the Go module — so adding a value means editing four places (the Go constant,
+the `vram.ts` array, its label key, both locales' sentences) with only the last
+three enforced against each other; the Go side pins its own literals in its
+guard tests, and a rename that gets past both reaches the portal as an unknown
+value and renders the fallback. The trigger's **refusal codes** are the same
+contract by a different route: they are keyed into `errorLabelByCode`, an
+unmapped one degrades to the backend's raw English in an otherwise localized
+portal, so `format.test.ts` pins those six wire strings as literals.
+
 **The history section decodes the payload for `kind == "vram"` only**, and the
 plain speed table **excludes** that kind explicitly — a VRAM row falling into it
 renders as four dashes and a green tick, which reads as a successful speed run

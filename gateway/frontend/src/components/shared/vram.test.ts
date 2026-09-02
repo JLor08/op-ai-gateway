@@ -7,12 +7,16 @@ import {
   vramApplyNumber,
   vramCardCheck,
   vramCardCheckLabelKey,
+  vramFingerprintKinds,
   vramFingerprintLabelKey,
   vramInconclusiveLabelKey,
+  vramInconclusiveReasons,
   vramWarningLabelKey,
+  vramWarnings,
 } from './vram';
 import { messages } from '../../i18n';
 import type { BenchmarkRunDTO, HardwareGPU, VRAMGPUItemDTO, VRAMReportDTO } from '../../api';
+import type { MessageKey } from './types';
 
 function gpu(over: Partial<VRAMGPUItemDTO> = {}): VRAMGPUItemDTO {
   return { index: 0, baseline_used_mb: 1024, attributable: true, ...over };
@@ -118,28 +122,69 @@ describe('latestApplicableVramRun', () => {
   });
 });
 
+// The mapping is pinned by ITERATING each declared vocabulary rather than by
+// listing its values here. A list is what failed: three values shipped
+// (`isolation_lost`, `strategy_disagreement`, `undeclared_gpu_allocation`)
+// while the lists here and in i18n.test.ts still held seven reasons and two
+// warnings, so the tests were green about a mapping they no longer covered --
+// and their titles asserted a count that was false. Iterating means the next
+// value added to `vram.ts` is under test the moment it is declared, and the
+// only way to add one without a sentence of its own is to make these red.
 describe('vram label keys', () => {
-  it('names an action for every inconclusive reason the backend can report', () => {
-    const reasons = [
-      'isolation_timeout',
-      'baseline_unstable',
-      'post_load_unstable',
-      'already_resident',
-      'below_floor',
-      'no_samples',
-      'run_failed',
-    ] as const;
-    const seen = new Set<string>();
-    for (const reason of reasons) {
-      const key = vramInconclusiveLabelKey(reason);
-      // Distinct texts, in both locales: the reason IS the next action, so two
-      // reasons sharing one sentence would send an operator to the wrong place.
-      seen.add(key);
+  /**
+   * Every declared value of one vocabulary reaches its OWN sentence, in BOTH
+   * locales.
+   *
+   * Three ways this fails, which are the three ways the mapping can lie:
+   * a value that falls through to the unknown fallback (declared but never
+   * mapped), two values sharing a label key (a copy-paste in the map), and two
+   * distinct keys carrying the same text in some locale (a copy-paste in
+   * `i18n.ts` -- green under a key-only check, and the operator still reads
+   * the wrong next action).
+   */
+  function expectDistinctSentences(
+    values: readonly string[],
+    labelKey: (value: string) => MessageKey,
+    fallback: MessageKey,
+    minLength: number,
+  ) {
+    const keys = new Set<MessageKey>();
+    const sentences = { de: new Set<string>(), en: new Set<string>() };
+    for (const value of values) {
+      const key = labelKey(value);
+      expect(key, `${value} is declared but not mapped: it falls back to ${fallback}`).not.toBe(
+        fallback,
+      );
+      keys.add(key);
       for (const locale of ['de', 'en'] as const) {
-        expect(messages[locale][key].length).toBeGreaterThan(20);
+        const text = messages[locale][key];
+        expect(
+          text.length,
+          `${value} -> ${key} (${locale}) is too short to name an action`,
+        ).toBeGreaterThan(minLength);
+        sentences[locale].add(text);
       }
     }
-    expect(seen.size).toBe(reasons.length);
+    expect(keys.size, `${values.length} values share fewer than ${values.length} label keys`).toBe(
+      values.length,
+    );
+    for (const locale of ['de', 'en'] as const) {
+      expect(sentences[locale].size, `two of these values render the SAME ${locale} sentence`).toBe(
+        values.length,
+      );
+    }
+  }
+
+  it('names a distinct action for every declared inconclusive reason, in both locales', () => {
+    // The reason IS the next action, so two reasons sharing one sentence send
+    // an operator to the wrong place -- worse than "no result" with no
+    // explanation at all.
+    expectDistinctSentences(
+      vramInconclusiveReasons,
+      vramInconclusiveLabelKey,
+      'benchmarkVramInconclusiveUnknown',
+      30,
+    );
   });
 
   it('falls back to an honest unknown for a reason this build does not know', () => {
@@ -147,27 +192,52 @@ describe('vram label keys', () => {
     expect(vramInconclusiveLabelKey('')).toBe('benchmarkVramInconclusiveUnknown');
   });
 
-  it('labels both warnings and falls back for an unknown one', () => {
-    expect(vramWarningLabelKey('non_managed_applications')).toBe('benchmarkVramWarningNonManaged');
-    expect(vramWarningLabelKey('post_transport_agent')).toBe('benchmarkVramWarningPostTransport');
-    // The contamination check the run could not MAKE -- an application with no
-    // loaded-models endpoint, which is most agent-managed ones. Without its
-    // own sentence the operator only ever sees the wrong reason (a sub-floor
-    // delta) for a model something else was already serving.
-    expect(vramWarningLabelKey('residency_unknown')).toBe('benchmarkVramWarningResidencyUnknown');
+  it('names a distinct caveat for every declared warning, in both locales', () => {
+    expectDistinctSentences(vramWarnings, vramWarningLabelKey, 'benchmarkVramWarningUnknown', 30);
+  });
+
+  it('says what to DO about the two caveats whose reason is invisible otherwise', () => {
+    // These two are not covered by distinctness alone, because what makes them
+    // useful is one specific instruction each.
+    for (const locale of ['de', 'en'] as const) {
+      // The undeclared card: every per-card number is correct, the SPEC is
+      // what is wrong, so the caveat has to name the missing GPU row rather
+      // than cast doubt on the measurement.
+      expect(messages[locale][vramWarningLabelKey('undeclared_gpu_allocation')]).toMatch(
+        /GPU[- ](row|Zeile)/i,
+      );
+      // The contamination check the run could not MAKE -- an application with
+      // no loaded-models endpoint, which is most agent-managed ones. Without
+      // naming that endpoint the operator only ever sees the wrong reason (a
+      // sub-floor delta) for a model something else was already serving.
+      expect(messages[locale][vramWarningLabelKey('residency_unknown')]).toMatch(
+        /loaded_models_path/,
+      );
+    }
+  });
+
+  it('falls back to an honest unknown for a warning this build does not know', () => {
     expect(vramWarningLabelKey('something_new')).toBe('benchmarkVramWarningUnknown');
+    expect(vramWarningLabelKey('')).toBe('benchmarkVramWarningUnknown');
   });
 
   it('never claims a bare "verified": each fingerprint kind says what was compared', () => {
-    expect(vramFingerprintLabelKey('uuid')).toBe('benchmarkVramFingerprintUuid');
-    expect(vramFingerprintLabelKey('name_total')).toBe('benchmarkVramFingerprintNameTotal');
+    // Short label fragments, not sentences ("by UUID"), so the length floor is
+    // the only thing that differs from the vocabularies above.
+    expectDistinctSentences(
+      vramFingerprintKinds,
+      vramFingerprintLabelKey,
+      'benchmarkVramFingerprintNone',
+      5,
+    );
     // No identifying field at all, and anything this build does not know, both
     // read as NOT verified rather than as a check that was never made.
     expect(vramFingerprintLabelKey('')).toBe('benchmarkVramFingerprintNone');
     expect(vramFingerprintLabelKey(undefined)).toBe('benchmarkVramFingerprintNone');
     expect(vramFingerprintLabelKey('something_new')).toBe('benchmarkVramFingerprintNone');
     for (const locale of ['de', 'en'] as const) {
-      expect(messages[locale].benchmarkVramFingerprintNameTotal).toMatch(/identi/i);
+      // name+total cannot tell two identical cards apart and has to say so.
+      expect(messages[locale][vramFingerprintLabelKey('name_total')]).toMatch(/identi/i);
     }
   });
 });

@@ -15,11 +15,68 @@ import type { MessageKey } from './types';
  * fallback rather than a raw identifier on screen.
  */
 
+/**
+ * The three CLOSED vocabularies this module renders -- the inconclusive
+ * reasons, the confidence warnings, the fingerprint kinds -- DECLARED here,
+ * once, as the arrays that every label map and every test derives from.
+ *
+ * They are arrays rather than bare map keys for one reason: a test can then
+ * iterate the vocabulary and require the mapping to be TOTAL, instead of
+ * restating the values and going stale the moment one is added. That
+ * restatement is exactly how `isolation_lost`, `strategy_disagreement` and
+ * `undeclared_gpu_allocation` shipped with no test naming them, under test
+ * titles that still claimed to cover "the seven reasons".
+ *
+ * ADDING A VALUE TOUCHES FOUR PLACES, and only the last three are checked
+ * against each other:
+ *
+ *  1. the Go constant it mirrors -- the `vramInconclusive*`, `vramWarning*`
+ *     and `vramFingerprint*` blocks in `internal/gateway/benchmark_vram.go`,
+ *     `benchmark_vram_isolation.go` and `benchmark_vram_confidence.go`;
+ *  2. the value, in the array below;
+ *  3. its label key, in the map below -- a missing one is a COMPILE error,
+ *     since each map is keyed by its vocabulary's own type, and so is a
+ *     mapped key for a value the vocabulary does not declare;
+ *  4. the German AND English sentence, in `i18n.ts`.
+ *
+ * Steps 2-4 are enforced: `vram.test.ts` requires every declared value to
+ * reach a distinct, non-fallback sentence in both locales, and `i18n.test.ts`
+ * requires every message key under these prefixes to be claimed by a declared
+ * value, so an orphaned sentence fails too. Step 1 is the seam no test in this
+ * package can close -- the values travel as free-form strings inside a
+ * persisted `vram_json` payload, appear in no schema, and the portal's tests
+ * do not read the Go module -- so a rename there reaches this portal as an
+ * unknown value and renders the honest fallback below.
+ */
+export const vramInconclusiveReasons = [
+  'isolation_timeout',
+  'baseline_unstable',
+  'post_load_unstable',
+  'already_resident',
+  'below_floor',
+  'no_samples',
+  'run_failed',
+  'isolation_lost',
+  'strategy_disagreement',
+] as const;
+export type VramInconclusiveReason = (typeof vramInconclusiveReasons)[number];
+
+export const vramWarnings = [
+  'non_managed_applications',
+  'post_transport_agent',
+  'undeclared_gpu_allocation',
+  'residency_unknown',
+] as const;
+export type VramWarning = (typeof vramWarnings)[number];
+
+export const vramFingerprintKinds = ['uuid', 'name_total'] as const;
+export type VramFingerprintKind = (typeof vramFingerprintKinds)[number];
+
 // reason -> the sentence that tells the operator what to DO about it. The
 // reasons are distinct values precisely because the next action differs per
 // reason, so the mapping is exhaustive rather than collapsed into one
 // "inconclusive" text.
-const inconclusiveLabelKeys: Readonly<Record<string, MessageKey>> = {
+const inconclusiveLabelKeys: Readonly<Record<VramInconclusiveReason, MessageKey>> = {
   isolation_timeout: 'benchmarkVramInconclusiveIsolationTimeout',
   baseline_unstable: 'benchmarkVramInconclusiveBaselineUnstable',
   post_load_unstable: 'benchmarkVramInconclusivePostLoadUnstable',
@@ -31,7 +88,7 @@ const inconclusiveLabelKeys: Readonly<Record<string, MessageKey>> = {
   strategy_disagreement: 'benchmarkVramInconclusiveStrategyDisagreement',
 };
 
-const warningLabelKeys: Readonly<Record<string, MessageKey>> = {
+const warningLabelKeys: Readonly<Record<VramWarning, MessageKey>> = {
   non_managed_applications: 'benchmarkVramWarningNonManaged',
   post_transport_agent: 'benchmarkVramWarningPostTransport',
   undeclared_gpu_allocation: 'benchmarkVramWarningUndeclaredGpu',
@@ -44,24 +101,48 @@ const warningLabelKeys: Readonly<Record<string, MessageKey>> = {
 // nothing here may read as "verified": `name_total` catches a swap between
 // unlike cards only, two identical cards trading indices are indistinguishable
 // that way, and an empty kind means no identifying field was available at all.
-const fingerprintLabelKeys: Readonly<Record<string, MessageKey>> = {
+const fingerprintLabelKeys: Readonly<Record<VramFingerprintKind, MessageKey>> = {
   uuid: 'benchmarkVramFingerprintUuid',
   name_total: 'benchmarkVramFingerprintNameTotal',
 };
 
+/**
+ * One closed vocabulary's label lookup: the mapped sentence, or the
+ * vocabulary's own honest fallback for a value this build does not know.
+ *
+ * The widening cast is the point rather than a shortcut. Each map is TOTAL
+ * over its vocabulary's type, which is what makes a missing or orphaned entry
+ * a compile error; the value being looked up, however, is decoded from a
+ * `vram_json` written by whatever gateway build ran the measurement, so a
+ * value outside the vocabulary is a normal input and must reach the fallback
+ * instead of being asserted away.
+ */
+function labelKeyFor<V extends string>(
+  keys: Readonly<Record<V, MessageKey>>,
+  value: string,
+  fallback: MessageKey,
+): MessageKey {
+  return (keys as Readonly<Partial<Record<string, MessageKey>>>)[value] ?? fallback;
+}
+
 /** The localized reason a run reached no number. Unknown → an honest fallback. */
 export function vramInconclusiveLabelKey(reason: string): MessageKey {
-  return inconclusiveLabelKeys[reason] ?? 'benchmarkVramInconclusiveUnknown';
+  return labelKeyFor(inconclusiveLabelKeys, reason, 'benchmarkVramInconclusiveUnknown');
 }
 
 /** The localized caveat that degraded a run's confidence without invalidating it. */
 export function vramWarningLabelKey(warning: string): MessageKey {
-  return warningLabelKeys[warning] ?? 'benchmarkVramWarningUnknown';
+  return labelKeyFor(warningLabelKeys, warning, 'benchmarkVramWarningUnknown');
 }
 
 /** What identified the card, named — never a bare "verified". */
 export function vramFingerprintLabelKey(kind: string | undefined): MessageKey {
-  return (kind && fingerprintLabelKeys[kind]) || 'benchmarkVramFingerprintNone';
+  return labelKeyFor(fingerprintLabelKeys, kind ?? '', 'benchmarkVramFingerprintNone');
+}
+
+/** Whether a recorded `fingerprint_kind` is one this build can compare at all. */
+function isVramFingerprintKind(kind: string): kind is VramFingerprintKind {
+  return (vramFingerprintKinds as readonly string[]).includes(kind);
 }
 
 // 1 MiB, NOT 10^6 -- the unit every VRAM figure in this feature is in (the
@@ -84,15 +165,28 @@ const VRAM_BYTES_PER_MB = 1024 * 1024;
  * `''` means this card cannot supply the field at all, which is "cannot
  * verify" and never "drift".
  */
-function vramLiveFingerprint(live: HardwareGPU, kind: string): string {
-  if (kind === 'uuid') return (live.uuid ?? '').trim();
-  const name = (live.name ?? '').trim();
-  const total =
-    live.memory_total_bytes > 0
-      ? `${Math.floor(live.memory_total_bytes / VRAM_BYTES_PER_MB)} MB`
-      : '';
-  if (name && total) return `${name} / ${total}`;
-  return name || total;
+function vramLiveFingerprint(live: HardwareGPU, kind: VramFingerprintKind): string {
+  switch (kind) {
+    case 'uuid':
+      return (live.uuid ?? '').trim();
+    case 'name_total': {
+      const name = (live.name ?? '').trim();
+      const total =
+        live.memory_total_bytes > 0
+          ? `${Math.floor(live.memory_total_bytes / VRAM_BYTES_PER_MB)} MB`
+          : '';
+      if (name && total) return `${name} / ${total}`;
+      return name || total;
+    }
+    default: {
+      // A third kind must not silently borrow the name+total shape: comparing
+      // one shape against a fingerprint recorded in another reports DRIFT for
+      // a card that never moved. This line makes adding a kind to
+      // `vramFingerprintKinds` a compile error until it is formatted here.
+      const unhandled: never = kind;
+      return unhandled;
+    }
+  }
 }
 
 /**
@@ -118,7 +212,7 @@ function vramLiveFingerprint(live: HardwareGPU, kind: string): string {
  *    hardware, so it is named rather than offered.
  */
 export type VramCardCheck =
-  | { state: 'verified'; kind: 'uuid' | 'name_total' }
+  | { state: 'verified'; kind: VramFingerprintKind }
   | { state: 'unverifiable' }
   | { state: 'drifted'; recorded: string; live: string };
 
@@ -143,7 +237,7 @@ export function vramCardCheck(
   // A kind this build does not know is not a comparison it can make. Treated
   // as "cannot verify" rather than as drift, for the same reason an unknown
   // inconclusive reason gets an honest fallback sentence.
-  if (!recorded || (kind !== 'uuid' && kind !== 'name_total')) return { state: 'unverifiable' };
+  if (!recorded || !isVramFingerprintKind(kind)) return { state: 'unverifiable' };
   if (!live) return { state: 'unverifiable' };
   const liveFingerprint = vramLiveFingerprint(live, kind);
   if (!liveFingerprint) return { state: 'unverifiable' };
