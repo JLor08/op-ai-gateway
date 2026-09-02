@@ -155,6 +155,7 @@ semantics.
 | Path | Methods | Scope | Purpose |
 |---|---|---|---|
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
+| `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, `409 benchmark.server_in_use`). See the four refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's complete co-residency pair list |
 | `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout` and `binary_path_os_mismatch` |
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
@@ -191,6 +192,24 @@ Conventions worth stating, because each is a judgement call a client depends on:
   write-back stops **and** the agent is served `vram_estimate_mb` in its
   runtime-config document. It is the documented recovery for a spec that a
   measurement above its GPU budget has left permanently `not_permitted`.
+- **The VRAM benchmark writes neither of those two fields**, and its four
+  refusals are all `409` — none of them is a malformed request; each is a
+  conflict with the server's current state. They are checked **before** the
+  server is reserved, so a refused run writes no spec and reserves nothing:
+
+  | Code | Condition |
+  |---|---|
+  | `benchmark.vram_not_agent_managed` | The target's application is not `server_agent`, or the target has no *enabled* launch spec — so it is not in the spec set the run drains, and "the target among them" is false |
+  | `benchmark.vram_isolation_unavailable` | File mode, or an agent that has not declared `runtime_manager`: every `admin_state` write would return 200 and stop nothing |
+  | `benchmark.vram_no_gpu_samples` | The server's latest telemetry carries no GPU sample, so there is nothing to difference and no per-process measurer either |
+  | `benchmark.vram_isolation_blocked` | A spec already carries an operator override (the target's own included), or a spec *other than the target* is pinned. The message names the spec |
+
+  The result rides `BenchmarkStatus.results[].vram`, and `vram` **absent** means
+  the run never reached the measurement phase, while `vram` **present** with
+  `inconclusive` set means it ran and reached no number — two different next
+  actions for the operator, so a client must not collapse them. `gpus` is
+  always an array (never `null`), and `0` means *unknown* in both `delta_mb`
+  and `measured_mb`, never a real zero.
 - **The SSE stream wraps every frame as `{"runtimes":[…]}` — not `{"data":[…]}`**
   like the model-servers and performance streams on this same portal. Both the
   initial `snapshot` frame and every later `update` frame carry the **complete**

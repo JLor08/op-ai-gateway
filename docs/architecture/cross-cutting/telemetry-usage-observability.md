@@ -284,6 +284,30 @@ nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
 published with nothing to be fresh about. See [Agent-Managed Model
 Runtime](agent-runtime-manager.md) §10.
 
+**The reader that needed the watermark, and the discipline it added.** The
+**VRAM benchmark**
+([agent-runtime-manager §11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+is the first consumer that must attribute an observation to something it just
+did, and it reads **both** live streams for it: the per-server per-GPU sample
+ring (`serverPerfRegistry`) for its before/after totals, and the runtime-status
+stream for the drain confirmation *and* the agent's own per-process
+measurement. Neither of the two facts it needs can be answered from the store —
+a `stopped` row has no timestamp and neither does a measured VRAM value — so
+the rule it follows is worth stating for any future reader of these streams:
+
+> **Subscribe first, then act, and count only what the channel delivers.**
+> `subscribe` registers its channel under the registry's own lock before it
+> returns, and `publish` collects its targets under that same lock, so a frame
+> delivered to a subscription was published *after* the registration completed.
+> A run that subscribes after its own write therefore knows every frame it
+> receives is newer than that write, with no comparison between the gateway's
+> clock and the agent's — and it **discards the subscription's snapshot**, which
+> is the one thing that may predate it.
+
+That is why the benchmark never polls either registry's stored snapshot for
+freshness, and why a pre-existing `stopped` state cannot be mistaken for the
+effect of a write the run just made.
+
 **The write-back skips an unchanged value, and the skip lives on the gateway,
 not on the agent.** Rule 2 above forbids the obvious agent-side saving — a spec
 whose measurement has not moved must still be *reported*, or the portal's live

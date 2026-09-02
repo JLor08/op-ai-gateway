@@ -34,7 +34,7 @@ var (
 	// vramStabilityFloorBytes is the absolute per-card tolerance. 1 % of a
 	// small card is below the jitter a neighbouring process makes, so the
 	// percentage alone would make a quiet 2 GiB card unmeasurable.
-	vramStabilityFloorBytes int64 = 64 * vramBytesPerMB
+	vramStabilityFloorBytes = 64 * vramBytesPerMB
 	// vramStabilityPct is the relative per-card tolerance, as a fraction of
 	// the card's total memory.
 	vramStabilityPct = 0.01

@@ -1107,6 +1107,18 @@ except the other spec becoming evictable or the operator filling the estimate
 in. Waiting for the measurement to arrive is waiting for something that will
 not happen (§13).
 
+**That wait now has a deliberate way out: the VRAM benchmark
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).**
+It loads one model **alone** on its server — draining every managed spec on the
+box, *the target included* — and reports two numbers per GPU side by side: the
+agent's own per-process measurement where a measurer exists, and the **per-GPU
+total delta** (used-after minus used-before), which is the only figure that
+will ever exist on the host classes named above. It is the answer to "how do I
+resolve an unknown demand on purpose?", and it is a **report**: it writes
+neither `vram_measured_mb` nor `vram_estimate_mb`, because the ownership split
+in §5.1 is the load-bearing rule of this whole feature. The operator applies
+the number to their own field.
+
 **Fail-open was explicitly rejected**: letting an unknown-demand spec start
 anyway hollows out exactly the protection the VRAM budget exists for, and
 removes the pressure that makes the measurement self-heal. Measurement
@@ -1950,6 +1962,20 @@ configuration" warning** that names where they live, states they are not
 deleted, and states they take effect again as soon as the source is switched
 back to `gateway`. Without that wording, gateway-side configuration looks
 deleted rather than dormant.
+
+**The VRAM benchmark
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+refuses outright in file mode**, with `benchmark.vram_isolation_unavailable`,
+and this is the same rule one step further: its isolation is
+`admin_state: force_stopped` written into the gateway document, so in file mode
+every one of those writes returns 200 and stops **nothing**. Degrading was not
+an option — the run would then report `Isolated: true` for a fleet it never
+touched, most starkly on a server whose gateway-side specs are all *already* in
+a no-process state, where the run confirms every one of them without waiting
+for anything. File mode is out of scope for that run **by refusal rather than
+by omission**: it is not unreachable-until-someone-gets-to-it, it is
+unreachable from the gateway side by design, and an agent-side "measure now,
+isolated" capability is the only thing that would ever serve it.
 
 ### 8.3 The upward report, and what it redacts
 
@@ -3255,6 +3281,234 @@ misclassifies an *active* agent that reports no features.
 
 For the state → colour mapping and why colour can only carry coarse facts here,
 see [Theming & Internationalization](theming-and-i18n.md).
+
+### 11.6 The VRAM benchmark: load one model alone, and measure what it costs
+
+`POST /api/portal/mappings/{id}/probe-vram` is the deliberate answer to
+"[how do I resolve an unknown VRAM demand on purpose?](#53-unknown-vram-resolves-itself-by-measurement)".
+It reserves the target's server through the benchmark registry (so it is
+mutually exclusive with every other run and excluded from new routing),
+force-stops **every** managed spec on that server, loads exactly **one** model,
+and reports two independent numbers per GPU. It is **operator-triggered and
+single-target**, like the context probe and the load run before it.
+
+**Why its own endpoint, and not a fifth `?mode=`.** Every `mode` value is a
+*per-target* measurement inside a fan-out loop over an application's or a
+server's mappings. This run is not per-target: it drains the whole server once
+and then loads one model. As a mode it would either silently measure only the
+first target, or drain-and-reload the server N times inside one reservation —
+and on the *server* scope a run an operator reads as "measure my models" would
+stop every model on the box. It is also not an extension of the **load** run,
+whose button would then stop every other model on the server with no affordance
+warning about it. What the two share is the **load core**
+(`ensureResidentForRun`), which matters because that core loads **by
+generating**: one `max_tokens: 1` stream, so a backend that allocates its KV
+cache lazily on first use has necessarily already done so before the post-load
+window opens. That is why there is deliberately **no** second "send one tiny
+generation" step — two windows for one observation doubles the exposure to a
+drifting neighbour and to the reservation being held open, for a number that
+cannot differ.
+
+**Isolation is `admin_state: force_stopped` on every enabled spec, the target
+included.** `force_stopped` is the only lever that *refuses a start*
+([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)); a lowered
+`runtime_max_processes` would be cheaper and unsafe in the opposite direction,
+because a router request for a sibling then licenses the agent to evict the one
+process being measured. **The target is drained too**, and that is not
+thoroughness: the load core short-circuits on an already-resident model, so
+leaving the target up would make the baseline window already contain it and
+yield a *definitive* delta of ~0 — for the commonest case an operator would
+probe.
+
+**Four refusals before anything is written**, each a state in which the
+promised isolation cannot be achieved by any gateway-side write. All four are
+HTTP 409 with a stable code, and all four are checked **before** the server is
+reserved, so a refused run writes nothing and reserves nothing:
+
+| Condition | Code |
+|---|---|
+| The target is not an agent-managed process (its application is not `server_agent`, or it has no enabled launch spec) | `benchmark.vram_not_agent_managed` |
+| [File mode](#82-file-mode), or an agent that has not declared `runtime_manager` | `benchmark.vram_isolation_unavailable` |
+| The server's latest telemetry carries no GPU sample | `benchmark.vram_no_gpu_samples` |
+| A spec already carries an operator override, or a spec *other than the target* is pinned (the message names it) | `benchmark.vram_isolation_blocked` |
+
+The override refusal is what makes the restore unambiguous: the run only ever
+restores to exactly `""`, so it never has to reconstruct what an operator's
+override was — which, after a gateway restart, it could not know. The **pinned**
+refusal is not because a pinned spec cannot be drained (`force_stopped`
+outranks `pinned`) but because pinned is a standing instruction that a model
+stays up, and silently breaking it for a benchmark is a worse surprise than
+refusing. A pinned **target** proceeds: stopping the target is the point.
+
+Two conditions **warn** instead of refusing, and ride the result as
+`warnings[]`: a server that also hosts active applications the agent does not
+manage (`non_managed_applications` — refusing would not improve isolation,
+since those processes are outside the agent's control either way, and would
+make the feature unusable on exactly the
+[migration-path deployments §13 blesses](#13-known-limitations-and-accepted-risks)),
+and an agent with no open WebSocket (`post_transport_agent` — the override
+binds only on its next runtime poll, so the run extends its bound rather than
+costing the operator the run).
+
+**`isolated` is evidence, never a 200.** In file mode every `admin_state` write
+succeeds and stops nothing, so a write's success proves nothing anywhere. The
+run holds per-spec evidence it produced itself, reported alongside the boolean
+as `isolation_evidence` so the claim can be audited:
+
+- `stopped_after_write` — a no-process state observed for a spec that **had** a
+  live process when the write landed. That is a real transition, and the
+  transition is itself the proof the override arrived.
+- `no_process_at_write` — the spec had **no** live process, so a `force_stopped`
+  write against it does nothing at all: no state change, no frame
+  ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)). It can only be
+  *confirmed*, never awaited — waiting for a transition that will never arrive
+  is what turns an already-quiet server into an isolation timeout — and only
+  after the transport's own binding delay has elapsed, or the run would claim a
+  refusal-to-start the agent has not yet been told about.
+
+`isolated` is true only when **every** enumerated spec carries one of those two
+values. An **empty** enumeration is `false`, not vacuously true: "nothing
+enumerated, nothing awaited, isolated claimed" is precisely the shape of the
+file-mode defect the rule exists to prevent. A state this gateway does not
+recognize (a future agent build) counts as neither, so the run reports an
+isolation timeout rather than claiming an isolation it cannot justify.
+
+**The watermark is channel ordering, not a clock.** A `stopped` frame that
+predates the run's write proves nothing, and no status frame carries an arrival
+time of its own. So the run subscribes to the live status stream *after* its
+write and discards the subscription's snapshot entirely: `subscribe` registers
+under the registry's lock before returning and `publish` collects its targets
+under that same lock, so any frame delivered was published after the
+registration — which was after the write. The same discipline governs the
+per-GPU sample windows and the per-process measurement below, and it needs no
+comparison between the gateway's clock and the agent's.
+
+**Two measurement strategies, reported side by side and never averaged.**
+
+- `delta_mb` — the per-GPU total, `used_after − used_before`, from the
+  gateway's own per-GPU sample ring. It is the model's **marginal cost** on
+  that card: a constant neighbour, the driver reserve and ECC overhead all
+  cancel out of it. **It is the only figure that will ever exist on AMD, Apple
+  and GPU-less-of-NVIDIA hosts**, which is why it is the structurally valuable
+  half.
+- `measured_mb` — the agent's **own per-process measurement**, read off the
+  live status stream and accepted only from a frame that arrived after the
+  load. It is that process's *attributed usage*. It cannot come from the store:
+  `RuntimeSpecGPU` has no timestamp and the write-back deliberately skips an
+  unchanged value, so polling for "a positive value appears" reads an
+  arbitrarily old number as this run's result, while demanding that the value
+  *change* fails in the normal case where a run measures exactly what the last
+  one did. Strategy (a) reports **nothing** rather than something stale.
+
+The two are different quantities and may legitimately differ; the portal shows
+both and never a mean. `0` keeps its house meaning throughout: **unknown, never
+a real zero.**
+
+**Honesty gates, and what each catches.** Each phase requires `K` consecutive
+samples (default 3, ~3 s at the 1 s cadence) in which every watched card varies
+by no more than `max(1 % of the card, 64 MiB)`. A result that reached no number
+says **why**, because the operator's next action differs per reason:
+`isolation_timeout`, `baseline_unstable`, `post_load_unstable`,
+`already_resident`, `below_floor`, `no_samples`. Two of them are worth naming
+here:
+
+- **`already_resident`** — after a *confirmed* drain, a model that still
+  reports resident is being served by something the gateway could not stop
+  (a non-managed application on the same host, most likely). The resident
+  short-circuit is a contamination **signal**, not a shortcut.
+- **`below_floor`** — no model costs ~0 MB, so a headline delta under the noise
+  floor can only mean the window missed the allocation or something else
+  absorbed it.
+
+`K`, the tolerance, the per-phase settles and the strategy-(a) wait are
+**reasoned, not measured**; they are package-level `var`s so tests shorten
+them, and they need validating on a real multi-GPU host before they are
+treated as settled. What a delta cannot see is also stated rather than implied:
+a client hitting the agent's own router port directly bypasses the benchmark
+reservation entirely (it excludes only *gateway* routing) and can at best trip
+the stability gate, and shared/host-spillover memory is out of scope — the
+Windows `Shared Usage` and `Non Local Usage` counters were measured reading
+*identically* on all three GPUs of a 3-GPU host, so they are not per-adapter
+figures and this feature claims nothing about spillover.
+
+**The card fingerprint degrades, and says how far.** A stored VRAM number
+attributed to index 1 after the cards were renumbered is worse than no number,
+so each per-GPU item carries what identified the card *and* which field did it:
+`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere —
+which catches a swap between *unlike* cards only, since two identical cards
+trading indices are indistinguishable. `GPUSample.UUID` is populated only by
+the NVIDIA parse, so a UUID-only detector would silently verify nothing on
+exactly the host classes the delta strategy exists to serve. The portal renders
+"verified by UUID" or "verified by name and total size only", never a bare
+"verified". On Apple silicon the figures are unified **system** memory read
+from ioreg rather than dedicated VRAM, so the item carries `unified_memory` and
+must be labelled wherever it is shown.
+
+**Which cards are watched.** The spec's declared `RuntimeSpecGPUs` when it has
+any — that is the index set admission actually uses, so a number measured there
+has a row the operator can apply it to (`attributable: true`). A spec that
+declares none has no such row anywhere: the run watches every card and reports
+only the indexes whose delta clears the floor, marked **unattributable**.
+
+**The result is REPORTED. The run writes neither VRAM field.** Not
+`vram_measured_mb`: it is agent-owned, it feeds admission arithmetic as the
+spec's own declared demand, and a breach by a *measured* value is terminal — so
+a gateway-computed delta that overshot (a neighbour allocating inside the
+window) would refuse every future start of a model that had been working, with
+no operator action having occurred. `vram_locked` exists precisely so the
+operator can opt out of being governed by *the agent's* measurement, and a
+second differently-sourced writer of the same field makes that lever mean
+something else; the write-back's unchanged-value suppression would also start
+lying, and the agent's next differing measurement would overwrite the
+benchmark's number anyway. Not `vram_estimate_mb` either: it is operator-owned,
+and putting a machine number in a field whose whole meaning is "what the
+operator declares" takes the decision away from them. Exactly like the context
+probe, the run status carries the result and the launch-spec form offers an
+**apply** affordance beside the editable estimate; the operator saves. A
+`kind = "vram"` history row records what was measured, when, and under what
+isolation — **evidence, not authority** (see
+[Routing & model selection §7](routing-and-model-selection.md#7-model-selection-metrics)
+for the row, and [the data model](../reference/data-model.md) for its
+`vram_json` column).
+
+**The writer, and the principal it does not have.** A benchmark run holds no
+`auth.Token`: the trigger's principal is consumed by
+`AuthorizeBenchmarkScope` and dropped, and `benchmarkTarget`/`benchmarkRun`
+have no field for one. `admin_state` is row 4 of the runtime-config document
+([§11.1](#111-writes-are-full-document-replaces-gated-on-their-own-get)), so
+every write of it owes a `notifyRuntimeChanged` — the sole trigger for the
+agent push — and a write that skipped it would reach a WS-connected agent no
+sooner than its 60 s poll. The run therefore uses one **principal-free**
+`portal.API` method, `SetBenchmarkRuntimeSpecAdminState`, documented with who
+authorized it (its caller: the trigger request, gated before the run started).
+Capturing the trigger's token instead would compile, but every authorization
+there re-derives from store rows, so the **deferred restore** — minutes later,
+with the whole server force-stopped — could be refused because the user was
+removed from the server's owners or the mapping was deleted mid-run. A
+safety-critical restore must not have an authorization failure mode.
+Synthesizing a system principal was the other option and is worse: no
+production code in this tree fabricates one.
+
+**The restore, and the three traps it avoids.** It runs in a `defer` on a
+context **derived from but not cancelled with** the run's, because the run's
+context is cancelled exactly when the restore matters most. It **re-reads each
+spec immediately before writing it** and replaces one field of that fresh
+document — never a replay of a document captured before the run, which would
+revert every field an operator edited *during* it, and a launch spec is exactly
+what an operator opens while a model is stopped. And the write is
+**compare-and-set**: if the freshly-read `admin_state` is no longer this run's
+`force_stopped`, nothing is written and the spec is reported in
+`restore_failed`, because somebody else owns the field now. A spec **deleted**
+mid-run is not a restore failure — its override went with it. On an isolation
+**timeout** the run abandons the measurement, still attempts the restore, and
+reports both facts; that is a deliberate divergence from §11.2, which chose not
+to clear an override on timeout because the portal cannot tell a wedged child
+from a slow one — a benchmark can, because it created them.
+
+The remaining exposure is recorded as a risk rather than solved: **if the
+gateway process dies between the drain and the restore, every model on that
+server stays `force_stopped` until an operator clears it by hand**
+([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 ## 12. The timeout budget
 

@@ -473,6 +473,12 @@ export type VRAMReportDTO = {
   drained_spec_ids?: string[];
   restore_failed?: string[];
   inconclusive?: string;
+  // Conditions that degraded the run's confidence without invalidating its
+  // number: "non_managed_applications" (the server also hosts active
+  // applications the agent cannot drain) and "post_transport_agent" (no open
+  // agent WebSocket, so every override bound only on the agent's next poll).
+  // The run warns rather than refusing on both.
+  warnings?: string[];
   gpus: VRAMGPUItemDTO[];
 };
 

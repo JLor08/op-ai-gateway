@@ -109,6 +109,11 @@ type VRAMReportDTO struct {
 	DrainedSpecIDs    []string          `json:"drained_spec_ids,omitempty"`
 	RestoreFailed     []string          `json:"restore_failed,omitempty"`
 	Inconclusive      string            `json:"inconclusive,omitempty"`
+	// Warnings are conditions that degraded the run's confidence without
+	// invalidating its number -- a non-managed neighbouring application on
+	// the same server, or an agent with no open WebSocket. The run warns
+	// rather than refusing on both.
+	Warnings []string `json:"warnings,omitempty"`
 	// GPUs is never nil on a decoded report (see MappingBenchmarks): a nil
 	// slice marshals as JSON null instead of [], and a client reading it with a
 	// `?? []` fallback then renders an eternally empty list with no error.

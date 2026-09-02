@@ -318,6 +318,7 @@ func TestVRAMResultVocabularyIsPinned(t *testing.T) {
 		{vramInconclusiveAlreadyResident, "already_resident"},
 		{vramInconclusiveBelowFloor, "below_floor"},
 		{vramInconclusiveNoSamples, "no_samples"},
+		{vramInconclusiveRunFailed, "run_failed"},
 		// Why this run believes a spec was not running. Nothing else counts.
 		{vramEvidenceStoppedAfterWrite, "stopped_after_write"},
 		{vramEvidenceNoProcessAtWrite, "no_process_at_write"},

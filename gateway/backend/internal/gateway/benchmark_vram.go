@@ -51,6 +51,19 @@ const (
 	// vramInconclusiveNoSamples: GPU samples STOPPED arriving mid-run. A server
 	// with no GPU samples at all is refused before the run starts.
 	vramInconclusiveNoSamples = "no_samples"
+	// vramInconclusiveRunFailed: the run stopped on a HARD ERROR after it had
+	// already written something, so Error says what happened and the operator
+	// reads that rather than a reason of its own. It exists because such a
+	// report must still be reported at all: the run had force-stopped part or
+	// all of the fleet by then, and DrainedSpecIDs / RestoreFailed are the only
+	// place an operator learns which specs were touched and which were left
+	// overridden. Without this value that report would carry an EMPTY
+	// Inconclusive -- which this contract reads as "a definitive result" --
+	// with zero GPUs, i.e. a measurement of nothing.
+	//
+	// A hard error BEFORE the first write keeps the nil-report contract
+	// instead: nothing was touched, so there is nothing to report but Error.
+	vramInconclusiveRunFailed = "run_failed"
 )
 
 // How a per-GPU result identified the card it is attributed to. A stored VRAM
@@ -95,6 +108,15 @@ type VRAMReport struct {
 	// Inconclusive is empty on a definitive result, else one of the
 	// vramInconclusive* reasons above.
 	Inconclusive string `json:"inconclusive,omitempty"`
+	// Warnings are the conditions that DEGRADE this result's confidence
+	// without invalidating it, one of the vramWarning* values. They ride the
+	// report because the run decided not to refuse on them: refusing on a
+	// non-managed neighbour would make the feature unusable on exactly the
+	// migration-path deployments the architecture blesses, and refusing on an
+	// agent with no open WebSocket would cost the run for the same result. A
+	// warning the operator never sees is not a warning, so they are reported
+	// rather than only logged.
+	Warnings []string `json:"warnings,omitempty"`
 	// GPUs is the per-GPU result, one item per watched index. ALWAYS non-nil:
 	// there is no omitempty here, so a nil slice would reach a client as JSON
 	// null instead of [], and a portal reading it with a `?? []` fallback would

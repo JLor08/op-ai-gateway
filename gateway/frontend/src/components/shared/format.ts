@@ -71,6 +71,12 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'benchmark.already_running': 'errorBenchmarkAlreadyRunning',
   'benchmark.server_in_use': 'errorBenchmarkServerInUse',
   'benchmark.no_models': 'errorBenchmarkNoModels',
+  // The VRAM benchmark's four precondition refusals (409 at the trigger), read
+  // verbatim from the Go constants in gateway/benchmark_vram_isolation.go.
+  'benchmark.vram_not_agent_managed': 'errorBenchmarkVramNotAgentManaged',
+  'benchmark.vram_isolation_unavailable': 'errorBenchmarkVramIsolationUnavailable',
+  'benchmark.vram_no_gpu_samples': 'errorBenchmarkVramNoGpuSamples',
+  'benchmark.vram_isolation_blocked': 'errorBenchmarkVramIsolationBlocked',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',

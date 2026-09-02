@@ -50,6 +50,13 @@ func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request)
 		s.startLoadModel(w, r, token, parts[0])
 		return
 	}
+	if len(parts) == 2 && parts[1] == "probe-vram" {
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		s.startVRAMProbe(w, r, token, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "benchmarks" {
 		if !requireMethod(w, r, http.MethodGet) {
 			return

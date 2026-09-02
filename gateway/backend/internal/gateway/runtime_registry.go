@@ -284,6 +284,25 @@ func (r *runtimeStatusRegistry) publish(serverID string, statuses []RuntimeStatu
 	}
 }
 
+// statusSnapshot returns a copy of serverID's most recent published
+// runtime-status snapshot, without subscribing. Nil for a nil registry and
+// for a server that has never reported.
+//
+// It is a READ OF STATE, never of an edge, and that distinction is the whole
+// reason it exists: a force_stopped write against a spec with no live process
+// produces no state change and no frame, so nothing downstream can wait for a
+// transition there -- but every spec IS present in every status frame, so its
+// state is readable. The VRAM benchmark's isolation reads this once, before
+// its own write, to learn which specs even HAVE a process to stop.
+func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusDTO {
+	if r == nil || serverID == "" {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]RuntimeStatusDTO(nil), r.statuses[serverID]...)
+}
+
 // subscribe atomically returns serverID's current runtime-status snapshot
 // plus a channel of subsequent full-snapshot publishes (so no update is lost
 // between snapshot and registration -- see serverPerfRegistry.subscribe,

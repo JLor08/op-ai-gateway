@@ -678,9 +678,24 @@ opaque `vram_json` column (migration 71) and is decoded onto the history DTO's
 into a launch spec, because `vram_measured_mb` stays agent-owned and
 `vram_estimate_mb` operator-owned (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) §5.1), so an operator reads the measurement
-and applies it to their own field themselves. The persisted shape, the wire
-shape (`BenchmarkResult.vram`) and the decode are in place ahead of the run that
-writes such a row; no metric on a mapping is touched by it, then or now.
+and applies it to their own field themselves. **No metric on a mapping is
+touched by it** — that run writes no `metrics_source`, no throughput, no
+context size and neither VRAM field, so it is invisible to §3.1's scoring
+entirely.
+
+The run behind that row is `POST /api/portal/mappings/{id}/probe-vram`
+(`startVRAMProbe` / `runVRAMProbe`): it force-stops **every** managed launch
+spec on the server, the target included, loads exactly that one model, and
+reports a per-GPU delta alongside the agent's own per-process measurement. Two
+things about it matter at this chapter's altitude. It **shares the load core**
+with the "Load model" action (`ensureResidentForRun`), which loads by issuing
+one `max_tokens: 1` stream — the same mechanism `runLoadModel` uses, and the
+reason the run needs no separate generation step. And it is **not scheduled and
+not sweepable**: `StartBenchmarkScheduler` drives `"speed"` only, and the
+isolation is destructive enough that it must be asked for one model at a time,
+so there is deliberately no application- or server-scoped fan-out. Its own
+mechanics, refusals and honesty gates live in [Agent-Managed Model Runtime
+§11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs).
 
 `IsMTPModelName` (`internal/routing/mtp.go`) is the **MTP heuristic**: a
 best-effort, conservative name-substring/token match (a known model family

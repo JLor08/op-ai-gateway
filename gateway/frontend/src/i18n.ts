@@ -943,6 +943,17 @@ const de = {
   errorBenchmarkServerInUse:
     'Der Server wird gerade verwendet; bitte erneut versuchen, wenn er frei ist.',
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
+  // Die vier Absagen des VRAM-Benchmarks. Jede nennt eine Bedingung, unter der
+  // die versprochene Isolierung durch keinen gateway-seitigen Schreibvorgang
+  // erreichbar ist -- deshalb eine Absage statt eines abgeschwächten Laufs.
+  errorBenchmarkVramNotAgentManaged:
+    'Dieses Modell wird nicht als agent-gesteuerter Prozess betrieben und kann daher für eine VRAM-Messung nicht isoliert werden.',
+  errorBenchmarkVramIsolationUnavailable:
+    'Der Agent dieses Servers wendet keine Laufzeitkonfiguration vom Gateway an (Dateimodus oder fehlende Fähigkeit), eine Isolierung würde also nichts stoppen.',
+  errorBenchmarkVramNoGpuSamples:
+    'Dieser Server meldet keine GPU, es gibt also kein VRAM zu messen.',
+  errorBenchmarkVramIsolationBlocked:
+    'Eine Startvorgabe steht der Isolierung im Weg (bestehende Admin-Übersteuerung oder ein angepinntes Nachbarmodell). Die Meldung nennt die betroffene Startvorgabe.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -2902,6 +2913,16 @@ const en: PortalMessages = {
   errorBenchmarkAlreadyRunning: 'A benchmark is already running on this server.',
   errorBenchmarkServerInUse: 'The server is in use; try again when idle.',
   errorBenchmarkNoModels: 'No models to benchmark.',
+  // The VRAM benchmark's four refusals. Each names a condition under which the
+  // isolation the run promises cannot be achieved by any gateway-side write,
+  // which is why it refuses rather than degrading.
+  errorBenchmarkVramNotAgentManaged:
+    'This model is not an agent-managed process, so it cannot be isolated for a VRAM measurement.',
+  errorBenchmarkVramIsolationUnavailable:
+    "This server's agent applies no runtime configuration from the gateway (file mode, or the capability is not declared), so an isolation would stop nothing.",
+  errorBenchmarkVramNoGpuSamples: 'This server reports no GPU, so there is no VRAM to measure.',
+  errorBenchmarkVramIsolationBlocked:
+    'A launch spec blocks the isolation (an existing admin override, or a pinned neighbouring model). The message names the spec.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",

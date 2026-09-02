@@ -77,6 +77,26 @@ func (r *serverPerfRegistry) publish(sample routing.TelemetrySample) {
 	}
 }
 
+// latest returns the most recent sample in serverID's ring. ok is false for a
+// nil registry and for a server whose ring is still empty -- which is the
+// state after a gateway restart, until the next agent sample arrives (at most
+// ~1 s later). A caller that gates on GPU presence must therefore read "not
+// ok" as "not known yet", never as "this host has no GPU"; the VRAM
+// benchmark's precondition refuses in both cases on purpose, because refusing
+// is the safe direction and costs the operator one retry.
+func (r *serverPerfRegistry) latest(serverID string) (routing.TelemetrySample, bool) {
+	if r == nil || serverID == "" {
+		return routing.TelemetrySample{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ring := r.rings[serverID]
+	if len(ring) == 0 {
+		return routing.TelemetrySample{}, false
+	}
+	return ring[len(ring)-1], true
+}
+
 // subscribe atomically returns a copy of the server's current ring plus a
 // channel of subsequent samples (so no sample is lost between snapshot and
 // registration) and an idempotent unsubscribe. A nil registry returns a nil
