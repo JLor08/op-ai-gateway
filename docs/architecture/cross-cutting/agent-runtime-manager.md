@@ -897,7 +897,12 @@ An open matrix cell is not a guarantee that the pair fits, and the portal's
 per-cell VRAM tooltip says so on every cell.
 
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
-my model get evicted" requires checking both the matrix and the arithmetic.
+my model get evicted" requires checking both the matrix and the arithmetic. The
+mirror-image question has one extra answer: a spec that sits waiting while an
+**idle** process occupies its card is not necessarily a stuck decision — if the
+waiting spec's own `vram_estimate_mb` is `0`, that is §5.3's precedence
+declining to evict a correctly-configured neighbour, and filling the estimate
+in is the fix.
 
 Three zero-values mean "no constraint", not "zero": `max_processes == 0` is
 unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand and
@@ -939,9 +944,20 @@ running set; the per-GPU budget is evaluated with those evictions notionally
 already removed; **the process-count limit runs last** and asks only for as many
 *additional* victims as the earlier rules have not already supplied. Reversing
 the last two over-evicts, and the already-counted chaining is the only thing
-preventing double eviction — including where the candidate-side and
-occupant-side unknown-VRAM rules name the same occupant, which they do whenever
-both sides are unknown.
+preventing double eviction.
+
+**Only one of the two unknown-VRAM rules proposes victims**, and that is the
+precedence in §5.3 and
+[ADR-032](../09-architecture-decisions.md#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts):
+*known demand beats unknown demand*. The occupant-side rule
+evicts (an idle occupant whose own demand is unknown); the candidate-side rule
+only **blocks** — a candidate whose own demand is unknown may insist on having
+its cards to itself, but never by drain-stopping an occupant whose estimate is
+filled in, and that block stands even where the matrix or the arithmetic would
+have evicted that occupant anyway. Two consequences for anyone reading `Admit`:
+the two rules can no longer name the same victim (they did whenever both sides
+were unknown, and the spec-id-keyed victim map was what made the overlap
+harmless), and a `Wait` no longer implies that every idle victim was exhausted.
 
 **The occupant-side unknown-VRAM rule's placement is pinned by tests**, not by
 its comment alone. Collected *after* the arithmetic, it makes the arithmetic
@@ -990,13 +1006,18 @@ other order, presenting as a random, hard-to-reproduce matrix failure.
 
 A spec whose demand on a GPU is unknown may start only **alone** on that GPU;
 otherwise it sits in `pending_vram_unknown` with the reason visible in the
-portal. **The rule is symmetric — it is the unknown demand that makes a card
-unshareable, on whichever side of the pair it sits.** An already-running process
-with an unknown demand of its *own* blocks a new candidate on **every card it
-holds**, exactly the way an unknown candidate is blocked on every card it wants,
-whatever that candidate declares for itself: the occupant is evicted if it is
-idle, yields `Wait` if it is busy or still loading, and yields the terminal
-`pending_vram_unknown` if it is pinned.
+portal. **The rule is symmetric in *subject* — it is the unknown demand that
+makes a card unshareable, on whichever side of the pair it sits — and
+deliberately asymmetric in *outcome*: known demand beats unknown demand, so
+only the side that has a real number may evict to get the card.** An
+already-running process with an unknown demand of its *own* blocks a new
+candidate on **every card it holds**, exactly the way an unknown candidate is
+blocked on every card it wants, whatever that candidate declares for itself:
+that occupant is evicted if it is idle, yields `Wait` if it is busy or still
+loading, and yields the terminal `pending_vram_unknown` if it is pinned. The
+other direction gets **no eviction at all**: a candidate whose own demand is
+unknown waits for an occupant of known demand that could still leave, and
+reports the same terminal for one that never can.
 
 **Both halves of that symmetry are whole-process, and the contention between
 them is per-GPU.** "Unknown" is a property of the process — one unknown card
@@ -1010,6 +1031,39 @@ revokes one card of the aloneness the rule had just granted. Measured on the
 per-card version: `OK` with that occupant idle, busy **and** pinned. An occupant
 holding no card the candidate wants stays ignored either way; widening *that*
 half to "any unknown process anywhere" would evict half the host on every start.
+
+**Known demand beats unknown demand, as a total order
+([ADR-032](../09-architecture-decisions.md#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts))
+— and the outcome-symmetric version it replaced did not converge.** The occupant-side
+rule evicts an unknown-demand occupant on behalf of a known-demand candidate,
+so as long as the candidate-side rule also evicted a *known*-demand occupant,
+one mixed pair contesting one card evicted in **both directions**. Executed on
+both revisions, one card, both processes idle, the pair open and no budget at
+all: candidate `a` (unknown demand) answered `Evict [b]` while candidate `b`
+(known demand) answered `Evict [a]`, so a host alternating requests between the
+two paid a cold load for every single request, forever, with no state in
+between that either request could be served from. The candidate-side rule
+therefore keeps the aloneness demand and gives up the eviction: an
+unknown-demand spec may still refuse to share its cards — that is what "may
+start only alone" means — but it may no longer drain-stop a spec whose estimate
+someone filled in to get them. The order is total, so it converges, and the
+side that loses is always the misconfigured one. **The block is
+unconditional**: a closed matrix cell (rule 1) or an overflowing sibling budget
+(rule 3) does supply an independent reason to evict that same occupant, and
+honouring the order only where no such reason exists would leave those pairs
+evicting in both directions too — the same defect, one rule over. What it costs
+is a `Wait` returned while an idle victim was plainly available: `Decision`'s
+own doc comment had to be corrected for it, because `Wait` no longer means
+"nothing *can* be evicted to help" but "nothing *may* be". How long such a
+wait can last is the terminal-reason paragraph below.
+
+**The tie is not decided and still thrashes.** Nothing in the order ranks two
+specs that are *both* of unknown demand, so those still evict each other in
+both directions exactly as before — unchanged, not fixed. It is a recorded
+acceptance
+([§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
+filling in either spec's estimate turns it into the mixed case, which
+converges.
 
 On an NVIDIA host the agent then measures actual usage of **its own
 child PIDs** — exact because the agent knows which PIDs are its children — and
@@ -1208,8 +1262,22 @@ returns before spawning or allocating anything, which is what keeps every AMD,
 Apple and CPU-only deployment byte-for-byte unchanged.
 
 `pending_vram_unknown` as a *terminal* reason is reserved for a holder that can
-never leave — a **pinned** process on the contested GPU. A merely busy,
-non-pinned occupant yields `Wait`, because it can drain.
+never leave — a **pinned** process on the contested GPU. Any other occupant
+yields `Wait`, which is the honest shape but not always a short one. A busy
+occupant drains. An idle occupant of known demand — the one the order above
+forbids evicting — is unloaded by the idle scan (§6) **if** its
+`idle_timeout_seconds` is positive; `0` there means *never unload*, so an idle,
+unpinned, never-again-requested occupant keeps the card until the operator
+fills the candidate's estimate in (or, on an NVIDIA host, a measurement lands),
+and the candidate's requests queue to their
+`admission_wait_timeout_seconds` meanwhile. **A `Wait` carries no message and
+sets no `last_error`** — the manager just leaves the spec queued — so this
+stall is diagnosed from the *absence* of a start rather than from a reason
+string, which is what the note at the end of §5.2 is for. That is the accepted
+price of "known demand beats unknown demand": the alternative is the
+unknown-demand spec drain-stopping the configured one, which is the
+non-converging behaviour above. It is not reported as terminal because none of
+the three ways out is closed.
 
 **A terminal reason must name a cause that resolving it actually unblocks**,
 and two things follow from that.

@@ -104,7 +104,8 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
   | …the same, but the pair is not co-resident | `Wait` | `not_permitted`, message naming the closed cell |
   | occupant unknown on gpu 0 only, candidate wants gpu 1 | `OK`, `Evict=[]` | `Evict=[a]` (rule 5 is whole-process, like rule 4) |
   | same occupant declaring 6000 MB | `Evict=[a]` | `Evict=[a]` (unchanged) |
-  | mirror: unknown CANDIDATE, idle occupant | `Evict=[a]` | `Evict=[a]` (unchanged) |
+  | mirror: unknown CANDIDATE, idle occupant of KNOWN demand | `Evict=[a]` | `Wait` — the convergence fix below |
+  | mirror: unknown CANDIDATE, idle occupant of UNKNOWN demand | `Evict=[a]` | `Evict=[a]` (unchanged: the accepted tie) |
   | candidate's own demand over budget, pinned unknown occupant | `not_permitted` (own demand) | `not_permitted` (own demand) — rule 5 briefly shadowed this; the review fix restored it |
 
   **Which host populations this actually changes** — measured over the same
@@ -112,8 +113,8 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
 
   | Host shape | Change |
   |---|---|
-  | **ALL-BLANK** — every spec left at the default `vram_estimate_mb: 0` | **None at all.** Rule 4 keys on the candidate, and on such a host every candidate is unknown, so every co-residency was already `Evict`/`Wait`/terminal before the fix. Verified idle, busy, pinned *and* still-loading: identical decisions on both revisions. |
-  | **MIXED** — some specs estimated, some blank | **This is the population that changes.** A spec with a real estimate used to be admitted onto a blank spec's card, charged `0 MB`; now the blank occupant blocks it — `Evict` if idle, `Wait` if busy or loading, terminal if pinned. |
+  | **ALL-BLANK** — every spec left at the default `vram_estimate_mb: 0` | **None at all.** Rule 4 keys on the candidate, and on such a host every candidate is unknown, so every co-residency was already `Evict`/`Wait`/terminal before the fix. Verified idle, busy, pinned *and* still-loading: identical decisions on both revisions. Still true after the known-beats-unknown precedence below: rule 4 has no known-demand occupant to block on here, and rule 5 now issues the same decisions rule 4 used to. |
+  | **MIXED** — some specs estimated, some blank | **This is the population that changes**, in both directions. A spec with a real estimate used to be admitted onto a blank spec's card, charged `0 MB`; now the blank occupant blocks it — `Evict` if idle, `Wait` if busy or loading, terminal if pinned. And the reverse: a blank spec used to drain-stop an estimated occupant to get its card, and now waits for it instead (the convergence fix below). |
   | **ALL-ESTIMATED** | None. No unknown demand on either side, so neither rule fires. |
 
   So the PR sentence is **not** "a host with no measurer blocks in strictly more
@@ -136,8 +137,35 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
   §5.3 (the symmetry and its whole-process scope, the rejected arithmetic fix,
   the terminal's message and its closed-matrix carve-out, and what "terminal is
   not permanent" does and does not mean per host).
-- No admission-logic change beyond the guard and that rule. The measurer
-  still only supplies better numbers to the existing arithmetic.
+- **Rule 5 made rules 4 and 5 symmetric in outcome, and that did not
+  converge — closed by an operator decision: KNOWN DEMAND BEATS UNKNOWN
+  DEMAND.** Rule 5 evicts an unknown-demand occupant for a known-demand
+  candidate while rule 4 evicted a known-demand occupant for an unknown-demand
+  candidate, so a mixed pair on one card evicted in **both** directions.
+  Executed on both revisions (one card, both idle, pair open, no budget):
+
+  | Direction | Before | After |
+  |---|---|---|
+  | candidate `a` (unknown) vs running `b` (known, idle) | `Evict=[b]` | `Wait` |
+  | candidate `b` (known) vs running `a` (unknown, idle) | `Evict=[a]` | `Evict=[a]` (unchanged) |
+  | candidate `a` (unknown) vs `b` (known, busy) | `Wait` | `Wait` (unchanged) |
+  | candidate `a` (unknown) vs `b` (known, pinned) | `pending_vram_unknown` | unchanged |
+  | …idle, and the pair is NOT co-resident | `Evict=[b]` | `Wait` (rule 1's reason does not restore the eviction right) |
+  | …idle on the candidate's OTHER, over-budget card | `Evict=[b]` | `Wait` (nor does rule 3's) |
+  | candidate `a` (unknown) vs `b` (**unknown**, idle) | `Evict=[b]` | `Evict=[b]` (unchanged: the tie) |
+
+  Rule 4 keeps the aloneness demand (hence `Wait`, not `OK`) and gives up the
+  eviction; rule 5 is untouched. A total order converges, and the spec that
+  loses is always the misconfigured one. The **tie** — both sides unknown — is
+  not decided and still evicts in both directions: recorded as a deliberate
+  acceptance in `11-risks-and-technical-debt.md` §11.4 and pinned by
+  `TestAdmitUnknownTieStillEvictsBothWays`. Durable description:
+  `agent-runtime-manager.md` §5.2 (only one of the two rules proposes victims)
+  and §5.3 (the order, the unconditional block, the accepted tie, and how long
+  the resulting `Wait` can last when the occupant's `idle_timeout_seconds` is
+  `0`).
+- No admission-logic change beyond the guard, that rule, and that precedence.
+  The measurer still only supplies better numbers to the existing arithmetic.
 - No `shared`/`non_local` spillover feature: unproven, see the table.
 - Agent `Version` bump: PATCH (`0.2.2` → `0.2.3`). No `agent.Features` entry —
   measurement is a hardware capability, not a negotiated flag (§5.3, ADR-025).
