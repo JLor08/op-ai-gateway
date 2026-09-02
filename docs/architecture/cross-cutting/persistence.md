@@ -586,4 +586,4 @@ itself is never returned to a client.
 ## See also
 
 - [Data Model (Reference)](../reference/data-model.md) — the concrete
-  tables, the domain types they back, and the full 70-migration history.
+  tables, the domain types they back, and the full 71-migration history.

@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (70 migrations)
+## 4. Migration history (71 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
