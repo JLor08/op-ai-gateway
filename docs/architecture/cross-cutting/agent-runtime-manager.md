@@ -3532,7 +3532,7 @@ by no more than `max(1 % of the card, 64 MiB)`. A result that reached no number
 says **why**, because the operator's next action differs per reason:
 `isolation_timeout`, `baseline_unstable`, `post_load_unstable`,
 `already_resident`, `below_floor`, `no_samples`, `isolation_lost`,
-`strategy_disagreement`. Four of them are worth naming here:
+`strategy_disagreement`, `run_failed`. Five of them are worth naming here:
 
 - **`already_resident`** — after a *confirmed* drain, a model that still
   reports resident is being served by something the gateway could not stop
@@ -3548,6 +3548,26 @@ says **why**, because the operator's next action differs per reason:
   by the end of the measurement, so the isolation did not cover the whole run.
 - **`strategy_disagreement`** — the delta and the agent's own per-process
   figure are further apart than the difference in the quantities can explain.
+- **`run_failed`** — the odd one out, and the only value whose next action is
+  not the reason itself: the run stopped on a hard error *after* it had already
+  written something, so `error` says what happened and the operator reads that.
+  It exists because such a report must still be reported **at all**. By then
+  the run had force-stopped part or all of the fleet, and `drained_spec_ids` /
+  `restore_failed` are the only place an operator ever learns which specs it
+  touched — while a report carrying an **empty** `inconclusive` with zero GPUs
+  is exactly what this contract reads as *a definitive result that measured
+  nothing*. A hard error **before** the first write keeps the nil-report
+  contract instead: nothing was touched, so there is nothing to report but
+  `error`. **A CANCELLED run is one of these too**, with the cancellation as
+  its `error`, and that is not a detail: every bounded wait in this run answers
+  `ctx.Done()` and its own timer *identically* — `vramStableWindow` returns the
+  same "no sample, not stable" for both, and its leading settle returns `false`
+  on cancellation so even *"samples arrived"* reads false — so a cancellation
+  used to surface as `no_samples`, i.e. **"GPU readings stopped arriving, check
+  the agent on this server"**, with an empty `error`. An operator who pressed
+  stop on their own run was sent to inspect a telemetry pipeline that was fine.
+  The context is the only thing that can tell the two apart, so the run asks
+  it before it attributes anything to a timer.
 
 `K`, the tolerance, the per-phase settles and the strategy-(a) wait are
 **reasoned, not measured**; they are package-level `var`s so tests shorten
@@ -3573,11 +3593,37 @@ identity at all —
 which catches a swap between *unlike* cards only, since two identical cards
 trading indices are indistinguishable. `GPUSample.UUID` is populated only by
 the NVIDIA parse, so a UUID-only detector would silently verify nothing on
-exactly the host classes the delta strategy exists to serve. The portal renders
-"verified by UUID" or "verified by name and total size only", never a bare
-"verified". On Apple silicon the figures are unified **system** memory read
-from ioreg rather than dedicated VRAM, so the item carries `unified_memory` and
-must be labelled wherever it is shown.
+exactly the host classes the delta strategy exists to serve. On Apple silicon
+the figures are unified **system** memory read from ioreg rather than dedicated
+VRAM, so the item carries `unified_memory` and must be labelled wherever it is
+shown.
+
+**And the fingerprint is COMPARED, not merely displayed** — the launch-spec
+form checks it against the live hardware report's card at that index before it
+offers the number, because an index is not an identity and the whole reason to
+record the field is that the numbering can change between the measurement and
+the moment an operator adopts it. Three outcomes, three different sentences:
+
+- **compared and equal** — the offer stands, labelled with *which* field
+  matched, since `name_total` cannot tell two identical cards apart and has to
+  say so;
+- **nothing to compare** — no fingerprint was recorded (a collector reporting
+  neither a UUID nor a name), the recorded kind is one this portal build does
+  not know, the live card cannot supply that field, or no hardware has been
+  reported for the index yet. The offer still stands — withholding it would
+  kill the feature on the AMD and Apple hosts the delta strategy exists for —
+  but it reads as **cannot verify**, never as verified: a check that could not
+  be made is not a check that passed;
+- **compared and different** — the number is real and belongs to other
+  hardware, so it is **named and withheld**: no apply affordance, no figure on
+  screen to be read as this card's cost, and both fingerprints shown so the
+  operator can see what changed.
+
+Fails toward *cannot verify* in every ambiguous direction, never toward
+verified — the same rule the per-GPU budget rows'
+`expected_uuid` drift detector ([§11.5](#115-what-each-remaining-tab-shows))
+applies, and for the same reason: an absent identifier on either side means no
+drift detection is available here, not that drift was detected.
 
 **Which cards are watched.** The spec's declared `RuntimeSpecGPUs` when it has
 any — that is the index set admission actually uses, so a number measured there
@@ -3704,7 +3750,9 @@ newest row that clears four gates, all of which fail CLOSED
 `isolated` true, and at least one strictly positive per-GPU number. The
 isolation gate is the load-bearing one: a number measured while something the
 gateway could not stop may have been serving the model is not a number to offer
-for the operator's own field.
+for the operator's own field. A fifth gate is applied **per card** rather than
+per run — the fingerprint comparison above — because a run can be perfectly
+valid and still be describing hardware that has since moved.
 
 **The writer, and the principal it does not have.** A benchmark run holds no
 `auth.Token`: the trigger's principal is consumed by

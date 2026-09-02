@@ -154,9 +154,7 @@ describe('vram label keys', () => {
     // loaded-models endpoint, which is most agent-managed ones. Without its
     // own sentence the operator only ever sees the wrong reason (a sub-floor
     // delta) for a model something else was already serving.
-    expect(vramWarningLabelKey('residency_unknown')).toBe(
-      'benchmarkVramWarningResidencyUnknown',
-    );
+    expect(vramWarningLabelKey('residency_unknown')).toBe('benchmarkVramWarningResidencyUnknown');
     expect(vramWarningLabelKey('something_new')).toBe('benchmarkVramWarningUnknown');
   });
 
