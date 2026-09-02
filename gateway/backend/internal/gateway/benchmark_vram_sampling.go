@@ -78,9 +78,13 @@ func vramGPUByIndex(sample routing.TelemetrySample) map[int]routing.GPUSample {
 // Three refusals, each of which would otherwise turn movement into a number:
 // a window shorter than vramStabilityWindow (not enough evidence yet), a
 // watched card missing from any sample (the run cannot difference what it
-// cannot see), and an EMPTY watched set (nothing was checked, so nothing is
-// stable -- the same non-vacuous discipline vramIsolationConfirmed applies to
-// an empty enumeration).
+// cannot see -- vramCardSpan reports that one), and an EMPTY watched set
+// (nothing was checked, so nothing is stable -- the same non-vacuous
+// discipline vramIsolationConfirmed applies to an empty enumeration).
+//
+// Every card is judged on ITS OWN tolerance, which is why the span and the
+// comparison are one step per card rather than a shared bound: see
+// vramCardToleranceMB for what a shared bound discards.
 func vramWindowStable(window []routing.TelemetrySample, watched []int) bool {
 	if len(window) < vramStabilityWindow || len(watched) == 0 {
 		return false
@@ -90,32 +94,48 @@ func vramWindowStable(window []routing.TelemetrySample, watched []int) bool {
 		byIndex = append(byIndex, vramGPUByIndex(sample))
 	}
 	for _, index := range watched {
-		var lo, hi, total int64
-		first := true
-		for _, snapshot := range byIndex {
-			gpu, ok := snapshot[index]
-			if !ok {
-				return false // a watched card vanished mid-window
-			}
-			if first {
-				lo, hi, total, first = gpu.MemUsedBytes, gpu.MemUsedBytes, gpu.MemTotalBytes, false
-				continue
-			}
-			if gpu.MemUsedBytes < lo {
-				lo = gpu.MemUsedBytes
-			}
-			if gpu.MemUsedBytes > hi {
-				hi = gpu.MemUsedBytes
-			}
-			if gpu.MemTotalBytes > total {
-				total = gpu.MemTotalBytes
-			}
-		}
-		if hi-lo > vramStabilityTolerance(total) {
+		lo, hi, total, complete := vramCardSpan(byIndex, index)
+		if !complete || hi-lo > vramStabilityTolerance(total) {
 			return false
 		}
 	}
 	return true
+}
+
+// vramCardSpan is one card's spread across an indexed window: its smallest and
+// largest used-bytes reading, and the largest total it reported.
+//
+// complete is false as soon as ONE sample does not carry the card at all --
+// the run cannot difference what it cannot see, and a card that vanished
+// mid-window says nothing about whether it held still. The caller refuses on
+// it rather than judging the readings that did arrive.
+//
+// The LARGEST reported total wins, so a sample that reported no total at all
+// (a 0) cannot shrink the tolerance the caller then applies -- which is the
+// same direction vramStabilityTolerance takes for an unknown total, and the
+// only one that does not turn a missing field into a stricter gate.
+func vramCardSpan(byIndex []map[int]routing.GPUSample, index int) (lo, hi, total int64, complete bool) {
+	first := true
+	for _, snapshot := range byIndex {
+		gpu, ok := snapshot[index]
+		if !ok {
+			return 0, 0, 0, false
+		}
+		if first {
+			lo, hi, total, first = gpu.MemUsedBytes, gpu.MemUsedBytes, gpu.MemTotalBytes, false
+			continue
+		}
+		if gpu.MemUsedBytes < lo {
+			lo = gpu.MemUsedBytes
+		}
+		if gpu.MemUsedBytes > hi {
+			hi = gpu.MemUsedBytes
+		}
+		if gpu.MemTotalBytes > total {
+			total = gpu.MemTotalBytes
+		}
+	}
+	return lo, hi, total, true
 }
 
 // vramDeltaMB is strategy (b)'s arithmetic for one card: used_after minus

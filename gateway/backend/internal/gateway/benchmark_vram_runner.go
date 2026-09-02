@@ -80,21 +80,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// The terminal defer, registered FIRST so it runs LAST -- after the
 	// restore defer below has recorded what it could not clear.
-	defer func() {
-		if report != nil {
-			report.normalizeGPUs()
-			res.VRAM = report
-		}
-		run.addResult(res)
-		run.finish(res.Error)
-		s.Benchmarks.publish(serverID, run.snapshot())
-		// The history row is EVIDENCE, not authority, and it is written on a
-		// context that is not the run's own for the same reason the restore
-		// is: a cancelled run must still record what it did.
-		historyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramHistoryWriteTimeout)
-		defer cancel()
-		_ = s.Routes.InsertBenchmarkRun(historyCtx, vramHistoryRow(tgt.mapping.ID, serverID, time.Now().UTC(), report, res.Error))
-	}()
+	defer func() { s.vramPublishOutcome(ctx, run, serverID, tgt.mapping.ID, report, res) }()
 
 	// (1) The two volatile gates again. The trigger already refused on them,
 	// but IsFileMode and the declared feature set are both written by
@@ -138,10 +124,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	report.IsolationEvidence = evidence
 	report.Isolated = vramIsolationConfirmed(plan.specIDs, evidence)
 	if !confirmed {
-		if !vramStoppedByCancellation(ctx, report, &res) {
-			report.Inconclusive = vramInconclusiveIsolationTimeout
-			res.Error = errVRAMIsolationTimedOut.Error()
-		}
+		vramIsolationFailure(ctx, report, &res)
 		return
 	}
 
@@ -164,15 +147,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (4) The baseline window.
 	baseline, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
-	if vramStoppedByCancellation(ctx, report, &res) {
-		return
-	}
-	switch {
-	case !sawSample:
-		report.Inconclusive = vramInconclusiveNoSamples
-		return
-	case !stable:
-		report.Inconclusive = vramInconclusiveBaselineUnstable
+	if vramWindowStop(ctx, sawSample, stable, vramInconclusiveBaselineUnstable, report, &res) {
 		return
 	}
 
@@ -190,69 +165,209 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// keeps naming it: this run did force-stop it.
 	pendingRestore = vramWithout(pendingRestore, plan.targetSpecID)
 
-	alreadyResident, residencyProbed, err := s.ensureResidentForRun(ctx, tgt)
-	if !residencyProbed {
-		// The contamination check could not be MADE -- no loaded-models probe
-		// on this application, or the probe failed. "Not resident" is then an
-		// unanswered question rather than a no, and the caveat is the only
-		// thing standing between the operator and the wrong next action: an
-		// undetected already-resident model surfaces as a sub-floor delta,
-		// whose message sends them to retry a run that fails identically.
-		report.Warnings = append(report.Warnings, vramWarningResidencyUnknown)
-	}
-	if err != nil {
-		report.Inconclusive = vramInconclusiveRunFailed
-		res.Error = err.Error()
-		return
-	}
-	// (6) The resident short-circuit is a contamination SIGNAL. The drain was
-	// confirmed, so a model that still reports resident is being served by
-	// something this gateway did not stop -- a non-managed application on the
-	// same host, most likely. A delta measured against that baseline would be
-	// ~0 and definitive, which is worse than no number.
-	if alreadyResident {
-		report.Inconclusive = vramInconclusiveAlreadyResident
+	// (6) What the load proved about contamination, and about whether it could
+	// be asked at all.
+	if vramRecordResidency(s.ensureResidentForRun(ctx, tgt)).apply(report, &res) {
 		return
 	}
 
-	// (7) The post-load window, then the floor gate.
+	// (7) The post-load window.
 	after, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
-	if vramStoppedByCancellation(ctx, report, &res) {
-		return
-	}
-	switch {
-	case !sawSample:
-		report.Inconclusive = vramInconclusiveNoSamples
-		return
-	case !stable:
-		report.Inconclusive = vramInconclusivePostLoadUnstable
+	if vramWindowStop(ctx, sawSample, stable, vramInconclusivePostLoadUnstable, report, &res) {
 		return
 	}
 
 	measured := s.vramAwaitMeasured(ctx, serverID, plan.targetSpecID)
 
-	// (8) Isolation again, at the END. Step 3 proved it once, before the
-	// baseline, and every window since only ever constrained movement INSIDE
-	// itself -- so a sibling started anywhere in between (a portal "Force
-	// start", a request straight to the agent's own router) left both windows
-	// individually stable and had its whole allocation added to delta_mb.
-	lost := s.vramIsolationLost(serverID, plan)
-	for _, specID := range lost {
-		// evidence IS report.IsolationEvidence, so the stored payload names
-		// what broke the isolation rather than only saying that it broke.
-		evidence[specID] = vramEvidenceRestartedDuringRun
-	}
-	// Recomputed through the one function that owns this field, so the boolean
-	// and the evidence behind it cannot drift. The lost-set conjunct is what
-	// covers a spec created AFTER the enumeration: that one is in no list
-	// vramIsolationConfirmed reads.
-	report.Isolated = len(lost) == 0 && vramIsolationConfirmed(plan.specIDs, evidence)
-	if len(lost) > 0 {
+	// (8) Isolation again, at the END -- the windows only ever constrained
+	// movement inside themselves.
+	if !s.vramRecheckIsolation(serverID, plan, report) {
 		report.Inconclusive = vramInconclusiveIsolationLost
 		return
 	}
 
 	// (9) The two numbers, the floor gate, and the cross-check between them.
+	gpus, warnings, inconclusive := vramFinalizeGPUs(watched, attributable, plan, baseline, after, measured)
+	report.GPUs = gpus
+	report.Warnings = append(report.Warnings, warnings...)
+	report.Inconclusive = inconclusive
+}
+
+// vramPublishOutcome is the run's terminal bookkeeping: attach the report to
+// the result, publish the terminal snapshot the frontend's poll reads, and
+// record the history row. None of it is a measurement, and all of it must
+// happen on EVERY exit, which is why it is one function behind one defer
+// rather than steps interleaved with the measurement.
+//
+// A nil report means the run never reached the measurement phase, which is a
+// different message to the operator than a report carrying an Inconclusive
+// reason -- so nil leaves res.VRAM unset instead of attaching an empty one.
+//
+// res is taken BY VALUE: it is read at defer time and nothing observes it
+// afterwards, so attaching the report to the copy is what the caller's own
+// mutation used to achieve.
+//
+// The history row is EVIDENCE, not authority, and it is written on a context
+// that is not the run's own for the same reason the restore is: a cancelled
+// run must still record what it did.
+func (s *Server) vramPublishOutcome(ctx context.Context, run *benchmarkRun, serverID, mappingID string, report *VRAMReport, res BenchmarkResult) {
+	if report != nil {
+		report.normalizeGPUs()
+		res.VRAM = report
+	}
+	run.addResult(res)
+	run.finish(res.Error)
+	s.Benchmarks.publish(serverID, run.snapshot())
+	historyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramHistoryWriteTimeout)
+	defer cancel()
+	_ = s.Routes.InsertBenchmarkRun(historyCtx, vramHistoryRow(mappingID, serverID, time.Now().UTC(), report, res.Error))
+}
+
+// vramIsolationFailure attributes an isolation that was NOT confirmed to the
+// right cause, and is why an operator who cancelled their own run is not sent
+// to inspect a healthy agent.
+//
+// vramAwaitIsolation returns (evidence, false) for BOTH a cancelled context
+// and an expired bound, so the timer's own reason may only be recorded once
+// the context has been ruled out. See vramStoppedByCancellation.
+func vramIsolationFailure(ctx context.Context, report *VRAMReport, res *BenchmarkResult) {
+	if vramStoppedByCancellation(ctx, report, res) {
+		return
+	}
+	report.Inconclusive = vramInconclusiveIsolationTimeout
+	res.Error = errVRAMIsolationTimedOut.Error()
+}
+
+// vramWindowStop records why a phase window produced no usable reading, and
+// reports whether the run must stop. The two phases differ only in what
+// "samples arrived but never held still" is called -- baseline_unstable before
+// the load, post_load_unstable after it -- because that is the one thing the
+// operator's next action turns on, so the phase passes its own name in.
+//
+// CANCELLATION IS ASKED FIRST AND UNCONDITIONALLY, even for a window that WAS
+// stable. vramStableWindow answers ctx.Done() and its own timer identically,
+// so a cancelled run read as a phase verdict surfaces as `no_samples` and
+// sends the operator to inspect a telemetry pipeline that was fine; and a
+// window that went stable in the same instant the operator cancelled is still
+// a cancelled run, not a reading. See vramStoppedByCancellation.
+func vramWindowStop(ctx context.Context, sawSample, stable bool, unstableReason string, report *VRAMReport, res *BenchmarkResult) bool {
+	if vramStoppedByCancellation(ctx, report, res) {
+		return true
+	}
+	switch {
+	case !sawSample:
+		// Samples STOPPED arriving -- the agent went away mid-run -- which is
+		// a different operator action than samples that never held still.
+		report.Inconclusive = vramInconclusiveNoSamples
+	case !stable:
+		report.Inconclusive = unstableReason
+	default:
+		return false
+	}
+	return true
+}
+
+// vramResidency is what ensureResidentForRun answered, reduced to the two
+// things the report has to record: the caveat to carry, and the reason to stop
+// on. The zero value carries neither.
+type vramResidency struct {
+	warning      string
+	inconclusive string
+	err          string
+}
+
+// apply writes this answer onto the report and reports whether the run stops.
+// A warning is recorded even when the run carries on -- that is the whole
+// point of the residency_unknown caveat.
+func (v vramResidency) apply(report *VRAMReport, res *BenchmarkResult) bool {
+	if v.warning != "" {
+		report.Warnings = append(report.Warnings, v.warning)
+	}
+	if v.inconclusive == "" {
+		return false
+	}
+	report.Inconclusive = v.inconclusive
+	res.Error = v.err
+	return true
+}
+
+// vramRecordResidency reduces ensureResidentForRun's three-value answer to one
+// question: was the target ALREADY being served by something this run did not
+// stop?
+//
+// The three answers, and why each earns what it does:
+//
+//   - THE CHECK COULD NOT BE MADE -- no loaded-models probe on this
+//     application, or the probe failed. "Not resident" is then an unanswered
+//     question rather than a no, and the caveat is the only thing standing
+//     between the operator and the wrong next action: an undetected
+//     already-resident model surfaces as a sub-floor delta, whose message
+//     sends them to retry a run that fails identically.
+//   - THE LOAD FAILED. Nothing was measured, so run_failed with the load's own
+//     error -- and the caveat, if the probe was also unavailable, still goes on
+//     the report.
+//   - THE MODEL IS RESIDENT. A contamination SIGNAL, not a shortcut: the drain
+//     was confirmed, so a model that still reports resident is being served by
+//     something this gateway did not stop -- a non-managed application on the
+//     same host, most likely. A delta measured against that baseline would be
+//     ~0 and definitive, which is worse than no number.
+//
+// It takes ensureResidentForRun's results positionally so the call reads as one
+// expression at the call site; it makes no probe of its own.
+func vramRecordResidency(alreadyResident, residencyProbed bool, err error) vramResidency {
+	out := vramResidency{}
+	if !residencyProbed {
+		out.warning = vramWarningResidencyUnknown
+	}
+	switch {
+	case err != nil:
+		out.inconclusive, out.err = vramInconclusiveRunFailed, err.Error()
+	case alreadyResident:
+		out.inconclusive = vramInconclusiveAlreadyResident
+	}
+	return out
+}
+
+// vramRecheckIsolation asks the isolation question AGAIN, at the END of the
+// measurement, and reports whether it held for the whole run.
+//
+// Step 3 proved it once, before the baseline, and every window since only ever
+// constrained movement INSIDE itself -- so a sibling started anywhere in
+// between (a portal "Force start", a request straight to the agent's own
+// router) left both windows individually stable and had its whole allocation
+// added to delta_mb.
+//
+// It writes both fields that answer for the isolation, because the two must
+// not drift: each lost spec's own evidence becomes restarted_during_run, so
+// the STORED payload names what broke the isolation rather than only saying
+// that it broke, and Isolated is then recomputed through the one function that
+// owns that field. The lost-set conjunct is what covers a spec created AFTER
+// the enumeration: that one is in no list vramIsolationConfirmed reads.
+func (s *Server) vramRecheckIsolation(serverID string, plan vramRunPlanned, report *VRAMReport) bool {
+	lost := s.vramIsolationLost(serverID, plan)
+	for _, specID := range lost {
+		report.IsolationEvidence[specID] = vramEvidenceRestartedDuringRun
+	}
+	report.Isolated = len(lost) == 0 && vramIsolationConfirmed(plan.specIDs, report.IsolationEvidence)
+	return len(lost) == 0
+}
+
+// vramFinalizeGPUs turns the two stable windows into the report's per-GPU rows
+// and the verdict on them: the visible items, any warning they earned, and the
+// inconclusive reason ("" when the numbers stand).
+//
+// THE ORDER OF THE THREE GATES IS THE POINT, and each one's own doc says why:
+// the undeclared cards are added BEFORE the floor gate (vramHeadlineDeltaMB is
+// the sum of every card the model allocated on, so leaving one out would decide
+// the floor question before the sum the floor judges), the visible-item trim
+// runs AFTER it (vramVisibleItems), and the cross-check runs last, on the
+// visible items, because those are the numbers the report shows.
+//
+// A below-floor headline returns NO items: 0 means UNKNOWN everywhere else in
+// this feature, so a sub-floor figure must not be shown as though it were a
+// measurement. A disagreement KEEPS them -- unlike below_floor there is
+// something to show, and the two numbers are the evidence for the reason.
+func vramFinalizeGPUs(watched []int, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[int]int) (gpus []VRAMGPUItem, warnings []string, inconclusive string) {
 	items := vramReportItems(watched, attributable, plan, baseline, after, measured)
 	if undeclared := vramUndeclaredAllocations(watched, baseline, after, measured); len(undeclared) > 0 {
 		// A card the spec does not declare that nonetheless allocated: the
@@ -260,25 +375,21 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 		// silently halved, and the spec's GPU rows are what the operator has
 		// to fix. Reported and warned, not refused -- see the warning's doc.
 		items = append(items, vramReportItems(undeclared, false, plan, baseline, after, measured)...)
-		report.Warnings = append(report.Warnings, vramWarningUndeclaredGPUAllocation)
+		warnings = append(warnings, vramWarningUndeclaredGPUAllocation)
 	}
 	if vramHeadlineDeltaMB(items) < vramFloorMB(watched, after) {
 		// No model costs ~0 MB, so a sub-floor headline can only mean the
-		// window missed the allocation or something else absorbed it. 0 means
-		// UNKNOWN everywhere else in this feature and must mean it here too.
-		report.Inconclusive = vramInconclusiveBelowFloor
-		report.GPUs = nil
-		return
+		// window missed the allocation or something else absorbed it.
+		return nil, warnings, vramInconclusiveBelowFloor
 	}
-	report.GPUs = vramVisibleItems(items)
-	if vramStrategiesDisagree(report.GPUs, after) {
+	gpus = vramVisibleItems(items)
+	if vramStrategiesDisagree(gpus, after) {
 		// The one contaminant no other gate can see: a neighbour the gateway
 		// cannot stop, allocating during the load, with the managed fleet
-		// provably isolated the whole time. The two disagreeing numbers STAY
-		// on the report -- unlike below_floor, where there is nothing to show,
-		// here they are the evidence for the reason.
-		report.Inconclusive = vramInconclusiveStrategyDisagreement
+		// provably isolated the whole time.
+		return gpus, warnings, vramInconclusiveStrategyDisagreement
 	}
+	return gpus, warnings, ""
 }
 
 // vramStoppedByCancellation records a run the operator (or the trigger's own
@@ -443,6 +554,9 @@ func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched 
 // the remaining half agree with the declared-card delta and so reinforced
 // confidence in half a number. The caller decides which indexes have a row to
 // be applied to; that is not this function's question.
+//
+// This function owns only the WAIT -- the post-load subscription, the bound and
+// the cancellation. What one frame contributes is vramMeasuredFromFrame.
 func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string) map[int]int {
 	_, frames, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()
@@ -459,23 +573,44 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 			if !open {
 				return nil
 			}
-			for _, status := range frame {
-				if status.SpecID != specID || status.MeasuredAt.IsZero() {
-					continue
-				}
-				out := map[int]int{}
-				for _, gpu := range status.GPUs {
-					// A measured 0 is UNKNOWN, the same rule the ingest and
-					// the write-back apply to this very array.
-					if gpu.VRAMMeasuredMB <= 0 {
-						continue
-					}
-					out[gpu.Index] = gpu.VRAMMeasuredMB
-				}
-				if len(out) > 0 {
-					return out
-				}
+			if measured := vramMeasuredFromFrame(frame, specID); measured != nil {
+				return measured
 			}
 		}
 	}
+}
+
+// vramMeasuredFromFrame reads the target spec's own per-card measurement off
+// ONE status frame, and returns nil when the frame carries none -- which is
+// what keeps the caller waiting rather than answering early.
+//
+// Two things disqualify a row before its numbers are read. A DIFFERENT spec,
+// because a frame carries the whole server. And a zero MeasuredAt: a spec the
+// agent has never measured still reports a GPU array, all zeros, and reading
+// that as a measurement of nothing is exactly the mistake this whole feature
+// refuses to make.
+//
+// A measured 0 is likewise UNKNOWN -- the same rule the ingest and the
+// write-back apply to this very array -- so a card at 0 is DROPPED, never
+// reported as 0. A row whose every card drops out therefore contributes
+// nothing and the scan moves on: an all-zero measurement is indistinguishable
+// from no measurement, and returning it would let strategy (a) claim a reading
+// on a host that has no per-process measurer at all.
+func vramMeasuredFromFrame(frame []RuntimeStatusDTO, specID string) map[int]int {
+	for _, status := range frame {
+		if status.SpecID != specID || status.MeasuredAt.IsZero() {
+			continue
+		}
+		out := map[int]int{}
+		for _, gpu := range status.GPUs {
+			if gpu.VRAMMeasuredMB <= 0 {
+				continue
+			}
+			out[gpu.Index] = gpu.VRAMMeasuredMB
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }

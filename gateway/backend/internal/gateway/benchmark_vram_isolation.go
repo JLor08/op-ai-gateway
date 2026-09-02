@@ -189,6 +189,22 @@ var (
 // timeout rather than claiming an isolation it cannot justify.
 func vramStateNoProcess(state string) bool { return vramStatesNoProcess[state] }
 
+// vramStateBySpec indexes one runtime-status frame -- or the registry's
+// snapshot, which carries the same rows -- by spec id, so the two isolation
+// checks read a spec's state by lookup instead of by scanning.
+//
+// A repeated spec id keeps the LAST row, which is the registry's own
+// last-write-wins view of a spec: a frame is a snapshot of distinct specs, so
+// a duplicate is either an update or malformed, and in both readings the later
+// row is the one to believe.
+func vramStateBySpec(statuses []RuntimeStatusDTO) map[string]string {
+	out := make(map[string]string, len(statuses))
+	for _, status := range statuses {
+		out[status.SpecID] = status.State
+	}
+	return out
+}
+
 // vramRunPlan runs every refusal a VRAM run makes before it writes anything,
 // and returns the plan the run then executes. It has exactly ONE call site,
 // the trigger endpoint, so each refusal is a 409 the operator sees.
@@ -237,50 +253,20 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMNoGPUSamples, msg: msgBenchmarkVRAMNoGPUSamples}
 	}
 
-	// D2.1: enumerate every ENABLED spec of the target's own agent-managed
-	// application. At most one server_agent application exists per server
-	// (portal enforcement plus a partial unique index), and P1 established
-	// that tgt.app IS it, so this one read covers the whole server. A
-	// DISABLED spec is nothing the agent ever runs, so it is no part of the
-	// fleet to drain.
+	// D2.1/D2.2: enumerate every ENABLED spec of the target's own agent-managed
+	// application, refusing on either blocking condition. At most one
+	// server_agent application exists per server (portal enforcement plus a
+	// partial unique index), and P1 established that tgt.app IS it, so this one
+	// read covers the whole server.
 	specs, err := s.Routes.RuntimeSpecsByApplication(ctx, tgt.app.ID)
 	if err != nil {
 		return vramRunPlanned{}, err
 	}
-	planned := vramRunPlanned{baseline: baseline}
-	for _, spec := range specs {
-		if !spec.Enabled {
-			continue
-		}
-		planned.specIDs = append(planned.specIDs, spec.ID)
-		if spec.MappingID == tgt.mapping.ID {
-			planned.targetSpecID = spec.ID
-		}
-		// D2.2, first refusal: an operator-owned override anywhere -- THE
-		// TARGET'S OWN INCLUDED -- is what makes the restore unambiguous.
-		// Refusing here means the state to restore is always exactly "", so
-		// the run never has to reconstruct what an override was; after a
-		// gateway restart it could not know.
-		if spec.AdminState != "" {
-			return vramRunPlanned{}, &vramRefusal{
-				code: codeBenchmarkVRAMIsolationBlocked,
-				msg:  "spec " + spec.ID + " already carries the admin override " + spec.AdminState + "; clear it first",
-			}
-		}
-		// D2.2, second refusal: a pinned SIBLING. Not because a pinned spec
-		// cannot be drained -- force_stopped outranks pinned -- but because
-		// pinned is an operator's standing instruction that this model stays
-		// up, and silently breaking it for a benchmark is a worse surprise
-		// than refusing and naming it. The TARGET may be pinned: stopping the
-		// target is the point of the run.
-		if spec.Pinned && spec.MappingID != tgt.mapping.ID {
-			return vramRunPlanned{}, &vramRefusal{
-				code: codeBenchmarkVRAMIsolationBlocked,
-				msg:  "spec " + spec.ID + " is pinned to stay running; unpin it first",
-			}
-		}
+	specIDs, targetSpecID, err := vramEnumerateFleet(specs, tgt.mapping.ID)
+	if err != nil {
+		return vramRunPlanned{}, err
 	}
-	sort.Strings(planned.specIDs)
+	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpecID}
 	// P1 again, by the other route: an agent-managed application whose target
 	// mapping has no ENABLED spec has no agent-managed process to measure --
 	// the agent's router has nothing to route to, so the load would fail
@@ -302,13 +288,7 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 	// vramIsolationBindDelay). Q10's answer therefore reduces to its warning
 	// half: an agent with no open WebSocket is told about, never refused.
 	planned.bindDelay = vramIsolationBindDelay
-	if !s.AgentStreams.hasConn(serverID) {
-		planned.warnings = append(planned.warnings, vramWarningPostTransportAgent)
-	}
-	// Q5: warn on a non-managed neighbour, do not refuse.
-	if s.vramHasNonManagedApplications(ctx, serverID, tgt.app.ID) {
-		planned.warnings = append(planned.warnings, vramWarningNonManagedApplications)
-	}
+	planned.warnings = s.vramPlanWarnings(ctx, serverID, tgt.app.ID)
 	// The Apple label. The gateway is hardware-agnostic everywhere else, but
 	// a figure read from unified SYSTEM memory reported as VRAM is a wrong
 	// number rather than a vague one, and the reported OS is the only thing
@@ -317,6 +297,77 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		planned.unifiedMemory = summary.OS == "darwin"
 	}
 	return planned, nil
+}
+
+// vramEnumerateFleet is D2.1 and D2.2 together: which ENABLED specs make up
+// the fleet this run has to drain, which of them is the target, and the two
+// conditions under which no gateway-side write can produce the isolation the
+// run promises.
+//
+// A DISABLED spec is nothing the agent ever runs, so it is no part of the
+// fleet to drain. The result is sorted so the drain, the restore and the
+// isolation evidence all name the fleet in one order.
+//
+// It takes the specs already read rather than reading them itself, so
+// vramRunPlan keeps the whole store-error path -- a refusal here is always a
+// decision about the fleet, never an I/O failure.
+func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (specIDs []string, targetSpecID string, err error) {
+	for _, spec := range specs {
+		if !spec.Enabled {
+			continue
+		}
+		specIDs = append(specIDs, spec.ID)
+		if spec.MappingID == targetMappingID {
+			targetSpecID = spec.ID
+		}
+		// D2.2, first refusal: an operator-owned override anywhere -- THE
+		// TARGET'S OWN INCLUDED -- is what makes the restore unambiguous.
+		// Refusing here means the state to restore is always exactly "", so
+		// the run never has to reconstruct what an override was; after a
+		// gateway restart it could not know.
+		if spec.AdminState != "" {
+			return nil, "", &vramRefusal{
+				code: codeBenchmarkVRAMIsolationBlocked,
+				msg:  "spec " + spec.ID + " already carries the admin override " + spec.AdminState + "; clear it first",
+			}
+		}
+		// D2.2, second refusal: a pinned SIBLING. Not because a pinned spec
+		// cannot be drained -- force_stopped outranks pinned -- but because
+		// pinned is an operator's standing instruction that this model stays
+		// up, and silently breaking it for a benchmark is a worse surprise
+		// than refusing and naming it. The TARGET may be pinned: stopping the
+		// target is the point of the run.
+		if spec.Pinned && spec.MappingID != targetMappingID {
+			return nil, "", &vramRefusal{
+				code: codeBenchmarkVRAMIsolationBlocked,
+				msg:  "spec " + spec.ID + " is pinned to stay running; unpin it first",
+			}
+		}
+	}
+	sort.Strings(specIDs)
+	return specIDs, targetSpecID, nil
+}
+
+// vramPlanWarnings collects the conditions that DEGRADE a run's confidence
+// without making it pointless, in the fixed order the result reports them.
+//
+// They are gathered together because they share one posture -- neither may
+// refuse -- and separately from the refusals above because that posture is the
+// whole distinction: a refusal costs the operator a message, a warning costs
+// them nothing and buys them the context to weigh the number they get. Neither
+// condition is read again during the run; the run carries the strings.
+func (s *Server) vramPlanWarnings(ctx context.Context, serverID, agentAppID string) []string {
+	var warnings []string
+	// Q10's warning half: an agent with no open WebSocket is told about, never
+	// refused -- the drain does not even begin until its next runtime poll.
+	if !s.AgentStreams.hasConn(serverID) {
+		warnings = append(warnings, vramWarningPostTransportAgent)
+	}
+	// Q5: warn on a non-managed neighbour, do not refuse.
+	if s.vramHasNonManagedApplications(ctx, serverID, agentAppID) {
+		warnings = append(warnings, vramWarningNonManagedApplications)
+	}
+	return warnings
 }
 
 // vramIsolationUnavailable reports whether a gateway-side runtime write can
@@ -481,6 +532,10 @@ func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, err
 //
 // Partial evidence is returned even on a timeout, so the report can be
 // audited rather than believed.
+//
+// This function owns only the ADMISSIBILITY of a frame -- the watermark, the
+// binding delay, the bound and the cancellation. What an admissible frame
+// proves about each still-pending spec is vramFrameEvidence.
 func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specIDs []string, liveAtWrite map[string]bool, bindDelay time.Duration) (map[string]string, bool) {
 	evidence := map[string]string{}
 	if len(specIDs) == 0 {
@@ -507,32 +562,56 @@ func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specID
 			if !open {
 				return evidence, false
 			}
-			stateBySpec := make(map[string]string, len(frame))
-			for _, status := range frame {
-				stateBySpec[status.SpecID] = status.State
-			}
 			if time.Now().Before(bindDeadline) {
 				// The override has not necessarily landed yet, so NOTHING on
 				// this frame is evidence -- for either half of the partition.
 				// See the doc block above.
 				continue
 			}
-			for specID := range pending {
-				state, present := stateBySpec[specID]
-				if !present || !vramStateNoProcess(state) {
-					continue
-				}
-				if liveAtWrite[specID] {
-					evidence[specID] = vramEvidenceStoppedAfterWrite
-					delete(pending, specID)
-					continue
-				}
-				evidence[specID] = vramEvidenceNoProcessAtWrite
+			for specID, label := range vramFrameEvidence(frame, pending, liveAtWrite) {
+				evidence[specID] = label
 				delete(pending, specID)
 			}
 		}
 	}
 	return evidence, true
+}
+
+// vramFrameEvidence reports what ONE admissible status frame proves about the
+// specs still pending -- spec id to evidence label, empty when the frame moved
+// nothing. The caller has already established that the frame is admissible at
+// all (it arrived on a post-write subscription, and the binding delay has
+// elapsed); this decides only what an admissible frame says.
+//
+// It returns the labels rather than writing them, so the wait's own evidence
+// map and pending set are mutated in exactly one place. A spec absent from the
+// frame, or present in a state this gateway does not recognize as
+// process-free, earns nothing and stays pending -- the fail-closed direction,
+// which surfaces as an isolation timeout rather than as an isolation this run
+// cannot justify.
+//
+// WHICH label is the only thing liveAtWrite decides, and that is why its
+// staleness is harmless: both labels are evidence of the same fact (this spec
+// is not running), and they differ in what they say about HOW it got there.
+// See vramLiveProcessBySpec.
+func vramFrameEvidence(frame []RuntimeStatusDTO, pending map[string]struct{}, liveAtWrite map[string]bool) map[string]string {
+	stateBySpec := vramStateBySpec(frame)
+	var found map[string]string
+	for specID := range pending {
+		state, present := stateBySpec[specID]
+		if !present || !vramStateNoProcess(state) {
+			continue
+		}
+		if found == nil {
+			found = make(map[string]string, len(pending))
+		}
+		if liveAtWrite[specID] {
+			found[specID] = vramEvidenceStoppedAfterWrite
+			continue
+		}
+		found[specID] = vramEvidenceNoProcessAtWrite
+	}
+	return found
 }
 
 // vramRestore clears every override this run set, back to exactly "" -- the

@@ -128,20 +128,11 @@ func vramCardToleranceMB(gpu routing.GPUSample) int {
 // target's own override in order to load it, so the target holding a process
 // at the end is the point of the run rather than contamination.
 //
-// Two questions, because a spec can break the isolation in two ways:
-//
-//   - every ENUMERATED sibling must still be present in a state this gateway
-//     recognizes as having no process. Absent counts as lost, and that is not
-//     over-strict: vramAwaitIsolation only ever recorded evidence for a spec it
-//     saw PRESENT in a no-process state, so every one of them was in the
-//     agent's report during this run, and a snapshot lingers rather than being
-//     cleared. A spec that has since vanished from it means the agent's own
-//     picture changed under the measurement;
-//   - no spec OUTSIDE that set may hold a process either. The enumeration is a
-//     trigger-time fact, and a launch spec created (or re-enabled) after it is
-//     neither drained nor required to carry evidence -- so checking only the
-//     enumerated set would leave exactly that spec free to start and be
-//     measured as though it were the target.
+// Two questions, because a spec can break the isolation in two ways, and the
+// two answers come from vramEnumeratedNotQuiet and vramUnenumeratedWithProcess
+// -- each carrying the reasoning for the half it decides. They partition the
+// snapshot (one reads only enumerated specs, the other only unenumerated
+// ones), so their results need no de-duplication between them.
 //
 // It reads the runtime-status snapshot rather than waiting for a delivered
 // frame, so it is up to one telemetry interval stale (the default is 1 s, and
@@ -153,37 +144,68 @@ func (s *Server) vramIsolationLost(serverID string, plan vramRunPlanned) []strin
 	for _, specID := range plan.specIDs {
 		enumerated[specID] = true
 	}
-	stateBySpec := map[string]string{}
-	for _, status := range s.RuntimeStatus.statusSnapshot(serverID) {
-		stateBySpec[status.SpecID] = status.State
-	}
+	stateBySpec := vramStateBySpec(s.RuntimeStatus.statusSnapshot(serverID))
 
-	lost := map[string]struct{}{}
-	for specID := range enumerated {
-		if specID == plan.targetSpecID {
-			continue
-		}
-		if state, present := stateBySpec[specID]; !present || !vramStateNoProcess(state) {
-			lost[specID] = struct{}{}
-		}
-	}
-	for specID, state := range stateBySpec {
-		if specID == plan.targetSpecID || enumerated[specID] {
-			continue
-		}
-		if vramStatesWithProcess[state] {
-			lost[specID] = struct{}{}
-		}
-	}
+	lost := append(
+		vramEnumeratedNotQuiet(enumerated, plan.targetSpecID, stateBySpec),
+		vramUnenumeratedWithProcess(enumerated, plan.targetSpecID, stateBySpec)...,
+	)
 	if len(lost) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(lost))
-	for specID := range lost {
-		out = append(out, specID)
+	sort.Strings(lost)
+	return lost
+}
+
+// vramEnumeratedNotQuiet is vramIsolationLost's first question: every
+// ENUMERATED sibling must still be present in a state this gateway recognizes
+// as having no process.
+//
+// ABSENT counts as lost, and that is not over-strict: vramAwaitIsolation only
+// ever recorded evidence for a spec it saw PRESENT in a no-process state, so
+// every one of them was in the agent's report during this run, and a snapshot
+// lingers rather than being cleared. A spec that has since vanished from it
+// means the agent's own picture changed under the measurement.
+//
+// Iterating the enumerated SET rather than the caller's slice is what keeps a
+// repeated spec id from being reported twice.
+func vramEnumeratedNotQuiet(enumerated map[string]bool, targetSpecID string, stateBySpec map[string]string) []string {
+	var lost []string
+	for specID := range enumerated {
+		if specID == targetSpecID {
+			continue
+		}
+		if state, present := stateBySpec[specID]; !present || !vramStateNoProcess(state) {
+			lost = append(lost, specID)
+		}
 	}
-	sort.Strings(out)
-	return out
+	return lost
+}
+
+// vramUnenumeratedWithProcess is vramIsolationLost's second question: no spec
+// OUTSIDE the enumerated set may hold a process either.
+//
+// The enumeration is a trigger-time fact, and a launch spec created (or
+// re-enabled) after it is neither drained nor required to carry evidence -- so
+// checking only the enumerated set would leave exactly that spec free to start
+// and be measured as though it were the target.
+//
+// The test is the POSITIVE one (vramStatesWithProcess), not the negation of
+// vramStateNoProcess, and the asymmetry against the enumerated half is
+// deliberate: an unrecognized state on a spec this run never drained is no
+// evidence that something started, whereas on an enumerated spec the same
+// unrecognized state withdraws evidence this run had already recorded.
+func vramUnenumeratedWithProcess(enumerated map[string]bool, targetSpecID string, stateBySpec map[string]string) []string {
+	var lost []string
+	for specID, state := range stateBySpec {
+		if specID == targetSpecID || enumerated[specID] {
+			continue
+		}
+		if vramStatesWithProcess[state] {
+			lost = append(lost, specID)
+		}
+	}
+	return lost
 }
 
 // vramUndeclaredAllocations reports the cards OUTSIDE the watched set that this
