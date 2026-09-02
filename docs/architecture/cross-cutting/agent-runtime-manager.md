@@ -2804,6 +2804,23 @@ leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agen
 picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
 
+**A GPU row can show a THIRD number, and it is an offer rather than a field.**
+When the mapping's benchmark history carries an applicable VRAM measurement
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)),
+each row whose index that run measured gains the benchmark's number — rendered
+read-only through `Field`'s own `readOnly` prop, so it cannot be mistaken for
+the editable estimate beside it — plus an **Apply** that fills the estimate and
+nothing else. Three numbers, three meanings, one owner each: the operator's
+estimate (editable), the agent's measurement (read-only text), the benchmark's
+(read-only, applied on request). Apply is a **form-state** change: no request is
+made until the operator saves, which is the whole of D4's ownership rule
+expressed as an affordance. It is matched **by GPU index**, never by row
+position, and it is absent — rather than showing a `0` — for the create form, an
+inconclusive run, a run whose isolation was never proven, and a declared card
+the run watched but measured nothing on. Which of the two reported quantities
+the number is (the delta, or the agent's per-process measurement) is named on
+screen beside it, because they are different quantities and are never averaged.
+
 Each spec GPU row carries a **picker of the server's reported cards** that
 writes the chosen card's index into the numeric field beside it. It exists
 because **4×/8× of the same card is the normal AI-server build**, and the
@@ -3505,6 +3522,17 @@ plain speed table **excludes** that kind explicitly — a VRAM row falling into 
 renders as four dashes and a green tick, which reads as a successful speed run
 that measured nothing. The rule is one list (`isNonSpeedKind`), so a fifth kind
 cannot be added without deciding where it belongs.
+
+**Where the apply affordance gets its number.** Not from the run status — the
+operator applies the number *later*, on another screen, and a launch spec is
+exactly what they open minutes or days after the measurement. The launch-spec
+form therefore reads the **mapping's own benchmark history** and takes the
+newest row that clears four gates, all of which fail CLOSED
+(`components/shared/vram.ts`): `kind == "vram"`, no `inconclusive` reason,
+`isolated` true, and at least one strictly positive per-GPU number. The
+isolation gate is the load-bearing one: a number measured while something the
+gateway could not stop may have been serving the model is not a number to offer
+for the operator's own field.
 
 **The writer, and the principal it does not have.** A benchmark run holds no
 `auth.Token`: the trigger's principal is consumed by

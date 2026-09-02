@@ -14,6 +14,7 @@ import { PortalApiError } from '../api/transport';
 import type { PortalApi } from './shared/types';
 import { messages } from '../i18n';
 import type {
+  BenchmarkRunDTO,
   BenchmarkStatus,
   CreateMappingRequest,
   GPUBudget,
@@ -31,6 +32,8 @@ import type {
   RuntimeStatus,
   UpdateMappingRequest,
   UpdateServerRequest,
+  VRAMGPUItemDTO,
+  VRAMReportDTO,
 } from '../api';
 
 const t = messages.de;
@@ -234,6 +237,9 @@ function renderSection(
     benchmarkStatus?: PortalApi['benchmarkStatus'];
     probeMappingContext?: PortalApi['probeMappingContext'];
     probeMappingVram?: PortalApi['probeMappingVram'];
+    // The launch-spec form reads a mapping's benchmark history to find the
+    // newest applicable VRAM measurement for its per-GPU apply affordance.
+    mappingBenchmarks?: PortalApi['mappingBenchmarks'];
     warnings?: string[];
     coresidencyPairs?: [string, string][];
     // Never resolves -- simulates the GET still being in flight, for the
@@ -483,7 +489,7 @@ function renderSection(
     benchmarkServer: vi.fn(async () => idleBenchmark),
     benchmarkApplication: vi.fn(async () => idleBenchmark),
     benchmarkMapping: vi.fn(async () => idleBenchmark),
-    mappingBenchmarks: vi.fn(async () => []),
+    mappingBenchmarks: opts.mappingBenchmarks ?? vi.fn(async () => []),
     subscribeBenchmark: vi.fn(() => () => {}),
   };
 
@@ -5224,5 +5230,235 @@ describe('RuntimeAdminSection spec form ownership', () => {
     // Asserting the recorded body rather than a re-derivation is deliberate: an
     // earlier round found a fake that hid the very bug its test named.
     expect(created[0]).toEqual({ gateway_model_name: 'app-new', app_model_name: 'app-new' });
+  });
+});
+
+// ===========================================================================
+// D4: the VRAM benchmark REPORTS a number; the operator applies it
+// ===========================================================================
+//
+// The run writes neither VRAM field -- not `vram_measured_mb` (agent-owned,
+// and a breach of a GPU budget by a MEASURED value is terminal) and not
+// `vram_estimate_mb` (operator-owned, and a machine number in a field whose
+// whole meaning is "what the operator declares" takes the decision away from
+// them). What the portal owes instead is an affordance that FILLS the
+// operator's own field, next to it, leaving the save to them.
+//
+// Every test below is one way that affordance could quietly betray that rule:
+// fill the wrong row, fill the wrong field, save by itself, or offer a number
+// where the run produced none.
+describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
+  function vramItem(over: Partial<VRAMGPUItemDTO> = {}): VRAMGPUItemDTO {
+    return { index: 0, baseline_used_mb: 1024, attributable: true, ...over };
+  }
+
+  function vramHistoryRun(
+    gpus: VRAMGPUItemDTO[],
+    reportOver: Partial<VRAMReportDTO> = {},
+    runOver: Partial<BenchmarkRunDTO> = {},
+  ): BenchmarkRunDTO {
+    return {
+      id: 'run_vram',
+      mapping_id: 'map_1',
+      server_id: 'srv_1',
+      created_at: '2026-09-01T10:00:00Z',
+      gen_tokens_per_second: 0,
+      prompt_tokens_per_second: 0,
+      load_time_ms: 0,
+      context_size: 0,
+      error: '',
+      kind: 'vram',
+      vram: { isolated: true, gpus, ...reportOver },
+      ...runOver,
+    };
+  }
+
+  // Two declared cards, so "filled the right row" is a question the DOM can
+  // answer: index 0 has nothing declared yet, index 1 carries an estimate and
+  // an agent measurement of its own.
+  const twoCardSpec = () =>
+    fullSpec({
+      gpus: [
+        { index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+        { index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 },
+      ],
+    });
+
+  async function openSpecEdit(opts: Parameters<typeof renderSection>[0]) {
+    const rendered = renderSection(opts);
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  const vramField = (idx: number) =>
+    screen.getByLabelText(t.runtimeSpecVram, {
+      selector: `#runtime-spec-gpu-vram-${idx}`,
+    }) as HTMLInputElement;
+
+  it('fills THIS row’s estimate field, touches nothing else, and saves nothing', async () => {
+    const { fakeApi, putSpecs } = await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([
+          vramItem({ index: 0, delta_mb: 22528 }),
+          vramItem({ index: 1, delta_mb: 4096 }),
+        ]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    // One read-only benchmark number per row, each matched to its own GPU index.
+    const numbers = (await screen.findAllByLabelText(
+      t.runtimeSpecVramBenchmark,
+    )) as HTMLInputElement[];
+    expect(numbers.map((el) => el.value)).toEqual(['22528', '4096']);
+
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecVramApply })[1]);
+
+    // The SECOND row's estimate, and only it.
+    expect(vramField(1).value).toBe('4096');
+    expect(vramField(0).value).toBe('0');
+    // Not the GPU index, and not the agent's own measurement beside it.
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecGpuIndex) as HTMLInputElement[]).map((el) => el.value),
+    ).toEqual(['0', '1']);
+    expect(screen.getByText(`${t.runtimeSpecVramMeasured}: 21500 MB`)).toBeInTheDocument();
+    // FILLS, does not write: the operator still has to save.
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+    expect(putSpecs).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus).toEqual([
+      { index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      // The applied number landed in the ESTIMATE. `vram_measured_mb` still
+      // carries the agent's value (the backend ignores it on write anyway) --
+      // the affordance must never move a number into the agent's column.
+      { index: 1, vram_estimate_mb: 4096, vram_measured_mb: 21500 },
+    ]);
+  });
+
+  it('renders the benchmark number read-only and leaves the estimate editable', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528 })]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    const benchmarkNumber = await screen.findByLabelText(t.runtimeSpecVramBenchmark);
+    // `Field`'s readOnly prop, not `inputProps={{readOnly:true}}`: it also
+    // strips the editable outline, and the marker is what jsdom can see.
+    expect(benchmarkNumber).toHaveAttribute('readonly');
+    expect(benchmarkNumber.closest('[data-readonly="true"]')).not.toBeNull();
+    // The operator's own field is untouched by that treatment.
+    expect(vramField(0)).not.toHaveAttribute('readonly');
+    expect(vramField(0).closest('[data-readonly="true"]')).toBeNull();
+    // And the hint says what Apply does, so "applied" is never read as "saved".
+    expect(screen.getByText(t.runtimeSpecVramApplyHint)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(t.runtimeSpecVramBenchmarkFrom))).toBeInTheDocument();
+  });
+
+  it('names which of the two reported numbers it would fill', async () => {
+    // No delta (an agent-measured-only result): the fallback is offered, and
+    // labelled as the agent's per-process measurement rather than as a delta.
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 0, measured_mb: 21000 })]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    const benchmarkNumber = (await screen.findByLabelText(
+      t.runtimeSpecVramBenchmark,
+    )) as HTMLInputElement;
+    expect(benchmarkNumber.value).toBe('21000');
+    expect(screen.getByText(t.runtimeSpecVramBenchmarkSourceMeasured)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramBenchmarkSourceDelta)).not.toBeInTheDocument();
+  });
+
+  it('offers nothing for a GPU the run reached no number for', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        // Index 1 measured 0, i.e. UNKNOWN -- and index 2 is not a row here.
+        vramHistoryRun([
+          vramItem({ index: 0, delta_mb: 22528 }),
+          vramItem({ index: 1, delta_mb: 0, measured_mb: 0 }),
+          vramItem({ index: 2, delta_mb: 8192 }),
+        ]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecVramBenchmark);
+    // Exactly one apply, on the one row with a real number. A zero must never
+    // reach a field: 0 means UNKNOWN, not "this model is free".
+    expect(screen.getAllByRole('button', { name: t.runtimeSpecVramApply })).toHaveLength(1);
+    expect(screen.getAllByLabelText(t.runtimeSpecVramBenchmark)).toHaveLength(1);
+    expect(vramField(1).value).toBe('22000');
+  });
+
+  it('offers nothing at all when the newest run reached no result', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([], { inconclusive: 'already_resident' }),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    // An inconclusive run is NOT a measurement of 0: there is no number, so
+    // there is no affordance and no field showing one.
+    expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecVramBenchmark)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramApplyHint)).not.toBeInTheDocument();
+    expect(vramField(0).value).toBe('0');
+  });
+
+  it('offers nothing when the run could not prove its isolation', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528 })], { isolated: false }),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
+  });
+
+  it('survives a history read that fails, and offers nothing', async () => {
+    // The affordance is a bonus, not a precondition: a failed GET must not
+    // break the form an operator opened to edit their launch config.
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => {
+        throw new Error('history unavailable');
+      }) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
+  });
+
+  it('offers nothing on the CREATE form, which has no measurement yet', async () => {
+    const { fakeApi } = renderSection({
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528 })]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecGpuAdd }));
+    expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
+    // No mapping exists yet, so there is nothing to read a history for.
+    expect(fakeApi.mappingBenchmarks).not.toHaveBeenCalled();
   });
 });

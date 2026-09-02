@@ -29,6 +29,7 @@ import ArticleIcon from '@mui/icons-material/Article';
 import SpeedIcon from '@mui/icons-material/Speed';
 import type {
   ApplicationStatus,
+  BenchmarkRunDTO,
   GPUBudget,
   HardwareGPU,
   PortalApplication,
@@ -40,6 +41,8 @@ import type {
   RuntimeSpecGPU,
   RuntimeStatus,
   UpdateMappingRequest,
+  VRAMGPUItemDTO,
+  VRAMReportDTO,
 } from '../api';
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
@@ -56,6 +59,7 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { latestApplicableVramRun, vramApplyNumber } from './shared/vram';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
@@ -2032,6 +2036,63 @@ export function RuntimeAdminSection({
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
 
+  /**
+   * The newest VRAM measurement this mapping has, for the per-GPU APPLY
+   * affordance below -- and it is an offer, never a writer.
+   *
+   * The VRAM benchmark reports a number and writes NEITHER VRAM field: not
+   * `vram_measured_mb`, which is agent-owned and feeds admission arithmetic as
+   * the spec's own declared demand (a breach by a measured value is terminal,
+   * so a gateway-computed delta that overshot would refuse every future start
+   * of a model that had been working); and not `vram_estimate_mb`, which is
+   * operator-owned and whose whole meaning is "what the operator declares".
+   * So the run leaves its number in a `kind = "vram"` history row as EVIDENCE,
+   * and this is where an operator picks it up: Apply fills the estimate field
+   * beside it and they save.
+   *
+   * Read from the mapping's own benchmark history rather than passed in,
+   * because the run happens on another screen (the benchmark area) and minutes
+   * or days earlier. `latestApplicableVramRun` is the gate: right kind,
+   * definitive result, proven isolation, at least one positive number.
+   */
+  const [vramEvidence, setVramEvidence] = useState<{
+    run: BenchmarkRunDTO;
+    report: VRAMReportDTO;
+  } | null>(null);
+  const editingSpecMappingId = typeof specMode === 'object' ? specMode.mapping.id : '';
+  useEffect(() => {
+    // No mapping, no history: the CREATE form has nothing to read a
+    // measurement for, and must not fetch one.
+    if (!editingSpecMappingId) {
+      setVramEvidence(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .mappingBenchmarks(editingSpecMappingId)
+      .then((runs) => {
+        if (!cancelled) setVramEvidence(latestApplicableVramRun(runs));
+      })
+      .catch(() => {
+        // Non-blocking: the affordance is a bonus on top of the form, so a
+        // failed history GET must not break the launch config the operator
+        // actually came here to edit.
+        if (!cancelled) setVramEvidence(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, editingSpecMappingId]);
+
+  // index -> that card's measured item, so a row finds its own number and
+  // never a sibling's. The run reports the indexes IT watched, which need not
+  // be the rows the spec declares today.
+  const vramMeasuredByIndex = useMemo(() => {
+    const byIndex = new Map<number, VRAMGPUItemDTO>();
+    for (const gpu of vramEvidence?.report.gpus ?? []) byIndex.set(gpu.index, gpu);
+    return byIndex;
+  }, [vramEvidence]);
+
   function resetSpecFields() {
     setEnabled(true);
     setBinary('');
@@ -2144,6 +2205,61 @@ export function RuntimeAdminSection({
   // where the backend's own refusal would land.
   function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+
+  /**
+   * The APPLY affordance for one GPU row: the benchmark's number for that card,
+   * read-only, plus a button that FILLS the operator's estimate field beside
+   * it. Nothing is written -- `updateGpuRow` touches form state only, and the
+   * operator saves.
+   *
+   * Returns null when this card has no positive number in the newest
+   * applicable run, which covers the create form, an inconclusive run, a run
+   * whose isolation was never proven, and a declared card the run watched but
+   * measured nothing on. Offering a 0 there would put "this model is free"
+   * into the admission arithmetic through the operator's own field.
+   *
+   * Matched BY GPU INDEX, never by row position: the run reports the indexes it
+   * watched, and the rows may have been reordered, added to or removed since.
+   */
+  function renderVramApply(row: GpuRow, rowIdx: number) {
+    const item = vramMeasuredByIndex.get(row.index);
+    const applicable = vramApplyNumber(item);
+    if (!applicable) return null;
+    // Which of the two reported quantities this is. They are never averaged
+    // and never silently interchanged, so the source is on screen next to the
+    // number the operator is about to adopt.
+    const source =
+      applicable.source === 'delta'
+        ? t.runtimeSpecVramBenchmarkSourceDelta
+        : t.runtimeSpecVramBenchmarkSourceMeasured;
+    return (
+      <>
+        <Field
+          id={`runtime-spec-gpu-vram-benchmark-${rowIdx}`}
+          label={t.runtimeSpecVramBenchmark}
+          value={String(applicable.mb)}
+          // The no-op is load-bearing, not decoration: jsdom's fireEvent.change
+          // fires on a readOnly input, so a live handler would still drive state
+          // and give a test a false green on a write no real user can perform.
+          onChange={() => {}}
+          // `readOnly`, not `disabled` and not `inputProps={{readOnly:true}}`:
+          // this number's whole job is to be READ, and the prop is what also
+          // strips the editable outline chrome.
+          readOnly
+          helperText={item?.unified_memory ? `${source} — ${t.benchmarkVramUnifiedMemory}` : source}
+          sx={{ maxWidth: 240 }}
+        />
+        <Button
+          type="button"
+          variant="outlined"
+          size="small"
+          onClick={() => updateGpuRow(rowIdx, { vramEstimateMb: applicable.mb })}
+        >
+          {t.runtimeSpecVramApply}
+        </Button>
+      </>
+    );
   }
 
   // The reported GPUs row `rowIdx` may be switched to: every telemetry card
@@ -3431,6 +3547,20 @@ export function RuntimeAdminSection({
                   <Typography variant="body2" color="text.secondary" sx={{ minWidth: 200 }}>
                     {t.runtimeSpecVramMeasured}: {row.vramMeasuredMb} MB
                   </Typography>
+                  {/* THE THIRD NUMBER, and the only one this form merely
+                      OFFERS. Rendered read-only through `Field`'s own prop
+                      (which also strips the editable chrome) so it can never be
+                      mistaken for the field to the left: that one is the
+                      operator's estimate, the line above is the agent's
+                      measurement, and this is the benchmark's. Three numbers,
+                      three meanings, one owner each.
+
+                      Present only when this GPU index actually carries a
+                      positive number in the newest applicable run. A zero is
+                      UNKNOWN throughout this feature, so an unmeasured card
+                      gets no affordance rather than an Apply that would write
+                      "this model is free" into the admission arithmetic. */}
+                  {renderVramApply(row, idx)}
                   <Button
                     type="button"
                     size="small"
@@ -3441,6 +3571,17 @@ export function RuntimeAdminSection({
                   </Button>
                 </Box>
               ))}
+              {vramEvidence && (
+                <Box>
+                  <Typography variant="caption" color="text.secondary" component="p">
+                    {t.runtimeSpecVramBenchmarkFrom}:{' '}
+                    {new Date(vramEvidence.run.created_at).toLocaleString()}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" component="p">
+                    {t.runtimeSpecVramApplyHint}
+                  </Typography>
+                </Box>
+              )}
               <Box>
                 <Button type="button" variant="outlined" size="small" onClick={addGpuRow}>
                   {t.runtimeSpecGpuAdd}
