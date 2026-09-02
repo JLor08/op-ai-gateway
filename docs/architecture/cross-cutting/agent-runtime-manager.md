@@ -3389,8 +3389,18 @@ make the feature unusable on exactly the
 and an agent with no open WebSocket (`post_transport_agent` — nothing the run
 writes reaches it before its next runtime poll, so the drain does not even
 begin until then and the server is held for correspondingly longer; the run
-says so rather than refusing). A third warns on a result rather than before
-it: `undeclared_gpu_allocation` — see *Which cards are watched* below.
+says so rather than refusing). Two more warn on a **result** rather than before
+it: `undeclared_gpu_allocation` — see *Which cards are watched* below — and
+`residency_unknown`, which is the honesty half of the `already_resident`
+signal. That signal is the loaded-models probe, and it needs an
+application-level `loaded_models_path`: operator-entered, with **no default**,
+and empty on most agent-managed applications, whose child sits behind the
+agent's own router. Without it (or when the probe errors) the run gets "not
+resident" for a model that may well be resident, the baseline already contains
+it, and the ~0 delta surfaces at the floor gate as `below_floor` — whose next
+action, *"the window missed the allocation, measure again when the server is
+quiet"*, fails identically every time. So the run reports the check as
+**unavailable** rather than letting the wrong reason stand in for it.
 
 **`isolated` is evidence, never a 200.** In file mode every `admin_state` write
 succeeds and stops nothing, so a write's success proves nothing anywhere. The
@@ -3527,7 +3537,10 @@ says **why**, because the operator's next action differs per reason:
 - **`already_resident`** — after a *confirmed* drain, a model that still
   reports resident is being served by something the gateway could not stop
   (a non-managed application on the same host, most likely). The resident
-  short-circuit is a contamination **signal**, not a shortcut.
+  short-circuit is a contamination **signal**, not a shortcut. It is only
+  available where the target's application carries a `loaded_models_path`;
+  where it does not, the run says so with `residency_unknown` rather than
+  reporting a negative it did not establish.
 - **`below_floor`** — no model costs ~0 MB, so a headline delta under the noise
   floor can only mean the window missed the allocation or something else
   absorbed it.

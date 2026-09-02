@@ -24,7 +24,7 @@ func (s *Server) runLoadModel(ctx context.Context, run *benchmarkRun, serverID s
 		s.Benchmarks.publish(serverID, run.snapshot())
 	}()
 
-	if _, err := s.ensureResidentForRun(ctx, tgt); err != nil {
+	if _, _, err := s.ensureResidentForRun(ctx, tgt); err != nil {
 		res.Error = err.Error()
 		return
 	}
@@ -51,34 +51,53 @@ func (s *Server) runLoadModel(ctx context.Context, run *benchmarkRun, serverID s
 // value (it only wants the model up); the VRAM run reports inconclusive on
 // it, because a delta measured against a baseline that already contains the
 // model is a definitive ~0.
-func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) (alreadyResident bool, err error) {
+//
+// residencyProbed IS THE OTHER HALF OF THAT SIGNAL, and it exists because
+// "not resident" and "could not tell" are not the same answer. The probe
+// needs an application-level loaded_models_path (operator-entered, no
+// default) and a mapping-level app model name, and it can fail outright -- and
+// in each of those cases alreadyResident is false for a model that may well
+// be resident. A caller that treats the signal as load-bearing has to know
+// which of the two it got: the VRAM run reports the unavailability as a
+// caveat, because otherwise the contamination surfaces as a sub-floor delta
+// whose stated next action can never work.
+func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) (alreadyResident, residencyProbed bool, err error) {
 	streamer, ok := s.Provider.(provider.StreamingClient)
 	if !ok {
-		return false, errBenchmarkNoStreaming
+		return false, false, errBenchmarkNoStreaming
 	}
 	target, req := benchmarkTargetReq(tgt)
 	req.MaxTokens = 1 // minimal — we only want the model loaded
 
-	if s.modelResident(ctx, target, tgt) {
-		return true, nil
+	resident, probed := s.modelResident(ctx, target, tgt)
+	if resident {
+		return true, probed, nil
 	}
 	if _, _, err := s.streamOnce(ctx, streamer, target, req); err != nil {
-		return false, err
+		return false, probed, err
 	}
 	s.reflectLoadedAfterLoad(ctx, target, tgt)
-	return false, nil
+	return false, probed, nil
 }
 
-// modelResident best-effort reports whether tgt's upstream model is already loaded on tgt's server.
-// False on any error / no probe configured.
-func (s *Server) modelResident(ctx context.Context, target routing.Target, tgt benchmarkTarget) bool {
+// modelResident best-effort reports whether tgt's upstream model is already
+// loaded on tgt's server, and whether the question was ANSWERED at all.
+//
+// probed is false when there is nothing to ask (no LoadedModelLister, no
+// application loaded_models_path, no mapping app model name) or when the ask
+// failed. resident is then false as well, but it is false the way an
+// unanswered question is false -- see ensureResidentForRun's residencyProbed.
+func (s *Server) modelResident(ctx context.Context, target routing.Target, tgt benchmarkTarget) (resident, probed bool) {
 	lister, ok := s.Provider.(provider.LoadedModelLister)
 	if !ok || strings.TrimSpace(tgt.app.LoadedModelsPath) == "" || strings.TrimSpace(tgt.mapping.AppModelName) == "" {
-		return false
+		return false, false
 	}
 	probeCtx := s.upstreamAuthCtx(ctx, target)
 	loaded, err := modelLoaded(probeCtx, lister, target, tgt.app, tgt.mapping.AppModelName)
-	return err == nil && loaded
+	if err != nil {
+		return false, false
+	}
+	return loaded, true
 }
 
 // reflectLoadedAfterLoad best-effort re-probes the app's loaded set and writes it to the gateway-poll

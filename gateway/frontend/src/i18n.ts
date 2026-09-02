@@ -915,6 +915,8 @@ const de = {
     'Der Agent hat keine offene WebSocket-Verbindung. Jeder Override erreicht ihn deshalb erst mit seiner nächsten Abfrage: das Anhalten der Modelle hat entsprechend später überhaupt erst begonnen, und der Server war dadurch länger blockiert.',
   benchmarkVramWarningUndeclaredGpu:
     'Das Modell hat auch auf einer GPU Speicher belegt, die diese Launch-Spec nicht deklariert – ohne set_visible_devices sieht der Prozess alle Karten. Die Zahlen je Karte sind korrekt, aber die Spec beschreibt das Modell unvollständig: legen Sie die fehlende GPU-Zeile an und messen Sie erneut.',
+  benchmarkVramWarningResidencyUnknown:
+    'Der Lauf konnte nicht prüfen, ob das Modell schon von etwas anderem bedient wird: dieser Anwendung fehlt ein Endpunkt für geladene Modelle (loaded_models_path), oder die Abfrage schlug fehl. Eine dadurch unentdeckte Fremdbelegung erscheint als zu kleine Differenz – hinterlegen Sie den Endpunkt, wenn Sie diese Prüfung brauchen.',
   benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Basis (MB)',
@@ -2967,6 +2969,8 @@ const en: PortalMessages = {
     'The agent has no open WebSocket. Every override therefore reaches it only on its next poll, so stopping the models did not even begin until then and the server was held for correspondingly longer.',
   benchmarkVramWarningUndeclaredGpu:
     'The model also allocated on a GPU this launch spec does not declare — without set_visible_devices the process sees every card. The per-card numbers are correct, but the spec describes the model incompletely: add the missing GPU row, then measure again.',
+  benchmarkVramWarningResidencyUnknown:
+    'The run could not check whether something else is already serving this model: this application has no loaded-models endpoint (loaded_models_path), or the probe failed. A contamination missed that way shows up as a too-small delta instead — configure the endpoint if you need that check.',
   benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Baseline (MB)',

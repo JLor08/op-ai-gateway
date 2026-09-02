@@ -190,7 +190,16 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// keeps naming it: this run did force-stop it.
 	pendingRestore = vramWithout(pendingRestore, plan.targetSpecID)
 
-	alreadyResident, err := s.ensureResidentForRun(ctx, tgt)
+	alreadyResident, residencyProbed, err := s.ensureResidentForRun(ctx, tgt)
+	if !residencyProbed {
+		// The contamination check could not be MADE -- no loaded-models probe
+		// on this application, or the probe failed. "Not resident" is then an
+		// unanswered question rather than a no, and the caveat is the only
+		// thing standing between the operator and the wrong next action: an
+		// undetected already-resident model surfaces as a sub-floor delta,
+		// whose message sends them to retry a run that fails identically.
+		report.Warnings = append(report.Warnings, vramWarningResidencyUnknown)
+	}
 	if err != nil {
 		report.Inconclusive = vramInconclusiveRunFailed
 		res.Error = err.Error()

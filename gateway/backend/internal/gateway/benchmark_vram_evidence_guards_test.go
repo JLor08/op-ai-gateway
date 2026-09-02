@@ -255,6 +255,62 @@ func TestVRAMRunNoWatchedCardIsInconclusiveNotZero(t *testing.T) {
 	}
 }
 
+// --- a contamination check that could not be made --------------------------
+
+// TestVRAMRunSaysWhenItCouldNotCheckForContamination is the honesty half of
+// the already_resident signal: it is documented as load-bearing ("a
+// contamination SIGNAL, not a convenience"), and on most agent-managed
+// applications it cannot fire at all.
+//
+// modelResident answers false when the provider is no LoadedModelLister, when
+// the application has no loaded_models_path (operator-entered, with NO
+// default -- so it is empty unless somebody filled it in, and the child of a
+// server_agent application sits behind the agent's router), when the mapping
+// has no app model name, or on any probe error. ensureResidentForRun then
+// reported alreadyResident=false, the run measured through the contamination,
+// the baseline already contained the model, and the ~0 delta fell out at the
+// floor gate as `below_floor` -- whose next action is "the window missed the
+// allocation, measure again when the server is quiet", which fails
+// identically every time. The reason an operator needed was
+// already_resident's: something the gateway cannot stop is serving this model.
+//
+// A signal that is unavailable must be REPORTED as unavailable, so the run
+// carries the caveat rather than letting a wrong reason stand in for it.
+func TestVRAMRunSaysWhenItCouldNotCheckForContamination(t *testing.T) {
+	t.Run("the target application has no loaded-models probe", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{})
+		f.seedLatestSample()
+		f.drive(t)
+		f.provider.onStream = func() { f.used0.Store(21500 * oneMiB) }
+
+		res := vramOneResult(t, f.run(t))
+		if res.VRAM == nil {
+			t.Fatal("VRAM = nil, want a report")
+		}
+		if !containsString(res.VRAM.Warnings, vramWarningResidencyUnknown) {
+			t.Fatalf("warnings = %v, want %q: the run could not check whether something else was already serving this model", res.VRAM.Warnings, vramWarningResidencyUnknown)
+		}
+	})
+
+	t.Run("a probe that answered leaves no caveat", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{})
+		f.seedLatestSample()
+		f.drive(t)
+		// The application has a loaded-models endpoint and it answers: the
+		// model is not resident, which is a real answer and not a missing one.
+		f.target.app.LoadedModelsPath = "/loaded"
+		f.provider.onStream = func() { f.used0.Store(21500 * oneMiB) }
+
+		res := vramOneResult(t, f.run(t))
+		if res.VRAM == nil {
+			t.Fatal("VRAM = nil, want a report")
+		}
+		if containsString(res.VRAM.Warnings, vramWarningResidencyUnknown) {
+			t.Fatalf("warnings = %v, want no residency caveat: the probe answered", res.VRAM.Warnings)
+		}
+	})
+}
+
 // --- a cancelled run is a cancelled run ------------------------------------
 
 // TestVRAMRunACancelledRunIsNotAnAgentThatWentAway is the conflation every

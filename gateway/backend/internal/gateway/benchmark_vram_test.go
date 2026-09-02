@@ -322,6 +322,10 @@ func TestVRAMResultVocabularyIsPinned(t *testing.T) {
 		// Why this run believes a spec was not running. Nothing else counts.
 		{vramEvidenceStoppedAfterWrite, "stopped_after_write"},
 		{vramEvidenceNoProcessAtWrite, "no_process_at_write"},
+		// What degraded a run's confidence without invalidating its number.
+		{vramWarningNonManagedApplications, "non_managed_applications"},
+		{vramWarningPostTransportAgent, "post_transport_agent"},
+		{vramWarningResidencyUnknown, "residency_unknown"},
 		// What identified the card a number is attributed to.
 		{vramFingerprintUUID, "uuid"},
 		{vramFingerprintNameTotal, "name_total"},

@@ -35,6 +35,7 @@ const warningLabelKeys: Readonly<Record<string, MessageKey>> = {
   non_managed_applications: 'benchmarkVramWarningNonManaged',
   post_transport_agent: 'benchmarkVramWarningPostTransport',
   undeclared_gpu_allocation: 'benchmarkVramWarningUndeclaredGpu',
+  residency_unknown: 'benchmarkVramWarningResidencyUnknown',
 };
 
 // Which field IDENTIFIED the card at measurement time -- a record of what the
