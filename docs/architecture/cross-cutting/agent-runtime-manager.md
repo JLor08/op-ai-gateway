@@ -3363,25 +3363,55 @@ manage (`non_managed_applications` — refusing would not improve isolation,
 since those processes are outside the agent's control either way, and would
 make the feature unusable on exactly the
 [migration-path deployments §13 blesses](#13-known-limitations-and-accepted-risks)),
-and an agent with no open WebSocket (`post_transport_agent` — the override
-binds only on its next runtime poll, so the run extends its bound rather than
-costing the operator the run).
+and an agent with no open WebSocket (`post_transport_agent` — nothing the run
+writes reaches it before its next runtime poll, so the drain does not even
+begin until then and the server is held for correspondingly longer; the run
+says so rather than refusing).
 
 **`isolated` is evidence, never a 200.** In file mode every `admin_state` write
 succeeds and stops nothing, so a write's success proves nothing anywhere. The
 run holds per-spec evidence it produced itself, reported alongside the boolean
 as `isolation_evidence` so the claim can be audited:
 
-- `stopped_after_write` — a no-process state observed for a spec that **had** a
-  live process when the write landed. That is a real transition, and the
-  transition is itself the proof the override arrived.
+- `stopped_after_write` — a spec that **had** a live process when the write
+  landed is in a no-process state on a post-delay frame.
 - `no_process_at_write` — the spec had **no** live process, so a `force_stopped`
   write against it does nothing at all: no state change, no frame
   ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)). It can only be
   *confirmed*, never awaited — waiting for a transition that will never arrive
-  is what turns an already-quiet server into an isolation timeout — and only
-  after the transport's own binding delay has elapsed, or the run would claim a
-  refusal-to-start the agent has not yet been told about.
+  is what turns an already-quiet server into an isolation timeout.
+
+**Both** values are recorded only from a frame that arrived after the agent's
+**binding delay** has elapsed since the write, and that delay is the agent's own
+**runtime-poll interval** (60 s) **whatever the transport looks like**. Two
+things this used to get wrong, and both let the run confirm an isolation it had
+not earned:
+
+- *The delay gated one half only.* A stop **transition** was treated as
+  self-evident proof the override arrived. It is not: a spec's own exit looks
+  identical on the wire — an idle timeout, which the run's own reservation makes
+  likely because it leaves every sibling idle, or a crash landing in `crashed`
+  or `backoff`, both no-process states and both states the agent **restarts
+  from**. Confirming on that frame read a self-exit as an applied override, and
+  the spec was then one backoff timer or one router request away from running
+  straight through the measurement. (It also made the live-at-write
+  classification's one-sample staleness matter, because a spec that had already
+  exited before the write was mislabelled *live* and so bought the delay-free
+  branch — the stronger label for exactly the case the delay exists for.)
+- *The delay was picked from the transport.* Two seconds for a WS-connected
+  agent, the poll interval otherwise. That gave the WS push the standing of a
+  delivery, and it has none: there is **no acknowledgement anywhere**
+  ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)),
+  `PushRuntimeConfig` runs in a detached goroutine that returns silently when
+  the derive or the marshal fails, and `NotifyRuntimeConfig` sends to **zero**
+  connections when the socket closed after the probe or drops the frame with a
+  `slog.Debug` when a send queue is full — in each case the override binds on
+  the next poll anyway. The probe was also taken **before** the drain wrote
+  anything, so even a truthful answer said nothing about the transport at write
+  time. The poll is the one mechanism that is guaranteed (the agent re-fetches
+  the whole document on every poll and every reconnect), so one interval
+  measured from the write always covers a full cycle. An open WebSocket makes
+  arrival sooner *likely* and nothing rests on it.
 
 `isolated` is true only when **every** enumerated spec carries one of those two
 values. An **empty** enumeration is `false`, not vacuously true: "nothing

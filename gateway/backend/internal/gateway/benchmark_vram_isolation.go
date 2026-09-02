@@ -74,18 +74,31 @@ const (
 // coldLoadPollGap precedent) so tests shorten them, and each needs validating
 // against a real fleet before it is treated as settled.
 var (
-	// vramIsolationBindDelayWS is how long a WS-connected agent is given to
-	// have APPLIED a pushed override before a no-process spec is recorded as
-	// refused-to-start. The push itself is immediate, but there is no
-	// acknowledgement anywhere (the only observable evidence a config change
-	// took effect is its EFFECT on the status stream), and for a spec with no
-	// process there is no effect to observe -- so this is a settle, not a
-	// measurement. Two sample cadences.
-	vramIsolationBindDelayWS = 2 * time.Second
-	// vramIsolationBindDelayPoll is the same delay for an agent with no open
-	// WebSocket: the override binds only on its next runtime poll, which the
-	// agent runs once a minute.
-	vramIsolationBindDelayPoll = 60 * time.Second
+	// vramIsolationBindDelay is how long the agent is given to have APPLIED
+	// this run's overrides before any spec is recorded as isolated. It is the
+	// agent's own runtime-poll interval (agent/agent.go's
+	// runtimePollInterval), and it is TRANSPORT-INDEPENDENT on purpose.
+	//
+	// It used to be two values, picked by AgentStreams.hasConn: two seconds for
+	// a WS-connected agent, the poll interval otherwise. That gave the WS push
+	// the standing of a delivery, and it has none. There is no acknowledgement
+	// anywhere in this protocol (§3.5), the push runs in a detached goroutine
+	// that returns silently when the derive or the marshal fails, and
+	// NotifyRuntimeConfig sends to zero connections when the socket closed
+	// after the probe or drops the frame with a slog.Debug when a send queue
+	// is full -- in each case the override binds on the next poll anyway, while
+	// the run had already confirmed the fleet and reported Isolated: true. The
+	// probe was also taken BEFORE the drain wrote anything, so even a truthful
+	// answer said nothing about the transport at write time.
+	//
+	// The poll is the one delivery mechanism that is guaranteed: the agent
+	// re-fetches the whole document on every poll and on every reconnect, so
+	// one interval measured from the write always covers a full cycle. An open
+	// WebSocket makes the push likely to arrive sooner, and NOTHING here rests
+	// on it; what it still decides is the operator-facing warning
+	// (vramWarningPostTransportAgent), because a drain that does not even begin
+	// for a minute is worth telling them about.
+	vramIsolationBindDelay = 60 * time.Second
 	// vramIsolationDrainBound is how long a spec that HAD a live process is
 	// given to drain, on top of the binding delay.
 	vramIsolationDrainBound = 60 * time.Second
@@ -250,11 +263,12 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMNotAgentManaged, msg: msgBenchmarkVRAMNotAgentManaged}
 	}
 
-	// Q10: warn and extend the bound on an agent with no open WebSocket,
-	// rather than refusing.
-	planned.bindDelay = vramIsolationBindDelayWS
+	// The binding delay is the agent's guaranteed poll interval, WHATEVER the
+	// transport looks like -- an unacknowledged push cannot shorten it (see
+	// vramIsolationBindDelay). Q10's answer therefore reduces to its warning
+	// half: an agent with no open WebSocket is told about, never refused.
+	planned.bindDelay = vramIsolationBindDelay
 	if !s.AgentStreams.hasConn(serverID) {
-		planned.bindDelay = vramIsolationBindDelayPoll
 		planned.warnings = append(planned.warnings, vramWarningPostTransportAgent)
 	}
 	// Q5: warn on a non-managed neighbour, do not refuse.
@@ -399,15 +413,37 @@ func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, err
 // the write. Channel ordering IS the watermark, and it needs no clock
 // comparison between the gateway and the agent.
 //
-// THE PARTITION, and why both halves are needed. A spec that HAD a live
-// process is waited for until a no-process state appears: that is a real
-// TRANSITION, and it is itself the proof the override arrived. A spec that
-// had NO live process produces no state change and no frame at all -- a
-// force_stopped write against it does nothing -- so it can only be CONFIRMED,
-// and only once the transport's binding delay has elapsed; before that,
-// "force_stopped refuses its restart" is a claim about a document the agent
-// has not read. Waiting for a transition that will never arrive is what turns
-// an already-quiet server into an isolation timeout.
+// THE BINDING DELAY GATES BOTH HALVES OF THE PARTITION, and that is the whole
+// of what "evidence" means here. Until vramIsolationBindDelay has elapsed
+// since the write, the agent may not hold the document at all, so no frame in
+// that window says anything about this run: the delay is applied first and the
+// partition only afterwards.
+//
+// It used to gate one half only. A spec with no live process was confirmed
+// after the delay, but a spec that HAD one was confirmed by the first
+// no-process frame with no delay whatsoever -- on the reasoning that a stop
+// TRANSITION is itself the proof the override arrived. It is not. A spec's own
+// exit looks exactly the same on the wire: an idle timeout (which the run's own
+// reservation makes likely, since it leaves every sibling idle), or a crash
+// landing in `crashed`/`backoff` -- both no-process states, and both states the
+// agent RESTARTS from. Confirming on that frame claimed an applied override
+// from a self-exit, and the spec was then one backoff timer or one router
+// request away from running straight through the measurement.
+//
+// It also made vramLiveProcessBySpec's staleness matter. That classification
+// is up to one telemetry interval old, so a spec that had ALREADY exited before
+// the write can be labelled live -- and under the old order that mislabel
+// bought the delay-free branch, i.e. the stronger label, for exactly the case
+// the delay exists for. With the delay applied first, the misclassification
+// changes which evidence STRING is recorded and nothing else, which is what
+// that function's doc block always claimed.
+//
+// THE PARTITION, and why both halves are still needed. After the delay, a spec
+// that HAD a live process is waited for until a no-process state appears; a
+// spec that had NO live process produces no state change and no frame of its
+// own -- a force_stopped write against it does nothing -- so it can only be
+// CONFIRMED, never awaited. Waiting for a transition that will never arrive is
+// what turns an already-quiet server into an isolation timeout.
 //
 // Partial evidence is returned even on a timeout, so the report can be
 // audited rather than believed.
@@ -441,7 +477,12 @@ func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specID
 			for _, status := range frame {
 				stateBySpec[status.SpecID] = status.State
 			}
-			bound := time.Now().Before(bindDeadline)
+			if time.Now().Before(bindDeadline) {
+				// The override has not necessarily landed yet, so NOTHING on
+				// this frame is evidence -- for either half of the partition.
+				// See the doc block above.
+				continue
+			}
 			for specID := range pending {
 				state, present := stateBySpec[specID]
 				if !present || !vramStateNoProcess(state) {
@@ -451,9 +492,6 @@ func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specID
 					evidence[specID] = vramEvidenceStoppedAfterWrite
 					delete(pending, specID)
 					continue
-				}
-				if bound {
-					continue // the override has not necessarily landed yet
 				}
 				evidence[specID] = vramEvidenceNoProcessAtWrite
 				delete(pending, specID)

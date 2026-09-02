@@ -21,15 +21,23 @@ const benchmarkKindVRAM = "vram"
 // evidence, because a file-mode agent never reads the document that write
 // lands in, so every such write succeeds while stopping nothing.
 const (
-	// vramEvidenceStoppedAfterWrite: a stopped transition observed on a status
-	// frame LATER than this run's own force_stopped write. A stopped frame that
-	// predates the write proves nothing.
+	// BOTH values are recorded only from a frame that arrived after the
+	// agent's own binding delay elapsed (vramIsolationBindDelay). Neither is
+	// evidence before then: no push is acknowledged anywhere, so until the
+	// agent's guaranteed poll has had time to happen the gateway does not know
+	// the document reached it, and every observation in that window is
+	// compatible with an override that never arrived.
+
+	// vramEvidenceStoppedAfterWrite: a spec that HAD a live process when the
+	// write landed is in a no-process state on a post-delay frame. A stopped
+	// frame that predates the write proves nothing -- and neither does one from
+	// inside the binding delay, because a spec's own exit (an idle timeout, a
+	// crash into `crashed`/`backoff`, both of which the agent restarts from)
+	// looks identical to an applied override.
 	vramEvidenceStoppedAfterWrite = "stopped_after_write"
 	// vramEvidenceNoProcessAtWrite: the spec had no live process when the write
-	// landed, and force_stopped refuses its restart. Recorded only after the
-	// transport's own binding delay has elapsed (a WS-connected agent applies a
-	// push at once; a POST-transport agent picks it up on its runtime poll), or
-	// it claims a refusal-to-start the agent has not yet been told about.
+	// landed, and force_stopped refuses its restart -- a claim about a document
+	// the agent has to be holding, hence the same post-delay rule.
 	vramEvidenceNoProcessAtWrite = "no_process_at_write"
 )
 

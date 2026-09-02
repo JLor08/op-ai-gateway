@@ -156,24 +156,22 @@ func forEachVRAMStore(t *testing.T, run func(t *testing.T, newStore func(t *test
 func shrinkVRAMTimings(t *testing.T) {
 	t.Helper()
 	old := []any{
-		vramIsolationBindDelayWS, vramIsolationBindDelayPoll, vramIsolationDrainBound,
+		vramIsolationBindDelay, vramIsolationDrainBound,
 		vramPhaseSettle, vramPhaseWindowBound, vramMeasuredWaitBound, vramRestoreTimeout,
 	}
-	vramIsolationBindDelayWS = 10 * time.Millisecond
-	vramIsolationBindDelayPoll = 30 * time.Millisecond
+	vramIsolationBindDelay = 10 * time.Millisecond
 	vramIsolationDrainBound = 2 * time.Second
 	vramPhaseSettle = 5 * time.Millisecond
 	vramPhaseWindowBound = 2 * time.Second
 	vramMeasuredWaitBound = 300 * time.Millisecond
 	vramRestoreTimeout = 2 * time.Second
 	t.Cleanup(func() {
-		vramIsolationBindDelayWS = old[0].(time.Duration)
-		vramIsolationBindDelayPoll = old[1].(time.Duration)
-		vramIsolationDrainBound = old[2].(time.Duration)
-		vramPhaseSettle = old[3].(time.Duration)
-		vramPhaseWindowBound = old[4].(time.Duration)
-		vramMeasuredWaitBound = old[5].(time.Duration)
-		vramRestoreTimeout = old[6].(time.Duration)
+		vramIsolationBindDelay = old[0].(time.Duration)
+		vramIsolationDrainBound = old[1].(time.Duration)
+		vramPhaseSettle = old[2].(time.Duration)
+		vramPhaseWindowBound = old[3].(time.Duration)
+		vramMeasuredWaitBound = old[4].(time.Duration)
+		vramRestoreTimeout = old[5].(time.Duration)
 	})
 }
 
@@ -641,17 +639,13 @@ func TestVRAMRunPlanWarnsRatherThanRefusing(t *testing.T) {
 	if !containsString(plan.warnings, vramWarningNonManagedApplications) {
 		t.Fatalf("warnings = %v, want %q", plan.warnings, vramWarningNonManagedApplications)
 	}
-	// No open agent WebSocket: the push binds only on the agent's runtime
-	// poll, so the bound must cover that interval.
+	// No open agent WebSocket: the drain itself binds only on the agent's
+	// runtime poll, which is the operator-facing half of the caveat.
 	if !containsString(plan.warnings, vramWarningPostTransportAgent) {
 		t.Fatalf("warnings = %v, want %q", plan.warnings, vramWarningPostTransportAgent)
 	}
-	if plan.bindDelay != vramIsolationBindDelayPoll {
-		t.Fatalf("bindDelay = %v, want the poll interval %v", plan.bindDelay, vramIsolationBindDelayPoll)
-	}
 
-	// With a connected agent the push is immediate and the bound need only
-	// cover the drain.
+	// With a connected agent that caveat is gone.
 	f.srv.AgentStreams.add("srv1", &agentStreamConn{out: make(chan []byte, 1)})
 	plan, err = f.srv.vramRunPlan(context.Background(), f.target)
 	if err != nil {
@@ -660,8 +654,84 @@ func TestVRAMRunPlanWarnsRatherThanRefusing(t *testing.T) {
 	if containsString(plan.warnings, vramWarningPostTransportAgent) {
 		t.Fatalf("warnings = %v, want no transport warning for a WS-connected agent", plan.warnings)
 	}
-	if plan.bindDelay != vramIsolationBindDelayWS {
-		t.Fatalf("bindDelay = %v, want the WS delay %v", plan.bindDelay, vramIsolationBindDelayWS)
+}
+
+// TestVRAMRunPlanWarnsOnlyOnTheAgentsOwnNeighbours is the ABSENT half of the
+// non-managed-application warning, and the reason it needs its own test: the
+// server's own server_agent application is active by definition, so dropping
+// the `app.ID == agentAppID` clause from vramHasNonManagedApplications would
+// append `non_managed_applications` to EVERY run -- permanently telling the
+// operator their number is degraded by a neighbour that is the agent itself.
+// The happy path asserted no warning value in particular, so nothing noticed.
+func TestVRAMRunPlanWarnsOnlyOnTheAgentsOwnNeighbours(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+	// An open WebSocket too, so the ONLY thing that could put a value in
+	// warnings[] is a neighbouring application -- and there is none.
+	f.srv.AgentStreams.add("srv1", &agentStreamConn{out: make(chan []byte, 1)})
+
+	plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+	if err != nil {
+		t.Fatalf("vramRunPlan: %v", err)
+	}
+	if len(plan.warnings) != 0 {
+		t.Fatalf("warnings = %v, want none: the only active application on this server is the agent's own", plan.warnings)
+	}
+	// An INACTIVE neighbour is not a neighbour either -- it has no process.
+	now := time.Now().UTC()
+	if err := f.mem.CreateApplication(context.Background(), routing.Application{
+		ID: "app_disabled", ServerID: "srv1", Type: routing.ProviderLlamaCPP, Port: 8101, Scheme: "http",
+		TimeoutMS: 30000, Status: routing.ServerStatusDisabled, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	plan, err = f.srv.vramRunPlan(context.Background(), f.target)
+	if err != nil {
+		t.Fatalf("vramRunPlan (disabled neighbour): %v", err)
+	}
+	if containsString(plan.warnings, vramWarningNonManagedApplications) {
+		t.Fatalf("warnings = %v, want no neighbour warning for a DISABLED application", plan.warnings)
+	}
+}
+
+// TestVRAMRunPlanBindDelayDoesNotTrustAnUnacknowledgedPush is the rule the
+// binding delay actually rests on: THERE IS NO ACK ANYWHERE, so an open
+// WebSocket cannot shorten it.
+//
+// The delay used to be picked from AgentStreams.hasConn -- probed BEFORE the
+// drain wrote anything -- and it assumed a delivery nothing verifies.
+// PushRuntimeConfig runs in a detached goroutine and returns silently when the
+// derive or the marshal fails; AgentStreamRegistry.NotifyRuntimeConfig sends to
+// ZERO connections when the socket closed after that probe, and drops the frame
+// with a slog.Debug when a connection's send queue is full. In every one of
+// those cases the override binds only on the agent's next runtime poll, while
+// the run confirmed every idle spec two seconds after the write and reported
+// Isolated: true.
+//
+// So the bound is the one delivery mechanism that is GUARANTEED -- the poll --
+// whatever the transport looks like. hasConn still decides the operator-facing
+// WARNING, because "your agent has no open socket" is worth knowing; it decides
+// nothing about the evidence.
+func TestVRAMRunPlanBindDelayDoesNotTrustAnUnacknowledgedPush(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+
+	plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+	if err != nil {
+		t.Fatalf("vramRunPlan: %v", err)
+	}
+	if plan.bindDelay != vramIsolationBindDelay {
+		t.Fatalf("bindDelay = %v, want the guaranteed poll interval %v", plan.bindDelay, vramIsolationBindDelay)
+	}
+	// An open WebSocket buys the run nothing, because the push it enables
+	// carries no acknowledgement and fails silently three ways.
+	f.srv.AgentStreams.add("srv1", &agentStreamConn{out: make(chan []byte, 1)})
+	plan, err = f.srv.vramRunPlan(context.Background(), f.target)
+	if err != nil {
+		t.Fatalf("vramRunPlan (WS): %v", err)
+	}
+	if plan.bindDelay != vramIsolationBindDelay {
+		t.Fatalf("bindDelay = %v with an open WebSocket, want the guaranteed poll interval %v: an unacknowledged push is not applied isolation", plan.bindDelay, vramIsolationBindDelay)
 	}
 }
 
@@ -704,7 +774,7 @@ func TestVRAMIsolationConfirmsAnIdleSiblingWithoutAnyTransition(t *testing.T) {
 	)
 
 	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, live, vramIsolationBindDelayWS)
+		[]string{"rspec_sib", "rspec_target"}, live, vramIsolationBindDelay)
 	if !ok {
 		t.Fatalf("isolation timed out; evidence = %v", evidence)
 	}
@@ -716,6 +786,84 @@ func TestVRAMIsolationConfirmsAnIdleSiblingWithoutAnyTransition(t *testing.T) {
 	}
 	if !vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, evidence) {
 		t.Fatal("both specs carry this run's own evidence, so isolation must be confirmed")
+	}
+}
+
+// TestVRAMIsolationDoesNotTakeASelfExitAsAnAppliedOverride is the half of the
+// binding delay that was missing, and it is the same rule as the other half:
+// A SPEC'S OWN EXIT IS NOT PROOF THAT ANYTHING ARRIVED.
+//
+// The delay used to gate only a spec with NO live process at write time; a
+// spec that HAD one was confirmed by the first no-process frame, with no delay
+// at all. But a self-exit is indistinguishable from an applied override, and
+// the run makes one likely: its own reservation leaves every sibling idle, so
+// an idle timeout fires; a crash lands in `crashed` or `backoff`, which this
+// gateway counts as no-process states and WHICH THE AGENT RESTARTS
+// (owner.handleBackoffFire clears the timer and calls admitAndStart). Until
+// the override has bound, nothing refuses that restart -- so "it stopped after
+// we wrote" is a claim about a document the agent may not have read, exactly
+// as "force_stopped refuses its restart" is for an idle spec.
+func TestVRAMIsolationDoesNotTakeASelfExitAsAnAppliedOverride(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+	// ONE spec, live at write time, and nothing idle in the set: so the only
+	// thing that can hold the wait open is this spec's own delay. With the
+	// delay applied to the idle half alone, the whole set is confirmed on the
+	// first frame.
+	f.setStatuses(RuntimeStatusDTO{SpecID: "rspec_target", State: "running", PID: 4242})
+	f.drive(t)
+	live := map[string]bool{"rspec_target": true}
+	// Its process is gone on the very next frame -- an idle timeout, or a
+	// crash on the way out. Nothing here says the override caused it.
+	f.setStatuses(RuntimeStatusDTO{SpecID: "rspec_target", State: "backoff"})
+
+	bind := 150 * time.Millisecond
+	start := time.Now()
+	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_target"}, live, bind)
+	elapsed := time.Since(start)
+	if !ok {
+		t.Fatalf("isolation timed out; evidence = %v", evidence)
+	}
+	if elapsed < bind {
+		t.Fatalf("the set was confirmed after %v, before the %v binding delay elapsed: a self-exit was read as an applied override", elapsed, bind)
+	}
+	if evidence["rspec_target"] != vramEvidenceStoppedAfterWrite {
+		t.Fatalf("target evidence = %q, want %q", evidence["rspec_target"], vramEvidenceStoppedAfterWrite)
+	}
+}
+
+// TestVRAMIsolationRefusesASpecTheAgentRestartedInsideTheBindingDelay is the
+// consequence the delay exists to prevent, driven end to end: a spec whose
+// child crashed and whose backoff timer then started it again -- because the
+// force_stopped document had not reached the agent yet -- must NOT be
+// confirmed. Its no-process frame was real and proved nothing.
+//
+// Without the delay on this branch the `backoff` frame confirms the spec
+// immediately, pending empties, vramIsolationConfirmed returns true, and the
+// run measures a model sharing its cards with a sibling it reported as
+// isolated.
+func TestVRAMIsolationRefusesASpecTheAgentRestartedInsideTheBindingDelay(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+	f.setStatuses(RuntimeStatusDTO{SpecID: "rspec_target", State: "running", PID: 4242})
+	f.drive(t)
+	live := map[string]bool{"rspec_target": true}
+	// It crashes into the crash-loop wait...
+	f.setStatuses(RuntimeStatusDTO{SpecID: "rspec_target", State: "backoff"})
+	// ...and the agent starts it again, still not knowing it is force-stopped.
+	restarted := time.AfterFunc(40*time.Millisecond, func() {
+		f.setStatuses(RuntimeStatusDTO{SpecID: "rspec_target", State: "running", PID: 4243})
+	})
+	defer restarted.Stop()
+
+	oldBound := vramIsolationDrainBound
+	vramIsolationDrainBound = 100 * time.Millisecond
+	defer func() { vramIsolationDrainBound = oldBound }()
+
+	if evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_target"}, live, 150*time.Millisecond); ok {
+		t.Fatalf("a spec the agent restarted inside the binding delay was reported isolated: %v", evidence)
 	}
 }
 
@@ -739,7 +887,7 @@ func TestVRAMIsolationIgnoresAStaleStoppedFrame(t *testing.T) {
 	defer func() { vramIsolationDrainBound = oldBound }()
 
 	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationBindDelayWS)
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationBindDelay)
 	if ok {
 		t.Fatalf("a stale snapshot was accepted as this run's own evidence: %v", evidence)
 	}
@@ -797,7 +945,7 @@ func TestVRAMIsolationTimesOutOnASpecStillRunning(t *testing.T) {
 	defer func() { vramIsolationDrainBound = oldBound }()
 
 	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{"rspec_sib": true}, vramIsolationBindDelayWS)
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{"rspec_sib": true}, vramIsolationBindDelay)
 	if ok {
 		t.Fatalf("a still-running sibling was reported isolated: %v", evidence)
 	}
@@ -827,7 +975,7 @@ func TestVRAMIsolationRefusesAnUnrecognizedState(t *testing.T) {
 	defer func() { vramIsolationDrainBound = oldBound }()
 
 	if evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_target"}, map[string]bool{}, vramIsolationBindDelayWS); ok {
+		[]string{"rspec_target"}, map[string]bool{}, vramIsolationBindDelay); ok {
 		t.Fatalf("an unrecognized state was accepted as evidence: %v", evidence)
 	}
 }

@@ -899,7 +899,7 @@ const de = {
   benchmarkVramWarningNonManaged:
     'Dieser Server betreibt außerdem aktive Anwendungen, die der Agent nicht anhalten kann. Solange deren Verbrauch konstant bleibt, fällt er aus der Differenz heraus; ändert er sich während der Messung, ist die Zahl unzuverlässig.',
   benchmarkVramWarningPostTransport:
-    'Der Agent hat keine offene WebSocket-Verbindung, deshalb greift jeder Override erst mit seiner nächsten Abfrage. Der Lauf hat entsprechend länger auf die Isolation gewartet.',
+    'Der Agent hat keine offene WebSocket-Verbindung. Jeder Override erreicht ihn deshalb erst mit seiner nächsten Abfrage: das Anhalten der Modelle hat entsprechend später überhaupt erst begonnen, und der Server war dadurch länger blockiert.',
   benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Basis (MB)',
@@ -2932,7 +2932,7 @@ const en: PortalMessages = {
   benchmarkVramWarningNonManaged:
     'This server also hosts active applications the agent cannot stop. As long as their usage stays constant it cancels out of the delta; if it changes during the measurement the number is unreliable.',
   benchmarkVramWarningPostTransport:
-    'The agent has no open WebSocket, so every override binds only on its next poll. The run waited correspondingly longer for the isolation.',
+    'The agent has no open WebSocket. Every override therefore reaches it only on its next poll, so stopping the models did not even begin until then and the server was held for correspondingly longer.',
   benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Baseline (MB)',
