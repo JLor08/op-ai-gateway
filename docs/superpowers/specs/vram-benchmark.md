@@ -51,7 +51,9 @@ nothing. All three can still be *differenced*.
 
 The occupant fix landing on `windows-vram-measurer` (rule 5, see
 `specs/windows-vram-measurer.md`) makes an **unknown-demand occupant
-blocking**: idle → evicted, busy → `Wait`, pinned → `pending_vram_unknown`.
+blocking**: idle → evicted, busy → `Wait`, pinned → `pending_vram_unknown`
+(or `not_permitted` naming the closed cell, when the pair is not co-resident
+either — a missing estimate is not what blocks that one).
 That is correct, and it makes the cost of an unfilled `vram_estimate_mb`
 visible and immediate instead of silent.
 
@@ -64,8 +66,14 @@ is the operator's way through it.
 
 ## 3. What already exists (evidence)
 
-Everything in this section was read, not assumed. Line numbers are as of
-commit `8318c0e`.
+Everything in this section was read, not assumed. **Line numbers are as of this
+branch's tip**, re-derived after the admission-rule review fixes — not as of
+`8318c0e`, which this section declared while shipping on top of later commits:
+the rule-5 commit alone added ~40 lines inside `agent-runtime-manager.md`
+§5.2/§5.3 and ~90 to `policy.go`, shifting every reference below them (§5.6's
+levers table, once cited at `:1186-1204`, now starts at `:1299`). Where a number
+can shift again, the symbol or section name beside it is the durable anchor —
+re-derive, do not trust, an `NNNN` that no longer lands on what it names.
 
 ### 3.1 Run lifecycle: one run per server, reserved, cancellable
 
@@ -145,7 +153,7 @@ run kind is not swept into the scheduler by accident.
 | `routing.TelemetrySample.GPUs[]` = `GPUSample{Index, Name, UUID, UtilPct, MemUsedBytes, MemTotalBytes, …}` | **per GPU, host index space, with UUID** | agent pushes every `OP_AGENT_INTERVAL`, **default 1 s** (floor 250 ms) | `routing/store.go:264-292`, `:374-385`; cadence: `telemetry-usage-observability.md` §"`OP_AGENT_INTERVAL` \| 1s" |
 | Live per-GPU samples, gateway side | `s.ServerPerf` ring, cap 1200 samples, **volatile**, plus SSE fan-out | as above | `server_perf.go:11-19,47`, field at `server.go:138` |
 | Persisted per-GPU history | `server_telemetry_samples.gpus_json` | same samples, retained | `store/migrate.go:478`; read via `TelemetrySamples(serverID, from, to, limit)` |
-| Per-process measurement (strategy a) | `agent_runtime_sample.gpus[].vram_measured_mb` per `spec_id` | dispatched on the child's **first health pass** and on the owner's **15 s** housekeeping beat | agent: `runtime/manager.go:82` (`idleTickInterval`), `:1311` (`dispatchMeasurement`), `:1837` (health-pass dispatch); gateway: `agent_ingest.go:102-110`, `:335` |
+| Per-process measurement (strategy a) | `agent_runtime_sample.gpus[].vram_measured_mb` per `spec_id` | dispatched on the child's **first health pass** and on the owner's **15 s** housekeeping beat | agent: `runtime/manager.go:82` (`idleTickInterval`), `:1327` (`dispatchMeasurement`), `:1853` (health-pass dispatch); gateway: `agent_ingest.go:102-110`, `:335` |
 
 Precision of the underlying reads: NVIDIA `memory.used` is MiB, multiplied to
 bytes (`collector/nvidia.go:126-127`); ROCm reports bytes
@@ -177,8 +185,9 @@ reporting server and is not `vram_locked` (`agent_ingest.go:261-329`).
   fetched once per (api, server) with no polling refresh (§13). The only
   observable evidence that a config change took effect is its **effect** on the
   status stream.
-- Desired-state levers the gateway *does* own, and how each applies (§5.6,
-  `agent-runtime-manager.md:1186-1204`):
+- Desired-state levers the gateway *does* own, and how each applies (§5.6 "What
+  a pushed config applies, and what it does not",
+  `agent-runtime-manager.md:1299-1316`):
 
   | Lever | Applied on push? |
   |---|---|
@@ -283,8 +292,11 @@ defer until the single-model run is proven in the field.
 - **Rely on rule 4 (unknown demand starts alone).** Insufficient, twice over:
   it applies only to a spec whose demand is *already* unknown — the "verify a
   suspicious estimate" case is the other half of what was asked — and it forces
-  solitude only on **that spec's own GPUs** (`policy.go:169-175, 285-296`),
-  while a delta wants a quiet baseline on every GPU it reads.
+  solitude only on **that spec's own GPUs** (`specGPUIndexes`,
+  `policy.go:196-202`; the toucher loop at `:573-587`), while a delta wants a
+  quiet baseline on every GPU it reads. Rule 5, its occupant-side mirror, does
+  not widen that: it blocks a *newcomer* from the unknown spec's cards, which is
+  the same card set seen from the other end.
 - **Temporarily set `runtime_max_processes = 1`.** One write instead of N, and
   rule 2 would then let the target's *own* admission evict the others using the
   agent's machinery. **Rejected because it is unobservable**: §5.6 says a
@@ -321,9 +333,16 @@ for another feature, in this exact shape):
 
 - **Full-document replace.** `PutRuntimeSpec` is a full replacement (ADR-029),
   so the `admin_state` write must be built by **spreading the loaded spec** and
-  replacing one field — never by assembling a field list. §11.4 records what
-  the assembled-body version cost: a spec form that re-enabled a disabled
-  mapping on every save. A Go caller has no `...rest` spread, so this needs one
+  replacing one field — never by assembling a field list. The rule lives in
+  **§11.1** ("An `admin_state` write builds its PUT body by rest-spreading the
+  actual loaded spec"), not §11.4, and §11.1 also records what the
+  assembled-body version costs: a body that has quietly reset the operator's
+  binary path, args, timeouts and GPU rows, with a test asserting only that
+  `admin_state` came out right passing anyway. (§11.4's neighbouring rule — "a
+  form does not send a field it does not let you edit", whose cost was a spec
+  form that re-enabled a disabled mapping on every save — is about the mapping
+  PATCH's pointer fields, a different endpoint and a different mechanism.)
+  A Go caller has no `...rest` spread, so this needs one
   named `putRequestFromDTO(RuntimeSpecDTO) PutRuntimeSpecRequest` helper with a
   test that fails when a field is added to the spec and not to the mapper.
   **Open question O2**: whether a narrow internal `SetRuntimeSpecAdminState`

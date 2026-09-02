@@ -99,9 +99,29 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
   |---|---|---|
   | occupant of unknown demand, idle | `OK`, `Evict=[]` | `Evict=[a]` |
   | occupant of unknown demand, busy | `OK`, `Evict=[]` | `Wait` |
-  | occupant of unknown demand, pinned | `OK`, `Evict=[]` | `pending_vram_unknown` |
+  | occupant of unknown demand, still loading | `OK`, `Evict=[]` | `Wait` |
+  | occupant of unknown demand, pinned | `OK`, `Evict=[]` | `pending_vram_unknown`, message naming `a` |
+  | …the same, but the pair is not co-resident | `Wait` | `not_permitted`, message naming the closed cell |
+  | occupant unknown on gpu 0 only, candidate wants gpu 1 | `OK`, `Evict=[]` | `Evict=[a]` (rule 5 is whole-process, like rule 4) |
   | same occupant declaring 6000 MB | `Evict=[a]` | `Evict=[a]` (unchanged) |
   | mirror: unknown CANDIDATE, idle occupant | `Evict=[a]` | `Evict=[a]` (unchanged) |
+  | candidate's own demand over budget, pinned unknown occupant | `not_permitted` (own demand) | `not_permitted` (own demand) — rule 5 briefly shadowed this; the review fix restored it |
+
+  **Which host populations this actually changes** — measured over the same
+  matrix, because "admission now blocks more" is only true of one of them:
+
+  | Host shape | Change |
+  |---|---|
+  | **ALL-BLANK** — every spec left at the default `vram_estimate_mb: 0` | **None at all.** Rule 4 keys on the candidate, and on such a host every candidate is unknown, so every co-residency was already `Evict`/`Wait`/terminal before the fix. Verified idle, busy, pinned *and* still-loading: identical decisions on both revisions. |
+  | **MIXED** — some specs estimated, some blank | **This is the population that changes.** A spec with a real estimate used to be admitted onto a blank spec's card, charged `0 MB`; now the blank occupant blocks it — `Evict` if idle, `Wait` if busy or loading, terminal if pinned. |
+  | **ALL-ESTIMATED** | None. No unknown demand on either side, so neither rule fires. |
+
+  So the PR sentence is **not** "a host with no measurer blocks in strictly more
+  cases": a fully unconfigured host is byte-for-byte unchanged, and a fully
+  configured one never reaches these rules. What changes is the *partly*
+  configured host — the specs someone did fill in are now blocked by the ones
+  they did not. That is also exactly why the benchmark beside this branch
+  (`specs/vram-benchmark.md`) is the intended way out.
 
   So the Windows measurer would have shipped its better numbers into an
   arithmetic that silently revoked the "may start only alone on that GPU"
@@ -111,8 +131,11 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
   arithmetic's eviction loop releases a victim with `sum -= r.GPUs[idx]`,
   which subtracts the same `0`, so a charge-based fix evicts every idle
   process on the card and then answers `Wait` anyway. Durable description:
-  `agent-runtime-manager.md` §5.2 (evaluation order) and §5.3 (the symmetry,
-  the rejected arithmetic fix, and why terminal is not permanent here).
+  `agent-runtime-manager.md` §5.2 (evaluation order, the hoisted own-demand
+  refusal, and the two placement invariants that are now pinned by tests) and
+  §5.3 (the symmetry and its whole-process scope, the rejected arithmetic fix,
+  the terminal's message and its closed-matrix carve-out, and what "terminal is
+  not permanent" does and does not mean per host).
 - No admission-logic change beyond the guard and that rule. The measurer
   still only supplies better numbers to the existing arithmetic.
 - No `shared`/`non_local` spillover feature: unproven, see the table.
