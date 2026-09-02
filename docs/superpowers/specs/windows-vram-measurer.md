@@ -84,8 +84,37 @@ strictly safer than a measured 0, because nothing falls back to the estimate.
   admission on every platform (a measured 0 stops overriding an estimate) and
   is separable from the Windows work. Applying the house `<= 0` rule to the one
   path that lacks it.
-- No admission-logic change beyond that guard. The measurer only supplies
-  better numbers to the existing arithmetic.
+- ~~No admission-logic change beyond that guard.~~ **Widened deliberately by
+  the operator ("es gehört einfach mit dazu"), so it lands on this branch
+  rather than a follow-up.** Adding the zero-guard is what put the question in
+  front of us: the guard makes an unmeasured process fall back to the
+  operator's estimate, and that estimate is `0` — *unknown* — for exactly the
+  specs this feature exists to serve. Following that value into `Admit` showed
+  the unknown-demand class was only half enforced: both unknown-VRAM rules
+  keyed on the CANDIDATE's spec, while an unknown-demand **occupant** was
+  charged `0 MB` by the per-GPU arithmetic and ignored — even when busy, even
+  when pinned. Verified by executing `Admit`, not inferred:
+
+  | Snapshot | Before | After |
+  |---|---|---|
+  | occupant of unknown demand, idle | `OK`, `Evict=[]` | `Evict=[a]` |
+  | occupant of unknown demand, busy | `OK`, `Evict=[]` | `Wait` |
+  | occupant of unknown demand, pinned | `OK`, `Evict=[]` | `pending_vram_unknown` |
+  | same occupant declaring 6000 MB | `Evict=[a]` | `Evict=[a]` (unchanged) |
+  | mirror: unknown CANDIDATE, idle occupant | `Evict=[a]` | `Evict=[a]` (unchanged) |
+
+  So the Windows measurer would have shipped its better numbers into an
+  arithmetic that silently revoked the "may start only alone on that GPU"
+  guarantee on the next admission — the promise this whole measurement chain
+  is supposed to be the way OUT of. Shipping the two together is the point.
+  The fix is a symmetric explicit rule (rule 5), not a larger charge: the
+  arithmetic's eviction loop releases a victim with `sum -= r.GPUs[idx]`,
+  which subtracts the same `0`, so a charge-based fix evicts every idle
+  process on the card and then answers `Wait` anyway. Durable description:
+  `agent-runtime-manager.md` §5.2 (evaluation order) and §5.3 (the symmetry,
+  the rejected arithmetic fix, and why terminal is not permanent here).
+- No admission-logic change beyond the guard and that rule. The measurer
+  still only supplies better numbers to the existing arithmetic.
 - No `shared`/`non_local` spillover feature: unproven, see the table.
 - Agent `Version` bump: PATCH (`0.2.2` → `0.2.3`). No `agent.Features` entry —
   measurement is a hardware capability, not a negotiated flag (§5.3, ADR-025).

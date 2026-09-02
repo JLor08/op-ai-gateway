@@ -79,11 +79,17 @@ type PolicySnapshot struct {
 //     would ask for a drain-stop that can never restore a fit). Two
 //     distinct causes share this shape, both worth telling apart via
 //     Message since both surface as the same State:
-//   - StatePendingVRAMUnknown: spec has unknown VRAM demand and a
-//     PINNED process already occupies one of its GPUs (pinned
-//     processes are never evicted, and a pinned process never
-//     finishes, so waiting cannot help either). Message is empty for
-//     this cause -- Reason alone is unambiguous.
+//   - StatePendingVRAMUnknown: a VRAM demand on one of the contested
+//     GPUs is unknown -- the CANDIDATE's own (rule 4) or a running
+//     OCCUPANT's (rule 5) -- and a PINNED process sits on the other
+//     side of that contention: pinned processes are never evicted,
+//     and a pinned process never finishes, so waiting cannot help
+//     either. Message is empty for this cause -- Reason alone is
+//     unambiguous. Terminal is not the same as permanent: the manager
+//     re-evaluates this state after notPermittedRetryInterval, so a
+//     measurement landing on the pinned occupant (rule 5's case) or
+//     an operator filling the estimate in clears it without anything
+//     being evicted.
 //   - StateNotPermitted: spec's own declared demand on some GPU
 //     already exceeds that GPU's budget on its own, with nothing
 //     running at all. No eviction, on this GPU or any other, can ever
@@ -185,6 +191,61 @@ func specHasUnknownVRAM(spec Spec) bool {
 	return false
 }
 
+// procHasUnknownVRAMOn reports whether r occupies any GPU index named in
+// idx with an UNKNOWN demand. It is the occupant-side mirror of
+// specHasUnknownVRAM, and rule 5 in Admit is the rule it feeds.
+//
+// WHY THERE IS A RULE 5 AT ALL. Rule 4 admits a spec of unknown demand only
+// if it runs ALONE on its GPUs -- and without this predicate that guarantee
+// expired the moment it was granted. Both unknown-VRAM rules keyed on the
+// CANDIDATE, while rule 3's arithmetic charges an occupant whatever
+// r.GPUs[g.Index] says, which for an occupant of unknown demand is 0. So
+// the spec that had just been given a card to itself was charged nothing,
+// and the very next admission put a second process on that card no matter
+// how large the first really was, and no matter whether it was idle, busy
+// or PINNED. Measured before the fix: an occupant of unknown demand
+// produced OK with an empty Evict list in all three of those cases, where
+// the same occupant declaring 6000 MB produced Evict. Both processes could
+// then OOM, which is the one outcome the whole budget feature exists to
+// prevent. It was never a deliberate asymmetry -- §5.3 accepts that an
+// unknown-demand spec WAITS behind a pinned or busy holder, which is only
+// coherent if the reverse also holds.
+//
+// THE SIGNAL IS A KEY THAT IS PRESENT WITH A VALUE OF 0, and both halves
+// are load-bearing. RunningProc.GPUs holds the EFFECTIVE figure -- the
+// measured value when the agent has one, else the spec's estimate --
+// and SpecGPU.VRAMMB defines 0 as "unknown demand, never a real zero-cost
+// claim" (owner.buildSnapshot copies that 0 through verbatim, and
+// realMeasurement is what keeps a measured 0 from arriving here dressed up
+// as a measurement). An ABSENT key means something else entirely: the
+// process is not on that card, which rule 5 must ignore rather than read as
+// unknown -- rule 5 is per-GPU, like rule 3 and unlike rule 1.
+//
+// The test is `== 0`, not `<= 0`, so that it stays literally the test
+// specHasUnknownVRAM and rule 3 apply to a spec's declared demand. A
+// negative figure is not reachable (the portal rejects negative VRAM, and
+// realMeasurement admits only strictly positive measurements), and a
+// second, differently-shaped notion of "unknown" is exactly how the two
+// sides of a symmetric rule drift apart.
+//
+// WHY AN EXPLICIT RULE AND NOT AN ARITHMETIC FIX. Charging an unknown
+// occupant some large number in rule 3 instead does not work: that loop
+// releases an evicted toucher with `sum -= r.GPUs[g.Index]`, which
+// subtracts the same 0, so the eviction never reduces the sum. Rule 3 would
+// evict every idle toucher on the card, still find itself over budget, and
+// answer Wait -- destroying running work AND blocking the candidate. The
+// charge and the release would both have to be made consistent, inventing a
+// VRAM figure for a process nobody has measured; naming the contention
+// instead needs no number.
+func procHasUnknownVRAMOn(r RunningProc, idx []int) bool {
+	for _, i := range idx {
+		if v, ok := r.GPUs[i]; ok && v == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // sortOldestFirst orders procs by LastUsed ascending: the eviction order
 // Admit always uses (oldest idle victim first). Ties in LastUsed break on
 // SpecID so the output is fully deterministic -- sort.Slice is not stable,
@@ -203,8 +264,10 @@ func sortOldestFirst(procs []RunningProc) {
 // Admit answers: may spec start next to the processes already running in
 // snap? It applies the design doc's §5 admission rule -- matrix
 // compatibility, the process-count limit, and per-GPU VRAM arithmetic --
-// plus the unknown-VRAM-alone rule, and computes the idle-victim set that
-// would unblock the start if one exists.
+// plus the unknown-VRAM-alone rule, applied SYMMETRICALLY to both sides of
+// the pair (rule 4 for the candidate's own unknown demand, rule 5 for a
+// running occupant's), and computes the idle-victim set that would unblock
+// the start if one exists.
 //
 // Kept as a small, deliberately linear pipeline rather than a clever one,
 // since it will be read far more often than it will be changed:
@@ -217,14 +280,19 @@ func sortOldestFirst(procs []RunningProc) {
 //     matrix-incompatible with itself). Filtered out once, up front, so
 //     none of the rules below can propose evicting the very process being
 //     started or wait on it forever.
-//  1. Unknown-VRAM-vs-pinned short-circuit. This is one of two conditions
-//     that can resolve neither by eviction nor by waiting, so it is
-//     checked, and returned, before any other rule.
-//  2. Collect the matrix (rule 1) and unknown-VRAM (rule 4) blockers
-//     against the self-filtered running set: every disallowed pair, and
-//     -- if spec has any unknown-VRAM GPU -- every process touching any
-//     of spec's GPUs. An evictable blocker is queued for eviction; a
-//     non-evictable (busy) blocker marks the whole decision blocked.
+//  1. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
+//     EITHER side of the pair. This is one of two conditions that can
+//     resolve neither by eviction nor by waiting, so it is checked, and
+//     returned, before any other rule.
+//  2. Collect the matrix (rule 1) and unknown-VRAM (rules 4 and 5)
+//     blockers against the self-filtered running set: every disallowed
+//     pair; -- if spec has any unknown-VRAM GPU -- every process touching
+//     any of spec's GPUs; and every process whose OWN demand on one of
+//     spec's GPUs is unknown. An evictable blocker is queued for
+//     eviction; a non-evictable (busy or still-loading) blocker marks the
+//     whole decision blocked. Rules 4 and 5 name the same occupants when
+//     both sides are unknown, which is harmless: toEvict is keyed by spec
+//     id, so the overlap costs a map write and never a duplicate victim.
 //  3. Per-GPU budget (rule 3), evaluated with step 2's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
@@ -256,11 +324,28 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	unknownVRAM := specHasUnknownVRAM(spec)
 	gpuIdx := specGPUIndexes(spec)
 
-	if unknownVRAM {
-		for _, r := range running {
-			if r.Pinned && touchesAnyGPU(r, gpuIdx) {
-				return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
-			}
+	// Step 1. A pinned process is never an eviction victim and never
+	// finishes, so an unknown demand contested with one resolves by neither
+	// eviction nor waiting: returned ahead of every other rule so nothing
+	// below can propose a victim or a Wait that could not possibly help.
+	// Both directions land here because both are the same contention seen
+	// from opposite ends -- one card, two processes, and no number for at
+	// least one of them.
+	for _, r := range running {
+		if !r.Pinned {
+			continue
+		}
+		// Rule 4, candidate side: spec's own demand is unknown, so it may
+		// only run alone on its GPUs, and this pinned process holds one.
+		if unknownVRAM && touchesAnyGPU(r, gpuIdx) {
+			return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
+		}
+		// Rule 5, occupant side: the pinned process's OWN demand on one of
+		// spec's GPUs is unknown, so that card cannot be shared with it
+		// either -- whatever spec declares for itself. Note this implies
+		// touchesAnyGPU: procHasUnknownVRAMOn needs the key present.
+		if procHasUnknownVRAMOn(r, gpuIdx) {
+			return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
 		}
 	}
 
@@ -292,6 +377,31 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 			} else {
 				blocked = true
 			}
+		}
+	}
+
+	// Rule 5: the mirror of rule 4 -- every remaining occupant whose OWN
+	// demand on one of spec's GPUs is unknown, blocking the sharing of that
+	// card exactly as an unknown candidate does. Any pinned such occupant
+	// already short-circuited above, so only idle/busy remain here.
+	//
+	// It belongs in step 2, next to rules 1 and 4, for two reasons: it is
+	// evaluated against the ORIGINAL running set, so its verdict never
+	// depends on what another rule happened to queue first, and rule 3
+	// below must already see its victims as gone -- an occupant queued here
+	// is skipped by rule 3's sum, which is the only consistent reading
+	// (charging it a number there cannot work; see procHasUnknownVRAMOn).
+	// It must not move after rule 2 either: the process-count limit runs
+	// last precisely so it asks only for victims the earlier rules have not
+	// already supplied.
+	for _, r := range running {
+		if !procHasUnknownVRAMOn(r, gpuIdx) {
+			continue
+		}
+		if isEvictable(r) {
+			toEvict[r.SpecID] = r
+		} else {
+			blocked = true
 		}
 	}
 

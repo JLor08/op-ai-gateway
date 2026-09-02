@@ -929,14 +929,16 @@ into a hard refusal of every start.
 > no-op, and would leave the gateway and the agent disagreeing about a value the
 > store already persists.
 
-`Admit` evaluates in a fixed order, and the order is deliberate: an
-unknown-VRAM candidate blocked by a *pinned* occupant short-circuits first;
-matrix incompatibility and unknown-VRAM occupancy are collected against the
-original running set; the per-GPU budget is then evaluated with those evictions
-notionally already removed; **the process-count limit runs last** and asks only
-for as many *additional* victims as the earlier rules have not already supplied.
-Reversing the last two over-evicts, and the already-counted chaining is the only
-thing preventing double eviction.
+`Admit` evaluates in a fixed order, and the order is deliberate: an unknown
+VRAM demand on *either* side of the pair (§5.3), contested with a *pinned*
+process, short-circuits first; matrix incompatibility and both unknown-VRAM
+rules are collected against the original running set; the per-GPU budget is then
+evaluated with those evictions notionally already removed; **the process-count
+limit runs last** and asks only for as many *additional* victims as the earlier
+rules have not already supplied. Reversing the last two over-evicts, and the
+already-counted chaining is the only thing preventing double eviction —
+including where the candidate-side and occupant-side unknown-VRAM rules name the
+same occupant, which they do whenever both sides are unknown.
 
 Two guards read as trivial and are not:
 
@@ -967,7 +969,12 @@ other order, presenting as a random, hard-to-reproduce matrix failure.
 
 A spec whose demand on a GPU is unknown may start only **alone** on that GPU;
 otherwise it sits in `pending_vram_unknown` with the reason visible in the
-portal. On an NVIDIA host the agent then measures actual usage of **its own
+portal. **The rule is symmetric — it is the unknown demand that makes a card
+unshareable, on whichever side of the pair it sits.** An already-running process
+whose *own* demand on a contested GPU is unknown blocks a new candidate exactly
+the way an unknown candidate is blocked, whatever that candidate declares for
+itself: the occupant is evicted if it is idle, yields `Wait` if it is busy or
+still loading, and yields the terminal `pending_vram_unknown` if it is pinned. On an NVIDIA host the agent then measures actual usage of **its own
 child PIDs** — `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`,
 which is exact because the agent knows which PIDs are its children — and writes
 the measurement back to the gateway. There "unknown" is a self-resolving
@@ -1049,6 +1056,41 @@ Apple and CPU-only deployment byte-for-byte unchanged.
 `pending_vram_unknown` as a *terminal* reason is reserved for a holder that can
 never leave — a **pinned** process on the contested GPU. A merely busy,
 non-pinned occupant yields `Wait`, because it can drain.
+
+> **The occupant half of that symmetry was missing, and it made "alone on that
+> GPU" a promise that expired the instant it was granted.** Both unknown-VRAM
+> checks keyed on the *candidate*, while the per-GPU arithmetic charges a
+> running process whatever its VRAM map holds for the index being checked — and
+> for a process of unknown demand that is `0` **with the key present**, which
+> per §5.1 means *unknown*, never a zero-cost claim. So the spec that had just
+> been granted a card to itself was charged nothing on it, and the very next
+> admission placed a second process on the same card regardless of how large
+> the first really was, and regardless of whether it was idle, **busy, or
+> pinned**. Measured against `Admit` before the fix: an occupant of unknown
+> demand produced `OK` with an empty evict list in all three of those cases,
+> where the same occupant declaring 6000 MB produced an eviction. Two processes
+> sharing a card with no accounting for either is precisely the OOM the budget
+> exists to prevent. It was never a deliberate asymmetry: this section already
+> accepts that an unknown-demand *spec* waits behind a pinned or busy holder,
+> and that is only coherent if the reverse holds too.
+>
+> **It is an explicit rule, not a bigger number in the arithmetic.** Charging an
+> unknown occupant the whole budget looks like the smaller change and does not
+> work: the arithmetic's eviction loop releases a victim by subtracting that
+> same `0`, so evicting the unknown occupant never reduces the sum. That
+> version evicts every idle process on the card, still finds itself over budget,
+> and answers `Wait` — destroying running work **and** blocking the candidate.
+> Charge and release would both have to be made consistent, which means
+> inventing a VRAM figure for a process nobody has measured. Naming the
+> contention needs no number at all.
+>
+> **Terminal is not permanent in the occupant's case.** A pinned occupant's
+> `pending_vram_unknown` is re-evaluated once `notPermittedRetryInterval`
+> elapses, and unlike a candidate that cannot start, a pinned occupant *is*
+> running — so the housekeeping beat measures it and the block clears with
+> nothing evicted. On a host with no measurer installed it persists until the
+> operator fills the estimate in, the same dead end this section documents
+> above.
 
 ### 5.4 Eviction, queueing and drain
 
