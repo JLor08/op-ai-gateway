@@ -444,24 +444,17 @@ type pdhLUIDCaches struct {
 // The retry is bounded: at most one nvidia-smi spawn per call however many
 // adapters miss, and none at all in the steady state where every needed
 // adapter is already in one half of the cache.
+//
+// The three steps are pdhSplitNeeded (what the caches already answer), the
+// per-adapter loop below, and pdhRefetchPCI (the one nvidia-smi spawn and the
+// licence it grants).
 func resolvePDHLUIDs(
 	need []pdhLUID,
 	in pdhLUIDCaches,
 	adapterAddress func(pdhLUID) (pciAddress, error),
 	fetchPCIIndex func() (map[pciAddress]int, bool),
 ) (map[pdhLUID]int, pdhLUIDCaches) {
-	out := make(map[pdhLUID]int, len(need))
-	var unknown []pdhLUID
-	for _, l := range need {
-		if idx, ok := in.LUIDToIndex[l]; ok {
-			out[l] = idx
-			continue
-		}
-		if _, ok := in.Unresolvable[l]; ok {
-			continue // a durable finding; do not pay for it again
-		}
-		unknown = append(unknown, l)
-	}
+	out, unknown := pdhSplitNeeded(need, in)
 	if len(unknown) == 0 {
 		return out, in // the steady state: no syscall, no subprocess, no cache write
 	}
@@ -483,59 +476,109 @@ func resolvePDHLUIDs(
 	refetched := false
 	for _, l := range unknown {
 		addr, err := adapterAddress(l)
-		if err != nil {
-			// Only a verdict about the ADAPTER may be remembered. Every other
-			// probe failure is the absence of an answer and is left out of
-			// BOTH halves, so the next cycle asks again -- which is the whole
-			// distinction mayCacheUnresolvable exists to draw, and which this
-			// branch used to ignore by caching every error alike.
-			if mayCacheUnresolvable(err) {
-				next.Unresolvable[l] = struct{}{}
-			}
+		switch {
+		case err != nil && mayCacheUnresolvable(err):
+			// A verdict about the ADAPTER, and the only kind of probe failure
+			// that may be remembered.
+			next.Unresolvable[l] = struct{}{}
+			continue
+		case err != nil:
+			// Every other probe failure is the ABSENCE of an answer and is
+			// left out of BOTH halves, so the next cycle asks again -- which
+			// is the whole distinction mayCacheUnresolvable exists to draw,
+			// and which this branch used to ignore by caching every error
+			// alike.
 			continue
 		}
 		idx, ok := next.PCIToIndex[addr]
 		if !ok && !refetched {
-			// The one case a stale reading actually matters: an adapter at an
-			// address the cached reading does not know, i.e. a GPU added,
-			// removed or reindexed since the last fetch (a driver reset, for
-			// instance). Refetch once -- the same invalidation rule
-			// nvidiaComputeAppsMeasurer applies to its uuidToIndex cache.
 			refetched = true
-			if fresh, complete := fetchPCIIndex(); len(fresh) > 0 {
-				next.PCIToIndex = fresh
-				trustNegative = complete
-				if complete {
-					// A changed topology is the only thing that can turn a
-					// previously unresolvable adapter into a real GPU, so a
-					// superseding reading discards the negative half derived
-					// from the reading before it. Anything still
-					// unresolvable is re-learned next cycle, at the cost of
-					// one round of syscalls.
-					//
-					// Gated on completeness for the same reason the negative
-					// conclusion is: a reading missing rows supersedes
-					// nothing. Ungated, a host whose nvidia-smi permanently
-					// reports one row as `[N/A]` would refetch every cycle
-					// (correctly) and wipe the negative half every cycle
-					// (pointlessly), re-probing every D3DKMT-refused adapter
-					// for the life of the process.
-					next.Unresolvable = make(map[pdhLUID]struct{}, len(unknown))
-				}
-				idx, ok = fresh[addr]
-			}
+			next, trustNegative = pdhRefetchPCI(next, len(unknown), fetchPCIIndex)
+			idx, ok = next.PCIToIndex[addr]
 		}
-		if !ok {
-			if !trustNegative {
-				continue // no answer obtained this cycle; ask again next cycle
-			}
+		switch {
+		case ok:
+			next.LUIDToIndex[l] = idx
+			out[l] = idx
+		case trustNegative:
+			// A FRESH AND COMPLETE reading with no GPU at this adapter's PCI
+			// address: a property of the host's topology -- an integrated GPU,
+			// or a software/render adapter -- and the second of the two
+			// findings that may be remembered permanently.
 			next.Unresolvable[l] = struct{}{}
-			continue
 		}
-		next.LUIDToIndex[l] = idx
-		out[l] = idx
+		// Neither: no answer was obtained this cycle, so the adapter enters
+		// no half of the cache and is asked about again next cycle.
 	}
 	return out, next
+}
+
+// pdhSplitNeeded answers as much of need as the caches already can, and
+// reports the adapters that must be probed.
+//
+// An empty unknown set is THE STEADY STATE this cache exists for, and the
+// caller's whole reason to return early: no syscall, no subprocess, no cache
+// write.
+//
+// The negative half is consulted HERE, before the unknown set is built, and
+// that is exactly why only durable facts may enter it: a LUID in it can no
+// longer reach the refetch that is its only escape. See resolvePDHLUIDs for
+// which two findings qualify.
+func pdhSplitNeeded(need []pdhLUID, in pdhLUIDCaches) (resolved map[pdhLUID]int, unknown []pdhLUID) {
+	resolved = make(map[pdhLUID]int, len(need))
+	for _, l := range need {
+		if idx, ok := in.LUIDToIndex[l]; ok {
+			resolved[l] = idx
+			continue
+		}
+		if _, ok := in.Unresolvable[l]; ok {
+			continue // a durable finding; do not pay for it again
+		}
+		unknown = append(unknown, l)
+	}
+	return resolved, unknown
+}
+
+// pdhRefetchPCI re-reads the nvidia-smi PCI mapping into the caches and
+// reports whether the reading it obtained licenses a NEGATIVE conclusion.
+//
+// THE ONE CASE A STALE READING ACTUALLY MATTERS is an adapter at an address
+// the cached reading does not know -- a GPU added, removed or reindexed since
+// the last fetch (a driver reset, for instance). The caller pays for this at
+// most once per call, which is the same invalidation rule
+// nvidiaComputeAppsMeasurer applies to its uuidToIndex cache.
+//
+// An EMPTY reading changes nothing -- not the mapping, not the negative half,
+// not the licence -- because an nvidia-smi that answered nothing is the
+// absence of an answer, and the caches in hand are still the best available.
+//
+// COMPLETENESS decides two separate things, and both are gated on it for the
+// same reason: a reading missing rows supersedes nothing.
+//
+//   - The returned licence. An address missing from a reading that is itself
+//     missing rows says nothing at all about whether a GPU sits there.
+//   - Whether the negative half is DISCARDED. A changed topology is the only
+//     thing that can turn a previously unresolvable adapter into a real GPU,
+//     so a superseding reading drops the conclusions derived from the reading
+//     before it; anything still unresolvable is re-learned next cycle, at the
+//     cost of one round of syscalls. Ungated, a host whose nvidia-smi
+//     permanently reports one row as `[N/A]` would refetch every cycle
+//     (correctly) and wipe the negative half every cycle (pointlessly),
+//     re-probing every D3DKMT-refused adapter for the life of the process.
+//
+// The caches are taken and returned BY VALUE, and the maps inside them are
+// replaced rather than mutated -- pdhLUIDCaches' own contract, which is what
+// lets the measurer swap whole maps under its mutex.
+func pdhRefetchPCI(caches pdhLUIDCaches, unknownCount int, fetchPCIIndex func() (map[pciAddress]int, bool)) (pdhLUIDCaches, bool) {
+	fresh, complete := fetchPCIIndex()
+	if len(fresh) == 0 {
+		return caches, false
+	}
+	caches.PCIToIndex = fresh
+	if complete {
+		caches.Unresolvable = make(map[pdhLUID]struct{}, unknownCount)
+	}
+	return caches, complete
 }
 
 // attributePDHDedicated is the aggregation the measurer contract needs: filter
@@ -571,29 +614,40 @@ func resolvePDHLUIDs(
 // through the gateway, admission can still under-count -- which is a reason to
 // keep this function honest about what it does not know, not a reason to let
 // it emit a 0 that would make the same hole permanent.
+// The two halves are pdhSumDedicatedBytes and pdhBytesToMB, and the order is
+// the point: SUM IN BYTES FIRST, then convert once per (pid, gpu). Converting
+// each instance would round every physical segment down separately and lose up
+// to a MB per segment.
 func attributePDHDedicated(instances []pdhProcessMemory, luidToIndex map[pdhLUID]int, pids []int) map[int]map[int]int {
+	return pdhBytesToMB(pdhSumDedicatedBytes(instances, luidToIndex, pids))
+}
+
+// pdhSumDedicatedBytes is attributePDHDedicated's first half: filter the
+// counter instances to the manager's own PIDs, resolve each instance's adapter
+// LUID to a GPU index, and sum the adapter's physical segments -- still in
+// BYTES, because rounding is the caller's job and doing it here would round
+// every segment down separately.
+//
+// Three shapes are skipped, and each would otherwise charge VRAM to the wrong
+// place: an instance belonging to a process the manager does not own, a
+// non-positive byte count (nothing to add, and a nonsense negative must not
+// REDUCE a real segment), and an adapter that resolved to no NVIDIA GPU. That
+// last one is normal and was observed on the probe host -- a software/render
+// adapter, an iGPU, or a stale counter instance -- and skipping beats guessing
+// an index, index 0 being the guess a zero value would make.
+func pdhSumDedicatedBytes(instances []pdhProcessMemory, luidToIndex map[pdhLUID]int, pids []int) map[int]map[int]int64 {
 	wanted := make(map[int]bool, len(pids))
 	for _, p := range pids {
 		wanted[p] = true
 	}
 
-	// Sum in BYTES first, then convert once per (pid, gpu). Converting each
-	// instance would round every physical segment down separately and lose up
-	// to a MB per segment.
 	sums := make(map[int]map[int]int64)
 	for _, in := range instances {
-		if !wanted[in.PID] {
-			continue // not one of the manager's own managed children
-		}
-		if in.DedicatedBytes <= 0 {
-			continue // nothing to add, and a nonsense negative must not REDUCE a real segment
+		if !wanted[in.PID] || in.DedicatedBytes <= 0 {
+			continue
 		}
 		idx, ok := luidToIndex[in.LUID]
 		if !ok {
-			// An adapter that could not be resolved to an NVIDIA GPU: a
-			// software/render adapter, an iGPU, or a stale counter instance.
-			// Normal, and observed on the probe host -- skip it rather than
-			// guess an index (index 0 being the guess a zero value would make).
 			continue
 		}
 		if sums[in.PID] == nil {
@@ -601,22 +655,52 @@ func attributePDHDedicated(instances []pdhProcessMemory, luidToIndex map[pdhLUID
 		}
 		sums[in.PID][idx] += in.DedicatedBytes
 	}
+	return sums
+}
 
+// pdhBytesToMB is attributePDHDedicated's second half: the byte-to-MB
+// conversion and the drop rule, per process.
+//
+// A process left with NO measurable card contributes no key of its own, and
+// nothing measurable at all returns nil rather than an empty map. That is the
+// same rule pdhCardsToMB applies one level down, for the same reason: an empty
+// map[gpuIndex]MB under a present pid key would tell buildSnapshot the process
+// was measured and found to hold nothing.
+func pdhBytesToMB(sums map[int]map[int]int64) map[int]map[int]int {
 	var out map[int]map[int]int
 	for pid, byGPU := range sums {
-		for idx, bytes := range byGPU {
-			mb := int(bytes / bytesPerMB)
-			if mb <= 0 {
-				continue // see THE RULE above: a 0 must never reach the manager
-			}
-			if out == nil {
-				out = make(map[int]map[int]int)
-			}
-			if out[pid] == nil {
-				out[pid] = make(map[int]int)
-			}
-			out[pid][idx] = mb
+		byIndex := pdhCardsToMB(byGPU)
+		if len(byIndex) == 0 {
+			continue
 		}
+		if out == nil {
+			out = make(map[int]map[int]int, len(sums))
+		}
+		out[pid] = byIndex
+	}
+	return out
+}
+
+// pdhCardsToMB converts ONE process's per-card byte sums to MB, and is where
+// THE RULE stated on attributePDHDedicated is actually enforced: a card whose
+// summed usage rounds to 0 MB is DROPPED, never reported as 0.
+//
+// runtime/manager.go buildSnapshot reads `if v, ok := byGPU[g.Index]; ok`, so
+// a present key is authoritative and a measured 0 overrides the operator's
+// VRAM estimate -- the GPU budget then looks entirely free and co-residency
+// admission loses the OOM protection it exists for. An absent key means "not
+// measured", which falls back to the estimate.
+func pdhCardsToMB(byGPU map[int]int64) map[int]int {
+	var out map[int]int
+	for idx, bytes := range byGPU {
+		mb := int(bytes / bytesPerMB)
+		if mb <= 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[int]int, len(byGPU))
+		}
+		out[idx] = mb
 	}
 	return out
 }
