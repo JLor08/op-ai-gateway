@@ -272,3 +272,16 @@ func TestAttributePDHDedicatedIgnoresNegativeBytes(t *testing.T) {
 		t.Errorf("out[4242][0] = %d, want 6000 (the negative row ignored)", out[4242][0])
 	}
 }
+
+// TestNvidiaPCIBusIDFieldsColumnOrder makes the query/parser contract
+// machine-checked instead of a comment, exactly as
+// TestNvidiaQueryFieldsColumnOrder does for the telemetry query. Both columns
+// here are read positionally by parseNvidiaPCIIndexCSV, and swapping them
+// produces no error at all: a bus_id parsed as an index becomes 0 (naInt's
+// sentinel handling) and an index parsed as a bus_id fails, so the mapping
+// silently comes back empty and every measurement is discarded.
+func TestNvidiaPCIBusIDFieldsColumnOrder(t *testing.T) {
+	if nvidiaPCIBusIDFields != "index,pci.bus_id" {
+		t.Fatalf("nvidiaPCIBusIDFields = %q, want \"index,pci.bus_id\" -- parseNvidiaPCIIndexCSV reads row[0] as the index and row[1] as the bus id", nvidiaPCIBusIDFields)
+	}
+}
