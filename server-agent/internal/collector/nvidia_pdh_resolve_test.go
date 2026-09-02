@@ -308,3 +308,31 @@ func TestParseNvidiaPCIIndexCSVRefusesAThriceRepeatedAddress(t *testing.T) {
 		t.Error("complete = true, want false")
 	}
 }
+
+// TestResolvePDHLUIDsKeepsTheNegativeHalfWhenTheRefetchIsIncomplete is the
+// other half of the completeness rule, and the reason it gates the
+// INVALIDATION as well as the conclusion. An incomplete reading is not
+// evidence of a changed topology any more than it is evidence of an absent
+// GPU, so it must not discard settled findings either. Without this, a host
+// whose nvidia-smi permanently reports one row as `[N/A]` refetches every
+// cycle (correctly -- see TestResolvePDHLUIDsSurvivesAPartialMapping) and each
+// of those refetches would wipe the negative half, re-probing every
+// D3DKMT-refused adapter forever.
+func TestResolvePDHLUIDsKeepsTheNegativeHalfWhenTheRefetchIsIncomplete(t *testing.T) {
+	s := &pdhResolveStub{
+		addrs:    map[pdhLUID]pciAddress{luidGPU2: pdhAddrGPU2},
+		mapping:  map[pciAddress]int{pdhAddrGPU0: 0}, // still missing GPU 2's row
+		complete: false,
+	}
+	settled := pdhLUIDCaches{
+		Unresolvable: map[pdhLUID]struct{}{luidUnresolved: {}}, // D3DKMT refused it
+		PCIToIndex:   map[pciAddress]int{pdhAddrGPU1: 1},
+	}
+	_, caches := resolvePDHLUIDs([]pdhLUID{luidGPU2}, settled, s.adapterAddress, s.fetchPCIIndex)
+	if s.fetchCalls != 1 {
+		t.Fatalf("fetchPCIIndex called %d times, want 1 -- the refetch must still fire", s.fetchCalls)
+	}
+	if _, ok := caches.Unresolvable[luidUnresolved]; !ok {
+		t.Errorf("Unresolvable = %v, want the D3DKMT refusal kept: an incomplete reading invalidates nothing", caches.Unresolvable)
+	}
+}

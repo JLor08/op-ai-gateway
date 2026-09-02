@@ -345,12 +345,23 @@ func resolvePDHLUIDs(
 			if fresh, complete := fetchPCIIndex(); len(fresh) > 0 {
 				next.PCIToIndex = fresh
 				trustNegative = complete
-				// A changed topology is the only thing that can turn a
-				// previously unresolvable adapter into a real GPU, so the
-				// negative half is discarded along with the reading it was
-				// derived from. Anything still unresolvable is re-learned on
-				// the next cycle, at the cost of one round of syscalls.
-				next.Unresolvable = make(map[pdhLUID]struct{}, len(unknown))
+				if complete {
+					// A changed topology is the only thing that can turn a
+					// previously unresolvable adapter into a real GPU, so a
+					// superseding reading discards the negative half derived
+					// from the reading before it. Anything still
+					// unresolvable is re-learned next cycle, at the cost of
+					// one round of syscalls.
+					//
+					// Gated on completeness for the same reason the negative
+					// conclusion is: a reading missing rows supersedes
+					// nothing. Ungated, a host whose nvidia-smi permanently
+					// reports one row as `[N/A]` would refetch every cycle
+					// (correctly) and wipe the negative half every cycle
+					// (pointlessly), re-probing every D3DKMT-refused adapter
+					// for the life of the process.
+					next.Unresolvable = make(map[pdhLUID]struct{}, len(unknown))
+				}
 				idx, ok = fresh[addr]
 			}
 		}
