@@ -1195,6 +1195,48 @@ func (o *owner) setPendingVRAMUnknown(st *specState, message string) {
 	o.failPending(st, ErrAdmissionBlocked)
 }
 
+// noteAdmissionWait records a queued spec's reason for waiting as its
+// LastError, for the one Wait that carries one.
+//
+// WHY A WAIT WRITES ANYTHING AT ALL. Wait is the manager's silent branch by
+// design: the spec stays queued, its state is untouched, and a future
+// completion re-triggers the admission. That is right for a wait that resolves
+// itself -- a busy neighbour finishes, a drain completes -- and it is wrong for
+// the precedence Wait of ADR-032, which need not resolve at all: the
+// known-demand occupant is spared BECAUSE it is not being evicted, and
+// scanIdle skips a spec whose IdleTimeoutSeconds is 0, the documented "never
+// unload". So an unknown-demand candidate can requeue to its
+// admission_wait_timeout_seconds on every request indefinitely, and without
+// this the operator saw a spec that never starts, in a state that says nothing,
+// with no reason string anywhere. Admit decides which Wait that is (Message is
+// set on that one alone); this function only refuses to invent a diagnostic
+// where there is none.
+//
+// NEITHER THE STATE NOR failures MOVES. The spec has not failed to start --
+// nothing was attempted -- so this is not recordFailure, and the pending
+// waiters stay queued rather than being failed as setPendingVRAMUnknown fails
+// them. A successful start clears LastError, which is the same lifecycle the
+// terminal messages already have.
+//
+// It DOES replace an older message, including a crash's, exactly as
+// setNotPermitted and setPendingVRAMUnknown do: LastError is "why this spec is
+// not serving now", and an earlier generation's crash is no longer that once
+// admission is what holds it back. The crash output itself is not lost with it
+// -- the per-spec log view keeps that generation's tail (logs.go).
+//
+// The timestamp is kept at "since when", not "last asked": every retried
+// request re-runs this with the identical message, and refreshing At on each
+// of them would make LastError.At read as if the block had only just started.
+func (o *owner) noteAdmissionWait(st *specState, message string) {
+	if message == "" {
+		return
+	}
+	if st.lastError != nil && st.lastError.Message == message {
+		return
+	}
+	st.lastError = &LastError{Message: message, At: time.Now()}
+}
+
 func (o *owner) recordFailure(st *specState, message string, exitCode int, stderrTail string) {
 	st.failures++
 	st.lastError = &LastError{
@@ -1246,7 +1288,11 @@ func (o *owner) admitAndStart(specID string) {
 		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
 		// Leave st queued; a future completion event elsewhere re-triggers
-		// this via wakeAdmissionCandidates.
+		// this via wakeAdmissionCandidates. The state is deliberately
+		// unchanged -- the spec is waiting, not failed -- but a Wait that
+		// carries a message records it, because that is the one Wait nothing
+		// need ever resolve. See noteAdmissionWait.
+		o.noteAdmissionWait(st, dec.Message)
 	case len(dec.Evict) > 0:
 		for _, victimID := range dec.Evict {
 			// Record WHO this eviction is for before asking for it: the

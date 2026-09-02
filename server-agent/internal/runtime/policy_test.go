@@ -77,8 +77,9 @@ func assertDecision(t *testing.T, name string, got, want Decision) {
 // wrong process, the wrong number of them, or in the wrong order; leaving
 // Message unchecked would pass against an implementation that leaked
 // disambiguating text onto the wrong path (every case in this table wants
-// Message == "", the zero value, so assertDecision's check of it here is
-// exercised on every single case, not just the one dedicated Message test).
+// Message == "", the zero value, except case 11's precedence Wait -- so
+// assertDecision's check of it is exercised in both directions here, not just
+// in the dedicated Message tests).
 func TestAdmit(t *testing.T) {
 	noGPUs := Spec{ID: "cand"}
 
@@ -242,7 +243,14 @@ func TestAdmit(t *testing.T) {
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}},
-			want: Decision{Wait: true, Evict: []string{}},
+			// The one Wait in this table that carries a message: the occupant
+			// it may not evict need never leave on its own
+			// (TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor).
+			want: Decision{
+				Wait:    true,
+				Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it",
+				Evict:   []string{},
+			},
 		},
 		{
 			// 12: unknown VRAM, gpu occupied by pinned -> Reason:
@@ -414,7 +422,14 @@ func TestAdmitUnknownVRAMBusyBlockerWaits(t *testing.T) {
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	got := Admit(snap, spec)
-	assertDecision(t, "unknown vram busy blocker waits", got, Decision{Wait: true, Evict: []string{}})
+	// It is still the precedence block -- the occupant has a real number and
+	// this candidate does not -- so it carries rule 4's message even though
+	// the occupant being busy means this particular wait does resolve itself.
+	assertDecision(t, "unknown vram busy blocker waits", got, Decision{
+		Wait:    true,
+		Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it",
+		Evict:   []string{},
+	})
 }
 
 // TestAdmitEmptyRunningNeverNilEvict confirms Decision.Evict is always a
@@ -1087,7 +1102,14 @@ func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
-			want: Decision{Wait: true, Evict: []string{}},
+			// The two cards in the message are different here, which is the
+			// whole point of rule 4 being keyed on every card the candidate
+			// contests: gpu 1 is the one held, gpu 0 the one with no number.
+			want: Decision{
+				Wait:    true,
+				Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 1 rather than evicting it",
+				Evict:   []string{},
+			},
 		},
 	}
 	for _, tc := range cases {
@@ -1316,6 +1338,12 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 		return []RunningProc{r}
 	}
 	idle := func(*RunningProc) {}
+	// Every Wait below is rule 4's, so every one of them carries rule 4's
+	// message. What it says is pinned by
+	// TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor; here it is the marker
+	// that this Wait came from the precedence and not from another rule
+	// reaching the same shape.
+	const waits = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it"
 
 	cases := []struct {
 		name string
@@ -1331,14 +1359,14 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			name: "idle known occupant is waited for, never evicted",
 			snap: PolicySnapshot{Running: occupant(idle), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
 			spec: unknownCandidate,
-			want: Decision{Wait: true, Evict: []string{}},
+			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
 		{
 			// Unchanged: a busy occupant was never evictable anyway.
 			name: "busy known occupant still waits",
 			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.InFlight = 1 }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
 			spec: unknownCandidate,
-			want: Decision{Wait: true, Evict: []string{}},
+			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
 		{
 			// Unchanged: isEvictable's Starting clause (the C3 fix) already
@@ -1346,7 +1374,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			name: "still-loading known occupant still waits",
 			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Starting = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
 			spec: unknownCandidate,
-			want: Decision{Wait: true, Evict: []string{}},
+			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
 		{
 			// Unchanged, and it is what makes Wait above the right SHAPE
@@ -1368,7 +1396,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			name: "a closed co-residency cell does not restore the eviction right",
 			snap: PolicySnapshot{Running: occupant(idle), Budgets: map[int]int{0: 20000}},
 			spec: unknownCandidate,
-			want: Decision{Wait: true, Evict: []string{}},
+			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
 		{
 			// Before: Evict [occupant] -- here from rule 3's arithmetic on the
@@ -1383,7 +1411,13 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
-			want: Decision{Wait: true, Evict: []string{}},
+			// The contested card is the sibling here, so the message names
+			// gpu 1 as the one held and gpu 0 as the one with no number.
+			want: Decision{
+				Wait:    true,
+				Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 1 rather than evicting it",
+				Evict:   []string{},
+			},
 		},
 		{
 			// The order is about the cards the candidate CONTESTS. A
@@ -1408,6 +1442,132 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 	}
 }
 
+// TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor is the diagnostic half of
+// ADR-032. The order costs the losing spec a `Wait` while an idle victim was
+// plainly available, and that wait is only as short as the occupant's own
+// `idle_timeout_seconds` -- which is `0` (never unload) by default, so for an
+// idle, unpinned, never-again-requested occupant the candidate can queue to
+// its admission timeout on every attempt, forever. A spec that will not start,
+// with nothing anywhere saying why, is not an acceptable outcome, so THIS Wait
+// carries a message: which spec holds which card, and that this candidate's
+// own demand is the missing number.
+//
+// SCOPED TO THE PRECEDENCE WAIT, which the controls at the end pin. Every
+// other Wait is ordinary operation -- a busy neighbour finishes, a queued
+// victim drains -- and must keep saying nothing, or the portal's error column
+// fills with noise on every contested start.
+func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
+	unknownCandidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+
+	cases := []struct {
+		name string
+		snap PolicySnapshot
+		spec Spec
+		want Decision
+	}{
+		{
+			// The wait nothing resolves on its own: idle, unpinned, and (in
+			// the manager) an idle timeout of 0.
+			name: "the idle known occupant it may not evict is named, with its card",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
+				Allowed: allowPairs("cand", "occupant"),
+				Budgets: map[int]int{0: 20000},
+			},
+			spec: unknownCandidate,
+			want: Decision{
+				Wait:    true,
+				Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it",
+				Evict:   []string{},
+			},
+		},
+		{
+			// The candidate's unknown card and the contested card need not be
+			// the same one -- rule 4 demands aloneness on ALL of its cards --
+			// so the message names both.
+			name: "the contested card and the unknown card are named separately",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0}},
+				Allowed: allowPairs("cand", "occupant"),
+				Budgets: map[int]int{1: 20000},
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
+			want: Decision{
+				Wait:    true,
+				Message: "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 1 rather than evicting it",
+				Evict:   []string{},
+			},
+		},
+		{
+			// CONTROL: a matrix block against a busy neighbour. An ordinary
+			// Wait, resolved by that neighbour finishing, and it must stay
+			// silent.
+			name: "control: a matrix-blocked busy neighbour says nothing",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "blocker", InFlight: 1, LastUsed: t0}},
+			},
+			spec: Spec{ID: "cand"},
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// CONTROL: rule 5's own Wait. The candidate here has a real
+			// number and the OCCUPANT is the unknown one, so this is the
+			// winning side of the order merely waiting for a busy process to
+			// go idle -- at which point rule 5 evicts it. Transient by
+			// construction, so no message.
+			name: "control: rule 5 waiting for a busy unknown occupant says nothing",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 1, LastUsed: t0}},
+				Allowed: allowPairs("cand", "occupant"),
+				Budgets: map[int]int{0: 20000},
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// CONTROL: the tie the order does not decide. Both sides unknown,
+			// so nothing outranks anything, rule 5 owns the occupant, and the
+			// pre-existing mutual eviction stands -- there is no precedence
+			// block here to report.
+			name: "control: the both-unknown tie is not a precedence block",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 1, LastUsed: t0}},
+				Allowed: allowPairs("cand", "occupant"),
+				Budgets: map[int]int{0: 20000},
+			},
+			spec: unknownCandidate,
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, tc.name, Admit(tc.snap, tc.spec), tc.want)
+		})
+	}
+}
+
+// TestAdmitPrecedenceWaitMessageIsDeterministic: PolicySnapshot.Running
+// arrives in Go MAP order (owner.buildSnapshot ranges over o.specs), so
+// "whichever blocker the loop saw first" would name a different spec on every
+// admission against an unchanged host -- and this text goes into an
+// operator-facing `last_error` that the portal renders in a column. The
+// tie-break is the lowest spec id, the same total order the victim ordering
+// and pinnedUnknownOccupantRefusal already use.
+func TestAdmitPrecedenceWaitMessageIsDeterministic(t *testing.T) {
+	a := RunningProc{SpecID: "occupant-a", GPUs: map[int]int{0: 4000}, LastUsed: t1}
+	b := RunningProc{SpecID: "occupant-b", GPUs: map[int]int{0: 4000}, LastUsed: t0}
+	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	allowed := allowPairs("cand", "occupant-a", "occupant-b")
+
+	const want = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant-a to leave gpu 0 rather than evicting it"
+	for _, order := range [][]RunningProc{{a, b}, {b, a}} {
+		got := Admit(PolicySnapshot{Running: order, Allowed: allowed, Budgets: map[int]int{0: 20000}}, spec)
+		if got.Message != want {
+			t.Errorf("Running order %v -> Message = %q, want %q", []string{order[0].SpecID, order[1].SpecID}, got.Message, want)
+		}
+	}
+}
+
 // TestAdmitMixedPairConverges is the defect itself, asserted as a property of
 // the PAIR rather than of one decision: run Admit in both directions over one
 // contested card and at most one of them may evict. Before the change both
@@ -1427,7 +1587,11 @@ func TestAdmitMixedPairConverges(t *testing.T) {
 	assertDecision(t, "rule 5: known demand evicts the unknown occupant", knownAsCandidate,
 		Decision{Evict: []string{"unknown"}})
 	assertDecision(t, "rule 4: unknown demand waits for the known occupant", unknownAsCandidate,
-		Decision{Wait: true, Evict: []string{}})
+		Decision{
+			Wait:    true,
+			Message: "spec unknown: its own demand on gpu 0 is unknown, so it waits for spec known to leave gpu 0 rather than evicting it",
+			Evict:   []string{},
+		})
 
 	if len(knownAsCandidate.Evict) > 0 && len(unknownAsCandidate.Evict) > 0 {
 		t.Fatalf("both directions of one mixed pair evict, so alternating requests thrash forever: "+

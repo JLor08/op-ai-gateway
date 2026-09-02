@@ -1405,6 +1405,123 @@ func TestManagerPendingVRAMUnknownReportsWhichSpecIsUnknown(t *testing.T) {
 	}
 }
 
+// TestManagerPrecedenceWaitRecordsWhyItIsWaiting carries the ADR-032 Wait's
+// diagnostic the rest of the way to the operator, and the snapshot it builds
+// is the one that has no way out on its own.
+//
+// `Wait` is the manager's silent branch: it leaves the spec queued and sets no
+// state, no reason and no `last_error`, which is right for the waits that
+// resolve themselves -- a busy neighbour finishes, a queued victim drains.
+// The precedence Wait need not resolve at all. `scanIdle` skips
+// `IdleTimeoutSeconds <= 0` and `0` means *never unload*, so an idle,
+// unpinned, never-again-requested occupant of KNOWN demand keeps its card
+// indefinitely, while the unknown-demand candidate -- forbidden to evict it --
+// requeues to its admission timeout on every single request. Before this, that
+// spec never started and nothing anywhere said why.
+func TestManagerPrecedenceWaitRecordsWhyItIsWaiting(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	// The occupant: a real estimate, NOT pinned (a pinned one would be step
+	// 2's terminal instead), and an idle timeout of 0 -- so once it is idle
+	// nothing will ever unload it.
+	known := baseSpec("spec-known", "model-known")
+	known.GPUs = []SpecGPU{{Index: 0, VRAMMB: 5000}}
+	known.IdleTimeoutSeconds = 0
+
+	// The candidate: its own demand is the missing number, so it may start
+	// only alone on gpu 0 and may not evict the spec that has one.
+	unknown := baseSpec("spec-unknown", "model-unknown")
+	unknown.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+	unknown.AdmissionWaitTimeoutSeconds = 1
+
+	// The pair is OPEN, and a generous budget: rule 1 and rule 3 must have
+	// nothing to say, or they would produce the same Wait for another reason.
+	m.Apply(Config{
+		Specs:      []Spec{known, unknown},
+		Coresident: [][2]string{{"spec-known", "spec-unknown"}},
+		GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 20000}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, release, err := m.EnsureRunning(ctx, "model-known")
+	cancel()
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-known) error = %v, want the occupant to start", err)
+	}
+	release() // idle from here on, and with idle_timeout 0 it stays up
+	waitUntil(t, 5*time.Second, "spec-known running", func() bool {
+		st := statusFor(m, "spec-known")
+		return st != nil && st.State == StateRunning
+	})
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if _, _, err := m.EnsureRunning(ctx2, "model-unknown"); !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("EnsureRunning(model-unknown) error = %v, want ErrAdmissionBlocked from the admission wait", err)
+	}
+
+	st := statusFor(m, "spec-unknown")
+	if st == nil {
+		t.Fatal("Status() has no row for spec-unknown")
+	}
+	if st.LastError == nil {
+		t.Fatal("Status()[spec-unknown].LastError is nil -- BUG: the precedence Wait leaves the spec queued with no state change, no reason and no message, so a spec that can never start says nothing anywhere about why")
+	}
+	if !strings.Contains(st.LastError.Message, "spec-known") || !strings.Contains(st.LastError.Message, "gpu 0") {
+		t.Errorf("LastError.Message = %q, want it to name spec-known and the contested gpu 0", st.LastError.Message)
+	}
+
+	// The occupant is the correctly configured one and must be left entirely
+	// alone: still running (nothing was evicted for this) and not blamed.
+	stk := statusFor(m, "spec-known")
+	if stk == nil || stk.State != StateRunning {
+		t.Fatalf("Status()[spec-known] = %+v, want it still running -- known demand is never evicted for unknown", stk)
+	}
+	if stk.LastError != nil {
+		t.Errorf("Status()[spec-known].LastError = %+v, want nil: the spec whose estimate is filled in is not the one with a problem", stk.LastError)
+	}
+}
+
+// TestManagerOrdinaryWaitStillRecordsNothing is the other half of that scope,
+// and the reason the message is attached in `Admit` rather than to every Wait
+// the manager sees. A spec waiting behind a BUSY neighbour is normal operation
+// on a contested host; writing an error for it would put a warning icon on the
+// portal's status row every time two models compete, which is exactly how a
+// diagnostic stops being read.
+func TestManagerOrdinaryWaitStillRecordsNothing(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	busy := baseSpec("spec-busy", "model-busy")
+	candidate := baseSpec("spec-cand", "model-cand")
+	candidate.AdmissionWaitTimeoutSeconds = 1
+	// No Coresident entry: the pair is closed, so rule 1 blocks -- and the
+	// blocker is busy, so it cannot be evicted either. Neither spec declares a
+	// GPU, so no unknown-VRAM rule is in play at all.
+	m.Apply(Config{Specs: []Spec{busy, candidate}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, release, err := m.EnsureRunning(ctx, "model-busy")
+	cancel()
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-busy) error = %v", err)
+	}
+	defer release() // NOT released yet: in-flight is what makes it unevictable
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if _, _, err := m.EnsureRunning(ctx2, "model-cand"); !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("EnsureRunning(model-cand) error = %v, want ErrAdmissionBlocked from the admission wait", err)
+	}
+
+	if st := statusFor(m, "spec-cand"); st == nil || st.LastError != nil {
+		t.Errorf("Status()[spec-cand].LastError = %+v, want nil -- an ordinary Wait must not write an error", st.LastError)
+	}
+}
+
 // TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange is M1: an
 // Apply that changes spec B must not let spec A's crash backoff skip its
 // current wait. Before the fix, applyConfig's terminal-state reset ran for

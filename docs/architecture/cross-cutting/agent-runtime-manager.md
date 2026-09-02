@@ -898,11 +898,14 @@ per-cell VRAM tooltip says so on every cell.
 
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
 my model get evicted" requires checking both the matrix and the arithmetic. The
-mirror-image question has one extra answer: a spec that sits waiting while an
-**idle** process occupies its card is not necessarily a stuck decision — if the
-waiting spec's own `vram_estimate_mb` is `0`, that is §5.3's precedence
-declining to evict a correctly-configured neighbour, and filling the estimate
-in is the fix.
+mirror-image question has one extra answer, and that one says so itself: a spec
+that sits waiting while an **idle** process occupies its card is not
+necessarily a stuck decision — if the waiting spec's own `vram_estimate_mb` is
+`0`, that is §5.3's precedence declining to evict a correctly-configured
+neighbour, and filling the estimate in is the fix. That case is the one `Wait`
+that writes a `last_error` (naming the occupant and the card, see §5.3); every
+other `Wait` leaves the spec queued silently, so a waiting spec with no reason
+string is waiting for something that resolves on its own.
 
 Three zero-values mean "no constraint", not "zero": `max_processes == 0` is
 unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand and
@@ -1295,14 +1298,32 @@ forbids evicting — is unloaded by the idle scan (§6) **if** its
 unpinned, never-again-requested occupant keeps the card until the operator
 fills the candidate's estimate in (or, on an NVIDIA host, a measurement lands),
 and the candidate's requests queue to their
-`admission_wait_timeout_seconds` meanwhile. **A `Wait` carries no message and
-sets no `last_error`** — the manager just leaves the spec queued — so this
-stall is diagnosed from the *absence* of a start rather than from a reason
-string, which is what the note at the end of §5.2 is for. That is the accepted
-price of "known demand beats unknown demand": the alternative is the
-unknown-demand spec drain-stopping the configured one, which is the
-non-converging behaviour above. It is not reported as terminal because none of
-the three ways out is closed.
+`admission_wait_timeout_seconds` meanwhile. It is not reported as terminal
+because none of the three ways out is closed. That wait is the accepted price
+of "known demand beats unknown demand": the alternative is the unknown-demand
+spec drain-stopping the configured one, which is the non-converging behaviour
+above.
+
+**So this one `Wait` says why, and it is the only one that does.** `Wait` is
+otherwise the manager's silent branch — the spec stays queued, its state is
+untouched, no `last_error` is written — which is right for a wait that resolves
+itself: a busy neighbour finishes, a queued victim drains. The precedence wait
+need not resolve at all, and a spec that will never start while nothing
+anywhere says why is not an acceptable outcome, so `Admit` attaches a message
+to *that* decision and the manager records it as the candidate's `last_error`:
+`spec X: its own demand on gpu 0 is unknown, so it waits for spec Y to leave
+gpu 0 rather than evicting it`. Both cards are named because they need not be
+the same one (rule 4 demands aloneness on *every* card the candidate wants),
+and the occupant is chosen by lowest spec id — `Running` arrives in Go map
+order, and an operator-facing string must not name a different spec on every
+admission. The portal renders `last_error` in an always-visible column, so
+this is where the stall becomes visible. Scope is deliberate: **an ordinary
+`Wait` still records nothing**, because a warning on every contested start is
+how a diagnostic stops being read. Neither the state nor the failure count
+moves either — nothing was attempted, so this is not a failed start — and a
+successful start clears it, like every other reason string. Retried requests
+re-derive the identical message and leave the original timestamp alone, so
+`last_error.at` reads as *since when*, not *last asked*.
 
 **A terminal reason must name a cause that resolving it actually unblocks**,
 and two things follow from that.

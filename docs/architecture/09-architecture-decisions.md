@@ -417,7 +417,7 @@ outcome depend on request order). **Consequence:** an unknown-demand spec may
 still have a card to itself — that is rule 4's stated intent — but only a card
 it can *get* to itself; what it loses is the privilege of evicting a working
 model to get there, and the spec that loses the contest is always the
-misconfigured one, named in the other's `last_error`. Where **both** sides are
+misconfigured one. Where **both** sides are
 unknown neither outranks the other, and the pre-existing mutual eviction stands
 (rule 5 still evicts an evictable unknown occupant) — unchanged by this decision
 rather than fixed by it, and recorded as an acceptance in
@@ -426,4 +426,11 @@ price of the order is a `Wait` returned while an idle victim was plainly
 available, and that wait is only as short as the occupant's own
 `idle_timeout_seconds` (a `0` there means *never unload*): the ways out are a
 measurement, or the operator's estimate on the spec that is missing one.
+Because that price can be unbounded — an idle occupant with
+`idle_timeout_seconds: 0` never leaves, and the candidate requeues to its
+admission timeout on every request — **this `Wait` is the one that reports
+itself**: `Admit` gives it a message and the manager records it as the blocked
+spec's own `last_error`, naming the occupant and the card, which the portal
+shows in an always-visible column. Every other `Wait` stays silent, since a
+spec queued behind a busy neighbour is ordinary operation.
 → [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).

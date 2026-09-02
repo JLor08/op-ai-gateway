@@ -78,7 +78,12 @@ type PolicySnapshot struct {
 //     right shape for it: an idle occupant is resolvable, just by its own
 //     idle timeout rather than by an eviction this decision asks for. What
 //     Wait promises the caller is therefore only that re-asking later may
-//     succeed -- never that it exhausted the eviction candidates.
+//     succeed -- never that it exhausted the eviction candidates. ONLY THAT
+//     SECOND SITUATION SETS Message, because only it can fail to resolve on
+//     its own: an occupant with idle_timeout_seconds 0 (never unload) holds
+//     the card indefinitely, so the wait is diagnosed from the message rather
+//     than from the absence of a start. The first keeps Message empty -- a
+//     spec queued behind a busy neighbour is ordinary operation.
 //   - Reason: OK is false, Wait is false, Evict is empty, and Reason names
 //     a durable, non-transient block -- one that cannot resolve by
 //     eviction OR by waiting, so reporting it as either of the other two
@@ -119,9 +124,14 @@ type PolicySnapshot struct {
 //     StateNotPermitted for a refused binary/directory, so Message is
 //     the only thing separating all three.
 type Decision struct {
-	OK      bool
-	Reason  State    // "" unless a terminal case above applies
-	Message string   // set only alongside a terminal Reason that needs disambiguating context; "" otherwise
+	OK     bool
+	Reason State // "" unless a terminal case above applies
+	// Message is the operator-facing explanation, set on exactly two shapes:
+	// alongside a terminal Reason that needs disambiguating context, and
+	// alongside the precedence-induced Wait (rule 4), which is the one Wait
+	// that need never resolve by itself. "" otherwise -- and in particular on
+	// every ordinary Wait.
+	Message string
 	Evict   []string // spec IDs to drain-stop first, oldest LastUsed first; never nil
 	Wait    bool
 }
@@ -581,6 +591,10 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 
 	toEvict := make(map[string]RunningProc)
 	blocked := false
+	// waitMessage is set by rule 4 alone, and only ever reaches a Wait: rule 4
+	// setting it also sets blocked, and blocked always answers Wait. See rule
+	// 4 for why that one Wait is the only one that explains itself.
+	waitMessage := ""
 
 	// Rule 1: matrix compatibility.
 	for _, r := range running {
@@ -644,11 +658,65 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// acceptance (11-risks-and-technical-debt.md §11.4) pinned by
 	// TestAdmitUnknownTieStillEvictsBothWays -- which is also the test that
 	// fails if rule 5's scan is ever narrowed out from under this comment.
+	//
+	// IT IS THE ONE WAIT THAT REPORTS ITSELF. Every other Wait in this
+	// function resolves without anyone doing anything -- a busy neighbour
+	// finishes, a queued victim drains -- but this one need not resolve at
+	// all: the occupant is spared here precisely because it is not being
+	// evicted, and owner.scanIdle skips a spec whose IdleTimeoutSeconds is 0,
+	// which is the documented "never unload". An idle, unpinned,
+	// never-again-requested occupant therefore keeps the card indefinitely
+	// while this candidate requeues to its admission timeout on every
+	// request. So this branch fills in Decision.Message, which the manager
+	// records as the candidate's last_error (the portal renders it in an
+	// always-visible column); the ordinary Waits deliberately keep saying
+	// nothing, since an error on every contested start is how a diagnostic
+	// stops being read.
+	//
+	// The PINNED variant of this same block, returned by step 2 above, needs
+	// no message and still has none: it reports the terminal
+	// StatePendingVRAMUnknown, and that state on this spec's own row already
+	// names the missing number as this spec's (§5.3). A message is added here
+	// precisely because a Wait has no state to speak for it.
 	if unknownVRAM {
+		var (
+			precedenceBlocker string
+			precedenceGPU     int
+			foundBlocker      bool
+		)
 		for _, r := range running {
-			if touchesAnyGPU(r, gpuIdx) && !procHasUnknownVRAM(r) {
-				blocked = true
+			gpu, shares := firstSharedGPU(r, gpuIdx)
+			if !shares || procHasUnknownVRAM(r) {
+				continue
 			}
+			blocked = true
+			// Lowest spec id wins, as in pinnedUnknownOccupantRefusal and
+			// sortOldestFirst: PolicySnapshot.Running arrives in map order
+			// (owner.buildSnapshot ranges over o.specs), so "the first one
+			// seen" would name a different spec on every admission against an
+			// unchanged host -- in an operator-facing message.
+			if !foundBlocker || r.SpecID < precedenceBlocker {
+				precedenceBlocker, precedenceGPU, foundBlocker = r.SpecID, gpu, true
+			}
+		}
+		if foundBlocker {
+			// Both cards are named because they need not be the same one:
+			// rule 4 demands aloneness on ALL of the candidate's cards, so the
+			// card being held and the card whose number is missing can differ
+			// (see specGPUIndexes). unknownGPU is the first in spec.GPUs
+			// order, which is the order rule 3's messages already name cards
+			// in.
+			unknownGPU := 0
+			for _, g := range spec.GPUs {
+				if g.VRAMMB == 0 {
+					unknownGPU = g.Index
+					break
+				}
+			}
+			waitMessage = fmt.Sprintf(
+				"spec %s: its own demand on gpu %d is unknown, so it waits for spec %s to leave gpu %d rather than evicting it",
+				spec.ID, unknownGPU, precedenceBlocker, precedenceGPU,
+			)
 		}
 	}
 
@@ -765,7 +833,7 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	}
 
 	if blocked {
-		return Decision{Wait: true, Evict: []string{}}
+		return Decision{Wait: true, Message: waitMessage, Evict: []string{}}
 	}
 	if len(toEvict) == 0 {
 		return Decision{OK: true, Evict: []string{}}
