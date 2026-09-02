@@ -1177,6 +1177,24 @@ func (o *owner) setNotPermitted(st *specState, message string) {
 	o.failPending(st, ErrNotPermitted)
 }
 
+// setPendingVRAMUnknown records the terminal unknown-VRAM block, and records
+// the policy's message as this spec's LastError when there IS one.
+//
+// The message is what names the spec an operator has to fix, and for rule 5 it
+// is not this one: the spec entering this state is the one with a usable
+// estimate, while the missing estimate belongs to the pinned spec beside it.
+// Rule 4's block is the candidate's own demand, needs no name, and sends no
+// message -- lastError is then left exactly as it was rather than being
+// blanked, since it may still describe a real earlier failure of this spec.
+func (o *owner) setPendingVRAMUnknown(st *specState, message string) {
+	o.setState(st, StatePendingVRAMUnknown)
+	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
+	if message != "" {
+		st.lastError = &LastError{Message: message, At: time.Now()}
+	}
+	o.failPending(st, ErrAdmissionBlocked)
+}
+
 func (o *owner) recordFailure(st *specState, message string, exitCode int, stderrTail string) {
 	st.failures++
 	st.lastError = &LastError{
@@ -1225,9 +1243,7 @@ func (o *owner) admitAndStart(specID string) {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
-		o.setState(st, StatePendingVRAMUnknown)
-		st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
-		o.failPending(st, ErrAdmissionBlocked)
+		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
 		// Leave st queued; a future completion event elsewhere re-triggers
 		// this via wakeAdmissionCandidates.

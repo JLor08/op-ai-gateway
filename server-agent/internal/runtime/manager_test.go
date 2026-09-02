@@ -1340,6 +1340,71 @@ func TestManagerPendingVRAMUnknownRateLimitsReEvaluation(t *testing.T) {
 	}
 }
 
+// TestManagerPendingVRAMUnknownReportsWhichSpecIsUnknown carries rule 5's
+// terminal Message the rest of the way to the operator.
+//
+// Rule 4's block is the candidate's own missing estimate, so the state alone
+// points at the field to fix. Rule 5's is not: the spec that goes into
+// pending_vram_unknown is the one with a perfectly good estimate, while the
+// unfilled one belongs to the PINNED spec beside it. admitAndStart used to
+// drop Decision.Message on this branch (only the not_permitted branch read
+// it), so the portal showed a spec waiting for VRAM with nothing anywhere
+// naming what to fix -- and on an AMD, Apple or GPU-less host, where no
+// measurer will ever resolve it, filling that estimate in is the ONLY way
+// out (§5.3).
+func TestManagerPendingVRAMUnknownReportsWhichSpecIsUnknown(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	// Pinned, running, and its own demand unknown: the occupant rule 5 fires
+	// on. Pinned is what makes the block terminal rather than a Wait.
+	unknown := baseSpec("spec-unknown", "model-unknown")
+	unknown.Pinned = true
+	unknown.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+
+	// A real estimate, and the pair is OPEN, so nothing but rule 5 can
+	// refuse it -- in particular not the co-residency matrix, whose closed
+	// cell reports itself instead (see policy.go).
+	known := baseSpec("spec-known", "model-known")
+	known.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+
+	m.Apply(Config{
+		Specs:      []Spec{unknown, known},
+		Coresident: [][2]string{{"spec-unknown", "spec-known"}},
+	})
+
+	waitUntil(t, 5*time.Second, "pinned spec-unknown running", func() bool {
+		st := statusFor(m, "spec-unknown")
+		return st != nil && st.State == StateRunning
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := m.EnsureRunning(ctx, "model-known"); !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("EnsureRunning error = %v, want ErrAdmissionBlocked", err)
+	}
+
+	st := statusFor(m, "spec-known")
+	if st == nil || st.State != StatePendingVRAMUnknown {
+		t.Fatalf("Status()[spec-known] = %+v, want state %q", st, StatePendingVRAMUnknown)
+	}
+	if st.LastError == nil {
+		t.Fatal("Status()[spec-known].LastError is nil -- BUG: the terminal reason names the OTHER spec, and dropping the message leaves the operator with nothing to act on")
+	}
+	if !strings.Contains(st.LastError.Message, "spec-unknown") {
+		t.Errorf("LastError.Message = %q, want it to name spec-unknown as the spec whose demand is unknown", st.LastError.Message)
+	}
+
+	// The candidate's own state must not be blamed on the candidate: rule 4's
+	// terminal still sends no message, so a spec blocked by its OWN unknown
+	// demand keeps whatever LastError it already had.
+	st2 := statusFor(m, "spec-unknown")
+	if st2 == nil || st2.State != StateRunning {
+		t.Fatalf("Status()[spec-unknown] = %+v, want it still running and untouched", st2)
+	}
+}
+
 // TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange is M1: an
 // Apply that changes spec B must not let spec A's crash backoff skip its
 // current wait. Before the fix, applyConfig's terminal-state reset ran for

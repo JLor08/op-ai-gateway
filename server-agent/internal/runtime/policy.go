@@ -77,29 +77,39 @@ type PolicySnapshot struct {
 //     outcomes would be actively misleading (Wait would hang the caller
 //     until its admission-wait timeout on every single request; Evict
 //     would ask for a drain-stop that can never restore a fit). Two
-//     distinct causes share this shape, both worth telling apart via
-//     Message since both surface as the same State:
+//     States share this shape, carrying three distinct causes between
+//     them, and Message is what tells those causes apart:
 //   - StatePendingVRAMUnknown: a VRAM demand on one of the contested
 //     GPUs is unknown -- the CANDIDATE's own (rule 4) or a running
 //     OCCUPANT's (rule 5) -- and a PINNED process sits on the other
 //     side of that contention: pinned processes are never evicted,
 //     and a pinned process never finishes, so waiting cannot help
-//     either. Message is empty for this cause -- Reason alone is
-//     unambiguous. Terminal is not the same as permanent: the manager
-//     re-evaluates this state after notPermittedRetryInterval, so a
-//     measurement landing on the pinned occupant (rule 5's case) or
-//     an operator filling the estimate in clears it without anything
-//     being evicted.
-//   - StateNotPermitted: spec's own declared demand on some GPU
-//     already exceeds that GPU's budget on its own, with nothing
-//     running at all. No eviction, on this GPU or any other, can ever
-//     make it fit -- this is an operator misconfiguration (an
-//     over-estimated VRAM demand, or a budget shrunk below it), the
-//     same "configuration error, visible in the portal, not
-//     transient" meaning the design doc already assigns
-//     StateNotPermitted for a refused binary/directory. Message
-//     distinguishes this VRAM-budget cause from that one, since both
-//     share the State.
+//     either. Message NAMES THE OCCUPANT when the unknown demand is
+//     the occupant's, because the estimate an operator has to fill in
+//     then lives on a DIFFERENT spec than the one displaying this
+//     state; it is empty for the candidate's own unknown demand,
+//     where the state is already attached to the only spec involved.
+//     Terminal is a report, not a permanent verdict: the manager
+//     re-evaluates after notPermittedRetryInterval. What can clear it
+//     is HOST-DEPENDENT -- where a measurer is installed, the
+//     housekeeping beat measures the pinned occupant and the block
+//     clears with nothing evicted, but measurement is NVIDIA-only
+//     (§5.3), so on an AMD, Apple-silicon or GPU-less host nothing
+//     clears it except an operator filling the estimate in.
+//   - StateNotPermitted: a durable operator-configuration block. Two
+//     causes reach it from here. (1) Spec's own declared demand on
+//     some GPU exceeds that GPU's budget all by itself, whatever else
+//     is running -- an over-estimated VRAM demand, or a budget shrunk
+//     below it (rule 3's own-demand half, which is why that half is
+//     evaluated FIRST: no running set can change its verdict).
+//     (2) A pinned occupant of unknown demand holds one of spec's
+//     GPUs AND the co-residency pair is not permitted, where the
+//     closed matrix cell -- not the missing VRAM number -- is what
+//     actually blocks. Neither resolves by eviction or by waiting.
+//     Both carry the same "configuration error, visible in the
+//     portal, not transient" meaning the design doc already assigns
+//     StateNotPermitted for a refused binary/directory, so Message is
+//     the only thing separating all three.
 type Decision struct {
 	OK      bool
 	Reason  State    // "" unless a terminal case above applies
@@ -158,20 +168,31 @@ func isEvictable(r RunningProc) bool {
 	return !r.Pinned && !r.Starting && r.InFlight == 0
 }
 
-// touchesAnyGPU reports whether r occupies any GPU index named in idx.
-func touchesAnyGPU(r RunningProc, idx []int) bool {
+// firstSharedGPU returns the first index in idx that r occupies, and whether
+// there is one. idx is spec.GPUs order (see specGPUIndexes), so the answer is
+// deterministic and names the same card rule 3's messages name.
+func firstSharedGPU(r RunningProc, idx []int) (int, bool) {
 	for _, i := range idx {
 		if _, ok := r.GPUs[i]; ok {
-			return true
+			return i, true
 		}
 	}
-	return false
+	return 0, false
+}
+
+// touchesAnyGPU reports whether r occupies any GPU index named in idx.
+func touchesAnyGPU(r RunningProc, idx []int) bool {
+	_, ok := firstSharedGPU(r, idx)
+	return ok
 }
 
 // specGPUIndexes returns every GPU index spec.GPUs names, known-VRAM and
-// unknown-VRAM alike: the unknown-VRAM rule (rule 4) requires the spec to
-// start alone on ALL of its GPUs, not only the one(s) whose demand happens
-// to be unknown.
+// unknown-VRAM alike. It is the set of cards the candidate CONTESTS, and both
+// unknown-VRAM rules are keyed on it: rule 4 requires a spec of unknown
+// demand to start alone on ALL of its GPUs, not only the one(s) whose demand
+// happens to be unknown, and rule 5 asks the mirror question of an occupant
+// -- does it hold any of these cards -- so that the two sides agree on what
+// "the same card" means.
 func specGPUIndexes(spec Spec) []int {
 	idx := make([]int, len(spec.GPUs))
 	for i, g := range spec.GPUs {
@@ -191,9 +212,29 @@ func specHasUnknownVRAM(spec Spec) bool {
 	return false
 }
 
-// procHasUnknownVRAMOn reports whether r occupies any GPU index named in
-// idx with an UNKNOWN demand. It is the occupant-side mirror of
-// specHasUnknownVRAM, and rule 5 in Admit is the rule it feeds.
+// firstUnknownGPU returns the LOWEST GPU index whose demand r reports as
+// unknown (a key PRESENT with a value of 0), and whether there is one.
+//
+// The lowest, not the first one found: RunningProc.GPUs is a map and Go
+// randomizes map iteration, so "the first hit" would name a different card on
+// every admission for a process with two unknown cards -- and this index goes
+// into an operator-facing Message.
+func firstUnknownGPU(r RunningProc) (int, bool) {
+	lowest, found := 0, false
+	for i, v := range r.GPUs {
+		if v != 0 {
+			continue
+		}
+		if !found || i < lowest {
+			lowest, found = i, true
+		}
+	}
+	return lowest, found
+}
+
+// procHasUnknownVRAM reports whether r occupies ANY GPU whose demand is
+// UNKNOWN. It is the occupant-side mirror of specHasUnknownVRAM, and rule 5
+// in Admit is the rule it feeds.
 //
 // WHY THERE IS A RULE 5 AT ALL. Rule 4 admits a spec of unknown demand only
 // if it runs ALONE on its GPUs -- and without this predicate that guarantee
@@ -218,8 +259,26 @@ func specHasUnknownVRAM(spec Spec) bool {
 // claim" (owner.buildSnapshot copies that 0 through verbatim, and
 // realMeasurement is what keeps a measured 0 from arriving here dressed up
 // as a measurement). An ABSENT key means something else entirely: the
-// process is not on that card, which rule 5 must ignore rather than read as
-// unknown -- rule 5 is per-GPU, like rule 3 and unlike rule 1.
+// process is not on that card at all, which says nothing about its demand.
+//
+// THE SCOPE IS THE WHOLE PROCESS, AND THAT IS WHAT MAKES RULE 5 RULE 4's
+// MIRROR. This predicate asks "does r have an unknown demand anywhere",
+// exactly as specHasUnknownVRAM asks it of the candidate; Admit then pairs it
+// with touchesAnyGPU, exactly as rule 4 does. It was narrower once -- "is r
+// unknown at one of the CANDIDATE's indexes" -- which made rule 5 a mirror in
+// name only, because rule 4's promise is aloneness on ALL of the unknown
+// spec's GPUs (see specGPUIndexes), not just its unknown ones. Measured on
+// the narrow version: an occupant of {gpu 0: unknown, gpu 1: 5000} was
+// admitted by rule 4 only on the promise of running alone on BOTH cards, yet
+// a candidate asking for gpu 1 alone found nothing unknown there and got
+// OK -- with that occupant idle, busy AND pinned -- silently revoking on
+// gpu 1 the aloneness rule 4 had just granted. That is the same expiring
+// promise rule 5 exists to close, one card over.
+//
+// The CONTENTION half stays per-GPU: an occupant whose cards the candidate
+// never touches competes for nothing and is ignored (see
+// TestAdmitUnknownOccupantOnOtherGPUIsIgnored). Widening THAT to "any
+// unknown-demand process anywhere" would evict half the host on every start.
 //
 // The test is `== 0`, not `<= 0`, so that it stays literally the test
 // specHasUnknownVRAM and rule 3 apply to a spec's declared demand. A
@@ -237,13 +296,142 @@ func specHasUnknownVRAM(spec Spec) bool {
 // charge and the release would both have to be made consistent, inventing a
 // VRAM figure for a process nobody has measured; naming the contention
 // instead needs no number.
-func procHasUnknownVRAMOn(r RunningProc, idx []int) bool {
-	for _, i := range idx {
-		if v, ok := r.GPUs[i]; ok && v == 0 {
-			return true
+func procHasUnknownVRAM(r RunningProc) bool {
+	_, ok := firstUnknownGPU(r)
+	return ok
+}
+
+// ownDemandRefusal returns rule 3's own-demand terminal -- spec's declared
+// demand on one GPU exceeds that GPU's budget all by itself -- or ok == false
+// when every declared demand fits its own budget.
+//
+// IT READS ONLY spec AND snap.Budgets, WHICH IS WHY IT MAY RUN FIRST, ahead
+// of every rule that looks at the running set at all. Nothing about it
+// depends on what is running, what is pinned or what could be evicted, so no
+// ordering can change its verdict -- while its verdict is the most durable
+// one Admit has: the candidate cannot start until an operator edits a number,
+// whatever else happens on the host.
+//
+// Running it first is a FIX, not a tidy-up. It used to sit inside rule 3's
+// loop, behind the pinned unknown-VRAM short-circuit, and a snapshot
+// satisfying both reported the wrong one: candidate demand 9000 MB against a
+// budget of 8000 MB, plus a pinned occupant of unknown demand on the same
+// card, answered pending_vram_unknown -- inviting the operator to go fill in
+// a DIFFERENT spec's estimate, which cannot make 9000 MB fit under 8000 MB.
+// The shadowed cause is permanent and the reported one was not, which is the
+// wrong way round; §5.2 is explicit that Message is the only thing telling a
+// budget refusal apart from a local-policy refusal, and an empty one told
+// nothing.
+func ownDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
+	for _, g := range spec.GPUs {
+		if g.VRAMMB == 0 {
+			continue // unknown demand: rules 4 and 5, never the arithmetic
+		}
+		// Absent from Budgets and a budget of 0 both mean unconstrained and
+		// must behave identically -- see PolicySnapshot.Budgets, and the
+		// longer note at rule 3, which is the other reader of this rule.
+		budget := snap.Budgets[g.Index]
+		if budget <= 0 {
+			continue
+		}
+		if g.VRAMMB > budget {
+			return Decision{
+				Reason: StateNotPermitted,
+				Message: fmt.Sprintf(
+					"spec %s: gpu %d demand %d MB exceeds budget %d MB on its own",
+					spec.ID, g.Index, g.VRAMMB, budget,
+				),
+				Evict: []string{},
+			}, true
 		}
 	}
-	return false
+	return Decision{}, false
+}
+
+// pinnedUnknownOccupantRefusal is step 2's occupant half -- rule 5 against a
+// PINNED occupant -- returning the terminal refusal to report, or ok == false
+// when no pinned occupant of unknown demand holds any card spec wants.
+//
+// IT PICKS ITS SUBJECT DETERMINISTICALLY, and that is not cosmetic:
+// PolicySnapshot.Running arrives in Go map order (owner.buildSnapshot ranges
+// over o.specs), so "the first qualifying one" would name a different
+// occupant -- and, with the matrix rule below, report a different Reason --
+// on every admission against an unchanged host. A closed co-residency cell
+// wins over an open one; equal-precedence occupants break on the lowest spec
+// id, the same total order sortOldestFirst gives victims.
+//
+// A CLOSED MATRIX CELL IS REPORTED AS ITSELF, not as pending_vram_unknown.
+// Both blocks are durable here -- a pinned process is never evicted and never
+// drains -- but only one of them is resolvable by a VRAM number, and §5.3
+// reserves pending_vram_unknown for a block that a measurement or a filled-in
+// estimate DOES resolve. Filling in the occupant's estimate while the pair is
+// closed resolves nothing: rule 1 refuses the pair whatever the numbers say.
+// So the cause named is the one an operator can act on (open the cell, or
+// unpin the occupant), under StateNotPermitted, which already carries exactly
+// that meaning for the other two causes that reach it.
+//
+// THE ASYMMETRY WITH THE CANDIDATE SIDE IS DELIBERATE AND NARROW. Rule 4's
+// pinned short-circuit gets no such carve-out: a candidate whose OWN demand
+// is unknown, facing a pinned matrix-incompatible occupant, still reports
+// pending_vram_unknown. That outcome long predates rule 5 -- it is the
+// original §5.3 behaviour, and a manager-level test asserts it -- so revising
+// it is a separate decision about the candidate side. What is corrected here
+// is only what rule 5 itself introduced: before rule 5 existed, this exact
+// snapshot answered Wait, which queued the request to its admission timeout;
+// rule 5 turned it into a terminal naming a cause that resolves nothing.
+func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []RunningProc, gpuIdx []int) (Decision, bool) {
+	var (
+		blocker    RunningProc
+		sharedGPU  int
+		pairClosed bool
+		found      bool
+	)
+	for _, r := range running {
+		if !r.Pinned || !procHasUnknownVRAM(r) {
+			continue
+		}
+		gpu, shares := firstSharedGPU(r, gpuIdx)
+		if !shares {
+			continue
+		}
+		closed := !snap.Allowed[PairKey(spec.ID, r.SpecID)]
+		if found && !outranksAsBlocker(closed, r.SpecID, pairClosed, blocker.SpecID) {
+			continue
+		}
+		blocker, sharedGPU, pairClosed, found = r, gpu, closed, true
+	}
+	if !found {
+		return Decision{}, false
+	}
+	if pairClosed {
+		return Decision{
+			Reason: StateNotPermitted,
+			Message: fmt.Sprintf(
+				"spec %s: gpu %d is held by pinned spec %s, and that pair is not permitted by the co-residency matrix",
+				spec.ID, sharedGPU, blocker.SpecID,
+			),
+			Evict: []string{},
+		}, true
+	}
+	unknownGPU, _ := firstUnknownGPU(blocker) // procHasUnknownVRAM guarantees one
+	return Decision{
+		Reason: StatePendingVRAMUnknown,
+		Message: fmt.Sprintf(
+			"spec %s: gpu %d is held by pinned spec %s, whose own demand on gpu %d is unknown",
+			spec.ID, sharedGPU, blocker.SpecID, unknownGPU,
+		),
+		Evict: []string{},
+	}, true
+}
+
+// outranksAsBlocker is pinnedUnknownOccupantRefusal's precedence: a closed
+// co-residency cell first (it is the cause no VRAM number resolves), then the
+// lowest spec id.
+func outranksAsBlocker(closed bool, id string, bestClosed bool, bestID string) bool {
+	if closed != bestClosed {
+		return closed
+	}
+	return id < bestID
 }
 
 // sortOldestFirst orders procs by LastUsed ascending: the eviction order
@@ -280,35 +468,41 @@ func sortOldestFirst(procs []RunningProc) {
 //     matrix-incompatible with itself). Filtered out once, up front, so
 //     none of the rules below can propose evicting the very process being
 //     started or wait on it forever.
-//  1. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
-//     EITHER side of the pair. This is one of two conditions that can
-//     resolve neither by eviction nor by waiting, so it is checked, and
-//     returned, before any other rule.
-//  2. Collect the matrix (rule 1) and unknown-VRAM (rules 4 and 5)
+//  1. Rule 3's own-demand half, hoisted ahead of everything that reads
+//     the running set: a declared demand that exceeds its own GPU's
+//     budget by itself refuses terminally, because no running set, no
+//     eviction and no wait can change that verdict. It reads only spec
+//     and snap.Budgets, so running it first cannot disturb another rule's
+//     inputs -- and running it LAST let the resolvable cause in step 2
+//     shadow this permanent one (see ownDemandRefusal).
+//  2. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
+//     EITHER side of the pair. Neither eviction nor waiting can resolve
+//     it, so it is checked, and returned, before any rule that proposes
+//     either. The occupant half additionally reports a closed
+//     co-residency cell as itself rather than as a missing VRAM number
+//     (see pinnedUnknownOccupantRefusal).
+//  3. Collect the matrix (rule 1) and unknown-VRAM (rules 4 and 5)
 //     blockers against the self-filtered running set: every disallowed
 //     pair; -- if spec has any unknown-VRAM GPU -- every process touching
-//     any of spec's GPUs; and every process whose OWN demand on one of
-//     spec's GPUs is unknown. An evictable blocker is queued for
-//     eviction; a non-evictable (busy or still-loading) blocker marks the
-//     whole decision blocked. Rules 4 and 5 name the same occupants when
-//     both sides are unknown, which is harmless: toEvict is keyed by spec
-//     id, so the overlap costs a map write and never a duplicate victim.
-//  3. Per-GPU budget (rule 3), evaluated with step 2's already-queued
+//     any of spec's GPUs; and every process that has an unknown demand of
+//     its OWN and holds any of spec's GPUs. An evictable blocker is
+//     queued for eviction; a non-evictable (busy or still-loading)
+//     blocker marks the whole decision blocked. Rules 4 and 5 name the
+//     same occupants when both sides are unknown, which is harmless:
+//     toEvict is keyed by spec id, so the overlap costs a map write and
+//     never a duplicate victim.
+//  4. Per-GPU budget (rule 3), evaluated with step 3's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
 //     demand. A GPU absent from Budgets, and one whose budget is 0, are
 //     both unconstrained and are skipped identically (see
-//     PolicySnapshot.Budgets). If spec's own demand alone already exceeds a
-//     real, positive budget,
-//     that is the SECOND unresolvable-by-eviction-or-waiting condition --
-//     no toucher, present or absent, changes that -- so it returns a
-//     terminal StateNotPermitted immediately rather than evicting or
-//     waiting pointlessly. Otherwise, overflow evicts idle touchers of
-//     THAT gpu only, oldest LastUsed first, until it fits or idle
-//     candidates run out.
-//  4. Process-count limit (rule 2), evaluated last so it only asks for as
-//     many ADDITIONAL evictions as steps 2-3 have not already supplied.
-//  5. Build the Decision: any non-evictable blocker anywhere makes the
+//     PolicySnapshot.Budgets). Overflow evicts idle touchers of THAT gpu
+//     only, oldest LastUsed first, until it fits or idle candidates run
+//     out. Spec's own demand is already known to fit each budget by
+//     itself: step 1 refused it otherwise.
+//  5. Process-count limit (rule 2), evaluated last so it only asks for as
+//     many ADDITIONAL evictions as steps 3-4 have not already supplied.
+//  6. Build the Decision: any non-evictable blocker anywhere makes the
 //     answer Wait -- never a partial Evict list, since evicting only some
 //     of the blockers would not actually unblock a retry. Otherwise an
 //     empty evict set means OK; a non-empty one means Evict-then-retry,
@@ -324,29 +518,41 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	unknownVRAM := specHasUnknownVRAM(spec)
 	gpuIdx := specGPUIndexes(spec)
 
-	// Step 1. A pinned process is never an eviction victim and never
+	// Step 1. Spec's own declared demand against its own budgets, which is
+	// the one verdict in this function that nothing in the running set can
+	// influence -- and therefore the one that must be reached before any
+	// rule that inspects it. See ownDemandRefusal for the misreport that
+	// came of evaluating it last.
+	if dec, refuse := ownDemandRefusal(snap, spec); refuse {
+		return dec
+	}
+
+	// Step 2. A pinned process is never an eviction victim and never
 	// finishes, so an unknown demand contested with one resolves by neither
-	// eviction nor waiting: returned ahead of every other rule so nothing
-	// below can propose a victim or a Wait that could not possibly help.
-	// Both directions land here because both are the same contention seen
-	// from opposite ends -- one card, two processes, and no number for at
-	// least one of them.
-	for _, r := range running {
-		if !r.Pinned {
-			continue
+	// eviction nor waiting: returned ahead of every rule that proposes
+	// either, so nothing below can offer a victim or a Wait that could not
+	// possibly help. Both directions land here because both are the same
+	// contention seen from opposite ends -- one card, two processes, and no
+	// number for at least one of them.
+	//
+	// Rule 4, candidate side: spec's own demand is unknown, so it may only
+	// run alone on its GPUs, and a pinned process holds one of them. Every
+	// qualifying occupant yields the identical Decision, so this half needs
+	// no tie-break to stay deterministic over a map-ordered Running.
+	if unknownVRAM {
+		for _, r := range running {
+			if r.Pinned && touchesAnyGPU(r, gpuIdx) {
+				return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
+			}
 		}
-		// Rule 4, candidate side: spec's own demand is unknown, so it may
-		// only run alone on its GPUs, and this pinned process holds one.
-		if unknownVRAM && touchesAnyGPU(r, gpuIdx) {
-			return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
-		}
-		// Rule 5, occupant side: the pinned process's OWN demand on one of
-		// spec's GPUs is unknown, so that card cannot be shared with it
-		// either -- whatever spec declares for itself. Note this implies
-		// touchesAnyGPU: procHasUnknownVRAMOn needs the key present.
-		if procHasUnknownVRAMOn(r, gpuIdx) {
-			return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}
-		}
+	}
+	// Rule 5, occupant side: a pinned process with an unknown demand of its
+	// own holds one of spec's GPUs, so that card cannot be shared with it
+	// either -- whatever spec declares for itself. This half DOES name the
+	// occupant it refuses on, so it picks one deterministically and reports
+	// a closed co-residency pair as the closed pair it is.
+	if dec, refuse := pinnedUnknownOccupantRefusal(snap, spec, running, gpuIdx); refuse {
+		return dec
 	}
 
 	toEvict := make(map[string]RunningProc)
@@ -380,12 +586,13 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 		}
 	}
 
-	// Rule 5: the mirror of rule 4 -- every remaining occupant whose OWN
-	// demand on one of spec's GPUs is unknown, blocking the sharing of that
-	// card exactly as an unknown candidate does. Any pinned such occupant
-	// already short-circuited above, so only idle/busy remain here.
+	// Rule 5: the mirror of rule 4 -- every remaining occupant that has an
+	// unknown demand of its OWN and holds one of spec's GPUs, blocking the
+	// sharing of that card exactly as an unknown candidate does. Any pinned
+	// such occupant already short-circuited above, so only idle/busy remain
+	// here.
 	//
-	// It belongs in step 2, next to rules 1 and 4, for two reasons: it is
+	// It belongs in step 3, next to rules 1 and 4, for two reasons: it is
 	// evaluated against the ORIGINAL running set, so its verdict never
 	// depends on what another rule happened to queue first, and rule 3
 	// below must already see its victims as gone -- an occupant queued here
@@ -395,7 +602,7 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// last precisely so it asks only for victims the earlier rules have not
 	// already supplied.
 	for _, r := range running {
-		if !procHasUnknownVRAMOn(r, gpuIdx) {
+		if !procHasUnknownVRAM(r) || !touchesAnyGPU(r, gpuIdx) {
 			continue
 		}
 		if isEvictable(r) {
@@ -425,23 +632,9 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 		if budget <= 0 {
 			continue
 		}
-		if g.VRAMMB > budget {
-			// spec's own single-GPU demand alone already exceeds the
-			// budget: no eviction, on this GPU or any other, can ever
-			// make this fit, and waiting cannot help either since
-			// nothing here depends on what else happens to be running.
-			// A durable operator-configuration problem, not a transient
-			// contention one.
-			return Decision{
-				Reason: StateNotPermitted,
-				Message: fmt.Sprintf(
-					"spec %s: gpu %d demand %d MB exceeds budget %d MB on its own",
-					spec.ID, g.Index, g.VRAMMB, budget,
-				),
-				Evict: []string{},
-			}
-		}
-
+		// spec's own demand is already known to fit this budget by itself:
+		// step 1 (ownDemandRefusal) returned the terminal refusal otherwise,
+		// before anything here or in step 2 ran.
 		sum := g.VRAMMB
 		var touchers []RunningProc
 		for _, r := range running {
@@ -479,7 +672,7 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	}
 
 	// Rule 2: process-count limit, asking only for as many ADDITIONAL
-	// evictions as rules 1/3/4 have not already provided.
+	// evictions as rules 1, 3, 4 and 5 have not already provided.
 	if snap.MaxProcesses > 0 {
 		remaining := len(running) - len(toEvict)
 		deficit := remaining + 1 - snap.MaxProcesses

@@ -929,16 +929,28 @@ into a hard refusal of every start.
 > no-op, and would leave the gateway and the agent disagreeing about a value the
 > store already persists.
 
-`Admit` evaluates in a fixed order, and the order is deliberate: an unknown
-VRAM demand on *either* side of the pair (§5.3), contested with a *pinned*
-process, short-circuits first; matrix incompatibility and both unknown-VRAM
-rules are collected against the original running set; the per-GPU budget is then
-evaluated with those evictions notionally already removed; **the process-count
-limit runs last** and asks only for as many *additional* victims as the earlier
-rules have not already supplied. Reversing the last two over-evicts, and the
-already-counted chaining is the only thing preventing double eviction —
-including where the candidate-side and occupant-side unknown-VRAM rules name the
-same occupant, which they do whenever both sides are unknown.
+`Admit` evaluates in a fixed order, and the order is deliberate. A candidate
+whose *own* demand exceeds one of its own budgets is refused **first**, ahead of
+every rule that reads the running set at all, because that is the one verdict no
+running set can change; then an unknown VRAM demand on *either* side of the pair
+(§5.3), contested with a *pinned* process, short-circuits; then matrix
+incompatibility and both unknown-VRAM rules are collected against the original
+running set; the per-GPU budget is evaluated with those evictions notionally
+already removed; **the process-count limit runs last** and asks only for as many
+*additional* victims as the earlier rules have not already supplied. Reversing
+the last two over-evicts, and the already-counted chaining is the only thing
+preventing double eviction — including where the candidate-side and
+occupant-side unknown-VRAM rules name the same occupant, which they do whenever
+both sides are unknown.
+
+**The occupant-side unknown-VRAM rule's placement is pinned by tests**, not by
+its comment alone. Collected *after* the arithmetic, it makes the arithmetic
+evict a bystander: an unknown occupant contributes `0` to the sum and releases
+`0` when evicted, so the sum never comes down and the loop drain-stops the next
+idle process on the card instead — one that rule 5 was about to free anyway.
+Collected *after* the process-count limit, it makes that limit evict a second
+process for a slot that was already coming free. Both re-orderings compile and
+leave every other admission test green.
 
 Two guards read as trivial and are not:
 
@@ -955,8 +967,17 @@ Two guards read as trivial and are not:
   No eviction anywhere can make it fit, so waiting would queue the request until
   its admission timeout for a pure configuration error. `not_permitted` was
   *reused* rather than adding a new state, because a state value the portal does
-  not know renders as nothing; the message is what tells a budget refusal apart
-  from a local-policy refusal.
+  not know renders as nothing; the message is what tells this cause apart from
+  the other two that share the state (a local-policy refusal of the
+  binary/directory, and the closed-matrix case in §5.3).
+  **This check runs before the unknown-VRAM short-circuit because it was being
+  shadowed by it.** Executed on both revisions: candidate demand 9000 MB against
+  an 8000 MB budget, plus a pinned occupant of unknown demand on the same card,
+  reported `pending_vram_unknown` with an empty message — inviting the operator
+  to go fill in a *different* spec's estimate, which cannot make 9000 MB fit
+  under 8000 MB. The permanent cause has to outrank the resolvable one, and this
+  one reads only the spec and the budget map, never the running set, so putting
+  it first cannot disturb any other rule's inputs.
 
 Co-residency pairs travel in **wire order** while the policy's allowed set is
 canonical (`a ≤ b`, via `PairKey`). Building the lookup map by hand from the raw
@@ -971,10 +992,26 @@ A spec whose demand on a GPU is unknown may start only **alone** on that GPU;
 otherwise it sits in `pending_vram_unknown` with the reason visible in the
 portal. **The rule is symmetric — it is the unknown demand that makes a card
 unshareable, on whichever side of the pair it sits.** An already-running process
-whose *own* demand on a contested GPU is unknown blocks a new candidate exactly
-the way an unknown candidate is blocked, whatever that candidate declares for
-itself: the occupant is evicted if it is idle, yields `Wait` if it is busy or
-still loading, and yields the terminal `pending_vram_unknown` if it is pinned. On an NVIDIA host the agent then measures actual usage of **its own
+with an unknown demand of its *own* blocks a new candidate on **every card it
+holds**, exactly the way an unknown candidate is blocked on every card it wants,
+whatever that candidate declares for itself: the occupant is evicted if it is
+idle, yields `Wait` if it is busy or still loading, and yields the terminal
+`pending_vram_unknown` if it is pinned.
+
+**Both halves of that symmetry are whole-process, and the contention between
+them is per-GPU.** "Unknown" is a property of the process — one unknown card
+makes its whole footprint unaccounted — while what makes it *this* candidate's
+problem is holding one of the candidate's cards. Scoping the occupant half
+per-card instead (unknown *at the index the candidate wants*) reads as the
+tighter rule and reopens the hole: an occupant of `{gpu 0: unknown, gpu 1:
+5000}` was admitted only on the promise of running **alone on both** cards, so a
+candidate let onto gpu 1 — where that occupant's figure happens to be known —
+revokes one card of the aloneness the rule had just granted. Measured on the
+per-card version: `OK` with that occupant idle, busy **and** pinned. An occupant
+holding no card the candidate wants stays ignored either way; widening *that*
+half to "any unknown process anywhere" would evict half the host on every start.
+
+On an NVIDIA host the agent then measures actual usage of **its own
 child PIDs** — `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`,
 which is exact because the agent knows which PIDs are its children — and writes
 the measurement back to the gateway. There "unknown" is a self-resolving
@@ -1057,6 +1094,34 @@ Apple and CPU-only deployment byte-for-byte unchanged.
 never leave — a **pinned** process on the contested GPU. A merely busy,
 non-pinned occupant yields `Wait`, because it can drain.
 
+**A terminal reason must name a cause that resolving it actually unblocks**,
+and two things follow from that.
+
+- **The occupant case carries a message, and it names the other spec.** The
+  candidate case does not need one: the estimate to fill in belongs to the spec
+  already displaying the state. The occupant case is the opposite — the spec in
+  `pending_vram_unknown` is the one with a usable estimate, while the unfilled
+  field is on the pinned spec beside it — so the reason travels with
+  `spec X: gpu 1 is held by pinned spec Y, whose own demand on gpu 0 is unknown`
+  as the spec's `last_error`. Without it the portal shows a spec waiting for
+  VRAM and nothing anywhere says whose number is missing; on a host with no
+  measurer (below) filling that number in is the *only* way out.
+- **A closed co-residency cell is reported as itself, not as a missing VRAM
+  number.** If the pinned occupant is one the matrix does not let this candidate
+  sit beside anyway, filling in its estimate resolves nothing — rule 1 refuses
+  the pair whatever the numbers say. That case is therefore `not_permitted` with
+  `spec X: gpu 0 is held by pinned spec Y, and that pair is not permitted by the
+  co-residency matrix`: still terminal (a pinned occupant can neither be evicted
+  nor drain, so `Wait` would queue every request to its admission timeout for a
+  block that never lifts), but naming the cause an operator can act on. Where
+  several pinned occupants qualify, a closed cell outranks an open one and
+  equal-precedence occupants break on the lowest spec id — the snapshot's
+  running list arrives in map order, and a message that named a different spec
+  on every admission would be worse than none. The **candidate**-side terminal
+  deliberately keeps its older shape (`pending_vram_unknown` even behind a
+  closed cell); revising that is a separate decision about a behaviour that
+  predates the occupant rule.
+
 > **The occupant half of that symmetry was missing, and it made "alone on that
 > GPU" a promise that expired the instant it was granted.** Both unknown-VRAM
 > checks keyed on the *candidate*, while the per-GPU arithmetic charges a
@@ -1084,13 +1149,19 @@ non-pinned occupant yields `Wait`, because it can drain.
 > inventing a VRAM figure for a process nobody has measured. Naming the
 > contention needs no number at all.
 >
-> **Terminal is not permanent in the occupant's case.** A pinned occupant's
-> `pending_vram_unknown` is re-evaluated once `notPermittedRetryInterval`
-> elapses, and unlike a candidate that cannot start, a pinned occupant *is*
-> running — so the housekeeping beat measures it and the block clears with
-> nothing evicted. On a host with no measurer installed it persists until the
-> operator fills the estimate in, the same dead end this section documents
-> above.
+> **Terminal is a report, not a permanent verdict — but what lifts it is
+> host-dependent, and on most hosts it is only the operator.** A pinned
+> occupant's `pending_vram_unknown` is re-evaluated once
+> `notPermittedRetryInterval` elapses, and unlike a candidate that cannot start,
+> a pinned occupant *is* running — so **where a measurer is installed** the
+> housekeeping beat measures it and the block clears with nothing evicted. That
+> is the NVIDIA case and only the NVIDIA case: on AMD, Apple-silicon and
+> GPU-less hosts the agent installs no measurer at all, so nothing but an
+> operator filling the estimate in will ever clear it, and the re-evaluation
+> loop simply re-confirms the same block every five seconds. Do not read
+> "terminal is not permanent" as a property of the state — it is a property of
+> the host, which is why the message has to name the spec whose estimate is
+> missing.
 
 ### 5.4 Eviction, queueing and drain
 
