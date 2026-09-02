@@ -100,6 +100,12 @@ const (
 // LPWSTR szName (8) + PDH_FMT_COUNTERVALUE{DWORD CStatus (4), pad (4),
 // union (8)} = 24 bytes. The union is read as its LONGLONG member because the
 // array is requested with PDH_FMT_LARGE.
+//
+// CStatus is declared (it is part of the layout) but deliberately not
+// consulted. The probe ignored it and still agreed with nvidia-smi on 15 of 15
+// PIDs to within 0.8%, so gating on it would be an unverified guess about which
+// status codes accompany a usable value -- and an item whose value really is
+// unusable reads 0, which attributePDHDedicated drops anyway.
 type pdhFmtCounterValueItemW struct {
 	SzName     *uint16
 	CStatus    uint32
