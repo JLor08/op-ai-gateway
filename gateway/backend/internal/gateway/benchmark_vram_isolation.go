@@ -61,13 +61,30 @@ const (
 	// either way -- and would make the feature unusable on exactly those
 	// deployments. A STATIC neighbour cancels out of the delta; a MOVING one
 	// trips the stability gate; one serving the target model itself is caught
-	// as already-resident.
+	// as already-resident -- WHERE THAT CHECK IS AVAILABLE AT ALL, see
+	// vramWarningResidencyUnknown.
 	vramWarningNonManagedApplications = "non_managed_applications"
-	// vramWarningPostTransportAgent: no open agent WebSocket, so every
-	// override binds only when the agent next polls its runtime config. The
-	// run proceeds with an extended bound rather than refusing -- refusing
-	// would cost the run for the same result.
+	// vramWarningPostTransportAgent: no open agent WebSocket, so nothing this
+	// run writes reaches the agent before its next runtime poll -- the drain
+	// does not even begin until then and the server is held for correspondingly
+	// longer. The run says so rather than refusing, which would cost the run
+	// for the same result.
 	vramWarningPostTransportAgent = "post_transport_agent"
+	// vramWarningResidencyUnknown: the run could not check whether the target
+	// model was ALREADY being served by something it had not stopped, so the
+	// already_resident signal was unavailable rather than negative.
+	//
+	// That check is the loaded-models probe, and it needs an application-level
+	// `loaded_models_path` -- operator-entered, with no default, and empty on
+	// most agent-managed applications, whose child sits behind the agent's own
+	// router. Without it modelResident answers "not resident" for a model that
+	// may well be resident: the baseline then already contains the model and
+	// the ~0 delta surfaces at the floor gate as below_floor, whose next
+	// action ("the window missed the allocation, measure again when the server
+	// is quiet") fails identically every time. This warning is what keeps the
+	// operator from acting on that wrong reason. It also covers a probe that
+	// ERRORED, for the same reason: an unanswered question is not a no.
+	vramWarningResidencyUnknown = "residency_unknown"
 )
 
 // The VRAM run's bounds. EVERY ONE IS REASONED, NOT MEASURED -- vars (the
@@ -173,10 +190,19 @@ var (
 func vramStateNoProcess(state string) bool { return vramStatesNoProcess[state] }
 
 // vramRunPlan runs every refusal a VRAM run makes before it writes anything,
-// and returns the plan the run then executes. Called from the trigger
-// endpoint (so each refusal is a 409 the operator sees) and AGAIN at the top
-// of the run body, because two of the four gates are volatile facts an agent
-// report can flip between the two.
+// and returns the plan the run then executes. It has exactly ONE call site,
+// the trigger endpoint, so each refusal is a 409 the operator sees.
+//
+// It is deliberately NOT re-run at the top of the run body, and the
+// difference matters to a reader: two of these gates are volatile facts an
+// agent report can flip between the trigger and the run (IsFileMode and the
+// declared feature set are both written by telemetry ingest), and runVRAMProbe
+// re-checks exactly those two through vramIsolationUnavailable rather than
+// re-planning. The enumeration-dependent refusals below -- a pre-existing
+// override anywhere, a pinned sibling, a target with no enabled spec -- are
+// therefore evaluated ONCE, before the reservation. Nothing re-evaluates them
+// afterwards, which is why the run's defence against an override that appears
+// mid-run is the restore's compare-and-set rather than a second refusal.
 //
 // The order is deliberate: the cheapest, most structural refusal first
 // (the target is not agent-managed at all), then the two reachability gates,
