@@ -15,6 +15,52 @@ work that does NOT land on this branch.**
 > Everything below is a proposal with named open questions, not settled
 > behaviour.
 
+## 0. Review corrections — three premises were FALSE, and four arguments were weak
+
+The operator's design (load the model alone, then measure what it costs) is
+unchanged. What follows is what a review of the first revision found, verified
+in the tree rather than reasoned about, with the revision each finding forced.
+Read this before D2/D3: **the paragraphs below supersede any older wording that
+survives elsewhere in this file.**
+
+| # | The premise as it was written | What is actually true | Where |
+|---|---|---|---|
+| P1 | D2 force-stops every other enabled spec and waits, bounded, for each to report a **transition** to `stopped`. | For a sibling that is **not running**, `admin_state: force_stopped` "does nothing at all — no state change, no frame". So the bounded wait **exhausts for every idle sibling**, and the run reports an isolation timeout on a server that is already isolated. | §11.2 of `agent-runtime-manager.md`, and `EnsureRunning`'s own guard: `manager.go:989` returns `ErrAdmissionBlocked` for a `force_stopped` spec, but a spec with no live process transitions nowhere. Every spec *is* present in each status frame (`snapshotStatus`, `manager.go:2316`), so its state is readable — there is simply no *edge* to wait for. |
+| P2 | `runtime_max_processes = 1` was rejected **because it is unobservable** while `force_stopped` "is applied on push **and** produces a `stopped` frame per spec". | The observability asymmetry does not exist for a spec that is not running: no frame, **no `admin_state` field in `RuntimeStatusDTO` at all** (`runtime_registry.go:36-46`), and no applied-config version anywhere in telemetry (§3.5). So the stated ground is empty. The two levers must be re-weighed on **effect**, and there the difference is real and larger — see D2. | `runtime_registry.go:36-46`; `runtimeStatusDTOsFromSamples` (`agent_ingest.go:708`) drops the sample's `gpus` too. |
+| P3 | D3's sequence drains, takes a baseline, then loads the target. | **The target is never drained.** D2 step 2 refuses if the *target* carries an override and step 3 writes only to every **other** spec — and the shared load core short-circuits on an already-resident model (`load_runner.go:35-38`: `modelResident` → `Loaded = true`, no load at all). So for the commonest trigger — an operator probing a model that is currently loaded — the baseline window **already contains the model**, both post-load windows are stable, and the run reports a *definitive* `delta_mb ≈ 0`. That is the first thing an operator would probe, and `0` in this house means *unknown*. | `load_runner.go:35-38`, D2 step 3. |
+
+Four arguments that were weak rather than wrong:
+
+- **W1 — strategy (a) has no freshness signal.** `RuntimeSpecGPU` carries
+  `{SpecID, GPUIndex, VRAMEstimateMB, VRAMMeasuredMB}` and **no timestamp**
+  (`routing/store.go:1274-1279`), and `writeBackRuntimeVRAM` deliberately
+  **does not rewrite an unchanged value** (`agent_ingest.go`, "AN UNCHANGED
+  MEASUREMENT IS NOT REWRITTEN"). Polling for "a positive value appears"
+  therefore reads a number from last week as this run's result — and requiring
+  it to *change* fails in the normal case where the true value is the same.
+  Strategy (a) needs watermark discipline exactly like the `stopped` frame
+  does; D3 says how.
+- **W2 — the version-bump argument is not decisive.** D2 rejected the
+  agent-side "measure now, isolated" frame partly because this branch has
+  already spent its one bump on a PATCH. True, and irrelevant: **this feature
+  does not land on this branch**, and a follow-up branch is free to spend its
+  own single bump on a MINOR to `0.3.0`. The honest reasons are different ones
+  (D2).
+- **W3 — the deferred restore can revert a concurrent operator edit.**
+  `PutRuntimeSpec` is a full-document replace (ADR-029) over a
+  read-modify-write with no compare-and-set, and the same lost-update class is
+  already recorded for `UpdateMapping` in
+  [§11.1](../../architecture/11-risks-and-technical-debt.md#111-operational-risks).
+  A restore that re-PUTs a document captured *before* the run silently reverts
+  every edit an operator made during it. It must re-read immediately before
+  writing; see D2.
+- **W4 — the GPU-UUID drift safeguard is empty on exactly the hosts the delta
+  strategy exists for.** `sample.GPU.UUID` is populated only by the NVIDIA
+  collector; `collector/amd.go`'s ROCm parse and `collector/apple.go`'s ioreg
+  parse never set it. So on AMD and Apple the "record the UUID next to the
+  index" safeguard stores an empty string and warns about nothing. D3 replaces
+  it with a fingerprint that degrades.
+
 ## 1. What was asked for
 
 The operator's words:
@@ -268,24 +314,37 @@ once, then measure each mapping in turn while keeping the rest stopped) is
 worth adding later. It is strictly more useful and strictly more destructive;
 defer until the single-model run is proven in the field.
 
-### D2 — Isolation is achieved with `admin_state: force_stopped`, and it is observable
+### D2 — Isolation is `admin_state: force_stopped` on EVERY spec, target included, because it is the only lever that refuses a start
 
-**Decision.** Before the load, the run:
+**Decision.** Before the baseline, the run:
 
-1. Enumerates the server's other specs (`RuntimeSpecsByApplication`).
-2. **Refuses to start** (409, a new code `benchmark.vram_isolation_blocked`) if
-   any other spec already carries a non-empty `admin_state`, or if any other
-   spec is `pinned`, or if the target itself carries an override. Rationale
-   below.
-3. Writes `admin_state: force_stopped` to every other **enabled** spec —
-   force-stopping the *running* ones only would leave a window in which a
-   request through the agent's router starts one mid-measurement.
-4. Waits, bounded, for the status stream to report each of them
-   **transitioned** to `stopped` (§11.2's watermark discipline: a `stopped`
-   frame that predates our own write proves nothing).
-5. Runs the measurement.
+1. Enumerates every spec of the server's one `server_agent` application
+   (`RuntimeSpecsByApplication`), **the target included**.
+2. **Refuses to start** (409, a new code `benchmark.vram_isolation_blocked`,
+   naming the spec) if **any** of them — target included — already carries a
+   non-empty `admin_state`, or if any spec **other than the target** is
+   `pinned`. Rationale below.
+3. Writes `admin_state: force_stopped` to every **enabled** spec of that
+   application, **the target among them**. Writing it to the *running* ones only
+   would leave a window in which a request through the agent's router starts one
+   mid-measurement; writing it to the *others* only leaves the target itself
+   resident, which is exactly how the baseline came to contain the model (P3).
+4. **Partitions** what it wrote by the first status frame that resolves *after*
+   the write, and waits only for what it can observe. A spec with a live process
+   (`running`, `starting`, `draining`) is waited for, bounded, until a `stopped`
+   transition **later than the run's own write** (§11.2's watermark discipline:
+   a `stopped` frame that predates the write proves nothing). A spec in a
+   no-process state (`stopped`, `pending_vram_unknown`, `not_permitted`,
+   `crashed`, `start_failed`, `backoff`) is **already isolated** and is
+   *confirmed*, never awaited — `force_stopped` with no live process produces no
+   state change and no frame at all, so waiting for one is waiting out the
+   timeout (P1). A spec still running when the bound expires is a genuine
+   isolation timeout.
+5. Baseline, then the measurement (D3) — which clears the **target's** override
+   to start it, and nothing else's.
 6. **Restores** every override it set back to `""`, in a `defer`, on a context
-   that is *not* the run's own.
+   that is *not* the run's own, **re-reading each spec immediately before
+   writing it** (W3).
 
 **Why this and not the alternatives:**
 
@@ -296,36 +355,74 @@ defer until the single-model run is proven in the field.
   `policy.go:196-202`; the toucher loop at `:573-587`), while a delta wants a
   quiet baseline on every GPU it reads. Rule 5, its occupant-side mirror, does
   not widen that: it blocks a *newcomer* from the unknown spec's cards, which is
-  the same card set seen from the other end.
+  the same card set seen from the other end. **And rule 4 no longer clears a
+  card at all**: under the precedence the branch beside this one settled
+  (`known demand beats unknown demand`,
+  [ADR-032](../../architecture/09-architecture-decisions.md#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts)),
+  an unknown-demand candidate facing an occupant of *known* demand **blocks**
+  instead of evicting it. So the rule an operator would most expect to produce
+  isolation now produces a `Wait`, which is one more reason the run has to
+  create the isolation itself.
 - **Temporarily set `runtime_max_processes = 1`.** One write instead of N, and
   rule 2 would then let the target's *own* admission evict the others using the
-  agent's machinery. **Rejected because it is unobservable**: §5.6 says a
-  lowered limit is not retroactive, and nothing on the wire ever says the agent
-  has adopted it (§3.5). The run would have to *assume* isolation and then
-  measure — the one thing a measurement must not do. `force_stopped`, by
-  contrast, is applied on push **and** produces a `stopped` frame per spec.
-- **A new imperative "measure now, isolated" agent frame.** Semantically the
-  best answer: the agent already owns the measurement, the drain, the eviction
-  and the health probe, so it could isolate, measure and report a number it
-  legitimately owns — no ownership crossing at all (§4/D4), no gateway-side
-  drain to leak on a crash. **Deferred, with a sequencing consequence stated
-  plainly:** ADR-026 requires it to sit behind its own feature flag, a new
-  `agent.Features` entry requires a **MINOR** bump per AGENTS.md, and
-  `TestFeatureRegistry` fails a flag whose `Since` outruns `Version`. This
-  branch has already taken its one bump, a **PATCH** to `0.2.3`, and AGENTS.md
-  allows one bump per branch. **So the agent-side capability cannot land on
-  this branch at all**, and if it is ever chosen it must open its own branch
-  whose first commit bumps `Version` to `0.3.0`. That is the whole reason D2
-  picks the gateway-side drain: it needs **no new agent capability, no new
-  frame type, no feature flag and no version bump** — it composes levers the
-  agent already applies.
+  agent's machinery. The old ground for rejecting it — that it is unobservable
+  while `force_stopped` is observable — **does not hold** (P2): for a spec that
+  is not running, neither lever produces a frame, `RuntimeStatusDTO` has no
+  `admin_state` field at all, and no applied-config version rides telemetry.
+  **Rejected on effect instead, which is the larger difference:**
+  - `force_stopped` **refuses a start.** `EnsureRunning` returns
+    `ErrAdmissionBlocked` for a `force_stopped` spec before any admission
+    arithmetic runs (`manager.go:989`), and the reconcile pass drains one that
+    is up (`manager.go:923`) — *ahead* of the pinned/`force_running` start
+    branch, so it outranks `pinned` as well.
+  - `runtime_max_processes = 1` **licenses a displacement in the wrong
+    direction.** A router request for a sibling asks the agent to admit *that
+    sibling*, and rule 2 then looks for as many victims as the limit demands —
+    with the target the only running process and idle between the run's own two
+    probe requests, **the target is the victim**. The cheap lever hands any
+    inbound request permission to kill the thing being measured, and the run
+    would compute a delta across the target's own restart. It is also not
+    retroactive (§5.6), so it does nothing about what is already up.
 
-**Why the refusals in step 2 are not timidity.** They are what makes the
-restore unambiguous. If the run overwrote an operator's existing
-`force_stopped`, "restore" would have to mean "put back what was there", which
-it cannot know after a gateway restart; and a **pinned** spec cannot be drained
-at all, so the honest outcome is to name it rather than measure a contaminated
-delta. The message must name the blocking spec — the same discipline that made
+  So the conclusion survives its own rejected argument, on a ground that is
+  true: `force_stopped` is the only lever that makes "alone" hold for the
+  duration. The observability the old text claimed is real for a *running*
+  spec — which is exactly why step 4 partitions instead of waiting on all of
+  them.
+- **A new imperative "measure now, isolated" agent frame.** Still the
+  semantically best answer, and **not** excluded by the version rule the way the
+  first revision claimed (W2): this feature is its own branch, and that branch
+  may spend its single bump on a **MINOR** to `0.3.0`. The agent already owns
+  the measurement, the drain, the eviction and the health probe, so it could
+  isolate, measure and report a number it legitimately owns — no ownership
+  crossing (D4), and **no crash window**: a gateway that dies between drain and
+  restore leaves the whole fleet force-stopped (R1), while an agent that dies
+  takes its own transient overrides with it. What argues for building the
+  gateway-side drain **first** is fleet compatibility, not versioning: ADR-026
+  requires the frame behind its own feature flag and ADR-025 forbids gating on a
+  version number, so the run must cope with an agent that does not declare the
+  flag — which means the gateway-side path has to exist anyway, as the fallback
+  for every agent already in the field. Build the fallback, then treat the frame
+  as the end state that retires R1. Two things to keep in view when it is
+  written: the agent's number would be its **per-process** measurement, so a
+  host with no measurer still needs the gateway-side delta; and the frame must
+  carry its own bounded, self-restoring isolation, or it reintroduces R1 inside
+  the agent.
+
+**Why the refusals in step 2 are not timidity — and one of their stated reasons
+was wrong.** The `admin_state` refusal is what makes the restore unambiguous:
+the run only ever restores to `""`, so it never has to reconstruct what an
+operator's override was — which, after a gateway restart, it could not know. The
+**pinned** refusal was justified by "a pinned spec cannot be drained at all",
+and that is **false**: `force_stopped` is tested before the pinned start branch
+in the reconcile pass (`manager.go:923-930`) and `beginDrain` carries no pinned
+guard, so a pinned *running* spec is stopped like any other. Keep the refusal,
+on the honest ground: `pinned` is an operator's standing instruction that this
+model stays up, and silently breaking it for a benchmark is a worse surprise
+than refusing and naming it. The **target** may be pinned — stopping the target
+is the point of the run, and the operator asked for this run on this model — so
+the affordance must say plainly that the target will be stopped and restarted.
+Every refusal names the blocking spec, the same discipline that made
 `not_permitted`'s message load-bearing in §5.2.
 
 **Traps this sequence must not fall into** (each already documented elsewhere,
@@ -354,9 +451,22 @@ for another feature, in this exact shape):
   cancelled when the run finishes or is cancelled (`benchmark_endpoints.go:85-88`),
   which is precisely when the restore matters most. Use
   `context.WithoutCancel` (or a fresh background context) with its own timeout.
+- **The restore must re-read, never replay** (W3). A full-document replace of a
+  spec captured before the run reverts every field an operator edited *during*
+  it — a launch spec is exactly what an operator opens while a model is
+  stopped, and this endpoint is a read-modify-write with no compare-and-set,
+  the same lost-update class §11.1 records for `UpdateMapping`. So: re-read the
+  spec, spread *that* document, set `admin_state: ""`, PUT. And if the
+  freshly-read `admin_state` is no longer the `force_stopped` this run wrote,
+  **do not write at all** — someone else now owns the field; record the spec in
+  `restore_failed` so the portal can say so.
 - **Completion on a transition, not a state** — §11.2, verbatim reasoning: a
   `stopped` frame predating our write completes the wait immediately, and the
-  run would then measure a server that is still draining.
+  run would then measure a server that is still draining. **But only for the
+  specs that have a process to stop** (P1): for the others there is no
+  transition to come, and a wait that demands one converts an
+  already-isolated server into an isolation timeout. State and transition are
+  both needed, for disjoint halves of the set.
 - **A bounded wait, and no silent clearing on timeout.** §11.2 chose *not* to
   clear an override on timeout, because the portal cannot tell a wedged child
   from a slow one. A benchmark's calculus differs: it *created* the overrides,
@@ -384,31 +494,74 @@ says which it got:
 
 - **`measured_mb` (strategy a, "direkt per Quelle").** After the load, the
   agent measures its own child on the **first health pass** and every **15 s**
-  beat, and the value reaches the store through the existing write-back.
-  The run therefore *observes*: poll `RuntimeSpecGPUs(specID)` until a positive
-  `vram_measured_mb` appears for the spec's GPU indexes, bounded. **This
-  crosses no ownership boundary — it reads a number the agent produced.** On a
-  host with no measurer it simply never appears, which is the case strategy (b)
-  exists for.
+  beat. **This crosses no ownership boundary — it reads a number the agent
+  produced.** On a host with no measurer it simply never appears, which is the
+  case strategy (b) exists for.
+
+  **It must be read with a watermark, and the stored row cannot supply one**
+  (W1). `RuntimeSpecGPU` has no timestamp, and `writeBackRuntimeVRAM`
+  deliberately does not rewrite an unchanged value, so "poll
+  `RuntimeSpecGPUs(specID)` until a positive `vram_measured_mb` appears" reads
+  a value from an arbitrarily old run as this run's result — and the obvious
+  patch, requiring the value to *change*, fails in the normal case where this
+  run measures exactly what the last one did. Nor can the run wait for the row
+  to be *written*: the write is suppressed precisely when the answer is
+  unchanged. Two honest ways out, in preference order:
+  1. **Carry the measurement on the volatile status stream and time-stamp it
+     there.** The per-spec measurement already reaches the gateway once per
+     second inside `agentRuntimeSample.gpus[].vram_measured_mb`, and
+     `runtimeStatusDTOsFromSamples` (`agent_ingest.go:708`) throws it away —
+     `RuntimeStatusDTO` has no GPU field. Add one (plus the sample's arrival
+     time, or a monotonic frame counter), and strategy (a) gets the same
+     watermark discipline the `stopped` frame has: accept only a value carried
+     by a frame that arrived **after the load completed**. Volatile RAM, no
+     migration, no agent change, no new endpoint — the run is already
+     subscribed to that stream for D2's isolation wait, so it is one
+     subscription serving both purposes. The side benefit is a live measured-VRAM
+     reading in the portal, which today only exists as a stored number of
+     unknown age.
+  2. **Drop strategy (a) from the run** and report the delta alone, leaving the
+     measured column to be read where it already is. Cheaper, and it loses the
+     cross-check that is half the value of running both.
+
+  Whichever is chosen, the fallback rule is the same: **strategy (a) reports
+  nothing rather than something stale.** `measured_mb` stays absent unless a
+  post-load frame carried it.
 - **`delta_mb` (strategy b, "die Differenz").** From `s.ServerPerf`'s per-GPU
   samples: `used_after − used_before`, per GPU index, in MB.
 
 The sequence, and every step exists for a reason:
 
-1. Drain (D2) and confirm.
+1. Drain (D2) and confirm — **the target included**. A baseline taken while the
+   target is resident measures nothing at all (P3).
 2. **Baseline**: require `K` consecutive samples (proposal: K=3, i.e. ~3 s at
    the 1 s cadence) in which each watched GPU's `mem_used_bytes` varies by no
    more than `tol` (proposal: max(64 MiB, 1%)). Not stable → **inconclusive**,
    report nothing.
-3. Load the target (the shared load core).
-4. Settle, then the **same stability gate** on the post-load samples →
+3. **Clear the target's override only**, then load it through the shared load
+   core. Its siblings stay `force_stopped`, so the target starts alone without
+   any admission arithmetic having to be trusted: `force_stopped` refuses their
+   starts outright (D2).
+4. **The resident short-circuit is now a contamination signal, not a shortcut.**
+   `ensureResidentForRun` reports whether it actually loaded anything
+   (`load_runner.go:35-38` returns `Loaded = true` without loading when the
+   model is already resident). After step 1 confirmed the target stopped, a
+   model that reports resident is being served by something the gateway did not
+   stop — a non-managed application on the same host, most likely. **Report
+   inconclusive and say so**; never a delta.
+5. Settle, then the **same stability gate** on the post-load samples →
    `delta_A`.
-5. One tiny generation request (the load core already sends a 1-token stream) →
+6. One tiny generation request (the load core already sends a 1-token stream) →
    settle → stability gate → `delta_B`. Report `max(delta_A, delta_B)` as the
    headline and keep both.
-6. Restore (D2).
+7. **Floor gate.** A confirmed-resident model whose headline delta is below a
+   floor (proposal: `tol`) is **inconclusive**, not a measurement: no model
+   costs ~0 MB, so such a number can only mean the window missed the
+   allocation or something else absorbed it. `0` means *unknown* everywhere
+   else in this feature and must mean it here too.
+8. Restore (D2) — every override, target included.
 
-Step 5 is not padding. llama.cpp preallocates its KV cache at load, so
+Step 6 (the generation request) is not padding. llama.cpp preallocates its KV cache at load, so
 `delta_A` is already the steady state there; a backend that allocates on first
 use does not, and a number that omits the first KV allocation is an
 *understated* demand — which §5.3 names as "exactly how a co-resident pair
@@ -420,14 +573,27 @@ conservative direction.
 uses. When it has none, watch every GPU and report each index whose delta
 exceeds a floor, marked **unattributable** (there is no row to apply it to).
 
-**Record the UUID next to the index.** `GPUSample` carries `UUID`
-(`routing/store.go:377`), and the GPU-budget rows already snapshot
-`ExpectedUUID`/`ExpectedName` as "a purely descriptive drift detector […]
-compared against live telemetry to WARN that a card was renumbered"
-(`routing/store.go:1296-1322`). A stored VRAM number attributed to index 1
-after the cards were renumbered is worse than no number, so the result carries
-the UUID it was measured against and the portal warns on a mismatch. Same
-mechanism, same reason.
+**Record a card fingerprint next to the index, and make it degrade** (W4). A
+stored VRAM number attributed to index 1 after the cards were renumbered is
+worse than no number, so the result carries what identified the card it was
+measured on and the portal warns on a mismatch — the same mechanism the GPU
+budget rows already use, where `ExpectedUUID`/`ExpectedName` are "a purely
+descriptive drift detector […] compared against live telemetry to WARN that a
+card was renumbered" (`routing/store.go:1296-1322`). **But `GPUSample.UUID` is
+NVIDIA-only**: `collector/amd.go`'s ROCm parse and `collector/apple.go`'s ioreg
+parse never populate it, so a UUID-only detector is empty on exactly the two
+host classes the delta strategy exists to serve. So the fingerprint is
+`{uuid, name, mem_total_bytes}` with the **strongest available** field
+recorded and *named*:
+
+| Host | Fingerprint | What drift it can catch |
+|---|---|---|
+| NVIDIA | `uuid` | any renumbering |
+| AMD (ROCm) | `name` (`Card series`/`Card model`) + `mem_total_bytes` | a swap between *unlike* cards; two identical cards trading indices are indistinguishable, and the result must say so rather than imply a check it did not make |
+| Apple | index 0 only, `name` | nothing to renumber — one integrated GPU. What matters here instead is that `mem_used`/`mem_total` are **unified system memory** read from ioreg (`collector/apple.go:75-76`), not dedicated VRAM, so the number must be labelled as such wherever it is shown |
+
+The portal shows "verified by UUID" or "verified by name and total size only" —
+never a bare "verified".
 
 **What contaminates a delta, and what the design does about each:**
 
@@ -519,26 +685,36 @@ in.
 ```go
 // BenchmarkResult (gateway/backend/internal/gateway/benchmark.go) gains:
 
-// VRAM is the VRAM benchmark's result: nil = not run, or run and
-// inconclusive (isolation refused, or no sample window was stable) —
-// nothing to report and nothing to apply. Mirrors VisionCapable's
-// nil-means-inconclusive contract; the nested shape mirrors CapacityReport.
+// VRAM is the VRAM benchmark's result: nil = the run never reached the
+// measurement phase (isolation refused, or a hard error — see Error).
+// Non-nil with Inconclusive set = it ran and reached no number, and WHY
+// is the operator's next action. The nested shape mirrors CapacityReport;
+// what is deliberately NOT copied is VisionCapable's nil-means-both
+// contract, because "no result" and "no result because the model was
+// already being served by something we could not stop" send an operator
+// to two different places.
 VRAM *VRAMReport `json:"vram,omitempty"`
 
 type VRAMReport struct {
-    Isolated       bool          `json:"isolated"`                  // the drain was confirmed
+    Isolated       bool          `json:"isolated"`                  // every spec confirmed stopped, target included
     DrainedSpecIDs []string      `json:"drained_spec_ids,omitempty"`// what the run force-stopped
-    RestoreFailed  []string      `json:"restore_failed,omitempty"`  // specs left overridden (R1)
+    RestoreFailed  []string      `json:"restore_failed,omitempty"`  // specs left overridden, or taken over meanwhile (R1, W3)
+    // Inconclusive is empty on a definitive result, else one of:
+    // isolation_timeout | baseline_unstable | post_load_unstable |
+    // already_resident (P3/step 4) | below_floor (step 7) | no_samples.
+    Inconclusive   string        `json:"inconclusive,omitempty"`
     GPUs           []VRAMGPUItem `json:"gpus"`
 }
 
 type VRAMGPUItem struct {
-    Index          int    `json:"index"`
-    UUID           string `json:"uuid,omitempty"`           // drift detector, see D3
-    BaselineUsedMB int    `json:"baseline_used_mb"`
-    DeltaMB        int    `json:"delta_mb,omitempty"`       // strategy (b); 0 = none
-    MeasuredMB     int    `json:"measured_mb,omitempty"`    // strategy (a); 0 = none/unknown
-    Attributable   bool   `json:"attributable"`             // a spec GPU row exists for this index
+    Index           int    `json:"index"`
+    Fingerprint     string `json:"fingerprint,omitempty"`      // uuid, or name+total — see D3
+    FingerprintKind string `json:"fingerprint_kind,omitempty"` // "uuid" | "name_total" | "" (none available)
+    UnifiedMemory   bool   `json:"unified_memory,omitempty"`   // Apple: this is system memory, not VRAM
+    BaselineUsedMB  int    `json:"baseline_used_mb"`
+    DeltaMB         int    `json:"delta_mb,omitempty"`         // strategy (b); 0 = none
+    MeasuredMB      int    `json:"measured_mb,omitempty"`      // strategy (a), post-load frame only; 0 = none/unknown
+    Attributable    bool   `json:"attributable"`               // a spec GPU row exists for this index
 }
 ```
 
@@ -552,8 +728,15 @@ together (AGENTS.md).
 - No admission-logic change of any kind. This feature produces a number; rule 5
   on the branch beside it is what makes the number matter.
 - No agent change: no new `agent.Features` entry, no new frame type, **no
-  `Version` bump**. If a future revision chooses the agent-side capability
-  (D2's deferred alternative), that is its own branch and its own MINOR bump.
+  `Version` bump** — because the feature does not need one, *not* because a
+  bump is unavailable (W2). If a future revision chooses the agent-side
+  capability (D2's deferred alternative), that is its own branch, its own
+  MINOR bump and its own feature flag, with this design as the fallback for
+  agents that do not declare it.
+- One gateway-side DTO addition is in scope and is not an agent change:
+  `RuntimeStatusDTO` gaining a per-GPU measured-VRAM field plus frame
+  freshness, which is what gives strategy (a) a watermark (D3, option 1). It
+  is additive on the portal SSE, volatile, and needs no migration.
 - No spillover / shared-memory accounting (D3).
 - No scheduling: this run is manual, like `capacity` and `vision` before it
   (`benchmark_scheduler.go:90`).
@@ -565,19 +748,39 @@ together (AGENTS.md).
 1. `Admit`-free unit tests for the sampling core: stability gate accepts /
    rejects a synthetic sample window; delta arithmetic per index; `max(A,B)`.
 2. Isolation sequence against a fake store + a driven `RuntimeStatus`: refuses
-   on a pre-existing override; refuses on a pinned sibling; drains exactly the
-   other **enabled** specs; completes on a **transition** and not on a stale
-   `stopped`; restores in a `defer`; restores when the run context is already
-   cancelled (the D2 trap, asserted directly); reports `restore_failed`.
-3. Result reporting: inconclusive → `VRAM == nil` and **no** apply affordance;
-   definitive → per-GPU items, `attributable` false for an index with no spec
-   row.
-4. Ownership guard, the test that matters most: after a full VRAM run,
+   on a pre-existing override (target's own included); refuses on a pinned
+   **sibling** and proceeds on a pinned **target**; drains every **enabled**
+   spec **including the target**; completes on a **transition** and not on a
+   stale `stopped`; **completes without any transition for a sibling that was
+   already in a no-process state** (P1 — the case the first revision would
+   have timed out on, and the one to write first); reports an isolation
+   timeout only for a spec still running at the bound.
+3. Restore: runs in a `defer`; runs when the run context is already cancelled
+   (asserted directly); **re-reads before writing, so a field an operator
+   edited during the run survives** (W3); **skips the write and reports
+   `restore_failed`** when the re-read shows the override is no longer the one
+   this run wrote.
+4. Result honesty: an already-resident target after a confirmed drain →
+   `inconclusive: already_resident` and **no** `delta_mb` (P3); a headline
+   delta below the floor → `inconclusive: below_floor`; an unstable window →
+   `baseline_unstable` / `post_load_unstable`; every inconclusive result →
+   **no** apply affordance. Definitive → per-GPU items, `attributable` false
+   for an index with no spec row.
+5. Strategy (a) freshness (W1): a stored `vram_measured_mb` written before the
+   run is **never** reported as this run's `measured_mb`; a value carried by a
+   post-load frame is; a value identical to the stored one is still accepted
+   when it arrives on a post-load frame (the case a change-detection approach
+   gets wrong).
+6. Fingerprint (W4): NVIDIA samples yield `fingerprint_kind: "uuid"`; ROCm
+   samples (no UUID) yield `"name_total"`; a sample with neither yields `""`
+   and the portal renders no verification claim.
+7. Ownership guard, the test that matters most: after a full VRAM run,
    `RuntimeSpecGPUs(specID)` shows `vram_measured_mb` **unchanged** and
    `vram_estimate_mb` **unchanged**. Name it after the rule it protects.
-5. `putRequestFromDTO` field-completeness guard (D2/O2).
-6. Frontend: the apply button fills the estimate input and does **not** submit;
-   i18n parity.
+8. `putRequestFromDTO` field-completeness guard (D2/O2).
+9. Frontend: the apply button fills the estimate input and does **not** submit;
+   the trigger affordance states that the target itself will be stopped and
+   restarted; i18n parity.
 
 ## 7. Open questions, collected
 
@@ -588,7 +791,9 @@ together (AGENTS.md).
 | O3 | `K`, `tol`, per-phase settle — validate on the 3-GPU Windows host before freezing | D3 |
 | O4 | An "apply the agent's measurement to my estimate (and lock)" lever — adjacent, deliberately excluded | D4 |
 | O5 | Does the run refuse outright on a server that also hosts **non-managed** active applications, or merely warn? Refusing is safer and may make the feature unusable on exactly the migration-path deployments §13 blesses | D3 |
-| O6 | Bound for waiting on strategy (a)'s write-back: the health-pass dispatch makes it prompt, but a POST-transport agent's telemetry is still the carrier. 30 s is a guess | D3 |
+| O6 | Bound for waiting on strategy (a): the health-pass dispatch makes the *measurement* prompt, but a POST-transport agent's telemetry is still the carrier, and the wait now ends on a **post-load frame** rather than on a store write. 30 s is still a guess | D3 |
+| O7 | Where strategy (a)'s watermark comes from: a per-GPU field plus freshness on `RuntimeStatusDTO` (recommended — one stream already subscribed, and a live measured reading in the portal as a side benefit), or a separate volatile per-(spec, gpu) registry beside `RuntimeStatus`. Both are gateway-side and volatile; the choice is where the portal contract grows | D3/W1 |
+| O8 | Whether the run should refuse when the **target** is `pinned`. D2 proceeds (the operator asked for this model), so a pinned model is stopped and restarted by an explicit benchmark. The alternative is refusing and making the operator unpin first, which is louder but costs the run | D2 |
 
 ## 8. Where the durable description goes, when it lands
 
