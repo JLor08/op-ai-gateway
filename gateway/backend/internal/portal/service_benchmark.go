@@ -143,47 +143,87 @@ func (s *Service) MappingBenchmarks(ctx context.Context, principal auth.Token, m
 	}
 	out := make([]BenchmarkRunDTO, 0, len(runs))
 	for _, r := range runs {
-		kind := r.Kind
-		if kind == "" {
-			kind = "speed"
-		}
-		dto := BenchmarkRunDTO{
-			ID:                    r.ID,
-			MappingID:             r.MappingID,
-			ServerID:              r.ServerID,
-			CreatedAt:             r.CreatedAt,
-			GenTokensPerSecond:    r.GenTokensPerSecond,
-			PromptTokensPerSecond: r.PromptTokensPerSecond,
-			LoadTimeMS:            r.LoadTimeMS,
-			ContextSize:           r.ContextSize,
-			Error:                 r.Error,
-			Kind:                  kind,
-		}
-		if kind == "capacity" && strings.TrimSpace(r.CapacityCurve) != "" {
-			var report CapacityReportDTO
-			if err := json.Unmarshal([]byte(r.CapacityCurve), &report); err == nil {
-				dto.Capacity = &report
-			}
-		}
-		if kind == "vision" {
-			v := r.VisionCapable
-			dto.VisionCapable = &v
-		}
-		// The payload column is read for its OWN kind only, like the capacity
-		// curve above: a row of another kind carrying bytes here (a legacy row,
-		// or a future writer) must not be served as a VRAM result.
-		if kind == "vram" && strings.TrimSpace(r.VRAMJSON) != "" {
-			var report VRAMReportDTO
-			if err := json.Unmarshal([]byte(r.VRAMJSON), &report); err == nil {
-				if report.GPUs == nil {
-					report.GPUs = []VRAMGPUItemDTO{}
-				}
-				dto.VRAM = &report
-			}
-		}
-		out = append(out, dto)
+		out = append(out, benchmarkRunDTO(r))
 	}
 	return out, nil
+}
+
+// benchmarkRunDTO projects one stored benchmark row onto its wire shape.
+//
+// An empty Kind column reads as "speed": that is what a row written before the
+// column existed carries, and the zero value must not surface as a kind the
+// portal has no rendering for.
+//
+// The kind-specific payload is a SWITCH, not a chain of ifs, because a row has
+// exactly one kind and therefore at most one payload — a row of one kind
+// carrying another kind's bytes (a legacy row, or a future writer) must not be
+// served as that other kind's result. The switch makes that exclusivity
+// structural instead of leaving it to three independent conditions that could
+// each be relaxed on its own.
+func benchmarkRunDTO(r routing.BenchmarkRun) BenchmarkRunDTO {
+	kind := r.Kind
+	if kind == "" {
+		kind = "speed"
+	}
+	dto := BenchmarkRunDTO{
+		ID:                    r.ID,
+		MappingID:             r.MappingID,
+		ServerID:              r.ServerID,
+		CreatedAt:             r.CreatedAt,
+		GenTokensPerSecond:    r.GenTokensPerSecond,
+		PromptTokensPerSecond: r.PromptTokensPerSecond,
+		LoadTimeMS:            r.LoadTimeMS,
+		ContextSize:           r.ContextSize,
+		Error:                 r.Error,
+		Kind:                  kind,
+	}
+	switch kind {
+	case "capacity":
+		dto.Capacity = decodeCapacityReport(r.CapacityCurve)
+	case "vision":
+		v := r.VisionCapable
+		dto.VisionCapable = &v
+	case "vram":
+		dto.VRAM = decodeVRAMReport(r.VRAMJSON)
+	}
+	return dto
+}
+
+// decodeCapacityReport decodes a kind=="capacity" row's opaque curve column.
+// A blank or malformed payload yields nil rather than an error: the row's own
+// metric fields and Error still carry a usable history entry, and failing the
+// whole history request because one archived curve no longer parses would hide
+// every other run from the operator.
+func decodeCapacityReport(raw string) *CapacityReportDTO {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var report CapacityReportDTO
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return nil
+	}
+	return &report
+}
+
+// decodeVRAMReport decodes a kind=="vram" row's opaque result column, tolerating
+// a blank or malformed payload as nil for the same reason decodeCapacityReport
+// does.
+//
+// A decoded report's GPUs is never nil: a nil slice marshals as JSON null
+// instead of [], and a client reading it with a `?? []` fallback then renders an
+// eternally empty list with no error (see VRAMReportDTO.GPUs).
+func decodeVRAMReport(raw string) *VRAMReportDTO {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var report VRAMReportDTO
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return nil
+	}
+	if report.GPUs == nil {
+		report.GPUs = []VRAMGPUItemDTO{}
+	}
+	return &report
 }
 
 // AuthorizeBenchmarkScope authorizes principal for {scope,id} and returns the
