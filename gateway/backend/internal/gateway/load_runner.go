@@ -24,24 +24,49 @@ func (s *Server) runLoadModel(ctx context.Context, run *benchmarkRun, serverID s
 		s.Benchmarks.publish(serverID, run.snapshot())
 	}()
 
+	if _, err := s.ensureResidentForRun(ctx, tgt); err != nil {
+		res.Error = err.Error()
+		return
+	}
+	res.Loaded = true
+}
+
+// ensureResidentForRun is the LOAD CORE, shared by the load run and the VRAM
+// benchmark: make tgt's model resident on tgt's server, and report whether it
+// was ALREADY resident before we touched it.
+//
+// IT LOADS BY GENERATING, and that is load-bearing rather than incidental:
+// there is no non-generating load path anywhere in this code, so by the time
+// this returns the model has both loaded AND served a complete one-token
+// generation. A backend that allocates its KV cache lazily on first use has
+// therefore necessarily already done so -- which is why the VRAM run has no
+// second "send one tiny generation" step. Two windows for one observation
+// would double the exposure to a drifting neighbour and to the reservation
+// being held open, in exchange for a number that cannot differ.
+//
+// THE alreadyResident RETURN IS A CONTAMINATION SIGNAL, not a convenience.
+// The core short-circuits on a resident model, so a caller that has just
+// confirmed the model STOPPED and still gets true is being told that
+// something it could not stop is serving that model. The load run ignores the
+// value (it only wants the model up); the VRAM run reports inconclusive on
+// it, because a delta measured against a baseline that already contains the
+// model is a definitive ~0.
+func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) (alreadyResident bool, err error) {
 	streamer, ok := s.Provider.(provider.StreamingClient)
 	if !ok {
-		res.Error = errBenchmarkNoStreaming.Error()
-		return
+		return false, errBenchmarkNoStreaming
 	}
 	target, req := benchmarkTargetReq(tgt)
 	req.MaxTokens = 1 // minimal — we only want the model loaded
 
 	if s.modelResident(ctx, target, tgt) {
-		res.Loaded = true
-		return
+		return true, nil
 	}
 	if _, _, err := s.streamOnce(ctx, streamer, target, req); err != nil {
-		res.Error = err.Error()
-		return
+		return false, err
 	}
-	res.Loaded = true
 	s.reflectLoadedAfterLoad(ctx, target, tgt)
+	return false, nil
 }
 
 // modelResident best-effort reports whether tgt's upstream model is already loaded on tgt's server.
