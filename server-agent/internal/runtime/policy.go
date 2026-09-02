@@ -67,10 +67,18 @@ type PolicySnapshot struct {
 //   - Evict-then-retry: OK is false, Evict names the idle victims to
 //     drain-stop first, oldest LastUsed first. Once they are gone, Admit
 //     applied again to the reduced running set is expected to return OK.
-//   - Wait: OK is false, Wait is true, Evict is empty. Every remaining
-//     blocker is busy, still loading, or (outside the unknown-VRAM case
-//     below) pinned: nothing can be evicted to help right now, so the caller
-//     queues the request and re-asks on the next completion.
+//   - Wait: OK is false, Wait is true, Evict is empty. Nothing MAY be evicted
+//     to help right now, so the caller queues the request and re-asks on the
+//     next completion. Two different situations reach that, and only the
+//     first is "nothing CAN be evicted": every remaining blocker is busy,
+//     still loading, or (outside the unknown-VRAM case below) pinned. In the
+//     second, a blocker plainly could be evicted and deliberately is not --
+//     rule 4's known-demand occupant, which an unknown-demand candidate is no
+//     longer allowed to drain-stop (see rule 4 in Admit). Wait is still the
+//     right shape for it: an idle occupant is resolvable, just by its own
+//     idle timeout rather than by an eviction this decision asks for. What
+//     Wait promises the caller is therefore only that re-asking later may
+//     succeed -- never that it exhausted the eviction candidates.
 //   - Reason: OK is false, Wait is false, Evict is empty, and Reason names
 //     a durable, non-transient block -- one that cannot resolve by
 //     eviction OR by waiting, so reporting it as either of the other two
@@ -262,7 +270,10 @@ func firstUnknownGPU(r RunningProc) (int, bool) {
 // process is not on that card at all, which says nothing about its demand.
 //
 // THE SCOPE IS THE WHOLE PROCESS, AND THAT IS WHAT MAKES RULE 5 RULE 4's
-// MIRROR. This predicate asks "does r have an unknown demand anywhere",
+// MIRROR -- in SUBJECT. Which of the two sides may evict the other is a
+// separate question, settled the other way (known demand beats unknown
+// demand: rule 4 blocks, rule 5 evicts; see rule 4 in Admit).
+// This predicate asks "does r have an unknown demand anywhere",
 // exactly as specHasUnknownVRAM asks it of the candidate; Admit then pairs it
 // with touchesAnyGPU, exactly as rule 4 does. It was narrower once -- "is r
 // unknown at one of the CANDIDATE's indexes" -- which made rule 5 a mirror in
@@ -452,10 +463,20 @@ func sortOldestFirst(procs []RunningProc) {
 // Admit answers: may spec start next to the processes already running in
 // snap? It applies the design doc's §5 admission rule -- matrix
 // compatibility, the process-count limit, and per-GPU VRAM arithmetic --
-// plus the unknown-VRAM-alone rule, applied SYMMETRICALLY to both sides of
-// the pair (rule 4 for the candidate's own unknown demand, rule 5 for a
-// running occupant's), and computes the idle-victim set that would unblock
-// the start if one exists.
+// plus the unknown-VRAM-alone rule, which is applied to BOTH sides of the
+// pair (rule 4 for the candidate's own unknown demand, rule 5 for a running
+// occupant's), and computes the idle-victim set that would unblock the start
+// if one exists.
+//
+// The two unknown-VRAM rules are symmetric in SUBJECT and asymmetric in
+// OUTCOME, and the asymmetry is the point: an unknown demand makes a card
+// unshareable from whichever side it sits on, but only the known-demand side
+// may evict to get it. Known demand beats unknown demand -- a total order,
+// adopted because the outcome-symmetric version had a mixed pair evicting in
+// both directions and thrashing forever. Rule 4 in the body carries the
+// measurement and the reasoning; the one case the order does not decide (both
+// sides unknown) is a recorded acceptance in
+// 11-risks-and-technical-debt.md §11.4.
 //
 // Kept as a small, deliberately linear pipeline rather than a clever one,
 // since it will be read far more often than it will be changed:
@@ -485,12 +506,15 @@ func sortOldestFirst(procs []RunningProc) {
 //     blockers against the self-filtered running set: every disallowed
 //     pair; -- if spec has any unknown-VRAM GPU -- every process touching
 //     any of spec's GPUs; and every process that has an unknown demand of
-//     its OWN and holds any of spec's GPUs. An evictable blocker is
-//     queued for eviction; a non-evictable (busy or still-loading)
-//     blocker marks the whole decision blocked. Rules 4 and 5 name the
-//     same occupants when both sides are unknown, which is harmless:
-//     toEvict is keyed by spec id, so the overlap costs a map write and
-//     never a duplicate victim.
+//     its OWN and holds any of spec's GPUs. For rules 1 and 5 an evictable
+//     blocker is queued for eviction and a non-evictable (busy or
+//     still-loading) one marks the whole decision blocked. RULE 4 NEVER
+//     QUEUES A VICTIM: known demand beats unknown demand, so a candidate
+//     of unknown demand blocks on the occupants of its cards instead of
+//     evicting them -- which is also why rules 4 and 5 no longer name the
+//     same occupant when both sides are unknown. Rule 5 alone claims that
+//     one. See rule 4 in the body for the convergence defect this closes,
+//     and Decision's Wait shape for what it costs the caller.
 //  4. Per-GPU budget (rule 3), evaluated with step 3's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
@@ -571,36 +595,80 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	}
 
 	// Rule 4: unknown VRAM -- every remaining toucher of spec's GPUs. Any
-	// pinned toucher already short-circuited above, so only idle/busy
-	// remain here.
+	// pinned toucher already short-circuited above, so only idle, busy and
+	// still-loading ones remain here, and NONE of them is evicted for this
+	// candidate: rule 4 only ever BLOCKS now.
+	//
+	// KNOWN DEMAND BEATS UNKNOWN DEMAND (ADR-032). Rules 4 and 5 were symmetric
+	// in outcome as well as in subject, and that was a convergence defect
+	// rather than a nicety: rule 5 evicts an unknown-demand occupant for a
+	// known-demand candidate, while rule 4 evicted a known-demand occupant
+	// for an unknown-demand candidate -- so a mixed pair contesting one card
+	// evicted in BOTH directions. Measured on one card, both idle, the pair
+	// open and no budget at all: candidate a (unknown demand) answered
+	// Evict [b] and candidate b (known demand) answered Evict [a], so a host
+	// alternating requests between the two paid a cold load for every single
+	// request, forever, with no state in between that either request could be
+	// served from.
+	//
+	// The operator's resolution is a TOTAL ORDER, and rule 4 is the half that
+	// gives something up: a candidate whose own demand is unknown still
+	// insists on having its cards to itself -- that is rule 4's entire point,
+	// §5.3's "may start only alone on that GPU" -- but it may no longer
+	// drain-stop a correctly-configured occupant to get there. It loses only
+	// the privilege of killing a spec whose estimate someone filled in; it
+	// keeps the refusal to share. So the answer is Wait -- which the
+	// occupant's own idle timeout resolves while destroying nothing, WHEN IT
+	// HAS ONE: Spec.IdleTimeoutSeconds == 0 means never unload, and then the
+	// wait lasts until a measurement or an operator estimate arrives (§5.3
+	// states that price). For an occupant that can never leave the answer is
+	// the terminal step 2 already returned above. A total order converges, and
+	// the spec that loses is always the misconfigured one.
+	//
+	// THE BLOCK IS UNCONDITIONAL, not "unless some other rule would have
+	// evicted that occupant anyway". A closed matrix cell (rule 1) or an
+	// overflowing sibling budget (rule 3) does supply an independent reason
+	// to drain-stop the same occupant, and honouring the order only where no
+	// such reason exists would leave those pairs evicting in both directions
+	// -- the same defect, one rule over. The order is a property of the two
+	// SPECS, not of this loop.
+	//
+	// A TOUCHER OF UNKNOWN DEMAND IS RULE 5's SUBJECT AND IS LEFT TO IT.
+	// Rule 5 below scans exactly `procHasUnknownVRAM(r) && touchesAnyGPU(r,
+	// gpuIdx)` over this same running set, ungated by the candidate's own
+	// demand, so every occupant this loop would still have evicted after the
+	// change -- an equally-unknown one, the tie the order does not decide --
+	// gets the identical evict-if-idle / block-otherwise treatment there.
+	// Repeating it here would be a branch whose deletion changes no decision.
+	// That tie keeps its pre-existing mutual eviction and is a recorded
+	// acceptance (11-risks-and-technical-debt.md §11.4) pinned by
+	// TestAdmitUnknownTieStillEvictsBothWays -- which is also the test that
+	// fails if rule 5's scan is ever narrowed out from under this comment.
 	if unknownVRAM {
 		for _, r := range running {
-			if !touchesAnyGPU(r, gpuIdx) {
-				continue
-			}
-			if isEvictable(r) {
-				toEvict[r.SpecID] = r
-			} else {
+			if touchesAnyGPU(r, gpuIdx) && !procHasUnknownVRAM(r) {
 				blocked = true
 			}
 		}
 	}
 
-	// Rule 5: the mirror of rule 4 -- every remaining occupant that has an
-	// unknown demand of its OWN and holds one of spec's GPUs, blocking the
-	// sharing of that card exactly as an unknown candidate does. Any pinned
-	// such occupant already short-circuited above, so only idle/busy remain
-	// here.
+	// Rule 5: rule 4's mirror in SUBJECT -- every remaining occupant that has
+	// an unknown demand of its OWN and holds one of spec's GPUs, making that
+	// card unshareable exactly as an unknown candidate does. It is the
+	// winning half of the order above, so unlike rule 4 it still EVICTS:
+	// idle occupants are queued as victims, and it is the only rule that
+	// queues an occupant of unknown demand at all. Any pinned such occupant
+	// already short-circuited above, so only idle/busy/starting remain here.
 	//
 	// It belongs in step 3, next to rules 1 and 4, for two reasons: it is
 	// evaluated against the ORIGINAL running set, so its verdict never
 	// depends on what another rule happened to queue first, and rule 3
 	// below must already see its victims as gone -- an occupant queued here
 	// is skipped by rule 3's sum, which is the only consistent reading
-	// (charging it a number there cannot work; see procHasUnknownVRAMOn).
-	// It must not move after rule 2 either: the process-count limit runs
-	// last precisely so it asks only for victims the earlier rules have not
-	// already supplied.
+	// (charging it a number there cannot work; see procHasUnknownVRAM's own
+	// doc comment). It must not move after rule 2 either: the process-count
+	// limit runs last precisely so it asks only for victims the earlier
+	// rules have not already supplied.
 	for _, r := range running {
 		if !procHasUnknownVRAM(r) || !touchesAnyGPU(r, gpuIdx) {
 			continue

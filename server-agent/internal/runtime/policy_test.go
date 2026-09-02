@@ -219,8 +219,22 @@ func TestAdmit(t *testing.T) {
 			want: Decision{OK: true, Evict: []string{}},
 		},
 		{
-			// 11: unknown VRAM, gpu occupied by idle -> evict that proc.
-			name: "unknown vram occupied by idle evicts it",
+			// 11: unknown VRAM, gpu occupied by an idle occupant of KNOWN
+			// demand -> Wait.
+			//
+			// CHANGED DELIBERATELY, from `Evict: []string{"occupant"}` to
+			// Wait. The brief's original expectation was the eviction, and it
+			// is one half of a convergence defect: rule 5 evicts an
+			// unknown-demand occupant for this occupant's sake, so with rule 4
+			// evicting in the other direction the pair thrashed forever (see
+			// TestAdmitMixedPairConverges, and the block comment above it).
+			// The operator's resolution -- known demand beats unknown demand
+			// -- takes rule 4's eviction right away and leaves it the refusal
+			// to share, so the candidate now waits for the idle timeout of the
+			// spec whose estimate is filled in instead of drain-stopping it.
+			// Note what did NOT change: case 12 below, where the same occupant
+			// is pinned, is still the terminal.
+			name: "unknown vram occupied by idle known occupant waits",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
 					{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0},
@@ -228,7 +242,7 @@ func TestAdmit(t *testing.T) {
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}},
-			want: Decision{Evict: []string{"occupant"}},
+			want: Decision{Wait: true, Evict: []string{}},
 		},
 		{
 			// 12: unknown VRAM, gpu occupied by pinned -> Reason:
@@ -996,8 +1010,13 @@ func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 // cannot reach the same answer by arithmetic and hide a regression here.
 //
 // The mirrored snapshot is asserted in the same test, because "mirror" is the
-// claim under test: an unknown CANDIDATE facing a known occupant on one of
-// its cards has always evicted, and both directions must now agree.
+// claim under test -- and that claim has since been narrowed, by the operator,
+// to the two rules' SUBJECT and never their outcome. Both directions still
+// refuse to share the card; WHO PAYS for the refusal is now settled by "known
+// demand beats unknown demand", so the mirrored case below waits where it once
+// evicted. See TestAdmitUnknownCandidateNeverEvictsKnownOccupant and
+// TestAdmitMixedPairConverges for why the outcome-symmetric version could not
+// stand: it made every mixed pair evict in both directions.
 func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 	candidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 1, VRAMMB: 5000}}}
 	budgets := map[int]int{0: 20000, 1: 20000}
@@ -1049,7 +1068,17 @@ func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 			},
 		},
 		{
-			name: "mirror: an unknown candidate evicts a known occupant of one of its cards",
+			// CHANGED DELIBERATELY, from `Evict: []string{"occupant"}` to
+			// Wait: this is the exact snapshot the two rules disagreed over.
+			// The candidate is unknown on gpu 0 and known on gpu 1; the
+			// occupant is known and holds gpu 1. Rule 5, run the other way
+			// round (the first case in this table), evicts the unknown side --
+			// so as long as rule 4 also evicted here, one card with these two
+			// specs on it thrashed forever. Rule 4 keeps the aloneness demand
+			// (hence Wait rather than OK, and the pinned case above is still
+			// terminal) and gives up the eviction, which is the operator's
+			// "known demand beats unknown demand".
+			name: "mirror: an unknown candidate waits for a known occupant of one of its cards",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
 					{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0},
@@ -1058,7 +1087,7 @@ func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
-			want: Decision{Evict: []string{"occupant"}},
+			want: Decision{Wait: true, Evict: []string{}},
 		},
 	}
 	for _, tc := range cases {
@@ -1222,10 +1251,18 @@ func TestAdmitUnknownOccupantSelfIsNotAnOccupant(t *testing.T) {
 }
 
 // TestAdmitUnknownOnBothSidesEvictsOnce: when the CANDIDATE's demand is
-// unknown too, rules 4 and 5 name the same occupant. toEvict is keyed by
-// spec ID precisely so the two cannot produce a duplicate victim -- an
+// unknown too, the occupant appears exactly ONCE in the Evict list -- an
 // Evict list naming the same spec twice would have the caller drain-stop it
 // once and then wait forever for a second stop that never comes.
+//
+// The reason it can only appear once has changed, and the older one is worth
+// knowing. Rules 4 and 5 both used to queue this occupant, and the guarantee
+// was `toEvict`'s spec-ID key collapsing the two writes. Since "known demand
+// beats unknown demand" took rule 4's eviction right away, rule 4 no longer
+// queues anyone at all: this victim comes from rule 5 alone, and the
+// no-duplicate property is now structural rather than deduplicated. The
+// expectation is unchanged either way, which is why this test did not move
+// when the rule did.
 func TestAdmitUnknownOnBothSidesEvictsOnce(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
@@ -1236,4 +1273,190 @@ func TestAdmitUnknownOnBothSidesEvictsOnce(t *testing.T) {
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	got := Admit(snap, spec)
 	assertDecision(t, "unknown on both sides evicts the occupant once", got, Decision{Evict: []string{"occupant"}})
+}
+
+// --- Known demand beats unknown demand -----------------------------------
+//
+// Rules 4 and 5 were symmetric in the WRONG way: each direction of a mixed
+// known/unknown pair evicted the other. Measured on the revision before this
+// change -- one card, both processes idle, the pair open, no budget at all:
+//
+//	candidate a(unknown) vs running b(known)    -> Evict [b]
+//	candidate b(known)   vs running a(unknown)  -> Evict [a]
+//
+// so a host alternating requests between those two specs served every single
+// request only after a cold load, forever, with no state in between that
+// either request could be served from.
+//
+// The fix is a TOTAL ORDER -- known demand beats unknown demand -- and it
+// costs rule 4 its eviction right. A candidate whose own demand is unknown
+// still insists on having its cards to itself (that is exactly what rule 4 is
+// for), but it may no longer drain-stop a correctly-configured occupant to get
+// there: it BLOCKS instead, which is Wait while the occupant could still
+// leave, and the unchanged terminal when it is pinned and never can. Rule 5
+// keeps its eviction right untouched -- it is the half of the order that wins
+// -- so the spec that loses is always the one whose estimate is missing.
+//
+// What the order does NOT cover is unknown vs unknown, where neither side
+// outranks the other. That tie keeps its pre-existing mutual eviction and is
+// recorded as a deliberate acceptance in
+// docs/architecture/11-risks-and-technical-debt.md §11.4;
+// TestAdmitUnknownTieStillEvictsBothWays pins it so the acceptance is visible
+// in the suite instead of only in prose.
+
+// TestAdmitUnknownCandidateNeverEvictsKnownOccupant is rule 4's half of the
+// order. Every case leaves the co-residency pair open and the budgets
+// generous unless the case name says otherwise, so rule 4 is the only rule
+// that can produce the non-OK answer.
+func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
+	unknownCandidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	occupant := func(mod func(*RunningProc)) []RunningProc {
+		r := RunningProc{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}
+		mod(&r)
+		return []RunningProc{r}
+	}
+	idle := func(*RunningProc) {}
+
+	cases := []struct {
+		name string
+		snap PolicySnapshot
+		spec Spec
+		want Decision
+	}{
+		{
+			// THE CHANGED CASE. Before: Evict [occupant] -- an unknown-demand
+			// spec drain-stopped a spec with a perfectly good estimate to get
+			// the card to itself. Now: Wait, which the occupant's own idle
+			// timeout resolves without destroying anything.
+			name: "idle known occupant is waited for, never evicted",
+			snap: PolicySnapshot{Running: occupant(idle), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			spec: unknownCandidate,
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// Unchanged: a busy occupant was never evictable anyway.
+			name: "busy known occupant still waits",
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.InFlight = 1 }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			spec: unknownCandidate,
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// Unchanged: isEvictable's Starting clause (the C3 fix) already
+			// spared a still-loading occupant.
+			name: "still-loading known occupant still waits",
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Starting = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			spec: unknownCandidate,
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// Unchanged, and it is what makes Wait above the right SHAPE
+			// rather than a new terminal: an occupant that can never leave is
+			// still reported as the terminal it always was, by step 2's
+			// short-circuit, ahead of rule 4's collection loop.
+			name: "pinned known occupant is still the terminal",
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Pinned = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			spec: unknownCandidate,
+			want: Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}},
+		},
+		{
+			// Before: Evict [occupant], because rule 1 queued the occupant for
+			// the closed cell and rule 4 was content. The order is a property
+			// of the two SPECS, not of rule 4's own loop: a closed matrix cell
+			// does not hand the unknown-demand candidate back the right to
+			// drain-stop the known one, and blocking here converges the closed
+			// mixed pair too (which evicted in both directions before).
+			name: "a closed co-residency cell does not restore the eviction right",
+			snap: PolicySnapshot{Running: occupant(idle), Budgets: map[int]int{0: 20000}},
+			spec: unknownCandidate,
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// Before: Evict [occupant] -- here from rule 3's arithmetic on the
+			// candidate's OTHER, known card. Same answer as the closed cell
+			// above and for the same reason: whatever independently justifies
+			// the eviction, the victim is a known-demand occupant of a card
+			// this candidate contests, and this candidate may not have it.
+			name: "a sibling gpu over budget does not restore it either",
+			snap: PolicySnapshot{
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0}},
+				Budgets: map[int]int{1: 8000},
+				Allowed: allowPairs("cand", "occupant"),
+			},
+			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
+			want: Decision{Wait: true, Evict: []string{}},
+		},
+		{
+			// The order is about the cards the candidate CONTESTS. A
+			// known-demand occupant of a card this candidate never touches is
+			// outside rule 4 entirely and keeps being evicted by the rules
+			// that own it -- here the process-count limit. Blocking it too
+			// would make an unconfigured spec unable to start on an idle host.
+			name: "a known occupant of an untouched gpu is still evicted by the process limit",
+			snap: PolicySnapshot{
+				Running:      []RunningProc{{SpecID: "elsewhere", GPUs: map[int]int{7: 5000}, LastUsed: t0}},
+				MaxProcesses: 1,
+				Allowed:      allowPairs("cand", "elsewhere"),
+			},
+			spec: unknownCandidate,
+			want: Decision{Evict: []string{"elsewhere"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, tc.name, Admit(tc.snap, tc.spec), tc.want)
+		})
+	}
+}
+
+// TestAdmitMixedPairConverges is the defect itself, asserted as a property of
+// the PAIR rather than of one decision: run Admit in both directions over one
+// contested card and at most one of them may evict. Before the change both
+// did, which is a host that never reaches a served state it can stay in; the
+// two per-direction expectations are asserted as well so a regression says
+// WHICH direction moved, and the final check says what that costs.
+func TestAdmitMixedPairConverges(t *testing.T) {
+	allowed := map[[2]string]bool{PairKey("known", "unknown"): true}
+	specKnown := Spec{ID: "known", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}
+	specUnknown := Spec{ID: "unknown", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	runKnown := RunningProc{SpecID: "known", GPUs: map[int]int{0: 5000}, LastUsed: t0}
+	runUnknown := RunningProc{SpecID: "unknown", GPUs: map[int]int{0: 0}, LastUsed: t0}
+
+	knownAsCandidate := Admit(PolicySnapshot{Running: []RunningProc{runUnknown}, Allowed: allowed}, specKnown)
+	unknownAsCandidate := Admit(PolicySnapshot{Running: []RunningProc{runKnown}, Allowed: allowed}, specUnknown)
+
+	assertDecision(t, "rule 5: known demand evicts the unknown occupant", knownAsCandidate,
+		Decision{Evict: []string{"unknown"}})
+	assertDecision(t, "rule 4: unknown demand waits for the known occupant", unknownAsCandidate,
+		Decision{Wait: true, Evict: []string{}})
+
+	if len(knownAsCandidate.Evict) > 0 && len(unknownAsCandidate.Evict) > 0 {
+		t.Fatalf("both directions of one mixed pair evict, so alternating requests thrash forever: "+
+			"known-as-candidate evicts %v, unknown-as-candidate evicts %v",
+			knownAsCandidate.Evict, unknownAsCandidate.Evict)
+	}
+}
+
+// TestAdmitUnknownTieStillEvictsBothWays pins the case the operator's order
+// does NOT decide: two specs that are both of unknown demand do not outrank
+// each other, so each still evicts the other and the pair still thrashes.
+//
+// THIS TEST IS NOT AN ENDORSEMENT. It records an accepted remaining case
+// (docs/architecture/11-risks-and-technical-debt.md §11.4) at the one place a
+// reader of Admit will look for it, so that (a) the change above is visibly
+// scoped to the MIXED pair and did not quietly alter the tie, and (b) whoever
+// does resolve the tie -- with a tiebreak this branch deliberately did not
+// invent -- changes this expectation on purpose rather than discovering it.
+func TestAdmitUnknownTieStillEvictsBothWays(t *testing.T) {
+	allowed := map[[2]string]bool{PairKey("a", "b"): true}
+	specA := Spec{ID: "a", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	specB := Spec{ID: "b", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	runA := RunningProc{SpecID: "a", GPUs: map[int]int{0: 0}, LastUsed: t0}
+	runB := RunningProc{SpecID: "b", GPUs: map[int]int{0: 0}, LastUsed: t0}
+
+	assertDecision(t, "unknown a evicts unknown occupant b",
+		Admit(PolicySnapshot{Running: []RunningProc{runB}, Allowed: allowed}, specA),
+		Decision{Evict: []string{"b"}})
+	assertDecision(t, "unknown b evicts unknown occupant a",
+		Admit(PolicySnapshot{Running: []RunningProc{runA}, Allowed: allowed}, specB),
+		Decision{Evict: []string{"a"}})
 }
