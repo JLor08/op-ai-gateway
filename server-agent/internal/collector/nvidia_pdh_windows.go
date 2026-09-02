@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // This file is the SYSCALL half of the Windows per-process VRAM measurer. Its
@@ -38,15 +40,36 @@ import (
 // milliseconds. The single subprocess it does spawn, nvidia-smi, is cached and
 // bounded by nvidiaMeasureTimeout.
 
+// BOTH DLLs LOAD FROM SYSTEM32 ONLY, via windows.NewLazySystemDLL rather than
+// syscall.NewLazyDLL. This is a security boundary, not a style preference.
+// syscall.NewLazyDLL with a bare base name resolves through LoadLibraryExW's
+// standard search order, which starts with the APPLICATION DIRECTORY, and it
+// only bypasses that for the handful of DLLs Go itself registers as
+// System32-only (internal/syscall/windows/sysdll: advapi32, bcryptprimitives,
+// crypt32, dnsapi, iphlpapi, kernel32, mswsock, netapi32, ntdll, psapi,
+// secur32, shell32, userenv, ws2_32). pdh.dll is not among them and is not a
+// Windows KnownDLL either, so a file named pdh.dll dropped next to the agent
+// binary would be loaded and its DllMain executed IN PROCESS -- inside the
+// process that spawns the model children and holds the gateway mTLS client
+// identity -- on the first VRAM measurement after a managed model starts. The
+// agent ships as a single downloadable binary an operator installs wherever
+// they like (07-deployment-view.md 7.5), so "the install directory is not
+// writable" is not an assumption this code may make. Go's own syscall.LoadDLL
+// doc names both the hazard and this fix.
+//
+// gdi32.dll IS a KnownDLL and so is not hijackable, but it goes through the
+// same constructor anyway: one rule for both is one fewer thing to get right,
+// and it keeps pdhMeasurerProcs a single type. golang.org/x/sys was already in
+// the module graph.
 var (
-	pdhDLL                           = syscall.NewLazyDLL("pdh.dll")
+	pdhDLL                           = windows.NewLazySystemDLL("pdh.dll")
 	procPdhOpenQueryW                = pdhDLL.NewProc("PdhOpenQueryW")
 	procPdhAddEnglishCounterW        = pdhDLL.NewProc("PdhAddEnglishCounterW")
 	procPdhCollectQueryData          = pdhDLL.NewProc("PdhCollectQueryData")
 	procPdhGetFormattedCounterArrayW = pdhDLL.NewProc("PdhGetFormattedCounterArrayW")
 	procPdhCloseQuery                = pdhDLL.NewProc("PdhCloseQuery")
 
-	gdi32DLL                      = syscall.NewLazyDLL("gdi32.dll")
+	gdi32DLL                      = windows.NewLazySystemDLL("gdi32.dll")
 	procD3DKMTOpenAdapterFromLuid = gdi32DLL.NewProc("D3DKMTOpenAdapterFromLuid")
 	procD3DKMTQueryAdapterInfo    = gdi32DLL.NewProc("D3DKMTQueryAdapterInfo")
 	procD3DKMTCloseAdapter        = gdi32DLL.NewProc("D3DKMTCloseAdapter")
@@ -55,9 +78,9 @@ var (
 // pdhMeasurerProcs is every entry point the measurer needs. The constructor
 // resolves all of them up front so a host missing any one of them gets NO
 // measurer rather than a measurer that panics on its first call --
-// syscall.LazyProc resolves lazily and panics from Call when the export is
-// absent, which on this code path would take down an admission decision.
-var pdhMeasurerProcs = []*syscall.LazyProc{
+// a LazyProc resolves lazily and panics from Call when the export is absent,
+// which on this code path would take down an admission decision.
+var pdhMeasurerProcs = []*windows.LazyProc{
 	procPdhOpenQueryW,
 	procPdhAddEnglishCounterW,
 	procPdhCollectQueryData,
