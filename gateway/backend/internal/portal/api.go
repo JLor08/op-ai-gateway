@@ -176,6 +176,7 @@ type API interface {
 	ServerPerfHistory(context.Context, auth.Token, string, time.Duration) ([]routing.TelemetrySample, error)
 	ServerRuntimeReportView(context.Context, auth.Token, string) (ServerRuntimeReportViewDTO, error)
 	ServiceAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	SetBenchmarkRuntimeSpecAdminState(context.Context, string, string, string) (RuntimeSpecDTO, error)
 	SetCaptureSecret(auth.Token, string, bool) error
 	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
 	SetManagerPermissions(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool) error

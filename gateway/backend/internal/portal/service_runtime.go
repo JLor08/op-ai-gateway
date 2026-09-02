@@ -55,6 +55,15 @@ var (
 	// GetRuntimeSpec) so the portal can ask about any mapping without
 	// special-casing the application type.
 	ErrRuntimeSpecNotServerAgent = errors.New("runtime_spec.application_not_server_agent")
+	// ErrRuntimeSpecAdminStateConflict rejects a
+	// SetBenchmarkRuntimeSpecAdminState whose freshly-read admin_state is not
+	// the value the caller said it was replacing. This endpoint class is a
+	// read-modify-write with no If-Match and no row version, and the VRAM
+	// benchmark's deferred restore is the caller that needs the guard: without
+	// it, a restore minutes after the drain would hand a concurrent operator's
+	// override straight back to "". The caller records the spec as
+	// restore-failed instead -- somebody else owns the field now.
+	ErrRuntimeSpecAdminStateConflict = errors.New("runtime_spec.admin_state_conflict")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -382,6 +391,20 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	return s.putRuntimeSpec(ctx, mapping, app, server, req)
+}
+
+// putRuntimeSpec is PutRuntimeSpec's whole body with the AUTHORIZATION
+// removed and the resolved mapping/application/server handed in. It is the
+// one implementation of the full-document upsert -- validation, defaulting,
+// the VRAM ownership rule, and the notification -- so a second caller cannot
+// end up with a subtly different write.
+//
+// Its callers, and what authorized each: PutRuntimeSpec (the portal
+// principal, via authorizeMapping) and SetBenchmarkRuntimeSpecAdminState (the
+// benchmark trigger request, gated before the run started -- see that
+// method's doc for why the run itself carries no principal).
+func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest) (RuntimeSpecDTO, error) {
 	if app.Type != routing.ProviderServerAgent {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecNotServerAgent
 	}
