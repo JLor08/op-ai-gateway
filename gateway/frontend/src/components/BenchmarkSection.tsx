@@ -76,7 +76,12 @@ function vramMb(value: number | undefined): string {
  *  - the drained set is always named. If the gateway dies between the drain and
  *    the restore, those specs stay `force_stopped` until an operator clears
  *    them by hand, and this list plus `restore_failed` is the only place they
- *    are ever told which ones.
+ *    are ever told which ones;
+ *  - `restore_failed` and `restore_taken_over` get DIFFERENT alerts, because
+ *    they are different instructions. Only the first names specs that are
+ *    still `force_stopped`; the second names specs whose override somebody
+ *    else set during the run, and telling an operator to clear those by hand
+ *    would stop a model they had just deliberately started.
  */
 function VramReportView({
   t,
@@ -86,6 +91,7 @@ function VramReportView({
   const gpus = report.gpus ?? [];
   const drained = report.drained_spec_ids ?? [];
   const restoreFailed = report.restore_failed ?? [];
+  const restoreTakenOver = report.restore_taken_over ?? [];
   const warnings = report.warnings ?? [];
   return (
     <Box sx={{ display: 'grid', gap: 0.75 }}>
@@ -164,6 +170,17 @@ function VramReportView({
       {restoreFailed.length > 0 && (
         <Alert severity="error">
           {t.benchmarkVramRestoreFailed} {restoreFailed.join(', ')}
+        </Alert>
+      )}
+      {/*
+        A takeover is NOT the failure above and must not read like it: these
+        specs are no longer force_stopped, so "clear them by hand" would stop a
+        model the operator had just deliberately started. Severity "info", and
+        its own sentence.
+      */}
+      {restoreTakenOver.length > 0 && (
+        <Alert severity="info">
+          {t.benchmarkVramRestoreTakenOver} {restoreTakenOver.join(', ')}
         </Alert>
       )}
     </Box>

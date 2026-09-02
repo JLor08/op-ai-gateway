@@ -1005,8 +1005,8 @@ func TestVRAMRestoreRunsOnACancelledRunContext(t *testing.T) {
 		}
 		cancel()
 
-		if failed := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 {
-			t.Fatalf("restore on a cancelled context reported %v as failed", failed)
+		if failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
+			t.Fatalf("restore on a cancelled context reported failed=%v takenOver=%v", failed, takenOver)
 		}
 		if state := f.adminState(t, f.targetSpec); state != "" {
 			t.Fatalf("admin_state after the restore = %q, want empty", state)
@@ -1081,8 +1081,8 @@ func TestVRAMRestoreReReadsSoAnOperatorEditSurvives(t *testing.T) {
 		t.Fatalf("operator edit: %v", err)
 	}
 
-	if failed := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 {
-		t.Fatalf("restore reported %v as failed", failed)
+	if failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
+		t.Fatalf("restore reported failed=%v takenOver=%v", failed, takenOver)
 	}
 	after, _, err := f.mem.RuntimeSpecByID(ctx, f.targetSpec)
 	if err != nil {
@@ -1096,26 +1096,82 @@ func TestVRAMRestoreReReadsSoAnOperatorEditSurvives(t *testing.T) {
 	}
 }
 
-// TestVRAMRestoreReportsFailureWhenSomebodyElseOwnsTheField: if the
-// freshly-read admin_state is no longer the force_stopped this run wrote, do
-// not write at all -- and say which spec was left that way, because the
-// operator is the one who has to sort it out.
-func TestVRAMRestoreReportsFailureWhenSomebodyElseOwnsTheField(t *testing.T) {
+// TestVRAMRestoreDistinguishesATakeoverFromAWriteFailure is the difference
+// between the two things "the restore did not happen" can mean, and it matters
+// because the portal turns one of them into an INSTRUCTION.
+//
+// If the freshly-read admin_state is no longer this run's force_stopped, the
+// restore writes nothing -- correctly, somebody else owns the field. But
+// reporting that as restore_failed rendered "these specs are still
+// force_stopped and have to be cleared by hand", which is false (the spec is
+// force_running, or already cleared) and whose instruction STOPS a model the
+// operator had just deliberately started. A genuine write failure is the other
+// case and is the one that really does leave the override in place.
+func TestVRAMRestoreDistinguishesATakeoverFromAWriteFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		takeoverTo string
+	}{
+		// The operator hits "Force start" on the spec mid-run.
+		{name: "an operator started the model again", takeoverTo: "force_running"},
+		// Or "Clear override", which leaves the field at "" -- also no longer
+		// this run's, and also nothing to clear by hand.
+		{name: "an operator cleared the override", takeoverTo: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newVRAMFixture(t, vramFixtureOpts{})
+			if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, f.targetSpec, "", "force_stopped"); err != nil {
+				t.Fatalf("drain: %v", err)
+			}
+			if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, f.targetSpec, "force_stopped", tc.takeoverTo); err != nil {
+				t.Fatalf("takeover: %v", err)
+			}
+
+			failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec})
+			if len(failed) != 0 {
+				t.Fatalf("restore_failed = %v, want none: this spec is not still force_stopped, so telling the operator to clear it by hand would stop a model they started", failed)
+			}
+			if len(takenOver) != 1 || takenOver[0] != f.targetSpec {
+				t.Fatalf("restore_taken_over = %v, want [%s]", takenOver, f.targetSpec)
+			}
+			if state := f.adminState(t, f.targetSpec); state != tc.takeoverTo {
+				t.Fatalf("admin_state = %q, want the takeover's %q left alone", state, tc.takeoverTo)
+			}
+		})
+	}
+}
+
+// TestVRAMRestoreReportsAGenuineWriteFailure is the other half: a spec whose
+// override this run really could not clear IS still force_stopped, and that is
+// the one case whose portal message ("clear these by hand") is true.
+//
+// It needs a store that can fail, so it runs on sqlite with the database
+// closed underneath the restore -- routing.MemoryStore has no failure mode
+// that is not also a missing row.
+func TestVRAMRestoreReportsAGenuineWriteFailure(t *testing.T) {
 	ctx := context.Background()
-	f := newVRAMFixture(t, vramFixtureOpts{})
+	sqlStore, err := store.OpenSQLite(filepath.Join(t.TempDir(), "vram-restore-fail.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := sqlStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate sqlite: %v", err)
+	}
+	f := newVRAMFixture(t, vramFixtureOpts{store: sqlStore})
 	if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, f.targetSpec, "", "force_stopped"); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, f.targetSpec, "force_stopped", "force_running"); err != nil {
-		t.Fatalf("takeover: %v", err)
+	if err := sqlStore.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
 	}
 
-	failed := f.srv.vramRestore(ctx, []string{f.targetSpec})
+	failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec})
 	if len(failed) != 1 || failed[0] != f.targetSpec {
-		t.Fatalf("restore_failed = %v, want [%s]", failed, f.targetSpec)
+		t.Fatalf("restore_failed = %v, want [%s]: the override really is still there", failed, f.targetSpec)
 	}
-	if state := f.adminState(t, f.targetSpec); state != "force_running" {
-		t.Fatalf("admin_state = %q, want the takeover's force_running left alone", state)
+	if len(takenOver) != 0 {
+		t.Fatalf("restore_taken_over = %v, want none: nobody took the field, the write failed", takenOver)
 	}
 }
 
@@ -1123,8 +1179,9 @@ func TestVRAMRestoreReportsFailureWhenSomebodyElseOwnsTheField(t *testing.T) {
 // its override with it, so it is not something an operator must clear by hand.
 func TestVRAMRestoreTreatsADeletedSpecAsRestored(t *testing.T) {
 	f := newVRAMFixture(t, vramFixtureOpts{})
-	if failed := f.srv.vramRestore(context.Background(), []string{"rspec_gone"}); len(failed) != 0 {
-		t.Fatalf("restore_failed = %v, want none for a deleted spec", failed)
+	failed, takenOver := f.srv.vramRestore(context.Background(), []string{"rspec_gone"})
+	if len(failed) != 0 || len(takenOver) != 0 {
+		t.Fatalf("restore_failed = %v, restore_taken_over = %v, want none for a deleted spec", failed, takenOver)
 	}
 }
 

@@ -3653,6 +3653,20 @@ panel's place: the two numbers side by side, the isolation claim, and — always
 drain and the restore, those spec ids are what an operator needs, and no other
 screen shows them.
 
+**A restore that did not happen has two meanings, and they are two fields.**
+`restore_failed` is a **write failure** — those specs really are still
+`force_stopped` and an operator has to clear them by hand, which is what the
+portal's message says. `restore_taken_over` is the disjoint other case: the
+restore re-reads each spec inside its compare-and-set, and when the
+`admin_state` it finds is no longer this run's `force_stopped` it writes
+**nothing** — an operator hit *Force start* (`force_running`) or *Clear
+override* (`""`) while the run held the field. Collapsing the second into the
+first rendered "these specs are still `force_stopped` and have to be cleared by
+hand" for a spec that is not force-stopped at all, and following that
+instruction **stops a model the operator had just deliberately started**. So
+they get separate fields, separate sentences and separate severities — the
+takeover is `info`: nothing needs undoing, only confirming.
+
 **"No result" is a first-class outcome with two distinct shapes.** An
 inconclusive report renders its **reason as the next action** (`info`, not an
 error) and renders **no per-GPU table at all**, so there is no cell that could

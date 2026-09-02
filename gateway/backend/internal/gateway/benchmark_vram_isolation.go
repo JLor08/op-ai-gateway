@@ -521,34 +521,50 @@ func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specID
 // Each spec is RE-READ immediately before it is written, inside the
 // compare-and-set writer. A full-document replace of a spec captured BEFORE
 // the run would revert every field an operator edited DURING it -- and a
-// launch spec is exactly what an operator opens while a model is stopped. If
-// the freshly-read admin_state is no longer this run's force_stopped, nothing
-// is written and the spec is reported as restore-failed: somebody else owns
-// the field now.
+// launch spec is exactly what an operator opens while a model is stopped.
 //
-// A DELETED spec is not a restore failure -- its override went with it.
+// IT RETURNS TWO SETS, BECAUSE "THE RESTORE DID NOT HAPPEN" MEANS TWO
+// DIFFERENT THINGS AND THE PORTAL TURNS ONE OF THEM INTO AN INSTRUCTION.
+//
+//   - takenOver: the freshly-read admin_state is no longer this run's
+//     force_stopped, so nothing is written -- somebody else owns the field
+//     now. That is an operator's mid-run "Force start" (force_running) or
+//     "Clear override" (""), and in BOTH the spec is no longer force-stopped.
+//     Reporting it as a failure rendered "these specs are still force_stopped
+//     and have to be cleared by hand": false, and an instruction that STOPS a
+//     model the operator had just deliberately started.
+//   - failed: the write itself could not be made -- a store error. This is the
+//     one case where the override really is still in place and really does
+//     need clearing by hand.
+//
+// The compare-and-set already returns the distinction
+// (portal.ErrRuntimeSpecAdminStateConflict); it was being thrown away.
+//
+// A DELETED spec is neither -- its override went with it.
 //
 // This is a deliberate divergence from the portal's own start/stop
 // discipline, which chose NOT to clear an override on a timeout because it
 // cannot tell a wedged child from a slow one. A benchmark can: it created
 // these overrides, so leaving them is strictly worse than clearing them.
-func (s *Server) vramRestore(ctx context.Context, drained []string) []string {
+func (s *Server) vramRestore(ctx context.Context, drained []string) (failed, takenOver []string) {
 	if len(drained) == 0 {
-		return nil
+		return nil, nil
 	}
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	defer cancel()
-	var failed []string
 	for _, specID := range drained {
 		_, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(restoreCtx, specID, "force_stopped", "")
 		switch {
 		case err == nil:
 		case errors.Is(err, portal.ErrRuntimeSpecNotFound):
 			// The spec was deleted mid-run; its override went with it.
+		case errors.Is(err, portal.ErrRuntimeSpecAdminStateConflict):
+			slog.Info("vram benchmark: an admin override was taken over during the run", "spec_id", specID)
+			takenOver = append(takenOver, specID)
 		default:
 			slog.Warn("vram benchmark: could not restore an admin override", "spec_id", specID, "err", err)
 			failed = append(failed, specID)
 		}
 	}
-	return failed
+	return failed, takenOver
 }

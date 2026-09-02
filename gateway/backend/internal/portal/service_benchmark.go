@@ -107,8 +107,17 @@ type VRAMReportDTO struct {
 	Isolated          bool              `json:"isolated"`
 	IsolationEvidence map[string]string `json:"isolation_evidence,omitempty"`
 	DrainedSpecIDs    []string          `json:"drained_spec_ids,omitempty"`
-	RestoreFailed     []string          `json:"restore_failed,omitempty"`
-	Inconclusive      string            `json:"inconclusive,omitempty"`
+	// RestoreFailed is the specs whose override the run could not clear, so
+	// they ARE still force_stopped and need clearing by hand. RestoreTakenOver
+	// is the disjoint other case: the spec's admin_state was no longer the
+	// run's force_stopped when the restore re-read it, because an operator
+	// force-started it or cleared the override mid-run -- so the restore wrote
+	// nothing and there is nothing to clear. Two fields because they are two
+	// instructions, and giving the second one the first one's message tells an
+	// operator to stop a model they just started.
+	RestoreFailed    []string `json:"restore_failed,omitempty"`
+	RestoreTakenOver []string `json:"restore_taken_over,omitempty"`
+	Inconclusive     string   `json:"inconclusive,omitempty"`
 	// Warnings are conditions that degraded the run's confidence without
 	// invalidating its number -- a non-managed neighbouring application on
 	// the same server, or an agent with no open WebSocket. The run warns

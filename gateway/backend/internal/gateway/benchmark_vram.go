@@ -110,9 +110,21 @@ type VRAMReport struct {
 	// portal can name the fleet an operator must clear by hand if the gateway
 	// dies between the drain and the restore.
 	DrainedSpecIDs []string `json:"drained_spec_ids,omitempty"`
-	// RestoreFailed is the specs left overridden, or whose override was taken
-	// over by someone else while the run held it.
+	// RestoreFailed is the specs whose override this run could not clear, so
+	// they ARE still force_stopped and an operator has to clear them by hand.
+	// A store error, and nothing else: see RestoreTakenOver for the other way
+	// a restore can not happen.
 	RestoreFailed []string `json:"restore_failed,omitempty"`
+	// RestoreTakenOver is the specs whose admin_state was no longer this run's
+	// force_stopped when the restore re-read it, so the restore correctly
+	// wrote NOTHING: an operator's mid-run "Force start" or "Clear override".
+	//
+	// It is a separate field because the two are separate instructions. These
+	// specs are NOT force_stopped, so telling an operator to clear them by
+	// hand -- which is what the restore_failed message says -- would stop a
+	// model they had just deliberately started. What they need to know is that
+	// the override on these specs is now somebody's own, not this run's.
+	RestoreTakenOver []string `json:"restore_taken_over,omitempty"`
 	// Inconclusive is empty on a definitive result, else one of the
 	// vramInconclusive* reasons above.
 	Inconclusive string `json:"inconclusive,omitempty"`

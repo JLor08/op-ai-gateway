@@ -464,14 +464,22 @@ export type VRAMGPUItemDTO = {
 // producers). `isolated` is the run's own evidence-backed claim: audit it
 // through `isolation_evidence` (spec id -> why this run believes that spec was
 // not running), where a missing entry means NOT confirmed. `drained_spec_ids` is
-// what the run force-stopped, and `restore_failed` the specs it could not put
-// back — an operator must clear those by hand. `inconclusive` empty = a
-// definitive result; any value means there is NO number to apply.
+// what the run force-stopped. `inconclusive` empty = a definitive result; any
+// value means there is NO number to apply.
 export type VRAMReportDTO = {
   isolated: boolean;
   isolation_evidence?: Record<string, string>;
   drained_spec_ids?: string[];
+  // The two disjoint ways a restore can not have happened, and they are two
+  // different instructions. `restore_failed`: the write itself failed, so
+  // these specs ARE still force_stopped and an operator has to clear them by
+  // hand. `restore_taken_over`: the spec's override was no longer the run's
+  // when the restore re-read it — an operator force-started the model or
+  // cleared the override mid-run — so the run wrote nothing and there is
+  // nothing to clear. Rendering the second with the first's message tells an
+  // operator to stop a model they just deliberately started.
   restore_failed?: string[];
+  restore_taken_over?: string[];
   inconclusive?: string;
   // Conditions that degraded the run's confidence without invalidating its
   // number: "non_managed_applications" (the server also hosts active

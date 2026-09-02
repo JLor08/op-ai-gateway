@@ -703,6 +703,29 @@ describe('BenchmarkSection VRAM run', () => {
     );
     const alert = await screen.findByText(t.benchmarkVramRestoreFailed, { exact: false });
     expect(alert).toHaveTextContent('spec_a');
+    // And it does NOT reach for the takeover sentence, which says the opposite.
+    expect(screen.queryByText(t.benchmarkVramRestoreTakenOver, { exact: false })).toBeNull();
+  });
+
+  // A spec whose override somebody TOOK OVER mid-run is not a spec that was
+  // left force_stopped, and it must not read like one: "clear these by hand"
+  // would stop a model the operator had just deliberately started.
+  it('separates a taken-over override from one it could not restore', async () => {
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        ...finishedVramRun({
+          vram: vramReport({
+            drained_spec_ids: ['spec_a'],
+            restore_taken_over: ['spec_a'],
+          }),
+        }),
+      },
+    );
+    const alert = await screen.findByText(t.benchmarkVramRestoreTakenOver, { exact: false });
+    expect(alert).toHaveTextContent('spec_a');
+    expect(screen.queryByText(t.benchmarkVramRestoreFailed, { exact: false })).toBeNull();
   });
 
   it('renders an inconclusive outcome as its REASON, never as a 0', async () => {

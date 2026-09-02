@@ -895,6 +895,8 @@ const de = {
     'Diese Specs wurden für die Messung auf force_stopped gesetzt und danach wiederhergestellt. Stirbt der Gateway zwischen Anhalten und Wiederherstellen, bleiben sie angehalten, bis der Override von Hand entfernt wird.',
   benchmarkVramRestoreFailed:
     'Diese Specs stehen weiterhin auf force_stopped und müssen von Hand zurückgesetzt werden.',
+  benchmarkVramRestoreTakenOver:
+    'Bei diesen Specs wurde der Override während des Laufs von außen geändert – jemand hat das Modell gestartet oder den Override entfernt. Der Lauf hat sie deshalb unberührt gelassen: sie stehen NICHT auf force_stopped, und es gibt nichts von Hand zurückzusetzen. Prüfen Sie nur, ob der jetzt gesetzte Override der gewünschte ist.',
   benchmarkVramWarnings: 'Einschränkungen',
   benchmarkVramWarningNonManaged:
     'Dieser Server betreibt außerdem aktive Anwendungen, die der Agent nicht anhalten kann. Solange deren Verbrauch konstant bleibt, fällt er aus der Differenz heraus; ändert er sich während der Messung, ist die Zahl unzuverlässig.',
@@ -2938,6 +2940,8 @@ const en: PortalMessages = {
   benchmarkVramDrainedNote:
     'These specs were set to force_stopped for the measurement and restored afterwards. If the gateway dies between the drain and the restore they stay stopped until someone clears the override by hand.',
   benchmarkVramRestoreFailed: 'These specs are still force_stopped and have to be cleared by hand.',
+  benchmarkVramRestoreTakenOver:
+    'Somebody changed the override on these specs during the run — the model was started, or the override cleared. The run left them alone: they are NOT force_stopped and there is nothing to clear by hand. Just check that the override now set on them is the one you want.',
   benchmarkVramWarnings: 'Caveats',
   benchmarkVramWarningNonManaged:
     'This server also hosts active applications the agent cannot stop. As long as their usage stays constant it cancels out of the delta; if it changes during the measurement the number is unreliable.',
