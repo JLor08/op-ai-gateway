@@ -5381,6 +5381,28 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
     expect(screen.queryByText(t.runtimeSpecVramBenchmarkSourceDelta)).not.toBeInTheDocument();
   });
 
+  it('names the DELTA when both numbers exist, and fills that one', async () => {
+    // The other half of the two-value source vocabulary, which was only ever
+    // asserted ABSENT: with no test rendering it, a ternary stuck on the
+    // measured branch would label a delta as the agent's per-process figure
+    // and pass. The two are not the same quantity, so the label is what tells
+    // the operator which one they are about to save.
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528, measured_mb: 21000 })]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    const benchmarkNumber = (await screen.findByLabelText(
+      t.runtimeSpecVramBenchmark,
+    )) as HTMLInputElement;
+    expect(benchmarkNumber.value).toBe('22528');
+    expect(screen.getByText(t.runtimeSpecVramBenchmarkSourceDelta)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramBenchmarkSourceMeasured)).not.toBeInTheDocument();
+  });
+
   it('offers nothing for a GPU the run reached no number for', async () => {
     await openSpecEdit({
       mappings: [makeMapping({ id: 'map_1' })],
