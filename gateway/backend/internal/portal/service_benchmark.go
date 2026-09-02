@@ -46,6 +46,12 @@ type BenchmarkRunDTO struct {
 	// probe — the caller distinguishes the two via Error, which is empty only on
 	// a definitive verdict). Nil for any other kind.
 	VisionCapable *bool `json:"vision_capable,omitempty"`
+	// VRAM is the decoded per-GPU VRAM result, set only for a kind=="vram" row
+	// whose payload parsed (a malformed one is tolerated as nil, exactly like
+	// Capacity above). The row is evidence an operator reads, never authority:
+	// nothing applies it to a launch spec's vram_estimate_mb or
+	// vram_measured_mb.
+	VRAM *VRAMReportDTO `json:"vram,omitempty"`
 }
 
 // CapacityLevelDTO / CapacityReportDTO are the decoded capacity curve for a
@@ -71,6 +77,42 @@ type CapacityReportDTO struct {
 	GenTokensPerSecondAtCapacity float64            `json:"gen_tokens_per_second_at_capacity"`
 	MemoryObserved               bool               `json:"memory_observed"`
 	Levels                       []CapacityLevelDTO `json:"levels,omitempty"`
+}
+
+// VRAMGPUItemDTO / VRAMReportDTO are the decoded per-GPU VRAM result for a
+// kind=="vram" benchmark-history row (decoded from BenchmarkRun.VRAMJSON).
+// They mirror the gateway's VRAMReport/VRAMGPUItem field-for-field, the way
+// CapacityReportDTO mirrors routing.CapacityReport: the store keeps the payload
+// opaque, so the two ends agree by shape, and TestVRAMReportDecodesIntoThePortalDTO
+// (internal/gateway) fails if one side gains a field the other lacks.
+//
+// Inconclusive empty = a definitive result. Isolated is the run's own
+// evidence-backed claim, auditable through IsolationEvidence (spec id -> why
+// this run believes that spec was not running); a spec missing from that map
+// was NOT confirmed. MeasuredMB and DeltaMB are different quantities -- an
+// attributed per-process measurement vs the model's marginal cost on the card
+// -- and must never be averaged; 0 means unknown for both.
+type VRAMGPUItemDTO struct {
+	Index           int    `json:"index"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+	FingerprintKind string `json:"fingerprint_kind,omitempty"`
+	UnifiedMemory   bool   `json:"unified_memory,omitempty"`
+	BaselineUsedMB  int    `json:"baseline_used_mb"`
+	DeltaMB         int    `json:"delta_mb,omitempty"`
+	MeasuredMB      int    `json:"measured_mb,omitempty"`
+	Attributable    bool   `json:"attributable"`
+}
+
+type VRAMReportDTO struct {
+	Isolated          bool              `json:"isolated"`
+	IsolationEvidence map[string]string `json:"isolation_evidence,omitempty"`
+	DrainedSpecIDs    []string          `json:"drained_spec_ids,omitempty"`
+	RestoreFailed     []string          `json:"restore_failed,omitempty"`
+	Inconclusive      string            `json:"inconclusive,omitempty"`
+	// GPUs is never nil on a decoded report (see MappingBenchmarks): a nil
+	// slice marshals as JSON null instead of [], and a client reading it with a
+	// `?? []` fallback then renders an eternally empty list with no error.
+	GPUs []VRAMGPUItemDTO `json:"gpus"`
 }
 
 // MappingBenchmarks returns the benchmark-run history for a mapping, newest-first.
@@ -112,6 +154,18 @@ func (s *Service) MappingBenchmarks(ctx context.Context, principal auth.Token, m
 		if kind == "vision" {
 			v := r.VisionCapable
 			dto.VisionCapable = &v
+		}
+		// The payload column is read for its OWN kind only, like the capacity
+		// curve above: a row of another kind carrying bytes here (a legacy row,
+		// or a future writer) must not be served as a VRAM result.
+		if kind == "vram" && strings.TrimSpace(r.VRAMJSON) != "" {
+			var report VRAMReportDTO
+			if err := json.Unmarshal([]byte(r.VRAMJSON), &report); err == nil {
+				if report.GPUs == nil {
+					report.GPUs = []VRAMGPUItemDTO{}
+				}
+				dto.VRAM = &report
+			}
 		}
 		out = append(out, dto)
 	}

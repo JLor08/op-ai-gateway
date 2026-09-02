@@ -668,6 +668,20 @@ from the trigger modes above) selects what a run does per mapping: `"speed"`
 one benchmark runs per server at a time (`BenchmarkRegistry.TryStart`); the
 server is excluded from routing (`ServerBusy`) for its duration.
 
+**A history row's `kind` is a wider set than the mode argument**, because a run
+that is not a per-target fan-out gets its own endpoint and single-target runner
+rather than a fifth `mode` value. `model_mapping_benchmarks.kind` therefore also
+holds `"vram"` — the VRAM benchmark's row, whose per-GPU result rides in its own
+opaque `vram_json` column (migration 71) and is decoded onto the history DTO's
+`vram` field for that kind only, exactly as `capacity_curve` is for
+`"capacity"`. **That row is evidence, never authority**: nothing reads it back
+into a launch spec, because `vram_measured_mb` stays agent-owned and
+`vram_estimate_mb` operator-owned (see [Agent-Managed Model
+Runtime](agent-runtime-manager.md) §5.1), so an operator reads the measurement
+and applies it to their own field themselves. The persisted shape, the wire
+shape (`BenchmarkResult.vram`) and the decode are in place ahead of the run that
+writes such a row; no metric on a mapping is touched by it, then or now.
+
 `IsMTPModelName` (`internal/routing/mtp.go`) is the **MTP heuristic**: a
 best-effort, conservative name-substring/token match (a known model family
 like `deepseek-v3`/`glm-4.5`, or a standalone `mtp` token) that seeds a new

@@ -385,6 +385,11 @@ export type BenchmarkResult = {
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
   vision_capable?: boolean;
+  // The VRAM benchmark's result. ABSENT = the run never reached the measurement
+  // phase (see `error`); PRESENT with `inconclusive` set = it ran and reached no
+  // number, and that value is what tells the operator what to do next. The two
+  // are deliberately distinguishable, unlike `vision_capable` above.
+  vram?: VRAMReportDTO;
   error?: string;
 };
 
@@ -429,6 +434,48 @@ export type CapacityReportDTO = {
   levels?: CapacityLevelDTO[];
 };
 
+// One watched GPU's VRAM result (mirrors the Go VRAMGPUItemDTO). `delta_mb` and
+// `measured_mb` are NOT the same quantity and must never be averaged: the delta
+// is the model's marginal cost on that card (a constant neighbour, driver
+// reserve or ECC overhead cancels out of it), while the measured value is that
+// process's attributed usage from the agent's own per-process measurer, which
+// only NVIDIA hosts have. 0 means unknown for both, as everywhere else.
+// `unified_memory` marks a figure read from unified SYSTEM memory (Apple
+// silicon) rather than dedicated VRAM — label it as such wherever it is shown.
+// `fingerprint_kind` says what was actually compared: "uuid" catches any
+// renumbering, "name_total" catches a swap between UNLIKE cards only (two
+// identical cards trading indices are indistinguishable, so never render a bare
+// "verified"), and "" means no identifying field was available at all.
+export type VRAMGPUItemDTO = {
+  index: number;
+  fingerprint?: string;
+  fingerprint_kind?: string;
+  unified_memory?: boolean;
+  baseline_used_mb: number;
+  delta_mb?: number;
+  measured_mb?: number;
+  // False = no launch-spec GPU row exists for this index, so there is nothing to
+  // apply the number to.
+  attributable: boolean;
+};
+
+// A decoded VRAM report, attached to a kind:"vram" benchmark run and to a live
+// BenchmarkResult (mirrors the Go VRAMReportDTO / VRAMReport — one shape, two
+// producers). `isolated` is the run's own evidence-backed claim: audit it
+// through `isolation_evidence` (spec id -> why this run believes that spec was
+// not running), where a missing entry means NOT confirmed. `drained_spec_ids` is
+// what the run force-stopped, and `restore_failed` the specs it could not put
+// back — an operator must clear those by hand. `inconclusive` empty = a
+// definitive result; any value means there is NO number to apply.
+export type VRAMReportDTO = {
+  isolated: boolean;
+  isolation_evidence?: Record<string, string>;
+  drained_spec_ids?: string[];
+  restore_failed?: string[];
+  inconclusive?: string;
+  gpus: VRAMGPUItemDTO[];
+};
+
 // One persisted benchmark run for a mapping (mirrors the Go BenchmarkRunDTO).
 // Returned newest-first from GET /api/portal/mappings/{id}/benchmarks.
 export type BenchmarkRunDTO = {
@@ -447,6 +494,11 @@ export type BenchmarkRunDTO = {
   // both a definitive "not capable" AND an inconclusive probe — check `error`,
   // non-empty only when inconclusive, to tell the two apart).
   vision_capable?: boolean;
+  // Present only for a kind==="vram" row whose payload parsed. The row is
+  // EVIDENCE an operator reads (this spec measured 22 GB three times), never
+  // authority: nothing applies it to a launch spec's vram_estimate_mb (operator-
+  // owned) or vram_measured_mb (agent-owned).
+  vram?: VRAMReportDTO;
 };
 
 // The optional `?mode=...` query suffix shared by the three benchmark-start
