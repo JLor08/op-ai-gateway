@@ -49,9 +49,15 @@ import (
 // branch: on Windows the agent now measures per-process, per-GPU VRAM through
 // PDH performance counters instead of reporting nothing (nvidia-smi cannot
 // report it under WDDM), and a measured value of 0 no longer overrides the
-// operator's estimate in the admission snapshot. Both change what an operator
-// and the gateway observe, and no agent.Features entry was added -- measurement
-// is a hardware capability, not a negotiated flag (ADR-025) -- so PATCH.
+// operator's estimate in the admission snapshot. The branch's second headline
+// is the admission precedence (ADR-032): an occupant whose own VRAM demand is
+// unknown now blocks the cards it holds, and a candidate of unknown demand no
+// longer evicts a known-demand occupant but waits, naming the spec and the card
+// it waits for in its last_error. That changes which specs start, which get
+// evicted, and what an operator reads -- observable on every platform, not only
+// Windows. No agent.Features entry was added for any of it: measurement is a
+// hardware capability and admission is local policy, neither a negotiated flag
+// (ADR-025), so the whole branch is one PATCH.
 const Version = "0.2.3"
 
 // collectTimeout bounds each individual collector invocation so a wedged
