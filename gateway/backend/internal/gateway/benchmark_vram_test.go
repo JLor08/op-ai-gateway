@@ -332,3 +332,32 @@ func TestVRAMResultVocabularyIsPinned(t *testing.T) {
 		}
 	}
 }
+
+// TestVRAMReportNormalizeGPUs pins the one wire rule a producer can silently
+// get wrong: `gpus` has no omitempty (a client must always see an array), so a
+// nil slice would serialize as JSON null.
+func TestVRAMReportNormalizeGPUs(t *testing.T) {
+	var nilReport *VRAMReport
+	nilReport.normalizeGPUs() // nil-safe: must not panic
+
+	report := &VRAMReport{Inconclusive: vramInconclusiveBaselineUnstable}
+	report.normalizeGPUs()
+	if report.GPUs == nil {
+		t.Fatal("normalizeGPUs left GPUs nil")
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"gpus":[]`) {
+		t.Fatalf("payload = %s, want gpus as an empty array", encoded)
+	}
+
+	// Idempotent, and it never disturbs a populated slice.
+	populated := &VRAMReport{GPUs: []VRAMGPUItem{{Index: 1, DeltaMB: 100}}}
+	populated.normalizeGPUs()
+	populated.normalizeGPUs()
+	if len(populated.GPUs) != 1 || populated.GPUs[0].DeltaMB != 100 {
+		t.Fatalf("populated GPUs = %#v", populated.GPUs)
+	}
+}

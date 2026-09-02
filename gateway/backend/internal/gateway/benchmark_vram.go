@@ -98,9 +98,22 @@ type VRAMReport struct {
 	// GPUs is the per-GPU result, one item per watched index. ALWAYS non-nil:
 	// there is no omitempty here, so a nil slice would reach a client as JSON
 	// null instead of [], and a portal reading it with a `?? []` fallback would
-	// render an eternally empty list with no error and no crash. Producers set
-	// an empty slice; vramHistoryRow normalizes what it persists.
+	// render an eternally empty list with no error and no crash. Call
+	// normalizeGPUs before attaching a report to a BenchmarkResult;
+	// vramHistoryRow normalizes what it persists on its own.
 	GPUs []VRAMGPUItem `json:"gpus"`
+}
+
+// normalizeGPUs replaces a nil GPUs slice with an empty one, so the report
+// serializes `"gpus":[]` and never `"gpus":null` -- see that field. Nil-safe,
+// and idempotent. Call it BEFORE the report is attached to a result: once
+// attached it is shared with every already-published SSE frame and must not be
+// mutated (see BenchmarkResult.VRAM).
+func (r *VRAMReport) normalizeGPUs() {
+	if r == nil || r.GPUs != nil {
+		return
+	}
+	r.GPUs = []VRAMGPUItem{}
 }
 
 // VRAMGPUItem is one watched GPU's VRAM result. The two numbers are NOT the
@@ -176,11 +189,10 @@ func vramHistoryRow(mappingID, serverID string, at time.Time, report *VRAMReport
 	if report == nil {
 		return row
 	}
+	// Copy before normalizing: a report already attached to a result is shared
+	// with every published SSE frame and must not be mutated here.
 	payload := *report
-	if payload.GPUs == nil {
-		// Never persist `"gpus":null` -- see VRAMReport.GPUs.
-		payload.GPUs = []VRAMGPUItem{}
-	}
+	payload.normalizeGPUs()
 	if encoded, err := json.Marshal(payload); err == nil {
 		row.VRAMJSON = string(encoded)
 	}
