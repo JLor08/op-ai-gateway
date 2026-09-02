@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -2834,5 +2835,258 @@ func TestManagerVisibleDevicesRefusalIsNotPermitted(t *testing.T) {
 				t.Errorf("LastError = %+v, want a message containing %q -- this text is the operator's only explanation", st.LastError, tc.wantText)
 			}
 		})
+	}
+}
+
+// newSnapshotOwner assembles an owner just far enough to call buildSnapshot:
+// one spec, one live generation, no goroutine and no child process.
+// buildSnapshot reads only owner state (o.specs, o.cfg, o.allowedPairs) plus
+// the installed measurer, so an owner built here decides exactly as the real
+// one does on its own goroutine -- and going through it directly is the only
+// way to READ the charged number at all: it is consumed by Admit inside
+// admitAndStart and never reported anywhere.
+func newSnapshotOwner(spec Spec, pid int, measurer func(pids []int) map[int]map[int]int) (*owner, *specState) {
+	m := &Manager{}
+	m.SetMeasurer(measurer)
+	st := &specState{
+		spec:  spec,
+		state: StateRunning,
+		proc:  &runningProc{specID: spec.ID, pid: pid},
+	}
+	return &owner{
+		m:     m,
+		cfg:   Config{Specs: []Spec{spec}},
+		specs: map[string]*specState{spec.ID: st},
+	}, st
+}
+
+// gpusChargedFor returns the effective per-GPU VRAM a snapshot charges to
+// specID -- the number Admit sums against each GPU budget (policy.go rule 3).
+func gpusChargedFor(t *testing.T, snap PolicySnapshot, specID string) map[int]int {
+	t.Helper()
+	for _, r := range snap.Running {
+		if r.SpecID == specID {
+			return r.GPUs
+		}
+	}
+	t.Fatalf("PolicySnapshot.Running has no row for %q -- the test's own premise (a live generation) does not hold", specID)
+	return nil
+}
+
+// TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate is the
+// zero-guard. The defect is the absence of one rule that the OTHER end of
+// this very loop already has: the gateway's telemetry ingest skips any
+// measured value <= 0 (`if g.VRAMMeasuredMB <= 0 { continue }` in
+// gateway/backend/internal/gateway/agent_ingest.go, documented in
+// agent-runtime-manager.md section 5), while buildSnapshot took whatever the
+// measurer said and fell back to the operator's estimate only when the GPU
+// index was ABSENT from the map.
+//
+// A measured 0 does not mean "this process needs no VRAM", it means
+// "unknown" -- the same meaning SpecGPU.VRAMMB attaches to its own 0 ("0 =
+// unknown demand, never a real zero-cost claim"). Charging it as 0 is what
+// turns an unknown into a free lunch: the running process contributes nothing
+// to rule 3's `sum += v`, the GPU looks entirely free however much is
+// actually resident on it, and co-residency admission admits without limit --
+// losing exactly the OOM protection the VRAM budget exists for.
+//
+// Not hypothetical. On Windows the WDDM driver model reports `used_memory` as
+// `[N/A]` for every compute app, collector.naInt("[N/A]") is 0, and the
+// shipped compute-apps measurer therefore hands back a NON-NIL map of zeros
+// for every managed pid -- so every managed model process on every Windows
+// host was charged 0 MB for admission, silently.
+//
+// The rule is applied PER GPU INDEX, not per pid, for the same reason the
+// gateway's is: a multi-GPU spec can have one index answered and another not,
+// and throwing away a real 8 GB number because a sibling index came back
+// unknown would be its own bug.
+func TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate(t *testing.T) {
+	const (
+		estimate0 = 6000
+		estimate1 = 7000
+		pid       = 4242
+	)
+	cases := []struct {
+		name string
+		// measured is what the installed measurer answers for this pid.
+		measured map[int]int
+		// wantCharged is what admission must be charged per GPU index.
+		wantCharged map[int]int
+		// wantReported is what st.measuredVRAM must hold afterwards -- the
+		// telemetry/portal side of the same value. nil = nothing stored.
+		wantReported map[int]int
+	}{
+		{
+			name:         "a zero is unknown, not free",
+			measured:     map[int]int{0: 0, 1: 0},
+			wantCharged:  map[int]int{0: estimate0, 1: estimate1},
+			wantReported: nil,
+		},
+		{
+			name:         "a real measurement still wins over the estimate",
+			measured:     map[int]int{0: 8000, 1: 9000},
+			wantCharged:  map[int]int{0: 8000, 1: 9000},
+			wantReported: map[int]int{0: 8000, 1: 9000},
+		},
+		{
+			name:         "per GPU index, not per pid",
+			measured:     map[int]int{0: 8000, 1: 0},
+			wantCharged:  map[int]int{0: 8000, 1: estimate1},
+			wantReported: map[int]int{0: 8000},
+		},
+		{
+			// A measurer converting an unsigned byte counter to MB is
+			// exactly where a negative can appear, and the house rule the
+			// gateway applies is <= 0, not == 0.
+			name:         "a negative measurement is not a credit either",
+			measured:     map[int]int{0: -1, 1: -4096},
+			wantCharged:  map[int]int{0: estimate0, 1: estimate1},
+			wantReported: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: estimate0}, {Index: 1, VRAMMB: estimate1}}
+			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+				return map[int]map[int]int{pid: tc.measured}
+			})
+
+			snap := o.buildSnapshot()
+
+			if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, tc.wantCharged) {
+				t.Errorf("admission is charged %v for the measurement %v, want %v (estimates: gpu 0 = %d MB, gpu 1 = %d MB) -- a measured value <= 0 is UNKNOWN and must fall through to the operator's estimate, exactly as the gateway's write-back already skips it; charging it as 0 makes the GPU look free and lets co-residency admission admit without limit", got, tc.measured, tc.wantCharged, estimate0, estimate1)
+			}
+			if !reflect.DeepEqual(st.measuredVRAM, tc.wantReported) {
+				t.Errorf("st.measuredVRAM = %v for the measurement %v, want %v -- measuredVRAM is documented as the last REAL measurement and is what Status() reports and the agent attaches to every telemetry sample, so storing zeros means the agent ships an all-zero `gpus` array once per second for the gateway to discard", st.measuredVRAM, tc.measured, tc.wantReported)
+			}
+		})
+	}
+}
+
+// TestApplyMeasurementNeverStoresANonPositiveMeasurement closes the second
+// door onto st.measuredVRAM. buildSnapshot is the admission path; this is the
+// recurring off-owner one (dispatchMeasurement -> cmdMeasured), and it is the
+// path that runs once per housekeeping beat on every server, so it is where
+// zeros would accumulate into the telemetry sample.
+//
+// The field's own contract is the reason: measuredVRAM is "the last real
+// per-GPU measurement", nil when nothing has been measured, and F2 already
+// established what a value that is not a live truth costs -- the agent
+// attaches `gpus` to every sample and the gateway rewrites it once per second
+// forever. A zero is not a measurement, so it must leave the field alone,
+// which also keeps a previous real number from being erased by one unknown
+// cycle (applyMeasurement's own rule: only an exit clears it).
+func TestApplyMeasurementNeverStoresANonPositiveMeasurement(t *testing.T) {
+	const pid = 4242
+	cases := []struct {
+		name     string
+		previous map[int]int
+		measured map[int]int
+		want     map[int]int
+	}{
+		{
+			name:     "zeros do not become a measurement",
+			previous: nil,
+			measured: map[int]int{0: 0},
+			want:     nil,
+		},
+		{
+			name:     "zeros do not erase a previous real measurement",
+			previous: map[int]int{0: 8000},
+			measured: map[int]int{0: 0},
+			want:     map[int]int{0: 8000},
+		},
+		{
+			name:     "a real measurement is still stored",
+			previous: nil,
+			measured: map[int]int{0: 8000},
+			want:     map[int]int{0: 8000},
+		},
+		{
+			name:     "only the answered index is stored",
+			previous: nil,
+			measured: map[int]int{0: 8000, 1: 0},
+			want:     map[int]int{0: 8000},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}, {Index: 1, VRAMMB: 7000}}
+			o, st := newSnapshotOwner(spec, pid, nil)
+			st.measuredVRAM = tc.previous
+
+			o.applyMeasurement(cmdMeasured{
+				targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+				byPID:   map[int]map[int]int{pid: tc.measured},
+			})
+
+			if !reflect.DeepEqual(st.measuredVRAM, tc.want) {
+				t.Errorf("st.measuredVRAM = %v after measuring %v (previously %v), want %v -- a value <= 0 is not a measurement: storing it makes Status() report a zero the portal cannot tell apart from `never measured`, and makes the agent attach an all-zero `gpus` array to every telemetry sample for the gateway's write-back to throw away", st.measuredVRAM, tc.measured, tc.previous, tc.want)
+			}
+		})
+	}
+}
+
+// TestManagerZeroMeasurementDoesNotDefeatTheGPUBudget is the whole-path
+// counterpart to TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate,
+// in the shape TestManagerZeroGPUBudgetIsUnconstrained established: it drives
+// a real Config through Apply -> buildSnapshot -> Admit rather than reading a
+// snapshot, so what is asserted is the operator-visible consequence -- the
+// budget still refuses a second, co-resident process.
+//
+// spec-a is pinned (so Apply alone starts it, and it can never be evicted to
+// make room), the measurer answers 0 MB for every pid exactly as the Windows
+// compute-apps measurer does, and the pair is explicitly co-resident so the
+// matrix rule cannot be what blocks spec-b. The two estimates (6000 + 6000)
+// exceed the 8000 MB budget, so the only admission answer consistent with
+// them is "wait", which spec-b's 1 s admission-wait timeout turns into
+// ErrAdmissionBlocked.
+//
+// Against the unfixed tree spec-a is charged 0, the sum is 6000, and spec-b
+// STARTS -- two models on a GPU whose budget fits one.
+func TestManagerZeroMeasurementDoesNotDefeatTheGPUBudget(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	// Exactly what naInt("[N/A]") produces for every managed pid on Windows.
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[int]int{0: 0}
+		}
+		return out
+	})
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.Pinned = true
+	specA.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}}
+	specB := baseSpec("spec-b", "model-b")
+	specB.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}}
+	specB.AdmissionWaitTimeoutSeconds = 1
+	m.Apply(Config{
+		GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 8000}},
+		Specs:      []Spec{specA, specB},
+		Coresident: [][2]string{{"spec-a", "spec-b"}},
+	})
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-b")
+	if release != nil {
+		release()
+	}
+	if !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("EnsureRunning(model-b) = %v, want ErrAdmissionBlocked: spec-a's measurement came back 0 MB, so admission must charge its 6000 MB estimate, and 6000+6000 does not fit an 8000 MB budget -- a measured 0 accepted as the truth makes the GPU look free and admits a second model onto a budget that fits one", err)
+	}
+	if st := statusFor(m, "spec-b"); st != nil && st.PID != 0 {
+		t.Fatalf("Status()[spec-b] = state %v, pid %d -- spec-b was actually started on a GPU whose budget only fits spec-a", st.State, st.PID)
 	}
 }

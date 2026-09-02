@@ -1354,6 +1354,52 @@ func (o *owner) measurementTargets() []measureTarget {
 	return targets
 }
 
+// realMeasurement keeps only the entries of byGPU that are an actual
+// measurement -- strictly positive MB -- and returns nil when none are. The
+// result is always freshly allocated, so nothing downstream aliases the map
+// the measurer handed back and may reuse.
+//
+// A measured value of 0 means "unknown", never "this process needs no VRAM" --
+// the same meaning SpecGPU.VRAMMB carries for its own 0, and on Windows the
+// only meaning available at all: the WDDM driver model puts the OS rather
+// than the NVIDIA driver in charge of GPU memory, so
+// `nvidia-smi --query-compute-apps=used_memory` answers `[N/A]` for every
+// compute app and collector.naInt turns that into a 0. Taken literally, that
+// 0 breaks BOTH consumers of a measurement:
+//
+//   - ADMISSION (buildSnapshot) charges the process 0 MB instead of the
+//     operator's estimate, so it contributes nothing to Admit's per-GPU sum
+//     (policy.go rule 3): the GPU looks entirely free however much is
+//     actually resident on it, and co-residency admission admits without
+//     limit -- which is exactly the OOM protection the VRAM budget exists
+//     for, gone, on every managed process on every Windows host.
+//   - REPORTING (st.measuredVRAM) carries the 0 into every Status(), hence
+//     an all-zero `gpus` array on every telemetry sample, once per second
+//     per spec, for a value the gateway's ingest discards on arrival
+//     (`if g.VRAMMeasuredMB <= 0 { continue }` in agent_ingest.go). That is
+//     the F2 cost paid for a number that cannot even reach the portal, where
+//     a stored 0 is anyway indistinguishable from "never measured".
+//
+// That ingest check is where this `<= 0` rule already lives (and what
+// agent-runtime-manager.md section 5 documents); this is the same rule at the
+// near end of the same loop. It is applied PER GPU INDEX for the same reason
+// the gateway's is: a multi-GPU spec can have one index answered and another
+// not, and throwing away a real number because a sibling index came back
+// unknown would be its own bug.
+func realMeasurement(byGPU map[int]int) map[int]int {
+	var out map[int]int
+	for idx, mb := range byGPU {
+		if mb <= 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[int]int, len(byGPU))
+		}
+		out[idx] = mb
+	}
+	return out
+}
+
 // applyMeasurement records a completed measurement against the generations it
 // was actually taken for, and re-arms the next dispatch.
 //
@@ -1368,7 +1414,10 @@ func (o *owner) measurementTargets() []measureTarget {
 // than being cleared: nvidia-smi not listing a pid this cycle is a transient
 // (a hiccup, a CPU-only child, a race with the process appearing), not
 // evidence that the process stopped using VRAM. Only an actual exit clears
-// the value, in onProcExited.
+// the value, in onProcExited. A value that is not a real measurement counts
+// as saying nothing -- see realMeasurement, which is what makes a cycle of
+// zeros leave a previous real number in place instead of overwriting it with
+// an "unknown" the portal cannot tell apart from a measured zero.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	for _, t := range c.targets {
@@ -1376,7 +1425,7 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		if st == nil || st.proc != t.proc {
 			continue // superseded generation -- see measureTarget
 		}
-		if byGPU := c.byPID[t.pid]; byGPU != nil {
+		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
 			st.measuredVRAM = byGPU
 		}
 	}
@@ -1413,7 +1462,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		if st.proc == nil {
 			continue
 		}
-		byGPU := measured[st.proc.pid]
+		// realMeasurement is the zero-guard: only a strictly positive value
+		// is a measurement, so an index the measurer answered with 0 (or
+		// less) is absent here and falls through to the operator's estimate
+		// below, exactly like an index it never mentioned. Without it a
+		// measured 0 WON, and "unknown" became "this model needs no VRAM" --
+		// see realMeasurement for what that costs admission.
+		byGPU := realMeasurement(measured[st.proc.pid])
 		gpus := make(map[int]int, len(st.spec.GPUs))
 		for _, g := range st.spec.GPUs {
 			if byGPU != nil {
