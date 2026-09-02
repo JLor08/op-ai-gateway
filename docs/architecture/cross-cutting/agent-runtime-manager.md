@@ -1180,26 +1180,51 @@ Steps 2 and 3 describe the host's fixed topology, so the LUID → index bridge i
 cached across measurement cycles, both halves of it. In the steady state a
 measurement is therefore **one PDH read and no subprocess at all**. The rules
 for the **negative** half are the load-bearing part, because a LUID written off
-there can no longer trigger the re-fetch that is its only escape: only two
-findings may enter it — D3DKMT *refusing* the adapter (a property of the
-adapter), and a **fresh and complete** `nvidia-smi` reading that has no GPU at
-the adapter's PCI address (a property of the host's topology). Everything else —
-`nvidia-smi` failing, timing out, or answering with rows missing — is the
-*absence* of an answer and is retried next cycle. An earlier revision asked only
-whether `nvidia-smi` had ever answered, so on a warm cache a single 2 s timeout
-wrote a perfectly good GPU off for the life of the process. One further refusal
-belongs to the same discipline: `D3DKMT_ADAPTERADDRESS` reports no PCI
-**domain**, so two cards in different PCI segments collapse onto one join key —
-an address claimed twice is *removed* rather than resolved to whichever row came
-last, and both adapters fall back to the operator's estimate.
+there can no longer trigger the re-fetch that is its only escape: only a
+**durable verdict** may enter it, and three findings qualify — D3DKMT
+*refusing* to open the adapter (`STATUS_INVALID_PARAMETER` from
+`D3DKMTOpenAdapterFromLuid`, a property of the adapter), an address the adapter
+*did* report that no PCI bus could hold (a completed, repeatable reading — see
+the plausibility gate below), and a **fresh and complete** `nvidia-smi` reading
+that has no GPU at the adapter's PCI address (a property of the host's
+topology). Everything else is the *absence* of an answer and is retried next
+cycle, on **both** sides of the bridge:
 
-Failure is always fail-soft and never a wrong number: any PDH or D3DKMT error
-yields `nil` for that cycle (logged at debug, like the other optional
-collectors), which the manager already reads as "nothing measured", and an
-unresolvable adapter is skipped rather than charged to a guessed index 0. The
-one subprocess the chain can spawn is bounded by the same 2 s deadline the
-compute-apps measurer uses, for the same reason: the admission-time measurement
-runs on the serialized owner goroutine (§5.5).
+- `nvidia-smi` failing, timing out, or answering with rows missing. An earlier
+  revision asked only whether `nvidia-smi` had ever answered, so on a warm
+  cache a single 2 s timeout wrote a perfectly good GPU off for the life of the
+  process.
+- A **transient** D3DKMT failure: `STATUS_DEVICE_REMOVED` from a TDR or driver
+  reset, `STATUS_NO_MEMORY` under momentary pressure, or *any* failure of the
+  address query — that query runs on a handle the open call has already
+  produced, so the adapter has answered for its identity and what a failure
+  there can mean instead is a wrong `KMTQUERYADAPTERINFOTYPE` literal or mirror
+  struct, a defect in every adapter's probe alike (the compile-time layout
+  assertions are what guard that, and a negative-cache entry would hide it).
+  The rule is therefore an **allowlist**: a status nobody has classified is
+  retried, not written off. `STATUS_NOT_SUPPORTED` is deliberately outside it
+  even though "this adapter has no address to report" is a plausible reading —
+  the two mistakes cost different amounts, three syscalls a cycle against a
+  real GPU losing its measurement until the agent restarts.
+
+One further refusal belongs to the same discipline:
+`D3DKMT_ADAPTERADDRESS` reports no PCI **domain**, so two cards in different
+PCI segments collapse onto one join key — an address claimed twice is *removed*
+rather than resolved to whichever row came last, and both adapters fall back to
+the operator's estimate.
+
+Failure is always fail-soft and never a wrong number, and the blast radius
+differs by which half failed. A **PDH** error — the query, the counter add, the
+sizing call — yields `nil` for the whole cycle (logged at debug, like the other
+optional collectors), which the manager already reads as "nothing measured". A
+**D3DKMT** error costs only its own adapter: that LUID is skipped and the
+remaining ones are still measured, and the cycle yields `nil` only when *no*
+adapter resolved at all. An unresolvable adapter is skipped rather than charged
+to a guessed index 0, and — per the allowlist above — a transient failure is
+asked again on the next cycle rather than remembered. The one subprocess the
+chain can spawn is bounded by the same 2 s deadline the compute-apps measurer
+uses, for the same reason: the admission-time measurement runs on the serialized
+owner goroutine (§5.5).
 
 **Where the numbers in the paragraphs above come from.** The chain was proven
 end to end on the operator's 3-GPU Windows host (driver 610.62) with a

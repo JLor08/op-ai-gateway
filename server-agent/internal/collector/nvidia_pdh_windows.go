@@ -536,15 +536,26 @@ func readPDHDedicatedUsage() ([]pdhProcessMemory, error) {
 }
 
 // luidPCIAddress resolves one adapter LUID to its PCI address via the gdi32
-// D3DKMT entry points. An error means "no usable address for this adapter" and
-// is the caller's cue to cache the LUID as unresolvable; it is not a fault.
+// D3DKMT entry points. An error means "no usable address for this adapter",
+// not a fault.
+//
+// EVERY ERROR IT RETURNS IS TYPED, and that is load-bearing rather than
+// tidiness: resolvePDHLUIDs decides from the error alone whether the adapter
+// may be written off for the life of the process, and it decides by inspecting
+// these types (mayCacheUnresolvable, in the build-tag-free half CI actually
+// tests). A bare fmt.Errorf here would arrive there as an unclassifiable
+// shape -- retried forever at three syscalls a cycle in the one case that
+// genuinely cannot change.
 func luidPCIAddress(l pdhLUID) (pciAddress, error) {
 	open := d3dkmtOpenAdapterFromLuid{LowPart: l.LowPart, HighPart: l.HighPart}
 	if st, _, _ := procD3DKMTOpenAdapterFromLuid.Call(uintptr(unsafe.Pointer(&open))); st != 0 {
 		// STATUS_INVALID_PARAMETER (0xC000000D) here is the normal answer for
 		// an adapter that is not a real GPU; it was seen once on the probe
-		// host, which is why the caller caches the refusal.
-		return pciAddress{}, fmt.Errorf("D3DKMTOpenAdapterFromLuid: NTSTATUS 0x%08x", uint32(st))
+		// host, and it is the ONE status the caller caches. Anything else from
+		// this call -- STATUS_DEVICE_REMOVED after a TDR, STATUS_NO_MEMORY
+		// under pressure -- is this moment rather than this adapter, and the
+		// entry point is recorded so mayCacheUnresolvable can tell them apart.
+		return pciAddress{}, &d3dkmtStatusError{Entry: entryOpenAdapter, Status: uint32(st)}
 	}
 	defer func() {
 		// D3DKMT_CLOSEADAPTER is a bare D3DKMT_HANDLE. Every adapter opened
@@ -563,7 +574,12 @@ func luidPCIAddress(l pdhLUID) (pciAddress, error) {
 		PrivateDataSize: uint32(unsafe.Sizeof(addr)),
 	}
 	if st, _, _ := procD3DKMTQueryAdapterInfo.Call(uintptr(unsafe.Pointer(&q))); st != 0 {
-		return pciAddress{}, fmt.Errorf("D3DKMTQueryAdapterInfo(ADAPTERADDRESS): NTSTATUS 0x%08x", uint32(st))
+		// NOT cached by the caller, whatever the status. The handle above
+		// opened, so the adapter has already answered for its own identity;
+		// what a failure here can mean instead is that kmtqaiTypeAdapterAddress
+		// or the mirror struct is wrong, which is a defect in every adapter's
+		// probe alike -- see mayCacheUnresolvable.
+		return pciAddress{}, &d3dkmtStatusError{Entry: entryQueryAdapterAddress, Status: uint32(st)}
 	}
 
 	// Field by field, not `pciAddress(addr)`. The two structs happen to be
@@ -580,7 +596,7 @@ func luidPCIAddress(l pdhLUID) (pciAddress, error) {
 	// charge a model's VRAM to the wrong GPU. The compile-time assertions
 	// above are the first line of defence; this is the second, at runtime.
 	if p.Bus > 255 || p.Device > 31 || p.Function > 7 {
-		return pciAddress{}, fmt.Errorf("implausible PCI address %d:%d.%d from D3DKMT", p.Bus, p.Device, p.Function)
+		return pciAddress{}, &implausiblePCIAddressError{Addr: p}
 	}
 	return p, nil
 }

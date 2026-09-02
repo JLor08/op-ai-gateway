@@ -371,13 +371,21 @@ own PID→GPU mapping for 15 of 15 PIDs on a 3-GPU host — but the syscall half
 verified by review, the compile-time assertions and out-of-band Windows runs
 only, because CI builds nothing for Windows
 ([§11.3](11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
-Two rules follow and must not be relaxed: the **negative** LUID cache may record
-only durable findings (a D3DKMT refusal, or a *fresh and complete* `nvidia-smi`
-reading with no GPU at that address), since a wrongly cached adapter loses its
-measurement silently for the life of the process; and a PCI address claimed by
-two cards is refused rather than resolved to the last row, because
-`D3DKMT_ADAPTERADDRESS` reports no PCI domain and a confident wrong GPU index is
-worse than none.
+Two rules follow and must not be relaxed. First, the **negative** LUID cache may
+record only durable findings, since a wrongly cached adapter loses its
+measurement silently for the life of the process: D3DKMT *refusing to open* the
+adapter (`STATUS_INVALID_PARAMETER`), an implausible address it *did* report, or
+a *fresh and complete* `nvidia-smi` reading with no GPU at that address —
+everything else, a `STATUS_DEVICE_REMOVED` from a TDR and any failure of the
+address query included, is the absence of an answer and is retried. The rule is
+an **allowlist** precisely because the two mistakes are not symmetric (three
+wasted syscalls a cycle against a working GPU going unmeasured until the process
+restarts), and it must stay one function in the build-tag-free half where CI can
+test it — it was stated in this ADR and in the design doc while the code cached
+*every* probe error alike, which is the kind of divergence `//go:build windows`
+makes invisible. Second, a PCI address claimed by two cards is refused rather
+than resolved to the last row, because `D3DKMT_ADAPTERADDRESS` reports no PCI
+domain and a confident wrong GPU index is worse than none.
 → [Agent-Managed Model Runtime §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
 
 ## ADR-032 — Known VRAM demand outranks unknown: the unknown side blocks, never evicts

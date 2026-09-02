@@ -5,6 +5,7 @@ package collector
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -20,8 +21,12 @@ import (
 // comment, and so a fix for the poisoning cannot quietly pay for itself with a
 // subprocess spawn on every cycle.
 type pdhResolveStub struct {
-	addrs     map[pdhLUID]pciAddress
-	mapping   map[pciAddress]int
+	addrs   map[pdhLUID]pciAddress
+	mapping map[pciAddress]int
+	// errs overrides addrs for one LUID with a specific probe failure, so a
+	// test can say WHICH failure it is about. A LUID in neither map gets the
+	// refusal the probe host actually produced.
+	errs      map[pdhLUID]error
 	complete  bool
 	fetchFail bool
 
@@ -31,9 +36,15 @@ type pdhResolveStub struct {
 
 func (s *pdhResolveStub) adapterAddress(l pdhLUID) (pciAddress, error) {
 	s.d3dkmtCalls++
+	if err, ok := s.errs[l]; ok {
+		return pciAddress{}, err
+	}
 	addr, ok := s.addrs[l]
 	if !ok {
-		return pciAddress{}, errors.New("D3DKMTOpenAdapterFromLuid: NTSTATUS 0xc000000d")
+		// The typed error luidPCIAddress returns for the measured case:
+		// D3DKMT REFUSING the adapter, the one NTSTATUS verdict that licenses
+		// a permanent negative conclusion.
+		return pciAddress{}, &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusInvalidParameter}
 	}
 	return addr, nil
 }
@@ -135,6 +146,169 @@ func TestResolvePDHLUIDsCachesAnAddressACompleteMappingDoesNotKnow(t *testing.T)
 	if _, _ = resolvePDHLUIDs(need, caches, s.adapterAddress, s.fetchPCIIndex); s.d3dkmtCalls != calls || s.fetchCalls != fetches {
 		t.Errorf("a settled negative conclusion was re-paid for: d3dkmt %d->%d, fetch %d->%d",
 			calls, s.d3dkmtCalls, fetches, s.fetchCalls)
+	}
+}
+
+// TestMayCacheUnresolvableClassifiesEachProbeFailure is the classification the
+// negative cache's whole discipline rests on: which failed adapter probes are
+// verdicts about the ADAPTER (durable, cacheable) and which are the absence of
+// an answer (retried next cycle).
+//
+// It is a table over the shapes luidPCIAddress can return, because the rule is
+// an ALLOWLIST and the interesting half of an allowlist is what it excludes.
+// Both docs and ADR-031 state this rule as something that must not be relaxed,
+// while the code wrote EVERY probe error into the negative half -- so a TDR
+// returning STATUS_DEVICE_REMOVED, or a momentary STATUS_NO_MEMORY, removed a
+// perfectly good GPU from measurement for the life of the agent process.
+func TestMayCacheUnresolvableClassifiesEachProbeFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			// The measured verdict: LUID 0x0_0x16026 on the probe host. A
+			// property of the adapter, and the reason this cache exists.
+			name: "the open call refuses the adapter",
+			err:  &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusInvalidParameter},
+			want: true,
+		},
+		{
+			// The query succeeded and the reading is unusable. Deterministic,
+			// so retrying it cannot produce a different answer.
+			name: "the adapter reports an implausible PCI address",
+			err:  &implausiblePCIAddressError{Addr: pciAddress{Bus: 4096}},
+			want: true,
+		},
+		{
+			// A TDR or driver reset: the adapter is gone FOR NOW, and this is
+			// exactly the moment a topology change is renumbering cards.
+			name: "the device was removed",
+			err:  &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusDeviceRemoved},
+			want: false,
+		},
+		{
+			name: "the kernel was out of memory",
+			err:  &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusNoMemory},
+			want: false,
+		},
+		{
+			// The SAME status as the first case, from the other call, and it
+			// must not be read the same way: the handle was opened fine, so
+			// the adapter has already answered for its identity and what is
+			// more likely wrong is this module's enum literal or mirror
+			// struct -- a defect affecting every adapter equally, which the
+			// compile-time layout assertions exist to catch and a negative
+			// cache entry would hide.
+			name: "the address query returns the refusal status",
+			err:  &d3dkmtStatusError{Entry: entryQueryAdapterAddress, Status: statusInvalidParameter},
+			want: false,
+		},
+		{
+			name: "the address query fails for any other reason",
+			err:  &d3dkmtStatusError{Entry: entryQueryAdapterAddress, Status: statusDeviceRemoved},
+			want: false,
+		},
+		{
+			// No error this module produces means "not this adapter" without
+			// saying so in one of the two types above.
+			name: "an error of an unclassified shape",
+			err:  errors.New("something else went wrong"),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mayCacheUnresolvable(tc.err); got != tc.want {
+				t.Errorf("mayCacheUnresolvable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestD3DKMTStatusErrorNamesTheCallAndTheStatus keeps the debug line worth
+// reading. On Windows this text is the ONLY diagnostic for an adapter that
+// never resolves, and which of the two calls failed is what tells "not a GPU"
+// apart from "this module's struct layout is wrong".
+func TestD3DKMTStatusErrorNamesTheCallAndTheStatus(t *testing.T) {
+	got := (&d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusInvalidParameter}).Error()
+	if !strings.Contains(got, "D3DKMTOpenAdapterFromLuid") || !strings.Contains(got, "0xc000000d") {
+		t.Errorf("Error() = %q, want it to name D3DKMTOpenAdapterFromLuid and 0xc000000d", got)
+	}
+	got = (&d3dkmtStatusError{Entry: entryQueryAdapterAddress, Status: statusDeviceRemoved}).Error()
+	if !strings.Contains(got, "KMTQAITYPE_ADAPTERADDRESS") || !strings.Contains(got, "0xc00002b6") {
+		t.Errorf("Error() = %q, want it to name the ADAPTERADDRESS query and 0xc00002b6", got)
+	}
+}
+
+// TestResolvePDHLUIDsRetriesATransientD3DKMTFailure is the finding itself, at
+// the level the poisoning actually happens: resolvePDHLUIDs wrote EVERY error
+// from the adapter probe into the negative half, which is consulted before the
+// unknown set is built -- so one transient failure removed that GPU from
+// measurement until the agent process restarted, silently charging the
+// operator's estimate instead.
+//
+// The three failures below are all recoverable within one measurement cycle,
+// and each is retried and resolved on the next one.
+func TestResolvePDHLUIDsRetriesATransientD3DKMTFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"a TDR or driver reset removed the device", &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusDeviceRemoved}},
+		{"the kernel was momentarily out of memory", &d3dkmtStatusError{Entry: entryOpenAdapter, Status: statusNoMemory}},
+		{"the address query itself failed", &d3dkmtStatusError{Entry: entryQueryAdapterAddress, Status: statusInvalidParameter}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &pdhResolveStub{
+				addrs:    map[pdhLUID]pciAddress{luidGPU0: pdhAddrGPU0, luidGPU2: pdhAddrGPU2},
+				mapping:  map[pciAddress]int{pdhAddrGPU0: 0, pdhAddrGPU2: 2},
+				complete: true,
+				errs:     map[pdhLUID]error{luidGPU2: tc.err},
+			}
+			need := []pdhLUID{luidGPU0, luidGPU2}
+
+			_, caches := resolvePDHLUIDs(need, pdhLUIDCaches{}, s.adapterAddress, s.fetchPCIIndex)
+			if _, poisoned := caches.Unresolvable[luidGPU2]; poisoned {
+				t.Fatalf("a transient D3DKMT failure (%v) negative-cached a good adapter: Unresolvable = %v",
+					tc.err, caches.Unresolvable)
+			}
+
+			// The driver answers again on the next cycle, which the negative
+			// half would have made unreachable.
+			s.errs = nil
+			out, _ := resolvePDHLUIDs(need, caches, s.adapterAddress, s.fetchPCIIndex)
+			if out[luidGPU2] != 2 {
+				t.Fatalf("out = %v, want GPU 2 resolved once D3DKMT answered again", out)
+			}
+		})
+	}
+}
+
+// TestResolvePDHLUIDsCachesAnImplausibleAddress is the second durable verdict.
+// The query SUCCEEDED here -- there is a reading, it is simply outside the PCI
+// ranges -- so re-reading the same struct from the same adapter cannot answer
+// differently, and paying three syscalls a cycle for it forever is waste.
+func TestResolvePDHLUIDsCachesAnImplausibleAddress(t *testing.T) {
+	s := &pdhResolveStub{
+		addrs:    map[pdhLUID]pciAddress{luidGPU0: pdhAddrGPU0},
+		mapping:  map[pciAddress]int{pdhAddrGPU0: 0},
+		complete: true,
+		errs:     map[pdhLUID]error{luidGPU2: &implausiblePCIAddressError{Addr: pciAddress{Bus: 4096}}},
+	}
+	need := []pdhLUID{luidGPU0, luidGPU2}
+
+	out, caches := resolvePDHLUIDs(need, pdhLUIDCaches{}, s.adapterAddress, s.fetchPCIIndex)
+	if _, ok := out[luidGPU2]; ok {
+		t.Fatalf("out = %v, want no entry for an adapter with no usable address", out)
+	}
+	if _, ok := caches.Unresolvable[luidGPU2]; !ok {
+		t.Fatalf("Unresolvable = %v, want the implausible address cached", caches.Unresolvable)
+	}
+	calls := s.d3dkmtCalls
+	if _, _ = resolvePDHLUIDs(need, caches, s.adapterAddress, s.fetchPCIIndex); s.d3dkmtCalls != calls {
+		t.Errorf("d3dkmt calls %d -> %d: a cached implausible address was re-probed", calls, s.d3dkmtCalls)
 	}
 }
 

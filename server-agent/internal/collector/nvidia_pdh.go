@@ -4,6 +4,8 @@
 package collector
 
 import (
+	"errors"
+	"fmt"
 	"maps"
 	"regexp"
 	"strconv"
@@ -239,6 +241,138 @@ func parseNvidiaPCIIndexCSV(data []byte) (map[pciAddress]int, bool) {
 	return out, complete
 }
 
+// --- What a failed adapter probe means -----------------------------------
+//
+// luidPCIAddress (nvidia_pdh_windows.go) fails in three distinguishable ways,
+// and the negative cache must treat them differently: one is a verdict about
+// the ADAPTER and may be remembered for the life of the process, the others
+// are the ABSENCE of an answer and may not. So the probe's errors are TYPED
+// rather than fmt.Errorf strings: the classification is then a switch on a
+// value, in the file CI compiles and tests, instead of a guess about a
+// message written on the side CI never sees.
+
+// d3dkmtEntry names which of the two D3DKMT calls the probe makes produced an
+// NTSTATUS. The classification turns on it, because the same status means
+// different things from the two calls -- see mayCacheUnresolvable.
+type d3dkmtEntry uint8
+
+const (
+	// entryOpenAdapter is D3DKMTOpenAdapterFromLuid: "give me a handle for
+	// this LUID". Its verdict is about the adapter's IDENTITY.
+	entryOpenAdapter d3dkmtEntry = iota
+	// entryQueryAdapterAddress is
+	// D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS), made on a handle the
+	// open call has already produced. Its verdict is about the QUERY, and this
+	// module's own enum literal and mirror struct are among the things that
+	// can make it fail.
+	entryQueryAdapterAddress
+)
+
+func (e d3dkmtEntry) String() string {
+	if e == entryOpenAdapter {
+		return "D3DKMTOpenAdapterFromLuid"
+	}
+	return "D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS)"
+}
+
+// The NTSTATUS values this module names. Only the first is a verdict; the
+// other two are the shapes of "no answer right now" that the classification
+// exists to keep OUT of the negative cache, and they are named so the tests
+// can pin exactly that (production reads them nowhere -- the rule is an
+// allowlist, so a status is excluded by not being in it).
+const (
+	statusInvalidParameter uint32 = 0xc000000d // STATUS_INVALID_PARAMETER
+	statusDeviceRemoved    uint32 = 0xc00002b6 // STATUS_DEVICE_REMOVED
+	statusNoMemory         uint32 = 0xc0000017 // STATUS_NO_MEMORY
+)
+
+// d3dkmtStatusError is a D3DKMT call that returned a failing NTSTATUS.
+type d3dkmtStatusError struct {
+	Entry  d3dkmtEntry
+	Status uint32
+}
+
+func (e *d3dkmtStatusError) Error() string {
+	return fmt.Sprintf("%s: NTSTATUS 0x%08x", e.Entry, e.Status)
+}
+
+// implausiblePCIAddressError is luidPCIAddress's plausibility gate refusing an
+// address outside the PCI ranges (bus 0-255, device 0-31, function 0-7). The
+// call SUCCEEDED and the reading is repeatable; it is the reading that cannot
+// be used.
+type implausiblePCIAddressError struct {
+	Addr pciAddress
+}
+
+func (e *implausiblePCIAddressError) Error() string {
+	return fmt.Sprintf("implausible PCI address %d:%d.%d from D3DKMT",
+		e.Addr.Bus, e.Addr.Device, e.Addr.Function)
+}
+
+// mayCacheUnresolvable reports whether err from the adapter probe licenses a
+// PERMANENT negative conclusion about that adapter -- an entry in
+// pdhLUIDCaches.Unresolvable, which is consulted before the unknown set is
+// built and so can never be revisited except by a topology change.
+//
+// IT IS AN ALLOWLIST, and deliberately a two-entry one, because the two
+// mistakes cost wildly different amounts. Failing to remember a durable
+// verdict costs three syscalls per measurement cycle on an adapter that will
+// never resolve -- the measured waste this cache was added for. Remembering a
+// TRANSIENT failure costs a working GPU its measurement for the life of the
+// agent process, silently: attributePDHDedicated omits the (pid, gpu) pair,
+// buildSnapshot charges the operator's estimate instead, and nothing above
+// debug level says so. So a status nobody has classified is retried, never
+// written off.
+//
+// WHAT QUALIFIES.
+//
+//   - STATUS_INVALID_PARAMETER from D3DKMTOpenAdapterFromLuid: the answer the
+//     operator's own hardware gave for LUID 0x0_0x16026. The LUID is
+//     well-formed and the call is the same one that succeeds for the three
+//     real GPUs on that host, so the refusal is about that adapter and
+//     nothing else. It cannot change while the LUID exists either: a LUID is
+//     minted per adapter per boot, and a driver restart that gives a card a
+//     new identity gives it a new LUID -- a different cache key.
+//   - An implausible PCI address: the query SUCCEEDED, so this is a completed
+//     reading rather than a missing one, and repeating a deterministic read of
+//     the same struct from the same adapter cannot produce a different answer.
+//     Whatever the cause -- a wrong enum literal, a wrong struct layout, an
+//     adapter reporting nonsense -- there is no usable address here until the
+//     code itself changes, which means a new process.
+//
+// WHAT DOES NOT, AND WHY EACH IS THE ABSENCE OF AN ANSWER.
+//
+//   - STATUS_DEVICE_REMOVED (0xc00002b6) after a TDR or a driver reset, and
+//     STATUS_NO_MEMORY (0xc0000017) or STATUS_INSUFFICIENT_RESOURCES
+//     (0xc000009a) under momentary pressure. Each describes the MOMENT, not
+//     the adapter, and the first is correlated with exactly the topology
+//     change that produced an unknown LUID in the first place.
+//   - Any status from the ADDRESS query, STATUS_INVALID_PARAMETER included.
+//     That call is made on a handle just opened successfully, so the adapter
+//     has already answered for its identity; what can be wrong instead is
+//     THIS MODULE -- the KMTQUERYADAPTERINFOTYPE literal, or the mirror
+//     struct's layout -- which is a defect affecting every adapter equally
+//     and must not be recorded as a property of one. The compile-time layout
+//     assertions in nvidia_pdh_windows.go are what guard that half; a
+//     negative cache entry would only hide it.
+//   - STATUS_NOT_SUPPORTED / STATUS_NOT_IMPLEMENTED, even though "this
+//     adapter has no PCI address to report" is a plausible reading of them.
+//     Nothing has observed either here, and an unobserved durable verdict is
+//     the one guess this cache cannot afford; the cost of leaving them out is
+//     the bounded one above.
+//
+// An error of any other shape is likewise not a verdict: there is no error
+// this module produces that means "not this adapter" without saying so in one
+// of the two types above.
+func mayCacheUnresolvable(err error) bool {
+	var st *d3dkmtStatusError
+	if errors.As(err, &st) {
+		return st.Entry == entryOpenAdapter && st.Status == statusInvalidParameter
+	}
+	var bad *implausiblePCIAddressError
+	return errors.As(err, &bad)
+}
+
 // pdhLUIDCaches is the adapter-LUID -> GPU-index bridge the Windows measurer
 // carries across measurement cycles: both halves of the LUID cache, plus the
 // nvidia-smi PCI mapping they were derived from. Passed and returned by value
@@ -278,23 +412,34 @@ type pdhLUIDCaches struct {
 // charges the operator's estimate instead, and nothing above debug level says
 // so. Exactly two findings qualify:
 //
-//   - D3DKMT REFUSED THE ADAPTER. A property of the adapter itself, and the
-//     measured reason this cache exists at all: on the probe host LUID
-//     0x0_0x16026 failed D3DKMTOpenAdapterFromLuid with
+//   - THE ADAPTER PROBE RETURNED A VERDICT ABOUT THE ADAPTER. D3DKMT refusing
+//     to open the LUID at all, or an address the adapter reports that no PCI
+//     bus could hold. The first is the measured reason this cache exists: on
+//     the probe host LUID 0x0_0x16026 failed D3DKMTOpenAdapterFromLuid with
 //     STATUS_INVALID_PARAMETER and was retried once per counter instance --
 //     six wasted syscalls per cycle on the Manager's serialized owner
-//     goroutine for an answer that cannot change.
+//     goroutine for an answer that cannot change. Which probe failures
+//     qualify, and why every other one does not, is mayCacheUnresolvable.
 //   - A FRESH AND COMPLETE nvidia-smi READING HAS NO GPU AT THE ADAPTER'S PCI
 //     ADDRESS. A property of the host's topology: an integrated GPU, or a
 //     software/render adapter.
 //
-// Everything else -- nvidia-smi failing, timing out, or answering with rows
-// missing (see parseNvidiaPCIIndexCSV) -- is the ABSENCE of an answer, not a
-// negative one, and is retried on the next cycle. That distinction is the
-// whole fix: the earlier guard asked only whether nvidia-smi had EVER
-// answered, so on a warm cache a single 2s timeout (routine while a driver is
-// reinitialising, and correlated with the very topology change that produced
-// the unknown LUID) wrote a perfectly good GPU off for good.
+// Everything else is the ABSENCE of an answer, not a negative one, and is
+// retried on the next cycle. Both halves of that had to be fixed here, in
+// turn, and each was a permanently lost measurement:
+//
+//   - nvidia-smi failing, timing out, or answering with rows missing (see
+//     parseNvidiaPCIIndexCSV). The earlier guard asked only whether
+//     nvidia-smi had EVER answered, so on a warm cache a single 2s timeout
+//     (routine while a driver is reinitialising, and correlated with the very
+//     topology change that produced the unknown LUID) wrote a perfectly good
+//     GPU off for good.
+//   - A TRANSIENT adapter-probe failure -- a TDR returning
+//     STATUS_DEVICE_REMOVED, momentary pressure returning STATUS_NO_MEMORY,
+//     or any failure of the address query. This branch used to write EVERY
+//     error from adapterAddress into the negative half, on a comment
+//     asserting it was a refusal, while both this file's own rule and ADR-031
+//     said only a refusal qualifies.
 //
 // The retry is bounded: at most one nvidia-smi spawn per call however many
 // adapters miss, and none at all in the steady state where every needed
@@ -339,8 +484,14 @@ func resolvePDHLUIDs(
 	for _, l := range unknown {
 		addr, err := adapterAddress(l)
 		if err != nil {
-			// A refusal by the adapter, not a missing answer: durable.
-			next.Unresolvable[l] = struct{}{}
+			// Only a verdict about the ADAPTER may be remembered. Every other
+			// probe failure is the absence of an answer and is left out of
+			// BOTH halves, so the next cycle asks again -- which is the whole
+			// distinction mayCacheUnresolvable exists to draw, and which this
+			// branch used to ignore by caching every error alike.
+			if mayCacheUnresolvable(err) {
+				next.Unresolvable[l] = struct{}{}
+			}
 			continue
 		}
 		idx, ok := next.PCIToIndex[addr]
