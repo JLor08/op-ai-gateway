@@ -1012,10 +1012,12 @@ holding no card the candidate wants stays ignored either way; widening *that*
 half to "any unknown process anywhere" would evict half the host on every start.
 
 On an NVIDIA host the agent then measures actual usage of **its own
-child PIDs** — `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`,
-which is exact because the agent knows which PIDs are its children — and writes
-the measurement back to the gateway. There "unknown" is a self-resolving
-transient, not a permanent hole in the OOM protection.
+child PIDs** — exact because the agent knows which PIDs are its children — and
+writes the measurement back to the gateway. There "unknown" is a self-resolving
+transient, not a permanent hole in the OOM protection. *How* it measures is
+platform-specific: `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`
+everywhere except Windows, and PDH performance counters on Windows, where that
+query reports nothing usable at all (both are described below).
 
 **What makes it self-resolving is a measurement of a process that is merely
 RUNNING**, and for a while nothing took one. The measurer was consulted from
@@ -1032,13 +1034,17 @@ moment a child first passes a health probe — the point where a model server
 has finished mapping its weights, so the first number is already the
 meaningful one.
 
-**Measurement is NVIDIA-only.** `main.go` installs exactly one measurer,
-`collector.NewNvidiaComputeApps()`, and that constructor returns nil when
-`nvidia-smi` is not on PATH — so an AMD host (the host-level `rocm-smi`
-collector reports no per-PID split), an Apple unified-memory host, and a host
-with no GPU at all install **no** measurer and never write a measurement back.
-On those hosts the operator's `vram_estimate_mb` is the only number there will
-ever be. The rule above still applies — a spec left at the default `0` waits
+**Measurement is NVIDIA-only, and which NVIDIA measurer runs is decided per
+platform.** `main.go` installs exactly one measurer,
+`collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
+`measurer_windows.go`), not a `runtime.GOOS` branch — which yields the
+compute-apps measurer on every non-Windows host, the PDH measurer on Windows,
+and **nil** whenever the chosen one cannot work on this host. Both of them need
+`nvidia-smi` on PATH, so the NVIDIA-only scope is unchanged: an AMD host (the
+host-level `rocm-smi` collector reports no per-PID split), an Apple
+unified-memory host, and a host with no GPU at all install **no** measurer and
+never write a measurement back. On those hosts the operator's
+`vram_estimate_mb` is the only number there will ever be. The rule above still applies — a spec left at the default `0` waits
 while a pinned or busy spec holds one of its GPUs — but nothing resolves it
 except the other spec becoming evictable or the operator filling the estimate
 in. Waiting for the measurement to arrive is waiting for something that will
@@ -1051,11 +1057,122 @@ capability is deliberately *not* a negotiated feature flag — flags negotiate
 protocol, not hardware — an agent with no measurement path simply omits the
 field.
 
-The measurer resolves GPU UUID → index from a cached `--query-gpu=index,uuid`
-mapping, re-fetched only on the first call or when a *wanted* PID's UUID is
-missing from the cache (a card added, removed or reindexed), so the steady state
-spawns one subprocess per measurement rather than two. An unknown UUID is
-skipped, never guessed.
+The **compute-apps** measurer (every non-Windows host) resolves GPU UUID →
+index from a cached `--query-gpu=index,uuid` mapping, re-fetched only on the
+first call or when a *wanted* PID's UUID is missing from the cache (a card
+added, removed or reindexed), so the steady state spawns one subprocess per
+measurement rather than two. An unknown UUID is skipped, never guessed.
+
+**On Windows that query measures nothing, and this document used to claim
+otherwise.** Under the **WDDM** driver model the OS, not the NVIDIA driver, owns
+GPU memory, so `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`
+answers `[N/A]` for `used_memory` on every compute app. Only the **TCC** driver
+model restores per-process reporting, and TCC turns off the adapter's display
+output and is unavailable on most GeForce parts — not something an operator of a
+workstation-class AI server can switch on. So this section described a whole
+host class as self-resolving when nothing on it ever resolved.
+
+**And the failure was worse than a missing number.** `naInt("[N/A]")` is `0`, so
+the compute-apps measurer returned a **non-nil** `map[pid]map[gpuIndex]0`, and
+`buildSnapshot` reads `if v, ok := byGPU[g.Index]; ok` — a present key is
+authoritative. Every managed process on every Windows host was therefore charged
+**0 MB**, each GPU's budget read as entirely free however much was resident, and
+co-residency admission lost exactly the OOM protection it exists for. The
+estimate was never consulted, so filling one in changed nothing. Two guards now
+stand where there were none:
+
+- **The compute-apps measurer is never installed on Windows.** The platform
+  selector there offers PDH *or nothing* (`collector/measurer_windows.go`), and
+  nothing is strictly safer than a measured zero: no measurer means the manager
+  falls back to the operator's estimate, while a measured `0` overrode it.
+- **A measured `<= 0` no longer overrides an estimate, on any platform.**
+  `realMeasurement` (`runtime/manager.go`) keeps only strictly positive
+  entries and reports "nothing measured" when none remain — applied **per GPU
+  index**, so one unanswered index cannot discard a real number measured on its
+  sibling. It is the same `<= 0` rule the gateway's ingest already applies at
+  the far end of the same loop (`if g.VRAMMeasuredMB <= 0 { continue }`),
+  brought to the one place that lacked it; a measured `0` means *unknown*,
+  exactly as a spec's own `vram_mb: 0` does (§5.1).
+
+**What Windows measures instead: PDH performance counters, plus a
+LUID → PCI → GPU-index bridge.** Three steps, because no single interface
+carries both a PID and the GPU index specs and budgets are written in terms of:
+
+1. **`\GPU Process Memory(*)\Dedicated Usage`** (pdh.dll) → bytes per PID per
+   adapter. This is the figure Task Manager's per-process GPU-memory column
+   shows, and unlike the `nvidia-smi` query it works under WDDM. Instance names
+   are `pid_<PID>_luid_0x<HighPart>_0x<LowPart>_phys_<N>` — the **high part
+   comes first**, which is a measured fact and not a documented one. The counter
+   is added through `PdhAddEnglishCounterW`, because performance-object and
+   counter names are localized on Windows and the localized API would need the
+   German (or Japanese, …) spelling of both halves. **One
+   `PdhCollectQueryData`** suffices: the counter behaves as a raw gauge, so
+   there is no second sample and no settling sleep. A process holds VRAM on
+   several physical segments of the same adapter, so the `phys_<N>` segments are
+   summed away and only the per-adapter total is kept.
+2. **Adapter LUID → PCI address** via the gdi32 exports
+   `D3DKMTOpenAdapterFromLuid` and
+   `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS)`, which are user-mode
+   callable from the unprivileged agent. The address is compared as three
+   numbers, never as text: `nvidia-smi` prints `00000000:21:00.0` in **hex**
+   while `D3DKMT_ADAPTERADDRESS` reports the same location as decimal ints, so a
+   textual join would silently never match (bus `0x21` vs bus `33`).
+3. **PCI address → GPU index** via `nvidia-smi --query-gpu=index,pci.bus_id`.
+   The PCI address is the *only* identifier the two sides share — compute-apps'
+   GPU UUID is unavailable from D3DKMT, and D3DKMT's LUID is unavailable from
+   `nvidia-smi`.
+
+Steps 2 and 3 describe the host's fixed topology, so the LUID → index bridge is
+cached across measurement cycles, both halves of it. In the steady state a
+measurement is therefore **one PDH read and no subprocess at all**. The rules
+for the **negative** half are the load-bearing part, because a LUID written off
+there can no longer trigger the re-fetch that is its only escape: only two
+findings may enter it — D3DKMT *refusing* the adapter (a property of the
+adapter), and a **fresh and complete** `nvidia-smi` reading that has no GPU at
+the adapter's PCI address (a property of the host's topology). Everything else —
+`nvidia-smi` failing, timing out, or answering with rows missing — is the
+*absence* of an answer and is retried next cycle. An earlier revision asked only
+whether `nvidia-smi` had ever answered, so on a warm cache a single 2 s timeout
+wrote a perfectly good GPU off for the life of the process. One further refusal
+belongs to the same discipline: `D3DKMT_ADAPTERADDRESS` reports no PCI
+**domain**, so two cards in different PCI segments collapse onto one join key —
+an address claimed twice is *removed* rather than resolved to whichever row came
+last, and both adapters fall back to the operator's estimate.
+
+Failure is always fail-soft and never a wrong number: any PDH or D3DKMT error
+yields `nil` for that cycle (logged at debug, like the other optional
+collectors), which the manager already reads as "nothing measured", and an
+unresolvable adapter is skipped rather than charged to a guessed index 0. The
+one subprocess the chain can spawn is bounded by the same 2 s deadline the
+compute-apps measurer uses, for the same reason: the admission-time measurement
+runs on the serialized owner goroutine (§5.5).
+
+**Where the numbers in the paragraphs above come from.** The chain was proven
+end to end on the operator's 3-GPU Windows host (driver 610.62) with a
+standalone probe, and the numbers are worth recording because they are why the
+design looks as it does: per-GPU totals came within **0.04–0.8 %** of
+`nvidia-smi --query-gpu=memory.used`; the LUID→index attribution agreed with
+`nvidia-smi`'s own PID→GPU mapping for **15 of 15** PIDs; a single collection
+already returned non-zero values (hence one `PdhCollectQueryData`); and one
+adapter LUID (`0x0_0x16026`) failed `D3DKMTOpenAdapterFromLuid` with
+`STATUS_INVALID_PARAMETER` and was retried once per counter instance — six
+wasted syscalls per cycle for an answer that cannot change, which is why a
+refusal is cached. The operator's own model spans all three cards, so the
+per-adapter split is a requirement rather than a nicety. **Nothing here detects
+VRAM spillover into host memory**: the neighbouring `Shared Usage` and
+`Non Local Usage` counters read *identically* (4694 MiB) on all three GPUs of
+that host, so they are not per-adapter figures, and only `Dedicated Usage` is
+read.
+
+**The Windows code is split so that CI can test the half that can be wrong.**
+Every grammar, all the arithmetic and the whole cache-decision logic live in
+`collector/nvidia_pdh.go`, which carries **no build tag** and is unit-tested on
+Linux; only the syscalls sit behind `//go:build windows` in
+`nvidia_pdh_windows.go`, where they are pinned by compile-time struct-layout
+assertions and reviewed rather than tested. CI runs on `ubuntu-latest` and
+neither builds nor vets for Windows, which is the reason for the split and a
+standing risk in its own right
+([§11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
 
 **The recurring measurement runs OFF the owner goroutine; the admission-time
 one still runs on it.** That split is deliberate, and it is what let
