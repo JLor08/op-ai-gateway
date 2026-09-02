@@ -13,7 +13,9 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -78,8 +80,15 @@ func (p *vramFakeProvider) streamCount() int {
 }
 
 type vramFixture struct {
-	srv         *Server
-	mem         *routing.MemoryStore
+	srv *Server
+	// mem is the routing.Store the fixture seeded and the run writes through.
+	// It is the INTERFACE, not *routing.MemoryStore, so a test that needs a
+	// store honouring ctx.Err() can hand in the sqlite driver instead --
+	// routing.MemoryStore takes `_ context.Context` on every method and
+	// ignores cancellation entirely, which silently made the restore's
+	// cancellation guarantee untestable (see
+	// TestVRAMRestoreRunsOnACancelledRunContext).
+	mem         routing.Store
 	provider    *vramFakeProvider
 	notifies    func() []string
 	target      benchmarkTarget
@@ -105,6 +114,41 @@ type vramFixtureOpts struct {
 	noTargetSpec      bool
 	extraApplication  *routing.Application
 	os                string // reported host OS; "" = linux
+	// store overrides the routing.Store the fixture seeds and the run writes
+	// through. Nil means routing.NewMemoryStore(), the fast default. Pass the
+	// sqlite driver when the property under test is one MemoryStore cannot
+	// express -- above all CONTEXT CANCELLATION, which it ignores.
+	store routing.Store
+}
+
+// forEachVRAMStore runs run against both production routing.Store backends,
+// mirroring internal/store's forEachRoutingStore.
+//
+// It exists because a VRAM-run property can be invisible on one driver: every
+// routing.MemoryStore method takes `_ context.Context`, so a run whose
+// context is cancelled still reads and writes happily there, while
+// sqlite/postgres pass the context to database/sql and return
+// "context canceled" from every call. A guarantee about what survives a
+// cancelled run is therefore only observable on the SQL side.
+func forEachVRAMStore(t *testing.T, run func(t *testing.T, newStore func(t *testing.T) routing.Store)) {
+	t.Helper()
+	t.Run("memory", func(t *testing.T) {
+		run(t, func(*testing.T) routing.Store { return routing.NewMemoryStore() })
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		run(t, func(t *testing.T) routing.Store {
+			t.Helper()
+			sqlStore, err := store.OpenSQLite(filepath.Join(t.TempDir(), "vram.db"))
+			if err != nil {
+				t.Fatalf("open sqlite: %v", err)
+			}
+			t.Cleanup(func() { _ = sqlStore.Close() })
+			if err := sqlStore.Migrate(context.Background()); err != nil {
+				t.Fatalf("migrate sqlite: %v", err)
+			}
+			return sqlStore
+		})
+	})
 }
 
 // shrinkVRAMTimings drives every VRAM run bound down to milliseconds so a
@@ -138,7 +182,10 @@ func newVRAMFixture(t *testing.T, opts vramFixtureOpts) *vramFixture {
 	shrinkVRAMTimings(t)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
-	mem := routing.NewMemoryStore()
+	mem := opts.store
+	if mem == nil {
+		mem = routing.NewMemoryStore()
+	}
 
 	appType := opts.targetAppType
 	if appType == "" {
@@ -791,19 +838,76 @@ func TestVRAMIsolationRefusesAnUnrecognizedState(t *testing.T) {
 // rather than trusting a `defer`: the run body's context is cancelled exactly
 // when the restore matters most (the run finished, or the operator cancelled
 // it), so the restore must not be on it.
+//
+// IT RUNS ON BOTH DRIVERS, and the sqlite half is the whole point. Every
+// routing.MemoryStore method takes `_ context.Context` and ignores
+// cancellation, so against the memory driver this test passes whether the
+// restore uses context.WithoutCancel or the run's own context -- it was inert
+// against the exact bug it names, which is the branch's named risk
+// (11-risks-and-technical-debt.md: a finished or cancelled run leaving the
+// whole fleet force_stopped) going unguarded. internal/store/sqlite_runtime.go
+// passes the context to database/sql, so there the mutation returns
+// "context canceled" for every spec and this test fails.
 func TestVRAMRestoreRunsOnACancelledRunContext(t *testing.T) {
-	f := newVRAMFixture(t, vramFixtureOpts{})
-	ctx, cancel := context.WithCancel(context.Background())
-	if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(context.Background(), f.targetSpec, "", "force_stopped"); err != nil {
-		t.Fatalf("seed the override: %v", err)
-	}
-	cancel()
+	forEachVRAMStore(t, func(t *testing.T, newStore func(t *testing.T) routing.Store) {
+		f := newVRAMFixture(t, vramFixtureOpts{store: newStore(t)})
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := f.srv.Portal.SetBenchmarkRuntimeSpecAdminState(context.Background(), f.targetSpec, "", "force_stopped"); err != nil {
+			t.Fatalf("seed the override: %v", err)
+		}
+		cancel()
 
-	if failed := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 {
-		t.Fatalf("restore on a cancelled context reported %v as failed", failed)
+		if failed := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 {
+			t.Fatalf("restore on a cancelled context reported %v as failed", failed)
+		}
+		if state := f.adminState(t, f.targetSpec); state != "" {
+			t.Fatalf("admin_state after the restore = %q, want empty", state)
+		}
+	})
+}
+
+// TestVRAMRunRestoresTheFleetOnACancelledRun is the same guarantee one level
+// up, through the WHOLE run rather than through vramRestore alone: an
+// operator who cancels a VRAM run mid-flight must not be left with a fleet
+// that refuses to start.
+//
+// Cancelling the run's context is the realistic shape (the trigger stores a
+// cancel on the run and the portal's stop button calls it), and it cancels
+// everything the run body does from that moment on -- so on a context-honouring
+// driver the restore is the ONE thing that has to keep working. Run on sqlite
+// only: on the memory driver a cancelled context changes nothing at all, so
+// the assertion would hold for free.
+func TestVRAMRunRestoresTheFleetOnACancelledRun(t *testing.T) {
+	sqlStore, err := store.OpenSQLite(filepath.Join(t.TempDir(), "vram-cancel.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
 	}
-	if state := f.adminState(t, f.targetSpec); state != "" {
-		t.Fatalf("admin_state after the restore = %q, want empty", state)
+	defer func() { _ = sqlStore.Close() }()
+	if err := sqlStore.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate sqlite: %v", err)
+	}
+	f := newVRAMFixture(t, vramFixtureOpts{store: sqlStore})
+	f.seedLatestSample()
+	f.drive(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+	if err != nil {
+		t.Fatalf("vramRunPlan: %v", err)
+	}
+	run, ok := f.srv.Benchmarks.TryStart("srv1", "vram-probe", "vram", 1, time.Now().UTC(), cancel)
+	if !ok {
+		t.Fatal("TryStart did not start")
+	}
+	// Cancel the moment the load is reached, which is as deep into the run as
+	// the operator's stop button can realistically land.
+	f.provider.onStream = func() { cancel() }
+	f.srv.runVRAMProbe(ctx, run, "srv1", f.target, plan)
+
+	for _, specID := range []string{f.targetSpec, f.siblingSpec} {
+		if state := f.adminState(t, specID); state != "" {
+			t.Fatalf("spec %q admin_state = %q after a cancelled run, want empty: the fleet was left refusing to start", specID, state)
+		}
 	}
 }
 
@@ -1235,8 +1339,11 @@ func TestVRAMRunStrategyAReportsOnlyAPostLoadMeasurement(t *testing.T) {
 	ctx := context.Background()
 	f := newVRAMFixture(t, vramFixtureOpts{})
 	f.seedLatestSample()
-	// A stale stored measurement, and a status stream carrying nothing.
-	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 12345); err != nil {
+	// A stale stored measurement, and a status stream carrying nothing. The
+	// figure agrees with the delta this run will measure, because the two
+	// strategies are cross-checked against each other and this test is about
+	// the WATERMARK, not about a disagreement.
+	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 20800); err != nil {
 		t.Fatalf("seed the stored measurement: %v", err)
 	}
 	f.drive(t)
@@ -1248,7 +1355,7 @@ func TestVRAMRunStrategyAReportsOnlyAPostLoadMeasurement(t *testing.T) {
 		f.setStatuses(
 			RuntimeStatusDTO{
 				SpecID: "rspec_target", State: "running", PID: 5,
-				GPUs: []RuntimeGPUStatusDTO{{Index: 0, VRAMMeasuredMB: 12345}}, MeasuredAt: time.Now().UTC(),
+				GPUs: []RuntimeGPUStatusDTO{{Index: 0, VRAMMeasuredMB: 20800}}, MeasuredAt: time.Now().UTC(),
 			},
 			RuntimeStatusDTO{SpecID: "rspec_sib", State: "stopped"},
 		)
@@ -1259,8 +1366,8 @@ func TestVRAMRunStrategyAReportsOnlyAPostLoadMeasurement(t *testing.T) {
 	if report == nil || report.Inconclusive != "" {
 		t.Fatalf("report = %#v, want a definitive result", report)
 	}
-	if len(report.GPUs) != 1 || report.GPUs[0].MeasuredMB != 12345 {
-		t.Fatalf("GPUs = %#v, want measured_mb 12345 accepted from a post-load frame", report.GPUs)
+	if len(report.GPUs) != 1 || report.GPUs[0].MeasuredMB != 20800 {
+		t.Fatalf("GPUs = %#v, want measured_mb 20800 accepted from a post-load frame", report.GPUs)
 	}
 }
 
