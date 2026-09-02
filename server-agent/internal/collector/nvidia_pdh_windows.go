@@ -165,11 +165,30 @@ type d3dkmtAdapterAddress struct {
 // exactly N. Every number below is transcribed from the C declaration in
 // d3dkmthk.h / pdh.h.
 //
-// Each struct pins its total size, then every field's offset AND width. The
-// widths are not redundant: narrowing LargeValue to an int32 leaves both the
-// size and every offset intact (alignment absorbs it) while silently reading
-// half of a byte count, and the same is true of every other field the kernel
-// fills in. Only offsets plus widths together pin the reads.
+// Each struct pins its total size, then every NAMED field's offset AND width,
+// with no exceptions -- a review found four fields (this struct's Bus and
+// Device, and QUERYADAPTERINFO's HAdapter and Type) that had no width
+// assertion, which is what prompted spelling the rule out as "no exceptions"
+// rather than "every field".
+//
+// The widths are not redundant, and the gap was not theoretical: narrowing any
+// of those four to a uint16 leaves the total size and every other offset
+// intact -- alignment absorbs the two bytes -- so `GOOS=windows go build ./...`
+// accepted a struct that reads half of a number the kernel wrote. HAdapter is
+// the one with teeth: a truncated D3DKMT handle makes D3DKMTQueryAdapterInfo
+// fail for every adapter, so every LUID caches as unresolvable and the whole
+// measurer degrades to the silent "this hardware is not supported" outcome
+// this block exists to make impossible. Only offsets plus widths together pin
+// the reads.
+//
+// The first field's offset is asserted too, even though Go guarantees it is 0.
+// It costs one line, and a blanket "every named field, both facts" is a rule a
+// reader can check by counting; "every field except the ones where it is
+// implied" is a rule that invites the next omission.
+//
+// A blank padding field cannot be asserted at all (it has no name to take the
+// offset of), which is why the two structs that carry one pin their total size
+// instead: the size is what the padding moves.
 //
 // The 8-byte pointer this assumes holds for both platforms the agent ships a
 // Windows binary for, amd64 and arm64. A 32-bit Windows target would fail
@@ -178,6 +197,8 @@ type d3dkmtAdapterAddress struct {
 const (
 	_ = uint(unsafe.Sizeof(pdhFmtCounterValueItemW{}) - 24)
 	_ = uint(24 - unsafe.Sizeof(pdhFmtCounterValueItemW{}))
+	_ = uint(unsafe.Offsetof(pdhFmtCounterValueItemW{}.SzName) - 0)
+	_ = uint(0 - unsafe.Offsetof(pdhFmtCounterValueItemW{}.SzName))
 	_ = uint(unsafe.Sizeof(pdhFmtCounterValueItemW{}.SzName) - 8)
 	_ = uint(8 - unsafe.Sizeof(pdhFmtCounterValueItemW{}.SzName))
 	_ = uint(unsafe.Offsetof(pdhFmtCounterValueItemW{}.CStatus) - 8)
@@ -206,8 +227,14 @@ const (
 
 	_ = uint(unsafe.Sizeof(d3dkmtQueryAdapterInfo{}) - 24)
 	_ = uint(24 - unsafe.Sizeof(d3dkmtQueryAdapterInfo{}))
+	_ = uint(unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.HAdapter) - 0)
+	_ = uint(0 - unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.HAdapter))
+	_ = uint(unsafe.Sizeof(d3dkmtQueryAdapterInfo{}.HAdapter) - 4)
+	_ = uint(4 - unsafe.Sizeof(d3dkmtQueryAdapterInfo{}.HAdapter))
 	_ = uint(unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.Type) - 4)
 	_ = uint(4 - unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.Type))
+	_ = uint(unsafe.Sizeof(d3dkmtQueryAdapterInfo{}.Type) - 4)
+	_ = uint(4 - unsafe.Sizeof(d3dkmtQueryAdapterInfo{}.Type))
 	_ = uint(unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.PrivateData) - 8)
 	_ = uint(8 - unsafe.Offsetof(d3dkmtQueryAdapterInfo{}.PrivateData))
 	_ = uint(unsafe.Sizeof(d3dkmtQueryAdapterInfo{}.PrivateData) - 8)
@@ -219,8 +246,14 @@ const (
 
 	_ = uint(unsafe.Sizeof(d3dkmtAdapterAddress{}) - 12)
 	_ = uint(12 - unsafe.Sizeof(d3dkmtAdapterAddress{}))
+	_ = uint(unsafe.Offsetof(d3dkmtAdapterAddress{}.Bus) - 0)
+	_ = uint(0 - unsafe.Offsetof(d3dkmtAdapterAddress{}.Bus))
+	_ = uint(unsafe.Sizeof(d3dkmtAdapterAddress{}.Bus) - 4)
+	_ = uint(4 - unsafe.Sizeof(d3dkmtAdapterAddress{}.Bus))
 	_ = uint(unsafe.Offsetof(d3dkmtAdapterAddress{}.Device) - 4)
 	_ = uint(4 - unsafe.Offsetof(d3dkmtAdapterAddress{}.Device))
+	_ = uint(unsafe.Sizeof(d3dkmtAdapterAddress{}.Device) - 4)
+	_ = uint(4 - unsafe.Sizeof(d3dkmtAdapterAddress{}.Device))
 	_ = uint(unsafe.Offsetof(d3dkmtAdapterAddress{}.Function) - 8)
 	_ = uint(8 - unsafe.Offsetof(d3dkmtAdapterAddress{}.Function))
 	_ = uint(unsafe.Sizeof(d3dkmtAdapterAddress{}.Function) - 4)
