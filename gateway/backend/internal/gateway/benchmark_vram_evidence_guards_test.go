@@ -255,6 +255,80 @@ func TestVRAMRunNoWatchedCardIsInconclusiveNotZero(t *testing.T) {
 	}
 }
 
+// --- a cancelled run is a cancelled run ------------------------------------
+
+// TestVRAMRunACancelledRunIsNotAnAgentThatWentAway is the conflation every
+// bounded wait in this run produces, and it sent operators to the wrong place.
+//
+// vramStableWindow returns (sample{}, sawSample, false) on ctx.Done() exactly
+// as on its own timer, and its leading sleepCtx returns false on cancellation
+// so sawSample is false too; vramAwaitIsolation returns (evidence, false) for
+// both as well. The runner then read those as `no_samples` -- documented and
+// rendered as "GPU readings stopped arriving during the run. Check the agent
+// on this server." -- or as `isolation_timeout`, in both cases with an EMPTY
+// Error. An operator who pressed stop on their own run was told to go and
+// inspect a telemetry pipeline that was fine.
+//
+// The context is the only thing that can tell the two apart, so the run asks
+// it: run_failed, with the cancellation as the Error the operator reads.
+func TestVRAMRunACancelledRunIsNotAnAgentThatWentAway(t *testing.T) {
+	t.Run("cancelled before the isolation wait", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{})
+		f.seedLatestSample()
+		f.drive(t)
+		plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if err != nil {
+			t.Fatalf("vramRunPlan: %v", err)
+		}
+		run, ok := f.srv.Benchmarks.TryStart("srv1", "vram-probe", "vram", 1, time.Now().UTC(), func() {})
+		if !ok {
+			t.Fatal("TryStart did not start")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		f.srv.runVRAMProbe(ctx, run, "srv1", f.target, plan)
+
+		res := vramOneResult(t, f.srv.Benchmarks.Status("srv1"))
+		if res.VRAM == nil {
+			t.Fatal("VRAM = nil: the run had already force-stopped specs")
+		}
+		if res.VRAM.Inconclusive != vramInconclusiveRunFailed {
+			t.Fatalf("Inconclusive = %q, want %q: an isolation the operator cancelled is not an isolation that timed out", res.VRAM.Inconclusive, vramInconclusiveRunFailed)
+		}
+		if res.Error != context.Canceled.Error() {
+			t.Fatalf("Error = %q, want %q", res.Error, context.Canceled.Error())
+		}
+	})
+
+	t.Run("cancelled at the load, before the post-load window", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{})
+		f.seedLatestSample()
+		f.drive(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		// The stop button, landing as deep into the run as it realistically
+		// can: the isolation is confirmed, the baseline is taken, the model is
+		// loading.
+		f.provider.onStream = func() { cancel() }
+		plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if err != nil {
+			t.Fatalf("vramRunPlan: %v", err)
+		}
+		run, ok := f.srv.Benchmarks.TryStart("srv1", "vram-probe", "vram", 1, time.Now().UTC(), cancel)
+		if !ok {
+			t.Fatal("TryStart did not start")
+		}
+		f.srv.runVRAMProbe(ctx, run, "srv1", f.target, plan)
+
+		res := vramOneResult(t, f.srv.Benchmarks.Status("srv1"))
+		if res.VRAM == nil || res.VRAM.Inconclusive != vramInconclusiveRunFailed {
+			t.Fatalf("VRAM = %#v, want Inconclusive %q, not a GPU-sample or stability verdict", res.VRAM, vramInconclusiveRunFailed)
+		}
+		if res.Error == "" {
+			t.Fatal("Error is empty: a run that stopped because it was cancelled must say so")
+		}
+	})
+}
+
 // --- the refusals' wire strings -------------------------------------------
 
 // TestVRAMRefusalCodesAreStableWireStrings pins the four precondition codes as

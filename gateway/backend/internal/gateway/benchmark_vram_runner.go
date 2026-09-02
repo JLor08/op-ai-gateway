@@ -138,8 +138,10 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	report.IsolationEvidence = evidence
 	report.Isolated = vramIsolationConfirmed(plan.specIDs, evidence)
 	if !confirmed {
-		report.Inconclusive = vramInconclusiveIsolationTimeout
-		res.Error = errVRAMIsolationTimedOut.Error()
+		if !vramStoppedByCancellation(ctx, report, &res) {
+			report.Inconclusive = vramInconclusiveIsolationTimeout
+			res.Error = errVRAMIsolationTimedOut.Error()
+		}
 		return
 	}
 
@@ -162,6 +164,9 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (4) The baseline window.
 	baseline, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
+	if vramStoppedByCancellation(ctx, report, &res) {
+		return
+	}
 	switch {
 	case !sawSample:
 		report.Inconclusive = vramInconclusiveNoSamples
@@ -203,6 +208,9 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (7) The post-load window, then the floor gate.
 	after, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
+	if vramStoppedByCancellation(ctx, report, &res) {
+		return
+	}
 	switch {
 	case !sawSample:
 		report.Inconclusive = vramInconclusiveNoSamples
@@ -262,6 +270,36 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 		// here they are the evidence for the reason.
 		report.Inconclusive = vramInconclusiveStrategyDisagreement
 	}
+}
+
+// vramStoppedByCancellation records a run the operator (or the trigger's own
+// cancel) ended, and reports whether that is what happened -- so the caller
+// stops attributing it to the condition its timer was watching for.
+//
+// EVERY bounded wait in this run answers ctx.Done() and its own timer
+// IDENTICALLY: vramStableWindow returns (sample{}, sawSample, false) for both,
+// and its leading sleepCtx returns false on cancellation so sawSample is false
+// too; vramAwaitIsolation returns (evidence, false) for both. Read without
+// asking the context, a cancellation therefore surfaced as `no_samples` --
+// which the vocabulary defines, and the portal renders, as "GPU readings
+// stopped arriving during the run, check the agent on this server" -- or as
+// `baseline_unstable`/`post_load_unstable`/`isolation_timeout`, each with an
+// EMPTY Error. An operator who cancelled their own run was sent to inspect a
+// telemetry pipeline that was fine.
+//
+// run_failed is the right value for it: the run stopped after it had written
+// something, so Error is what the operator reads, and the report still has to
+// name the fleet it drained. vramAwaitMeasured shares the conflation
+// harmlessly -- both of its paths mean "no measured_mb" and neither becomes a
+// reason.
+func vramStoppedByCancellation(ctx context.Context, report *VRAMReport, res *BenchmarkResult) bool {
+	err := ctx.Err()
+	if err == nil {
+		return false
+	}
+	report.Inconclusive = vramInconclusiveRunFailed
+	res.Error = err.Error()
+	return true
 }
 
 // vramWithout returns ids with one id removed, preserving order.

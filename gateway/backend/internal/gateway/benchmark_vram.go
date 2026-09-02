@@ -61,7 +61,12 @@ const (
 	vramInconclusiveNoSamples = "no_samples"
 	// vramInconclusiveRunFailed: the run stopped on a HARD ERROR after it had
 	// already written something, so Error says what happened and the operator
-	// reads that rather than a reason of its own. It exists because such a
+	// reads that rather than a reason of its own. A CANCELLED run is one of
+	// these -- Error is the context's -- because every bounded wait here
+	// answers cancellation and its own timer identically, and reading a
+	// cancellation as the timer's condition sends an operator who stopped
+	// their own run to inspect a telemetry pipeline that is fine (see
+	// vramStoppedByCancellation). It exists because such a
 	// report must still be reported at all: the run had force-stopped part or
 	// all of the fleet by then, and DrainedSpecIDs / RestoreFailed are the only
 	// place an operator learns which specs were touched and which were left
