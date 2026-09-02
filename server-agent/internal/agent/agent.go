@@ -44,7 +44,15 @@ import (
 // subtree synonym; a new runtime_allow_binary_dirs toggle auto-allows each
 // allowed binary's parent directory), but no agent.Features entry was added,
 // so it is PATCH, not MINOR.
-const Version = "0.2.2"
+//
+// 0.2.2 -> 0.2.3 is the single PATCH bump for the windows-vram-measurer
+// branch: on Windows the agent now measures per-process, per-GPU VRAM through
+// PDH performance counters instead of reporting nothing (nvidia-smi cannot
+// report it under WDDM), and a measured value of 0 no longer overrides the
+// operator's estimate in the admission snapshot. Both change what an operator
+// and the gateway observe, and no agent.Features entry was added -- measurement
+// is a hardware capability, not a negotiated flag (ADR-025) -- so PATCH.
+const Version = "0.2.3"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
