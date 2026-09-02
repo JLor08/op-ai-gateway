@@ -214,10 +214,34 @@ func TestAttributePDHDedicatedDropsZeroSums(t *testing.T) {
 	}
 }
 
-// TestAttributePDHDedicatedDropsPIDWithOnlyZeros proves the drop reaches the
+// TestAttributePDHDedicatedDropsPIDWhoseSumsTruncateToZero proves the drop reaches the
 // OUTER map too: a pid measured at 0 everywhere must not appear at all, or
 // buildSnapshot would charge every one of its GPUs 0 MB.
-func TestAttributePDHDedicatedDropsPIDWithOnlyZeros(t *testing.T) {
+//
+// The byte counts are POSITIVE but sub-MiB on purpose. Zero-byte instances
+// would be consumed by the per-instance `DedicatedBytes <= 0` guard, `sums`
+// would stay empty, and the outer aggregation loop -- the very thing this test
+// names -- would never execute, so no mutation of it could make the test fail
+// (it would only re-test what TestAttributePDHDedicatedIgnoresNegativeBytes
+// already pins). Sub-MiB values pass that guard, reach the outer loop, and are
+// dropped there by the `mb <= 0` truncation guard, which is the path that has
+// to hold: an eagerly allocated `out[pid]` would escape as an empty non-nil
+// inner map.
+func TestAttributePDHDedicatedDropsPIDWhoseSumsTruncateToZero(t *testing.T) {
+	instances := []pdhProcessMemory{
+		{PID: 4242, LUID: luidGPU0, Phys: 0, DedicatedBytes: 500_000},
+		{PID: 4242, LUID: luidGPU1, Phys: 0, DedicatedBytes: 400_000},
+	}
+	out := attributePDHDedicated(instances, pdhTestLUIDIdx, []int{4242})
+	if out != nil {
+		t.Fatalf("out = %v, want nil (nothing was measured)", out)
+	}
+}
+
+// TestAttributePDHDedicatedDropsPIDWhoseInstancesAreAllZeroBytes keeps the
+// all-zero-bytes input covered too, one guard earlier: the per-instance
+// filter, which must also leave the outer map nil rather than empty.
+func TestAttributePDHDedicatedDropsPIDWhoseInstancesAreAllZeroBytes(t *testing.T) {
 	instances := []pdhProcessMemory{
 		{PID: 4242, LUID: luidGPU0, Phys: 0, DedicatedBytes: 0},
 		{PID: 4242, LUID: luidGPU1, Phys: 0, DedicatedBytes: 0},
