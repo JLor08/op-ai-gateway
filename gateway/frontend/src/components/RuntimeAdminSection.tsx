@@ -59,7 +59,12 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
-import { latestApplicableVramRun, vramApplyNumber } from './shared/vram';
+import {
+  latestApplicableVramRun,
+  vramApplyNumber,
+  vramCardCheck,
+  vramCardCheckLabelKey,
+} from './shared/vram';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
@@ -2221,11 +2226,44 @@ export function RuntimeAdminSection({
    *
    * Matched BY GPU INDEX, never by row position: the run reports the indexes it
    * watched, and the rows may have been reordered, added to or removed since.
+   *
+   * And an index is not an identity, which is why the recorded card
+   * fingerprint is COMPARED here rather than merely displayed. A driver reset
+   * or a hardware swap renumbers the cards; without the comparison this
+   * affordance would go on offering a run's 21500 MB for whatever card now
+   * sits at index 1, days later, while the history table still named the UUID
+   * it had captured. On drift the number is stated and withheld; when nothing
+   * could be compared the offer stands but says so -- "cannot verify" must
+   * never read as "verified".
    */
   function renderVramApply(row: GpuRow, rowIdx: number) {
     const item = vramMeasuredByIndex.get(row.index);
     const applicable = vramApplyNumber(item);
     if (!applicable) return null;
+    const check = vramCardCheck(
+      item,
+      telemetryGpus.find((gpu) => gpu.index === row.index),
+    );
+    if (check.state === 'drifted') {
+      // No number field and no Apply: the measurement is real but belongs to
+      // other hardware, and applying it would put a foreign card's cost into
+      // the admission arithmetic through the operator's own field. Both
+      // fingerprints are named, because "which card was it then, and which is
+      // it now" is the operator's next question.
+      return (
+        <Alert severity="warning" sx={{ width: '100%' }}>
+          <Box sx={{ display: 'grid', gap: 0.25 }}>
+            <span>{t.runtimeSpecVramCardDrift}</span>
+            <Typography variant="caption">
+              {t.runtimeGpuDriftExpected}: {check.recorded}
+            </Typography>
+            <Typography variant="caption">
+              {t.runtimeGpuDriftCurrent}: {check.live}
+            </Typography>
+          </Box>
+        </Alert>
+      );
+    }
     // Which of the two reported quantities this is. They are never averaged
     // and never silently interchanged, so the source is on screen next to the
     // number the operator is about to adopt.
@@ -2259,6 +2297,36 @@ export function RuntimeAdminSection({
           {t.runtimeSpecVramApply}
         </Button>
       </>
+    );
+  }
+
+  /**
+   * What the fingerprint comparison established for one row, on a line of its
+   * own beneath the offer.
+   *
+   * Rendered in every state the offer survives -- not only the interesting one
+   * -- because the absence of a caveat is itself a claim: silence next to a
+   * number would let an UNVERIFIABLE card read as a checked one, which is the
+   * drift bug with better manners. The drift case is not here: it is inside
+   * the affordance, because there the sentence replaces the number rather than
+   * qualifying it.
+   *
+   * Separate from renderVramApply purely for layout: the row is a wrapping
+   * flex line, so a full-width element in the middle of it would push the
+   * row's own Remove button onto the line below and orphan it from its row.
+   */
+  function renderVramCardCheck(row: GpuRow) {
+    const item = vramMeasuredByIndex.get(row.index);
+    if (!vramApplyNumber(item)) return null;
+    const check = vramCardCheck(
+      item,
+      telemetryGpus.find((gpu) => gpu.index === row.index),
+    );
+    if (check.state === 'drifted') return null;
+    return (
+      <Typography variant="caption" color="text.secondary" sx={{ width: '100%' }}>
+        {t[vramCardCheckLabelKey(check)]}
+      </Typography>
     );
   }
 
@@ -3569,6 +3637,10 @@ export function RuntimeAdminSection({
                   >
                     {t.runtimeSpecGpuRemove}
                   </Button>
+                  {/* Last in the row, on its own full-width line: what the
+                      card-fingerprint comparison established for the number
+                      above. */}
+                  {renderVramCardCheck(row)}
                 </Box>
               ))}
               {vramEvidence && (

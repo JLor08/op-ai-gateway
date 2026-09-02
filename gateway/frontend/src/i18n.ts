@@ -605,6 +605,17 @@ const de = {
   runtimeSpecVramBenchmarkFrom: 'Messung vom',
   runtimeSpecVramBenchmarkSourceDelta: 'Differenz vor/nach dem Laden',
   runtimeSpecVramBenchmarkSourceMeasured: 'Per-Prozess-Messung des Agenten während des Laufs',
+  // Was der Vergleich der beim Lauf aufgezeichneten Karten-Kennung mit der
+  // Karte ergeben hat, die jetzt auf diesem Index sitzt. Nie ein blankes
+  // „geprüft“: „nicht prüfbar“ ist keine bestandene Prüfung, und Name +
+  // Gesamtgröße unterscheiden zwei identische Karten nicht.
+  runtimeSpecVramCardVerifiedUuid: 'Karte per UUID als dieselbe bestätigt.',
+  runtimeSpecVramCardVerifiedNameTotal:
+    'Karte nur per Name und Gesamtgröße bestätigt: zwei identische Karten sind so nicht unterscheidbar.',
+  runtimeSpecVramCardUnverifiable:
+    'Nicht prüfbar, ob das noch dieselbe Karte ist: der Lauf hat keine Kennung aufgezeichnet, oder dieser Server hat für diesen Index gerade keine Hardware gemeldet. Die Zahl gilt damit für den GPU-Index – nicht für eine nachgewiesene Karte.',
+  runtimeSpecVramCardDrift:
+    'Die Karte auf diesem GPU-Index ist nicht die gemessene: die Nummerierung hat sich seit der Messung verändert (Treiber-Update oder Hardware-Tausch). Die Zahl wird deshalb nicht angeboten – messen Sie erneut.',
   runtimeSpecGpuIndex: 'GPU-Index',
   runtimeSpecGpuPick: 'Gemeldete GPU',
   runtimeSpecGpuPickPlaceholder: 'Karte auswählen …',
@@ -909,11 +920,11 @@ const de = {
   benchmarkVramColBaseline: 'Basis (MB)',
   benchmarkVramColDelta: 'Differenz (MB)',
   benchmarkVramColMeasured: 'Agent-Messung (MB)',
-  benchmarkVramColCard: 'Karte geprüft',
+  benchmarkVramColCard: 'Karte erkannt über',
   benchmarkVramFingerprintUuid: 'per UUID',
   benchmarkVramFingerprintNameTotal:
     'nur per Name und Gesamtgröße: zwei identische Karten sind so nicht unterscheidbar',
-  benchmarkVramFingerprintNone: 'nicht geprüft',
+  benchmarkVramFingerprintNone: 'keine Kennung verfügbar',
   benchmarkVramUnifiedMemory:
     'Unified Memory: die Zahl ist System-RAM (Apple Silicon), kein dediziertes VRAM.',
   benchmarkVramNotAttributable:
@@ -2659,6 +2670,13 @@ const en: PortalMessages = {
   runtimeSpecVramBenchmarkFrom: 'Measured',
   runtimeSpecVramBenchmarkSourceDelta: 'Delta before/after the load',
   runtimeSpecVramBenchmarkSourceMeasured: 'Agent per-process measurement taken during the run',
+  runtimeSpecVramCardVerifiedUuid: 'Card confirmed as the same one, by UUID.',
+  runtimeSpecVramCardVerifiedNameTotal:
+    'Card confirmed by name and total size only: two identical cards are indistinguishable that way.',
+  runtimeSpecVramCardUnverifiable:
+    'Cannot verify that this is still the same card: the run recorded no identifier, or this server has reported no hardware for this index right now. The number belongs to the GPU index — not to a proven card.',
+  runtimeSpecVramCardDrift:
+    'The card at this GPU index is not the one that was measured: the numbering has changed since (a driver update or a hardware swap). The number is therefore not offered — measure again.',
   runtimeSpecGpuIndex: 'GPU index',
   runtimeSpecGpuPick: 'Reported GPU',
   runtimeSpecGpuPickPlaceholder: 'Select a card …',
@@ -2954,11 +2972,11 @@ const en: PortalMessages = {
   benchmarkVramColBaseline: 'Baseline (MB)',
   benchmarkVramColDelta: 'Delta (MB)',
   benchmarkVramColMeasured: 'Agent measurement (MB)',
-  benchmarkVramColCard: 'Card verified',
+  benchmarkVramColCard: 'Card identified by',
   benchmarkVramFingerprintUuid: 'by UUID',
   benchmarkVramFingerprintNameTotal:
     'by name and total size only: two identical cards are indistinguishable that way',
-  benchmarkVramFingerprintNone: 'not verified',
+  benchmarkVramFingerprintNone: 'no identifying field available',
   benchmarkVramUnifiedMemory:
     'Unified memory: the figure is system RAM (Apple silicon), not dedicated VRAM.',
   benchmarkVramNotAttributable:
@@ -2979,9 +2997,9 @@ const en: PortalMessages = {
   benchmarkVramInconclusiveRunFailed:
     'The run stopped on an error after it had already force-stopped the specs. The error is below; also check the specs named there.',
   benchmarkVramInconclusiveIsolationLost:
-    'One of the launch specs this run had stopped for the measurement was running again by the end of it. The isolation therefore did not hold for the whole run, and the delta would carry that second process\'s memory. Stop it, then measure again.',
+    "One of the launch specs this run had stopped for the measurement was running again by the end of it. The isolation therefore did not hold for the whole run, and the delta would carry that second process's memory. Stop it, then measure again.",
   benchmarkVramInconclusiveStrategyDisagreement:
-    'The two independently measured numbers are too far apart: the delta across the window is much larger than the agent\'s own measurement of the process itself. So something else allocated memory during the load — most likely an application this gateway cannot stop. Measure again once the server is quiet.',
+    "The two independently measured numbers are too far apart: the delta across the window is much larger than the agent's own measurement of the process itself. So something else allocated memory during the load — most likely an application this gateway cannot stop. Measure again once the server is quiet.",
   benchmarkVramInconclusiveUnknown:
     'No result, and this portal build does not know the reason it reported.',
   modelServerTitle: 'Offered on servers',
@@ -3074,7 +3092,7 @@ const en: PortalMessages = {
   errorBenchmarkVramIsolationBlocked:
     'A launch spec blocks the isolation (an existing admin override, or a pinned neighbouring model). The message names the spec.',
   errorBenchmarkVramDeclaredGpuMissing:
-    'The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec\'s GPU rows.',
+    "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
   agentToken: 'Server-Reporting-Agent',

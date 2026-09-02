@@ -2398,6 +2398,10 @@ describe('VRAM-benchmark portal i18n keys', () => {
     'runtimeSpecVramBenchmarkFrom',
     'runtimeSpecVramBenchmarkSourceDelta',
     'runtimeSpecVramBenchmarkSourceMeasured',
+    'runtimeSpecVramCardVerifiedUuid',
+    'runtimeSpecVramCardVerifiedNameTotal',
+    'runtimeSpecVramCardUnverifiable',
+    'runtimeSpecVramCardDrift',
   ] as const;
 
   it('defines every new key in de and en', () => {
@@ -2434,6 +2438,34 @@ describe('VRAM-benchmark portal i18n keys', () => {
         if (k === 'benchmarkVramInconclusiveTitle') continue;
         // Every reason is a sentence naming an action, not a two-word tag.
         expect(messages[locale][k].length).toBeGreaterThan(30);
+      }
+    }
+  });
+
+  it('never lets "cannot verify" read as "verified", in both locales', () => {
+    // The recorded fingerprint is compared against the live card before the
+    // number is offered, and the three outcomes are three different facts. An
+    // empty fingerprint (GPUSample.UUID is NVIDIA-only) means the check could
+    // not be MADE -- claiming it passed would be the drift bug with a
+    // reassuring label on it.
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(
+        new Set([
+          m.runtimeSpecVramCardVerifiedUuid,
+          m.runtimeSpecVramCardVerifiedNameTotal,
+          m.runtimeSpecVramCardUnverifiable,
+          m.runtimeSpecVramCardDrift,
+        ]).size,
+      ).toBe(4);
+      // Each is a sentence naming what was (or was not) established, never a
+      // bare "verified" tag.
+      for (const text of [
+        m.runtimeSpecVramCardVerifiedNameTotal,
+        m.runtimeSpecVramCardUnverifiable,
+        m.runtimeSpecVramCardDrift,
+      ]) {
+        expect(text.length).toBeGreaterThan(30);
       }
     }
   });

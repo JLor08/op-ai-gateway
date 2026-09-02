@@ -5408,7 +5408,15 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
       mappings: [makeMapping({ id: 'map_1' })],
       specsByMappingId: { map_1: twoCardSpec() },
       mappingBenchmarks: vi.fn(async () => [
-        vramHistoryRun([], { inconclusive: 'already_resident' }),
+        // The row carries a POSITIVE per-GPU number as well as the reason, so
+        // what rejects it is the `inconclusive` gate itself. With `gpus: []`
+        // the "at least one applicable number" gate rejects it either way and
+        // this test would pass with the reason check deleted -- and the reason
+        // vocabulary is persisted, so this portal decodes rows written by
+        // other builds and each gate must hold on the payload alone.
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528 })], {
+          inconclusive: 'already_resident',
+        }),
       ]) as unknown as PortalApi['mappingBenchmarks'],
     });
 
@@ -5447,6 +5455,92 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
 
     expect(await screen.findByLabelText(t.runtimeSpecBinary)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
+  });
+
+  // F8: an index is not an identity. The run records a card fingerprint for
+  // exactly one reason -- catching a renumbering between the measurement and
+  // the moment an operator adopts the number -- and until this comparison
+  // existed the value was written, shipped through the DTO and read by
+  // nothing, while the history table still named the UUID it had captured.
+  const nvidiaCard = (index: number, uuid: string) => ({
+    index,
+    name: 'NVIDIA RTX 6000',
+    uuid,
+    memory_total_bytes: 24576 * 1048576,
+  });
+
+  it('withholds the number when the card at this index is not the one measured', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      // The run measured GPU-abc at index 1; a driver reset has since put
+      // GPU-bbb there.
+      hardware: makeHardware([nvidiaCard(0, 'GPU-aaa'), nvidiaCard(1, 'GPU-bbb')]),
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([
+          vramItem({ index: 0, delta_mb: 22528, fingerprint: 'GPU-aaa', fingerprint_kind: 'uuid' }),
+          vramItem({ index: 1, delta_mb: 21500, fingerprint: 'GPU-abc', fingerprint_kind: 'uuid' }),
+        ]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecVramBenchmark);
+    // Row 0 still matches, so it keeps its offer; row 1 loses it entirely --
+    // no number on screen to be read as this card's cost, and no button to
+    // put a foreign card's 21500 MB into the admission arithmetic.
+    expect(screen.getAllByRole('button', { name: t.runtimeSpecVramApply })).toHaveLength(1);
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecVramBenchmark) as HTMLInputElement[]).map(
+        (el) => el.value,
+      ),
+    ).toEqual(['22528']);
+    expect(screen.queryByText('21500')).not.toBeInTheDocument();
+    expect(vramField(1).value).toBe('22000');
+    // And it SAYS so, naming both cards: "which card was it then, and which
+    // is it now" is the operator's next question.
+    expect(screen.getByText(t.runtimeSpecVramCardDrift)).toBeInTheDocument();
+    expect(screen.getByText(`${t.runtimeGpuDriftExpected}: GPU-abc`)).toBeInTheDocument();
+    expect(screen.getByText(`${t.runtimeGpuDriftCurrent}: GPU-bbb`)).toBeInTheDocument();
+  });
+
+  it('names the comparison it actually made when the card still matches', async () => {
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      hardware: makeHardware([nvidiaCard(0, 'GPU-aaa'), nvidiaCard(1, 'GPU-bbb')]),
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([
+          vramItem({ index: 0, delta_mb: 22528, fingerprint: 'GPU-aaa', fingerprint_kind: 'uuid' }),
+        ]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecVramBenchmark);
+    expect(screen.getByRole('button', { name: t.runtimeSpecVramApply })).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecVramCardVerifiedUuid)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramCardUnverifiable)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramCardDrift)).not.toBeInTheDocument();
+  });
+
+  it('says CANNOT VERIFY, not "verified", when there was no identifier to compare', async () => {
+    // GPUSample.UUID is NVIDIA-only, so an empty fingerprint is the normal
+    // case on exactly the AMD and Apple hosts the delta strategy exists for.
+    // The offer stands there -- withholding it would kill the feature on
+    // those hosts -- but it must not borrow the verified sentence.
+    await openSpecEdit({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: twoCardSpec() },
+      hardware: makeHardware([{ index: 0, name: '', memory_total_bytes: 0 }]),
+      mappingBenchmarks: vi.fn(async () => [
+        vramHistoryRun([vramItem({ index: 0, delta_mb: 22528 })]),
+      ]) as unknown as PortalApi['mappingBenchmarks'],
+    });
+
+    await screen.findByLabelText(t.runtimeSpecVramBenchmark);
+    expect(screen.getByRole('button', { name: t.runtimeSpecVramApply })).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecVramCardUnverifiable)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramCardVerifiedUuid)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecVramCardVerifiedNameTotal)).not.toBeInTheDocument();
   });
 
   it('offers nothing on the CREATE form, which has no measurement yet', async () => {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { BenchmarkRunDTO, VRAMGPUItemDTO, VRAMReportDTO } from '../../api';
+import type { BenchmarkRunDTO, HardwareGPU, VRAMGPUItemDTO, VRAMReportDTO } from '../../api';
 import type { MessageKey } from './types';
 
 /**
@@ -37,10 +37,12 @@ const warningLabelKeys: Readonly<Record<string, MessageKey>> = {
   undeclared_gpu_allocation: 'benchmarkVramWarningUndeclaredGpu',
 };
 
-// What the run actually COMPARED to decide the number belongs to this card.
-// Deliberately no "verified" without a qualifier: `name_total` catches a swap
-// between unlike cards only, and two identical cards trading indices are
-// indistinguishable that way.
+// Which field IDENTIFIED the card at measurement time -- a record of what the
+// run captured, not of a comparison it made. The comparison happens later and
+// elsewhere (`vramCardCheck`, when an operator is offered the number), so
+// nothing here may read as "verified": `name_total` catches a swap between
+// unlike cards only, two identical cards trading indices are indistinguishable
+// that way, and an empty kind means no identifying field was available at all.
 const fingerprintLabelKeys: Readonly<Record<string, MessageKey>> = {
   uuid: 'benchmarkVramFingerprintUuid',
   name_total: 'benchmarkVramFingerprintNameTotal',
@@ -59,6 +61,111 @@ export function vramWarningLabelKey(warning: string): MessageKey {
 /** What identified the card, named — never a bare "verified". */
 export function vramFingerprintLabelKey(kind: string | undefined): MessageKey {
   return (kind && fingerprintLabelKeys[kind]) || 'benchmarkVramFingerprintNone';
+}
+
+// 1 MiB, NOT 10^6 -- the unit every VRAM figure in this feature is in (the
+// backend's vramBytesPerMB, the agent's per-process measurer, every estimate
+// and every budget). Two units for one number is a wrong number, not a
+// rounding difference, and here it would turn a matching card into drift.
+const VRAM_BYTES_PER_MB = 1024 * 1024;
+
+/**
+ * One live card's fingerprint, in the SAME shape the run recorded for it, so
+ * the two can be compared as strings.
+ *
+ * A deliberate local mirror of the backend's `vramFingerprintOf`, not a
+ * derivation: the recorded string is PERSISTED verbatim inside a
+ * `kind = "vram"` history row's `vram_json` and read back here days later, so
+ * its format is a closed vocabulary exactly like the reason and
+ * fingerprint-kind sets above — which is why the two shapes are pinned by
+ * tests on both sides rather than by a shared serializer.
+ *
+ * `''` means this card cannot supply the field at all, which is "cannot
+ * verify" and never "drift".
+ */
+function vramLiveFingerprint(live: HardwareGPU, kind: string): string {
+  if (kind === 'uuid') return (live.uuid ?? '').trim();
+  const name = (live.name ?? '').trim();
+  const total =
+    live.memory_total_bytes > 0
+      ? `${Math.floor(live.memory_total_bytes / VRAM_BYTES_PER_MB)} MB`
+      : '';
+  if (name && total) return `${name} / ${total}`;
+  return name || total;
+}
+
+/**
+ * What comparing the recorded card fingerprint against the live card at that
+ * index actually established.
+ *
+ * Three outcomes and no fourth, because the recorded fingerprint exists for
+ * exactly one job — catching a renumbering between the measurement and the
+ * moment an operator adopts the number — and each outcome is a different
+ * sentence:
+ *
+ *  - `verified`: the field the run recorded still matches the live card, and
+ *    `kind` says WHICH field, because `name_total` catches a swap between
+ *    UNLIKE cards only;
+ *  - `unverifiable`: there is nothing to compare — no fingerprint was recorded
+ *    (`GPUSample.UUID` is NVIDIA-only, and a collector reporting neither a
+ *    name nor a total leaves the field empty on exactly the AMD and Apple
+ *    hosts the delta strategy exists for), or no live card is known at this
+ *    index yet. It must READ differently from `verified`: a check that could
+ *    not be made is not a check that passed;
+ *  - `drifted`: the run measured a demonstrably different card than the one
+ *    sitting at this index now. The number is real but belongs to other
+ *    hardware, so it is named rather than offered.
+ */
+export type VramCardCheck =
+  | { state: 'verified'; kind: 'uuid' | 'name_total' }
+  | { state: 'unverifiable' }
+  | { state: 'drifted'; recorded: string; live: string };
+
+/**
+ * Compares the fingerprint a run recorded for one card against the live card
+ * at that index.
+ *
+ * This is the reader the recorded fingerprint was always for. Without it the
+ * value is written, shipped through the DTO and never looked at, while a
+ * renumbering — a driver reset, a hardware swap — silently redirects a stored
+ * 21500 MB onto whatever card now sits at index 1. Fails toward
+ * `unverifiable`, never toward `verified`: an absent identifier on EITHER side
+ * means "no drift detection available here", the same rule the per-GPU budget
+ * rows' `expected_uuid` detector applies.
+ */
+export function vramCardCheck(
+  item: VRAMGPUItemDTO | undefined,
+  live: HardwareGPU | undefined,
+): VramCardCheck {
+  const recorded = (item?.fingerprint ?? '').trim();
+  const kind = item?.fingerprint_kind ?? '';
+  // A kind this build does not know is not a comparison it can make. Treated
+  // as "cannot verify" rather than as drift, for the same reason an unknown
+  // inconclusive reason gets an honest fallback sentence.
+  if (!recorded || (kind !== 'uuid' && kind !== 'name_total')) return { state: 'unverifiable' };
+  if (!live) return { state: 'unverifiable' };
+  const liveFingerprint = vramLiveFingerprint(live, kind);
+  if (!liveFingerprint) return { state: 'unverifiable' };
+  if (liveFingerprint === recorded) return { state: 'verified', kind };
+  return { state: 'drifted', recorded, live: liveFingerprint };
+}
+
+/**
+ * The sentence for a card check's outcome — what was compared, or why nothing
+ * was. Never a bare "verified": `name_total` cannot tell two identical cards
+ * apart and says so, and `unverifiable` says that no check was possible.
+ */
+export function vramCardCheckLabelKey(check: VramCardCheck): MessageKey {
+  switch (check.state) {
+    case 'verified':
+      return check.kind === 'uuid'
+        ? 'runtimeSpecVramCardVerifiedUuid'
+        : 'runtimeSpecVramCardVerifiedNameTotal';
+    case 'drifted':
+      return 'runtimeSpecVramCardDrift';
+    default:
+      return 'runtimeSpecVramCardUnverifiable';
+  }
 }
 
 /** Which of the two reported numbers an apply affordance would fill the field with. */
@@ -105,6 +212,12 @@ export function vramApplyNumber(item: VRAMGPUItemDTO | undefined): VramApplyNumb
  *  - at least one applicable per-GPU number, by the rule above.
  *
  * The history endpoint returns newest-first, so the first match is the newest.
+ *
+ * A fifth gate is deliberately NOT here, because it is per CARD rather than
+ * per run: `vramCardCheck` compares each item's recorded fingerprint against
+ * the live card at that index. A run can be entirely valid and still describe
+ * hardware that has since been renumbered, so selecting the run and trusting
+ * its cards are two different questions.
  */
 export function latestApplicableVramRun(
   runs: readonly BenchmarkRunDTO[],
