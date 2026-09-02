@@ -11,15 +11,24 @@ import (
 )
 
 // This file is the PURE half of the Windows per-process VRAM measurer: the
-// counter-instance name grammar, the pci.bus_id grammar, and the aggregation
-// into the nested map runtime.Manager.SetMeasurer expects. It carries NO build
-// tag on purpose, exactly like wmi_map.go next to hwinfo_windows.go: CI runs
-// on ubuntu-latest and never builds, vets or tests GOOS=windows, so anything
-// behind `//go:build windows` is verified by review alone. Everything that can
-// be wrong about a number -- a swapped LUID field, a hex/decimal mix-up, a
-// mis-summed multi-GPU model, a 0 escaping as if it were a measurement -- lives
-// here, where a unit test on Linux exercises the very code Windows runs. Only
-// the syscalls themselves are in nvidia_pdh_windows.go.
+// counter-instance name grammar, the pci.bus_id grammar, the LUID -> GPU-index
+// resolution and its two caches, and the aggregation into the nested map
+// runtime.Manager.SetMeasurer expects. It carries NO build tag on purpose,
+// exactly like wmi_map.go next to hwinfo_windows.go: CI runs on ubuntu-latest
+// and never builds, vets or tests GOOS=windows, so anything behind
+// `//go:build windows` is verified by review alone. Everything that can be
+// wrong about a number -- a swapped LUID field, a hex/decimal mix-up, a
+// mis-summed multi-GPU model, a 0 escaping as if it were a measurement, an
+// adapter written off as unmeasurable on no evidence -- lives here, where a
+// unit test on Linux exercises the very code Windows runs. Only the syscalls
+// themselves are in nvidia_pdh_windows.go.
+//
+// The last of those was not on the list originally. resolvePDHLUIDs started
+// out inside the Windows file and permanently negative-cached good adapters
+// after a single nvidia-smi timeout; review caught it, no test could have.
+// The line to hold is that a DECISION belongs here even when it is reached
+// only from Windows -- what the file is tagged for is the syscall, not the
+// reasoning around it.
 //
 // Why this measurer exists at all: on Windows the WDDM driver model puts the
 // OS, not the NVIDIA driver, in charge of GPU memory, so
