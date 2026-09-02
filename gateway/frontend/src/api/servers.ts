@@ -710,6 +710,27 @@ export function serversApi(fetcher: Fetcher) {
         `/api/portal/mappings/${encodeURIComponent(id)}/probe-context`,
         { method: 'POST' },
       ),
+    // The VRAM measurement: loads this mapping's model ALONE on its server
+    // (force-stopping every agent-managed spec on the box, the target
+    // included) and measures what it costs. 202 + initial BenchmarkStatus
+    // (running=true, mode "vram"); poll benchmarkStatus(serverId) to
+    // completion, then read results[0].vram. Its own endpoint rather than a
+    // fifth ?mode= value, because every mode is a per-target measurement
+    // inside a fan-out over a scope while this run drains the whole server
+    // once and loads exactly one model.
+    //
+    // Does NOT persist either VRAM field: the run REPORTS a number (and a
+    // kind:"vram" history row as evidence), and the operator applies it to
+    // their own vram_estimate_mb in the launch-spec form. A 409 with one of
+    // benchmark.vram_{not_agent_managed,isolation_unavailable,no_gpu_samples,
+    // isolation_blocked} is a precondition refusal: nothing was reserved and
+    // no spec was written.
+    probeMappingVram: (id: string) =>
+      request<BenchmarkStatus>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(id)}/probe-vram`,
+        { method: 'POST' },
+      ),
     // GET the per-mapping benchmark run history (newest-first).
     mappingBenchmarks: (mappingId: string) =>
       request<{ data: BenchmarkRunDTO[] }>(

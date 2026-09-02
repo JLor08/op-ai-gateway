@@ -2355,3 +2355,99 @@ describe('per-application TLS-proxy opt-out i18n keys', () => {
     }
   });
 });
+
+describe('VRAM-benchmark portal i18n keys', () => {
+  const stringKeys = [
+    'benchmarkTypeVram',
+    'benchmarkTypeVramHint',
+    'benchmarkVramRunningNote',
+    'benchmarkVramResultTitle',
+    'benchmarkVramRuns',
+    'benchmarkVramIsolationConfirmed',
+    'benchmarkVramIsolationUnconfirmed',
+    'benchmarkVramNoReport',
+    'benchmarkVramDrained',
+    'benchmarkVramDrainedNote',
+    'benchmarkVramRestoreFailed',
+    'benchmarkVramWarnings',
+    'benchmarkVramWarningNonManaged',
+    'benchmarkVramWarningPostTransport',
+    'benchmarkVramWarningUnknown',
+    'benchmarkVramColIndex',
+    'benchmarkVramColBaseline',
+    'benchmarkVramColDelta',
+    'benchmarkVramColMeasured',
+    'benchmarkVramColCard',
+    'benchmarkVramFingerprintUuid',
+    'benchmarkVramFingerprintNameTotal',
+    'benchmarkVramFingerprintNone',
+    'benchmarkVramUnifiedMemory',
+    'benchmarkVramNotAttributable',
+    'benchmarkVramInconclusiveTitle',
+    'benchmarkVramInconclusiveIsolationTimeout',
+    'benchmarkVramInconclusiveBaselineUnstable',
+    'benchmarkVramInconclusivePostLoadUnstable',
+    'benchmarkVramInconclusiveAlreadyResident',
+    'benchmarkVramInconclusiveBelowFloor',
+    'benchmarkVramInconclusiveNoSamples',
+    'benchmarkVramInconclusiveRunFailed',
+    'benchmarkVramInconclusiveUnknown',
+    'runtimeSpecVramBenchmark',
+    'runtimeSpecVramApply',
+    'runtimeSpecVramApplyHint',
+    'runtimeSpecVramBenchmarkFrom',
+    'runtimeSpecVramBenchmarkSourceDelta',
+    'runtimeSpecVramBenchmarkSourceMeasured',
+  ] as const;
+
+  it('defines every new key in de and en', () => {
+    for (const k of stringKeys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('gives the seven inconclusive reasons seven DISTINCT sentences, in both locales', () => {
+    // The reason IS the operator's next action (D4/D5): two reasons sharing one
+    // sentence would send them to the wrong place, which is worse than "no
+    // result" with no explanation at all.
+    for (const locale of ['de', 'en'] as const) {
+      const reasons = new Set([
+        messages[locale].benchmarkVramInconclusiveIsolationTimeout,
+        messages[locale].benchmarkVramInconclusiveBaselineUnstable,
+        messages[locale].benchmarkVramInconclusivePostLoadUnstable,
+        messages[locale].benchmarkVramInconclusiveAlreadyResident,
+        messages[locale].benchmarkVramInconclusiveBelowFloor,
+        messages[locale].benchmarkVramInconclusiveNoSamples,
+        messages[locale].benchmarkVramInconclusiveRunFailed,
+      ]);
+      expect(reasons.size).toBe(7);
+    }
+  });
+
+  it('never renders "no result" as a zero, and never as a bare label', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].benchmarkVramInconclusiveTitle).not.toMatch(/0/);
+      for (const k of stringKeys.filter((key) => key.startsWith('benchmarkVramInconclusive'))) {
+        if (k === 'benchmarkVramInconclusiveTitle') continue;
+        // Every reason is a sentence naming an action, not a two-word tag.
+        expect(messages[locale][k].length).toBeGreaterThan(30);
+      }
+    }
+  });
+
+  it('says the apply affordance FILLS the field rather than saving it, in both locales', () => {
+    // The whole ownership rule the affordance rests on: the run reports, the
+    // operator applies and saves. A hint that read "applies the measurement"
+    // would describe a writer.
+    expect(messages.de.runtimeSpecVramApplyHint).toMatch(/Speichern/);
+    expect(messages.en.runtimeSpecVramApplyHint).toMatch(/Save/);
+  });
+
+  it('labels the unified-memory figure as system RAM in both locales', () => {
+    expect(messages.de.benchmarkVramUnifiedMemory).toMatch(/System-RAM/);
+    expect(messages.en.benchmarkVramUnifiedMemory).toMatch(/system RAM/);
+  });
+});
