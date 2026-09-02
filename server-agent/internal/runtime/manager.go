@@ -380,7 +380,10 @@ func (m *Manager) Transitions() <-chan struct{} {
 
 // SetMeasurer installs f, which is called with every currently-live managed
 // PID to get real per-GPU VRAM usage instead of a spec's static estimate
-// (main.go wires this to nvidia-smi). f may be nil to go back to estimates
+// (main.go wires this to collector.NewVRAMMeasurer, which picks a
+// platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
+// per-process query returns [N/A] under WDDM, and nvidia-smi
+// --query-compute-apps everywhere else). f may be nil to go back to estimates
 // only, which is also NewManager's default -- measurement is a hardware
 // capability, not a negotiated protocol feature, so every AMD, Apple and
 // CPU-only host simply never installs one and is entirely unaffected by
@@ -396,9 +399,20 @@ func (m *Manager) Transitions() <-chan struct{} {
 //
 // f MUST BOUND ITS OWN RUNTIME. Nothing here interrupts it: on the owner it
 // stalls every Status() and EnsureRunning for its duration, and off the owner
-// it is tracked in the Manager's WaitGroup, so Close waits for it. The
-// shipped measurer uses a 2s context deadline covering both of its subprocess
-// spawns.
+// it is tracked in the Manager's WaitGroup, so Close waits for it.
+//
+// How each shipped measurer meets that is worth knowing, because they meet it
+// differently and only one of them meets it end to end. The compute-apps
+// measurer is entirely subprocess work and puts a 2s context deadline
+// (collector.nvidiaMeasureTimeout) over all of it. The Windows PDH measurer
+// bounds its one subprocess with the same deadline -- and spawns none at all
+// in the steady state -- but its PDH and D3DKMT syscalls, which are what runs
+// on every admission, are in-process Win32 calls under NO deadline: there is
+// nothing to cancel and no way to interrupt them, so a slow PDH provider
+// stalls the owner for however long it takes. That is accepted (a wedged
+// performance-counter provider is a broken host, and the alternative is a
+// goroutine handing an abandoned buffer to the kernel), not overlooked -- but
+// do not read "the shipped measurer is deadline-bounded" off this comment.
 func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	if f == nil {
 		m.measurer.Store(nil)
@@ -1275,8 +1289,10 @@ func (o *owner) admitAndStart(specID string) {
 //
 // NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
 // most: every AMD, Apple unified-memory and CPU-only deployment lands here
-// (collector.NewNvidiaComputeApps returns nil when nvidia-smi is off PATH,
-// and nil is also NewManager's default). Those hosts take the first branch,
+// (collector.NewVRAMMeasurer returns nil when the host cannot support the
+// platform's measurer at all -- nvidia-smi off PATH everywhere, and on
+// Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
+// NewManager's default). Those hosts take the first branch,
 // spawn nothing, allocate nothing, and behave exactly as they did before this
 // function existed.
 //

@@ -387,8 +387,19 @@ func resolvePDHLUIDs(
 // exists for. That is the live bug on Windows today (nvidia-smi's `[N/A]` ->
 // naInt -> 0 -> a non-nil map of zeros), and this measurer must not reproduce
 // it in a new shape. An absent key means "not measured", which falls back to
-// the estimate; an estimate is the safe direction, because it is never smaller
-// than reality by accident.
+// the estimate.
+//
+// Falling back is the BETTER direction, not a safe one, and the difference
+// matters. An operator-entered estimate is generally larger than reality --
+// people round up -- so charging it usually over-books the GPU rather than
+// under-booking it. But `0` is the documented default for an estimate and
+// means "unknown", and a running occupant charged 0 is indistinguishable in
+// Admit's rule-3 sum from one that genuinely needs 0 MB (policy.go: `sum +=
+// v`). Rule 4's "unknown VRAM starts alone" only fires when the unknown spec
+// is the CANDIDATE. So on a host where no measurement has yet round-tripped
+// through the gateway, admission can still under-count -- which is a reason to
+// keep this function honest about what it does not know, not a reason to let
+// it emit a 0 that would make the same hole permanent.
 func attributePDHDedicated(instances []pdhProcessMemory, luidToIndex map[pdhLUID]int, pids []int) map[int]map[int]int {
 	wanted := make(map[int]bool, len(pids))
 	for _, p := range pids {
