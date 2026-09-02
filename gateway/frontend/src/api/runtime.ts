@@ -93,10 +93,26 @@ export interface RuntimeError {
   stderr_tail?: string;
 }
 
+// One GPU's measured VRAM as carried on THIS status frame (mirrors the Go
+// RuntimeGPUStatusDTO). Only a strictly positive measurement appears: 0 means
+// unknown throughout the runtime feature and is dropped on ingest.
+export interface RuntimeGPUStatus {
+  index: number;
+  vram_measured_mb: number;
+}
+
 // One agent-managed model process's live state, as published on the
-// `snapshot`/`update` SSE stream (GET .../runtime/events). Deliberately has
-// NO gpu field: measured VRAM reaches the UI through the spec's own
-// gpus[].vram_measured_mb after the write-back, never through this stream.
+// `snapshot`/`update` SSE stream (GET .../runtime/events).
+//
+// `gpus` + `measured_at` are a WATERMARK and are omitted together: a frame that
+// measured nothing (no measurer on the host, or a spec with no live process)
+// carries neither, so a timestamp never appears with nothing to be fresh about.
+// `measured_at` is the GATEWAY's arrival time for the frame that carried the
+// measurement, not the agent's self-reported `reported_at`. This is the only
+// place a measurement's AGE is available: the spec's own
+// gpus[].vram_measured_mb (from the write-back) stays the durable value but
+// carries no timestamp and is not rewritten when it does not change, so reading
+// it back tells you nothing about when it was taken.
 export interface RuntimeStatus {
   spec_id: string;
   model: string;
@@ -106,6 +122,8 @@ export interface RuntimeStatus {
   port?: number;
   in_flight: number;
   restarts: number;
+  gpus?: RuntimeGPUStatus[];
+  measured_at?: string;
   last_error?: RuntimeError;
 }
 

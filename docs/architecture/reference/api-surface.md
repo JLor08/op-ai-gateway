@@ -202,10 +202,19 @@ Conventions worth stating, because each is a judgement call a client depends on:
   server-wide list with no per-application filter, and must join rows back to
   operator-facing names itself via `spec_id → spec.mapping_id → mapping`. Row
   shape: `{spec_id, model, state, since, pid?, port?, in_flight, restarts,
-  last_error?}` with `last_error = {message, at, exit_code, failures,
-  stderr_tail?}`. There is deliberately **no GPU field** — measured VRAM reaches
-  the UI through the spec's `gpus[].vram_measured_mb` after the agent's
-  write-back.
+  gpus?, measured_at?, last_error?}` with `last_error = {message, at, exit_code,
+  failures, stderr_tail?}` and `gpus = [{index, vram_measured_mb}]`.
+- **`gpus`/`measured_at` are a watermark, and they are omitted together.**
+  `measured_at` is the **gateway's** arrival time for the frame that carried the
+  measurement, not the agent's self-reported `reported_at`; a frame that measured
+  nothing (no measurer on the host, or a spec with no live process) carries
+  neither key, and a measured `0` — *unknown*, everywhere in this feature — is
+  dropped rather than published. This is the only way to learn a measurement's
+  AGE: the durable value on the spec's `gpus[].vram_measured_mb` carries no
+  timestamp and is not rewritten when it does not change, so polling the spec
+  reads an arbitrarily old number as a fresh one. A consumer that needs a
+  measurement it can attribute to something it just did must take it from a frame
+  that arrived after that event.
 - **The runtime-report response deliberately reuses the hardware panel's
   envelope**: `{available, collected_at?, updated_at?, report?, agent_version,
   agent_features}`. `available: false` means no report has ever been stored, not

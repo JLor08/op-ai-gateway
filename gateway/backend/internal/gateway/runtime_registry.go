@@ -29,20 +29,53 @@ type RuntimeErrorDTO struct {
 	StderrTail string    `json:"stderr_tail,omitempty"`
 }
 
+// RuntimeGPUStatusDTO is one GPU's measured VRAM for a managed process, as
+// carried on THIS status frame (mirrors agentRuntimeGPUSample field-for-field).
+// Only a strictly positive measurement appears here: a measured 0 means
+// UNKNOWN throughout the runtime feature, and the store write-back drops it on
+// the same rule.
+type RuntimeGPUStatusDTO struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
 // RuntimeStatusDTO is one agent-managed model process's live state, as
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
-// for every field it carries; it deliberately omits GPUs -- per-GPU measured
-// VRAM feeds the store write-back, not the live status view).
+// for every field it carries).
 type RuntimeStatusDTO struct {
-	SpecID    string           `json:"spec_id"`
-	Model     string           `json:"model"`
-	State     string           `json:"state"`
-	Since     time.Time        `json:"since"`
-	PID       int              `json:"pid,omitempty"`
-	Port      int              `json:"port,omitempty"`
-	InFlight  int              `json:"in_flight"`
-	Restarts  int              `json:"restarts"`
-	LastError *RuntimeErrorDTO `json:"last_error,omitempty"`
+	SpecID   string    `json:"spec_id"`
+	Model    string    `json:"model"`
+	State    string    `json:"state"`
+	Since    time.Time `json:"since"`
+	PID      int       `json:"pid,omitempty"`
+	Port     int       `json:"port,omitempty"`
+	InFlight int       `json:"in_flight"`
+	Restarts int       `json:"restarts"`
+	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
+	// GATEWAY's own arrival time for the frame that carried it -- never the
+	// agent's self-reported reported_at, which is a claim rather than an
+	// observation. Both are omitted together when the frame measured nothing
+	// (no measurer on the host, or a spec with no live process), so a consumer
+	// never sees a timestamp with nothing to be fresh about.
+	//
+	// This is a WATERMARK, and it exists because the STORED value cannot carry
+	// one: routing.RuntimeSpecGPU is {SpecID, GPUIndex, VRAMEstimateMB,
+	// VRAMMeasuredMB} with no timestamp, and writeBackRuntimeVRAM deliberately
+	// skips an unchanged value -- so a store poll reads an arbitrarily old
+	// number as a fresh one, and demanding that the number CHANGE fails in the
+	// normal case where a run measures exactly what the last one did. A reader
+	// that must attribute a measurement to something it just did (the VRAM
+	// benchmark) accepts only a value carried by a frame that arrived after
+	// the event it cares about. The write-back to the spec's own
+	// vram_measured_mb column is unchanged and remains the durable path.
+	//
+	// MeasuredAt is tagged `omitzero`, NOT `omitempty`: omitempty has no
+	// effect on a struct type, so a zero time.Time under it would reach every
+	// client as "0001-01-01T00:00:00Z" -- a timestamp that reads as a real
+	// (very stale) measurement instead of as no measurement.
+	GPUs       []RuntimeGPUStatusDTO `json:"gpus,omitempty"`
+	MeasuredAt time.Time             `json:"measured_at,omitzero"`
+	LastError  *RuntimeErrorDTO      `json:"last_error,omitempty"`
 }
 
 // agentFeaturesRegistry records, per server, the feature-name set the

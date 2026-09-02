@@ -100,9 +100,13 @@ type agentTelemetryRequest struct {
 
 // agentRuntimeGPUSample is one GPU's measured VRAM inside an
 // agentRuntimeSample, the gateway-side mirror of the agent's per-runtime GPU
-// sample (agent-runtime-manager Task 9). Consumed ONLY by the VRAM
-// write-back (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO,
-// which carries no per-GPU detail.
+// sample (agent-runtime-manager Task 9). It has TWO independent consumers, and
+// they answer different questions: the VRAM write-back
+// (writeBackRuntimeVRAM) persists it onto the spec's GPU row as the durable
+// value admission reads, and runtimeStatusDTOsFromSamples republishes it on
+// the volatile status stream together with the gateway's arrival time -- the
+// only place a reader can learn HOW OLD a measurement is, since the stored
+// row carries no timestamp (see RuntimeStatusDTO.GPUs/MeasuredAt).
 type agentRuntimeGPUSample struct {
 	Index          int `json:"index"`
 	VRAMMeasuredMB int `json:"vram_measured_mb"`
@@ -126,13 +130,12 @@ type agentRuntimeError struct {
 // the telemetry sample (agent-runtime-manager Task 9, design spec §7/§9):
 // state machine phase, OS-level identifiers, in-flight/restart counters, and
 // the last-error detail that back the portal's live runtime status stream.
-// GPUs (measured VRAM) is consumed separately, ONLY by the store write-back
-// (writeBackRuntimeVRAM) -- it never reaches RuntimeStatusDTO, which carries
-// no per-GPU detail (see agentRuntimeGPUSample's doc). SpecID ties it back to
-// the launch spec (runtime-config's AgentRuntimeSpecDTO.ID) the gateway
-// itself handed the agent, so there is no ambiguity about which
-// mapping/model this entry describes even when the agent has not (yet)
-// resolved Model.
+// GPUs (measured VRAM) has two consumers -- the store write-back
+// (writeBackRuntimeVRAM) and the status stream's watermark -- see
+// agentRuntimeGPUSample's doc. SpecID ties it back to the launch spec
+// (runtime-config's AgentRuntimeSpecDTO.ID) the gateway itself handed the
+// agent, so there is no ambiguity about which mapping/model this entry
+// describes even when the agent has not (yet) resolved Model.
 type agentRuntimeSample struct {
 	SpecID    string                  `json:"spec_id"`
 	Model     string                  `json:"model"`
@@ -167,7 +170,13 @@ func clampRuntimeStderrTail(s string) string {
 // always returning a non-nil slice (a nil req.Runtimes -- a legacy agent, or
 // simply a fleet with nothing managed yet -- must publish an EMPTY snapshot,
 // not a JSON null, to any live SSE subscriber).
-func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample) []RuntimeStatusDTO {
+//
+// receivedAt is the GATEWAY's own arrival time for this sample, stamped onto
+// every entry that actually carries a measurement as
+// RuntimeStatusDTO.MeasuredAt -- see that field for why the watermark cannot
+// come from the store, and why it is deliberately not the agent's
+// self-reported reported_at.
+func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.Time) []RuntimeStatusDTO {
 	out := make([]RuntimeStatusDTO, 0, len(samples))
 	for _, rt := range samples {
 		dto := RuntimeStatusDTO{
@@ -179,6 +188,19 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample) []RuntimeStatusD
 			Port:     rt.Port,
 			InFlight: rt.InFlight,
 			Restarts: rt.Restarts,
+		}
+		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
+		// writeBackRuntimeVRAM applies to this very array on the store side.
+		// Dropping it here keeps GPUs (and therefore MeasuredAt) absent rather
+		// than publishing a fresh-looking nothing.
+		for _, gpu := range rt.GPUs {
+			if gpu.VRAMMeasuredMB <= 0 {
+				continue
+			}
+			dto.GPUs = append(dto.GPUs, RuntimeGPUStatusDTO(gpu))
+		}
+		if len(dto.GPUs) > 0 {
+			dto.MeasuredAt = receivedAt
 		}
 		if rt.LastError != nil {
 			dto.LastError = &RuntimeErrorDTO{
@@ -705,7 +727,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// registry update in this block: a report is evidence about what the
 	// agent is running RIGHT NOW, and stamping it while the sample itself
 	// failed to persist would claim freshness the gateway does not have.
-	s.RuntimeStatus.publish(serverID, runtimeStatusDTOsFromSamples(req.Runtimes))
+	s.RuntimeStatus.publish(serverID, runtimeStatusDTOsFromSamples(req.Runtimes, now))
 	// Best-effort write-back of each managed process's measured VRAM onto its
 	// launch spec (skipped for a VRAMLocked spec) -- see writeBackRuntimeVRAM.
 	// Never rejects the sample; a failure here is logged and dropped.

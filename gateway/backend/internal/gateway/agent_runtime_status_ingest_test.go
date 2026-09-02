@@ -474,3 +474,97 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing
 		t.Fatalf("VRAMMeasuredMB = %d, want the changed 22500", gpus[0].VRAMMeasuredMB)
 	}
 }
+
+// TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredVRAMWatermark proves
+// the live status stream carries this sample's per-GPU measured VRAM together
+// with the GATEWAY's own arrival time for the frame that carried it. The
+// stored row cannot supply that watermark -- routing.RuntimeSpecGPU has no
+// timestamp and the write-back deliberately skips an unchanged value -- so a
+// consumer polling the store cannot tell this run's measurement from one
+// taken last week. The stamp is the gateway's clock, never the agent's
+// self-reported reported_at.
+func TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredVRAMWatermark(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_watermark", false)
+
+	// A deliberately stale agent-reported timestamp: the watermark must NOT
+	// come from it.
+	staleReport := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	body := `{"reported_at":"2020-01-01T00:00:00Z","host":{"cpu_util_pct":1},"runtimes":[` +
+		`{"spec_id":"rspec_watermark","state":"running","gpus":[{"index":0,"vram_measured_mb":21000},{"index":3,"vram_measured_mb":1500}]}]}`
+	req, raw := ingestReq(t, body)
+
+	before := time.Now().UTC()
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	after := time.Now().UTC()
+
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %#v, want one entry", snap)
+	}
+	got := snap[0]
+	if len(got.GPUs) != 2 {
+		t.Fatalf("status GPUs = %#v, want both measured indices", got.GPUs)
+	}
+	if got.GPUs[0].Index != 0 || got.GPUs[0].VRAMMeasuredMB != 21000 ||
+		got.GPUs[1].Index != 3 || got.GPUs[1].VRAMMeasuredMB != 1500 {
+		t.Fatalf("status GPUs = %#v", got.GPUs)
+	}
+	if got.MeasuredAt.Before(before) || got.MeasuredAt.After(after) {
+		t.Fatalf("MeasuredAt = %v, want the gateway's own arrival time within [%v, %v]", got.MeasuredAt, before, after)
+	}
+	if got.MeasuredAt.Equal(staleReport) {
+		t.Fatal("MeasuredAt took the agent's self-reported reported_at, which is not a gateway observation")
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement
+// proves the stream never claims a freshness it has no measurement for: a
+// frame that measured nothing (no measurer on the host, or a spec that is not
+// running) carries no GPU rows and no timestamp, and a measured value of 0 --
+// which means UNKNOWN everywhere else in this feature, and which the store
+// write-back drops on the same rule -- does not become one.
+func TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement(t *testing.T) {
+	cases := []struct {
+		name string
+		gpus string
+	}{
+		{name: "no gpus key at all", gpus: ""},
+		{name: "an empty gpus array", gpus: `,"gpus":[]`},
+		{name: "a measured 0 means unknown", gpus: `,"gpus":[{"index":0,"vram_measured_mb":0}]`},
+		{name: "a negative measurement is not a measurement", gpus: `,"gpus":[{"index":0,"vram_measured_mb":-5}]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, "rspec_nomeasure", false)
+			body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_nomeasure","state":"running"` + tc.gpus + `}]}`
+			req, raw := ingestReq(t, body)
+			if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+			defer unsub()
+			if len(snap) != 1 {
+				t.Fatalf("snapshot = %#v, want one entry", snap)
+			}
+			if len(snap[0].GPUs) != 0 {
+				t.Fatalf("status GPUs = %#v, want none", snap[0].GPUs)
+			}
+			if !snap[0].MeasuredAt.IsZero() {
+				t.Fatalf("MeasuredAt = %v, want the zero time (no measurement to be fresh about)", snap[0].MeasuredAt)
+			}
+			// The wire must omit both, not send `"gpus":null,"measured_at":"0001-01-01T00:00:00Z"`.
+			payload, err := json.Marshal(snap[0])
+			if err != nil {
+				t.Fatalf("marshal status: %v", err)
+			}
+			if strings.Contains(string(payload), "gpus") || strings.Contains(string(payload), "measured_at") {
+				t.Fatalf("status JSON = %s, want no gpus/measured_at keys", payload)
+			}
+		})
+	}
+}

@@ -269,8 +269,20 @@ Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
 The gateway-side runtime status this feeds is held in a **volatile in-RAM
 registry and never persisted** (a stderr tail can carry prompt fragments, which
 the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
-on ingest, and the status DTO deliberately has no GPU field — measured VRAM
-reaches the UI through the spec's `vram_measured_mb` after the agent's write-back.
+on ingest.
+
+**`gpus[]` has two independent consumers, and they answer different
+questions.** The write-back below persists it onto the spec's GPU row — the
+durable value admission reads — while the status stream republishes it with
+`measured_at`, the **gateway's** arrival time for the frame that carried it
+(never the sample's own `reported_at`, which is a claim rather than an
+observation). Only the stream can answer "how old is this number?": the stored
+row carries no timestamp and the write-back skips an unchanged value, so a
+store poll reads an arbitrarily old measurement as a fresh one. A measured `0`
+reaches neither consumer — it means *unknown* — and a frame that measured
+nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
+published with nothing to be fresh about. See [Agent-Managed Model
+Runtime](agent-runtime-manager.md) §10.
 
 **The write-back skips an unchanged value, and the skip lives on the gateway,
 not on the agent.** Rule 2 above forbids the obvious agent-side saving — a spec

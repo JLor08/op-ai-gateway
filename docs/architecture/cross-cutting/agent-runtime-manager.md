@@ -2270,9 +2270,39 @@ can be lost (the `serverPerfRegistry` discipline). Delivery is non-blocking: a
 full subscriber buffer drops that update and the subscriber catches up on the
 next one. The subscribe snapshot can legitimately be a bare nil, so
 non-nil-ness is enforced one layer up at serialization — and must be applied to
-**both** the initial snapshot and every subsequent update. Status rows carry no
-GPU field by design: measured VRAM reaches the UI through the spec's
-`gpus[].vram_measured_mb` after the write-back, never through this stream.
+**both** the initial snapshot and every subsequent update.
+
+**A status row carries the measurement AND its age; the stored row can only
+carry the measurement.** Each row republishes the sample's own
+`gpus[].vram_measured_mb` alongside `measured_at`, the **gateway's** arrival
+time for the frame that carried it — never the agent's self-reported
+`reported_at`, which is a claim rather than an observation. The stored value is
+unchanged and remains the durable path (the write-back onto
+`agent_runtime_spec_gpus`, which is what admission reads), but it cannot answer
+"how old is this number?": `RuntimeSpecGPU` is `{SpecID, GPUIndex,
+VRAMEstimateMB, VRAMMeasuredMB}` with **no timestamp**, and the write-back
+deliberately skips an unchanged value (see [Telemetry, Usage Analytics &
+Observability](telemetry-usage-observability.md) for that skip). So a reader
+polling the store reads an arbitrarily old number as a fresh one, while
+demanding that the number *change* fails in the normal case where a measurement
+lands on exactly the value already stored. A caller that must attribute a
+measurement to something it just did — the VRAM benchmark's strategy (a) — takes
+only a value carried by a frame that arrived **after** the event it cares about,
+which is the same watermark discipline a `stopped` transition needs
+([§11.2](#112-restart-is-a-sequence-not-an-endpoint)).
+
+Two honesty rules on those two fields, and both are contracts:
+
+- **They are omitted together.** A frame that measured nothing — no measurer
+  installed on the host, or a spec with no live process — carries neither, so a
+  consumer never sees a timestamp with nothing to be fresh about. (`measured_at`
+  is tagged `omitzero`, not `omitempty`: `omitempty` has no effect on a struct
+  type, so a zero `time.Time` under it would reach every client as
+  `0001-01-01T00:00:00Z` — a timestamp that reads as a very stale measurement
+  rather than as no measurement.)
+- **A measured `0` is dropped**, exactly as the store write-back drops it: `0`
+  means *unknown* throughout this feature, and publishing it would make an
+  absent measurement look fresh.
 
 For the wire shape of the stream and its unusual envelope key, see
 [HTTP API Surface](../reference/api-surface.md); for the sample's two additive
