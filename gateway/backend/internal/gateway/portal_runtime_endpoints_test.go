@@ -102,6 +102,46 @@ func TestHandlePortalMappingRuntimeSpecPutBadAdminStateReturns400(t *testing.T) 
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutBadEndpointModeReturns400 and
+// TestHandlePortalMappingRuntimeSpecPutBadFlavorReturns400 pin the WIRE
+// contract (status + code) of portal.ErrRuntimeSpecEndpointModeInvalid and
+// portal.ErrRuntimeSpecFlavorInvalid.
+//
+// Both sentinels existed at the internal/portal service level and were
+// unit-tested there with errors.Is, but neither appeared in
+// portalRuntimeSpecErrRows (portal_runtime_endpoints.go), so both fell
+// straight through to the 500 "runtime_spec.request_failed" fallback --
+// exactly the gap TestHandlePortalMappingRuntimeSpecPutBadAdminStateReturns400
+// above already covers for ErrRuntimeSpecAdminStateInvalid, which is the
+// precedent these two follow.
+func TestHandlePortalMappingRuntimeSpecPutBadEndpointModeReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","responses_mode":"bogus"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.endpoint_mode_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.endpoint_mode_invalid", code)
+	}
+}
+
+func TestHandlePortalMappingRuntimeSpecPutBadFlavorReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_flavors":["bogus"]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.flavor_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.flavor_invalid", code)
+	}
+}
+
 func TestHandlePortalMappingRuntimeSpecDeleteReturnsOKTrue(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)

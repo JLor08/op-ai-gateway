@@ -404,24 +404,25 @@ New stable error codes:
 |---|---|---|
 | `responses.endpoint_disabled` | 404 | an inference request to `/v1/responses` resolved to an application/spec whose effective `responses_mode` is `disabled` — an inference-time rejection, never returned by a portal write ([Compatibility & Inference §13](../cross-cutting/compatibility-and-inference.md#13-errors)) |
 | `messages.endpoint_disabled` | 404 | the `/v1/messages` analogue |
-| `application.endpoint_mode_invalid` | 400, but see note | `CreateApplicationRequest`/`UpdateApplicationRequest` carries an unrecognized `responses_mode`/`messages_mode` |
-| `runtime_spec.endpoint_mode_invalid` | 400, but see note | `PutRuntimeSpecRequest` carries an unrecognized `responses_mode`/`messages_mode` |
-| `runtime_spec.flavor_invalid` | 400, but see note | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic` |
+| `application.endpoint_mode_invalid` | 400 | `CreateApplicationRequest`/`UpdateApplicationRequest` carries an unrecognized `responses_mode`/`messages_mode` |
+| `runtime_spec.endpoint_mode_invalid` | 400 | `PutRuntimeSpecRequest` carries an unrecognized `responses_mode`/`messages_mode` |
+| `runtime_spec.flavor_invalid` | 400 | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic` |
 
-The two `.endpoint_disabled` codes are wired end to end and answer 404 exactly
-as listed. **The three validation codes are not**, as shipped: `internal/portal.Service`
-returns them (`ErrApplicationEndpointModeInvalid`, `ErrRuntimeSpecEndpointModeInvalid`,
-`ErrRuntimeSpecFlavorInvalid`) with the documented intent of a 400 — mirroring
-`application.flavor_invalid`, which **is** wired — but none of the three sentinel
-appears in `portalApplicationErrRows`, `portalRuntimeSpecErrRows`, or
-`sharedErrorMap` (`internal/gateway/error_map.go`). A request that trips one of
-them today falls through to the generic fallback instead: `500
-application.request_failed` for the application write, `500
-runtime_spec.request_failed` for the runtime-spec write. This is the same
-class of gap this document already records having found and fixed once, for
-`application.proxy_listen_port_invalid`/`_conflict` (above): a service-layer
-sentinel that existed and was unit-tested at the `internal/portal` level
-without ever being added to the gateway's HTTP error-code table.
+All five codes above are wired end to end and answer the listed status.
+`internal/portal.Service` returns the three validation sentinels
+(`ErrApplicationEndpointModeInvalid`, `ErrRuntimeSpecEndpointModeInvalid`,
+`ErrRuntimeSpecFlavorInvalid`), and each is mapped to 400 in the corresponding
+gateway HTTP error-code table — the first in `portalApplicationErrRows`, the
+other two in `portalRuntimeSpecErrRows` — mirroring
+`application.flavor_invalid`, which was already wired the same way. This
+closed the same class of gap this document already records having found and
+fixed once, for `application.proxy_listen_port_invalid`/`_conflict` (above): a
+service-layer sentinel existed and was unit-tested at the `internal/portal`
+level without initially being added to the gateway's HTTP error-code table, so
+a request that tripped one of the three fell through to the generic 500
+fallback instead (`application.request_failed` for the application write,
+`runtime_spec.request_failed` for the runtime-spec write) until the rows
+above were added.
 
 ### Groups, projects, services, resource-groups (governance model)
 
