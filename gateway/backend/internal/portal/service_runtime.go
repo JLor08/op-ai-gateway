@@ -67,6 +67,12 @@ var (
 	// override straight back to "". The caller records the spec as
 	// restore-failed instead -- somebody else owns the field now.
 	ErrRuntimeSpecAdminStateConflict = errors.New("runtime_spec.admin_state_conflict")
+	// ErrRuntimeSpecEndpointModeInvalid rejects a responses_mode/messages_mode
+	// that is not one of the three EndpointMode values. HTTP 400.
+	ErrRuntimeSpecEndpointModeInvalid = errors.New("runtime_spec.endpoint_mode_invalid")
+	// ErrRuntimeSpecFlavorInvalid rejects an api_flavors entry that is not
+	// openai/anthropic. HTTP 400.
+	ErrRuntimeSpecFlavorInvalid = errors.New("runtime_spec.flavor_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -286,6 +292,14 @@ func runtimeSpecBinaryIsAbsolute(binary string) bool {
 	return isAbsPOSIXBinaryPath(binary) || isAbsWindowsBinaryPath(binary)
 }
 
+// normalizeRuntimeSpecFlavors is normalizeFlavors (service_applications.go)
+// scoped to the runtime-spec error code: same defaulting/dedup/validation as
+// normalizeApplicationFlavors, but a bad entry reports the honest
+// runtime_spec.flavor_invalid rather than the application-scoped code.
+func normalizeRuntimeSpecFlavors(raw []string) ([]string, error) {
+	return normalizeFlavors(raw, ErrRuntimeSpecFlavorInvalid)
+}
+
 // RuntimeSpecGPUDTO is one per-GPU VRAM demand row on the wire.
 // VRAMEstimateMB is operator-owned (round-tripped from PutRuntimeSpecRequest
 // verbatim); VRAMMeasuredMB is agent-owned and read-only on this API — see
@@ -324,6 +338,14 @@ type RuntimeSpecDTO struct {
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of
+	// the three-state endpoint control (mirrors the same trio on
+	// ApplicationDTO), stored explicitly on this spec rather than inherited
+	// from the parent server_agent application — see PutRuntimeSpec's "no
+	// backend inheritance" contract.
+	APIFlavors    []string `json:"api_flavors"`
+	ResponsesMode string   `json:"responses_mode"`
+	MessagesMode  string   `json:"messages_mode"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -350,6 +372,13 @@ type PutRuntimeSpecRequest struct {
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
+	// Absent (empty/"") defaults to both/passthrough — see putRuntimeSpec;
+	// the backend does NOT inherit the parent server_agent application's
+	// values, the portal frontend pre-fills the create form instead.
+	APIFlavors    []string `json:"api_flavors"`
+	ResponsesMode string   `json:"responses_mode"`
+	MessagesMode  string   `json:"messages_mode"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -368,7 +397,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
-		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}}, nil
+		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
@@ -471,6 +500,31 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err := validateRuntimeSpecVisibleDevices(req); err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	// Endpoint-mode + flavor validation, defaulting absent fields (spec
+	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
+	// frontend pre-fills the create form; the backend only supplies a sane
+	// default when the request omits a field). See
+	// TestPutRuntimeSpecDoesNotInheritAppModes.
+	respMode := routing.EndpointModePassthrough
+	if strings.TrimSpace(req.ResponsesMode) != "" {
+		m, ok := validEndpointMode(req.ResponsesMode)
+		if !ok {
+			return RuntimeSpecDTO{}, ErrRuntimeSpecEndpointModeInvalid
+		}
+		respMode = m
+	}
+	msgMode := routing.EndpointModePassthrough
+	if strings.TrimSpace(req.MessagesMode) != "" {
+		m, ok := validEndpointMode(req.MessagesMode)
+		if !ok {
+			return RuntimeSpecDTO{}, ErrRuntimeSpecEndpointModeInvalid
+		}
+		msgMode = m
+	}
+	flavors, err := normalizeRuntimeSpecFlavors(req.APIFlavors)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
 	args := req.Args
 	if args == nil {
 		args = []string{}
@@ -535,6 +589,9 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		AdminState:                  adminState,
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
+		APIFlavors:                  flavors,
+		ResponsesMode:               respMode,
+		MessagesMode:                msgMode,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -725,6 +782,9 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		VRAMLocked:                  spec.VRAMLocked,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		GPUs:                        gpuDTOs,
+		APIFlavors:                  append([]string{}, spec.APIFlavors...),
+		ResponsesMode:               string(spec.ResponsesMode),
+		MessagesMode:                string(spec.MessagesMode),
 	}, nil
 }
 

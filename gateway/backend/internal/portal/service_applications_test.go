@@ -486,6 +486,22 @@ func TestCreateApplicationValidation(t *testing.T) {
 			mutate:  func(req CreateApplicationRequest) CreateApplicationRequest { req.Status = "bogus"; return req },
 			wantErr: ErrApplicationStatusInvalid,
 		},
+		{
+			name: "bad responses_mode",
+			mutate: func(req CreateApplicationRequest) CreateApplicationRequest {
+				req.ResponsesMode = "bogus"
+				return req
+			},
+			wantErr: ErrApplicationEndpointModeInvalid,
+		},
+		{
+			name: "bad messages_mode",
+			mutate: func(req CreateApplicationRequest) CreateApplicationRequest {
+				req.MessagesMode = "sideways"
+				return req
+			},
+			wantErr: ErrApplicationEndpointModeInvalid,
+		},
 	}
 
 	for _, tc := range cases {
@@ -496,6 +512,99 @@ func TestCreateApplicationValidation(t *testing.T) {
 				t.Fatalf("CreateApplication error = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestApplicationDTOCarriesEndpointModes pins that ApplicationDTO emits the
+// per-endpoint responses_mode/messages_mode strings (replacing the retired
+// native_responses/native_messages bools).
+func TestApplicationDTOCarriesEndpointModes(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+		ResponsesMode: string(routing.EndpointModeTranslate),
+		MessagesMode:  string(routing.EndpointModeDisabled),
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.ResponsesMode != string(routing.EndpointModeTranslate) {
+		t.Fatalf("responses_mode = %q, want translate", dto.ResponsesMode)
+	}
+	if dto.MessagesMode != string(routing.EndpointModeDisabled) {
+		t.Fatalf("messages_mode = %q, want disabled", dto.MessagesMode)
+	}
+}
+
+// TestCreateApplicationEndpointModeDefaultsToPassthrough pins the create-path
+// default (spec §6): every supported upstream now serves both native
+// endpoints, so an absent responses_mode/messages_mode defaults to
+// passthrough rather than Go's bool zero value.
+func TestCreateApplicationEndpointModeDefaultsToPassthrough(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+		// ResponsesMode / MessagesMode absent
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.ResponsesMode != string(routing.EndpointModePassthrough) ||
+		dto.MessagesMode != string(routing.EndpointModePassthrough) {
+		t.Fatalf("defaults = %q/%q, want passthrough/passthrough", dto.ResponsesMode, dto.MessagesMode)
+	}
+}
+
+// TestUpdateApplicationEndpointModes pins the update-path keep-if-nil /
+// validate-before-mutate discipline for responses_mode/messages_mode: nil
+// leaves the stored value untouched, a valid pointer sets it, and a non-nil
+// unknown value (including explicit "") is rejected without mutating anything.
+func TestUpdateApplicationEndpointModes(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "https",
+	}) // both default passthrough
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+
+	// keep-if-nil: update an unrelated field, modes untouched.
+	got, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{
+		Weight: intPtr(3),
+	})
+	if err != nil {
+		t.Fatalf("UpdateApplication(weight): %v", err)
+	}
+	if got.ResponsesMode != string(routing.EndpointModePassthrough) {
+		t.Fatalf("keep-if-nil failed: responses_mode = %q", got.ResponsesMode)
+	}
+
+	// explicit set.
+	disabled := string(routing.EndpointModeDisabled)
+	got, err = svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{
+		ResponsesMode: &disabled,
+	})
+	if err != nil {
+		t.Fatalf("UpdateApplication(responses_mode): %v", err)
+	}
+	if got.ResponsesMode != disabled || got.MessagesMode != string(routing.EndpointModePassthrough) {
+		t.Fatalf("set failed: %q / %q", got.ResponsesMode, got.MessagesMode)
+	}
+
+	// non-nil unknown (incl. explicit "") rejected.
+	bad := "bogus"
+	if _, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{
+		MessagesMode: &bad,
+	}); !errors.Is(err, ErrApplicationEndpointModeInvalid) {
+		t.Fatalf("bad update err = %v, want ErrApplicationEndpointModeInvalid", err)
 	}
 }
 

@@ -28,11 +28,15 @@ const (
 )
 
 var (
-	ErrApplicationNotFound              = errors.New(CodeApplicationNotFound)
-	ErrApplicationTypeInvalid           = errors.New("application.type_invalid")
-	ErrApplicationSchemeInvalid         = errors.New("application.scheme_invalid")
-	ErrApplicationPortInvalid           = errors.New("application.port_invalid")
-	ErrApplicationFlavorInvalid         = errors.New("application.flavor_invalid")
+	ErrApplicationNotFound      = errors.New(CodeApplicationNotFound)
+	ErrApplicationTypeInvalid   = errors.New("application.type_invalid")
+	ErrApplicationSchemeInvalid = errors.New("application.scheme_invalid")
+	ErrApplicationPortInvalid   = errors.New("application.port_invalid")
+	ErrApplicationFlavorInvalid = errors.New("application.flavor_invalid")
+	// ErrApplicationEndpointModeInvalid rejects a responses_mode/messages_mode
+	// that is not one of the three EndpointMode values. HTTP 400 (a malformed
+	// request), mirroring ErrApplicationFlavorInvalid.
+	ErrApplicationEndpointModeInvalid   = errors.New("application.endpoint_mode_invalid")
 	ErrApplicationStatusInvalid         = errors.New("application.status_invalid")
 	ErrApplicationTuningInvalid         = errors.New("application.tuning_invalid")
 	ErrApplicationHealthPathInvalid     = errors.New("application.health_path_invalid")
@@ -122,11 +126,11 @@ type ApplicationDTO struct {
 	// HealthCheckIntervalSeconds is the per-application probe cadence in seconds;
 	// 0 means "follow the system-wide setting" (Default in the UI), > 0 is Custom.
 	HealthCheckIntervalSeconds int `json:"health_check_interval_seconds"`
-	// NativeResponses / NativeMessages: when true the gateway proxies the raw
-	// client body straight to the upstream's native endpoint (Codex /v1/responses
-	// resp. Claude Code /v1/messages) instead of translating it.
-	NativeResponses bool `json:"native_responses"`
-	NativeMessages  bool `json:"native_messages"`
+	// ResponsesMode / MessagesMode are the per-endpoint EndpointMode
+	// (disabled | translate | passthrough) for Codex /v1/responses resp.
+	// Claude Code /v1/messages. Serialized as the lowercase enum string.
+	ResponsesMode string `json:"responses_mode"`
+	MessagesMode  string `json:"messages_mode"`
 	// LoadedModelsPath / LoadedModelsFormat configure the optional loaded-model
 	// probe: the upstream endpoint path to poll + the response-parser hint
 	// ("" / "auto" / "openai" / "llama_swap" / "llama_cpp"). Empty path = off.
@@ -192,8 +196,8 @@ type CreateApplicationRequest struct {
 	HealthCheckPath                  string   `json:"health_check_path"`
 	HealthCheckMode                  string   `json:"health_check_mode"`
 	HealthCheckIntervalSeconds       int      `json:"health_check_interval_seconds"`
-	NativeResponses                  bool     `json:"native_responses"`
-	NativeMessages                   bool     `json:"native_messages"`
+	ResponsesMode                    string   `json:"responses_mode"`
+	MessagesMode                     string   `json:"messages_mode"`
 	LoadedModelsPath                 string   `json:"loaded_models_path"`
 	LoadedModelsFormat               string   `json:"loaded_models_format"`
 	ContextProbePath                 string   `json:"context_probe_path"`
@@ -209,8 +213,8 @@ type CreateApplicationRequest struct {
 	ProxyListenPort int `json:"proxy_listen_port"`
 	// ProxyExcluded opts the application out of the gateway-guided TLS proxy.
 	//
-	// A POINTER, unlike NativeResponses and the other create-path bools beside
-	// it, and deliberately so: the normalization below must distinguish "the
+	// A POINTER, unlike the other plain create-path fields beside it, and
+	// deliberately so: the normalization below must distinguish "the
 	// caller said false" from "the caller said nothing", which is what keeps a
 	// pre-70 API client producing exactly the state it always produced.
 	ProxyExcluded *bool `json:"proxy_excluded,omitempty"`
@@ -231,8 +235,8 @@ type UpdateApplicationRequest struct {
 	HealthCheckPath              *string   `json:"health_check_path,omitempty"`
 	HealthCheckMode              *string   `json:"health_check_mode,omitempty"`
 	HealthCheckIntervalSeconds   *int      `json:"health_check_interval_seconds,omitempty"`
-	NativeResponses              *bool     `json:"native_responses,omitempty"`
-	NativeMessages               *bool     `json:"native_messages,omitempty"`
+	ResponsesMode                *string   `json:"responses_mode,omitempty"`
+	MessagesMode                 *string   `json:"messages_mode,omitempty"`
 	LoadedModelsPath             *string   `json:"loaded_models_path,omitempty"`
 	LoadedModelsFormat           *string   `json:"loaded_models_format,omitempty"`
 	ContextProbePath             *string   `json:"context_probe_path,omitempty"`
@@ -310,6 +314,25 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	flavors, err := normalizeApplicationFlavors(req.APIFlavors)
 	if err != nil {
 		return ApplicationDTO{}, err
+	}
+	// Every supported upstream now serves both native endpoints (spec §6), so
+	// an absent responses_mode/messages_mode defaults to passthrough rather
+	// than Go's bool zero value (the old native_*=false/"translate" default).
+	responsesMode := routing.EndpointModePassthrough
+	if strings.TrimSpace(req.ResponsesMode) != "" {
+		m, ok := validEndpointMode(req.ResponsesMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		responsesMode = m
+	}
+	messagesMode := routing.EndpointModePassthrough
+	if strings.TrimSpace(req.MessagesMode) != "" {
+		m, ok := validEndpointMode(req.MessagesMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		messagesMode = m
 	}
 	status, err := normalizeApplicationStatus(req.Status)
 	if err != nil {
@@ -389,8 +412,8 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		HealthCheckPath:                  healthCheckPath,
 		HealthCheckMode:                  healthMode,
 		HealthCheckIntervalSeconds:       req.HealthCheckIntervalSeconds,
-		NativeResponses:                  req.NativeResponses,
-		NativeMessages:                   req.NativeMessages,
+		ResponsesMode:                    responsesMode,
+		MessagesMode:                     messagesMode,
 		LoadedModelsPath:                 strings.TrimSpace(req.LoadedModelsPath),
 		LoadedModelsFormat:               normalizeLoadedModelsFormat(req.LoadedModelsFormat),
 		ContextProbePath:                 strings.TrimSpace(req.ContextProbePath),
@@ -520,6 +543,25 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 			return ApplicationDTO{}, err
 		}
 	}
+	// Validate-before-mutate for the two endpoint modes: nil keeps the stored
+	// value, and a non-nil unknown value (including explicit "") is rejected
+	// -- there is no "clear to empty" for a three-state enum, and nil already
+	// means keep (Task A3).
+	var responsesMode, messagesMode routing.EndpointMode
+	if req.ResponsesMode != nil {
+		m, ok := validEndpointMode(*req.ResponsesMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		responsesMode = m
+	}
+	if req.MessagesMode != nil {
+		m, ok := validEndpointMode(*req.MessagesMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		messagesMode = m
+	}
 	if req.BenchmarkScheduleIntervalSeconds != nil {
 		if err := validateApplicationBenchmarkInterval(*req.BenchmarkScheduleIntervalSeconds); err != nil {
 			return ApplicationDTO{}, err
@@ -595,11 +637,11 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	if req.HealthCheckIntervalSeconds != nil {
 		app.HealthCheckIntervalSeconds = *req.HealthCheckIntervalSeconds
 	}
-	if req.NativeResponses != nil {
-		app.NativeResponses = *req.NativeResponses
+	if req.ResponsesMode != nil {
+		app.ResponsesMode = responsesMode
 	}
-	if req.NativeMessages != nil {
-		app.NativeMessages = *req.NativeMessages
+	if req.MessagesMode != nil {
+		app.MessagesMode = messagesMode
 	}
 	if req.LoadedModelsPath != nil {
 		app.LoadedModelsPath = strings.TrimSpace(*req.LoadedModelsPath)
@@ -760,8 +802,8 @@ func applicationDTO(server routing.AIServer, app routing.Application) Applicatio
 		HealthCheckPath:              app.HealthCheckPath,
 		HealthCheckMode:              routing.EffectiveHealthCheckMode(app),
 		HealthCheckIntervalSeconds:   app.HealthCheckIntervalSeconds,
-		NativeResponses:              app.NativeResponses,
-		NativeMessages:               app.NativeMessages,
+		ResponsesMode:                string(app.ResponsesMode),
+		MessagesMode:                 string(app.MessagesMode),
 		LoadedModelsPath:             app.LoadedModelsPath,
 		LoadedModelsFormat:           app.LoadedModelsFormat,
 		ContextProbePath:             app.ContextProbePath,
@@ -1191,7 +1233,13 @@ func (s *Service) classifyApplicationWriteConflict(ctx context.Context, app rout
 	return ErrApplicationConflict
 }
 
-func normalizeApplicationFlavors(raw []string) ([]string, error) {
+// normalizeFlavors validates + dedups api-flavor entries (defaults empty ->
+// both), returning errInvalid on any unrecognized value so each caller keeps
+// its own honest error code: normalizeApplicationFlavors below reports
+// ErrApplicationFlavorInvalid, and the runtime-spec path (service_runtime.go)
+// reports its own ErrRuntimeSpecFlavorInvalid rather than borrowing this
+// package's application-scoped code.
+func normalizeFlavors(raw []string, errInvalid error) ([]string, error) {
 	if len(raw) == 0 {
 		return []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, nil
 	}
@@ -1202,7 +1250,7 @@ func normalizeApplicationFlavors(raw []string) ([]string, error) {
 		switch flavor {
 		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic:
 		default:
-			return nil, ErrApplicationFlavorInvalid
+			return nil, errInvalid
 		}
 		if _, dup := seen[flavor]; dup {
 			continue
@@ -1211,6 +1259,23 @@ func normalizeApplicationFlavors(raw []string) ([]string, error) {
 		out = append(out, flavor)
 	}
 	return out, nil
+}
+
+func normalizeApplicationFlavors(raw []string) ([]string, error) {
+	return normalizeFlavors(raw, ErrApplicationFlavorInvalid)
+}
+
+// validEndpointMode reports whether raw (trimmed) is one of the three
+// endpoint modes, returning the typed value. Callers wrap their own domain
+// error so the application and runtime-spec write paths keep DISTINCT stable
+// error codes.
+func validEndpointMode(raw string) (routing.EndpointMode, bool) {
+	switch m := routing.EndpointMode(strings.TrimSpace(raw)); m {
+	case routing.EndpointModeDisabled, routing.EndpointModeTranslate, routing.EndpointModePassthrough:
+		return m, true
+	default:
+		return "", false
+	}
 }
 
 func normalizeApplicationStatus(raw string) (string, error) {
