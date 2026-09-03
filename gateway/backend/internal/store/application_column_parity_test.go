@@ -15,31 +15,31 @@ import (
 // applicationParityRows is how many applications rows the column-parity
 // fixture seeds, computed the same way (and for the same reason) as
 // aiServerParityRows in ai_server_column_parity_test.go: the applications
-// select lists carry SIX integer-boolean columns, two same-typed columns are
+// select lists carry FOUR integer-boolean columns, two same-typed columns are
 // only distinguishable by value if they differ in at least one seeded row, so
 // each needs its own DISTINCT pattern across the rows. With r rows there are
-// 2^r patterns, so r must satisfy 2^r >= 6 — three rows.
+// 2^r patterns, so r must satisfy 2^r >= 4 — three rows (native_responses /
+// native_messages were replaced by the ResponsesMode / MessagesMode text
+// columns below, which the string fixture already varies per row).
 const applicationParityRows = 3
 
 // applicationParityBools is the bit-pattern table, one row per integer-boolean
-// column in SELECT-LIST order (always_reachable, native_responses,
-// native_messages, benchmark_schedule_enabled, opportunistic_metrics_enabled,
-// proxy_excluded) and one column per seeded application.
+// column in SELECT-LIST order (always_reachable, benchmark_schedule_enabled,
+// opportunistic_metrics_enabled, proxy_excluded) and one column per seeded
+// application.
 //
 // Its two load-bearing properties are asserted by
 // TestApplicationParityFixtureDistinguishesEverySameTypedPair below, so the
 // table cannot silently degrade into an all-true fixture that catches nothing:
 //
 //   - every PAIR of rows differs in at least one column, so swapping any two of
-//     the six bool columns in one reader's select list changes an observable
+//     the four bool columns in one reader's select list changes an observable
 //     value in at least one seeded application;
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows up
 //     as a mismatch somewhere.
-var applicationParityBools = [6][applicationParityRows]bool{
+var applicationParityBools = [4][applicationParityRows]bool{
 	{true, true, false},  // always_reachable
-	{true, false, true},  // native_responses
-	{true, false, false}, // native_messages
 	{false, true, true},  // benchmark_schedule_enabled
 	{false, true, false}, // opportunistic_metrics_enabled
 	{false, false, true}, // proxy_excluded
@@ -103,6 +103,16 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 		// distinct non-zero values so it cannot be confused with the other
 		// integer columns, which are all distinct per row as well.
 		proxyPorts := [applicationParityRows]int{8601, 8602, 0}
+		// responsesModes/messagesModes vary per row and differ from each other
+		// (like the retired native_responses/native_messages bools they
+		// replaced), so a swapped select-list pair between the two columns
+		// remains observable via the DeepEqual comparison.
+		responsesModes := [applicationParityRows]routing.EndpointMode{
+			routing.EndpointModeDisabled, routing.EndpointModeTranslate, routing.EndpointModePassthrough,
+		}
+		messagesModes := [applicationParityRows]routing.EndpointMode{
+			routing.EndpointModeTranslate, routing.EndpointModePassthrough, routing.EndpointModeDisabled,
+		}
 
 		want := make([]routing.Application, 0, applicationParityRows)
 		for i := 0; i < applicationParityRows; i++ {
@@ -121,8 +131,8 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 				// other text columns.
 				HealthCheckMode:                  "mode-" + idx,
 				HealthCheckIntervalSeconds:       61 + i,
-				NativeResponses:                  applicationParityBools[1][i],
-				NativeMessages:                   applicationParityBools[2][i],
+				ResponsesMode:                    responsesModes[i],
+				MessagesMode:                     messagesModes[i],
 				LoadedModelsPath:                 "/loaded-" + idx,
 				LoadedModelsFormat:               "format-" + idx,
 				ContextProbePath:                 "/context-" + idx,
@@ -130,11 +140,11 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 				AppPathSuffix:                    "/suffix-" + idx,
 				APIToken:                         "plain:token-" + idx,
 				APITokenHeader:                   "x-token-" + idx,
-				BenchmarkScheduleEnabled:         applicationParityBools[3][i],
+				BenchmarkScheduleEnabled:         applicationParityBools[1][i],
 				BenchmarkScheduleIntervalSeconds: 71 + i,
-				OpportunisticMetricsEnabled:      applicationParityBools[4][i],
+				OpportunisticMetricsEnabled:      applicationParityBools[2][i],
 				ProxyListenPort:                  proxyPorts[i],
-				ProxyExcluded:                    applicationParityBools[5][i],
+				ProxyExcluded:                    applicationParityBools[3][i],
 				CreatedAt:                        now.Add(time.Duration(-10-i) * time.Minute),
 				UpdatedAt:                        now.Add(time.Duration(-i) * time.Minute),
 			})
@@ -216,7 +226,7 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 // own history, is how that hole got there the first time.
 func TestApplicationParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
 	names := []string{
-		"always_reachable", "native_responses", "native_messages",
+		"always_reachable",
 		"benchmark_schedule_enabled", "opportunistic_metrics_enabled", "proxy_excluded",
 	}
 	for i := range applicationParityBools {

@@ -22,7 +22,7 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 		insert into applications (
 			id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, native_responses, native_messages,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
@@ -45,8 +45,8 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 		app.HealthCheckPath,
 		app.HealthCheckMode,
 		app.HealthCheckIntervalSeconds,
-		app.NativeResponses,
-		app.NativeMessages,
+		app.ResponsesMode,
+		app.MessagesMode,
 		app.LoadedModelsPath,
 		app.LoadedModelsFormat,
 		app.ContextProbePath,
@@ -86,7 +86,7 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 			admission_queue_timeout_seconds = ?,
 			status = ?, always_reachable = ?, health_check_path = ?,
 			health_check_mode = ?, health_check_interval_seconds = ?,
-			native_responses = ?, native_messages = ?,
+			responses_mode = ?, messages_mode = ?,
 			loaded_models_path = ?, loaded_models_format = ?, context_probe_path = ?,
 			capacity_probe_path = ?,
 			app_path_suffix = ?, api_token = ?, api_token_header = ?,
@@ -110,8 +110,8 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 		app.HealthCheckPath,
 		app.HealthCheckMode,
 		app.HealthCheckIntervalSeconds,
-		app.NativeResponses,
-		app.NativeMessages,
+		app.ResponsesMode,
+		app.MessagesMode,
 		app.LoadedModelsPath,
 		app.LoadedModelsFormat,
 		app.ContextProbePath,
@@ -143,7 +143,7 @@ func (s *SQLiteStore) ApplicationByID(ctx context.Context, id string) (routing.A
 	row := s.queryRow(ctx, `
 		select id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, native_responses, native_messages,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
@@ -158,7 +158,7 @@ func (s *SQLiteStore) ApplicationsByServer(ctx context.Context, serverID string)
 	rows, err := s.query(ctx, `
 		select id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, native_responses, native_messages,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
@@ -476,7 +476,7 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			a.id, a.server_id, a.type, a.port, a.scheme, a.api_flavors, a.priority,
 			a.weight, a.timeout_ms, a.affinity_ttl_seconds, a.admission_queue_timeout_seconds, a.status, a.always_reachable,
 			a.health_check_path, a.health_check_mode, a.health_check_interval_seconds,
-			a.native_responses, a.native_messages, a.loaded_models_path, a.loaded_models_format,
+			a.responses_mode, a.messages_mode, a.loaded_models_path, a.loaded_models_format,
 			a.context_probe_path, a.capacity_probe_path,
 			a.app_path_suffix, a.api_token, a.api_token_header,
 			a.benchmark_schedule_enabled, a.benchmark_schedule_interval_seconds, a.opportunistic_metrics_enabled,
@@ -519,8 +519,6 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		lastSeen             sql.NullTime
 		appFlavors           string
 		alwaysReachable      int64
-		nativeResponses      int64
-		nativeMessages       int64
 		benchScheduleEnabled int64
 		oppMetricsEnabled    int64
 		proxyExcluded        int64
@@ -536,7 +534,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&appFlavors, &c.Application.Priority, &c.Application.Weight, &c.Application.TimeoutMS,
 		&c.Application.AffinityTTLSeconds, &c.Application.AdmissionQueueTimeoutSeconds, &c.Application.Status, &alwaysReachable, &c.Application.HealthCheckPath,
 		&c.Application.HealthCheckMode, &c.Application.HealthCheckIntervalSeconds,
-		&nativeResponses, &nativeMessages,
+		&c.Application.ResponsesMode, &c.Application.MessagesMode,
 		&c.Application.LoadedModelsPath, &c.Application.LoadedModelsFormat,
 		&c.Application.ContextProbePath, &c.Application.CapacityProbePath,
 		&c.Application.AppPathSuffix, &c.Application.APIToken, &c.Application.APITokenHeader,
@@ -554,8 +552,6 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		return routing.MappingCandidate{}, fmt.Errorf("scan mapping candidate: %w", err)
 	}
 	c.Application.AlwaysReachable = alwaysReachable != 0
-	c.Application.NativeResponses = nativeResponses != 0
-	c.Application.NativeMessages = nativeMessages != 0
 	c.Application.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	c.Application.ProxyExcluded = proxyExcluded != 0
@@ -599,7 +595,6 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 	var app routing.Application
 	var apiFlavors string
 	var alwaysReachable int64
-	var nativeResponses, nativeMessages int64
 	var benchScheduleEnabled, oppMetricsEnabled int64
 	var proxyExcluded int64
 	err := row.Scan(
@@ -619,8 +614,8 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 		&app.HealthCheckPath,
 		&app.HealthCheckMode,
 		&app.HealthCheckIntervalSeconds,
-		&nativeResponses,
-		&nativeMessages,
+		&app.ResponsesMode,
+		&app.MessagesMode,
 		&app.LoadedModelsPath,
 		&app.LoadedModelsFormat,
 		&app.ContextProbePath,
@@ -643,8 +638,6 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 		return routing.Application{}, fmt.Errorf("scan application: %w", err)
 	}
 	app.AlwaysReachable = alwaysReachable != 0
-	app.NativeResponses = nativeResponses != 0
-	app.NativeMessages = nativeMessages != 0
 	app.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	app.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	app.ProxyExcluded = proxyExcluded != 0

@@ -629,10 +629,11 @@ func TestConformanceRoutingServerApplicationMapping(t *testing.T) {
 	})
 }
 
-// TestConformanceApplicationNativePassthroughFlags verifies the per-application
-// native-passthrough flags round-trip through create, update, direct read, and the
-// routing join on both dialects.
-func TestConformanceApplicationNativePassthroughFlags(t *testing.T) {
+// TestConformanceApplicationEndpointModes verifies the per-application
+// ResponsesMode / MessagesMode columns (the EndpointMode replacement for the
+// old native_responses / native_messages booleans) round-trip through create,
+// update, direct read, and the routing join on both dialects.
+func TestConformanceApplicationEndpointModes(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Now().UTC().Truncate(time.Second)
@@ -648,7 +649,7 @@ func TestConformanceApplicationNativePassthroughFlags(t *testing.T) {
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
 			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
-			NativeResponses: true, NativeMessages: false,
+			ResponsesMode:   routing.EndpointModePassthrough, MessagesMode: routing.EndpointModeTranslate,
 			CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.CreateApplication(ctx, app); err != nil {
@@ -659,13 +660,13 @@ func TestConformanceApplicationNativePassthroughFlags(t *testing.T) {
 		if err != nil {
 			t.Fatalf("application by id: %v", err)
 		}
-		if !got.NativeResponses || got.NativeMessages {
-			t.Fatalf("after create: NativeResponses=%v NativeMessages=%v, want true/false", got.NativeResponses, got.NativeMessages)
+		if got.ResponsesMode != routing.EndpointModePassthrough || got.MessagesMode != routing.EndpointModeTranslate {
+			t.Fatalf("after create: ResponsesMode=%q MessagesMode=%q, want passthrough/translate", got.ResponsesMode, got.MessagesMode)
 		}
 
 		// Flip both and update.
-		got.NativeResponses = false
-		got.NativeMessages = true
+		got.ResponsesMode = routing.EndpointModeDisabled
+		got.MessagesMode = routing.EndpointModePassthrough
 		got.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateApplication(ctx, got); err != nil {
 			t.Fatalf("update application: %v", err)
@@ -674,11 +675,11 @@ func TestConformanceApplicationNativePassthroughFlags(t *testing.T) {
 		if err != nil {
 			t.Fatalf("application by id (2): %v", err)
 		}
-		if got.NativeResponses || !got.NativeMessages {
-			t.Fatalf("after update: NativeResponses=%v NativeMessages=%v, want false/true", got.NativeResponses, got.NativeMessages)
+		if got.ResponsesMode != routing.EndpointModeDisabled || got.MessagesMode != routing.EndpointModePassthrough {
+			t.Fatalf("after update: ResponsesMode=%q MessagesMode=%q, want disabled/passthrough", got.ResponsesMode, got.MessagesMode)
 		}
 
-		// The routing join must carry the flags too.
+		// The routing join must carry the modes too.
 		if err := s.CreateMapping(ctx, routing.ModelMapping{
 			ID: "map1", ApplicationID: "app1", GatewayModelName: "gpt", AppModelName: "m",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
@@ -689,8 +690,9 @@ func TestConformanceApplicationNativePassthroughFlags(t *testing.T) {
 		if err != nil || len(candidates) != 1 {
 			t.Fatalf("active mappings: err=%v n=%d", err, len(candidates))
 		}
-		if candidates[0].Application.NativeResponses || !candidates[0].Application.NativeMessages {
-			t.Fatalf("join flags: NativeResponses=%v NativeMessages=%v, want false/true", candidates[0].Application.NativeResponses, candidates[0].Application.NativeMessages)
+		if candidates[0].Application.ResponsesMode != routing.EndpointModeDisabled || candidates[0].Application.MessagesMode != routing.EndpointModePassthrough {
+			t.Fatalf("join modes: ResponsesMode=%q MessagesMode=%q, want disabled/passthrough",
+				candidates[0].Application.ResponsesMode, candidates[0].Application.MessagesMode)
 		}
 	})
 }
