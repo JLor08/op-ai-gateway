@@ -370,6 +370,55 @@ func (m *Manager) LoadedModels() []string {
 	}
 }
 
+// AppliedETag returns the ETag of the runtime-config document this manager
+// has APPLIED -- the value that rides upward as the telemetry sample's
+// runtime_config_applied_etag, so a gateway can wait for "you applied MY
+// document" instead of guessing with a fixed delay. "" means nothing has
+// been applied that carried an ETag, which includes a cold start and the
+// driver's own drain (stopAll applies an ETag-less empty config).
+//
+// WHY THIS IS SERVED FROM THE OWNER LOOP, and not from an atomic field or
+// from the Driver. There are three values in this module that could each be
+// called "the ETag", and only one of them is true:
+//
+//   - GatewaySource.etag advances when a document is FETCHED and parsed,
+//     strictly BEFORE the driver hands it to Apply. Reporting that one is
+//     the exact lie this whole feature must not tell -- the gateway would
+//     read "applied" off a document that has reconciled nothing.
+//   - A field the Driver set around its Apply call would be honest about
+//     ordering but would duplicate state the reconciler already owns, and
+//     would need its own synchronization to be read from the sample-building
+//     goroutine.
+//   - o.cfg.ETag, returned here, is written by owner.applyConfig itself, on
+//     the goroutine that owns every piece of state in this package, inside
+//     the single event-loop turn that performs the reconciliation. Because
+//     owner.run processes one command at a time and nothing re-enters the
+//     loop, this command cannot be served midway through an apply: there is
+//     no observable state in which this value names a document applyConfig
+//     has not processed.
+//
+// What "applied" therefore means is precise and narrower than it looks: the
+// document is the desired state and every reconciliation DECISION it
+// implies is committed. Asynchronous consequences may still be in flight --
+// a drained child is in StateDraining until its grace/kill sequence
+// finishes, and a newly pinned spec may still be starting -- and Status()
+// is what reports those. The one guarantee that makes this useful for
+// isolation is separate: after the applied document force-stops a spec,
+// NOTHING can start it again (both handleEnsure and admitAndStart refuse
+// AdminState "force_stopped" outright), so an absence observed after this
+// ETag names the document is durable in a way the same absence observed
+// before it is not.
+func (m *Manager) AppliedETag() string {
+	reply := make(chan string, 1)
+	m.postCmd(cmdAppliedETag{reply: reply})
+	select {
+	case s := <-reply:
+		return s
+	case <-m.done:
+		return ""
+	}
+}
+
 // Transitions returns a channel that receives a signal on any spec state
 // change. Buffered(1): a burst of transitions between two reads of this
 // channel coalesces into a single pending wake, exactly like
@@ -557,6 +606,16 @@ func (cmdStatus) isCommand() {}
 type cmdLoadedModels struct{ reply chan []string }
 
 func (cmdLoadedModels) isCommand() {}
+
+// cmdAppliedETag asks the owner for o.cfg.ETag. A COMMAND rather than an
+// atomic field written by applyConfig, and that is the whole point: only a
+// value served from the owner's own event loop is guaranteed to name a
+// document the owner has finished reconciling. An atomic set at the top of
+// applyConfig would be readable while the reconciliation it belongs to is
+// still running -- see Manager.AppliedETag.
+type cmdAppliedETag struct{ reply chan string }
+
+func (cmdAppliedETag) isCommand() {}
 
 type cmdClose struct{}
 
@@ -815,6 +874,8 @@ func (o *owner) handle(cmd command) {
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
+	case cmdAppliedETag:
+		c.reply <- o.cfg.ETag
 	case cmdClose:
 		o.handleClose()
 	}

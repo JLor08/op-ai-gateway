@@ -45,20 +45,36 @@ import (
 // allowed binary's parent directory), but no agent.Features entry was added,
 // so it is PATCH, not MINOR.
 //
-// 0.2.2 -> 0.2.3 is the single PATCH bump for the windows-vram-measurer
-// branch: on Windows the agent now measures per-process, per-GPU VRAM through
-// PDH performance counters instead of reporting nothing (nvidia-smi cannot
-// report it under WDDM), and a measured value of 0 no longer overrides the
-// operator's estimate in the admission snapshot. The branch's second headline
-// is the admission precedence (ADR-032): an occupant whose own VRAM demand is
-// unknown now blocks the cards it holds, and a candidate of unknown demand no
-// longer evicts a known-demand occupant but waits, naming the spec and the card
-// it waits for in its last_error. That changes which specs start, which get
-// evicted, and what an operator reads -- observable on every platform, not only
-// Windows. No agent.Features entry was added for any of it: measurement is a
-// hardware capability and admission is local policy, neither a negotiated flag
-// (ADR-025), so the whole branch is one PATCH.
-const Version = "0.2.3"
+// 0.2.2 -> 0.3.0 is the single bump for the windows-vram-measurer branch,
+// covering everything the branch ships:
+//
+//   - Windows per-process VRAM measurement. The agent now attributes
+//     per-process, per-GPU VRAM through PDH performance counters instead of
+//     reporting nothing, because nvidia-smi's per-process query returns
+//     [N/A] under WDDM.
+//   - The measured-zero guard. A measured value of 0 no longer overrides the
+//     operator's estimate in the admission snapshot -- "unknown" used to
+//     become "this model needs no VRAM".
+//   - ADR-032's admission precedence. An occupant whose own VRAM demand is
+//     unknown now blocks the cards it holds, and a candidate of unknown
+//     demand no longer evicts a known-demand occupant but waits, naming the
+//     spec and the card it waits for in its last_error. That changes which
+//     specs start, which get evicted, and what an operator reads --
+//     observable on every platform, not only Windows.
+//   - The runtime-config acknowledgement: the applied document's ETag rides
+//     on every sample as the top-level runtime_config_applied_etag, and
+//     agent.Features declares "runtime_config_ack" so a gateway knows
+//     whether that acknowledgement will ever arrive.
+//
+// MINOR, not PATCH, and the last item alone decides it: the rule is MINOR
+// whenever agent.Features gains an entry, because a new name is a new
+// capability the fleet can negotiate, and a gateway must be able to tell a
+// binary that can acknowledge from one that cannot. Everything above it in
+// this list would have been PATCH on its own -- measurement is a hardware
+// capability and admission is local policy, neither a negotiated flag
+// (ADR-025) -- and none of them earns a bump of its own here, because one
+// branch is one bump however many commits it contains.
+const Version = "0.3.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -168,6 +184,24 @@ type runtimeDriver interface {
 // it (or a nil runtimeDriver) simply never gets this call.
 type runtimeReportResender interface {
 	ResendReport(ctx context.Context)
+}
+
+// runtimeConfigAcknowledger is the optional interface a runtimeDriver may
+// additionally implement to report WHICH gateway runtime-config document it
+// has applied, for the telemetry sample's top-level
+// runtime_config_applied_etag (see sample.Sample.RuntimeConfigAppliedETag
+// for what the value does and does not promise). *runtimectl.Driver
+// implements it; a fake that omits it -- or a nil runtimeDriver -- simply
+// never contributes the field, and the sample keeps the pre-feature
+// shape.
+//
+// OPTIONAL rather than a fourth method on runtimeDriver, following
+// runtimeReportResender exactly: the required trio (Sync/Status/Active) is
+// what a driver must do for the feature to function at all, while this is
+// a report ABOUT that work, useful to one gateway-side consumer. Keeping it
+// optional also keeps the interface honest about what a caller may assume.
+type runtimeConfigAcknowledger interface {
+	AppliedConfigETag() string
 }
 
 // runtimeWaker is the optional interface a poster may additionally
@@ -400,6 +434,11 @@ type Agent struct {
 	// Invoked from the same reportTicker cadence sendSystemReport already
 	// uses (fix round 1, I5) -- never on its own ticker.
 	runtimeReportResender runtimeReportResender
+	// runtimeConfigAck is the optional applied-document reporter derived
+	// from runtimeDriver (see runtimeConfigAcknowledger); nil when there is
+	// no driver, or the driver does not implement it -- in which case the
+	// sample simply carries no runtime_config_applied_etag.
+	runtimeConfigAck runtimeConfigAcknowledger
 
 	// --- T3, live managed-process log streaming -------------------------
 	//
@@ -525,6 +564,9 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	}
 	if r, ok := d.RuntimeDriver.(runtimeReportResender); ok {
 		a.runtimeReportResender = r
+	}
+	if r, ok := d.RuntimeDriver.(runtimeConfigAcknowledger); ok {
+		a.runtimeConfigAck = r
 	}
 	// The log-streaming trio is derived ALL-OR-NOTHING on purpose. Wiring
 	// only the wake channel would leave Run's select ready to fire on a
@@ -901,6 +943,25 @@ func (a *Agent) resendRuntimeReport(ctx context.Context) {
 	a.runtimeReportResender.ResendReport(ctx)
 }
 
+// appliedConfigETag is the ETag of the gateway runtime-config document this
+// agent has actually applied, or "" when nothing here can report one -- no
+// driver, or a driver/fake that does not implement runtimeConfigAcknowledger.
+// "" is exactly what an agent without the feature sends, so the absent case
+// needs no separate handling at the call site.
+//
+// It is its own method for the same reason resendRuntimeReport above is:
+// collectOnce is the module's second-largest function (a deliberate,
+// documented acceptance in §11.4 of the architecture docs, measured at 62),
+// and a nil-guard for an optional interface inlined into its already-nested
+// runtime block cost it two cognitive-complexity points for nothing. A
+// one-line assignment costs none.
+func (a *Agent) appliedConfigETag() string {
+	if a.runtimeConfigAck == nil {
+		return ""
+	}
+	return a.runtimeConfigAck.AppliedConfigETag()
+}
+
 // collectOnce builds one sample from the host, GPU, and scrape collectors and
 // pushes it. Each collector failure is logged and skipped so a partial sample
 // still ships; a push failure is logged but not returned (the loop keeps going).
@@ -1014,6 +1075,15 @@ func (a *Agent) collectOnce(ctx context.Context) {
 	// that never wires the feature at all: the no-op invariant this whole
 	// feature is built around.
 	if a.runtimeDriver != nil && a.runtimeDriver.Active() {
+		// Read the acknowledgement BEFORE the statuses, deliberately.
+		// Both are separate reads of a manager that another goroutine may
+		// Apply to in between, so one of the two orders has to be chosen.
+		// This one can only ever pair a document with statuses at least as
+		// NEW as it -- so a consumer waiting for its own document to be
+		// acknowledged is never handed that ETag alongside the previous
+		// document's states. The other order carries exactly that risk,
+		// and no compensating benefit.
+		s.RuntimeConfigAppliedETag = a.appliedConfigETag()
 		statuses := a.runtimeDriver.Status()
 		var loaded []string
 		if len(statuses) > 0 {
