@@ -1564,6 +1564,13 @@ short-circuits entirely when the incoming ETag equals the applied one. A blanket
 "config changed, re-evaluate everything" reset would give an operator a way to
 defeat crash-loop protection by touching an unrelated spec.
 
+The applied document's ETag is **reported upward**, so a gateway that wrote an
+override can wait for the fact instead of guessing at a delay — including which
+of the rows above have therefore taken effect and which are waiting for a next
+start. What the acknowledgement promises, and the three cases in which an agent
+acknowledges nothing, are
+[§7.2](#72-the-applied-document-acknowledgement).
+
 ## 6. Process lifecycle
 
 Nine states are visible per spec, and they are a **wire contract** — portal
@@ -1712,8 +1719,9 @@ failure — and the 404 also resets the tracked ETag, since a 404-returning serv
 would ignore a stale validator anyway); a transport error, unparseable body or
 unexpected status returns the last known set with a nil error; unknown names are
 ignored on both sides. One flag per **shipped** capability, not per plan: today
-`runtime_manager` (the managed runtime itself) and `runtime_logs`
-([§14](#14-managed-process-logs-t3)).
+`runtime_manager` (the managed runtime itself), `runtime_logs`
+([§14](#14-managed-process-logs-t3)) and `runtime_config_ack`
+([§7.2](#72-the-applied-document-acknowledgement)).
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -1802,6 +1810,53 @@ Its honest limit, stated rather than faked: a forgotten PATCH bump after a plain
 bugfix is **not** machine-detectable, because the guard has no external signal
 for what changed. That half stays a process rule in
 [`AGENTS.md`](../../../AGENTS.md).
+
+### 7.2 The applied-document acknowledgement
+
+Every telemetry sample carries the ETag of the runtime-config document the agent
+has **applied**, as the top-level `runtime_config_applied_etag`
+([telemetry §8.3.2](telemetry-usage-observability.md#832-shared-ingest-core)).
+Without it, a gateway that writes a desired-state override has no way to learn it
+arrived: nothing on the wire says "applied", and the absence of a process is not
+evidence — a self-exit (idle unload, a crash) looks identical to an obeyed
+override. The flag `runtime_config_ack` declares that the acknowledgement will
+come, so a gateway can *wait for a fact* against an agent that has it and fall
+back against one that does not. Without the flag the two are indistinguishable
+and there is no timeout that separates "still draining" from "will never answer".
+
+**What it means, exactly.** *This document is my desired state, and every
+reconciliation decision it implies is committed.* It does **not** mean every
+process the document stops has exited: a drain's grace/kill sequence is
+asynchronous, and the per-spec `runtimes[].state` in the same sample is what
+reports how far it got. What the acknowledgement *does* add, and the reason it is
+worth having, is that no `force_stopped` spec can be started again afterwards —
+both admission entry points refuse that `admin_state` outright — so an **absence
+observed after** this ETag names the document is durable, whereas the same
+absence observed before it means nothing.
+
+**Where the value comes from is a correctness decision, not an implementation
+detail.** Three values in the agent could each be called "the ETag", and only one
+is true:
+
+| Candidate | Why it is wrong / right |
+|---|---|
+| `GatewaySource`'s tracked etag | **Wrong.** Advances when a document is *fetched and parsed*, strictly before it reaches the manager — acknowledging it claims application for a document that has reconciled nothing. |
+| A copy the driver keeps around its `Apply` call | **Wrong.** Correct on ordering, but duplicates state the reconciler owns and drifts the moment anything else applies a config (the feature-revoked drain does). |
+| The manager's own applied config | **Right.** Written by the reconciler itself, on the goroutine that owns all state in the package, inside the single event-loop turn that performs the reconciliation. Served *from* that loop, so it cannot be read midway through an apply: there is no observable state in which it names a document the reconciler has not processed. |
+
+Three cases acknowledge **nothing**, and the field is then absent rather than
+empty (so an agent with nothing to say produces the pre-feature sample shape):
+nothing applied yet; `runtime_manager` not currently negotiated active, since an
+agent enforcing nothing must not claim otherwise; and **file mode**. The
+file-mode case is why the gate is a positive check for the gateway source and not
+"is the ETag non-empty": a file-mode agent discards the gateway's document
+outright (§8.2), while its own `Config.ETag` is whatever the operator's file
+contains — and because the gateway derives the ETag as a deterministic digest
+over the document's content, an operator who copies a served document verbatim
+into their local file would hold a value that *matches* one the gateway really
+served. Acknowledging that is the worst available failure, because it is
+indistinguishable from the truth. The gateway's own refusal to treat a file-mode
+server's gateway-side specs as effective (§8.2) stands instead.
 
 ## 8. The two configuration sources
 
@@ -3380,6 +3435,17 @@ through the benchmark writer and must not refuse themselves. A write to another
 server, and a DELETE (which drains a spec rather than starting one, and which
 the restore already treats as restored), are not gated.
 
+**That is the ONLY write it gates, and the rest of the document is genuinely
+mutable under a run** — which is a fact the isolation wait below has to be built
+around rather than a gap to be closed here. Per-GPU budgets, the co-residency
+list, `runtime_max_processes`, a mapping rename, the agent application's router
+port and **the agent's own measured-VRAM write-back** all still land, the last of
+them at telemetry cadence and by design
+([§9's notification-rule exemption](#9-keeping-the-agent-current-the-notification-rule)).
+None of them can start a model — which is why none is gated, and why the
+reservation is narrow on purpose rather than by omission — but every one of them
+changes the runtime-config document, and therefore its `etag`.
+
 Two conditions **warn** instead of refusing, and ride the result as
 `warnings[]`: a server that also hosts active applications the agent does not
 manage (`non_managed_applications` — refusing would not improve isolation,
@@ -3408,18 +3474,127 @@ run holds per-spec evidence it produced itself, reported alongside the boolean
 as `isolation_evidence` so the claim can be audited:
 
 - `stopped_after_write` — a spec that **had** a live process when the write
-  landed is in a no-process state on a post-delay frame.
+  landed is in a no-process state on an admissible frame.
 - `no_process_at_write` — the spec had **no** live process, so a `force_stopped`
   write against it does nothing at all: no state change, no frame
   ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)). It can only be
   *confirmed*, never awaited — waiting for a transition that will never arrive
   is what turns an already-quiet server into an isolation timeout.
 
-**Both** values are recorded only from a frame that arrived after the agent's
-**binding delay** has elapsed since the write, and that delay is the agent's own
-**runtime-poll interval** (60 s) **whatever the transport looks like**. Two
-things this used to get wrong, and both let the run confirm an isolation it had
-not earned:
+**Neither value is recorded from a frame the wait has not ADMITTED, and there
+are two standards of admissibility.** The report says which one it used, as
+`isolation_proof`, because they are different strengths of evidence and an
+operator weighing a number must not have to assume the stronger:
+
+| `isolation_proof` | Admissible once… | What it is |
+|---|---|---|
+| `config_acknowledged` | the agent has reported applying a runtime-config document this run derived and verified still force-stops **every** enumerated spec | a fact about a document the agent is demonstrably holding |
+| `bind_delay` | `vramIsolationBindDelay` (the agent's own guaranteed runtime-poll interval, 60 s) has elapsed since the write | an inference from a clock plus the absence of a process |
+
+**The value the report carries and the standard the wait applies are ONE
+derivation**, and that is a correctness requirement rather than tidiness. They
+began as two independent reads of the same planned boolean — one filling the
+report's `isolation_proof`, one building the wait's policy — and nothing tied
+them together, so a single edit to either could have made a report claim *"the
+agent confirmed it applied this document"* over a wait that had actually applied
+the timed fallback. For a feature that exists so a confirmed isolation is
+**provable**, that is the one divergence which must be impossible, so the policy
+is derived once and the report's string is read off that policy. Pinned both
+structurally and end to end: the run is driven under each standard with the
+binding delay set far from the test's patience, so a report whose claim does not
+match what its wait did fails on the clock.
+
+The first is available for an agent that declares
+[`runtime_config_ack`](#72-the-applied-document-acknowledgement), and it normally
+lands within one telemetry interval instead of a minute. The second is what
+remains for an agent that does not — negotiation is by **name**, never by version
+([ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)),
+so an older binary in the field keeps exactly the pre-acknowledgement behaviour
+rather than hanging on a message it will never send. The **total bound** is
+`bindDelay + vramIsolationDrainBound` under both: the acknowledgement removes the
+blind delay from what counts as *evidence*, not from the budget a slow drain is
+allowed.
+
+**Equality against the acknowledged ETag is a proof only because the ETag is a
+content digest.** `agentRuntimeConfigETag` is `sha256` over the document with its
+own `etag` field blanked, so equal content always yields an equal digest and the
+gateway can derive the exact value an agent holding a given document must report.
+Two consequences the design rests on. A **stale** acknowledgement — an agent still
+holding the pre-drain document — can never be mistaken for a fresh one, and
+structurally rather than by luck: the run *refuses to start* against any
+pre-existing override, so a pre-drain document always differs from a post-drain
+one in at least one spec's `admin_state`. And nothing an agent **invents** can
+confirm anything, because the comparison is against a digest the gateway computed
+itself; the reported value is clamped on ingest purely as a memory bound, never
+validated by shape.
+
+**The digest covers the WHOLE document, which is the one trap this design has to
+answer.** Any write that reaches the derivation changes it, and the benchmark's
+reservation covers only the launch-spec `PUT` — deliberately not the per-GPU
+budgets, the co-residency matrix, `runtime_max_processes`, a mapping rename, the
+agent application's router port, or **the agent's own measured-VRAM write-back**,
+which [§9's notification rule](#9-keeping-the-agent-current-the-notification-rule)
+exempts and which arrives at telemetry cadence. So the document really does move
+under a run. A wait pinned to the single value captured after the drain would
+then never match: the agent applies the *new* document, reports *its* digest, and
+the run burns its whole bound and reports a timeout for a fleet that was drained
+correctly the entire time.
+
+The wait therefore keeps a **set** of accepted digests. It seeds the set by
+deriving the document once, immediately after the drain; whenever the reported
+value is one it has not answered yet, it re-derives and admits the new digest —
+**but only after checking that the fresh document still force-stops every
+enumerated spec.** That check is what makes re-derivation a proof rather than a
+convenience, and its false branch is a real case: an operator's mid-wait "Force
+start" or "Clear override" produces a document that lets a sibling start, the
+agent applies and reports it dutifully, and accepting it would claim
+`isolated: true` for a run whose isolation had already been revoked. A spec
+**missing** from the document fails the check too, which is the fail-closed
+direction rather than an oversight: a spec deleted or disabled mid-wait is no
+longer in the document, so the document says nothing about it, and *"not
+mentioned"* is not *"refused a start"*. Such a spec is in fact quiet — an agent
+is not told about it, so it does not run it — and inferring that is exactly what
+this check may not do, because its job is to decide what an acknowledgement
+**proves**. The run
+reports `isolation_lost` instead — the same reason, and the same operator action,
+as a sibling seen running again at the end of the measurement. Earlier digests
+stay in the set rather than being replaced, because the gateway does not control
+the order in which an agent reports them: a document that was current a moment
+ago is a perfectly good proof of what it *is* a proof of — it force-stopped the
+whole enumerated fleet when this run derived it, and the agent says it is the one
+it holds. It is **not** a statement about the document the store holds now, and
+the difference is worth stating because the obvious reading overclaims: while the
+agent keeps reporting a digest already in the set, nothing is re-derived, so a
+mid-wait revocation stays invisible to the gate until the agent reports the new
+document. That is not a hole — an agent holding a document that stops the fleet
+has not started the released sibling yet — and the revocation is owned
+**downstream** either way, by the end-of-run re-verification (`isolation_lost`)
+and by the restore's compare-and-set. What the window costs is the earliest
+possible detection, never the detection. Re-derivation costs one store read per
+*change* of the reported value, not one per frame.
+
+**An agent that promises an acknowledgement and never sends one is its own
+reason.** `isolation_unacknowledged`, not `isolation_timeout`, because the next
+action differs and that difference is the whole diagnostic value of the
+acknowledgement: `isolation_timeout` says the document landed and a *model* would
+not go quiet, so look at that model; `isolation_unacknowledged` says the document
+never landed at all, so look at the **agent**. It also covers the honest remainder
+of a mid-run downgrade — the declared feature set is read **once**, before
+anything is written, so an agent that stops declaring the name before the wait
+ends costs one bounded wait and is *named*, rather than silently dropping to the
+weaker standard halfway through a proof.
+
+**What the acknowledgement does not say**, because trusting it further would be a
+new lie in place of the old one: it means *this document is my desired state and
+every reconciliation decision it implies is committed* — **not** that every
+process the document stops has exited. The drain's grace/kill sequence is
+asynchronous, and the per-spec `runtimes[].state` is still what reports how far it
+got, which is why the per-spec evidence above survives unchanged. What it adds is
+that no `force_stopped` spec can be started again afterwards, so an absence
+observed *after* it is durable ([§7.2](#72-the-applied-document-acknowledgement)).
+
+Two things this used to get wrong, both of which let a run confirm an isolation it
+had not earned, and both worth keeping because each looked reasonable:
 
 - *The delay gated one half only.* A stop **transition** was treated as
   self-evident proof the override arrived. It is not: a spec's own exit looks
@@ -3434,18 +3609,17 @@ not earned:
   branch — the stronger label for exactly the case the delay exists for.)
 - *The delay was picked from the transport.* Two seconds for a WS-connected
   agent, the poll interval otherwise. That gave the WS push the standing of a
-  delivery, and it has none: there is **no acknowledgement anywhere**
-  ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)),
-  `PushRuntimeConfig` runs in a detached goroutine that returns silently when
-  the derive or the marshal fails, and `NotifyRuntimeConfig` sends to **zero**
-  connections when the socket closed after the probe or drops the frame with a
-  `slog.Debug` when a send queue is full — in each case the override binds on
-  the next poll anyway. The probe was also taken **before** the drain wrote
-  anything, so even a truthful answer said nothing about the transport at write
-  time. The poll is the one mechanism that is guaranteed (the agent re-fetches
-  the whole document on every poll and every reconnect), so one interval
-  measured from the write always covers a full cycle. An open WebSocket makes
-  arrival sooner *likely* and nothing rests on it.
+  delivery, and it has none: `PushRuntimeConfig` runs in a detached goroutine
+  that returns silently when the derive or the marshal fails, and
+  `NotifyRuntimeConfig` sends to **zero** connections when the socket closed
+  after the probe or drops the frame with a `slog.Debug` when a send queue is
+  full — in each case the override binds on the next poll anyway. The probe was
+  also taken **before** the drain wrote anything, so even a truthful answer said
+  nothing about the transport at write time. The acknowledgement is the opposite
+  of that probe in every respect: it is sent *after* the agent reconciled, it
+  *names* the document, and it cannot be true of a document the agent is not
+  holding. What an open WebSocket still decides is only the operator-facing
+  `post_transport_agent` warning.
 
 `isolated` is true only when **every** enumerated spec carries one of those two
 values. An **empty** enumeration is `false`, not vacuously true: "nothing
@@ -3530,9 +3704,11 @@ exists for.
 samples (default 3, ~3 s at the 1 s cadence) in which every watched card varies
 by no more than `max(1 % of the card, 64 MiB)`. A result that reached no number
 says **why**, because the operator's next action differs per reason:
-`isolation_timeout`, `baseline_unstable`, `post_load_unstable`,
-`already_resident`, `below_floor`, `no_samples`, `isolation_lost`,
-`strategy_disagreement`, `run_failed`. Five of them are worth naming here:
+`isolation_timeout`, `isolation_unacknowledged`, `baseline_unstable`,
+`post_load_unstable`, `already_resident`, `below_floor`, `no_samples`,
+`isolation_lost`, `strategy_disagreement`, `run_failed` — **ten**, and the
+count is worth stating because this list has twice gone stale behind the code
+it describes. Six of them are worth naming here:
 
 - **`already_resident`** — after a *confirmed* drain, a model that still
   reports resident is being served by something the gateway could not stop
@@ -3546,6 +3722,14 @@ says **why**, because the operator's next action differs per reason:
   absorbed it.
 - **`isolation_lost`** — a spec the run had drained held a live process again
   by the end of the measurement, so the isolation did not cover the whole run.
+- **`isolation_unacknowledged`** — the agent declared that it reports which
+  runtime-config document it has applied and then never acknowledged one
+  carrying this run's overrides. The document never landed at all, so the place
+  to look is the **agent** (wedged, mid-restart, holding a document it cannot
+  apply), not the fleet — which is the whole diagnostic value of the
+  acknowledgement, and why it is not folded into `isolation_timeout`. See
+  [§7.2](#72-the-applied-document-acknowledgement) for the standard it belongs
+  to.
 - **`strategy_disagreement`** — the delta and the agent's own per-process
   figure are further apart than the difference in the quantities can explain.
 - **`run_failed`** — the odd one out, and the only value whose next action is
@@ -3736,10 +3920,16 @@ trigger's refusal instead of to a neighbouring process. `BenchmarkResult.vram`
 being nullable is the whole of that distinction.
 
 **Every wire value the portal renders is declared once, and the mapping is
-pinned in both directions.** The inconclusive reasons, the confidence warnings
-and the fingerprint kinds are closed vocabularies that travel as free-form
-strings inside a persisted `vram_json`, so the portal has to hold a localized
-sentence for each and an honest fallback for a value it does not know. It
+pinned in both directions.** The inconclusive reasons, the confidence warnings,
+the fingerprint kinds and the isolation proofs are closed vocabularies that
+travel as free-form strings inside a persisted `vram_json`, so the portal has to
+hold a localized sentence for each and an honest fallback for a value it does not
+know. `isolation_proof` carries one extra rule, because an ABSENT value there is
+not an unknown one: a row written before the acknowledgement shipped recorded no
+proof at all, and naming either standard for it would invent behaviour that is
+not in the payload — so the lookup returns *null* and the line is simply not
+rendered, while a non-empty value this build does not know still gets the honest
+fallback. It
 declares each vocabulary **once**, in `components/shared/vram.ts`, and keys
 each label map by that declaration's own type — a declared value with no
 sentence and a mapped key for a value nobody declares are both compile errors.
@@ -3753,14 +3943,25 @@ discipline exists because the alternative failed inside one branch: two reasons
 (`isolation_lost`, `strategy_disagreement`) and two warnings
 (`undeclared_gpu_allocation`, `residency_unknown`) shipped while the tests
 still asserted "the seven reasons" against a hand-written list of seven, and a
-test that names a property it does not enforce is worse than no test. What no
-portal test can close is the **cross-language** half — the Go constants are the
-source, the values appear in no schema, and the portal's suite does not read
-the Go module — so adding a value means editing four places (the Go constant,
-the `vram.ts` array, its label key, both locales' sentences) with only the last
-three enforced against each other; the Go side pins its own literals in its
-guard tests, and a rename that gets past both reaches the portal as an unknown
-value and renders the fallback. The trigger's **refusal codes** are the same
+test that names a property it does not enforce is worse than no test.
+**Deriving from `vram.ts` was not enough, and the proof is that the same defect
+recurred immediately.** A derivation is only as good as what it derives *from*,
+and `vram.ts` is a mirror, not the source: the Go side then grew
+`isolation_unacknowledged`, the array kept nine values, the whole portal suite
+stayed green, and the panel rendered *"this build does not know the reason it
+reported"* for a reason the matching backend build reports. So `vram.test.ts`
+now reads the four Go constant blocks **off disk**
+(`internal/gateway/benchmark_vram.go`, `benchmark_vram_isolation.go`,
+`benchmark_vram_confidence.go`) and requires each array to be exactly the closed
+set declared there, in both directions — the same monorepo reach
+`AgentTokenSection.test.tsx` already uses for the shared agent-config golden,
+with a floor on the number of constants found so a renamed prefix or a moved
+file fails loudly instead of comparing two empty sets. Adding a value therefore
+still means editing four places (the Go constant, the `vram.ts` array, its label
+key, both locales' sentences), but **all four are now enforced**, and the Go
+side additionally pins its own literals in its guard tests. The runtime fallback
+stays load-bearing for the case it was always for: a persisted row written by a
+**newer** gateway than the portal reading it. The trigger's **refusal codes** are the same
 contract by a different route: they are keyed into `errorLabelByCode`, an
 unmapped one degrades to the backend's raw English in an otherwise localized
 portal, so `format.test.ts` pins those six wire strings as literals.

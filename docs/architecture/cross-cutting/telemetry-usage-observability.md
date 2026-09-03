@@ -206,6 +206,7 @@ sequenceDiagram
     GW->>Perf: publish(sample)
     Perf-->>GW: SSE to Server Detail live charts
     GW->>GW: LoadedModels.SetAgentReport / AgentCertReports.Report / AgentProxyStatus.Report
+    GW->>GW: AgentFeatures.Set → RuntimeStatus.SetAppliedConfigETag → RuntimeStatus.publish (in that order)
     GW->>Pres: ReportReactivated(serverID, window)
     Pres-->>GW: inactive→active edge? → maybeFireReactivation (out-of-band health probe)
 
@@ -228,8 +229,8 @@ negative values are rejected outright for required scalars, and silently coerced
 `CPUTempC`) — a single bad sensor reading degrades gracefully rather than
 poisoning the persisted series.
 
-The sample also carries two **additive** keys for the
-[agent-managed model runtime](agent-runtime-manager.md), both recorded only
+The sample also carries three **additive** keys for the
+[agent-managed model runtime](agent-runtime-manager.md), recorded only
 *after* every store write in the ingest has succeeded — a report is evidence, and
 evidence is not stamped on a failed write:
 
@@ -249,6 +250,41 @@ evidence is not stamped on a failed write:
   contain only specs in state `running` — `starting` deliberately does not count,
   because prefer-loaded routing must never send traffic to a model that cannot
   answer yet.
+- **`runtime_config_applied_etag`** — the ETag of the runtime-config document the agent
+  has **applied**: the acknowledgement that turns "the gateway pushed an
+  override" into "the override is in force". Top-level, beside `agent_version`,
+  because it is a property of the one document and not of any spec — and because
+  `runtimes` is omitted entirely for a document with no specs, which is a
+  legitimate desired state whose application a caller may well be waiting to
+  hear about. Omitted when there is nothing to acknowledge, and the absence is
+  the contract a consumer's fallback keys on: an older agent, a `file`-mode
+  agent (which discards the gateway's document, so it has none of the gateway's
+  to acknowledge), or one whose `runtime_manager` negotiation is not currently
+  active. Declared as the agent feature `runtime_config_ack`, because a caller
+  cannot otherwise tell "still working on it" from "will never answer".
+  What it means precisely, and the boundary that makes it safe to trust, is
+  [agent-runtime-manager §7.2](agent-runtime-manager.md#72-the-applied-document-acknowledgement).
+
+**Two ingest-side ordering rules on those registry updates are contracts, not
+tidiness.** All of them run **after every store write succeeded** — a report is
+evidence about what the agent is doing *right now*, and stamping it while the
+sample itself failed to persist would claim a freshness the gateway does not
+have. And within them, `runtime_config_applied_etag` is recorded **before** the
+runtime-status snapshot is published, because the two are read together by one
+consumer: the VRAM benchmark's isolation wait is *woken* by a published frame and
+then reads the acknowledgement registry
+([agent-runtime-manager §11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+Recording first is what makes "the acknowledgement I can read is at least as
+fresh as the frame that woke me" true; reversed, a frame reaches the subscriber
+which then reads the *previous* acknowledgement, discards the frame as
+inadmissible and waits for the next sample — a telemetry interval each time, and
+on a run whose only remaining frame was that one, the whole bound. Both
+statements are non-blocking and adjacent, so no deterministic runtime
+observation can separate the two orders; the rule is pinned by a source-order
+assertion instead (`TestIngestRecordsTheAcknowledgementBeforePublishingTheFrame`,
+the technique `cmd/gateway`'s wiring tests already use), with the observable
+half — that both facts reach the wait over the wire at all — driven end to end
+through this very core.
 
 Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
 

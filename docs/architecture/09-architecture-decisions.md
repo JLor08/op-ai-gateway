@@ -222,6 +222,19 @@ flag per **shipped** capability. **Consequence:** `if agent_version >= X` is not
 an acceptable gate anywhere; a mixed-version fleet degrades silently and
 correctly; and a negotiated-away feature must be surfaced explicitly in the
 portal rather than becoming a silent no-op.
+
+A flag also earns its place when the capability it names is only a *fact the
+agent states about itself*, and `runtime_config_ack`
+([§7.2](cross-cutting/agent-runtime-manager.md#72-the-applied-document-acknowledgement))
+is the clearest case: the agent needs no permission to report which
+runtime-config document it has applied, and it sends the field unconditionally.
+What the name buys is on the CONSUMER side — "no answer yet" and "no answer
+ever" are the same silence on the wire, and no timeout separates them, so
+without the name a gateway waiting for that report must either hang against
+every older binary or abandon the report for everyone. The pattern to follow:
+**when the absence of a message is the thing you have to interpret, the flag
+gates the FALLBACK rather than the feature** — the behaviour without it is a
+weaker but correct path, never "off".
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-026 — Gateway→agent control is desired state, not commands

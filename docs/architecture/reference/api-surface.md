@@ -211,15 +211,40 @@ Conventions worth stating, because each is a judgement call a client depends on:
   actions for the operator, so a client must not collapse them. `gpus` is
   always an array (never `null`), and `0` means *unknown* in both `delta_mb`
   and `measured_mb`, never a real zero.
+
+  `isolated` is qualified by **`isolation_proof`**, which a client must read
+  beside it rather than folding into it: `"config_acknowledged"` means the agent
+  reported having applied a runtime-config document the run had verified
+  force-stops the whole fleet, `"bind_delay"` means the agent never reports that
+  (it does not declare `runtime_config_ack`) so the run waited out its
+  guaranteed poll interval and observed no process. Those are different
+  *strengths* of evidence. The field is present whether or not the isolation was
+  confirmed — a failure then says which standard failed — and **absent** on a
+  row written before the acknowledgement shipped, which a client must render as
+  "not recorded" and never as `bind_delay`.
+
+  `isolation_unacknowledged` is the matching `inconclusive` reason: the agent
+  declared that it acknowledges and then never acknowledged a document that
+  drains the fleet. Distinct from `isolation_timeout` on purpose — that one says
+  the document landed and a *model* would not go quiet, this one says the
+  document never landed, so the operator inspects the agent rather than the
+  fleet.
 - **`PUT /api/portal/mappings/{id}/runtime-spec` answers `409
   runtime_spec.server_benchmarking` while a benchmark run holds that mapping's
-  server.** The endpoint is a full-document replace with `admin_state` among
+  server** — and this is the *only* write it gates, which a client
+  reasoning about a run's isolation has to know. The endpoint is a full-document replace with `admin_state` among
   its fields, so it is an override action as much as an edit, and one
   "Force start" on a spec a VRAM run has drained puts a sibling's allocation
   inside the measurement window. The gate is the benchmark reservation — the
   same fact that already excludes the server from routing — checked after
   authorization, so an unauthorized caller learns nothing from it. `GET` and
-  `DELETE` are ungated, and so is a write to any other server.
+  `DELETE` are ungated, and so is a write to any other server. Per-GPU budgets,
+  the co-residency list, `runtime_max_processes`, mapping renames, the agent
+  application's router port and the agent's own measured-VRAM write-back are all
+  ungated too, so the runtime-config document — and therefore its `etag` — really
+  does move during a run. The isolation wait handles that by re-deriving rather
+  than by pinning one value; see
+  [agent-runtime-manager §11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs).
 - **The SSE stream wraps every frame as `{"runtimes":[…]}` — not `{"data":[…]}`**
   like the model-servers and performance streams on this same portal. Both the
   initial `snapshot` frame and every later `update` frame carry the **complete**
@@ -423,10 +448,11 @@ the agent as a WebSocket frame payload, which has no HTTP headers at all, so a
 header-only representation would silently disagree across the two transports.
 A pushed frame must therefore carry the full document **including** its `etag`.
 
-`/features` returns `{"features":["runtime_manager"]}`. Gating is name-based
-string equality: a feature is active only when the gateway and the agent both
-declare it. A **404 is not an error** for an agent — it means an older gateway,
-and reads as the empty feature set.
+`/features` returns the gateway's declared names —
+`{"features":["runtime_manager","runtime_logs","runtime_config_ack"]}`. Gating is
+name-based string equality: a feature is active only when the gateway and the
+agent both declare it. A **404 is not an error** for an agent — it means an older
+gateway, and reads as the empty feature set.
 
 `/runtime-config` returns the desired state **for the server that owns the agent
 token**; the server id is never taken from a parameter. Shape rules that two
@@ -441,6 +467,14 @@ independent implementations must agree on:
   `admin_state`;
 - **`coresident` entries are SPEC ids, never mapping ids** — the mistake that
   would type-check and silently break admission;
+- **`etag` is a deterministic digest over the document's own content** —
+  `sha256` of the marshalled document with the `etag` field blanked — so equal
+  content always yields an equal value, and *both* sides can compute it. That is
+  not an implementation note: it is what lets the gateway derive the exact value
+  an agent holding a given document must report back as
+  `runtime_config_applied_etag`, and therefore what makes that acknowledgement a
+  proof rather than a shared counter
+  ([agent-runtime-manager §7.2](../cross-cutting/agent-runtime-manager.md#72-the-applied-document-acknowledgement));
 - `gpus[].vram_mb` is the *measured* value if present, else the estimate, with
   `0` meaning **unknown** — never omitted, never null;
 - only **enabled** specs appear, and a spec whose `mapping_id` no longer resolves
