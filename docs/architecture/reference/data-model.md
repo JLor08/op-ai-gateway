@@ -36,7 +36,7 @@ not route-based).
 |---|---|
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
-| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, native-passthrough flags, health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
+| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
@@ -48,7 +48,7 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `enabled` (off by default). |
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent). |
 | `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`. |
 | `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (71 migrations)
+## 4. Migration history (72 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -244,7 +244,7 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 |---|---|---|
 | 3 | `server_telemetry_samples` | Adds the `server_telemetry_samples` time-series table. |
 | 4 | `server_telemetry_bigint_bytes` | Widens `server_telemetry`'s byte columns from `integer` to `bigint` on Postgres (int4 overflow on hosts with >2 GB RAM/VRAM). |
-| 5 | `application_native_passthrough` | Adds per-application native-passthrough flags (`native_responses`, `native_messages`). |
+| 5 | `application_native_passthrough` | Adds per-application native-passthrough flags (`native_responses`, `native_messages`). **Superseded by migration 72** below — both columns stay in the schema, inert, and are no longer read or written. |
 | 6 | `usage_provider_path` | Adds `usage_events.provider_path` — the actual upstream endpoint path called. |
 | 7 | `token_model_override_map` | Adds `api_tokens.model_override_map` — the per-requested-model override map. |
 | 8 | `application_loaded_models` | Adds `applications.loaded_models_path`/`loaded_models_format` (which upstream endpoint/format reports loaded models). |
@@ -399,6 +399,12 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 71 | `model_mapping_benchmarks_vram_json` | Adds `model_mapping_benchmarks.vram_json` (`text`, default empty): the VRAM benchmark's per-GPU result for a `kind = 'vram'` history row. Its **own** column, following `capacity_curve` (migration 15) exactly — an opaque JSON string the store never parses, marshalled by the gateway and decoded in the portal DTO for that one kind; reusing `capacity_curve` would be a lie in a column name. `text` on both dialects, because the payload grows with the number of GPUs watched and with the per-spec isolation evidence, so it has no small bound to declare ([ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types)). The v60-frozen baseline creates the table without the column, so the `ALTER` does real work on a fresh install as well as on an upgrade. **No backfill** — no earlier row has a VRAM result to derive — and the row is evidence, never authority: nothing reads it back into a launch spec's `vram_estimate_mb` or `vram_measured_mb`. |
 
+### Endpoint modes
+
+| # | Migration | Purpose |
+|---|---|---|
+| 72 | `application_endpoint_modes` | Replaces the two native-passthrough booleans (migration 5) with the three-state `EndpointMode` (`disabled`/`translate`/`passthrough`) at both levels. Adds `applications.responses_mode`/`messages_mode` (`text not null default ''`), **backfilled** from the existing booleans (`native_responses <> 0 → 'passthrough'`, else `'translate'`; same for messages) so no application's served behavior changes on upgrade. Adds `agent_runtime_specs.api_flavors`/`responses_mode`/`messages_mode` (`text not null default '[]'`/`''`/`''`), **backfilled from the parent application** — a join through `model_mappings.application_id` — so every pre-existing spec becomes an explicit, independent snapshot of its application's just-backfilled values rather than inheriting them dynamically ("Snapshot aus App": [ADR-033](../09-architecture-decisions.md#adr-033--endpoint-modes-replace-the-native_-booleans-independent-per-endpoint-disable-per-spec-snapshot)). The `native_responses`/`native_messages` columns are **not dropped** — append-only migration discipline (three store drivers) — they simply stop being read or written by new code. |
+
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
 
@@ -420,6 +426,23 @@ plausible-looking validation rule would break the normal case:
   (`runtime_spec.args_invalid` / `runtime_spec.env_invalid`), never a raw JSON
   error or a 500. **`env` must never hold a secret value** — only
   `${AGENT_ENV:…}` references (see [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway)).
+- **`responses_mode`/`messages_mode` (`applications`, `agent_runtime_specs`)
+  are `text`, not an integer enum**, storing the lowercase `EndpointMode`
+  string (`disabled`/`translate`/`passthrough`) directly, scanned straight into
+  the typed Go field — there is no CHECK constraint; validation is the
+  portal's alone
+  ([API Surface](api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode)).
+  Nothing should ever store `''` post-migration: migration 72 backfills every
+  existing row and the portal's own create paths substitute `passthrough` for
+  a blank request field before the write, never after. `EndpointMode.OrDefault`
+  resolves the hypothetical unset (`''`) case to `passthrough` rather than
+  `disabled` — a defaulting rule a zero-value in-memory struct literal (a test
+  fixture, say) would need — but as shipped no production read path calls it;
+  it is exercised only by its own unit test. `agent_runtime_specs.api_flavors`
+  reuses `applications.api_flavors`' own shape (opaque JSON-array `text`,
+  migration 72) and is a **snapshot**, not a live reference: once a spec is
+  created it never re-reads its parent application's row, by design
+  ([ADR-033](../09-architecture-decisions.md#adr-033--endpoint-modes-replace-the-native_-booleans-independent-per-endpoint-disable-per-spec-snapshot)).
 - **Five zero-values mean "unbounded" or "automatic", not "off":**
   `listen_port` 0 = the agent picks a free loopback port (the normal case);
   `idle_timeout_seconds` 0 = never unload; `admission_wait_timeout_seconds` 0 =

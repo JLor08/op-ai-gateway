@@ -55,14 +55,16 @@ flowchart TD
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
-    Resp --> NativeGate{"target.NativeResponses\n(tryProxyNative)?"}
-    Msg --> NativeGate2{"target.NativeMessages\n(tryProxyNative)?"}
+    Resp --> NativeGate{"endpointModeFor(target,\nopenai_responses)"}
+    Msg --> NativeGate2{"endpointModeFor(target,\nanthropic_messages)"}
     CT --> CountTok["compat.CountAnthropicTokens\n(word-count estimate, no upstream call)"]
 
-    NativeGate -->|yes| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
-    NativeGate -->|no| ParseResp["compat.ParseOpenAIResponses"]
-    NativeGate2 -->|yes| Native2["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/messages"]
-    NativeGate2 -->|no| ParseMsg["compat.ParseAnthropicMessages"]
+    NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
+    NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
+    NativeGate -->|disabled| Reject1["404 responses.endpoint_disabled"]
+    NativeGate2 -->|passthrough| Native2["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/messages"]
+    NativeGate2 -->|translate| ParseMsg["compat.ParseAnthropicMessages"]
+    NativeGate2 -->|disabled| Reject2["404 messages.endpoint_disabled"]
 
     ParseChat --> Req["inference.Request"]
     ParseResp --> Req
@@ -109,8 +111,8 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | Client protocol | Endpoint(s) | Handler | Auth | Native passthrough |
 |---|---|---|---|---|
 | OpenAI Chat Completions | `/v1/chat/completions`, `/openai/v1/chat/completions` | `handleOpenAIChat` | `requireWebAnyScope` (session cookie **or** bearer) | none — always translated |
-| OpenAI Responses (Codex) | `/v1/responses`, `/openai/v1/responses` | `handleOpenAIResponses` | `requireAnyScope` (bearer only) | `Application.NativeResponses` |
-| Anthropic Messages (Claude Code) | `/v1/messages`, `/anthropic/v1/messages` | `handleAnthropicMessages` | `requireAnyScope` (bearer only) | `Application.NativeMessages` |
+| OpenAI Responses (Codex) | `/v1/responses`, `/openai/v1/responses` | `handleOpenAIResponses` | `requireAnyScope` (bearer only) | `Target.ResponsesMode` (§6) |
+| Anthropic Messages (Claude Code) | `/v1/messages`, `/anthropic/v1/messages` | `handleAnthropicMessages` | `requireAnyScope` (bearer only) | `Target.MessagesMode` (§6) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -248,14 +250,80 @@ gateway model's `max_context_length` (and, when currently loaded,
 `loaded_context_length`) alongside an LM-Studio `state` (`loaded`/`not-loaded`)
 — metadata only; chat still flows over `/v1/chat/completions`.
 
-## 6. Native passthrough
+## 6. Endpoint modes and native passthrough
 
 For Codex and Claude Code, translation is inherently lossy (it can represent
-only text + simple tool calls) — an application can instead be flagged
-`NativeResponses`/`NativeMessages` (per-application, `internal/routing/store.go`),
-in which case the gateway proxies the **raw client body** to the upstream's own
-native endpoint and streams the raw response back unmodified.
-`tryProxyNative` (`internal/gateway/native_passthrough.go`) makes the decision:
+only text + simple tool calls). Each of these two coding-agent endpoints is
+governed by a three-state `routing.EndpointMode`
+(`internal/routing/endpoint_mode.go`), replacing the two booleans
+`Application.NativeResponses`/`NativeMessages` this design superseded
+(`true`→`passthrough`, `false`→`translate`, per the migration backfill in
+[Data Model §4](../reference/data-model.md)):
+
+| Mode | Meaning |
+|---|---|
+| `disabled` | the endpoint is not served — a client gets a stable 404 (below) |
+| `translate` | the client body is translated to `/v1/chat/completions`, exactly the lossy compat path described in §1–§5 |
+| `passthrough` | the gateway proxies the **raw client body** to the upstream's own native endpoint and streams the raw response back unmodified |
+
+An absent or blank mode defaults to `passthrough` (`DefaultEndpointMode`) —
+substituted at write time by the portal service for both the application and
+runtime-spec create paths — for every application type, because every
+supported upstream now serves both native endpoints (see [Agent-Managed Model
+Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
+
+**Where the effective mode lives.** An ordinary application carries
+`ResponsesMode`/`MessagesMode` directly on `routing.Application`
+(`internal/routing/store.go`). A `server_agent` application's **resolved
+runtime spec** is instead the sole authority for its model:
+`RuntimeSpec.APIFlavors`/`ResponsesMode`/`MessagesMode` are a per-spec
+snapshot — independent of the parent application once created — documented in
+[Agent-Managed Model Runtime §11.5](agent-runtime-manager.md#115-what-each-remaining-tab-shows).
+`Resolver.targetFrom` (`internal/routing/resolver.go`) surfaces whichever is
+authoritative onto the routing `Target` (the spec's values when the mapping
+has one, the application's otherwise), so every downstream reader —
+candidacy and dispatch alike — consumes one uniform
+`Target.{APIFlavors,ResponsesMode,MessagesMode}`.
+
+**The effective-served rule** is the single source of truth for both
+eligibility and the pass-through decision:
+
+```
+responsesServed = ("openai"    ∈ APIFlavors) && ResponsesMode != disabled
+messagesServed  = ("anthropic" ∈ APIFlavors) && MessagesMode  != disabled
+```
+
+So an endpoint can be off two independent ways: the coarse `openai`/`anthropic`
+flavor is unchecked, or the flavor stays checked and the mode is set to
+`disabled` — the latter is what lets an application serve plain
+`/v1/chat/completions` while refusing Codex's `/v1/responses` specifically.
+Unchecking a flavor does not force its stored mode to `disabled`; the
+effective rule already treats it as off, so re-checking the flavor restores
+whatever mode was last set.
+
+**Two-tier enforcement**, because a `server_agent` application's authority
+only resolves per-model, after a candidate has already been picked:
+
+1. **Candidate eligibility** — `applicationServesEndpoint`
+   (`internal/routing/store.go`), consulted wherever the resolver builds its
+   candidate list. For an `openai_responses` request, an **ordinary**
+   application is a candidate only when `responsesServed` is true; a
+   `server_agent` application is gated on the coarse `openai` flavor alone
+   here, because its authoritative per-model mode isn't knowable until a
+   model has actually been picked — candidacy must not exclude it on the
+   (possibly stale) application-level fallback. `anthropic_messages` is the
+   `anthropic`/`MessagesMode` analogue. A plain `openai_chat_completions`
+   request is unaffected by either mode — only the coarse flavor gates it —
+   so a disabled Codex endpoint never removes an application's
+   chat-completions eligibility.
+2. **Dispatch-time rejection** — `endpointModeFor`/`tryProxyNative`
+   (`internal/gateway/native_passthrough.go`), described below. Once a
+   `server_agent` mapping's runtime spec has been resolved, a per-model
+   `disabled` mode is enforced right there, with a stable error code — the
+   only point in the request lifecycle where it is knowable.
+
+`tryProxyNative` (`internal/gateway/native_passthrough.go`) makes the
+dispatch-time decision:
 
 1. Peek `model`/`stream` from the raw body (tolerant of a malformed body — falls
    through to the translate path, which produces the proper parse error).
@@ -270,12 +338,21 @@ native endpoint and streams the raw response back unmodified.
 3. `Resolver.Resolve` the model. An admission-queue rejection here is
    **terminal** (surfaced immediately, never falls through — otherwise the
    translate path would re-queue and wait a second time).
-4. If the resolved application is native-flagged for this flavor, `proxyNative`
-   forwards the body (with only its `model` field rewritten to the upstream's
-   mapped name — `rewriteModelField`, value-lossless but not byte-identical
-   JSON); otherwise `tryProxyNative` returns `false` and the caller's translate
-   handler parses and resolves again (an accepted, idempotent double-resolve —
-   the one place in the gateway that happens).
+4. Read `endpointModeFor(target, apiFlavor)` — the resolved `Target`'s
+   effective mode for this flavor — and switch three ways:
+   - `passthrough` → `proxyNative` forwards the body (with only its `model`
+     field rewritten to the upstream's mapped name — `rewriteModelField`,
+     value-lossless but not byte-identical JSON) and `tryProxyNative` returns
+     `true` (handled).
+   - `disabled` → reject immediately: a stable error code + HTTP 404
+     (`responses.endpoint_disabled` / `messages.endpoint_disabled`, written
+     inline like `model.not_allowed` — see §13) and return `true`. This never
+     falls through to translate — falling through would silently downgrade an
+     operator's explicit "not served" into a lossy best-effort answer.
+   - anything else (`translate`, or an unpopulated `""` — treated as the safe
+     translate fallback) → return `false`, and the caller's translate handler
+     parses and resolves again (an accepted, idempotent double-resolve — the
+     one place in the gateway that happens).
 
 The client's own bearer token is **never** forwarded upstream; only
 `Content-Type` and — via `provider.WithUpstreamAuth` — the resolved
@@ -580,6 +657,8 @@ Every inference error response uses the gateway-wide envelope
 | `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate |
 | `limit.cost_budget_exceeded` | 402 | `PrincipalLimiter` admission gate |
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
+| `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
+| `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
 | `routing.no_model_route` / `routing.no_healthy_host` | 502 | no mapping / every candidate gated |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |
 | `provider.timeout` / `.invalid_response` / `.unavailable` | 502 | upstream call failed or returned something unparseable |

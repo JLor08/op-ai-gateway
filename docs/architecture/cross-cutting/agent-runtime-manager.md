@@ -575,6 +575,14 @@ Every other request is routed on a `model` field in a JSON request body.
 - A request with **no body, a non-JSON body, or a body naming no managed
   model** gets `404 runtime.model_not_managed`. See §4.5 for what that means for
   websocket-serving model servers.
+- **The router is a catch-all: it forwards `/v1/responses` and `/v1/messages`
+  exactly like any other path**, routing purely on the body's top-level
+  `model` field — it has no notion of Codex or Claude Code, and no notion of
+  the endpoint-mode feature ([Compatibility & Inference
+  §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+  The gateway decides *disabled* / *translate* / *passthrough* entirely on its
+  own side, before ever dispatching to this router — see §7.1 for why that
+  keeps this feature out of the agent wire protocol altogether.
 
 ### 4.3 Stable error codes
 
@@ -1811,6 +1819,23 @@ bugfix is **not** machine-detectable, because the guard has no external signal
 for what changed. That half stays a process rule in
 [`AGENTS.md`](../../../AGENTS.md).
 
+**Not every gateway-side feature touching a runtime spec needs a bump.** The
+per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
+`MessagesMode` (§11.5; [Compatibility & Inference
+§6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough))
+— governs whether the gateway proxies a Codex/Claude Code request natively or
+translates it, a decision the gateway makes entirely on its own side **before**
+dispatching to this router (§4.2). The router has no use for the three fields,
+so they were deliberately **never added** to `AgentRuntimeSpecDTO` or the
+agent's own `runtime.Spec` wire type — `TestAgentRuntimeConfigOmitsFlavorsAndModes`
+(`internal/portal/service_runtime_test.go`) marshals a runtime-config document
+built from a spec carrying non-default values for all three and asserts none
+of `api_flavors`/`responses_mode`/`messages_mode` appear in the JSON. No wire
+shape changed, so `agent.Version` was **not** bumped and `server-agent/` was
+not touched for this feature — the guard test is what makes "the agent doesn't
+need to know" a checked fact rather than an assumption a later change could
+quietly invalidate.
+
 ### 7.2 The applied-document acknowledgement
 
 Every telemetry sample carries the ETag of the runtime-config document the agent
@@ -2858,6 +2883,34 @@ case that sends people looking for it, a measurement above the GPU budget
 leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agent
 picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
+
+**Every launch spec also carries its own API-Varianten block** — the identical
+`openai`/`anthropic` flavor checkboxes and Codex/Claude-Code endpoint-mode
+dropdowns the application form shows, extracted into one shared component,
+`ApiVariantControls` (`gateway/frontend/src/components/shared/ApiVariantControls.tsx`),
+so the two forms cannot drift apart. `RuntimeAdminSection` renders it against
+`spec.api_flavors`/`responses_mode`/`messages_mode` (`PutRuntimeSpecRequest`
+carries the same trio), which — once saved — is the **sole** authority for
+that model's Codex/Claude Code endpoints; the parent `server_agent`
+application's own values no longer apply to a mapping that has a spec (full
+semantics, including the effective-served rule and the disabled-endpoint 404:
+[Compatibility & Inference
+§6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+**Snapshot, not inheritance:** opening the **create** form pre-fills the three
+fields from the parent application's *current* values (`openCreate` in
+`RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/
+`messages_mode` into local form state) purely so a new spec starts out
+agreeing with what the application already exposes rather than a blank
+passthrough-only guess — this is a **frontend, form-open-time** convenience,
+not a backend default: the backend's own absent-field default is unconditionally
+`passthrough` for both modes and both flavors enabled
+(`PutRuntimeSpecRequest`, `internal/portal/service_runtime.go`), and it never
+reads the parent application to fill in a gap (pinned by
+`TestPutRuntimeSpecDoesNotInheritAppModes`). A later edit to the application's
+own values therefore never propagates to an existing spec — only a **new**
+spec's create form picks up the application's current template — matching the
+"full-document replace, no inheritance" posture the rest of this feature holds
+to (§11.1).
 
 **A GPU row can show a THIRD number, and it is an offer rather than a field.**
 When the mapping's benchmark history carries an applicable VRAM measurement
