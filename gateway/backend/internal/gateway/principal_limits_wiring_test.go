@@ -157,7 +157,7 @@ func TestWriteLimitDeniedCostBudget(t *testing.T) {
 // These reuse newServiceScopeTestServer (service_token_scope_test.go), which
 // already builds a full *Server (real routing/resolver, provider.NewMock()
 // upstream) with two routable models -- "qwen-coder" (translate path) and
-// "native-model" (native passthrough, NativeResponses enabled). New(...)
+// "native-model" (native passthrough, ResponsesMode=passthrough). New(...)
 // always installs a default s.Limiter (backed by the routing.MemoryStore
 // those helpers use, which is a genuine no-op store -- see the "CARRY" note in
 // docs/superpowers/sdd/2026-08-08-principal-limits/progress.md); each test
@@ -240,9 +240,9 @@ func TestPrincipalLimiterRateLimitDenies(t *testing.T) {
 }
 
 // TestPrincipalLimiterRateLimitDeniesNativePassthrough proves the SAME Admit
-// gate applies on the tryProxyNative path (native-model, NativeResponses
-// enabled) -- the choke point the brief calls out as a separate call site from
-// the three translate handlers.
+// gate applies on the tryProxyNative path (native-model, ResponsesMode=
+// passthrough) -- the choke point the brief calls out as a separate call site
+// from the three translate handlers.
 func TestPrincipalLimiterRateLimitDeniesNativePassthrough(t *testing.T) {
 	srv, tokens, recorder := newServiceScopeTestServer(t)
 	addServiceToken(tokens, "svc-secret", auth.Token{ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Svc"})
@@ -277,8 +277,8 @@ func TestPrincipalLimiterRateLimitDeniesNativePassthrough(t *testing.T) {
 // both attempt native passthrough (tryProxyNative) BEFORE falling back to
 // their own translate handler when the resolved application is NOT
 // native-passthrough-enabled -- the common, default-off case (here,
-// "qwen-coder" via app_mock_comp, which sets neither NativeResponses nor
-// NativeMessages; see seedGatewayTestRoutes). Both call sites call
+// "qwen-coder" via app_mock_comp, whose ResponsesMode/MessagesMode are both
+// left at the zero value, i.e. translate; see seedGatewayTestRoutes). Both call sites call
 // admitPrincipal at their own pre-Resolve choke point, but they are the SAME
 // client request: admitPrincipal must run Limiter.Admit at MOST once for it.
 // Before the fix, tryProxyNative's admitPrincipal call consumed the rate

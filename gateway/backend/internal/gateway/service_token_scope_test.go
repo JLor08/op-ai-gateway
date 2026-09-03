@@ -24,7 +24,7 @@ import (
 //     BOTH the OpenAI and Anthropic api flavors, translate path only), used for the
 //     three-inference-handler pass-through tests and the translate-path allowlist
 //     gate tests;
-//   - a second application/mapping ("native-model") with NativeResponses enabled,
+//   - a second application/mapping ("native-model") with ResponsesMode=passthrough,
 //     used for the native-passthrough allowlist gate test.
 //
 // A service token is never store-backed in Task 2 (that lands in Task 3's
@@ -300,7 +300,7 @@ func TestModelAllowlistGateOtherTranslateEndpoints(t *testing.T) {
 
 // The allowlist gate fires on the NATIVE PASSTHROUGH path too (tryProxyNative),
 // before Resolve/ProxyNative is ever called — the app serving "native-model" has
-// NativeResponses enabled, so a plain /v1/responses request for it takes the
+// ResponsesMode=passthrough, so a plain /v1/responses request for it takes the
 // native path, not the translate fallback.
 func TestModelAllowlistGateNativePassthroughPath(t *testing.T) {
 	t.Run("blocked before upstream", func(t *testing.T) {

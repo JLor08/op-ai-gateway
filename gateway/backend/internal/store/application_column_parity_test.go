@@ -72,7 +72,7 @@ var applicationParityBools = [4][applicationParityRows]bool{
 //
 // WHAT THE FIXTURE GUARANTEES, precisely: fields that CAN hold a distinct value
 // per row (strings, ints) do, and each varies per row as well, so a reader
-// returning the wrong ROW is caught too. The six integer-booleans carry the
+// returning the wrong ROW is caught too. The four integer-booleans carry the
 // bit-pattern table above, sized so every pair of them differs in at least one
 // seeded application. Together that makes a swapped pair in any one list
 // observable wherever the two columns are same-typed — the only case that does
