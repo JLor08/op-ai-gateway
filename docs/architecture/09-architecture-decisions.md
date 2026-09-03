@@ -222,6 +222,19 @@ flag per **shipped** capability. **Consequence:** `if agent_version >= X` is not
 an acceptable gate anywhere; a mixed-version fleet degrades silently and
 correctly; and a negotiated-away feature must be surfaced explicitly in the
 portal rather than becoming a silent no-op.
+
+A flag also earns its place when the capability it names is only a *fact the
+agent states about itself*, and `runtime_config_ack`
+([§7.2](cross-cutting/agent-runtime-manager.md#72-the-applied-document-acknowledgement))
+is the clearest case: the agent needs no permission to report which
+runtime-config document it has applied, and it sends the field unconditionally.
+What the name buys is on the CONSUMER side — "no answer yet" and "no answer
+ever" are the same silence on the wire, and no timeout separates them, so
+without the name a gateway waiting for that report must either hang against
+every older binary or abandon the report for everyone. The pattern to follow:
+**when the absence of a message is the thing you have to interpret, the flag
+gates the FALLBACK rather than the feature** — the behaviour without it is a
+weaker but correct path, never "off".
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-026 — Gateway→agent control is desired state, not commands
@@ -332,3 +345,105 @@ https-switch **scope**, which is durable, and never the agent's reported
 on a proxy-mode agent before its first leaf) — a control that hid on it would
 vanish exactly while an operator was provisioning.
 → [Certificates & TLS §7](cross-cutting/certificates-tls.md), [Data Model](reference/data-model.md).
+
+## ADR-031 — Per-process VRAM on Windows: PDH counters plus a D3DKMT LUID bridge
+**Context:** co-residency admission charges a managed process its *measured*
+VRAM wherever a measurement exists, and on Windows there was none to be had:
+under the **WDDM** driver model the OS, not the NVIDIA driver, owns GPU memory,
+so `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory` answers `[N/A]`
+for `used_memory`. The failure was not benign — `[N/A]` parses to `0`, the
+measurer returned a *non-nil* map of zeros, and a present key outranks the
+operator's estimate, so every managed process on every Windows host was admitted
+as needing **0 MB** and each GPU's budget read as entirely free. **Decision:**
+measure Windows through the `\GPU Process Memory(*)\Dedicated Usage` **PDH**
+counter, whose instance names carry the PID and the display-adapter **LUID**;
+bridge that LUID to a PCI address with the user-mode-callable gdi32 **D3DKMT**
+exports (`D3DKMTOpenAdapterFromLuid` +
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS)`); and join the PCI address
+to the GPU index specs and budgets are written in terms of via
+`nvidia-smi --query-gpu=index,pci.bus_id`. The measurer is chosen by **build
+tag** (`collector.NewVRAMMeasurer`), the compute-apps measurer is **never**
+installed on Windows, and a measured `<= 0` no longer overrides an estimate on
+**any** platform. All grammars, arithmetic and cache decisions live in a
+build-tag-free file so Linux CI exercises the code Windows runs; only the
+syscalls sit behind `//go:build windows`, pinned by compile-time struct-layout
+assertions. **Rejected:** the **TCC** driver model, which does restore
+per-process reporting but disables the adapter's display output and is
+unavailable on most GeForce parts — these are workstation-class hosts;
+installing compute-apps on Windows regardless (a non-nil map of zeros is *worse*
+than no measurer, because `0` overrides the estimate while `nil` falls back to
+it); reading the neighbouring `Shared Usage` / `Non Local Usage` counters as
+VRAM-spillover detection (they read identically on all three GPUs of the probe
+host, so they are not per-adapter figures); and a second `PdhCollectQueryData`
+with a settling delay (the counter is a raw gauge — one collection already
+returned correct values, and the delay would be spent on the manager's
+serialized owner goroutine during an admission). **Consequence:** Windows
+admission now runs on real numbers — within 0.04–0.8 % of
+`nvidia-smi memory.used` per GPU, with attribution agreeing with `nvidia-smi`'s
+own PID→GPU mapping for 15 of 15 PIDs on a 3-GPU host — but the syscall half is
+verified by review, the compile-time assertions and out-of-band Windows runs
+only, because CI builds nothing for Windows
+([§11.3](11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
+Two rules follow and must not be relaxed. First, the **negative** LUID cache may
+record only durable findings, since a wrongly cached adapter loses its
+measurement silently for the life of the process: D3DKMT *refusing to open* the
+adapter (`STATUS_INVALID_PARAMETER`), an implausible address it *did* report, or
+a *fresh and complete* `nvidia-smi` reading with no GPU at that address —
+everything else, a `STATUS_DEVICE_REMOVED` from a TDR and any failure of the
+address query included, is the absence of an answer and is retried. The rule is
+an **allowlist** precisely because the two mistakes are not symmetric (three
+wasted syscalls a cycle against a working GPU going unmeasured until the process
+restarts), and it must stay one function in the build-tag-free half where CI can
+test it — it was stated in this ADR and in the design doc while the code cached
+*every* probe error alike, which is the kind of divergence `//go:build windows`
+makes invisible. Second, a PCI address claimed by two cards is refused rather
+than resolved to the last row, because `D3DKMT_ADAPTERADDRESS` reports no PCI
+domain and a confident wrong GPU index is worse than none.
+→ [Agent-Managed Model Runtime §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
+
+## ADR-032 — Known VRAM demand outranks unknown: the unknown side blocks, never evicts
+**Context:** the unknown-VRAM rule is symmetric — a candidate whose own demand
+is unknown may start only *alone* on its GPUs (rule 4), and an occupant of
+unknown demand blocks the cards it holds (rule 5, added alongside the Windows
+measurer so that "alone" survives the next admission). Symmetric **eviction
+rights** do not converge. With one spec estimated and one left blank on the same
+card, rule 5 evicts the blank incumbent for the estimated candidate while rule 4
+evicts the estimated incumbent for the blank candidate: alternating requests are
+each served only after destroying the other's loaded model, forever.
+**Decision:** make the two rules a **total order — known demand beats unknown
+demand.** Rule 5 keeps its eviction right unchanged. Rule 4 gives its up: a
+candidate whose own demand is unknown no longer evicts an occupant of **known**
+demand, it *blocks* — the existing terminal `pending_vram_unknown` when that
+occupant is **pinned** and can never leave, and `Wait` for every other one. The
+block is **unconditional**: it stands even where the matrix or the arithmetic
+would have evicted that same occupant anyway, because honouring the order only
+where no other reason exists leaves those pairs evicting in both directions —
+the same defect, one rule over.
+**Rejected:** giving rule 4 the priority instead (it hands a misconfigured spec
+the power to kill correctly configured ones, which is the wrong side of the trade
+in every direction); charging an unknown demand the whole budget inside the
+per-GPU arithmetic instead of naming the contention (the eviction loop releases
+the same `0`, so the sum never comes down — that version evicts every idle
+process on the card *and* still answers `Wait`); and breaking the tie on age or
+`last_used` (still lets a blank spec destroy a configured one, and makes the
+outcome depend on request order). **Consequence:** an unknown-demand spec may
+still have a card to itself — that is rule 4's stated intent — but only a card
+it can *get* to itself; what it loses is the privilege of evicting a working
+model to get there, and the spec that loses the contest is always the
+misconfigured one. Where **both** sides are
+unknown neither outranks the other, and the pre-existing mutual eviction stands
+(rule 5 still evicts an evictable unknown occupant) — unchanged by this decision
+rather than fixed by it, and recorded as an acceptance in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). The
+price of the order is a `Wait` returned while an idle victim was plainly
+available, and that wait is only as short as the occupant's own
+`idle_timeout_seconds` (a `0` there means *never unload*): the ways out are a
+measurement, or the operator's estimate on the spec that is missing one.
+Because that price can be unbounded — an idle occupant with
+`idle_timeout_seconds: 0` never leaves, and the candidate requeues to its
+admission timeout on every request — **this `Wait` is the one that reports
+itself**: `Admit` gives it a message and the manager records it as the blocked
+spec's own `last_error`, naming the occupant and the card, which the portal
+shows in an always-visible column. Every other `Wait` stays silent, since a
+spec queued behind a busy neighbour is ordinary operation.
+→ [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).

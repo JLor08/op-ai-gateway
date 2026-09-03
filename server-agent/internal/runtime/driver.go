@@ -95,6 +95,7 @@ type driverManager interface {
 	Transitions() <-chan struct{}
 	EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
 	LoadedModels() []string
+	AppliedETag() string
 }
 
 // Driver is the top-level agent-managed-runtime object internal/agent holds
@@ -447,6 +448,48 @@ func (d *Driver) stopAll() {
 // data rather than guessing.
 func (d *Driver) Active() bool {
 	return d.active.Load()
+}
+
+// AppliedConfigETag returns the ETag of the GATEWAY runtime-config document
+// this agent has applied, for the telemetry sample's
+// runtime_config_applied_etag field (internal/agent's optional
+// runtimeConfigAcknowledger). "" means there is nothing to acknowledge, and
+// there are three ways to get there.
+//
+// Nothing applied yet -- the manager's own "" (see Manager.AppliedETag,
+// which is where the value comes from and which explains why it is the only
+// honest source for it).
+//
+// NOT NEGOTIATED ACTIVE. An agent whose runtime_manager feature is not
+// active on both sides is enforcing nothing, so it must acknowledge
+// nothing. This gate is checked HERE rather than left to the caller for the
+// same reason ResendReport checks it: the driver owns the invariant. It is
+// also deliberately not left to stopAll's side effect -- a drain does
+// overwrite the manager's document with an ETag-less empty one, so the
+// answer would usually be "" anyway, but "usually, by consequence" is not a
+// contract.
+//
+// FILE MODE. A *FileSource ignores the gateway's pushed document outright
+// (see load), so a file-mode agent has none of the gateway's to
+// acknowledge. Note that the gate is a POSITIVE check for *GatewaySource
+// rather than "is the ETag non-empty": a file-mode Config carries whatever
+// "etag" the operator's own file contains, and because the gateway computes
+// its ETag as a deterministic digest over the document's content, an
+// operator who copies a served document verbatim into their local file ends
+// up holding a value that would MATCH a document the gateway really served.
+// Acknowledging that would tell the gateway "I applied your document" about
+// a document this agent provably discarded -- the worst available failure,
+// since it is indistinguishable from the truth. The gateway's own refusal
+// to treat a file-mode server's gateway-side specs as effective (§8.2) is
+// what stands instead.
+func (d *Driver) AppliedConfigETag() string {
+	if d.mgr == nil || !d.Active() {
+		return ""
+	}
+	if _, isGateway := d.src.(*GatewaySource); !isGateway {
+		return ""
+	}
+	return d.mgr.AppliedETag()
 }
 
 // load resolves the desired config for one Sync call: a non-empty pushed

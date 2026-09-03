@@ -143,6 +143,7 @@ export function ApplicationSection({
     | 'mappingBenchmarks'
     | 'mappings'
     | 'probeMappingContext'
+    | 'probeMappingVram'
     | 'subscribeBenchmark'
     | 'syncApplicationModels'
     | 'updateApplication'

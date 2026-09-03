@@ -204,6 +204,7 @@ function renderSection(
     mappingBenchmarks: vi.fn(async () => []),
     activeBenchmarks: vi.fn(async () => []),
     probeMappingContext: vi.fn(async () => idleBenchmark),
+    probeMappingVram: vi.fn(async () => idleBenchmark),
     // RuntimeAdminSection's Pick (reached only by the server_agent drill-down
     // tests below; unused defaults for every other test).
     runtimeSpec: vi.fn(async () => makeRuntimeSpec()),

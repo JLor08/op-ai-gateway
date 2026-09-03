@@ -29,20 +29,53 @@ type RuntimeErrorDTO struct {
 	StderrTail string    `json:"stderr_tail,omitempty"`
 }
 
+// RuntimeGPUStatusDTO is one GPU's measured VRAM for a managed process, as
+// carried on THIS status frame (mirrors agentRuntimeGPUSample field-for-field).
+// Only a strictly positive measurement appears here: a measured 0 means
+// UNKNOWN throughout the runtime feature, and the store write-back drops it on
+// the same rule.
+type RuntimeGPUStatusDTO struct {
+	Index          int `json:"index"`
+	VRAMMeasuredMB int `json:"vram_measured_mb"`
+}
+
 // RuntimeStatusDTO is one agent-managed model process's live state, as
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
-// for every field it carries; it deliberately omits GPUs -- per-GPU measured
-// VRAM feeds the store write-back, not the live status view).
+// for every field it carries).
 type RuntimeStatusDTO struct {
-	SpecID    string           `json:"spec_id"`
-	Model     string           `json:"model"`
-	State     string           `json:"state"`
-	Since     time.Time        `json:"since"`
-	PID       int              `json:"pid,omitempty"`
-	Port      int              `json:"port,omitempty"`
-	InFlight  int              `json:"in_flight"`
-	Restarts  int              `json:"restarts"`
-	LastError *RuntimeErrorDTO `json:"last_error,omitempty"`
+	SpecID   string    `json:"spec_id"`
+	Model    string    `json:"model"`
+	State    string    `json:"state"`
+	Since    time.Time `json:"since"`
+	PID      int       `json:"pid,omitempty"`
+	Port     int       `json:"port,omitempty"`
+	InFlight int       `json:"in_flight"`
+	Restarts int       `json:"restarts"`
+	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
+	// GATEWAY's own arrival time for the frame that carried it -- never the
+	// agent's self-reported reported_at, which is a claim rather than an
+	// observation. Both are omitted together when the frame measured nothing
+	// (no measurer on the host, or a spec with no live process), so a consumer
+	// never sees a timestamp with nothing to be fresh about.
+	//
+	// This is a WATERMARK, and it exists because the STORED value cannot carry
+	// one: routing.RuntimeSpecGPU is {SpecID, GPUIndex, VRAMEstimateMB,
+	// VRAMMeasuredMB} with no timestamp, and writeBackRuntimeVRAM deliberately
+	// skips an unchanged value -- so a store poll reads an arbitrarily old
+	// number as a fresh one, and demanding that the number CHANGE fails in the
+	// normal case where a run measures exactly what the last one did. A reader
+	// that must attribute a measurement to something it just did (the VRAM
+	// benchmark) accepts only a value carried by a frame that arrived after
+	// the event it cares about. The write-back to the spec's own
+	// vram_measured_mb column is unchanged and remains the durable path.
+	//
+	// MeasuredAt is tagged `omitzero`, NOT `omitempty`: omitempty has no
+	// effect on a struct type, so a zero time.Time under it would reach every
+	// client as "0001-01-01T00:00:00Z" -- a timestamp that reads as a real
+	// (very stale) measurement instead of as no measurement.
+	GPUs       []RuntimeGPUStatusDTO `json:"gpus,omitempty"`
+	MeasuredAt time.Time             `json:"measured_at,omitzero"`
+	LastError  *RuntimeErrorDTO      `json:"last_error,omitempty"`
 }
 
 // agentFeaturesRegistry records, per server, the feature-name set the
@@ -166,13 +199,33 @@ type runtimeStatusRegistry struct {
 	// subs is the live SSE fan-out: one channel per active subscriber, keyed
 	// by server id, mirroring serverPerfRegistry.subs.
 	subs map[string]map[chan []RuntimeStatusDTO]struct{}
+	// appliedETag is each server's agent's last-reported APPLIED
+	// runtime-config ETag (telemetry's runtime_config_applied_etag) -- the
+	// acknowledgement the protocol used not to have.
+	//
+	// It is a SERVER-level fact and lives here rather than on
+	// RuntimeStatusDTO, where a per-GPU measurement watermark already rides,
+	// because the document it names covers the whole server: one string per
+	// spec would be the same value repeated N times, absent entirely on a
+	// server whose agent manages nothing yet, and it would invite the two
+	// copies to disagree.
+	//
+	// Reading it is still in step with the status stream, and by ordering
+	// rather than by luck: ingestTelemetrySample records this BEFORE it
+	// publishes the sample's status snapshot, so any frame a subscriber
+	// receives implies this map already holds an acknowledgement at least as
+	// fresh as that frame. A later one is strictly better -- the VRAM
+	// benchmark's isolation wait only ever ACCEPTS on a match, never refuses
+	// on a mismatch it has not re-derived -- so freshness may only help.
+	appliedETag map[string]string
 }
 
 func newRuntimeStatusRegistry() *runtimeStatusRegistry {
 	return &runtimeStatusRegistry{
-		fileMode: make(map[string]bool),
-		statuses: make(map[string][]RuntimeStatusDTO),
-		subs:     make(map[string]map[chan []RuntimeStatusDTO]struct{}),
+		fileMode:    make(map[string]bool),
+		statuses:    make(map[string][]RuntimeStatusDTO),
+		subs:        make(map[string]map[chan []RuntimeStatusDTO]struct{}),
+		appliedETag: make(map[string]string),
 	}
 }
 
@@ -219,6 +272,44 @@ func (r *runtimeStatusRegistry) IsFileMode(serverID string) bool {
 	return r.fileMode[serverID]
 }
 
+// SetAppliedConfigETag records which runtime-config document serverID's agent
+// reports having APPLIED. An EMPTY etag deletes the entry rather than storing
+// a blank, because each telemetry sample is a full snapshot (the same rule as
+// agentFeaturesRegistry.Set and SetFileMode above): an agent that stops
+// reporting one -- a downgrade, a restart before its first reconcile, an
+// agent that never had the feature -- must read as "nothing acknowledged" on
+// the very next sample, never as a stale confirmation that some document is
+// still in force. No-op on a nil registry or an empty id.
+func (r *runtimeStatusRegistry) SetAppliedConfigETag(serverID, etag string) {
+	if r == nil || serverID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if etag == "" {
+		delete(r.appliedETag, serverID)
+		return
+	}
+	r.appliedETag[serverID] = etag
+}
+
+// AppliedConfigETag reports the runtime-config ETag serverID's agent last said
+// it had applied, or "" for a nil registry, a server that has never reported,
+// and an agent that reports none.
+//
+// "" is the FAIL-CLOSED default and the only safe one: the sole consumer
+// compares this against a digest the gateway derived itself, so an empty value
+// means "no acknowledgement", which withholds the fast path rather than
+// granting it.
+func (r *runtimeStatusRegistry) AppliedConfigETag(serverID string) string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.appliedETag[serverID]
+}
+
 // publish replaces serverID's runtime-status snapshot and non-blockingly fans
 // it out to that server's live subscribers (mirrors
 // serverPerfRegistry.publish's outside-the-lock delivery discipline exactly:
@@ -249,6 +340,25 @@ func (r *runtimeStatusRegistry) publish(serverID string, statuses []RuntimeStatu
 		default:
 		}
 	}
+}
+
+// statusSnapshot returns a copy of serverID's most recent published
+// runtime-status snapshot, without subscribing. Nil for a nil registry and
+// for a server that has never reported.
+//
+// It is a READ OF STATE, never of an edge, and that distinction is the whole
+// reason it exists: a force_stopped write against a spec with no live process
+// produces no state change and no frame, so nothing downstream can wait for a
+// transition there -- but every spec IS present in every status frame, so its
+// state is readable. The VRAM benchmark's isolation reads this once, before
+// its own write, to learn which specs even HAVE a process to stop.
+func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusDTO {
+	if r == nil || serverID == "" {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]RuntimeStatusDTO(nil), r.statuses[serverID]...)
 }
 
 // subscribe atomically returns serverID's current runtime-status snapshot
@@ -285,7 +395,8 @@ func (r *runtimeStatusRegistry) subscribe(serverID string) ([]RuntimeStatusDTO, 
 	return snap, ch, unsub
 }
 
-// Retain prunes fileMode and statuses entries for servers no longer in live
+// Retain prunes fileMode, statuses and appliedETag entries for servers no
+// longer in live
 // (mirrors AgentPresenceRegistry.Retain / AgentCertReportRegistry.Retain,
 // called at the end of every app-health cycle): a deleted server's flag or
 // last-known status must not linger in memory forever. A nil registry is a
@@ -308,6 +419,11 @@ func (r *runtimeStatusRegistry) Retain(live map[string]struct{}) {
 	for id := range r.statuses {
 		if _, ok := live[id]; !ok {
 			delete(r.statuses, id)
+		}
+	}
+	for id := range r.appliedETag {
+		if _, ok := live[id]; !ok {
+			delete(r.appliedETag, id)
 		}
 	}
 }

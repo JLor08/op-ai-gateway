@@ -41,8 +41,24 @@ type BenchmarkResult struct {
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity,omitempty"`
 	// VisionCapable is the vision benchmark's verdict: nil = not run or
 	// inconclusive (nothing persisted); non-nil true/false = a definitive result.
-	VisionCapable *bool  `json:"vision_capable,omitempty"`
-	Error         string `json:"error,omitempty"`
+	VisionCapable *bool `json:"vision_capable,omitempty"`
+	// VRAM is the VRAM benchmark's result: nil = the run never reached the
+	// measurement phase (refused before it started, isolation refused, or a
+	// hard error -- see Error). Non-nil with Inconclusive set = it ran and
+	// reached no number, and WHY is the operator's next action. The nested
+	// shape mirrors routing.CapacityReport; what is deliberately NOT copied is
+	// VisionCapable's nil-means-both contract above, because "no result" and
+	// "no result because the model was already being served by something we
+	// could not stop" send an operator to two different places. See
+	// benchmark_vram.go for the report itself.
+	//
+	// Held by POINTER, and a report attached to a result is IMMUTABLE from
+	// that moment: benchmarkRun.snapshot copies the Results slice but not what
+	// its pointers reference, so a mutation after addResult would be visible
+	// to every already-published SSE frame (VisionCapable has the same
+	// property, and the same rule).
+	VRAM  *VRAMReport `json:"vram,omitempty"`
+	Error string      `json:"error,omitempty"`
 }
 
 type benchmarkRun struct {

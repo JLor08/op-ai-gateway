@@ -1074,3 +1074,72 @@ func TestRoutingStoreSingleServerAgentApplication(t *testing.T) {
 		}
 	})
 }
+
+// --- Benchmark history: the kind-specific payload columns -------------------
+
+// TestRoutingStoreBenchmarkRunVRAMJSON is the MEMORY-vs-SQL half of the
+// migration-v71 vram_json contract (the sqlite-vs-postgres half is
+// TestConformanceBenchmarkRunsVRAMJSON): a kind=="vram" row round-trips its
+// opaque per-GPU payload through routing.Store on both production backends,
+// and a run of any other kind reads back with the payload empty. The memory
+// driver stores routing.BenchmarkRun by value, so a new field reaches it for
+// free while the SQL driver needs the column in BOTH its insert and its
+// select list -- exactly the asymmetry a memory-only suite cannot see.
+func TestRoutingStoreBenchmarkRunVRAMJSON(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_vram", Name: "VRAM", Domain: "vram.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://vram", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_vram", ServerID: "srv_vram", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_vram", ApplicationID: "app_vram", GatewayModelName: "vram-model",
+			AppModelName: "vram-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		const payload = `{"isolated":true,"gpus":[{"index":1,"delta_mb":22000,"attributable":true}]}`
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map_vram", ServerID: "srv_vram", CreatedAt: now.Add(time.Minute),
+			Kind: "vram", VRAMJSON: payload,
+		}); err != nil {
+			t.Fatalf("insert vram run: %v", err)
+		}
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map_vram", ServerID: "srv_vram", CreatedAt: now, GenTokensPerSecond: 12,
+		}); err != nil {
+			t.Fatalf("insert speed run: %v", err)
+		}
+
+		runs, err := s.BenchmarkRunsByMapping(ctx, "map_vram", 50)
+		if err != nil {
+			t.Fatalf("BenchmarkRunsByMapping: %v", err)
+		}
+		if len(runs) != 2 {
+			t.Fatalf("expected 2 runs, got %d (%+v)", len(runs), runs)
+		}
+		// Newest-first: the +1m VRAM row leads the speed row.
+		if runs[0].Kind != "vram" {
+			t.Fatalf("newest run kind = %q, want vram", runs[0].Kind)
+		}
+		if runs[0].VRAMJSON != payload {
+			t.Errorf("vram payload round-trip mismatch:\n got %q\nwant %q", runs[0].VRAMJSON, payload)
+		}
+		if runs[1].Kind != "speed" || runs[1].VRAMJSON != "" {
+			t.Errorf("speed run = %+v, want kind=speed with an empty VRAM payload", runs[1])
+		}
+	})
+}

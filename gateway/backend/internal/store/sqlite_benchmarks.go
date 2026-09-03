@@ -29,8 +29,9 @@ func (s *SQLiteStore) InsertBenchmarkRun(ctx context.Context, run routing.Benchm
 		insert into model_mapping_benchmarks (
 			id, mapping_id, server_id, created_at,
 			gen_tokens_per_second, prompt_tokens_per_second,
-			load_time_ms, context_size, error, kind, capacity_curve, vision_capable
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			load_time_ms, context_size, error, kind, capacity_curve, vision_capable,
+			vram_json
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id,
 		run.MappingID,
 		run.ServerID,
@@ -43,6 +44,7 @@ func (s *SQLiteStore) InsertBenchmarkRun(ctx context.Context, run routing.Benchm
 		kind,
 		run.CapacityCurve,
 		run.VisionCapable,
+		run.VRAMJSON,
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -62,7 +64,8 @@ func (s *SQLiteStore) BenchmarkRunsByMapping(ctx context.Context, mappingID stri
 	rows, err := s.query(ctx, `
 		select id, mapping_id, server_id, created_at,
 			gen_tokens_per_second, prompt_tokens_per_second,
-			load_time_ms, context_size, error, kind, capacity_curve, vision_capable
+			load_time_ms, context_size, error, kind, capacity_curve, vision_capable,
+			vram_json
 		from model_mapping_benchmarks
 		where mapping_id = ?
 		order by created_at desc
@@ -79,6 +82,7 @@ func (s *SQLiteStore) BenchmarkRunsByMapping(ctx context.Context, mappingID stri
 			&run.ID, &run.MappingID, &run.ServerID, &run.CreatedAt,
 			&run.GenTokensPerSecond, &run.PromptTokensPerSecond,
 			&run.LoadTimeMS, &run.ContextSize, &run.Error, &run.Kind, &run.CapacityCurve, &visionCapable,
+			&run.VRAMJSON,
 		); err != nil {
 			return nil, fmt.Errorf("scan benchmark run: %w", err)
 		}

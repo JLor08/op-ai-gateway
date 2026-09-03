@@ -149,3 +149,25 @@ func TestCapabilitiesJSONReturnsAFreshSliceEachCall(t *testing.T) {
 		t.Fatalf("after overwriting a returned capabilities slice, the next call returned %q, want %q -- capabilitiesJSON must copy, never alias the package-level template", got, want)
 	}
 }
+
+// TestRuntimeConfigAckFeatureIsDeclared pins the acknowledgement feature's
+// exact wire NAME and the version it ships in. The name is the whole
+// negotiation: the gateway checks this literal string before it will wait
+// for an acknowledgement instead of falling back to its fixed isolation
+// delay, and nothing in this module gates on it -- so a rename here breaks
+// the gateway silently, with no compiler and no other test to catch it.
+// This is the same two-sides-of-one-contract reasoning that makes
+// internal/runtime carry its own copy of the runtime_manager literal.
+func TestRuntimeConfigAckFeatureIsDeclared(t *testing.T) {
+	const name = "runtime_config_ack"
+	for _, f := range Features {
+		if f.Name != name {
+			continue
+		}
+		if f.Since != "0.3.0" {
+			t.Fatalf("feature %q Since = %q, want 0.3.0 (the branch's single bump)", name, f.Since)
+		}
+		return
+	}
+	t.Fatalf("Features does not declare %q; the gateway cannot know an acknowledgement will ever arrive: %+v", name, Features)
+}

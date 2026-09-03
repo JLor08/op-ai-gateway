@@ -594,6 +594,28 @@ const de = {
   runtimeSpecSetVisibleDevicesHint:
     'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
+  // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
+  // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
+  // Ihr Schätzfeld, schreibt aber nichts – gespeichert wird erst mit
+  // „Speichern“.
+  runtimeSpecVramBenchmark: 'Benchmark-Messung (MB)',
+  runtimeSpecVramApply: 'Übernehmen',
+  runtimeSpecVramApplyHint:
+    '„Übernehmen“ füllt nur das Feld „VRAM (MB)“ dieser Zeile; gespeichert wird die Zahl erst mit „Speichern“. Drei Zahlen mit drei Bedeutungen: Ihre Schätzung (editierbar, gehört Ihnen), die Messung des Agenten (nur lesbar, gehört dem Agenten) und die Messung des Benchmarks (nur lesbar, gehört dem Lauf).',
+  runtimeSpecVramBenchmarkFrom: 'Messung vom',
+  runtimeSpecVramBenchmarkSourceDelta: 'Differenz vor/nach dem Laden',
+  runtimeSpecVramBenchmarkSourceMeasured: 'Per-Prozess-Messung des Agenten während des Laufs',
+  // Was der Vergleich der beim Lauf aufgezeichneten Karten-Kennung mit der
+  // Karte ergeben hat, die jetzt auf diesem Index sitzt. Nie ein blankes
+  // „geprüft“: „nicht prüfbar“ ist keine bestandene Prüfung, und Name +
+  // Gesamtgröße unterscheiden zwei identische Karten nicht.
+  runtimeSpecVramCardVerifiedUuid: 'Karte per UUID als dieselbe bestätigt.',
+  runtimeSpecVramCardVerifiedNameTotal:
+    'Karte nur per Name und Gesamtgröße bestätigt: zwei identische Karten sind so nicht unterscheidbar.',
+  runtimeSpecVramCardUnverifiable:
+    'Nicht prüfbar, ob das noch dieselbe Karte ist: der Lauf hat keine Kennung aufgezeichnet, oder dieser Server hat für diesen Index gerade keine Hardware gemeldet. Die Zahl gilt damit für den GPU-Index – nicht für eine nachgewiesene Karte.',
+  runtimeSpecVramCardDrift:
+    'Die Karte auf diesem GPU-Index ist nicht die gemessene: die Nummerierung hat sich seit der Messung verändert (Treiber-Update oder Hardware-Tausch). Die Zahl wird deshalb nicht angeboten – messen Sie erneut.',
   runtimeSpecGpuIndex: 'GPU-Index',
   runtimeSpecGpuPick: 'Gemeldete GPU',
   runtimeSpecGpuPickPlaceholder: 'Karte auswählen …',
@@ -862,6 +884,82 @@ const de = {
   benchmarkServerBusy: 'Server gerade in Benutzung',
   benchmarkRunning: 'Benchmark läuft',
   benchmarkLastCompleted: 'Zuletzt abgeschlossen',
+  // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
+  // agent-gesteuerte Modell auf dem Server anhält, genau eines lädt und eine
+  // Zahl MELDET – er schreibt keines der beiden VRAM-Felder. Zwei Regeln
+  // stecken in diesen Texten: 0 heißt in diesem Feature immer „unbekannt“ und
+  // niemals „null MB“, und „kein Ergebnis“ nennt jedes Mal die nächste
+  // Handlung, weil sie sich je Grund unterscheidet.
+  benchmarkTypeVram: 'VRAM',
+  benchmarkTypeVramHint:
+    'Nur im Umfang „Modell“: die Messung hält jedes agent-gesteuerte Modell auf diesem Server an (force_stopped), lädt dann genau dieses eine Modell, misst und stellt anschließend alle Overrides wieder her.',
+  benchmarkVramRunningNote:
+    'Der Server wird für die Messung geleert: jedes agent-gesteuerte Modell steht währenddessen auf force_stopped und wird nach dem Lauf wiederhergestellt.',
+  benchmarkVramResultTitle: 'Ergebnis der VRAM-Messung',
+  benchmarkVramRuns: 'VRAM-Messungen',
+  benchmarkVramIsolationConfirmed: 'Isolation nachgewiesen',
+  benchmarkVramIsolationUnconfirmed: 'Isolation nicht nachgewiesen',
+  benchmarkVramIsolationProofAcknowledged:
+    'Nachweis: der Agent hat gemeldet, genau diese Konfiguration angewendet zu haben – die Modelle waren also nachweislich angehalten, nicht nur vermutlich.',
+  benchmarkVramIsolationProofBindDelay:
+    'Nachweis: dieser Agent meldet nicht, welche Konfiguration er angewendet hat (ältere Version). Der Lauf hat deshalb ein vollständiges Abfrageintervall abgewartet und danach keinen laufenden Prozess mehr gesehen – ein Rückschluss aus dem Fehlen eines Prozesses, kein direkter Nachweis. Ein Agent-Update macht diese Messung schneller und belastbarer.',
+  benchmarkVramIsolationProofUnknown:
+    'Ein Isolationsnachweis, den dieser Portal-Build nicht kennt.',
+  benchmarkVramNoReport:
+    'Der Lauf hat die Messphase nicht erreicht: es wurde nichts angehalten und nichts gemessen.',
+  benchmarkVramDrained: 'Angehaltene Launch-Specs',
+  benchmarkVramDrainedNote:
+    'Diese Specs wurden für die Messung auf force_stopped gesetzt und danach wiederhergestellt. Stirbt der Gateway zwischen Anhalten und Wiederherstellen, bleiben sie angehalten, bis der Override von Hand entfernt wird.',
+  benchmarkVramRestoreFailed:
+    'Diese Specs stehen weiterhin auf force_stopped und müssen von Hand zurückgesetzt werden.',
+  benchmarkVramRestoreTakenOver:
+    'Bei diesen Specs wurde der Override während des Laufs von außen geändert – jemand hat das Modell gestartet oder den Override entfernt. Der Lauf hat sie deshalb unberührt gelassen: sie stehen NICHT auf force_stopped, und es gibt nichts von Hand zurückzusetzen. Prüfen Sie nur, ob der jetzt gesetzte Override der gewünschte ist.',
+  benchmarkVramWarnings: 'Einschränkungen',
+  benchmarkVramWarningNonManaged:
+    'Dieser Server betreibt außerdem aktive Anwendungen, die der Agent nicht anhalten kann. Solange deren Verbrauch konstant bleibt, fällt er aus der Differenz heraus; ändert er sich während der Messung, ist die Zahl unzuverlässig.',
+  benchmarkVramWarningPostTransport:
+    'Der Agent hat keine offene WebSocket-Verbindung. Jeder Override erreicht ihn deshalb erst mit seiner nächsten Abfrage: das Anhalten der Modelle hat entsprechend später überhaupt erst begonnen, und der Server war dadurch länger blockiert.',
+  benchmarkVramWarningUndeclaredGpu:
+    'Das Modell hat auch auf einer GPU Speicher belegt, die diese Launch-Spec nicht deklariert – ohne set_visible_devices sieht der Prozess alle Karten. Die Zahlen je Karte sind korrekt, aber die Spec beschreibt das Modell unvollständig: legen Sie die fehlende GPU-Zeile an und messen Sie erneut.',
+  benchmarkVramWarningResidencyUnknown:
+    'Der Lauf konnte nicht prüfen, ob das Modell schon von etwas anderem bedient wird: dieser Anwendung fehlt ein Endpunkt für geladene Modelle (loaded_models_path), oder die Abfrage schlug fehl. Eine dadurch unentdeckte Fremdbelegung erscheint als zu kleine Differenz – hinterlegen Sie den Endpunkt, wenn Sie diese Prüfung brauchen.',
+  benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
+  benchmarkVramColIndex: 'GPU',
+  benchmarkVramColBaseline: 'Basis (MB)',
+  benchmarkVramColDelta: 'Differenz (MB)',
+  benchmarkVramColMeasured: 'Agent-Messung (MB)',
+  benchmarkVramColCard: 'Karte erkannt über',
+  benchmarkVramFingerprintUuid: 'per UUID',
+  benchmarkVramFingerprintNameTotal:
+    'nur per Name und Gesamtgröße: zwei identische Karten sind so nicht unterscheidbar',
+  benchmarkVramFingerprintNone: 'keine Kennung verfügbar',
+  benchmarkVramUnifiedMemory:
+    'Unified Memory: die Zahl ist System-RAM (Apple Silicon), kein dediziertes VRAM.',
+  benchmarkVramNotAttributable:
+    'Für mindestens eine gemessene GPU hat die Launch-Spec keine Zeile. Dort gibt es also kein Feld, in das diese Zahl gehört: legen Sie die GPU-Zeile an, bevor Sie die Messung übernehmen.',
+  benchmarkVramInconclusiveTitle: 'Kein Ergebnis',
+  benchmarkVramInconclusiveIsolationTimeout:
+    'Die Isolation ließ sich nicht nachweisen, deshalb wurde die Messung abgebrochen und die Overrides wurden wieder entfernt. Prüfen Sie, ob der Agent dieses Servers verbunden ist, und messen Sie erneut.',
+  benchmarkVramInconclusiveBaselineUnstable:
+    'Vor dem Laden war der VRAM-Verbrauch nicht stabil: etwas anderes belegt auf diesem Server gerade Speicher. Messen Sie erneut, wenn der Server ruhig ist.',
+  benchmarkVramInconclusivePostLoadUnstable:
+    'Nach dem Laden war der VRAM-Verbrauch nicht stabil: während der Messung hat sich etwas anderes verändert. Messen Sie erneut, wenn der Server ruhig ist.',
+  benchmarkVramInconclusiveAlreadyResident:
+    'Das Modell wurde trotz nachgewiesener Isolation weiterhin als geladen gemeldet: etwas, das der Gateway nicht anhalten kann, bedient es – meist eine nicht verwaltete Anwendung auf demselben Host. Beenden Sie diesen Prozess und messen Sie erneut.',
+  benchmarkVramInconclusiveBelowFloor:
+    'Die gemessene Differenz liegt unterhalb des Rauschens. Kein Modell kostet ~0 MB, die Zahl wäre also falsch: messen Sie erneut, wenn der Server ruhig ist.',
+  benchmarkVramInconclusiveNoSamples:
+    'Während des Laufs kamen keine GPU-Werte mehr an. Prüfen Sie den Agenten dieses Servers und messen Sie erneut.',
+  benchmarkVramInconclusiveRunFailed:
+    'Der Lauf brach mit einem Fehler ab, nachdem er die Specs bereits angehalten hatte. Die Fehlermeldung steht darunter; prüfen Sie außerdem die unten genannten Specs.',
+  benchmarkVramInconclusiveIsolationLost:
+    'Eine der für die Messung angehaltenen Launch-Specs lief am Ende des Laufs wieder. Damit hat die Isolation nicht über die ganze Messung gehalten, und die Differenz enthielte den Speicher dieses zweiten Prozesses. Halten Sie ihn an und messen Sie erneut.',
+  benchmarkVramInconclusiveStrategyDisagreement:
+    'Die beiden unabhängig gemessenen Zahlen weichen zu weit voneinander ab: die Differenz über das Zeitfenster ist deutlich größer als die Messung des Agenten am Prozess selbst. Etwas anderes hat also während des Ladens Speicher belegt – meist eine Anwendung, die der Gateway nicht anhalten kann. Messen Sie erneut, wenn der Server ruhig ist.',
+  benchmarkVramInconclusiveIsolationUnacknowledged:
+    'Der Agent dieses Servers meldet normalerweise, welche Runtime-Konfiguration er angewendet hat – die Konfiguration mit den Stopp-Overrides dieses Laufs hat er jedoch nie bestätigt. Das Dokument ist also gar nicht bei ihm angekommen: Prüfen Sie den Agenten selbst (verbunden? neu gestartet? gleicht er seine Konfiguration ab?), nicht die Modelle, und messen Sie danach erneut.',
+  benchmarkVramInconclusiveUnknown:
+    'Kein Ergebnis, und dieser Portal-Build kennt den gemeldeten Grund nicht.',
   modelServerTitle: 'Angeboten auf Servern',
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
@@ -943,6 +1041,21 @@ const de = {
   errorBenchmarkServerInUse:
     'Der Server wird gerade verwendet; bitte erneut versuchen, wenn er frei ist.',
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
+  // Die vier Absagen des VRAM-Benchmarks. Jede nennt eine Bedingung, unter der
+  // die versprochene Isolierung durch keinen gateway-seitigen Schreibvorgang
+  // erreichbar ist -- deshalb eine Absage statt eines abgeschwächten Laufs.
+  errorBenchmarkVramNotAgentManaged:
+    'Dieses Modell wird nicht als agent-gesteuerter Prozess betrieben und kann daher für eine VRAM-Messung nicht isoliert werden.',
+  errorBenchmarkVramIsolationUnavailable:
+    'Der Agent dieses Servers wendet keine Laufzeitkonfiguration vom Gateway an (Dateimodus oder fehlende Fähigkeit), eine Isolierung würde also nichts stoppen.',
+  errorBenchmarkVramNoGpuSamples:
+    'Dieser Server meldet keine GPU, es gibt also kein VRAM zu messen.',
+  errorBenchmarkVramIsolationBlocked:
+    'Eine Startvorgabe steht der Isolierung im Weg (bestehende Admin-Übersteuerung oder ein angepinntes Nachbarmodell). Die Meldung nennt die betroffene Startvorgabe.',
+  errorBenchmarkVramDeclaredGpuMissing:
+    'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
+  errorRuntimeSpecServerBenchmarking:
+    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -2560,6 +2673,20 @@ const en: PortalMessages = {
   runtimeSpecSetVisibleDevicesHint:
     "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
+  runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
+  runtimeSpecVramApply: 'Apply',
+  runtimeSpecVramApplyHint:
+    'Apply only fills this row VRAM (MB) field; the number is saved when you press Save. Three numbers with three meanings: your estimate (editable, yours), the agent measurement (read-only, the agent owns it) and the benchmark measurement (read-only, the run owns it).',
+  runtimeSpecVramBenchmarkFrom: 'Measured',
+  runtimeSpecVramBenchmarkSourceDelta: 'Delta before/after the load',
+  runtimeSpecVramBenchmarkSourceMeasured: 'Agent per-process measurement taken during the run',
+  runtimeSpecVramCardVerifiedUuid: 'Card confirmed as the same one, by UUID.',
+  runtimeSpecVramCardVerifiedNameTotal:
+    'Card confirmed by name and total size only: two identical cards are indistinguishable that way.',
+  runtimeSpecVramCardUnverifiable:
+    'Cannot verify that this is still the same card: the run recorded no identifier, or this server has reported no hardware for this index right now. The number belongs to the GPU index — not to a proven card.',
+  runtimeSpecVramCardDrift:
+    'The card at this GPU index is not the one that was measured: the numbering has changed since (a driver update or a hardware swap). The number is therefore not offered — measure again.',
   runtimeSpecGpuIndex: 'GPU index',
   runtimeSpecGpuPick: 'Reported GPU',
   runtimeSpecGpuPickPlaceholder: 'Select a card …',
@@ -2823,6 +2950,77 @@ const en: PortalMessages = {
   benchmarkServerBusy: 'Server currently in use',
   benchmarkRunning: 'Benchmark running',
   benchmarkLastCompleted: 'Last completed',
+  // See the German block for the two rules these texts carry: 0 always means
+  // UNKNOWN in this feature, and every "no result" names the operator's next
+  // action, because that action differs per reason.
+  benchmarkTypeVram: 'VRAM',
+  benchmarkTypeVramHint:
+    'Model scope only: the run force-stops every agent-managed model on this server, then loads exactly this one model, measures it, and restores every override afterwards.',
+  benchmarkVramRunningNote:
+    'The server is being drained for the measurement: every agent-managed model is force_stopped for the duration and restored when the run ends.',
+  benchmarkVramResultTitle: 'VRAM measurement result',
+  benchmarkVramRuns: 'VRAM runs',
+  benchmarkVramIsolationConfirmed: 'Isolation proven',
+  benchmarkVramIsolationUnconfirmed: 'Isolation not proven',
+  benchmarkVramIsolationProofAcknowledged:
+    'Evidence: the agent reported having applied exactly this configuration, so the models were demonstrably stopped rather than presumed to be.',
+  benchmarkVramIsolationProofBindDelay:
+    'Evidence: this agent does not report which configuration it has applied (an older version). The run therefore waited out a full poll interval and then saw no running process — an inference from the absence of a process, not a direct proof. Updating the agent makes this measurement both faster and stronger.',
+  benchmarkVramIsolationProofUnknown: 'An isolation proof this portal build does not know.',
+  benchmarkVramNoReport:
+    'The run never reached the measurement phase: nothing was stopped and nothing was measured.',
+  benchmarkVramDrained: 'Force-stopped launch specs',
+  benchmarkVramDrainedNote:
+    'These specs were set to force_stopped for the measurement and restored afterwards. If the gateway dies between the drain and the restore they stay stopped until someone clears the override by hand.',
+  benchmarkVramRestoreFailed: 'These specs are still force_stopped and have to be cleared by hand.',
+  benchmarkVramRestoreTakenOver:
+    'Somebody changed the override on these specs during the run — the model was started, or the override cleared. The run left them alone: they are NOT force_stopped and there is nothing to clear by hand. Just check that the override now set on them is the one you want.',
+  benchmarkVramWarnings: 'Caveats',
+  benchmarkVramWarningNonManaged:
+    'This server also hosts active applications the agent cannot stop. As long as their usage stays constant it cancels out of the delta; if it changes during the measurement the number is unreliable.',
+  benchmarkVramWarningPostTransport:
+    'The agent has no open WebSocket. Every override therefore reaches it only on its next poll, so stopping the models did not even begin until then and the server was held for correspondingly longer.',
+  benchmarkVramWarningUndeclaredGpu:
+    'The model also allocated on a GPU this launch spec does not declare — without set_visible_devices the process sees every card. The per-card numbers are correct, but the spec describes the model incompletely: add the missing GPU row, then measure again.',
+  benchmarkVramWarningResidencyUnknown:
+    'The run could not check whether something else is already serving this model: this application has no loaded-models endpoint (loaded_models_path), or the probe failed. A contamination missed that way shows up as a too-small delta instead — configure the endpoint if you need that check.',
+  benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
+  benchmarkVramColIndex: 'GPU',
+  benchmarkVramColBaseline: 'Baseline (MB)',
+  benchmarkVramColDelta: 'Delta (MB)',
+  benchmarkVramColMeasured: 'Agent measurement (MB)',
+  benchmarkVramColCard: 'Card identified by',
+  benchmarkVramFingerprintUuid: 'by UUID',
+  benchmarkVramFingerprintNameTotal:
+    'by name and total size only: two identical cards are indistinguishable that way',
+  benchmarkVramFingerprintNone: 'no identifying field available',
+  benchmarkVramUnifiedMemory:
+    'Unified memory: the figure is system RAM (Apple silicon), not dedicated VRAM.',
+  benchmarkVramNotAttributable:
+    'At least one measured GPU has no row on the launch spec, so there is no field there to put this number in: add the GPU row before you apply the measurement.',
+  benchmarkVramInconclusiveTitle: 'No result',
+  benchmarkVramInconclusiveIsolationTimeout:
+    'The isolation could not be proven, so the measurement was abandoned and the overrides were cleared again. Check that the agent on this server is connected, then measure again.',
+  benchmarkVramInconclusiveBaselineUnstable:
+    'VRAM usage was not stable before the load: something else on this server is allocating memory. Measure again once the server is quiet.',
+  benchmarkVramInconclusivePostLoadUnstable:
+    'VRAM usage was not stable after the load: something else changed during the measurement. Measure again once the server is quiet.',
+  benchmarkVramInconclusiveAlreadyResident:
+    'The model still reported as loaded even though the isolation was proven, so something this gateway cannot stop is serving it — most likely a non-managed application on the same host. Stop that process, then measure again.',
+  benchmarkVramInconclusiveBelowFloor:
+    'The measured delta is below the noise floor. No model costs ~0 MB, so the number would be wrong: measure again once the server is quiet.',
+  benchmarkVramInconclusiveNoSamples:
+    'GPU readings stopped arriving during the run. Check the agent on this server, then measure again.',
+  benchmarkVramInconclusiveRunFailed:
+    'The run stopped on an error after it had already force-stopped the specs. The error is below; also check the specs named there.',
+  benchmarkVramInconclusiveIsolationLost:
+    "One of the launch specs this run had stopped for the measurement was running again by the end of it. The isolation therefore did not hold for the whole run, and the delta would carry that second process's memory. Stop it, then measure again.",
+  benchmarkVramInconclusiveStrategyDisagreement:
+    "The two independently measured numbers are too far apart: the delta across the window is much larger than the agent's own measurement of the process itself. So something else allocated memory during the load — most likely an application this gateway cannot stop. Measure again once the server is quiet.",
+  benchmarkVramInconclusiveIsolationUnacknowledged:
+    "This server's agent normally reports which runtime configuration it has applied, but it never confirmed the one carrying this run's stop overrides. So the document never reached it at all: check the agent itself (connected? restarted? reconciling its configuration?) rather than the models, then measure again.",
+  benchmarkVramInconclusiveUnknown:
+    'No result, and this portal build does not know the reason it reported.',
   modelServerTitle: 'Offered on servers',
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
@@ -2902,6 +3100,20 @@ const en: PortalMessages = {
   errorBenchmarkAlreadyRunning: 'A benchmark is already running on this server.',
   errorBenchmarkServerInUse: 'The server is in use; try again when idle.',
   errorBenchmarkNoModels: 'No models to benchmark.',
+  // The VRAM benchmark's four refusals. Each names a condition under which the
+  // isolation the run promises cannot be achieved by any gateway-side write,
+  // which is why it refuses rather than degrading.
+  errorBenchmarkVramNotAgentManaged:
+    'This model is not an agent-managed process, so it cannot be isolated for a VRAM measurement.',
+  errorBenchmarkVramIsolationUnavailable:
+    "This server's agent applies no runtime configuration from the gateway (file mode, or the capability is not declared), so an isolation would stop nothing.",
+  errorBenchmarkVramNoGpuSamples: 'This server reports no GPU, so there is no VRAM to measure.',
+  errorBenchmarkVramIsolationBlocked:
+    'A launch spec blocks the isolation (an existing admin override, or a pinned neighbouring model). The message names the spec.',
+  errorBenchmarkVramDeclaredGpuMissing:
+    "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
+  errorRuntimeSpecServerBenchmarking:
+    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",

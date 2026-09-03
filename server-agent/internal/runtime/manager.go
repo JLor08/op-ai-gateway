@@ -370,6 +370,55 @@ func (m *Manager) LoadedModels() []string {
 	}
 }
 
+// AppliedETag returns the ETag of the runtime-config document this manager
+// has APPLIED -- the value that rides upward as the telemetry sample's
+// runtime_config_applied_etag, so a gateway can wait for "you applied MY
+// document" instead of guessing with a fixed delay. "" means nothing has
+// been applied that carried an ETag, which includes a cold start and the
+// driver's own drain (stopAll applies an ETag-less empty config).
+//
+// WHY THIS IS SERVED FROM THE OWNER LOOP, and not from an atomic field or
+// from the Driver. There are three values in this module that could each be
+// called "the ETag", and only one of them is true:
+//
+//   - GatewaySource.etag advances when a document is FETCHED and parsed,
+//     strictly BEFORE the driver hands it to Apply. Reporting that one is
+//     the exact lie this whole feature must not tell -- the gateway would
+//     read "applied" off a document that has reconciled nothing.
+//   - A field the Driver set around its Apply call would be honest about
+//     ordering but would duplicate state the reconciler already owns, and
+//     would need its own synchronization to be read from the sample-building
+//     goroutine.
+//   - o.cfg.ETag, returned here, is written by owner.applyConfig itself, on
+//     the goroutine that owns every piece of state in this package, inside
+//     the single event-loop turn that performs the reconciliation. Because
+//     owner.run processes one command at a time and nothing re-enters the
+//     loop, this command cannot be served midway through an apply: there is
+//     no observable state in which this value names a document applyConfig
+//     has not processed.
+//
+// What "applied" therefore means is precise and narrower than it looks: the
+// document is the desired state and every reconciliation DECISION it
+// implies is committed. Asynchronous consequences may still be in flight --
+// a drained child is in StateDraining until its grace/kill sequence
+// finishes, and a newly pinned spec may still be starting -- and Status()
+// is what reports those. The one guarantee that makes this useful for
+// isolation is separate: after the applied document force-stops a spec,
+// NOTHING can start it again (both handleEnsure and admitAndStart refuse
+// AdminState "force_stopped" outright), so an absence observed after this
+// ETag names the document is durable in a way the same absence observed
+// before it is not.
+func (m *Manager) AppliedETag() string {
+	reply := make(chan string, 1)
+	m.postCmd(cmdAppliedETag{reply: reply})
+	select {
+	case s := <-reply:
+		return s
+	case <-m.done:
+		return ""
+	}
+}
+
 // Transitions returns a channel that receives a signal on any spec state
 // change. Buffered(1): a burst of transitions between two reads of this
 // channel coalesces into a single pending wake, exactly like
@@ -380,7 +429,10 @@ func (m *Manager) Transitions() <-chan struct{} {
 
 // SetMeasurer installs f, which is called with every currently-live managed
 // PID to get real per-GPU VRAM usage instead of a spec's static estimate
-// (main.go wires this to nvidia-smi). f may be nil to go back to estimates
+// (main.go wires this to collector.NewVRAMMeasurer, which picks a
+// platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
+// per-process query returns [N/A] under WDDM, and nvidia-smi
+// --query-compute-apps everywhere else). f may be nil to go back to estimates
 // only, which is also NewManager's default -- measurement is a hardware
 // capability, not a negotiated protocol feature, so every AMD, Apple and
 // CPU-only host simply never installs one and is entirely unaffected by
@@ -396,9 +448,20 @@ func (m *Manager) Transitions() <-chan struct{} {
 //
 // f MUST BOUND ITS OWN RUNTIME. Nothing here interrupts it: on the owner it
 // stalls every Status() and EnsureRunning for its duration, and off the owner
-// it is tracked in the Manager's WaitGroup, so Close waits for it. The
-// shipped measurer uses a 2s context deadline covering both of its subprocess
-// spawns.
+// it is tracked in the Manager's WaitGroup, so Close waits for it.
+//
+// How each shipped measurer meets that is worth knowing, because they meet it
+// differently and only one of them meets it end to end. The compute-apps
+// measurer is entirely subprocess work and puts a 2s context deadline
+// (collector.nvidiaMeasureTimeout) over all of it. The Windows PDH measurer
+// bounds its one subprocess with the same deadline -- and spawns none at all
+// in the steady state -- but its PDH and D3DKMT syscalls, which are what runs
+// on every admission, are in-process Win32 calls under NO deadline: there is
+// nothing to cancel and no way to interrupt them, so a slow PDH provider
+// stalls the owner for however long it takes. That is accepted (a wedged
+// performance-counter provider is a broken host, and the alternative is a
+// goroutine handing an abandoned buffer to the kernel), not overlooked -- but
+// do not read "the shipped measurer is deadline-bounded" off this comment.
 func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	if f == nil {
 		m.measurer.Store(nil)
@@ -543,6 +606,16 @@ func (cmdStatus) isCommand() {}
 type cmdLoadedModels struct{ reply chan []string }
 
 func (cmdLoadedModels) isCommand() {}
+
+// cmdAppliedETag asks the owner for o.cfg.ETag. A COMMAND rather than an
+// atomic field written by applyConfig, and that is the whole point: only a
+// value served from the owner's own event loop is guaranteed to name a
+// document the owner has finished reconciling. An atomic set at the top of
+// applyConfig would be readable while the reconciliation it belongs to is
+// still running -- see Manager.AppliedETag.
+type cmdAppliedETag struct{ reply chan string }
+
+func (cmdAppliedETag) isCommand() {}
 
 type cmdClose struct{}
 
@@ -801,6 +874,8 @@ func (o *owner) handle(cmd command) {
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
+	case cmdAppliedETag:
+		c.reply <- o.cfg.ETag
 	case cmdClose:
 		o.handleClose()
 	}
@@ -1163,6 +1238,66 @@ func (o *owner) setNotPermitted(st *specState, message string) {
 	o.failPending(st, ErrNotPermitted)
 }
 
+// setPendingVRAMUnknown records the terminal unknown-VRAM block, and records
+// the policy's message as this spec's LastError when there IS one.
+//
+// The message is what names the spec an operator has to fix, and for rule 5 it
+// is not this one: the spec entering this state is the one with a usable
+// estimate, while the missing estimate belongs to the pinned spec beside it.
+// Rule 4's block is the candidate's own demand, needs no name, and sends no
+// message -- lastError is then left exactly as it was rather than being
+// blanked, since it may still describe a real earlier failure of this spec.
+func (o *owner) setPendingVRAMUnknown(st *specState, message string) {
+	o.setState(st, StatePendingVRAMUnknown)
+	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
+	if message != "" {
+		st.lastError = &LastError{Message: message, At: time.Now()}
+	}
+	o.failPending(st, ErrAdmissionBlocked)
+}
+
+// noteAdmissionWait records a queued spec's reason for waiting as its
+// LastError, for the one Wait that carries one.
+//
+// WHY A WAIT WRITES ANYTHING AT ALL. Wait is the manager's silent branch by
+// design: the spec stays queued, its state is untouched, and a future
+// completion re-triggers the admission. That is right for a wait that resolves
+// itself -- a busy neighbour finishes, a drain completes -- and it is wrong for
+// the precedence Wait of ADR-032, which need not resolve at all: the
+// known-demand occupant is spared BECAUSE it is not being evicted, and
+// scanIdle skips a spec whose IdleTimeoutSeconds is 0, the documented "never
+// unload". So an unknown-demand candidate can requeue to its
+// admission_wait_timeout_seconds on every request indefinitely, and without
+// this the operator saw a spec that never starts, in a state that says nothing,
+// with no reason string anywhere. Admit decides which Wait that is (Message is
+// set on that one alone); this function only refuses to invent a diagnostic
+// where there is none.
+//
+// NEITHER THE STATE NOR failures MOVES. The spec has not failed to start --
+// nothing was attempted -- so this is not recordFailure, and the pending
+// waiters stay queued rather than being failed as setPendingVRAMUnknown fails
+// them. A successful start clears LastError, which is the same lifecycle the
+// terminal messages already have.
+//
+// It DOES replace an older message, including a crash's, exactly as
+// setNotPermitted and setPendingVRAMUnknown do: LastError is "why this spec is
+// not serving now", and an earlier generation's crash is no longer that once
+// admission is what holds it back. The crash output itself is not lost with it
+// -- the per-spec log view keeps that generation's tail (logs.go).
+//
+// The timestamp is kept at "since when", not "last asked": every retried
+// request re-runs this with the identical message, and refreshing At on each
+// of them would make LastError.At read as if the block had only just started.
+func (o *owner) noteAdmissionWait(st *specState, message string) {
+	if message == "" {
+		return
+	}
+	if st.lastError != nil && st.lastError.Message == message {
+		return
+	}
+	st.lastError = &LastError{Message: message, At: time.Now()}
+}
+
 func (o *owner) recordFailure(st *specState, message string, exitCode int, stderrTail string) {
 	st.failures++
 	st.lastError = &LastError{
@@ -1211,12 +1346,14 @@ func (o *owner) admitAndStart(specID string) {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
-		o.setState(st, StatePendingVRAMUnknown)
-		st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
-		o.failPending(st, ErrAdmissionBlocked)
+		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
 		// Leave st queued; a future completion event elsewhere re-triggers
-		// this via wakeAdmissionCandidates.
+		// this via wakeAdmissionCandidates. The state is deliberately
+		// unchanged -- the spec is waiting, not failed -- but a Wait that
+		// carries a message records it, because that is the one Wait nothing
+		// need ever resolve. See noteAdmissionWait.
+		o.noteAdmissionWait(st, dec.Message)
 	case len(dec.Evict) > 0:
 		for _, victimID := range dec.Evict {
 			// Record WHO this eviction is for before asking for it: the
@@ -1275,8 +1412,10 @@ func (o *owner) admitAndStart(specID string) {
 //
 // NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
 // most: every AMD, Apple unified-memory and CPU-only deployment lands here
-// (collector.NewNvidiaComputeApps returns nil when nvidia-smi is off PATH,
-// and nil is also NewManager's default). Those hosts take the first branch,
+// (collector.NewVRAMMeasurer returns nil when the host cannot support the
+// platform's measurer at all -- nvidia-smi off PATH everywhere, and on
+// Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
+// NewManager's default). Those hosts take the first branch,
 // spawn nothing, allocate nothing, and behave exactly as they did before this
 // function existed.
 //
@@ -1354,6 +1493,52 @@ func (o *owner) measurementTargets() []measureTarget {
 	return targets
 }
 
+// realMeasurement keeps only the entries of byGPU that are an actual
+// measurement -- strictly positive MB -- and returns nil when none are. The
+// result is always freshly allocated, so nothing downstream aliases the map
+// the measurer handed back and may reuse.
+//
+// A measured value of 0 means "unknown", never "this process needs no VRAM" --
+// the same meaning SpecGPU.VRAMMB carries for its own 0, and on Windows the
+// only meaning available at all: the WDDM driver model puts the OS rather
+// than the NVIDIA driver in charge of GPU memory, so
+// `nvidia-smi --query-compute-apps=used_memory` answers `[N/A]` for every
+// compute app and collector.naInt turns that into a 0. Taken literally, that
+// 0 breaks BOTH consumers of a measurement:
+//
+//   - ADMISSION (buildSnapshot) charges the process 0 MB instead of the
+//     operator's estimate, so it contributes nothing to Admit's per-GPU sum
+//     (policy.go rule 3): the GPU looks entirely free however much is
+//     actually resident on it, and co-residency admission admits without
+//     limit -- which is exactly the OOM protection the VRAM budget exists
+//     for, gone, on every managed process on every Windows host.
+//   - REPORTING (st.measuredVRAM) carries the 0 into every Status(), hence
+//     an all-zero `gpus` array on every telemetry sample, once per second
+//     per spec, for a value the gateway's ingest discards on arrival
+//     (`if g.VRAMMeasuredMB <= 0 { continue }` in agent_ingest.go). That is
+//     the F2 cost paid for a number that cannot even reach the portal, where
+//     a stored 0 is anyway indistinguishable from "never measured".
+//
+// That ingest check is where this `<= 0` rule already lives (and what
+// agent-runtime-manager.md section 5 documents); this is the same rule at the
+// near end of the same loop. It is applied PER GPU INDEX for the same reason
+// the gateway's is: a multi-GPU spec can have one index answered and another
+// not, and throwing away a real number because a sibling index came back
+// unknown would be its own bug.
+func realMeasurement(byGPU map[int]int) map[int]int {
+	var out map[int]int
+	for idx, mb := range byGPU {
+		if mb <= 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[int]int, len(byGPU))
+		}
+		out[idx] = mb
+	}
+	return out
+}
+
 // applyMeasurement records a completed measurement against the generations it
 // was actually taken for, and re-arms the next dispatch.
 //
@@ -1368,7 +1553,10 @@ func (o *owner) measurementTargets() []measureTarget {
 // than being cleared: nvidia-smi not listing a pid this cycle is a transient
 // (a hiccup, a CPU-only child, a race with the process appearing), not
 // evidence that the process stopped using VRAM. Only an actual exit clears
-// the value, in onProcExited.
+// the value, in onProcExited. A value that is not a real measurement counts
+// as saying nothing -- see realMeasurement, which is what makes a cycle of
+// zeros leave a previous real number in place instead of overwriting it with
+// an "unknown" the portal cannot tell apart from a measured zero.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	for _, t := range c.targets {
@@ -1376,7 +1564,7 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		if st == nil || st.proc != t.proc {
 			continue // superseded generation -- see measureTarget
 		}
-		if byGPU := c.byPID[t.pid]; byGPU != nil {
+		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
 			st.measuredVRAM = byGPU
 		}
 	}
@@ -1413,7 +1601,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		if st.proc == nil {
 			continue
 		}
-		byGPU := measured[st.proc.pid]
+		// realMeasurement is the zero-guard: only a strictly positive value
+		// is a measurement, so an index the measurer answered with 0 (or
+		// less) is absent here and falls through to the operator's estimate
+		// below, exactly like an index it never mentioned. Without it a
+		// measured 0 WON, and "unknown" became "this model needs no VRAM" --
+		// see realMeasurement for what that costs admission.
+		byGPU := realMeasurement(measured[st.proc.pid])
 		gpus := make(map[int]int, len(st.spec.GPUs))
 		for _, g := range st.spec.GPUs {
 			if byGPU != nil {

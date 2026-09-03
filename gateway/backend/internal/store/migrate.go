@@ -101,6 +101,7 @@ var migrations = []migration{
 	{version: 68, name: "application_single_server_agent", up: migration68Up},
 	{version: 69, name: "runtime_spec_set_visible_devices", up: migration69Up},
 	{version: 70, name: "application_proxy_excluded", up: migration70Up},
+	{version: 71, name: "model_mapping_benchmarks_vram_json", up: migration71Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3079,4 +3080,30 @@ func migration70Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return execTx(ctx, tx, dl, `update applications set proxy_excluded = 1
 		where scheme = 'https' and proxy_listen_port = 0`)
+}
+
+// migration71Up adds model_mapping_benchmarks.vram_json -- the VRAM
+// benchmark's per-GPU result for a kind=="vram" history row (empty for every
+// other kind, and for a VRAM run that reached no result at all, whose row then
+// carries only its `error`).
+//
+// It is its OWN column, following capacity_curve (migration 15) exactly: an
+// opaque JSON string the store never parses, marshalled by the gateway and
+// decoded in the portal DTO for one kind only. Reusing capacity_curve for a
+// second payload would be a lie in a column name, and would make either
+// reader's kind check the only thing standing between an operator and a
+// capacity curve rendered as a VRAM measurement.
+//
+// `text` on both dialects (PostgreSQL text is unlimited, per ADR-005's
+// wide-type rule): the payload grows with the number of GPUs watched and with
+// the per-spec isolation evidence, so it has no small bound to declare.
+//
+// The v60-frozen baseline creates model_mapping_benchmarks WITHOUT this
+// column, so this ALTER does real work on a fresh DB as well as an upgrade
+// (same as migration15Up). The duplicate-column tolerance in
+// addColumnIfMissing is what keeps it a no-op should the column ever arrive by
+// another route.
+func migration71Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "model_mapping_benchmarks",
+		"vram_json text not null default ''")
 }

@@ -416,6 +416,13 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetRuntimeConfigChangedHook != nil {
 		deps.SetRuntimeConfigChangedHook(srv.PushRuntimeConfig)
 	}
+	// The same conduit, for the same reason, in the other direction: the
+	// portal's launch-spec write refuses while a benchmark run holds that
+	// server's reservation, and the BenchmarkRegistry that knows only exists
+	// once srv does. See portal.Service.serverIsBenchmarking.
+	if deps.SetBenchmarkReservationHook != nil {
+		deps.SetBenchmarkReservationHook(srv.Benchmarks.ServerBusy)
+	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the
@@ -1045,6 +1052,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		// setter's doc and ServerDeps.SetRuntimeConfigChangedHook's doc for
 		// why this indirection exists instead of a direct field value.
 		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
+		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,

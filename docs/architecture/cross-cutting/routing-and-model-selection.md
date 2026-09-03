@@ -668,6 +668,35 @@ from the trigger modes above) selects what a run does per mapping: `"speed"`
 one benchmark runs per server at a time (`BenchmarkRegistry.TryStart`); the
 server is excluded from routing (`ServerBusy`) for its duration.
 
+**A history row's `kind` is a wider set than the mode argument**, because a run
+that is not a per-target fan-out gets its own endpoint and single-target runner
+rather than a fifth `mode` value. `model_mapping_benchmarks.kind` therefore also
+holds `"vram"` — the VRAM benchmark's row, whose per-GPU result rides in its own
+opaque `vram_json` column (migration 71) and is decoded onto the history DTO's
+`vram` field for that kind only, exactly as `capacity_curve` is for
+`"capacity"`. **That row is evidence, never authority**: nothing reads it back
+into a launch spec, because `vram_measured_mb` stays agent-owned and
+`vram_estimate_mb` operator-owned (see [Agent-Managed Model
+Runtime](agent-runtime-manager.md) §5.1), so an operator reads the measurement
+and applies it to their own field themselves. **No metric on a mapping is
+touched by it** — that run writes no `metrics_source`, no throughput, no
+context size and neither VRAM field, so it is invisible to §3.1's scoring
+entirely.
+
+The run behind that row is `POST /api/portal/mappings/{id}/probe-vram`
+(`startVRAMProbe` / `runVRAMProbe`): it force-stops **every** managed launch
+spec on the server, the target included, loads exactly that one model, and
+reports a per-GPU delta alongside the agent's own per-process measurement. Two
+things about it matter at this chapter's altitude. It **shares the load core**
+with the "Load model" action (`ensureResidentForRun`), which loads by issuing
+one `max_tokens: 1` stream — the same mechanism `runLoadModel` uses, and the
+reason the run needs no separate generation step. And it is **not scheduled and
+not sweepable**: `StartBenchmarkScheduler` drives `"speed"` only, and the
+isolation is destructive enough that it must be asked for one model at a time,
+so there is deliberately no application- or server-scoped fan-out. Its own
+mechanics, refusals and honesty gates live in [Agent-Managed Model Runtime
+§11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs).
+
 `IsMTPModelName` (`internal/routing/mtp.go`) is the **MTP heuristic**: a
 best-effort, conservative name-substring/token match (a known model family
 like `deepseek-v3`/`glm-4.5`, or a standalone `mtp` token) that seeds a new

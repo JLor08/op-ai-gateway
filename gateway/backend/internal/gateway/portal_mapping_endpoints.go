@@ -7,12 +7,37 @@ import (
 	"encoding/json"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
 	"strings"
 )
 
 const msgMappingNotFound = "mapping not found"
+
+// mappingRunStarters are the mapping sub-actions that are POST-only, take
+// nothing but the mapping id, and write their own response — the
+// `/api/portal/mappings/{id}/{action}` shape whose whole body is "reject any
+// other method, then hand the id to a starter".
+//
+// A table rather than one `if` clause per action, because the three clauses it
+// replaces made no decision of their own: the sub-action's name is the only
+// thing that differed between them, so an added action was three lines of
+// copied control flow around one changed identifier. Adding an entry here
+// cannot get the method guard wrong, and cannot get it right for two actions
+// and wrong for the third.
+//
+// It is deliberately NOT the home for every sub-action of a mapping. The
+// remaining clauses in handlePortalMappingItem each decide something else —
+// `benchmark` parses a mode off the request before it may start, `benchmarks`
+// is a GET that maps a service error, `runtime-spec` dispatches on the method
+// itself — and folding those in would hide three different bodies behind one
+// uniform-looking lookup.
+var mappingRunStarters = map[string]func(*Server, http.ResponseWriter, *http.Request, auth.Token, string){
+	"probe-context": (*Server).startContextProbe,
+	"load":          (*Server).startLoadModel,
+	"probe-vram":    (*Server).startVRAMProbe,
+}
 
 func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
@@ -36,19 +61,14 @@ func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request)
 		s.startBenchmark(w, r, token, "mapping", parts[0], mode)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "probe-context" {
-		if !requireMethod(w, r, http.MethodPost) {
+	if len(parts) == 2 {
+		if start, ok := mappingRunStarters[parts[1]]; ok {
+			if !requireMethod(w, r, http.MethodPost) {
+				return
+			}
+			start(s, w, r, token, parts[0])
 			return
 		}
-		s.startContextProbe(w, r, token, parts[0])
-		return
-	}
-	if len(parts) == 2 && parts[1] == "load" {
-		if !requireMethod(w, r, http.MethodPost) {
-			return
-		}
-		s.startLoadModel(w, r, token, parts[0])
-		return
 	}
 	if len(parts) == 2 && parts[1] == "benchmarks" {
 		if !requireMethod(w, r, http.MethodGet) {

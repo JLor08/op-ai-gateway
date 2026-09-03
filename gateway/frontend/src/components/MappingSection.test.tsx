@@ -165,6 +165,7 @@ function renderSection(
     // The edit form polls the running benchmarks to gate the context-probe button.
     activeBenchmarks: opts.activeBenchmarks ?? vi.fn(async () => []),
     probeMappingContext: opts.probeMappingContext ?? vi.fn(async () => idle),
+    probeMappingVram: vi.fn(async () => idle),
   };
 
   render(

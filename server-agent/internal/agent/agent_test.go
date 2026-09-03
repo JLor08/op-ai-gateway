@@ -1022,6 +1022,7 @@ type fakeRuntimeDriver struct {
 	trans       chan struct{}
 	active      atomic.Bool // fix round 1, I3: defaults to false, matching the real Driver's honest "not yet negotiated" zero value
 	resendCalls int
+	appliedETag string
 }
 
 func newFakeRuntimeDriver() *fakeRuntimeDriver {
@@ -1079,6 +1080,21 @@ func (f *fakeRuntimeDriver) lastPush() json.RawMessage {
 // honest "not yet negotiated" starting state now that main.go no longer
 // blocks startup on a one-shot features probe.
 func (f *fakeRuntimeDriver) Active() bool { return f.active.Load() }
+
+// AppliedConfigETag satisfies the optional runtimeConfigAcknowledger
+// interface, returning whatever setAppliedETag last stored ("" by default,
+// matching a driver that has applied no gateway document).
+func (f *fakeRuntimeDriver) AppliedConfigETag() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.appliedETag
+}
+
+func (f *fakeRuntimeDriver) setAppliedETag(etag string) {
+	f.mu.Lock()
+	f.appliedETag = etag
+	f.mu.Unlock()
+}
 
 func (f *fakeRuntimeDriver) setActive(b bool) { f.active.Store(b) }
 

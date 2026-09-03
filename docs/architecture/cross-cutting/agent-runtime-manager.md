@@ -897,7 +897,15 @@ An open matrix cell is not a guarantee that the pair fits, and the portal's
 per-cell VRAM tooltip says so on every cell.
 
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
-my model get evicted" requires checking both the matrix and the arithmetic.
+my model get evicted" requires checking both the matrix and the arithmetic. The
+mirror-image question has one extra answer, and that one says so itself: a spec
+that sits waiting while an **idle** process occupies its card is not
+necessarily a stuck decision — if the waiting spec's own `vram_estimate_mb` is
+`0`, that is §5.3's precedence declining to evict a correctly-configured
+neighbour, and filling the estimate in is the fix. That case is the one `Wait`
+that writes a `last_error` (naming the occupant and the card, see §5.3); every
+other `Wait` leaves the spec queued silently, so a waiting spec with no reason
+string is waiting for something that resolves on its own.
 
 Three zero-values mean "no constraint", not "zero": `max_processes == 0` is
 unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand and
@@ -929,14 +937,39 @@ into a hard refusal of every start.
 > no-op, and would leave the gateway and the agent disagreeing about a value the
 > store already persists.
 
-`Admit` evaluates in a fixed order, and the order is deliberate: an
-unknown-VRAM candidate blocked by a *pinned* occupant short-circuits first;
-matrix incompatibility and unknown-VRAM occupancy are collected against the
-original running set; the per-GPU budget is then evaluated with those evictions
-notionally already removed; **the process-count limit runs last** and asks only
-for as many *additional* victims as the earlier rules have not already supplied.
-Reversing the last two over-evicts, and the already-counted chaining is the only
-thing preventing double eviction.
+`Admit` evaluates in a fixed order, and the order is deliberate. A candidate
+whose *own* demand exceeds one of its own budgets is refused **first**, ahead of
+every rule that reads the running set at all, because that is the one verdict no
+running set can change; then an unknown VRAM demand on *either* side of the pair
+(§5.3), contested with a *pinned* process, short-circuits; then matrix
+incompatibility and both unknown-VRAM rules are collected against the original
+running set; the per-GPU budget is evaluated with those evictions notionally
+already removed; **the process-count limit runs last** and asks only for as many
+*additional* victims as the earlier rules have not already supplied. Reversing
+the last two over-evicts, and the already-counted chaining is the only thing
+preventing double eviction.
+
+**Only one of the two unknown-VRAM rules proposes victims**, and that is the
+precedence in §5.3 and
+[ADR-032](../09-architecture-decisions.md#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts):
+*known demand beats unknown demand*. The occupant-side rule
+evicts (an idle occupant whose own demand is unknown); the candidate-side rule
+only **blocks** — a candidate whose own demand is unknown may insist on having
+its cards to itself, but never by drain-stopping an occupant whose estimate is
+filled in, and that block stands even where the matrix or the arithmetic would
+have evicted that occupant anyway. Two consequences for anyone reading `Admit`:
+the two rules can no longer name the same victim (they did whenever both sides
+were unknown, and the spec-id-keyed victim map was what made the overlap
+harmless), and a `Wait` no longer implies that every idle victim was exhausted.
+
+**The occupant-side unknown-VRAM rule's placement is pinned by tests**, not by
+its comment alone. Collected *after* the arithmetic, it makes the arithmetic
+evict a bystander: an unknown occupant contributes `0` to the sum and releases
+`0` when evicted, so the sum never comes down and the loop drain-stops the next
+idle process on the card instead — one that rule 5 was about to free anyway.
+Collected *after* the process-count limit, it makes that limit evict a second
+process for a slot that was already coming free. Both re-orderings compile and
+leave every other admission test green.
 
 Two guards read as trivial and are not:
 
@@ -953,8 +986,17 @@ Two guards read as trivial and are not:
   No eviction anywhere can make it fit, so waiting would queue the request until
   its admission timeout for a pure configuration error. `not_permitted` was
   *reused* rather than adding a new state, because a state value the portal does
-  not know renders as nothing; the message is what tells a budget refusal apart
-  from a local-policy refusal.
+  not know renders as nothing; the message is what tells this cause apart from
+  the other two that share the state (a local-policy refusal of the
+  binary/directory, and the closed-matrix case in §5.3).
+  **This check runs before the unknown-VRAM short-circuit because it was being
+  shadowed by it.** Executed on both revisions: candidate demand 9000 MB against
+  an 8000 MB budget, plus a pinned occupant of unknown demand on the same card,
+  reported `pending_vram_unknown` with an empty message — inviting the operator
+  to go fill in a *different* spec's estimate, which cannot make 9000 MB fit
+  under 8000 MB. The permanent cause has to outrank the resolvable one, and this
+  one reads only the spec and the budget map, never the running set, so putting
+  it first cannot disturb any other rule's inputs.
 
 Co-residency pairs travel in **wire order** while the policy's allowed set is
 canonical (`a ≤ b`, via `PairKey`). Building the lookup map by hand from the raw
@@ -967,11 +1009,72 @@ other order, presenting as a random, hard-to-reproduce matrix failure.
 
 A spec whose demand on a GPU is unknown may start only **alone** on that GPU;
 otherwise it sits in `pending_vram_unknown` with the reason visible in the
-portal. On an NVIDIA host the agent then measures actual usage of **its own
-child PIDs** — `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`,
-which is exact because the agent knows which PIDs are its children — and writes
-the measurement back to the gateway. There "unknown" is a self-resolving
-transient, not a permanent hole in the OOM protection.
+portal. **The rule is symmetric in *subject* — it is the unknown demand that
+makes a card unshareable, on whichever side of the pair it sits — and
+deliberately asymmetric in *outcome*: known demand beats unknown demand, so
+only the side that has a real number may evict to get the card.** An
+already-running process with an unknown demand of its *own* blocks a new
+candidate on **every card it holds**, exactly the way an unknown candidate is
+blocked on every card it wants, whatever that candidate declares for itself:
+that occupant is evicted if it is idle, yields `Wait` if it is busy or still
+loading, and yields the terminal `pending_vram_unknown` if it is pinned. The
+other direction gets **no eviction at all**: a candidate whose own demand is
+unknown waits for an occupant of known demand that could still leave, and
+reports the same terminal for one that never can.
+
+**Both halves of that symmetry are whole-process, and the contention between
+them is per-GPU.** "Unknown" is a property of the process — one unknown card
+makes its whole footprint unaccounted — while what makes it *this* candidate's
+problem is holding one of the candidate's cards. Scoping the occupant half
+per-card instead (unknown *at the index the candidate wants*) reads as the
+tighter rule and reopens the hole: an occupant of `{gpu 0: unknown, gpu 1:
+5000}` was admitted only on the promise of running **alone on both** cards, so a
+candidate let onto gpu 1 — where that occupant's figure happens to be known —
+revokes one card of the aloneness the rule had just granted. Measured on the
+per-card version: `OK` with that occupant idle, busy **and** pinned. An occupant
+holding no card the candidate wants stays ignored either way; widening *that*
+half to "any unknown process anywhere" would evict half the host on every start.
+
+**Known demand beats unknown demand, as a total order
+([ADR-032](../09-architecture-decisions.md#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts))
+— and the outcome-symmetric version it replaced did not converge.** The occupant-side
+rule evicts an unknown-demand occupant on behalf of a known-demand candidate,
+so as long as the candidate-side rule also evicted a *known*-demand occupant,
+one mixed pair contesting one card evicted in **both directions**. Executed on
+both revisions, one card, both processes idle, the pair open and no budget at
+all: candidate `a` (unknown demand) answered `Evict [b]` while candidate `b`
+(known demand) answered `Evict [a]`, so a host alternating requests between the
+two paid a cold load for every single request, forever, with no state in
+between that either request could be served from. The candidate-side rule
+therefore keeps the aloneness demand and gives up the eviction: an
+unknown-demand spec may still refuse to share its cards — that is what "may
+start only alone" means — but it may no longer drain-stop a spec whose estimate
+someone filled in to get them. The order is total, so it converges, and the
+side that loses is always the misconfigured one. **The block is
+unconditional**: a closed matrix cell (rule 1) or an overflowing sibling budget
+(rule 3) does supply an independent reason to evict that same occupant, and
+honouring the order only where no such reason exists would leave those pairs
+evicting in both directions too — the same defect, one rule over. What it costs
+is a `Wait` returned while an idle victim was plainly available: `Decision`'s
+own doc comment had to be corrected for it, because `Wait` no longer means
+"nothing *can* be evicted to help" but "nothing *may* be". How long such a
+wait can last is the terminal-reason paragraph below.
+
+**The tie is not decided and still thrashes.** Nothing in the order ranks two
+specs that are *both* of unknown demand, so those still evict each other in
+both directions exactly as before — unchanged, not fixed. It is a recorded
+acceptance
+([§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
+filling in either spec's estimate turns it into the mixed case, which
+converges.
+
+On an NVIDIA host the agent then measures actual usage of **its own
+child PIDs** — exact because the agent knows which PIDs are its children — and
+writes the measurement back to the gateway. There "unknown" is a self-resolving
+transient, not a permanent hole in the OOM protection. *How* it measures is
+platform-specific: `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`
+everywhere except Windows, and PDH performance counters on Windows, where that
+query reports nothing usable at all (both are described below).
 
 **What makes it self-resolving is a measurement of a process that is merely
 RUNNING**, and for a while nothing took one. The measurer was consulted from
@@ -988,17 +1091,33 @@ moment a child first passes a health probe — the point where a model server
 has finished mapping its weights, so the first number is already the
 meaningful one.
 
-**Measurement is NVIDIA-only.** `main.go` installs exactly one measurer,
-`collector.NewNvidiaComputeApps()`, and that constructor returns nil when
-`nvidia-smi` is not on PATH — so an AMD host (the host-level `rocm-smi`
-collector reports no per-PID split), an Apple unified-memory host, and a host
-with no GPU at all install **no** measurer and never write a measurement back.
-On those hosts the operator's `vram_estimate_mb` is the only number there will
-ever be. The rule above still applies — a spec left at the default `0` waits
+**Measurement is NVIDIA-only, and which NVIDIA measurer runs is decided per
+platform.** `main.go` installs exactly one measurer,
+`collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
+`measurer_windows.go`), not a `runtime.GOOS` branch — which yields the
+compute-apps measurer on every non-Windows host, the PDH measurer on Windows,
+and **nil** whenever the chosen one cannot work on this host. Both of them need
+`nvidia-smi` on PATH, so the NVIDIA-only scope is unchanged: an AMD host (the
+host-level `rocm-smi` collector reports no per-PID split), an Apple
+unified-memory host, and a host with no GPU at all install **no** measurer and
+never write a measurement back. On those hosts the operator's
+`vram_estimate_mb` is the only number there will ever be. The rule above still applies — a spec left at the default `0` waits
 while a pinned or busy spec holds one of its GPUs — but nothing resolves it
 except the other spec becoming evictable or the operator filling the estimate
 in. Waiting for the measurement to arrive is waiting for something that will
 not happen (§13).
+
+**That wait now has a deliberate way out: the VRAM benchmark
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).**
+It loads one model **alone** on its server — draining every managed spec on the
+box, *the target included* — and reports two numbers per GPU side by side: the
+agent's own per-process measurement where a measurer exists, and the **per-GPU
+total delta** (used-after minus used-before), which is the only figure that
+will ever exist on the host classes named above. It is the answer to "how do I
+resolve an unknown demand on purpose?", and it is a **report**: it writes
+neither `vram_measured_mb` nor `vram_estimate_mb`, because the ownership split
+in §5.1 is the load-bearing rule of this whole feature. The operator applies
+the number to their own field.
 
 **Fail-open was explicitly rejected**: letting an unknown-demand spec start
 anyway hollows out exactly the protection the VRAM budget exists for, and
@@ -1007,11 +1126,147 @@ capability is deliberately *not* a negotiated feature flag — flags negotiate
 protocol, not hardware — an agent with no measurement path simply omits the
 field.
 
-The measurer resolves GPU UUID → index from a cached `--query-gpu=index,uuid`
-mapping, re-fetched only on the first call or when a *wanted* PID's UUID is
-missing from the cache (a card added, removed or reindexed), so the steady state
-spawns one subprocess per measurement rather than two. An unknown UUID is
-skipped, never guessed.
+The **compute-apps** measurer (every non-Windows host) resolves GPU UUID →
+index from a cached `--query-gpu=index,uuid` mapping, re-fetched only on the
+first call or when a *wanted* PID's UUID is missing from the cache (a card
+added, removed or reindexed), so the steady state spawns one subprocess per
+measurement rather than two. An unknown UUID is skipped, never guessed.
+
+**On Windows that query measures nothing, and this document used to claim
+otherwise.** Under the **WDDM** driver model the OS, not the NVIDIA driver, owns
+GPU memory, so `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`
+answers `[N/A]` for `used_memory` on every compute app. Only the **TCC** driver
+model restores per-process reporting, and TCC turns off the adapter's display
+output and is unavailable on most GeForce parts — not something an operator of a
+workstation-class AI server can switch on. So this section described a whole
+host class as self-resolving when nothing on it ever resolved.
+
+**And the failure was worse than a missing number.** `naInt("[N/A]")` is `0`, so
+the compute-apps measurer returned a **non-nil** `map[pid]map[gpuIndex]0`, and
+`buildSnapshot` reads `if v, ok := byGPU[g.Index]; ok` — a present key is
+authoritative. Every managed process on every Windows host was therefore charged
+**0 MB**, each GPU's budget read as entirely free however much was resident, and
+co-residency admission lost exactly the OOM protection it exists for. The
+estimate was never consulted, so filling one in changed nothing. Two guards now
+stand where there were none:
+
+- **The compute-apps measurer is never installed on Windows.** The platform
+  selector there offers PDH *or nothing* (`collector/measurer_windows.go`), and
+  nothing is strictly safer than a measured zero: no measurer means the manager
+  falls back to the operator's estimate, while a measured `0` overrode it.
+- **A measured `<= 0` no longer overrides an estimate, on any platform.**
+  `realMeasurement` (`runtime/manager.go`) keeps only strictly positive
+  entries and reports "nothing measured" when none remain — applied **per GPU
+  index**, so one unanswered index cannot discard a real number measured on its
+  sibling. It is the same `<= 0` rule the gateway's ingest already applies at
+  the far end of the same loop (`if g.VRAMMeasuredMB <= 0 { continue }`),
+  brought to the one place that lacked it; a measured `0` means *unknown*,
+  exactly as a spec's own `vram_mb: 0` does (§5.1).
+
+**What Windows measures instead: PDH performance counters, plus a
+LUID → PCI → GPU-index bridge.** Three steps, because no single interface
+carries both a PID and the GPU index specs and budgets are written in terms of:
+
+1. **`\GPU Process Memory(*)\Dedicated Usage`** (pdh.dll) → bytes per PID per
+   adapter. This is the figure Task Manager's per-process GPU-memory column
+   shows, and unlike the `nvidia-smi` query it works under WDDM. Instance names
+   are `pid_<PID>_luid_0x<HighPart>_0x<LowPart>_phys_<N>` — the **high part
+   comes first**, which is a measured fact and not a documented one. The counter
+   is added through `PdhAddEnglishCounterW`, because performance-object and
+   counter names are localized on Windows and the localized API would need the
+   German (or Japanese, …) spelling of both halves. **One
+   `PdhCollectQueryData`** suffices: the counter behaves as a raw gauge, so
+   there is no second sample and no settling sleep. A process holds VRAM on
+   several physical segments of the same adapter, so the `phys_<N>` segments are
+   summed away and only the per-adapter total is kept.
+2. **Adapter LUID → PCI address** via the gdi32 exports
+   `D3DKMTOpenAdapterFromLuid` and
+   `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS)`, which are user-mode
+   callable from the unprivileged agent. The address is compared as three
+   numbers, never as text: `nvidia-smi` prints `00000000:21:00.0` in **hex**
+   while `D3DKMT_ADAPTERADDRESS` reports the same location as decimal ints, so a
+   textual join would silently never match (bus `0x21` vs bus `33`).
+3. **PCI address → GPU index** via `nvidia-smi --query-gpu=index,pci.bus_id`.
+   The PCI address is the *only* identifier the two sides share — compute-apps'
+   GPU UUID is unavailable from D3DKMT, and D3DKMT's LUID is unavailable from
+   `nvidia-smi`.
+
+Steps 2 and 3 describe the host's fixed topology, so the LUID → index bridge is
+cached across measurement cycles, both halves of it. In the steady state a
+measurement is therefore **one PDH read and no subprocess at all**. The rules
+for the **negative** half are the load-bearing part, because a LUID written off
+there can no longer trigger the re-fetch that is its only escape: only a
+**durable verdict** may enter it, and three findings qualify — D3DKMT
+*refusing* to open the adapter (`STATUS_INVALID_PARAMETER` from
+`D3DKMTOpenAdapterFromLuid`, a property of the adapter), an address the adapter
+*did* report that no PCI bus could hold (a completed, repeatable reading — see
+the plausibility gate below), and a **fresh and complete** `nvidia-smi` reading
+that has no GPU at the adapter's PCI address (a property of the host's
+topology). Everything else is the *absence* of an answer and is retried next
+cycle, on **both** sides of the bridge:
+
+- `nvidia-smi` failing, timing out, or answering with rows missing. An earlier
+  revision asked only whether `nvidia-smi` had ever answered, so on a warm
+  cache a single 2 s timeout wrote a perfectly good GPU off for the life of the
+  process.
+- A **transient** D3DKMT failure: `STATUS_DEVICE_REMOVED` from a TDR or driver
+  reset, `STATUS_NO_MEMORY` under momentary pressure, or *any* failure of the
+  address query — that query runs on a handle the open call has already
+  produced, so the adapter has answered for its identity and what a failure
+  there can mean instead is a wrong `KMTQUERYADAPTERINFOTYPE` literal or mirror
+  struct, a defect in every adapter's probe alike (the compile-time layout
+  assertions are what guard that, and a negative-cache entry would hide it).
+  The rule is therefore an **allowlist**: a status nobody has classified is
+  retried, not written off. `STATUS_NOT_SUPPORTED` is deliberately outside it
+  even though "this adapter has no address to report" is a plausible reading —
+  the two mistakes cost different amounts, three syscalls a cycle against a
+  real GPU losing its measurement until the agent restarts.
+
+One further refusal belongs to the same discipline:
+`D3DKMT_ADAPTERADDRESS` reports no PCI **domain**, so two cards in different
+PCI segments collapse onto one join key — an address claimed twice is *removed*
+rather than resolved to whichever row came last, and both adapters fall back to
+the operator's estimate.
+
+Failure is always fail-soft and never a wrong number, and the blast radius
+differs by which half failed. A **PDH** error — the query, the counter add, the
+sizing call — yields `nil` for the whole cycle (logged at debug, like the other
+optional collectors), which the manager already reads as "nothing measured". A
+**D3DKMT** error costs only its own adapter: that LUID is skipped and the
+remaining ones are still measured, and the cycle yields `nil` only when *no*
+adapter resolved at all. An unresolvable adapter is skipped rather than charged
+to a guessed index 0, and — per the allowlist above — a transient failure is
+asked again on the next cycle rather than remembered. The one subprocess the
+chain can spawn is bounded by the same 2 s deadline the compute-apps measurer
+uses, for the same reason: the admission-time measurement runs on the serialized
+owner goroutine (§5.5).
+
+**Where the numbers in the paragraphs above come from.** The chain was proven
+end to end on the operator's 3-GPU Windows host (driver 610.62) with a
+standalone probe, and the numbers are worth recording because they are why the
+design looks as it does: per-GPU totals came within **0.04–0.8 %** of
+`nvidia-smi --query-gpu=memory.used`; the LUID→index attribution agreed with
+`nvidia-smi`'s own PID→GPU mapping for **15 of 15** PIDs; a single collection
+already returned non-zero values (hence one `PdhCollectQueryData`); and one
+adapter LUID (`0x0_0x16026`) failed `D3DKMTOpenAdapterFromLuid` with
+`STATUS_INVALID_PARAMETER` and was retried once per counter instance — six
+wasted syscalls per cycle for an answer that cannot change, which is why a
+refusal is cached. The operator's own model spans all three cards, so the
+per-adapter split is a requirement rather than a nicety. **Nothing here detects
+VRAM spillover into host memory**: the neighbouring `Shared Usage` and
+`Non Local Usage` counters read *identically* (4694 MiB) on all three GPUs of
+that host, so they are not per-adapter figures, and only `Dedicated Usage` is
+read.
+
+**The Windows code is split so that CI can test the half that can be wrong.**
+Every grammar, all the arithmetic and the whole cache-decision logic live in
+`collector/nvidia_pdh.go`, which carries **no build tag** and is unit-tested on
+Linux; only the syscalls sit behind `//go:build windows` in
+`nvidia_pdh_windows.go`, where they are pinned by compile-time struct-layout
+assertions and reviewed rather than tested. CI runs on `ubuntu-latest` and
+neither builds nor vets for Windows, which is the reason for the split and a
+standing risk in its own right
+([§11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
 
 **The recurring measurement runs OFF the owner goroutine; the admission-time
 one still runs on it.** That split is deliberate, and it is what let
@@ -1047,8 +1302,109 @@ returns before spawning or allocating anything, which is what keeps every AMD,
 Apple and CPU-only deployment byte-for-byte unchanged.
 
 `pending_vram_unknown` as a *terminal* reason is reserved for a holder that can
-never leave — a **pinned** process on the contested GPU. A merely busy,
-non-pinned occupant yields `Wait`, because it can drain.
+never leave — a **pinned** process on the contested GPU. Any other occupant
+yields `Wait`, which is the honest shape but not always a short one. A busy
+occupant drains. An idle occupant of known demand — the one the order above
+forbids evicting — is unloaded by the idle scan (§6) **if** its
+`idle_timeout_seconds` is positive; `0` there means *never unload*, so an idle,
+unpinned, never-again-requested occupant keeps the card until the operator
+fills the candidate's estimate in (or, on an NVIDIA host, a measurement lands),
+and the candidate's requests queue to their
+`admission_wait_timeout_seconds` meanwhile. It is not reported as terminal
+because none of the three ways out is closed. That wait is the accepted price
+of "known demand beats unknown demand": the alternative is the unknown-demand
+spec drain-stopping the configured one, which is the non-converging behaviour
+above.
+
+**So this one `Wait` says why, and it is the only one that does.** `Wait` is
+otherwise the manager's silent branch — the spec stays queued, its state is
+untouched, no `last_error` is written — which is right for a wait that resolves
+itself: a busy neighbour finishes, a queued victim drains. The precedence wait
+need not resolve at all, and a spec that will never start while nothing
+anywhere says why is not an acceptable outcome, so `Admit` attaches a message
+to *that* decision and the manager records it as the candidate's `last_error`:
+`spec X: its own demand on gpu 0 is unknown, so it waits for spec Y to leave
+gpu 0 rather than evicting it`. Both cards are named because they need not be
+the same one (rule 4 demands aloneness on *every* card the candidate wants),
+and the occupant is chosen by lowest spec id — `Running` arrives in Go map
+order, and an operator-facing string must not name a different spec on every
+admission. The portal renders `last_error` in an always-visible column, so
+this is where the stall becomes visible. Scope is deliberate: **an ordinary
+`Wait` still records nothing**, because a warning on every contested start is
+how a diagnostic stops being read. Neither the state nor the failure count
+moves either — nothing was attempted, so this is not a failed start — and a
+successful start clears it, like every other reason string. Retried requests
+re-derive the identical message and leave the original timestamp alone, so
+`last_error.at` reads as *since when*, not *last asked*.
+
+**A terminal reason must name a cause that resolving it actually unblocks**,
+and two things follow from that.
+
+- **The occupant case carries a message, and it names the other spec.** The
+  candidate case does not need one: the estimate to fill in belongs to the spec
+  already displaying the state. The occupant case is the opposite — the spec in
+  `pending_vram_unknown` is the one with a usable estimate, while the unfilled
+  field is on the pinned spec beside it — so the reason travels with
+  `spec X: gpu 1 is held by pinned spec Y, whose own demand on gpu 0 is unknown`
+  as the spec's `last_error`. Without it the portal shows a spec waiting for
+  VRAM and nothing anywhere says whose number is missing; on a host with no
+  measurer (below) filling that number in is the *only* way out.
+- **A closed co-residency cell is reported as itself, not as a missing VRAM
+  number.** If the pinned occupant is one the matrix does not let this candidate
+  sit beside anyway, filling in its estimate resolves nothing — rule 1 refuses
+  the pair whatever the numbers say. That case is therefore `not_permitted` with
+  `spec X: gpu 0 is held by pinned spec Y, and that pair is not permitted by the
+  co-residency matrix`: still terminal (a pinned occupant can neither be evicted
+  nor drain, so `Wait` would queue every request to its admission timeout for a
+  block that never lifts), but naming the cause an operator can act on. Where
+  several pinned occupants qualify, a closed cell outranks an open one and
+  equal-precedence occupants break on the lowest spec id — the snapshot's
+  running list arrives in map order, and a message that named a different spec
+  on every admission would be worse than none. The **candidate**-side terminal
+  deliberately keeps its older shape (`pending_vram_unknown` even behind a
+  closed cell); revising that is a separate decision about a behaviour that
+  predates the occupant rule.
+
+> **The occupant half of that symmetry was missing, and it made "alone on that
+> GPU" a promise that expired the instant it was granted.** Both unknown-VRAM
+> checks keyed on the *candidate*, while the per-GPU arithmetic charges a
+> running process whatever its VRAM map holds for the index being checked — and
+> for a process of unknown demand that is `0` **with the key present**, which
+> per §5.1 means *unknown*, never a zero-cost claim. So the spec that had just
+> been granted a card to itself was charged nothing on it, and the very next
+> admission placed a second process on the same card regardless of how large
+> the first really was, and regardless of whether it was idle, **busy, or
+> pinned**. Measured against `Admit` before the fix: an occupant of unknown
+> demand produced `OK` with an empty evict list in all three of those cases,
+> where the same occupant declaring 6000 MB produced an eviction. Two processes
+> sharing a card with no accounting for either is precisely the OOM the budget
+> exists to prevent. It was never a deliberate asymmetry: this section already
+> accepts that an unknown-demand *spec* waits behind a pinned or busy holder,
+> and that is only coherent if the reverse holds too.
+>
+> **It is an explicit rule, not a bigger number in the arithmetic.** Charging an
+> unknown occupant the whole budget looks like the smaller change and does not
+> work: the arithmetic's eviction loop releases a victim by subtracting that
+> same `0`, so evicting the unknown occupant never reduces the sum. That
+> version evicts every idle process on the card, still finds itself over budget,
+> and answers `Wait` — destroying running work **and** blocking the candidate.
+> Charge and release would both have to be made consistent, which means
+> inventing a VRAM figure for a process nobody has measured. Naming the
+> contention needs no number at all.
+>
+> **Terminal is a report, not a permanent verdict — but what lifts it is
+> host-dependent, and on most hosts it is only the operator.** A pinned
+> occupant's `pending_vram_unknown` is re-evaluated once
+> `notPermittedRetryInterval` elapses, and unlike a candidate that cannot start,
+> a pinned occupant *is* running — so **where a measurer is installed** the
+> housekeeping beat measures it and the block clears with nothing evicted. That
+> is the NVIDIA case and only the NVIDIA case: on AMD, Apple-silicon and
+> GPU-less hosts the agent installs no measurer at all, so nothing but an
+> operator filling the estimate in will ever clear it, and the re-evaluation
+> loop simply re-confirms the same block every five seconds. Do not read
+> "terminal is not permanent" as a property of the state — it is a property of
+> the host, which is why the message has to name the spec whose estimate is
+> missing.
 
 ### 5.4 Eviction, queueing and drain
 
@@ -1208,6 +1564,13 @@ short-circuits entirely when the incoming ETag equals the applied one. A blanket
 "config changed, re-evaluate everything" reset would give an operator a way to
 defeat crash-loop protection by touching an unrelated spec.
 
+The applied document's ETag is **reported upward**, so a gateway that wrote an
+override can wait for the fact instead of guessing at a delay — including which
+of the rows above have therefore taken effect and which are waiting for a next
+start. What the acknowledgement promises, and the three cases in which an agent
+acknowledges nothing, are
+[§7.2](#72-the-applied-document-acknowledgement).
+
 ## 6. Process lifecycle
 
 Nine states are visible per spec, and they are a **wire contract** — portal
@@ -1356,8 +1719,9 @@ failure — and the 404 also resets the tracked ETag, since a 404-returning serv
 would ignore a stale validator anyway); a transport error, unparseable body or
 unexpected status returns the last known set with a nil error; unknown names are
 ignored on both sides. One flag per **shipped** capability, not per plan: today
-`runtime_manager` (the managed runtime itself) and `runtime_logs`
-([§14](#14-managed-process-logs-t3)).
+`runtime_manager` (the managed runtime itself), `runtime_logs`
+([§14](#14-managed-process-logs-t3)) and `runtime_config_ack`
+([§7.2](#72-the-applied-document-acknowledgement)).
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -1446,6 +1810,53 @@ Its honest limit, stated rather than faked: a forgotten PATCH bump after a plain
 bugfix is **not** machine-detectable, because the guard has no external signal
 for what changed. That half stays a process rule in
 [`AGENTS.md`](../../../AGENTS.md).
+
+### 7.2 The applied-document acknowledgement
+
+Every telemetry sample carries the ETag of the runtime-config document the agent
+has **applied**, as the top-level `runtime_config_applied_etag`
+([telemetry §8.3.2](telemetry-usage-observability.md#832-shared-ingest-core)).
+Without it, a gateway that writes a desired-state override has no way to learn it
+arrived: nothing on the wire says "applied", and the absence of a process is not
+evidence — a self-exit (idle unload, a crash) looks identical to an obeyed
+override. The flag `runtime_config_ack` declares that the acknowledgement will
+come, so a gateway can *wait for a fact* against an agent that has it and fall
+back against one that does not. Without the flag the two are indistinguishable
+and there is no timeout that separates "still draining" from "will never answer".
+
+**What it means, exactly.** *This document is my desired state, and every
+reconciliation decision it implies is committed.* It does **not** mean every
+process the document stops has exited: a drain's grace/kill sequence is
+asynchronous, and the per-spec `runtimes[].state` in the same sample is what
+reports how far it got. What the acknowledgement *does* add, and the reason it is
+worth having, is that no `force_stopped` spec can be started again afterwards —
+both admission entry points refuse that `admin_state` outright — so an **absence
+observed after** this ETag names the document is durable, whereas the same
+absence observed before it means nothing.
+
+**Where the value comes from is a correctness decision, not an implementation
+detail.** Three values in the agent could each be called "the ETag", and only one
+is true:
+
+| Candidate | Why it is wrong / right |
+|---|---|
+| `GatewaySource`'s tracked etag | **Wrong.** Advances when a document is *fetched and parsed*, strictly before it reaches the manager — acknowledging it claims application for a document that has reconciled nothing. |
+| A copy the driver keeps around its `Apply` call | **Wrong.** Correct on ordering, but duplicates state the reconciler owns and drifts the moment anything else applies a config (the feature-revoked drain does). |
+| The manager's own applied config | **Right.** Written by the reconciler itself, on the goroutine that owns all state in the package, inside the single event-loop turn that performs the reconciliation. Served *from* that loop, so it cannot be read midway through an apply: there is no observable state in which it names a document the reconciler has not processed. |
+
+Three cases acknowledge **nothing**, and the field is then absent rather than
+empty (so an agent with nothing to say produces the pre-feature sample shape):
+nothing applied yet; `runtime_manager` not currently negotiated active, since an
+agent enforcing nothing must not claim otherwise; and **file mode**. The
+file-mode case is why the gate is a positive check for the gateway source and not
+"is the ETag non-empty": a file-mode agent discards the gateway's document
+outright (§8.2), while its own `Config.ETag` is whatever the operator's file
+contains — and because the gateway derives the ETag as a deterministic digest
+over the document's content, an operator who copies a served document verbatim
+into their local file would hold a value that *matches* one the gateway really
+served. Acknowledging that is the worst available failure, because it is
+indistinguishable from the truth. The gateway's own refusal to treat a file-mode
+server's gateway-side specs as effective (§8.2) stands instead.
 
 ## 8. The two configuration sources
 
@@ -1606,6 +2017,20 @@ configuration" warning** that names where they live, states they are not
 deleted, and states they take effect again as soon as the source is switched
 back to `gateway`. Without that wording, gateway-side configuration looks
 deleted rather than dormant.
+
+**The VRAM benchmark
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+refuses outright in file mode**, with `benchmark.vram_isolation_unavailable`,
+and this is the same rule one step further: its isolation is
+`admin_state: force_stopped` written into the gateway document, so in file mode
+every one of those writes returns 200 and stops **nothing**. Degrading was not
+an option — the run would then report `Isolated: true` for a fleet it never
+touched, most starkly on a server whose gateway-side specs are all *already* in
+a no-process state, where the run confirms every one of them without waiting
+for anything. File mode is out of scope for that run **by refusal rather than
+by omission**: it is not unreachable-until-someone-gets-to-it, it is
+unreachable from the gateway side by design, and an agent-side "measure now,
+isolated" capability is the only thing that would ever serve it.
 
 ### 8.3 The upward report, and what it redacts
 
@@ -1926,9 +2351,39 @@ can be lost (the `serverPerfRegistry` discipline). Delivery is non-blocking: a
 full subscriber buffer drops that update and the subscriber catches up on the
 next one. The subscribe snapshot can legitimately be a bare nil, so
 non-nil-ness is enforced one layer up at serialization — and must be applied to
-**both** the initial snapshot and every subsequent update. Status rows carry no
-GPU field by design: measured VRAM reaches the UI through the spec's
-`gpus[].vram_measured_mb` after the write-back, never through this stream.
+**both** the initial snapshot and every subsequent update.
+
+**A status row carries the measurement AND its age; the stored row can only
+carry the measurement.** Each row republishes the sample's own
+`gpus[].vram_measured_mb` alongside `measured_at`, the **gateway's** arrival
+time for the frame that carried it — never the agent's self-reported
+`reported_at`, which is a claim rather than an observation. The stored value is
+unchanged and remains the durable path (the write-back onto
+`agent_runtime_spec_gpus`, which is what admission reads), but it cannot answer
+"how old is this number?": `RuntimeSpecGPU` is `{SpecID, GPUIndex,
+VRAMEstimateMB, VRAMMeasuredMB}` with **no timestamp**, and the write-back
+deliberately skips an unchanged value (see [Telemetry, Usage Analytics &
+Observability](telemetry-usage-observability.md) for that skip). So a reader
+polling the store reads an arbitrarily old number as a fresh one, while
+demanding that the number *change* fails in the normal case where a measurement
+lands on exactly the value already stored. A caller that must attribute a
+measurement to something it just did — the VRAM benchmark's strategy (a) — takes
+only a value carried by a frame that arrived **after** the event it cares about,
+which is the same watermark discipline a `stopped` transition needs
+([§11.2](#112-restart-is-a-sequence-not-an-endpoint)).
+
+Two honesty rules on those two fields, and both are contracts:
+
+- **They are omitted together.** A frame that measured nothing — no measurer
+  installed on the host, or a spec with no live process — carries neither, so a
+  consumer never sees a timestamp with nothing to be fresh about. (`measured_at`
+  is tagged `omitzero`, not `omitempty`: `omitempty` has no effect on a struct
+  type, so a zero `time.Time` under it would reach every client as
+  `0001-01-01T00:00:00Z` — a timestamp that reads as a very stale measurement
+  rather than as no measurement.)
+- **A measured `0` is dropped**, exactly as the store write-back drops it: `0`
+  means *unknown* throughout this feature, and publishing it would make an
+  absent measurement look fresh.
 
 For the wire shape of the stream and its unusual envelope key, see
 [HTTP API Surface](../reference/api-surface.md); for the sample's two additive
@@ -2403,6 +2858,23 @@ case that sends people looking for it, a measurement above the GPU budget
 leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agent
 picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
+
+**A GPU row can show a THIRD number, and it is an offer rather than a field.**
+When the mapping's benchmark history carries an applicable VRAM measurement
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)),
+each row whose index that run measured gains the benchmark's number — rendered
+read-only through `Field`'s own `readOnly` prop, so it cannot be mistaken for
+the editable estimate beside it — plus an **Apply** that fills the estimate and
+nothing else. Three numbers, three meanings, one owner each: the operator's
+estimate (editable), the agent's measurement (read-only text), the benchmark's
+(read-only, applied on request). Apply is a **form-state** change: no request is
+made until the operator saves, which is the whole of D4's ownership rule
+expressed as an affordance. It is matched **by GPU index**, never by row
+position, and it is absent — rather than showing a `0` — for the create form, an
+inconclusive run, a run whose isolation was never proven, and a declared card
+the run watched but measured nothing on. Which of the two reported quantities
+the number is (the delta, or the agent's per-process measurement) is named on
+screen beside it, because they are different quantities and are never averaged.
 
 Each spec GPU row carries a **picker of the server's reported cards** that
 writes the chosen card's index into the numeric field beside it. It exists
@@ -2882,6 +3354,676 @@ misclassifies an *active* agent that reports no features.
 For the state → colour mapping and why colour can only carry coarse facts here,
 see [Theming & Internationalization](theming-and-i18n.md).
 
+### 11.6 The VRAM benchmark: load one model alone, and measure what it costs
+
+`POST /api/portal/mappings/{id}/probe-vram` is the deliberate answer to
+"[how do I resolve an unknown VRAM demand on purpose?](#53-unknown-vram-resolves-itself-by-measurement)".
+It reserves the target's server through the benchmark registry (so it is
+mutually exclusive with every other run and excluded from new routing),
+force-stops **every** managed spec on that server, loads exactly **one** model,
+and reports two independent numbers per GPU. It is **operator-triggered and
+single-target**, like the context probe and the load run before it.
+
+**Why its own endpoint, and not a fifth `?mode=`.** Every `mode` value is a
+*per-target* measurement inside a fan-out loop over an application's or a
+server's mappings. This run is not per-target: it drains the whole server once
+and then loads one model. As a mode it would either silently measure only the
+first target, or drain-and-reload the server N times inside one reservation —
+and on the *server* scope a run an operator reads as "measure my models" would
+stop every model on the box. It is also not an extension of the **load** run,
+whose button would then stop every other model on the server with no affordance
+warning about it. What the two share is the **load core**
+(`ensureResidentForRun`), which matters because that core loads **by
+generating**: one `max_tokens: 1` stream, so a backend that allocates its KV
+cache lazily on first use has necessarily already done so before the post-load
+window opens. That is why there is deliberately **no** second "send one tiny
+generation" step — two windows for one observation doubles the exposure to a
+drifting neighbour and to the reservation being held open, for a number that
+cannot differ.
+
+**Isolation is `admin_state: force_stopped` on every enabled spec, the target
+included.** `force_stopped` is the only lever that *refuses a start*
+([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)); a lowered
+`runtime_max_processes` would be cheaper and unsafe in the opposite direction,
+because a router request for a sibling then licenses the agent to evict the one
+process being measured. **The target is drained too**, and that is not
+thoroughness: the load core short-circuits on an already-resident model, so
+leaving the target up would make the baseline window already contain it and
+yield a *definitive* delta of ~0 — for the commonest case an operator would
+probe.
+
+**Four refusals before anything is written**, each a state in which the
+promised isolation cannot be achieved by any gateway-side write. All four are
+HTTP 409 with a stable code, and all four are checked **before** the server is
+reserved, so a refused run writes nothing and reserves nothing:
+
+| Condition | Code |
+|---|---|
+| The target is not an agent-managed process (its application is not `server_agent`, or it has no enabled launch spec) | `benchmark.vram_not_agent_managed` |
+| [File mode](#82-file-mode), or an agent that has not declared `runtime_manager` | `benchmark.vram_isolation_unavailable` |
+| The server's latest telemetry carries no GPU sample | `benchmark.vram_no_gpu_samples` |
+| A spec already carries an operator override, or a spec *other than the target* is pinned (the message names it) | `benchmark.vram_isolation_blocked` |
+| The target's launch spec declares a GPU index this host does not report (the message names it) | `benchmark.vram_declared_gpu_missing` |
+
+The override refusal is what makes the restore unambiguous: the run only ever
+restores to exactly `""`, so it never has to reconstruct what an operator's
+override was — which, after a gateway restart, it could not know. The **pinned**
+refusal is not because a pinned spec cannot be drained (`force_stopped`
+outranks `pinned`) but because pinned is a standing instruction that a model
+stays up, and silently breaking it for a benchmark is a worse surprise than
+refusing. A pinned **target** proceeds: stopping the target is the point.
+
+The **declared-GPU** refusal exists because the alternative is a run that
+cannot succeed and drains the fleet first. The stability gate requires every
+watched card to be present in every sample — the run cannot difference what it
+cannot see — so a spec declaring index 3 on a two-GPU host burns each window's
+full bound and reports `baseline_unstable`, whose stated next action ("something
+on the card was moving; retry once the server is quiet") is wrong and can never
+work. The host's whole card list is already in hand at trigger time, so naming
+the missing index costs nothing.
+
+**A launch-spec write is refused while a run holds the server.** The
+launch-spec endpoint is a full-document replace with `admin_state` among its
+fields, so it is an override action as much as an edit: one "Force start" on a
+spec the run has drained puts a sibling's allocation inside the measurement
+window. `PUT /api/portal/mappings/{id}/runtime-spec` therefore answers **409
+`runtime_spec.server_benchmarking`** whenever the benchmark reservation is held
+for that mapping's server — the same reservation that already excludes the
+server from gateway routing, checked *after* authorization so it leaks nothing,
+and only on the principal-carrying path: the run's own drain and restore go
+through the benchmark writer and must not refuse themselves. A write to another
+server, and a DELETE (which drains a spec rather than starting one, and which
+the restore already treats as restored), are not gated.
+
+**That is the ONLY write it gates, and the rest of the document is genuinely
+mutable under a run** — which is a fact the isolation wait below has to be built
+around rather than a gap to be closed here. Per-GPU budgets, the co-residency
+list, `runtime_max_processes`, a mapping rename, the agent application's router
+port and **the agent's own measured-VRAM write-back** all still land, the last of
+them at telemetry cadence and by design
+([§9's notification-rule exemption](#9-keeping-the-agent-current-the-notification-rule)).
+None of them can start a model — which is why none is gated, and why the
+reservation is narrow on purpose rather than by omission — but every one of them
+changes the runtime-config document, and therefore its `etag`.
+
+Two conditions **warn** instead of refusing, and ride the result as
+`warnings[]`: a server that also hosts active applications the agent does not
+manage (`non_managed_applications` — refusing would not improve isolation,
+since those processes are outside the agent's control either way, and would
+make the feature unusable on exactly the
+[migration-path deployments §13 blesses](#13-known-limitations-and-accepted-risks)),
+and an agent with no open WebSocket (`post_transport_agent` — nothing the run
+writes reaches it before its next runtime poll, so the drain does not even
+begin until then and the server is held for correspondingly longer; the run
+says so rather than refusing). Two more warn on a **result** rather than before
+it: `undeclared_gpu_allocation` — see *Which cards are watched* below — and
+`residency_unknown`, which is the honesty half of the `already_resident`
+signal. That signal is the loaded-models probe, and it needs an
+application-level `loaded_models_path`: operator-entered, with **no default**,
+and empty on most agent-managed applications, whose child sits behind the
+agent's own router. Without it (or when the probe errors) the run gets "not
+resident" for a model that may well be resident, the baseline already contains
+it, and the ~0 delta surfaces at the floor gate as `below_floor` — whose next
+action, *"the window missed the allocation, measure again when the server is
+quiet"*, fails identically every time. So the run reports the check as
+**unavailable** rather than letting the wrong reason stand in for it.
+
+**`isolated` is evidence, never a 200.** In file mode every `admin_state` write
+succeeds and stops nothing, so a write's success proves nothing anywhere. The
+run holds per-spec evidence it produced itself, reported alongside the boolean
+as `isolation_evidence` so the claim can be audited:
+
+- `stopped_after_write` — a spec that **had** a live process when the write
+  landed is in a no-process state on an admissible frame.
+- `no_process_at_write` — the spec had **no** live process, so a `force_stopped`
+  write against it does nothing at all: no state change, no frame
+  ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)). It can only be
+  *confirmed*, never awaited — waiting for a transition that will never arrive
+  is what turns an already-quiet server into an isolation timeout.
+
+**Neither value is recorded from a frame the wait has not ADMITTED, and there
+are two standards of admissibility.** The report says which one it used, as
+`isolation_proof`, because they are different strengths of evidence and an
+operator weighing a number must not have to assume the stronger:
+
+| `isolation_proof` | Admissible once… | What it is |
+|---|---|---|
+| `config_acknowledged` | the agent has reported applying a runtime-config document this run derived and verified still force-stops **every** enumerated spec | a fact about a document the agent is demonstrably holding |
+| `bind_delay` | `vramIsolationBindDelay` (the agent's own guaranteed runtime-poll interval, 60 s) has elapsed since the write | an inference from a clock plus the absence of a process |
+
+**The value the report carries and the standard the wait applies are ONE
+derivation**, and that is a correctness requirement rather than tidiness. They
+began as two independent reads of the same planned boolean — one filling the
+report's `isolation_proof`, one building the wait's policy — and nothing tied
+them together, so a single edit to either could have made a report claim *"the
+agent confirmed it applied this document"* over a wait that had actually applied
+the timed fallback. For a feature that exists so a confirmed isolation is
+**provable**, that is the one divergence which must be impossible, so the policy
+is derived once and the report's string is read off that policy. Pinned both
+structurally and end to end: the run is driven under each standard with the
+binding delay set far from the test's patience, so a report whose claim does not
+match what its wait did fails on the clock.
+
+The first is available for an agent that declares
+[`runtime_config_ack`](#72-the-applied-document-acknowledgement), and it normally
+lands within one telemetry interval instead of a minute. The second is what
+remains for an agent that does not — negotiation is by **name**, never by version
+([ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)),
+so an older binary in the field keeps exactly the pre-acknowledgement behaviour
+rather than hanging on a message it will never send. The **total bound** is
+`bindDelay + vramIsolationDrainBound` under both: the acknowledgement removes the
+blind delay from what counts as *evidence*, not from the budget a slow drain is
+allowed.
+
+**Equality against the acknowledged ETag is a proof only because the ETag is a
+content digest.** `agentRuntimeConfigETag` is `sha256` over the document with its
+own `etag` field blanked, so equal content always yields an equal digest and the
+gateway can derive the exact value an agent holding a given document must report.
+Two consequences the design rests on. A **stale** acknowledgement — an agent still
+holding the pre-drain document — can never be mistaken for a fresh one, and
+structurally rather than by luck: the run *refuses to start* against any
+pre-existing override, so a pre-drain document always differs from a post-drain
+one in at least one spec's `admin_state`. And nothing an agent **invents** can
+confirm anything, because the comparison is against a digest the gateway computed
+itself; the reported value is clamped on ingest purely as a memory bound, never
+validated by shape.
+
+**The digest covers the WHOLE document, which is the one trap this design has to
+answer.** Any write that reaches the derivation changes it, and the benchmark's
+reservation covers only the launch-spec `PUT` — deliberately not the per-GPU
+budgets, the co-residency matrix, `runtime_max_processes`, a mapping rename, the
+agent application's router port, or **the agent's own measured-VRAM write-back**,
+which [§9's notification rule](#9-keeping-the-agent-current-the-notification-rule)
+exempts and which arrives at telemetry cadence. So the document really does move
+under a run. A wait pinned to the single value captured after the drain would
+then never match: the agent applies the *new* document, reports *its* digest, and
+the run burns its whole bound and reports a timeout for a fleet that was drained
+correctly the entire time.
+
+The wait therefore keeps a **set** of accepted digests. It seeds the set by
+deriving the document once, immediately after the drain; whenever the reported
+value is one it has not answered yet, it re-derives and admits the new digest —
+**but only after checking that the fresh document still force-stops every
+enumerated spec.** That check is what makes re-derivation a proof rather than a
+convenience, and its false branch is a real case: an operator's mid-wait "Force
+start" or "Clear override" produces a document that lets a sibling start, the
+agent applies and reports it dutifully, and accepting it would claim
+`isolated: true` for a run whose isolation had already been revoked. A spec
+**missing** from the document fails the check too, which is the fail-closed
+direction rather than an oversight: a spec deleted or disabled mid-wait is no
+longer in the document, so the document says nothing about it, and *"not
+mentioned"* is not *"refused a start"*. Such a spec is in fact quiet — an agent
+is not told about it, so it does not run it — and inferring that is exactly what
+this check may not do, because its job is to decide what an acknowledgement
+**proves**. The run
+reports `isolation_lost` instead — the same reason, and the same operator action,
+as a sibling seen running again at the end of the measurement. Earlier digests
+stay in the set rather than being replaced, because the gateway does not control
+the order in which an agent reports them: a document that was current a moment
+ago is a perfectly good proof of what it *is* a proof of — it force-stopped the
+whole enumerated fleet when this run derived it, and the agent says it is the one
+it holds. It is **not** a statement about the document the store holds now, and
+the difference is worth stating because the obvious reading overclaims: while the
+agent keeps reporting a digest already in the set, nothing is re-derived, so a
+mid-wait revocation stays invisible to the gate until the agent reports the new
+document. That is not a hole — an agent holding a document that stops the fleet
+has not started the released sibling yet — and the revocation is owned
+**downstream** either way, by the end-of-run re-verification (`isolation_lost`)
+and by the restore's compare-and-set. What the window costs is the earliest
+possible detection, never the detection. Re-derivation costs one store read per
+*change* of the reported value, not one per frame.
+
+**An agent that promises an acknowledgement and never sends one is its own
+reason.** `isolation_unacknowledged`, not `isolation_timeout`, because the next
+action differs and that difference is the whole diagnostic value of the
+acknowledgement: `isolation_timeout` says the document landed and a *model* would
+not go quiet, so look at that model; `isolation_unacknowledged` says the document
+never landed at all, so look at the **agent**. It also covers the honest remainder
+of a mid-run downgrade — the declared feature set is read **once**, before
+anything is written, so an agent that stops declaring the name before the wait
+ends costs one bounded wait and is *named*, rather than silently dropping to the
+weaker standard halfway through a proof.
+
+**What the acknowledgement does not say**, because trusting it further would be a
+new lie in place of the old one: it means *this document is my desired state and
+every reconciliation decision it implies is committed* — **not** that every
+process the document stops has exited. The drain's grace/kill sequence is
+asynchronous, and the per-spec `runtimes[].state` is still what reports how far it
+got, which is why the per-spec evidence above survives unchanged. What it adds is
+that no `force_stopped` spec can be started again afterwards, so an absence
+observed *after* it is durable ([§7.2](#72-the-applied-document-acknowledgement)).
+
+Two things this used to get wrong, both of which let a run confirm an isolation it
+had not earned, and both worth keeping because each looked reasonable:
+
+- *The delay gated one half only.* A stop **transition** was treated as
+  self-evident proof the override arrived. It is not: a spec's own exit looks
+  identical on the wire — an idle timeout, which the run's own reservation makes
+  likely because it leaves every sibling idle, or a crash landing in `crashed`
+  or `backoff`, both no-process states and both states the agent **restarts
+  from**. Confirming on that frame read a self-exit as an applied override, and
+  the spec was then one backoff timer or one router request away from running
+  straight through the measurement. (It also made the live-at-write
+  classification's one-sample staleness matter, because a spec that had already
+  exited before the write was mislabelled *live* and so bought the delay-free
+  branch — the stronger label for exactly the case the delay exists for.)
+- *The delay was picked from the transport.* Two seconds for a WS-connected
+  agent, the poll interval otherwise. That gave the WS push the standing of a
+  delivery, and it has none: `PushRuntimeConfig` runs in a detached goroutine
+  that returns silently when the derive or the marshal fails, and
+  `NotifyRuntimeConfig` sends to **zero** connections when the socket closed
+  after the probe or drops the frame with a `slog.Debug` when a send queue is
+  full — in each case the override binds on the next poll anyway. The probe was
+  also taken **before** the drain wrote anything, so even a truthful answer said
+  nothing about the transport at write time. The acknowledgement is the opposite
+  of that probe in every respect: it is sent *after* the agent reconciled, it
+  *names* the document, and it cannot be true of a document the agent is not
+  holding. What an open WebSocket still decides is only the operator-facing
+  `post_transport_agent` warning.
+
+`isolated` is true only when **every** enumerated spec carries one of those two
+values. An **empty** enumeration is `false`, not vacuously true: "nothing
+enumerated, nothing awaited, isolated claimed" is precisely the shape of the
+file-mode defect the rule exists to prevent. A state this gateway does not
+recognize (a future agent build) counts as neither, so the run reports an
+isolation timeout rather than claiming an isolation it cannot justify.
+
+**And it is proved twice, because one proof covers the wrong half of the run.**
+The drain proof happens *before* the baseline; everything after it — the
+settle, the baseline window, the whole load (bounded only by the spec's startup
+timeout, by far the longest part of a run), the post-load settle — was
+unmonitored, and the stability gate only ever constrains movement *inside* one
+window. A sibling started anywhere in between therefore left both windows
+individually stable and had its whole allocation added to `delta_mb`, reported
+as definitive with `isolated: true`. So the run re-reads the runtime-status
+snapshot after the post-load window and requires every **non-target** spec to
+still be in a no-process state — the target's own process is the point of the
+run, and no spec *outside* the trigger-time enumeration may hold one either,
+since a spec created after that enumeration was never drained and carries no
+evidence. A spec that fails this is recorded with the third evidence value,
+`restarted_during_run`, which is the one value that is *not* evidence of
+isolation: it sits outside the closed set, so it flips `isolated` through the
+same function that computes that field, and it NAMES the spec in the stored
+payload rather than only saying that something broke. The result is
+`isolation_lost` and no number. The snapshot is up to one telemetry interval
+old, so this is a contamination *detector*, not a proof about the final
+instant — which is why the cross-check below stands beside it rather than
+behind it.
+
+**The watermark is channel ordering, not a clock.** A `stopped` frame that
+predates the run's write proves nothing, and no status frame carries an arrival
+time of its own. So the run subscribes to the live status stream *after* its
+write and discards the subscription's snapshot entirely: `subscribe` registers
+under the registry's lock before returning and `publish` collects its targets
+under that same lock, so any frame delivered was published after the
+registration — which was after the write. The same discipline governs the
+per-GPU sample windows and the per-process measurement below, and it needs no
+comparison between the gateway's clock and the agent's.
+
+**Two measurement strategies, reported side by side and never averaged.**
+
+- `delta_mb` — the per-GPU total, `used_after − used_before`, from the
+  gateway's own per-GPU sample ring. It is the model's **marginal cost** on
+  that card: a constant neighbour, the driver reserve and ECC overhead all
+  cancel out of it. **It is the only figure that will ever exist on AMD, Apple
+  and GPU-less-of-NVIDIA hosts**, which is why it is the structurally valuable
+  half.
+- `measured_mb` — the agent's **own per-process measurement**, read off the
+  live status stream and accepted only from a frame that arrived after the
+  load. It is that process's *attributed usage*. It cannot come from the store:
+  `RuntimeSpecGPU` has no timestamp and the write-back deliberately skips an
+  unchanged value, so polling for "a positive value appears" reads an
+  arbitrarily old number as this run's result, while demanding that the value
+  *change* fails in the normal case where a run measures exactly what the last
+  one did. Strategy (a) reports **nothing** rather than something stale.
+
+The two are different quantities and may legitimately differ; the portal shows
+both and never a mean. `0` keeps its house meaning throughout: **unknown, never
+a real zero.**
+
+**They are also CROSS-CHECKED, which is half the reason to run both.** Where a
+card carries both figures they must agree within an allowance, and a gap past
+it means one of them measured something the other did not — which for the delta
+means something else allocated inside the window. That is the only gate that
+can catch the one contaminant nothing else sees: a **non-managed** neighbour
+allocating during the load leaves both windows individually stable *and* the
+managed fleet provably isolated, so no other check has any reason to doubt the
+delta, while the agent's own figure counts only the target's own pages. A
+disagreement is `strategy_disagreement`, and the two numbers **stay on the
+report** — unlike `below_floor`, where there is nothing to show, here they are
+the evidence for the reason. The allowance is
+`max(the card's stability tolerance, 512 MB, 10 % of the agent's figure)`,
+because the delta legitimately carries the process's CUDA context and the
+driver reserve that a per-process measurer attributes to neither — a difference
+that is absolute rather than proportional, hence both halves. A card with only
+one figure is not checked: demanding a second opinion on AMD or Apple, where no
+measurer exists, would refuse every run on exactly the hosts the delta strategy
+exists for.
+
+**Honesty gates, and what each catches.** Each phase requires `K` consecutive
+samples (default 3, ~3 s at the 1 s cadence) in which every watched card varies
+by no more than `max(1 % of the card, 64 MiB)`. A result that reached no number
+says **why**, because the operator's next action differs per reason:
+`isolation_timeout`, `isolation_unacknowledged`, `baseline_unstable`,
+`post_load_unstable`, `already_resident`, `below_floor`, `no_samples`,
+`isolation_lost`, `strategy_disagreement`, `run_failed` — **ten**, and the
+count is worth stating because this list has twice gone stale behind the code
+it describes. Six of them are worth naming here:
+
+- **`already_resident`** — after a *confirmed* drain, a model that still
+  reports resident is being served by something the gateway could not stop
+  (a non-managed application on the same host, most likely). The resident
+  short-circuit is a contamination **signal**, not a shortcut. It is only
+  available where the target's application carries a `loaded_models_path`;
+  where it does not, the run says so with `residency_unknown` rather than
+  reporting a negative it did not establish.
+- **`below_floor`** — no model costs ~0 MB, so a headline delta under the noise
+  floor can only mean the window missed the allocation or something else
+  absorbed it.
+- **`isolation_lost`** — a spec the run had drained held a live process again
+  by the end of the measurement, so the isolation did not cover the whole run.
+- **`isolation_unacknowledged`** — the agent declared that it reports which
+  runtime-config document it has applied and then never acknowledged one
+  carrying this run's overrides. The document never landed at all, so the place
+  to look is the **agent** (wedged, mid-restart, holding a document it cannot
+  apply), not the fleet — which is the whole diagnostic value of the
+  acknowledgement, and why it is not folded into `isolation_timeout`. See
+  [§7.2](#72-the-applied-document-acknowledgement) for the standard it belongs
+  to.
+- **`strategy_disagreement`** — the delta and the agent's own per-process
+  figure are further apart than the difference in the quantities can explain.
+- **`run_failed`** — the odd one out, and the only value whose next action is
+  not the reason itself: the run stopped on a hard error *after* it had already
+  written something, so `error` says what happened and the operator reads that.
+  It exists because such a report must still be reported **at all**. By then
+  the run had force-stopped part or all of the fleet, and `drained_spec_ids` /
+  `restore_failed` are the only place an operator ever learns which specs it
+  touched — while a report carrying an **empty** `inconclusive` with zero GPUs
+  is exactly what this contract reads as *a definitive result that measured
+  nothing*. A hard error **before** the first write keeps the nil-report
+  contract instead: nothing was touched, so there is nothing to report but
+  `error`. **A CANCELLED run is one of these too**, with the cancellation as
+  its `error`, and that is not a detail: every bounded wait in this run answers
+  `ctx.Done()` and its own timer *identically* — `vramStableWindow` returns the
+  same "no sample, not stable" for both, and its leading settle returns `false`
+  on cancellation so even *"samples arrived"* reads false — so a cancellation
+  used to surface as `no_samples`, i.e. **"GPU readings stopped arriving, check
+  the agent on this server"**, with an empty `error`. An operator who pressed
+  stop on their own run was sent to inspect a telemetry pipeline that was fine.
+  The context is the only thing that can tell the two apart, so the run asks
+  it before it attributes anything to a timer.
+
+`K`, the tolerance, the per-phase settles and the strategy-(a) wait are
+**reasoned, not measured**; they are package-level `var`s so tests shorten
+them, and they need validating on a real multi-GPU host before they are
+treated as settled. What a delta cannot see is also stated rather than implied:
+a client hitting the agent's own router port directly bypasses the benchmark
+reservation entirely (it excludes only *gateway* routing) and can at best trip
+the stability gate, and shared/host-spillover memory is out of scope — the
+Windows `Shared Usage` and `Non Local Usage` counters were measured reading
+*identically* on all three GPUs of a 3-GPU host, so they are not per-adapter
+figures and this feature claims nothing about spillover.
+
+**The card fingerprint degrades, and says how far.** A stored VRAM number
+attributed to index 1 after the cards were renumbered is worse than no number,
+so each per-GPU item carries what identified the card *and* which field did it:
+`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere,
+read from the **post-load window's own sample** rather than the trigger-time
+one, because that is the sample the numbers came from: recording the
+trigger-time identity beside a window-time figure pairs the OLD card's uuid
+with the NEW card's number if the cards were renumbered in between, which is
+the exact event a fingerprint exists to detect and is worse than recording no
+identity at all —
+which catches a swap between *unlike* cards only, since two identical cards
+trading indices are indistinguishable. `GPUSample.UUID` is populated only by
+the NVIDIA parse, so a UUID-only detector would silently verify nothing on
+exactly the host classes the delta strategy exists to serve. On Apple silicon
+the figures are unified **system** memory read from ioreg rather than dedicated
+VRAM, so the item carries `unified_memory` and must be labelled wherever it is
+shown.
+
+**And the fingerprint is COMPARED, not merely displayed** — the launch-spec
+form checks it against the live hardware report's card at that index before it
+offers the number, because an index is not an identity and the whole reason to
+record the field is that the numbering can change between the measurement and
+the moment an operator adopts it. Three outcomes, three different sentences:
+
+- **compared and equal** — the offer stands, labelled with *which* field
+  matched, since `name_total` cannot tell two identical cards apart and has to
+  say so;
+- **nothing to compare** — no fingerprint was recorded (a collector reporting
+  neither a UUID nor a name), the recorded kind is one this portal build does
+  not know, the live card cannot supply that field, or no hardware has been
+  reported for the index yet. The offer still stands — withholding it would
+  kill the feature on the AMD and Apple hosts the delta strategy exists for —
+  but it reads as **cannot verify**, never as verified: a check that could not
+  be made is not a check that passed;
+- **compared and different** — the number is real and belongs to other
+  hardware, so it is **named and withheld**: no apply affordance, no figure on
+  screen to be read as this card's cost, and both fingerprints shown so the
+  operator can see what changed.
+
+Fails toward *cannot verify* in every ambiguous direction, never toward
+verified — the same rule the per-GPU budget rows'
+`expected_uuid` drift detector ([§11.5](#115-what-each-remaining-tab-shows))
+applies, and for the same reason: an absent identifier on either side means no
+drift detection is available here, not that drift was detected.
+
+**Which cards are watched.** The spec's declared `RuntimeSpecGPUs` when it has
+any — that is the index set admission actually uses, so a number measured there
+has a row the operator can apply it to (`attributable: true`). A spec that
+declares none has no such row anywhere: the run watches every card and reports
+the indexes that contributed, marked **unattributable**.
+
+**A card the spec does NOT declare is still reported when it allocated.**
+`set_visible_devices` defaults to false, so the child process sees every card
+on the host whatever its spec declares, and a model that splits onto an
+undeclared card used to produce a per-card delta that was individually correct
+and, as the model's total cost, silently half the answer — with the agent's own
+measurement on that card, the one figure that proved it, filtered out of
+strategy (a) before anything could compare them. So the agent's per-card map is
+now kept whole, and any card outside the watched set that either moved by more
+than its own tolerance or carries a positive per-process figure is reported as
+an item of its own (unattributable — there is no row to apply it to yet),
+counts toward the headline, and raises `undeclared_gpu_allocation`.
+
+It **warns rather than refusing** because every per-card number on the report
+is still correct; what is wrong is the *spec*, and the operator's action is to
+add the missing GPU row — which refusing would withhold the very numbers for.
+The undeclared figures are deliberately not stability-gated: the two windows
+only ever held the *declared* cards still, and widening the gate to every card
+in the host would make the feature unusable on exactly the deployments that
+coexist with a non-managed neighbour, which
+[§13 blesses](#13-known-limitations-and-accepted-risks).
+
+**The floor gate is applied to the SUM, before anything is trimmed.** The
+per-card threshold for hiding a quiet unattributable card is that card's own
+tolerance rather than the headline floor — the headline floor is deliberately
+the *largest* tolerance among the watched cards, and reusing it per card
+discards a genuine allocation on a small card whenever a big one is watched
+beside it — and the trim runs *after* the headline gate, not before it.
+Filtering first is what made one identical measurement definitive with declared
+GPU rows and `below_floor` without them, contradicting the very rationale the
+headline exists for: a model split over two cards costs the sum of both deltas.
+The trim's own test is "contributed nothing", not "below this card's
+tolerance", because a card under its own tolerance can still be part of a
+headline that cleared the floor — two cards at 300 MB each on 48 GiB cards —
+and dropping it would leave a *definitive* report with zero GPU items, which
+the result contract reads as a measurement of nothing. What remains fail-closed
+and is not fixed here: a lone allocation on a small card, with a much larger
+card also watched, is still below the headline floor and still reports
+`below_floor`. That floor is one of the knobs the section below marks as
+reasoned rather than measured.
+
+**The result is REPORTED. The run writes neither VRAM field.** Not
+`vram_measured_mb`: it is agent-owned, it feeds admission arithmetic as the
+spec's own declared demand, and a breach by a *measured* value is terminal — so
+a gateway-computed delta that overshot (a neighbour allocating inside the
+window) would refuse every future start of a model that had been working, with
+no operator action having occurred. `vram_locked` exists precisely so the
+operator can opt out of being governed by *the agent's* measurement, and a
+second differently-sourced writer of the same field makes that lever mean
+something else; the write-back's unchanged-value suppression would also start
+lying, and the agent's next differing measurement would overwrite the
+benchmark's number anyway. Not `vram_estimate_mb` either: it is operator-owned,
+and putting a machine number in a field whose whole meaning is "what the
+operator declares" takes the decision away from them. Exactly like the context
+probe, the run status carries the result and the launch-spec form offers an
+**apply** affordance beside the editable estimate; the operator saves. A
+`kind = "vram"` history row records what was measured, when, and under what
+isolation — **evidence, not authority** (see
+[Routing & model selection §7](routing-and-model-selection.md#7-model-selection-metrics)
+for the row, and [the data model](../reference/data-model.md) for its
+`vram_json` column).
+
+**Where an operator meets it, and what the surface must not round off.** The
+run starts where every other run kind starts — the server's benchmark area
+(`BenchmarkSection`) — but it is **not** a fourth entry in that form's `?mode=`
+list: the type selector offers it **only while the scope is "model"**, and its
+hint is rendered unconditionally, in every scope, because that hint is the only
+place the scope restriction and the drain are stated. Leaving the model scope
+with it selected **drops back to `speed`** rather than leaving the form holding
+a run type the scope cannot start. While it runs, the live panel says in words
+that every agent-managed model on the server is `force_stopped` for the
+duration; an operator must not learn that from a routing failure.
+
+**The outcome stays on screen after the run, and that is the named risk's only
+mitigation in the UI.** The live panel disappears the moment `running` flips
+false, which is exactly when a VRAM run produces its single result (the runner
+publishes it in its terminal defer), so the finished result is rendered in the
+panel's place: the two numbers side by side, the isolation claim, and — always
+— the **drained set** plus any `restore_failed`. If the gateway dies between the
+drain and the restore, those spec ids are what an operator needs, and no other
+screen shows them.
+
+**A restore that did not happen has two meanings, and they are two fields.**
+`restore_failed` is a **write failure** — those specs really are still
+`force_stopped` and an operator has to clear them by hand, which is what the
+portal's message says. `restore_taken_over` is the disjoint other case: the
+restore re-reads each spec inside its compare-and-set, and when the
+`admin_state` it finds is no longer this run's `force_stopped` it writes
+**nothing** — an operator hit *Force start* (`force_running`) or *Clear
+override* (`""`) while the run held the field. Collapsing the second into the
+first rendered "these specs are still `force_stopped` and have to be cleared by
+hand" for a spec that is not force-stopped at all, and following that
+instruction **stops a model the operator had just deliberately started**. So
+they get separate fields, separate sentences and separate severities — the
+takeover is `info`: nothing needs undoing, only confirming.
+
+**"No result" is a first-class outcome with two distinct shapes.** An
+inconclusive report renders its **reason as the next action** (`info`, not an
+error) and renders **no per-GPU table at all**, so there is no cell that could
+read `0 MB` — `0` means unknown here as everywhere. An **absent** report is the
+other shape and reads differently: the run never reached the measurement phase,
+nothing was stopped and nothing measured, so the operator is sent to the
+trigger's refusal instead of to a neighbouring process. `BenchmarkResult.vram`
+being nullable is the whole of that distinction.
+
+**Every wire value the portal renders is declared once, and the mapping is
+pinned in both directions.** The inconclusive reasons, the confidence warnings,
+the fingerprint kinds and the isolation proofs are closed vocabularies that
+travel as free-form strings inside a persisted `vram_json`, so the portal has to
+hold a localized sentence for each and an honest fallback for a value it does not
+know. `isolation_proof` carries one extra rule, because an ABSENT value there is
+not an unknown one: a row written before the acknowledgement shipped recorded no
+proof at all, and naming either standard for it would invent behaviour that is
+not in the payload — so the lookup returns *null* and the line is simply not
+rendered, while a non-empty value this build does not know still gets the honest
+fallback. It
+declares each vocabulary **once**, in `components/shared/vram.ts`, and keys
+each label map by that declaration's own type — a declared value with no
+sentence and a mapped key for a value nobody declares are both compile errors.
+The tests then **derive** from the declaration instead of restating it:
+`vram.test.ts` requires every declared value to reach a distinct, non-fallback
+sentence in German *and* English, and `i18n.test.ts` requires every message key
+under those prefixes to be claimed by a declared value or named as structural
+(the panel heading, the unknown fallback), so a reason whose sentence lands in
+`i18n.ts` while the mapping is forgotten fails as an **orphan**. That
+discipline exists because the alternative failed inside one branch: two reasons
+(`isolation_lost`, `strategy_disagreement`) and two warnings
+(`undeclared_gpu_allocation`, `residency_unknown`) shipped while the tests
+still asserted "the seven reasons" against a hand-written list of seven, and a
+test that names a property it does not enforce is worse than no test.
+**Deriving from `vram.ts` was not enough, and the proof is that the same defect
+recurred immediately.** A derivation is only as good as what it derives *from*,
+and `vram.ts` is a mirror, not the source: the Go side then grew
+`isolation_unacknowledged`, the array kept nine values, the whole portal suite
+stayed green, and the panel rendered *"this build does not know the reason it
+reported"* for a reason the matching backend build reports. So `vram.test.ts`
+now reads the four Go constant blocks **off disk**
+(`internal/gateway/benchmark_vram.go`, `benchmark_vram_isolation.go`,
+`benchmark_vram_confidence.go`) and requires each array to be exactly the closed
+set declared there, in both directions — the same monorepo reach
+`AgentTokenSection.test.tsx` already uses for the shared agent-config golden,
+with a floor on the number of constants found so a renamed prefix or a moved
+file fails loudly instead of comparing two empty sets. Adding a value therefore
+still means editing four places (the Go constant, the `vram.ts` array, its label
+key, both locales' sentences), but **all four are now enforced**, and the Go
+side additionally pins its own literals in its guard tests. The runtime fallback
+stays load-bearing for the case it was always for: a persisted row written by a
+**newer** gateway than the portal reading it. The trigger's **refusal codes** are the same
+contract by a different route: they are keyed into `errorLabelByCode`, an
+unmapped one degrades to the backend's raw English in an otherwise localized
+portal, so `format.test.ts` pins those six wire strings as literals.
+
+**The history section decodes the payload for `kind == "vram"` only**, and the
+plain speed table **excludes** that kind explicitly — a VRAM row falling into it
+renders as four dashes and a green tick, which reads as a successful speed run
+that measured nothing. The rule is one list (`isNonSpeedKind`), so a fifth kind
+cannot be added without deciding where it belongs.
+
+**Where the apply affordance gets its number.** Not from the run status — the
+operator applies the number *later*, on another screen, and a launch spec is
+exactly what they open minutes or days after the measurement. The launch-spec
+form therefore reads the **mapping's own benchmark history** and takes the
+newest row that clears four gates, all of which fail CLOSED
+(`components/shared/vram.ts`): `kind == "vram"`, no `inconclusive` reason,
+`isolated` true, and at least one strictly positive per-GPU number. The
+isolation gate is the load-bearing one: a number measured while something the
+gateway could not stop may have been serving the model is not a number to offer
+for the operator's own field. A fifth gate is applied **per card** rather than
+per run — the fingerprint comparison above — because a run can be perfectly
+valid and still be describing hardware that has since moved.
+
+**The writer, and the principal it does not have.** A benchmark run holds no
+`auth.Token`: the trigger's principal is consumed by
+`AuthorizeBenchmarkScope` and dropped, and `benchmarkTarget`/`benchmarkRun`
+have no field for one. `admin_state` is row 4 of the runtime-config document
+([§11.1](#111-writes-are-full-document-replaces-gated-on-their-own-get)), so
+every write of it owes a `notifyRuntimeChanged` — the sole trigger for the
+agent push — and a write that skipped it would reach a WS-connected agent no
+sooner than its 60 s poll. The run therefore uses one **principal-free**
+`portal.API` method, `SetBenchmarkRuntimeSpecAdminState`, documented with who
+authorized it (its caller: the trigger request, gated before the run started).
+Capturing the trigger's token instead would compile, but every authorization
+there re-derives from store rows, so the **deferred restore** — minutes later,
+with the whole server force-stopped — could be refused because the user was
+removed from the server's owners or the mapping was deleted mid-run. A
+safety-critical restore must not have an authorization failure mode.
+Synthesizing a system principal was the other option and is worse: no
+production code in this tree fabricates one.
+
+**The restore, and the three traps it avoids.** It runs in a `defer` on a
+context **derived from but not cancelled with** the run's, because the run's
+context is cancelled exactly when the restore matters most. It **re-reads each
+spec immediately before writing it** and replaces one field of that fresh
+document — never a replay of a document captured before the run, which would
+revert every field an operator edited *during* it, and a launch spec is exactly
+what an operator opens while a model is stopped. And the write is
+**compare-and-set**: if the freshly-read `admin_state` is no longer this run's
+`force_stopped`, nothing is written and the spec is reported in
+`restore_failed`, because somebody else owns the field now. A spec **deleted**
+mid-run is not a restore failure — its override went with it. On an isolation
+**timeout** the run abandons the measurement, still attempts the restore, and
+reports both facts; that is a deliberate divergence from §11.2, which chose not
+to clear an override on timeout because the portal cannot tell a wedged child
+from a slow one — a benchmark can, because it created them.
+
+The remaining exposure is recorded as a risk rather than solved: **if the
+gateway process dies between the drain and the restore, every model on that
+server stays `force_stopped` until an operator clears it by hand**
+([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
+
 ## 12. The timeout budget
 
 Five bounds sit on one request to a cold managed model, and they are only
@@ -2991,8 +4133,11 @@ operator meets first:
 - **Three smaller accepted risks in the agent.** When a spec does not pin a
   listen port the agent binds `127.0.0.1:0`, reads the port back and closes the
   listener — an accepted TOCTOU window before the child's own bind. Measured VRAM
-  freshness is **admission-driven, not polled**, so a long-idle host reports
-  stale measurements. And work-directory containment is **lexical**: a symlink
+  is **beat-fresh, not continuously fresh**: it is dispatched from the 15 s
+  housekeeping beat, from a child's first health pass, and synchronously from
+  every admission snapshot (§5.3) — so a reported figure can be up to one beat
+  old, and a target the measurer says nothing about keeps its previous value
+  until the process exits. And work-directory containment is **lexical**: a symlink
   inside an allowed directory can point outside it — the binary allowlist, not
   the directory check, is the boundary.
 - **The feature ships no metrics** of its own beyond the telemetry sample and the

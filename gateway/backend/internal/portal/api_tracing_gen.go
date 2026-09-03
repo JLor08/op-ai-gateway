@@ -1768,6 +1768,18 @@ func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 au
 	return _d.API.ServiceAdminGroupCandidates(ctx, t1)
 }
 
+func (_d *APIWithTracing) SetBenchmarkRuntimeSpecAdminState(ctx context.Context, s1 string, s2 string, s3 string) (r1 RuntimeSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkRuntimeSpecAdminState")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetBenchmarkRuntimeSpecAdminState(ctx, s1, s2, s3)
+}
+
 func (_d *APIWithTracing) SetCaptureSecret(t1 auth.Token, s1 string, b1 bool) (err error) {
 	return _d.API.SetCaptureSecret(t1, s1, b1)
 }

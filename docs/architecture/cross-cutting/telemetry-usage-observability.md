@@ -206,6 +206,7 @@ sequenceDiagram
     GW->>Perf: publish(sample)
     Perf-->>GW: SSE to Server Detail live charts
     GW->>GW: LoadedModels.SetAgentReport / AgentCertReports.Report / AgentProxyStatus.Report
+    GW->>GW: AgentFeatures.Set → RuntimeStatus.SetAppliedConfigETag → RuntimeStatus.publish (in that order)
     GW->>Pres: ReportReactivated(serverID, window)
     Pres-->>GW: inactive→active edge? → maybeFireReactivation (out-of-band health probe)
 
@@ -228,8 +229,8 @@ negative values are rejected outright for required scalars, and silently coerced
 `CPUTempC`) — a single bad sensor reading degrades gracefully rather than
 poisoning the persisted series.
 
-The sample also carries two **additive** keys for the
-[agent-managed model runtime](agent-runtime-manager.md), both recorded only
+The sample also carries three **additive** keys for the
+[agent-managed model runtime](agent-runtime-manager.md), recorded only
 *after* every store write in the ingest has succeeded — a report is evidence, and
 evidence is not stamped on a failed write:
 
@@ -249,6 +250,41 @@ evidence is not stamped on a failed write:
   contain only specs in state `running` — `starting` deliberately does not count,
   because prefer-loaded routing must never send traffic to a model that cannot
   answer yet.
+- **`runtime_config_applied_etag`** — the ETag of the runtime-config document the agent
+  has **applied**: the acknowledgement that turns "the gateway pushed an
+  override" into "the override is in force". Top-level, beside `agent_version`,
+  because it is a property of the one document and not of any spec — and because
+  `runtimes` is omitted entirely for a document with no specs, which is a
+  legitimate desired state whose application a caller may well be waiting to
+  hear about. Omitted when there is nothing to acknowledge, and the absence is
+  the contract a consumer's fallback keys on: an older agent, a `file`-mode
+  agent (which discards the gateway's document, so it has none of the gateway's
+  to acknowledge), or one whose `runtime_manager` negotiation is not currently
+  active. Declared as the agent feature `runtime_config_ack`, because a caller
+  cannot otherwise tell "still working on it" from "will never answer".
+  What it means precisely, and the boundary that makes it safe to trust, is
+  [agent-runtime-manager §7.2](agent-runtime-manager.md#72-the-applied-document-acknowledgement).
+
+**Two ingest-side ordering rules on those registry updates are contracts, not
+tidiness.** All of them run **after every store write succeeded** — a report is
+evidence about what the agent is doing *right now*, and stamping it while the
+sample itself failed to persist would claim a freshness the gateway does not
+have. And within them, `runtime_config_applied_etag` is recorded **before** the
+runtime-status snapshot is published, because the two are read together by one
+consumer: the VRAM benchmark's isolation wait is *woken* by a published frame and
+then reads the acknowledgement registry
+([agent-runtime-manager §11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+Recording first is what makes "the acknowledgement I can read is at least as
+fresh as the frame that woke me" true; reversed, a frame reaches the subscriber
+which then reads the *previous* acknowledgement, discards the frame as
+inadmissible and waits for the next sample — a telemetry interval each time, and
+on a run whose only remaining frame was that one, the whole bound. Both
+statements are non-blocking and adjacent, so no deterministic runtime
+observation can separate the two orders; the rule is pinned by a source-order
+assertion instead (`TestIngestRecordsTheAcknowledgementBeforePublishingTheFrame`,
+the technique `cmd/gateway`'s wiring tests already use), with the observable
+half — that both facts reach the wait over the wire at all — driven end to end
+through this very core.
 
 Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
 
@@ -269,8 +305,44 @@ Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
 The gateway-side runtime status this feeds is held in a **volatile in-RAM
 registry and never persisted** (a stderr tail can carry prompt fragments, which
 the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
-on ingest, and the status DTO deliberately has no GPU field — measured VRAM
-reaches the UI through the spec's `vram_measured_mb` after the agent's write-back.
+on ingest.
+
+**`gpus[]` has two independent consumers, and they answer different
+questions.** The write-back below persists it onto the spec's GPU row — the
+durable value admission reads — while the status stream republishes it with
+`measured_at`, the **gateway's** arrival time for the frame that carried it
+(never the sample's own `reported_at`, which is a claim rather than an
+observation). Only the stream can answer "how old is this number?": the stored
+row carries no timestamp and the write-back skips an unchanged value, so a
+store poll reads an arbitrarily old measurement as a fresh one. A measured `0`
+reaches neither consumer — it means *unknown* — and a frame that measured
+nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
+published with nothing to be fresh about. See [Agent-Managed Model
+Runtime](agent-runtime-manager.md) §10.
+
+**The reader that needed the watermark, and the discipline it added.** The
+**VRAM benchmark**
+([agent-runtime-manager §11.6](agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+is the first consumer that must attribute an observation to something it just
+did, and it reads **both** live streams for it: the per-server per-GPU sample
+ring (`serverPerfRegistry`) for its before/after totals, and the runtime-status
+stream for the drain confirmation *and* the agent's own per-process
+measurement. Neither of the two facts it needs can be answered from the store —
+a `stopped` row has no timestamp and neither does a measured VRAM value — so
+the rule it follows is worth stating for any future reader of these streams:
+
+> **Subscribe first, then act, and count only what the channel delivers.**
+> `subscribe` registers its channel under the registry's own lock before it
+> returns, and `publish` collects its targets under that same lock, so a frame
+> delivered to a subscription was published *after* the registration completed.
+> A run that subscribes after its own write therefore knows every frame it
+> receives is newer than that write, with no comparison between the gateway's
+> clock and the agent's — and it **discards the subscription's snapshot**, which
+> is the one thing that may predate it.
+
+That is why the benchmark never polls either registry's stored snapshot for
+freshness, and why a pre-existing `stopped` state cannot be mistaken for the
+effect of a write the run just made.
 
 **The write-back skips an unchanged value, and the skip lives on the gateway,
 not on the agent.** Rule 2 above forbids the obvious agent-side saving — a spec

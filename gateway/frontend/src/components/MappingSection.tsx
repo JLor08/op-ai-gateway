@@ -56,6 +56,7 @@ export function MappingSection({
     | 'mappingBenchmarks'
     | 'mappings'
     | 'probeMappingContext'
+    | 'probeMappingVram'
     | 'subscribeBenchmark'
     | 'syncApplicationModels'
     | 'updateMapping'

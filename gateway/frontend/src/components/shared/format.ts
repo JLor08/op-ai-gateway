@@ -71,6 +71,17 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'benchmark.already_running': 'errorBenchmarkAlreadyRunning',
   'benchmark.server_in_use': 'errorBenchmarkServerInUse',
   'benchmark.no_models': 'errorBenchmarkNoModels',
+  // The VRAM benchmark's precondition refusals (409 at the trigger), read
+  // verbatim from the Go constants in gateway/benchmark_vram_isolation.go and
+  // gateway/benchmark_vram_confidence.go.
+  'benchmark.vram_not_agent_managed': 'errorBenchmarkVramNotAgentManaged',
+  'benchmark.vram_isolation_unavailable': 'errorBenchmarkVramIsolationUnavailable',
+  'benchmark.vram_no_gpu_samples': 'errorBenchmarkVramNoGpuSamples',
+  'benchmark.vram_isolation_blocked': 'errorBenchmarkVramIsolationBlocked',
+  'benchmark.vram_declared_gpu_missing': 'errorBenchmarkVramDeclaredGpuMissing',
+  // A launch-spec write refused because a benchmark run is holding that
+  // server: one override click mid-run is what contaminates its measurement.
+  'runtime_spec.server_benchmarking': 'errorRuntimeSpecServerBenchmarking',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',

@@ -186,11 +186,19 @@ func main() {
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
-	// nvidia-smi is a HARDWARE capability, not a negotiated feature (design
-	// spec §5): NewNvidiaComputeApps returns nil on hosts without it (AMD,
-	// Apple unified memory, no GPU at all), and SetMeasurer(nil) is exactly
-	// NewManager's own default -- operator VRAM estimates stand.
-	mgr.SetMeasurer(collector.NewNvidiaComputeApps())
+	// Per-process VRAM measurement is a HARDWARE capability, not a negotiated
+	// feature (design spec §5): NewVRAMMeasurer returns nil on hosts that
+	// cannot measure (AMD, Apple unified memory, no GPU at all, no nvidia-smi),
+	// and SetMeasurer(nil) is exactly NewManager's own default -- operator VRAM
+	// estimates stand.
+	//
+	// The measurer is chosen per PLATFORM, inside the collector package: every
+	// non-Windows host gets the nvidia-smi compute-apps measurer it always had,
+	// while Windows gets the PDH one or none, never compute-apps -- which under
+	// WDDM reports `[N/A]` per process, parses to 0, and would override every
+	// operator estimate with a measured zero. Do not call a specific measurer's
+	// constructor from here; that routes around the split.
+	mgr.SetMeasurer(collector.NewVRAMMeasurer())
 
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {

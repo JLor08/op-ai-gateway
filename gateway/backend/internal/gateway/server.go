@@ -219,6 +219,18 @@ type ServerDeps struct {
 	// correct default for any Server built without cmd/gateway (e.g. a bare
 	// test Server) -- there is nothing to wire in that case.
 	SetRuntimeConfigChangedHook func(func(serverID string))
+	// SetBenchmarkReservationHook is the same wiring conduit for the other
+	// direction of the same construction-order gap: it is
+	// portal.Service.SetBenchmarkReservationHook itself, called ONCE by
+	// cmd/gateway's buildGatewayServer with the just-built Server's
+	// Benchmarks.ServerBusy bound as the argument, so the portal's launch-spec
+	// write can refuse while a benchmark run holds that server (see that
+	// setter's doc, and portal.Service.serverIsBenchmarking for why). The
+	// BenchmarkRegistry belongs to the Server and does not exist until
+	// gateway.New returns, so the portal Service cannot take it at its own
+	// construction. Server never stores or reads this field. nil is correct
+	// for any Server built without cmd/gateway.
+	SetBenchmarkReservationHook func(func(serverID string) bool)
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.

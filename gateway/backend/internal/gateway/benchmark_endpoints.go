@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
@@ -152,6 +153,76 @@ func (s *Server) startLoadModel(w http.ResponseWriter, r *http.Request, token au
 		s.runLoadModel(ctx, run, server.ID, tgt)
 	}()
 	writeJSON(w, http.StatusAccepted, s.Benchmarks.Status(server.ID))
+}
+
+// startVRAMProbe loads a mapping's model ALONE on its server and measures
+// what it costs, so an operator can resolve an unknown VRAM demand
+// deliberately. It is its OWN endpoint rather than a fifth ?mode= value, and
+// deliberately not an extension of the load run:
+//
+//   - not a mode, because every mode is a PER-TARGET measurement inside a
+//     fan-out loop over an application's or a server's mappings, while this
+//     run drains the whole server ONCE and then loads exactly ONE model. As a
+//     mode it would either silently measure only the first target, or
+//     drain-and-reload the server N times inside one reservation -- and on the
+//     server scope a run an operator reads as "measure my models" would stop
+//     every model on the box;
+//   - not the load run, because the "Load" button would then stop every other
+//     model on the server with no affordance warning about it.
+//
+// THE PRECONDITIONS RUN BEFORE THE RESERVATION, not after. All four are
+// read-only, so a refused run never reserves the server, never excludes it
+// from routing, and -- the assertion that matters -- never writes a single
+// spec. AuthorizeBenchmarkScope is the authorization for everything the run
+// later does without a principal of its own, so it stays first.
+func (s *Server) startVRAMProbe(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
+	server, views, err := s.Portal.AuthorizeBenchmarkScope(r.Context(), token, "mapping", mappingID)
+	if err != nil {
+		writeBenchmarkError(w, err)
+		return
+	}
+	v := views[0] // mapping scope → exactly one view
+	tgt := benchmarkTarget{server: v.Server, app: v.App, mapping: v.Mapping}
+	plan, err := s.vramRunPlan(r.Context(), tgt)
+	if err != nil {
+		writeVRAMProbeError(w, err)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run, ok := s.Benchmarks.TryStart(server.ID, "vram-probe", "vram", 1, time.Now().UTC(), cancel)
+	if !ok {
+		cancel()
+		writeJSON(w, http.StatusConflict, apierror.Response(codeBenchmarkAlreadyRunning, msgBenchmarkAlreadyRunning, ""))
+		return
+	}
+	if s.Active != nil && s.Active.CountByServerName(server.Name) > 0 {
+		s.Benchmarks.Release(server.ID)
+		cancel()
+		writeJSON(w, http.StatusConflict, apierror.Response(codeBenchmarkServerInUse, msgBenchmarkServerInUse, ""))
+		return
+	}
+	go func() {
+		defer cancel()
+		s.runVRAMProbe(ctx, run, server.ID, tgt, plan)
+	}()
+	writeJSON(w, http.StatusAccepted, s.Benchmarks.Status(server.ID))
+}
+
+// writeVRAMProbeError answers a VRAM-probe precondition refusal as 409 with
+// its own stable code and a message that names the blocking condition or
+// spec; anything else falls through to the shared benchmark mapper.
+//
+// 409 rather than 400 for all four: none of them is a malformed request. Each
+// is a conflict with the server's current state -- its agent's configuration
+// source, its declared capabilities, its hardware, or an override an operator
+// already set.
+func writeVRAMProbeError(w http.ResponseWriter, err error) {
+	var refusal *vramRefusal
+	if errors.As(err, &refusal) {
+		writeJSON(w, http.StatusConflict, apierror.Response(refusal.code, refusal.msg, ""))
+		return
+	}
+	writeBenchmarkError(w, err)
 }
 
 // parseBenchmarkMode reads + validates the optional ?mode query param for a

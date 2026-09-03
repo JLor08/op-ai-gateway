@@ -3,6 +3,18 @@
 
 import { describe, expect, it } from 'vitest';
 import { messages } from './i18n';
+import {
+  vramCardCheckLabelKey,
+  vramFingerprintKinds,
+  vramFingerprintLabelKey,
+  vramInconclusiveLabelKey,
+  vramInconclusiveReasons,
+  vramIsolationProofLabelKey,
+  vramIsolationProofs,
+  vramWarningLabelKey,
+  vramWarnings,
+} from './components/shared/vram';
+import type { MessageKey } from './components/shared/types';
 
 describe('activityNewRequests interpolation', () => {
   it('uses singular for one and plural otherwise (de)', () => {
@@ -2353,5 +2365,191 @@ describe('per-application TLS-proxy opt-out i18n keys', () => {
       expect(text.length).toBeGreaterThan(20);
       expect(text).not.toMatch(/:\s*(0|-|—)\s*$/);
     }
+  });
+});
+
+// The VRAM feature's message keys are DERIVED from the catalogue here, and its
+// closed vocabularies from `shared/vram.ts`, because the hand-written lists
+// this block used to carry were wrong within one branch: `stringKeys` never
+// gained the two reasons added last (`isolation_lost`,
+// `strategy_disagreement`) or the two warnings (`undeclared_gpu_allocation`,
+// `residency_unknown`), a `Set` of seven was asserted `toBe(7)` under a title
+// that claimed to cover every reason, and the length check that filtered
+// `stringKeys` silently skipped the missing four as well. Nothing below
+// restates a value or a count: adding a vocabulary value in `vram.ts` puts it
+// under test, and adding a sentence in `i18n.ts` that no value maps to fails
+// as an orphan.
+describe('VRAM-benchmark portal i18n keys', () => {
+  // Every VRAM key the portal ships. `benchmarkTypeVram*` is the run-type
+  // selector, `runtimeSpecVram*` the launch-spec form's own; the rest of the
+  // feature is under `benchmarkVram*`.
+  const vramKeys = (Object.keys(messages.en) as MessageKey[]).filter((k) =>
+    /^(benchmarkVram|benchmarkTypeVram|runtimeSpecVram)/.test(k),
+  );
+
+  it('defines every VRAM key in de and en', () => {
+    // A floor on the count, so a renamed prefix fails here instead of making
+    // every test in this block pass vacuously over an empty list.
+    expect(vramKeys.length).toBeGreaterThan(40);
+    for (const k of vramKeys) {
+      expect(typeof messages.de[k], k).toBe('string');
+      expect(typeof messages.en[k], k).toBe('string');
+      expect(messages.de[k].length, `${k} (de) is empty`).toBeGreaterThan(0);
+      expect(messages.en[k].length, `${k} (en) is empty`).toBeGreaterThan(0);
+    }
+  });
+
+  /**
+   * The closed vocabularies decoded from a persisted `vram_json` payload, each
+   * with the key prefix its sentences live under and the keys under that
+   * prefix that NO value maps to.
+   *
+   * Those `unclaimed` lists are what makes the pin below run in BOTH
+   * directions. Forwards: every declared value reaches a distinct sentence.
+   * Backwards: every sentence under the prefix is claimed by a declared value
+   * or named here as structural — so a tenth reason whose key lands in
+   * `i18n.ts` while the mapping is forgotten fails, and so does a key left
+   * behind by a value the backend dropped.
+   */
+  const vocabularies: {
+    what: string;
+    values: readonly string[];
+    labelKey: (value: string) => MessageKey;
+    prefix: string;
+    unclaimed: readonly MessageKey[];
+  }[] = [
+    {
+      what: 'inconclusive reason',
+      values: vramInconclusiveReasons,
+      labelKey: vramInconclusiveLabelKey,
+      prefix: 'benchmarkVramInconclusive',
+      // The panel heading, and the fallback for a reason a newer gateway
+      // reported to an older portal. Neither is a reason.
+      unclaimed: ['benchmarkVramInconclusiveTitle', 'benchmarkVramInconclusiveUnknown'],
+    },
+    {
+      what: 'confidence warning',
+      values: vramWarnings,
+      labelKey: vramWarningLabelKey,
+      prefix: 'benchmarkVramWarning',
+      // `benchmarkVramWarnings` is the plural section heading and shares the
+      // prefix by accident only; `...Unknown` is the fallback.
+      unclaimed: ['benchmarkVramWarnings', 'benchmarkVramWarningUnknown'],
+    },
+    {
+      what: 'fingerprint kind',
+      values: vramFingerprintKinds,
+      labelKey: vramFingerprintLabelKey,
+      prefix: 'benchmarkVramFingerprint',
+      // "no identifying field available": the ABSENCE of a kind, which is not
+      // itself a kind.
+      unclaimed: ['benchmarkVramFingerprintNone'],
+    },
+    {
+      what: 'isolation proof',
+      values: vramIsolationProofs,
+      // The label lookup returns null for an ABSENT proof (a report from a
+      // gateway that predates the acknowledgement), which is not a value of the
+      // vocabulary -- so the declared values are asserted through the same
+      // lookup and the null branch is covered in `vram.test.ts` instead.
+      labelKey: (value) => vramIsolationProofLabelKey(value) as MessageKey,
+      prefix: 'benchmarkVramIsolationProof',
+      // The fallback for a standard a newer gateway reported to an older
+      // portal. Not itself a standard.
+      unclaimed: ['benchmarkVramIsolationProofUnknown'],
+    },
+    {
+      what: 'card-check outcome',
+      // Not a wire vocabulary but a closed union computed here (`vramCardCheck`
+      // compares the recorded fingerprint against the live card), so the values
+      // are its states and the mapping's totality is a compile error rather
+      // than a test. The orphan direction still needs pinning.
+      values: ['verified:uuid', 'verified:name_total', 'unverifiable', 'drifted'],
+      labelKey: (state) =>
+        vramCardCheckLabelKey(
+          state === 'verified:uuid'
+            ? { state: 'verified', kind: 'uuid' }
+            : state === 'verified:name_total'
+              ? { state: 'verified', kind: 'name_total' }
+              : state === 'drifted'
+                ? { state: 'drifted', recorded: 'a', live: 'b' }
+                : { state: 'unverifiable' },
+        ),
+      prefix: 'runtimeSpecVramCard',
+      unclaimed: [],
+    },
+  ];
+
+  it.each(vocabularies)(
+    'gives every declared $what its own sentence in de and en, with no orphan key under $prefix',
+    ({ values, labelKey, prefix, unclaimed }) => {
+      const claimed = values.map((value) => labelKey(value));
+      // Forwards: one distinct key per declared value. A value that is
+      // declared but not mapped lands on the fallback, which is listed as
+      // unclaimed, so it collides here and in the comparison below.
+      expect(new Set(claimed).size, `${values.join(', ')} do not have distinct label keys`).toBe(
+        values.length,
+      );
+      // Backwards: the sentences under this prefix are EXACTLY the claimed
+      // ones plus the structural keys.
+      expect(
+        vramKeys.filter((k) => k.startsWith(prefix)).sort(),
+        `an unclaimed ${prefix}* key: either map it from a declared value or list it as structural`,
+      ).toEqual([...claimed, ...unclaimed].sort());
+      // And distinct TEXTS, not just distinct keys: the value is the
+      // operator's next action, so two of them rendering one sentence sends
+      // them to the wrong place — which a key-only check reports as green.
+      for (const locale of ['de', 'en'] as const) {
+        const texts = claimed.map((k) => messages[locale][k]);
+        expect(new Set(texts).size, `two of these render the same ${locale} sentence`).toBe(
+          values.length,
+        );
+      }
+    },
+  );
+
+  it('never renders "no result" as a zero, and never as a bare label', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].benchmarkVramInconclusiveTitle).not.toMatch(/0/);
+      for (const k of vramKeys.filter((key) => key.startsWith('benchmarkVramInconclusive'))) {
+        if (k === 'benchmarkVramInconclusiveTitle') continue;
+        // Every reason — the unknown fallback included — is a sentence naming
+        // an action, not a two-word tag.
+        expect(messages[locale][k].length, `${k} (${locale})`).toBeGreaterThan(30);
+      }
+    }
+  });
+
+  it('never lets "cannot verify" read as "verified", in both locales', () => {
+    // The recorded fingerprint is compared against the live card before the
+    // number is offered, and the three outcomes are three different facts. An
+    // empty fingerprint (GPUSample.UUID is NVIDIA-only) means the check could
+    // not be MADE -- claiming it passed would be the drift bug with a
+    // reassuring label on it.
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      // Each is a sentence naming what was (or was not) established, never a
+      // bare "verified" tag.
+      for (const text of [
+        m.runtimeSpecVramCardVerifiedNameTotal,
+        m.runtimeSpecVramCardUnverifiable,
+        m.runtimeSpecVramCardDrift,
+      ]) {
+        expect(text.length).toBeGreaterThan(30);
+      }
+    }
+  });
+
+  it('says the apply affordance FILLS the field rather than saving it, in both locales', () => {
+    // The whole ownership rule the affordance rests on: the run reports, the
+    // operator applies and saves. A hint that read "applies the measurement"
+    // would describe a writer.
+    expect(messages.de.runtimeSpecVramApplyHint).toMatch(/Speichern/);
+    expect(messages.en.runtimeSpecVramApplyHint).toMatch(/Save/);
+  });
+
+  it('labels the unified-memory figure as system RAM in both locales', () => {
+    expect(messages.de.benchmarkVramUnifiedMemory).toMatch(/System-RAM/);
+    expect(messages.en.benchmarkVramUnifiedMemory).toMatch(/system RAM/);
   });
 });

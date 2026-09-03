@@ -464,3 +464,30 @@ func TestHostCPUTempFieldPresentWhenSet(t *testing.T) {
 		t.Fatalf("cpu_temp_c not serialized; got %s", raw)
 	}
 }
+
+// TestSampleRuntimeConfigAppliedETagIsOmittedWhenEmpty pins the wire tag and the
+// omitempty on the acknowledgement field. Absent-not-empty is the contract
+// the gateway's fallback keys on: an agent that acknowledges nothing --
+// because it is older, because it is in file mode, or because it has
+// applied no gateway document yet -- must produce the pre-feature sample
+// shape, byte for byte.
+func TestSampleRuntimeConfigAppliedETagIsOmittedWhenEmpty(t *testing.T) {
+	s := Sample{ReportedAt: time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)}
+	s.Normalize()
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(raw, []byte("runtime_config_applied_etag")) {
+		t.Fatalf("raw JSON carries runtime_config_applied_etag with nothing to acknowledge: %s", raw)
+	}
+
+	s.RuntimeConfigAppliedETag = "e1"
+	raw, err = json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"runtime_config_applied_etag":"e1"`)) {
+		t.Fatalf("raw JSON missing runtime_config_applied_etag:\"e1\": %s", raw)
+	}
+}

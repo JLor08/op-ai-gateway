@@ -74,10 +74,11 @@ func newToggleableFeaturesServer(t *testing.T, activeStart bool) (client *Featur
 // can exercise Sync's control flow without a real process-supervision
 // stack.
 type fakeManager struct {
-	mu       sync.Mutex
-	applied  []Config
-	statuses []Status
-	trans    chan struct{}
+	mu         sync.Mutex
+	applied    []Config
+	statuses   []Status
+	trans      chan struct{}
+	forcedETag *string
 }
 
 func (f *fakeManager) Apply(cfg Config) {
@@ -99,6 +100,28 @@ func (f *fakeManager) EnsureRunning(context.Context, string) (string, func(), er
 }
 
 func (f *fakeManager) LoadedModels() []string { return nil }
+
+// AppliedETag mirrors the real Manager's contract: the ETag of the LAST
+// document actually applied. forceAppliedETag overrides it so a test can
+// pin *Driver.AppliedConfigETag's own gates (file mode, feature-inactive)
+// without depending on what the drain path incidentally left behind.
+func (f *fakeManager) AppliedETag() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.forcedETag != nil {
+		return *f.forcedETag
+	}
+	if len(f.applied) == 0 {
+		return ""
+	}
+	return f.applied[len(f.applied)-1].ETag
+}
+
+func (f *fakeManager) forceAppliedETag(etag string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forcedETag = &etag
+}
 
 func (f *fakeManager) applyCount() int {
 	f.mu.Lock()

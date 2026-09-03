@@ -338,6 +338,19 @@ type BenchmarkRun struct {
 	// a row with VisionCapable=false and Error set — the caller distinguishes the two
 	// via Error, mirroring how a failed speed row's metric fields are zero/unknown.
 	VisionCapable bool
+	// VRAMJSON is the raw JSON of a VRAM benchmark's per-GPU result for a
+	// kind=="vram" row (empty for every other kind, and empty for a VRAM run
+	// that reached no result at all — Error then says why). Its own column
+	// (`vram_json`), NOT a second tenant of CapacityCurve: the store treats it
+	// as an opaque string, the gateway marshals it and the portal decodes it,
+	// exactly like CapacityCurve above.
+	//
+	// The row is EVIDENCE, never authority. Nothing in admission, scoring or
+	// the launch spec reads it: `vram_measured_mb` stays agent-owned and
+	// `vram_estimate_mb` operator-owned, and the operator applies a measured
+	// number to their own field themselves (see the agent-runtime-manager
+	// cross-cutting doc's ownership split).
+	VRAMJSON string
 }
 
 // CapacityLevel is one concurrency level measured during a capacity ramp. Every

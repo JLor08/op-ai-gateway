@@ -385,6 +385,11 @@ export type BenchmarkResult = {
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
   vision_capable?: boolean;
+  // The VRAM benchmark's result. ABSENT = the run never reached the measurement
+  // phase (see `error`); PRESENT with `inconclusive` set = it ran and reached no
+  // number, and that value is what tells the operator what to do next. The two
+  // are deliberately distinguishable, unlike `vision_capable` above.
+  vram?: VRAMReportDTO;
   error?: string;
 };
 
@@ -429,6 +434,72 @@ export type CapacityReportDTO = {
   levels?: CapacityLevelDTO[];
 };
 
+// One watched GPU's VRAM result (mirrors the Go VRAMGPUItemDTO). `delta_mb` and
+// `measured_mb` are NOT the same quantity and must never be averaged: the delta
+// is the model's marginal cost on that card (a constant neighbour, driver
+// reserve or ECC overhead cancels out of it), while the measured value is that
+// process's attributed usage from the agent's own per-process measurer, which
+// only NVIDIA hosts have. 0 means unknown for both, as everywhere else.
+// `unified_memory` marks a figure read from unified SYSTEM memory (Apple
+// silicon) rather than dedicated VRAM — label it as such wherever it is shown.
+// `fingerprint_kind` says what was actually compared: "uuid" catches any
+// renumbering, "name_total" catches a swap between UNLIKE cards only (two
+// identical cards trading indices are indistinguishable, so never render a bare
+// "verified"), and "" means no identifying field was available at all.
+export type VRAMGPUItemDTO = {
+  index: number;
+  fingerprint?: string;
+  fingerprint_kind?: string;
+  unified_memory?: boolean;
+  baseline_used_mb: number;
+  delta_mb?: number;
+  measured_mb?: number;
+  // False = no launch-spec GPU row exists for this index, so there is nothing to
+  // apply the number to.
+  attributable: boolean;
+};
+
+// A decoded VRAM report, attached to a kind:"vram" benchmark run and to a live
+// BenchmarkResult (mirrors the Go VRAMReportDTO / VRAMReport — one shape, two
+// producers). `isolated` is the run's own evidence-backed claim: audit it
+// through `isolation_evidence` (spec id -> why this run believes that spec was
+// not running), where a missing entry means NOT confirmed, and weigh it with
+// `isolation_proof` (what established that the run's overrides had landed at
+// all). `drained_spec_ids` is what the run force-stopped. `inconclusive` empty = a definitive result; any
+// value means there is NO number to apply.
+export type VRAMReportDTO = {
+  isolated: boolean;
+  isolation_evidence?: Record<string, string>;
+  // WHICH standard of proof the isolation wait applied — "config_acknowledged"
+  // (the agent reported having applied a runtime-config document the run had
+  // verified force-stops the whole fleet) or "bind_delay" (an agent that never
+  // acknowledges, so the run waited out its guaranteed poll interval and then
+  // observed no process). Different STRENGTHS of evidence, so it is rendered
+  // beside `isolated` rather than folded into it, and it is present even when
+  // the isolation was NOT confirmed — a timeout then says which standard
+  // failed. Absent on a report written before the acknowledgement existed.
+  isolation_proof?: string;
+  drained_spec_ids?: string[];
+  // The two disjoint ways a restore can not have happened, and they are two
+  // different instructions. `restore_failed`: the write itself failed, so
+  // these specs ARE still force_stopped and an operator has to clear them by
+  // hand. `restore_taken_over`: the spec's override was no longer the run's
+  // when the restore re-read it — an operator force-started the model or
+  // cleared the override mid-run — so the run wrote nothing and there is
+  // nothing to clear. Rendering the second with the first's message tells an
+  // operator to stop a model they just deliberately started.
+  restore_failed?: string[];
+  restore_taken_over?: string[];
+  inconclusive?: string;
+  // Conditions that degraded the run's confidence without invalidating its
+  // number: "non_managed_applications" (the server also hosts active
+  // applications the agent cannot drain) and "post_transport_agent" (no open
+  // agent WebSocket, so every override bound only on the agent's next poll).
+  // The run warns rather than refusing on both.
+  warnings?: string[];
+  gpus: VRAMGPUItemDTO[];
+};
+
 // One persisted benchmark run for a mapping (mirrors the Go BenchmarkRunDTO).
 // Returned newest-first from GET /api/portal/mappings/{id}/benchmarks.
 export type BenchmarkRunDTO = {
@@ -447,6 +518,11 @@ export type BenchmarkRunDTO = {
   // both a definitive "not capable" AND an inconclusive probe — check `error`,
   // non-empty only when inconclusive, to tell the two apart).
   vision_capable?: boolean;
+  // Present only for a kind==="vram" row whose payload parsed. The row is
+  // EVIDENCE an operator reads (this spec measured 22 GB three times), never
+  // authority: nothing applies it to a launch spec's vram_estimate_mb (operator-
+  // owned) or vram_measured_mb (agent-owned).
+  vram?: VRAMReportDTO;
 };
 
 // The optional `?mode=...` query suffix shared by the three benchmark-start
@@ -650,6 +726,27 @@ export function serversApi(fetcher: Fetcher) {
       request<BenchmarkStatus>(
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(id)}/probe-context`,
+        { method: 'POST' },
+      ),
+    // The VRAM measurement: loads this mapping's model ALONE on its server
+    // (force-stopping every agent-managed spec on the box, the target
+    // included) and measures what it costs. 202 + initial BenchmarkStatus
+    // (running=true, mode "vram"); poll benchmarkStatus(serverId) to
+    // completion, then read results[0].vram. Its own endpoint rather than a
+    // fifth ?mode= value, because every mode is a per-target measurement
+    // inside a fan-out over a scope while this run drains the whole server
+    // once and loads exactly one model.
+    //
+    // Does NOT persist either VRAM field: the run REPORTS a number (and a
+    // kind:"vram" history row as evidence), and the operator applies it to
+    // their own vram_estimate_mb in the launch-spec form. A 409 with one of
+    // benchmark.vram_{not_agent_managed,isolation_unavailable,no_gpu_samples,
+    // isolation_blocked} is a precondition refusal: nothing was reserved and
+    // no spec was written.
+    probeMappingVram: (id: string) =>
+      request<BenchmarkStatus>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(id)}/probe-vram`,
         { method: 'POST' },
       ),
     // GET the per-mapping benchmark run history (newest-first).

@@ -49,6 +49,39 @@ type Sample struct {
 	// every off/files agent (no proxy Manager at all), so this field is a pure
 	// addition -- byte-neutral for every pre-existing agent's telemetry shape.
 	ProxyRoutes []ProxyRouteSample `json:"proxy_routes,omitempty"`
+	// RuntimeConfigAppliedETag is the ETag of the gateway runtime-config
+	// document this agent has APPLIED -- the acknowledgement that turns "I
+	// pushed an override" into "the override is in force". Empty (and
+	// omitted) means
+	// there is nothing to acknowledge: an agent that has applied no gateway
+	// document yet, one whose runtime_manager negotiation is currently
+	// inactive, or a FILE-mode agent, which discards the gateway's document
+	// outright and therefore has none of the gateway's to acknowledge.
+	//
+	// A TOP-LEVEL field, beside AgentVersion, not a member of the Runtimes
+	// entries below, for two reasons. It is a property of the DOCUMENT, of
+	// which there is exactly one, not of any single spec. And Runtimes is
+	// omitted entirely when the applied document carries no specs -- which
+	// is a perfectly legitimate desired state whose application a gateway
+	// may well be waiting to hear about, so a nested field would vanish in
+	// one of the cases it exists for.
+	//
+	// Declared as the agent.Features entry "runtime_config_ack" so a
+	// gateway knows whether an acknowledgement will ever arrive: an older
+	// agent simply never sends this field, and a consumer must fall back
+	// rather than wait forever.
+	//
+	// WHAT IT DOES NOT SAY, because the difference is load-bearing: it
+	// means "this document is my desired state and every reconciliation
+	// decision it implies is committed", NOT "every process it stops has
+	// exited". A drain's SIGTERM/grace/kill sequence is asynchronous; the
+	// per-spec Runtimes[].State below is what reports how far it got. What
+	// the acknowledgement does add is that no force_stopped spec can be
+	// (re)started afterwards -- the agent's admission refuses one outright
+	// -- so an absent process observed AFTER this ETag names the document
+	// means isolation, whereas the same observation before it means
+	// nothing.
+	RuntimeConfigAppliedETag string `json:"runtime_config_applied_etag,omitempty"`
 	// Runtimes reports the live state of every agent-managed model process
 	// (agent-runtime-manager design spec §7/§9), populated by collectOnce
 	// only when internal/agent's runtime driver is non-nil -- i.e. only when

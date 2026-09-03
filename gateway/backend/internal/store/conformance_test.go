@@ -2867,6 +2867,98 @@ func TestConformanceBenchmarkRunsVisionCapable(t *testing.T) {
 	})
 }
 
+// TestConformanceBenchmarkRunsVRAMJSON verifies the migration-v71 vram_json
+// column on model_mapping_benchmarks: a kind=="vram" history row round-trips
+// its opaque per-GPU payload byte-for-byte on both dialects, the payload rides
+// in its OWN column (capacity_curve stays empty next to it), and every OTHER
+// run kind reads back with vram_json empty -- a speed/capacity/vision run must
+// write no VRAM payload at all.
+func TestConformanceBenchmarkRunsVRAMJSON(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+
+		srv := routing.AIServer{
+			ID: "srv1", Name: "Server 1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateAIServer(ctx, srv); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		app := routing.Application{
+			ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		mapping := routing.ModelMapping{
+			ID: "map1", ApplicationID: "app1", GatewayModelName: "gw", AppModelName: "up",
+			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateMapping(ctx, mapping); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		// A VRAM row: the payload is opaque to the store, so it must come back
+		// exactly as written (nested objects, arrays and a map included).
+		const payload = `{"isolated":true,"isolation_evidence":{"spec1":"stopped_after_write"},` +
+			`"drained_spec_ids":["spec1"],"gpus":[{"index":0,"fingerprint":"GPU-abc",` +
+			`"fingerprint_kind":"uuid","baseline_used_mb":700,"delta_mb":22000,` +
+			`"measured_mb":21900,"attributable":true}]}`
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map1", ServerID: "srv1", CreatedAt: now.Add(3 * time.Minute),
+			Kind: "vram", VRAMJSON: payload,
+		}); err != nil {
+			t.Fatalf("insert vram run: %v", err)
+		}
+		// Every other kind, side by side, to prove none of them carries a payload.
+		others := []routing.BenchmarkRun{
+			{MappingID: "map1", ServerID: "srv1", CreatedAt: now.Add(2 * time.Minute), GenTokensPerSecond: 12},
+			{MappingID: "map1", ServerID: "srv1", CreatedAt: now.Add(time.Minute), Kind: "capacity", CapacityCurve: `{"max_concurrency":4}`},
+			{MappingID: "map1", ServerID: "srv1", CreatedAt: now, Kind: "vision", VisionCapable: true},
+		}
+		for i, run := range others {
+			if err := s.InsertBenchmarkRun(ctx, run); err != nil {
+				t.Fatalf("insert non-vram run %d: %v", i, err)
+			}
+		}
+
+		runs, err := s.BenchmarkRunsByMapping(ctx, "map1", 50)
+		if err != nil {
+			t.Fatalf("runs by mapping: %v", err)
+		}
+		if len(runs) != 4 {
+			t.Fatalf("expected 4 runs, got %d", len(runs))
+		}
+		byKind := make(map[string]routing.BenchmarkRun, len(runs))
+		for _, run := range runs {
+			byKind[run.Kind] = run
+		}
+		vram, ok := byKind["vram"]
+		if !ok {
+			t.Fatalf("no kind=vram row in %+v", runs)
+		}
+		if vram.VRAMJSON != payload {
+			t.Errorf("vram_json round-trip mismatch:\n got %q\nwant %q", vram.VRAMJSON, payload)
+		}
+		if vram.CapacityCurve != "" {
+			t.Errorf("kind=vram row capacity_curve = %q, want empty (its own column, not the capacity one)", vram.CapacityCurve)
+		}
+		for _, kind := range []string{"speed", "capacity", "vision"} {
+			run, ok := byKind[kind]
+			if !ok {
+				t.Fatalf("no kind=%s row in %+v", kind, runs)
+			}
+			if run.VRAMJSON != "" {
+				t.Errorf("kind=%s row vram_json = %q, want empty", kind, run.VRAMJSON)
+			}
+		}
+	})
+}
+
 // --- 6. Usage: Record + Query + Stats ---------------------------------------
 
 func TestConformanceUsageRecordQueryStats(t *testing.T) {

@@ -59,6 +59,34 @@ var Features = []Feature{
 	// feature branch's bump and has not shipped, so the binary that first
 	// carries this name is the same 0.2.0 that first carries runtime_manager.
 	{Name: "runtime_logs", Since: "0.2.0"},
+	// runtime_config_ack: this agent reports the ETag of the gateway
+	// runtime-config document it has APPLIED, as the telemetry sample's
+	// top-level runtime_config_applied_etag
+	// (sample.Sample.RuntimeConfigAppliedETag).
+	//
+	// Like runtime_logs, it is declared for the GATEWAY's benefit rather
+	// than the agent's -- the agent gates nothing on it and sends the field
+	// unconditionally -- but the failure it prevents is worse than a blank
+	// window, which is why it is a flag at all rather than "just a new
+	// field an older agent omits". The gateway's VRAM benchmark writes
+	// admin_state: force_stopped to every spec and must not trust its
+	// measurement until the agent has applied that document. With this
+	// name declared it can WAIT for the matching ETag, which is a fact. An
+	// agent that never declares it also never sends the field, so waiting
+	// for the ETag would hang forever -- there is no timeout that
+	// distinguishes "still draining" from "will never answer". The name is
+	// what lets the gateway choose between waiting for the acknowledgement
+	// and falling back to its fixed, unconditional delay. Absent the flag,
+	// the two are indistinguishable and the gateway must either hang or
+	// abandon the acknowledgement for everyone.
+	//
+	// Since is 0.3.0, this branch's SINGLE bump (see the Version constant's
+	// own comment block), not a further one: this repository's rule is one
+	// bump per SHIPPED CHANGE, never per commit, and 0.3.0 has not shipped
+	// -- the binary that first carries this name is the same 0.3.0 that
+	// first carries the Windows VRAM measurement and ADR-032's admission
+	// precedence.
+	{Name: "runtime_config_ack", Since: "0.3.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

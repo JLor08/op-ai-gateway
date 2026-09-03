@@ -127,6 +127,59 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     }
   });
 
+  /**
+   * The VRAM benchmark's own wire codes, pinned as LITERALS on purpose.
+   *
+   * The whole-map invariants above cover entries that do not exist yet, but
+   * none of them can catch the failure that matters for these six: the code
+   * STRING drifting apart from the backend's. A code the map does not carry is
+   * not an error the portal reports badly -- `formatPortalError` falls back to
+   * the raw English the server sent, so a 409 an operator is meant to act on
+   * ("this server is in file mode", "the spec declares GPU 3 and the host has
+   * two") arrives untranslated and unexplained, in a portal that is otherwise
+   * fully localized. Nothing else in this package names these strings.
+   *
+   * They are declared in Go as `codeBenchmarkVRAM*`
+   * (`internal/gateway/benchmark_vram_isolation.go`,
+   * `benchmark_vram_confidence.go`) and as the `ErrRuntimeSpecServerBenchmarking`
+   * sentinel's own message, wired to a 409 in the `errRow` table in
+   * `portal_runtime_endpoints.go`. Renaming one there means editing this list
+   * and the map together; the Go side pins its own literals for the four
+   * isolation refusals and the declared-GPU one, so only
+   * `runtime_spec.server_benchmarking` has no guard on its half.
+   */
+  const vramWireCodes = [
+    'benchmark.vram_not_agent_managed',
+    'benchmark.vram_isolation_unavailable',
+    'benchmark.vram_no_gpu_samples',
+    'benchmark.vram_isolation_blocked',
+    'benchmark.vram_declared_gpu_missing',
+    'runtime_spec.server_benchmarking',
+  ] as const;
+
+  it('carries every VRAM-benchmark refusal code, by its exact wire string', () => {
+    for (const code of vramWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    // Both directions, so the list cannot go stale the way the reason
+    // vocabularies did: a sixth `benchmark.vram_*` refusal added to the map
+    // without being named here fails too.
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('benchmark.vram_'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(
+      vramWireCodes
+        .filter((code) => code.startsWith('benchmark.vram_'))
+        .slice()
+        .sort(),
+    );
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is
