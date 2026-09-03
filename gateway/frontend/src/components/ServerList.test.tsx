@@ -240,6 +240,9 @@ function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     vram_locked: false,
     set_visible_devices: false,
     gpus: [],
+    api_flavors: [],
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     ...overrides,
   };
 }

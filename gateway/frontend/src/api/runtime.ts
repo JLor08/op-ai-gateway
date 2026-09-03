@@ -11,6 +11,7 @@
 // comment, as the source of truth if the two ever drift.
 
 import { type Fetcher, request, subscribeSSE } from './transport';
+import type { EndpointMode } from './models';
 
 // One per-GPU VRAM demand row on a runtime spec. vram_estimate_mb is
 // operator-owned (round-tripped from a PUT verbatim); vram_measured_mb is
@@ -55,6 +56,14 @@ export interface RuntimeSpec {
   // on together with one of those variables hand-set in `env`.
   set_visible_devices: boolean;
   gpus: RuntimeSpecGPU[];
+  // Per-endpoint API-variant snapshot for this managed model (gateway-side only;
+  // NOT sent to the agent). api_flavors gates routing eligibility; the two modes
+  // decide disabled / translate / passthrough for /v1/responses and /v1/messages.
+  // A full-document upsert stores all three explicitly (snapshot from the app on
+  // create; see RuntimeAdminSection). Mirrors the Go RuntimeSpecDTO.
+  api_flavors: string[];
+  responses_mode: EndpointMode;
+  messages_mode: EndpointMode;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim

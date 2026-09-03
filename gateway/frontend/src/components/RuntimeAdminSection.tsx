@@ -30,6 +30,7 @@ import SpeedIcon from '@mui/icons-material/Speed';
 import type {
   ApplicationStatus,
   BenchmarkRunDTO,
+  EndpointMode,
   GPUBudget,
   HardwareGPU,
   PortalApplication,
@@ -53,6 +54,7 @@ import { StatusChip } from './shared/StatusChip';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
+import { ApiVariantControls } from './shared/ApiVariantControls';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -192,6 +194,9 @@ function emptySpec(mappingId: string): RuntimeSpec {
     vram_locked: false,
     set_visible_devices: false,
     gpus: [],
+    api_flavors: [],
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
   };
 }
 
@@ -2040,6 +2045,9 @@ export function RuntimeAdminSection({
   const [vramLocked, setVramLocked] = useState(false);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
+  const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
+  const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
+  const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
 
   /**
    * The newest VRAM measurement this mapping has, for the per-GPU APPLY
@@ -2141,12 +2149,21 @@ export function RuntimeAdminSection({
         vramMeasuredMb: g.vram_measured_mb,
       })),
     );
+    setSpecApiFlavors([...spec.api_flavors]);
+    setSpecResponsesMode(spec.responses_mode);
+    setSpecMessagesMode(spec.messages_mode);
   }
 
   function openCreate() {
     setGatewayName('');
     setAppName('');
     resetSpecFields();
+    // Snapshot from the parent application: a spec created for it starts out
+    // agreeing with what the app already exposes, rather than a fresh
+    // passthrough-only guess that the operator has to re-derive by hand.
+    setSpecApiFlavors([...application.api_flavors]);
+    setSpecResponsesMode(application.responses_mode);
+    setSpecMessagesMode(application.messages_mode);
     setSpecMode('create');
   }
 
@@ -2378,6 +2395,9 @@ export function RuntimeAdminSection({
         vram_estimate_mb: r.vramEstimateMb,
         vram_measured_mb: r.vramMeasuredMb,
       })),
+      api_flavors: specApiFlavors,
+      responses_mode: specResponsesMode,
+      messages_mode: specMessagesMode,
     };
   }
 
@@ -3344,6 +3364,15 @@ export function RuntimeAdminSection({
             <Typography variant="subtitle2" component="h3" sx={{ mt: 1 }}>
               {t.runtimeSpecConfigSection}
             </Typography>
+            <ApiVariantControls
+              t={t}
+              apiFlavors={specApiFlavors}
+              responsesMode={specResponsesMode}
+              messagesMode={specMessagesMode}
+              onFlavorsChange={setSpecApiFlavors}
+              onResponsesModeChange={setSpecResponsesMode}
+              onMessagesModeChange={setSpecMessagesMode}
+            />
             <FormControlLabel
               control={
                 <Checkbox checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

@@ -2553,3 +2553,19 @@ describe('VRAM-benchmark portal i18n keys', () => {
     expect(messages.en.benchmarkVramUnifiedMemory).toMatch(/system RAM/);
   });
 });
+
+describe('endpoint-mode i18n keys', () => {
+  it('defines the endpoint-mode dropdown keys in de and en', () => {
+    const keys = [
+      'applicationResponsesMode',
+      'applicationMessagesMode',
+      'applicationModeDisabled',
+      'applicationModeTranslate',
+      'applicationModePassthrough',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+    }
+  });
+});

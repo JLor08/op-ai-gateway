@@ -151,6 +151,9 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     vram_locked: false,
     set_visible_devices: false,
     gpus: [],
+    api_flavors: [],
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     ...overrides,
   };
 }
@@ -760,6 +763,59 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(await screen.findByRole('button', { name: t.runtimeSpecCreate })).toBeInTheDocument();
   });
 
+  it('shows the API-variant controls in the spec create form', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    // The two mode dropdowns, labeled for Codex (Responses) and Claude Code (Messages).
+    expect(screen.getByLabelText(t.applicationResponsesMode)).toBeInTheDocument();
+    expect(screen.getByLabelText(t.applicationMessagesMode)).toBeInTheDocument();
+    // The flavor checkboxes come along too (shared component owns them).
+    expect(screen.getByRole('checkbox', { name: 'openai' })).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeInTheDocument();
+  });
+
+  it('pre-fills the API-variant controls from the parent app on create', async () => {
+    renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai'],
+        responses_mode: 'translate',
+        messages_mode: 'disabled',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    // openai checked, anthropic unchecked (unchecked => its dropdown is disabled+Deaktiviert per area 05).
+    expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
+    // Codex mode shows the app's stored 'translate'.
+    expect(screen.getByRole('combobox', { name: t.applicationResponsesMode })).toHaveTextContent(
+      t.applicationModeTranslate,
+    );
+  });
+
+  it('sends api_flavors + responses_mode + messages_mode in the spec PUT body', async () => {
+    const { created, putSpecs } = renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'passthrough',
+        messages_mode: 'translate',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('passthrough');
+    expect(putSpecs[0].body.messages_mode).toBe('translate');
+    expect(created).toHaveLength(1);
+  });
+
   it('rejects a reserved env key before ever calling the API', async () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -966,6 +1022,30 @@ describe('RuntimeAdminSection edit + delete', () => {
 
     await waitFor(() => expect(deletedMappingIds).toEqual(['map_1']));
     expect(deletedSpecIds).toHaveLength(0);
+  });
+
+  it('shows the spec stored API-variant values on edit', async () => {
+    const spec = makeSpec({
+      configured: true,
+      mapping_id: 'map_1',
+      api_flavors: ['anthropic'],
+      responses_mode: 'disabled',
+      messages_mode: 'passthrough',
+    });
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+    expect(screen.getByRole('combobox', { name: t.applicationMessagesMode })).toHaveTextContent(
+      t.applicationModePassthrough,
+    );
   });
 });
 
@@ -1623,6 +1703,9 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
     gpus: spec.gpus,
+    api_flavors: spec.api_flavors,
+    responses_mode: spec.responses_mode,
+    messages_mode: spec.messages_mode,
   };
 }
 
