@@ -1912,10 +1912,10 @@ func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target
 	}, nil
 }
 
-// newNativeProxyTestServer seeds one vLLM upstream + app + mapping (gateway model
-// "gw-model" -> upstream "upstream-model", so the model-rewrite is observable),
-// with the given native-passthrough flags.
-func newNativeProxyTestServer(prov provider.Client, nativeResponses, nativeMessages bool) *Server {
+// newNativeModeTestServer seeds one vLLM upstream + app + mapping (gateway model
+// "gw-model" -> upstream "upstream-model") with EXPLICIT per-endpoint modes, so a
+// test can drive disabled/translate/passthrough directly.
+func newNativeModeTestServer(prov provider.Client, responsesMode, messagesMode routing.EndpointMode) *Server {
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
@@ -1929,7 +1929,19 @@ func newNativeProxyTestServer(prov provider.Client, nativeResponses, nativeMessa
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native", Name: "Native Upstream", Domain: "native.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native", ServerID: "srv-native", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, NativeResponses: nativeResponses, NativeMessages: nativeMessages, CreatedAt: now, UpdatedAt: now}); err != nil {
+	// Type is ProviderServerAgent (not the seeded server's own ProviderVLLM label)
+	// so that a disabled mode still reaches this test's Target: ordinary
+	// (non-server_agent) applications are EXCLUDED from candidacy entirely once
+	// disabled (routing/store.go applicationServesEndpoint, landed in Area 01 —
+	// see TestCandidacyExcludesResponsesDisabledOrdinaryApp), so Resolve would
+	// return ErrNoModelRoute rather than ever handing tryProxyNative a Target to
+	// reject. A server_agent app bypasses that candidacy mode-filter by design
+	// (its authoritative mode lives on the resolved runtime spec, checked only
+	// post-resolve) and — with no runtime spec seeded here — targetFrom falls
+	// back to exactly this application's own ResponsesMode/MessagesMode, which is
+	// what lets a disabled/translate/passthrough mode reach tryProxyNative's
+	// three-way decision directly, matching this helper's purpose.
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native", ServerID: "srv-native", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: responsesMode, MessagesMode: messagesMode, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native", ApplicationID: "app-native", GatewayModelName: "gw-model", AppModelName: "upstream-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -1945,6 +1957,19 @@ func newNativeProxyTestServer(prov provider.Client, nativeResponses, nativeMessa
 		Routes:   routeStore,
 		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
 	})
+}
+
+// newNativeProxyTestServer keeps the existing bool contract (true => passthrough,
+// false => translate) so every current call site is unchanged.
+func newNativeProxyTestServer(prov provider.Client, nativeResponses, nativeMessages bool) *Server {
+	return newNativeModeTestServer(prov, modeFromBool(nativeResponses), modeFromBool(nativeMessages))
+}
+
+func modeFromBool(b bool) routing.EndpointMode {
+	if b {
+		return routing.EndpointModePassthrough
+	}
+	return routing.EndpointModeTranslate
 }
 
 func TestOpenAIResponsesNativePassthroughProxiesRawBody(t *testing.T) {

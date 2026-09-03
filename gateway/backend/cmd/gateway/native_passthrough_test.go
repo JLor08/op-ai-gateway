@@ -22,9 +22,10 @@ import (
 
 // TestNativePassthroughEndToEnd drives a real streaming /v1/responses request
 // through the fully-wired gateway (real Multiplexer -> real OpenAICompatibleClient)
-// to a fake Codex-capable upstream, proving that an application with
-// native_responses=true proxies the raw body verbatim (rewriting only the model),
-// hits the upstream's own /v1/responses path, and streams the response back.
+// to a fake Codex-capable upstream, proving that an application whose
+// ResponsesMode is passthrough proxies the raw body verbatim (rewriting only the
+// model), hits the upstream's own /v1/responses path, and streams the response
+// back.
 func TestNativePassthroughEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
@@ -44,8 +45,9 @@ func TestNativePassthroughEndToEnd(t *testing.T) {
 	}
 	port, _ := strconv.Atoi(u.Port())
 
-	// Seed user + token + a vLLM app with native_responses=true (always_reachable
-	// so no probe gating) mapping gateway model "gw-model" -> upstream "up-model".
+	// Seed user + token + a vLLM app with ResponsesMode=passthrough
+	// (always_reachable so no probe gating) mapping gateway model "gw-model" ->
+	// upstream "up-model".
 	dbPath := filepath.Join(t.TempDir(), "gateway.db")
 	seed, err := store.OpenSQLite(dbPath)
 	if err != nil {
@@ -64,7 +66,7 @@ func TestNativePassthroughEndToEnd(t *testing.T) {
 	if err := seed.CreateAIServer(ctx, routing.AIServer{ID: "srv_c", Name: "Codex Upstream", Domain: u.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create server: %v", err)
 	}
-	if err := seed.CreateApplication(ctx, routing.Application{ID: "app_c", ServerID: "srv_c", Type: routing.ProviderVLLM, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, HealthCheckMode: routing.HealthCheckModeAlwaysReachable, AlwaysReachable: true, NativeResponses: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := seed.CreateApplication(ctx, routing.Application{ID: "app_c", ServerID: "srv_c", Type: routing.ProviderVLLM, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, HealthCheckMode: routing.HealthCheckModeAlwaysReachable, AlwaysReachable: true, ResponsesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create application: %v", err)
 	}
 	if err := seed.CreateMapping(ctx, routing.ModelMapping{ID: "map_c", ApplicationID: "app_c", GatewayModelName: "gw-model", AppModelName: "up-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

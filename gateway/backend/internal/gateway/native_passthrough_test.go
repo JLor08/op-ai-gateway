@@ -560,7 +560,7 @@ func newCapAdmissionTestServer(t *testing.T, prov provider.Client) (*Server, str
 	if err := routeStore.CreateApplication(ctx, routing.Application{
 		ID: "app-native-cap", ServerID: serverID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000,
-		Status: routing.ServerStatusActive, NativeResponses: true,
+		Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough,
 		AdmissionQueueTimeoutSeconds: 1, // real, short: the test genuinely waits out one timeout
 	}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
@@ -616,5 +616,126 @@ func TestTryProxyNativeAdmissionQueueTimeoutRecordsFailure(t *testing.T) {
 	}
 	if events[0].ContentType != jsonContentType {
 		t.Fatalf("usage content_type = %q, want %q", events[0].ContentType, jsonContentType)
+	}
+}
+
+func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
+	target := routing.Target{
+		Provider:      routing.ProviderVLLM,
+		ResponsesMode: routing.EndpointModePassthrough,
+		MessagesMode:  routing.EndpointModeDisabled,
+	}
+	cases := []struct {
+		apiFlavor string
+		wantPath  string
+		wantMode  routing.EndpointMode
+	}{
+		{"openai_responses", "/v1/responses", routing.EndpointModePassthrough},
+		{"anthropic_messages", "/v1/messages", routing.EndpointModeDisabled},
+		{"openai_chat_completions", "", ""}, // neither coding-agent endpoint
+	}
+	for _, tc := range cases {
+		t.Run(tc.apiFlavor, func(t *testing.T) {
+			path, mode := endpointModeFor(target, tc.apiFlavor)
+			if path != tc.wantPath || mode != tc.wantMode {
+				t.Fatalf("endpointModeFor(%q) = (%q, %q), want (%q, %q)", tc.apiFlavor, path, mode, tc.wantPath, tc.wantMode)
+			}
+		})
+	}
+}
+
+// TestOpenAIResponsesDisabledEndpointRejects proves a resolved target whose
+// EFFECTIVE ResponsesMode is disabled is REJECTED with the stable code + 4xx and
+// is NOT translated: the simple body used here WOULD translate+succeed (200) if it
+// fell through, so a 404 proves the disabled branch fired, not the parser.
+func TestOpenAIResponsesDisabledEndpointRejects(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: "unused"}
+	srv := newNativeModeTestServer(prov, routing.EndpointModeDisabled, routing.EndpointModeTranslate)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "responses.endpoint_disabled" {
+		t.Fatalf("error code = %q, want responses.endpoint_disabled", code)
+	}
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0 (disabled must not proxy)", prov.proxyCalls)
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1 (the rejection is recorded)", len(events))
+	}
+	if events[0].Status != "error" || events[0].ErrorCode != "responses.endpoint_disabled" {
+		t.Fatalf("usage event = %+v, want status=error error_code=responses.endpoint_disabled", events[0])
+	}
+	if events[0].HTTPStatus != http.StatusNotFound {
+		t.Fatalf("usage http_status = %d, want 404", events[0].HTTPStatus)
+	}
+}
+
+// TestAnthropicMessagesDisabledEndpointRejects — the /v1/messages mirror.
+func TestAnthropicMessagesDisabledEndpointRejects(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: "unused"}
+	srv := newNativeModeTestServer(prov, routing.EndpointModeTranslate, routing.EndpointModeDisabled)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "messages.endpoint_disabled" {
+		t.Fatalf("error code = %q, want messages.endpoint_disabled", code)
+	}
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 || events[0].ErrorCode != "messages.endpoint_disabled" {
+		t.Fatalf("usage events = %+v, want one messages.endpoint_disabled error", events)
+	}
+}
+
+// TestResponsesEndpointModeTable pins all three modes on the ordinary app for the
+// Responses endpoint in one place.
+func TestResponsesEndpointModeTable(t *testing.T) {
+	cases := []struct {
+		mode          routing.EndpointMode
+		wantStatus    int
+		wantProxy     int
+		wantErrorCode string // "" => success
+	}{
+		{routing.EndpointModePassthrough, http.StatusOK, 1, ""},
+		{routing.EndpointModeTranslate, http.StatusOK, 0, ""},
+		{routing.EndpointModeDisabled, http.StatusNotFound, 0, "responses.endpoint_disabled"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"}
+			srv := newNativeModeTestServer(prov, tc.mode, routing.EndpointModeTranslate)
+			// A SIMPLE body so the translate path can succeed (proves translate != reject).
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+			req.Header.Set("Authorization", "Bearer dev-secret")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("mode %s: status = %d, want %d, body=%s", tc.mode, rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if prov.proxyCalls != tc.wantProxy {
+				t.Fatalf("mode %s: proxyCalls = %d, want %d", tc.mode, prov.proxyCalls, tc.wantProxy)
+			}
+			if tc.wantErrorCode != "" && errorBodyOf(t, rec) != tc.wantErrorCode {
+				t.Fatalf("mode %s: error code = %q, want %q", tc.mode, errorBodyOf(t, rec), tc.wantErrorCode)
+			}
+		})
 	}
 }

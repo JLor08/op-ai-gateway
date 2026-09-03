@@ -50,7 +50,7 @@ func newServiceScopeTestServer(t *testing.T) (*Server, *auth.TokenStore, *usage.
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native-svc", Name: "Native Upstream", Domain: "native-svc.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native-svc.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed native server: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-svc", ServerID: "srv-native-svc", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, NativeResponses: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-svc", ServerID: "srv-native-svc", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed native app: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native-svc", ApplicationID: "app-native-svc", GatewayModelName: "native-model", AppModelName: "native-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
