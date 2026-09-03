@@ -16,9 +16,10 @@ import type { MessageKey } from './types';
  */
 
 /**
- * The three CLOSED vocabularies this module renders -- the inconclusive
- * reasons, the confidence warnings, the fingerprint kinds -- DECLARED here,
- * once, as the arrays that every label map and every test derives from.
+ * The four CLOSED vocabularies this module renders -- the inconclusive
+ * reasons, the confidence warnings, the fingerprint kinds, the isolation
+ * proofs -- DECLARED here, once, as the arrays that every label map and every
+ * test derives from.
  *
  * They are arrays rather than bare map keys for one reason: a test can then
  * iterate the vocabulary and require the mapping to be TOTAL, instead of
@@ -27,26 +28,36 @@ import type { MessageKey } from './types';
  * `undeclared_gpu_allocation` shipped with no test naming them, under test
  * titles that still claimed to cover "the seven reasons".
  *
- * ADDING A VALUE TOUCHES FOUR PLACES, and only the last three are checked
- * against each other:
+ * ADDING A VALUE TOUCHES FOUR PLACES, and ALL FOUR are checked against each
+ * other:
  *
- *  1. the Go constant it mirrors -- the `vramInconclusive*`, `vramWarning*`
- *     and `vramFingerprint*` blocks in `internal/gateway/benchmark_vram.go`,
- *     `benchmark_vram_isolation.go` and `benchmark_vram_confidence.go`;
+ *  1. the Go constant it mirrors -- the `vramInconclusive*`, `vramWarning*`,
+ *     `vramFingerprint*` and `vramProof*` blocks in
+ *     `internal/gateway/benchmark_vram.go`, `benchmark_vram_isolation.go` and
+ *     `benchmark_vram_confidence.go`;
  *  2. the value, in the array below;
  *  3. its label key, in the map below -- a missing one is a COMPILE error,
  *     since each map is keyed by its vocabulary's own type, and so is a
  *     mapped key for a value the vocabulary does not declare;
  *  4. the German AND English sentence, in `i18n.ts`.
  *
- * Steps 2-4 are enforced: `vram.test.ts` requires every declared value to
- * reach a distinct, non-fallback sentence in both locales, and `i18n.test.ts`
- * requires every message key under these prefixes to be claimed by a declared
- * value, so an orphaned sentence fails too. Step 1 is the seam no test in this
- * package can close -- the values travel as free-form strings inside a
- * persisted `vram_json` payload, appear in no schema, and the portal's tests
- * do not read the Go module -- so a rename there reaches this portal as an
- * unknown value and renders the honest fallback below.
+ * Steps 2-4 are enforced against each other: `vram.test.ts` requires every
+ * declared value to reach a distinct, non-fallback sentence in both locales,
+ * and `i18n.test.ts` requires every message key under these prefixes to be
+ * claimed by a declared value, so an orphaned sentence fails too.
+ *
+ * STEP 1 IS ENFORCED TOO, and that is newer than the rest. Deriving these
+ * arrays from THEMSELVES pinned only what this file already said, so the very
+ * defect the derivation was introduced to end recurred the moment the Go side
+ * grew a tenth reason (`isolation_unacknowledged`) on its own: the portal
+ * rendered "this build does not know the reason it reported" for a reason the
+ * matching build reports. So `vram.test.ts` now reads the Go constant blocks
+ * off disk and requires each array here to be exactly the closed set declared
+ * there -- both directions, so a value added, dropped or renamed in Go fails
+ * this portal's own suite. The values still travel as free-form strings inside
+ * a persisted `vram_json` and appear in no schema, so the FALLBACK below stays
+ * load-bearing for a row written by a NEWER gateway than this portal; what it
+ * no longer covers up is a value this very build's backend already reports.
  */
 export const vramInconclusiveReasons = [
   'isolation_timeout',
@@ -58,6 +69,7 @@ export const vramInconclusiveReasons = [
   'run_failed',
   'isolation_lost',
   'strategy_disagreement',
+  'isolation_unacknowledged',
 ] as const;
 export type VramInconclusiveReason = (typeof vramInconclusiveReasons)[number];
 
@@ -71,6 +83,28 @@ export type VramWarning = (typeof vramWarnings)[number];
 
 export const vramFingerprintKinds = ['uuid', 'name_total'] as const;
 export type VramFingerprintKind = (typeof vramFingerprintKinds)[number];
+
+/**
+ * What established that the run's `force_stopped` overrides had actually
+ * reached the agent -- the two are DIFFERENT STRENGTHS of evidence, which is
+ * why the report names one instead of leaving the reader to assume the
+ * stronger:
+ *
+ *  - `config_acknowledged`: the agent reported which runtime-config document it
+ *    had applied, and it was one the run had verified force-stops the whole
+ *    fleet. A fact.
+ *  - `bind_delay`: the agent does not report that at all (an older build), so
+ *    the run waited out its guaranteed runtime-poll interval and then observed
+ *    no process. An inference from an absence -- the only standard available
+ *    before the acknowledgement existed, and still the only one for an agent
+ *    that has not been upgraded.
+ *
+ * A report written before the acknowledgement shipped carries NEITHER value,
+ * and that is why the label is only rendered when the field is present: a
+ * missing value is "this build did not record it", never `bind_delay`.
+ */
+export const vramIsolationProofs = ['config_acknowledged', 'bind_delay'] as const;
+export type VramIsolationProof = (typeof vramIsolationProofs)[number];
 
 // reason -> the sentence that tells the operator what to DO about it. The
 // reasons are distinct values precisely because the next action differs per
@@ -86,6 +120,7 @@ const inconclusiveLabelKeys: Readonly<Record<VramInconclusiveReason, MessageKey>
   run_failed: 'benchmarkVramInconclusiveRunFailed',
   isolation_lost: 'benchmarkVramInconclusiveIsolationLost',
   strategy_disagreement: 'benchmarkVramInconclusiveStrategyDisagreement',
+  isolation_unacknowledged: 'benchmarkVramInconclusiveIsolationUnacknowledged',
 };
 
 const warningLabelKeys: Readonly<Record<VramWarning, MessageKey>> = {
@@ -104,6 +139,14 @@ const warningLabelKeys: Readonly<Record<VramWarning, MessageKey>> = {
 const fingerprintLabelKeys: Readonly<Record<VramFingerprintKind, MessageKey>> = {
   uuid: 'benchmarkVramFingerprintUuid',
   name_total: 'benchmarkVramFingerprintNameTotal',
+};
+
+// proof -> the sentence that says what was actually established. Neither may
+// read as a bare "isolated": one names the agent's own acknowledgement, the
+// other names a wait and an absence.
+const isolationProofLabelKeys: Readonly<Record<VramIsolationProof, MessageKey>> = {
+  config_acknowledged: 'benchmarkVramIsolationProofAcknowledged',
+  bind_delay: 'benchmarkVramIsolationProofBindDelay',
 };
 
 /**
@@ -138,6 +181,23 @@ export function vramWarningLabelKey(warning: string): MessageKey {
 /** What identified the card, named — never a bare "verified". */
 export function vramFingerprintLabelKey(kind: string | undefined): MessageKey {
   return labelKeyFor(fingerprintLabelKeys, kind ?? '', 'benchmarkVramFingerprintNone');
+}
+
+/**
+ * How the run established that its overrides had landed, or `null` when the
+ * report does not say.
+ *
+ * `null` rather than a fallback sentence, and that is the one asymmetry against
+ * the three vocabularies above: they are rendered for a value that exists but
+ * is unknown to this build, whereas an ABSENT proof is a report from a gateway
+ * that predates the acknowledgement entirely. Naming a standard it never
+ * recorded — in either direction — would be an invention, so the line is simply
+ * not rendered. An unknown non-empty value still gets an honest fallback, for
+ * the same reason the others do: a newer gateway may report a third standard.
+ */
+export function vramIsolationProofLabelKey(proof: string | undefined): MessageKey | null {
+  if (!proof) return null;
+  return labelKeyFor(isolationProofLabelKeys, proof, 'benchmarkVramIsolationProofUnknown');
 }
 
 /** Whether a recorded `fingerprint_kind` is one this build can compare at all. */

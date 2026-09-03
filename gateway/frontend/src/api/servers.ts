@@ -463,12 +463,22 @@ export type VRAMGPUItemDTO = {
 // BenchmarkResult (mirrors the Go VRAMReportDTO / VRAMReport — one shape, two
 // producers). `isolated` is the run's own evidence-backed claim: audit it
 // through `isolation_evidence` (spec id -> why this run believes that spec was
-// not running), where a missing entry means NOT confirmed. `drained_spec_ids` is
-// what the run force-stopped. `inconclusive` empty = a definitive result; any
+// not running), where a missing entry means NOT confirmed, and weigh it with
+// `isolation_proof` (what established that the run's overrides had landed at
+// all). `drained_spec_ids` is what the run force-stopped. `inconclusive` empty = a definitive result; any
 // value means there is NO number to apply.
 export type VRAMReportDTO = {
   isolated: boolean;
   isolation_evidence?: Record<string, string>;
+  // WHICH standard of proof the isolation wait applied — "config_acknowledged"
+  // (the agent reported having applied a runtime-config document the run had
+  // verified force-stops the whole fleet) or "bind_delay" (an agent that never
+  // acknowledges, so the run waited out its guaranteed poll interval and then
+  // observed no process). Different STRENGTHS of evidence, so it is rendered
+  // beside `isolated` rather than folded into it, and it is present even when
+  // the isolation was NOT confirmed — a timeout then says which standard
+  // failed. Absent on a report written before the acknowledgement existed.
+  isolation_proof?: string;
   drained_spec_ids?: string[];
   // The two disjoint ways a restore can not have happened, and they are two
   // different instructions. `restore_failed`: the write itself failed, so

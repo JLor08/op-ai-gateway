@@ -899,6 +899,12 @@ const de = {
   benchmarkVramRuns: 'VRAM-Messungen',
   benchmarkVramIsolationConfirmed: 'Isolation nachgewiesen',
   benchmarkVramIsolationUnconfirmed: 'Isolation nicht nachgewiesen',
+  benchmarkVramIsolationProofAcknowledged:
+    'Nachweis: der Agent hat gemeldet, genau diese Konfiguration angewendet zu haben – die Modelle waren also nachweislich angehalten, nicht nur vermutlich.',
+  benchmarkVramIsolationProofBindDelay:
+    'Nachweis: dieser Agent meldet nicht, welche Konfiguration er angewendet hat (ältere Version). Der Lauf hat deshalb ein vollständiges Abfrageintervall abgewartet und danach keinen laufenden Prozess mehr gesehen – ein Rückschluss aus dem Fehlen eines Prozesses, kein direkter Nachweis. Ein Agent-Update macht diese Messung schneller und belastbarer.',
+  benchmarkVramIsolationProofUnknown:
+    'Ein Isolationsnachweis, den dieser Portal-Build nicht kennt.',
   benchmarkVramNoReport:
     'Der Lauf hat die Messphase nicht erreicht: es wurde nichts angehalten und nichts gemessen.',
   benchmarkVramDrained: 'Angehaltene Launch-Specs',
@@ -950,6 +956,8 @@ const de = {
     'Eine der für die Messung angehaltenen Launch-Specs lief am Ende des Laufs wieder. Damit hat die Isolation nicht über die ganze Messung gehalten, und die Differenz enthielte den Speicher dieses zweiten Prozesses. Halten Sie ihn an und messen Sie erneut.',
   benchmarkVramInconclusiveStrategyDisagreement:
     'Die beiden unabhängig gemessenen Zahlen weichen zu weit voneinander ab: die Differenz über das Zeitfenster ist deutlich größer als die Messung des Agenten am Prozess selbst. Etwas anderes hat also während des Ladens Speicher belegt – meist eine Anwendung, die der Gateway nicht anhalten kann. Messen Sie erneut, wenn der Server ruhig ist.',
+  benchmarkVramInconclusiveIsolationUnacknowledged:
+    'Der Agent dieses Servers meldet normalerweise, welche Runtime-Konfiguration er angewendet hat – die Konfiguration mit den Stopp-Overrides dieses Laufs hat er jedoch nie bestätigt. Das Dokument ist also gar nicht bei ihm angekommen: Prüfen Sie den Agenten selbst (verbunden? neu gestartet? gleicht er seine Konfiguration ab?), nicht die Modelle, und messen Sie danach erneut.',
   benchmarkVramInconclusiveUnknown:
     'Kein Ergebnis, und dieser Portal-Build kennt den gemeldeten Grund nicht.',
   modelServerTitle: 'Angeboten auf Servern',
@@ -2954,6 +2962,11 @@ const en: PortalMessages = {
   benchmarkVramRuns: 'VRAM runs',
   benchmarkVramIsolationConfirmed: 'Isolation proven',
   benchmarkVramIsolationUnconfirmed: 'Isolation not proven',
+  benchmarkVramIsolationProofAcknowledged:
+    'Evidence: the agent reported having applied exactly this configuration, so the models were demonstrably stopped rather than presumed to be.',
+  benchmarkVramIsolationProofBindDelay:
+    'Evidence: this agent does not report which configuration it has applied (an older version). The run therefore waited out a full poll interval and then saw no running process — an inference from the absence of a process, not a direct proof. Updating the agent makes this measurement both faster and stronger.',
+  benchmarkVramIsolationProofUnknown: 'An isolation proof this portal build does not know.',
   benchmarkVramNoReport:
     'The run never reached the measurement phase: nothing was stopped and nothing was measured.',
   benchmarkVramDrained: 'Force-stopped launch specs',
@@ -3004,6 +3017,8 @@ const en: PortalMessages = {
     "One of the launch specs this run had stopped for the measurement was running again by the end of it. The isolation therefore did not hold for the whole run, and the delta would carry that second process's memory. Stop it, then measure again.",
   benchmarkVramInconclusiveStrategyDisagreement:
     "The two independently measured numbers are too far apart: the delta across the window is much larger than the agent's own measurement of the process itself. So something else allocated memory during the load — most likely an application this gateway cannot stop. Measure again once the server is quiet.",
+  benchmarkVramInconclusiveIsolationUnacknowledged:
+    "This server's agent normally reports which runtime configuration it has applied, but it never confirmed the one carrying this run's stop overrides. So the document never reached it at all: check the agent itself (connected? restarted? reconciling its configuration?) rather than the models, then measure again.",
   benchmarkVramInconclusiveUnknown:
     'No result, and this portal build does not know the reason it reported.',
   modelServerTitle: 'Offered on servers',

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   latestApplicableVramRun,
@@ -11,6 +14,8 @@ import {
   vramFingerprintLabelKey,
   vramInconclusiveLabelKey,
   vramInconclusiveReasons,
+  vramIsolationProofLabelKey,
+  vramIsolationProofs,
   vramWarningLabelKey,
   vramWarnings,
 } from './vram';
@@ -221,6 +226,41 @@ describe('vram label keys', () => {
     expect(vramWarningLabelKey('')).toBe('benchmarkVramWarningUnknown');
   });
 
+  it('distinguishes the two isolation proofs, and says which is the weaker, in both locales', () => {
+    expectDistinctSentences(
+      vramIsolationProofs,
+      (value) => vramIsolationProofLabelKey(value) as MessageKey,
+      'benchmarkVramIsolationProofUnknown',
+      40,
+    );
+    for (const locale of ['de', 'en'] as const) {
+      // The whole point of naming the proof is that the operator can tell the
+      // two apart, so the WEAKER one has to say it is an inference rather than
+      // reading like a second way of saying "proven". Pinned as literals
+      // because a sentence that merely mentions the poll interval would pass a
+      // distinctness check while still reading as a proof.
+      const weaker = messages[locale][vramIsolationProofLabelKey('bind_delay') as MessageKey];
+      expect(weaker).toMatch(locale === 'de' ? /Rückschluss/ : /inference/i);
+      // ...and it has to name the remedy, because there IS one: the operator
+      // can update the agent and get the stronger standard.
+      expect(weaker).toMatch(locale === 'de' ? /Agent-Update|aktualisier/i : /updat/i);
+    }
+  });
+
+  it('renders no proof at all for a report that never recorded one', () => {
+    // A gateway that predates the acknowledgement wrote no `isolation_proof`,
+    // and naming EITHER standard for it would be an invention -- `bind_delay`
+    // would be a guess about a run whose behaviour is not in the payload. Null
+    // suppresses the line instead.
+    expect(vramIsolationProofLabelKey(undefined)).toBeNull();
+    expect(vramIsolationProofLabelKey('')).toBeNull();
+    // A value this build does not know is the opposite case: something WAS
+    // recorded, so it gets the honest fallback rather than silence.
+    expect(vramIsolationProofLabelKey('agent_measured_alone')).toBe(
+      'benchmarkVramIsolationProofUnknown',
+    );
+  });
+
   it('never claims a bare "verified": each fingerprint kind says what was compared', () => {
     // Short label fragments, not sentences ("by UUID"), so the length floor is
     // the only thing that differs from the vocabularies above.
@@ -358,5 +398,95 @@ describe('vramCardCheck', () => {
       // Drift names the renumbering AND that the number is withheld.
       expect(messages[locale][drifted].length).toBeGreaterThan(30);
     }
+  });
+});
+
+/**
+ * THE CROSS-LANGUAGE HALF, which is what actually failed.
+ *
+ * The four vocabularies are declared in Go and mirrored here, and every test
+ * above derives from the mirror -- so it pins what `vram.ts` already says and
+ * nothing about whether that still matches its source. That is not a
+ * hypothetical gap: it is how `isolation_unacknowledged` shipped. The Go side
+ * grew a tenth inconclusive reason, the array here kept nine, and this suite
+ * stayed green while the portal rendered "this build does not know the reason
+ * it reported" for a reason the very build beside it reports. The earlier
+ * round on this branch replaced hand-written value LISTS in the tests with
+ * derivation from `vram.ts`, which closed the stale-copy failure inside the
+ * portal and left this one wide open -- a derivation is only as good as what
+ * it derives FROM.
+ *
+ * So this reads the Go constant blocks off disk and requires each array in
+ * `vram.ts` to be exactly the set declared there, in both directions: a value
+ * added in Go with no entry here fails, and so does an entry here for a value
+ * Go no longer declares. It is the same technique, and the same monorepo
+ * reach, as `AgentTokenSection.test.tsx`'s byte-for-byte comparison against
+ * the shared agent-config golden.
+ *
+ * What it deliberately does NOT do is make the runtime fallback redundant.
+ * These values are persisted verbatim inside a history row's `vram_json`, so
+ * this portal still decodes rows written by a NEWER gateway and must render an
+ * honest fallback for a value it has never heard of. The pin closes the other
+ * case -- the two halves of ONE build disagreeing.
+ *
+ * `vramEvidence*` is deliberately absent: the portal declares no vocabulary
+ * for the per-spec evidence labels (it renders no sentence for them), so there
+ * is nothing here for a pin to compare against.
+ */
+describe('the Go source of truth', () => {
+  const GO_DIR = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../../../backend/internal/gateway',
+  );
+  // Every file the four constant blocks are spread across. A vocabulary whose
+  // constants move to a fifth file makes the floor assertion below fail rather
+  // than silently shrinking the set this compares against.
+  const GO_FILES = [
+    'benchmark_vram.go',
+    'benchmark_vram_isolation.go',
+    'benchmark_vram_confidence.go',
+  ];
+
+  /**
+   * The values of every `vram<Prefix>*` string constant declared in the Go
+   * package -- `vramInconclusiveIsolationTimeout = "isolation_timeout"` and
+   * friends, whether they sit in a `const (...)` block or on their own line.
+   *
+   * `floor` fails closed. Without it, a renamed prefix or a moved file would
+   * make this compare an empty set against an empty set and pass -- which is
+   * the exact shape of the failure this whole block exists to end.
+   */
+  function goVocabulary(prefix: string, floor: number): string[] {
+    const values = new Set<string>();
+    for (const file of GO_FILES) {
+      const source = fs.readFileSync(path.join(GO_DIR, file), 'utf8');
+      const declaration = new RegExp(
+        String.raw`\bvram${prefix}[A-Za-z0-9_]*\s*=\s*"([a-z0-9_]+)"`,
+        'g',
+      );
+      for (const match of source.matchAll(declaration)) values.add(match[1]);
+    }
+    expect(
+      values.size,
+      `found ${values.size} vram${prefix}* constants under ${GO_DIR}; expected at least ${floor}. Either the prefix was renamed or the constants moved to a file GO_FILES does not list — fix this test, do not let it compare an empty set.`,
+    ).toBeGreaterThanOrEqual(floor);
+    return [...values].sort();
+  }
+
+  it.each([
+    {
+      what: 'inconclusive reason',
+      prefix: 'Inconclusive',
+      floor: 9,
+      declared: vramInconclusiveReasons,
+    },
+    { what: 'confidence warning', prefix: 'Warning', floor: 4, declared: vramWarnings },
+    { what: 'fingerprint kind', prefix: 'Fingerprint', floor: 2, declared: vramFingerprintKinds },
+    { what: 'isolation proof', prefix: 'Proof', floor: 2, declared: vramIsolationProofs },
+  ])('declares exactly the $what values the Go package declares', ({ prefix, declared, floor }) => {
+    expect(
+      [...declared].sort(),
+      `the vram.ts array and the Go vram${prefix}* constants disagree. Add the missing value to the array, its label key to the map beside it, and a German AND English sentence in i18n.ts — or, if Go dropped it, remove all four.`,
+    ).toEqual(goVocabulary(prefix, floor));
   });
 });

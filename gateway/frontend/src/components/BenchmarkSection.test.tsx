@@ -691,6 +691,36 @@ describe('BenchmarkSection VRAM run', () => {
     expect(screen.getByText(t.benchmarkVramDrainedNote)).toBeInTheDocument();
   });
 
+  it('says WHICH proof the isolation rested on', async () => {
+    // Two questions, two lines: whether the evidence was complete
+    // (`isolated`), and how strong it was allowed to be (`isolation_proof`).
+    // An operator weighing a number needs the second, because "the agent
+    // confirmed it applied this document" and "we waited a minute and saw no
+    // process" are not the same claim.
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      {
+        ...withMapping,
+        ...finishedVramRun({ vram: vramReport({ isolation_proof: 'config_acknowledged' }) }),
+      },
+    );
+    expect(await screen.findByText(t.benchmarkVramIsolationProofAcknowledged)).toBeInTheDocument();
+    expect(screen.queryByText(t.benchmarkVramIsolationProofBindDelay)).not.toBeInTheDocument();
+  });
+
+  it('names no proof at all for a run that did not record one', async () => {
+    // A report from a gateway that predates the acknowledgement records
+    // NEITHER standard, and rendering `bind_delay` for it would be a guess
+    // about behaviour that is not in the payload.
+    renderSection(
+      { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+      { ...withMapping, ...finishedVramRun({ vram: vramReport({}) }) },
+    );
+    await screen.findByText(t.benchmarkVramResultTitle, { exact: false });
+    expect(screen.queryByText(t.benchmarkVramIsolationProofAcknowledged)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.benchmarkVramIsolationProofBindDelay)).not.toBeInTheDocument();
+  });
+
   it('names the specs it could NOT restore as something to clear by hand', async () => {
     renderSection(
       { kind: 'mapping', id: 'map_1', name: 'gw-model' },

@@ -9,6 +9,8 @@ import {
   vramFingerprintLabelKey,
   vramInconclusiveLabelKey,
   vramInconclusiveReasons,
+  vramIsolationProofLabelKey,
+  vramIsolationProofs,
   vramWarningLabelKey,
   vramWarnings,
 } from './components/shared/vram';
@@ -2442,6 +2444,19 @@ describe('VRAM-benchmark portal i18n keys', () => {
       // "no identifying field available": the ABSENCE of a kind, which is not
       // itself a kind.
       unclaimed: ['benchmarkVramFingerprintNone'],
+    },
+    {
+      what: 'isolation proof',
+      values: vramIsolationProofs,
+      // The label lookup returns null for an ABSENT proof (a report from a
+      // gateway that predates the acknowledgement), which is not a value of the
+      // vocabulary -- so the declared values are asserted through the same
+      // lookup and the null branch is covered in `vram.test.ts` instead.
+      labelKey: (value) => vramIsolationProofLabelKey(value) as MessageKey,
+      prefix: 'benchmarkVramIsolationProof',
+      // The fallback for a standard a newer gateway reported to an older
+      // portal. Not itself a standard.
+      unclaimed: ['benchmarkVramIsolationProofUnknown'],
     },
     {
       what: 'card-check outcome',

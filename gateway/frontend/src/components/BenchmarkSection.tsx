@@ -33,6 +33,7 @@ import { formatPortalError } from './shared/format';
 import {
   vramFingerprintLabelKey,
   vramInconclusiveLabelKey,
+  vramIsolationProofLabelKey,
   vramWarningLabelKey,
 } from './shared/vram';
 
@@ -93,11 +94,22 @@ function VramReportView({
   const restoreFailed = report.restore_failed ?? [];
   const restoreTakenOver = report.restore_taken_over ?? [];
   const warnings = report.warnings ?? [];
+  // WHICH standard of proof the run's isolation rested on. Rendered beside the
+  // confirmed/unconfirmed line rather than folded into it, because the two are
+  // different questions: whether the evidence was complete, and how strong it
+  // was allowed to be. Null on a report from a gateway that predates the
+  // acknowledgement, where naming either standard would be an invention.
+  const proofKey = vramIsolationProofLabelKey(report.isolation_proof);
   return (
     <Box sx={{ display: 'grid', gap: 0.75 }}>
       <Typography variant="body2" color="text.secondary">
         {report.isolated ? t.benchmarkVramIsolationConfirmed : t.benchmarkVramIsolationUnconfirmed}
       </Typography>
+      {proofKey && (
+        <Typography variant="caption" color="text.secondary">
+          {t[proofKey]}
+        </Typography>
+      )}
       {warnings.length > 0 && (
         <Alert severity="warning">
           <Typography variant="body2">{t.benchmarkVramWarnings}</Typography>
