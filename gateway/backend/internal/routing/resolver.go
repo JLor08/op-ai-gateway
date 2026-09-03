@@ -61,12 +61,16 @@ type Target struct {
 	// APITokenHeader is an optional custom header name for APIToken; empty ⇒ the
 	// default "Authorization: Bearer <token>".
 	APITokenHeader string
-	// NativeResponses / NativeMessages mirror the resolved application's
-	// native-passthrough flags, so the handler can decide whether to proxy the raw
-	// client body to the upstream (Codex /v1/responses resp. Claude Code
-	// /v1/messages) instead of translating it.
-	NativeResponses bool
-	NativeMessages  bool
+	// APIFlavors / ResponsesMode / MessagesMode are the EFFECTIVE API-variant
+	// capability + endpoint modes for this request: the resolved application's
+	// values for an ordinary app, or the resolved RuntimeSpec's values for a
+	// server_agent mapping that has a spec (the app's values when it has none —
+	// see targetFrom). The dispatch layer (native_passthrough) reads them to pick
+	// disabled / translate / pass-through and to enforce responsesServed /
+	// messagesServed.
+	APIFlavors    []string
+	ResponsesMode EndpointMode
+	MessagesMode  EndpointMode
 	// OpportunisticMetrics mirrors the resolved application's per-app toggle: when
 	// set, a successful real inference EWMA-updates the served mapping's throughput
 	// metrics from the usage event.
@@ -251,6 +255,7 @@ type resolverStore interface {
 	ApplicationByID(ctx context.Context, id string) (Application, error)
 	AIServerByID(ctx context.Context, id string) (AIServer, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
+	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
 }
 
 type Resolver struct {
@@ -385,7 +390,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		}
 	}
 	if token.ID != "" {
-		target, ok, err := r.resolveAffinity(ctx, key, now)
+		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, now)
 		if err != nil {
 			return Target{}, err
 		}
@@ -417,6 +422,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	if err != nil {
 		return Target{}, err
 	}
+	candidates = filterServesEndpoint(candidates, req.APIFlavor)
 	if len(candidates) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
@@ -470,7 +476,10 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		if !ok {
 			return Target{}, ErrNoHealthyHost
 		}
-		target := targetFrom(selected.Server, selected.Application, selected.Mapping, apiFlavor)
+		target, err := r.targetFrom(ctx, selected.Server, selected.Application, selected.Mapping, apiFlavor)
+		if err != nil {
+			return Target{}, err
+		}
 		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 {
 			if err := r.store.UpsertAffinity(ctx, RouteAffinity{
 				ID:            affinityID(key),
@@ -513,6 +522,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 			mine = append(mine, c)
 		}
 	}
+	mine = filterServesEndpoint(mine, req.APIFlavor)
 	if len(mine) == 0 {
 		return Target{}, ErrServerOverrideModelUnavailable
 	}
@@ -535,7 +545,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	// One server usually offers exactly one mapping for a given gateway model; pick the
 	// first (deterministic: the store's ActiveMappingsForModel result is stably ordered).
 	c := mine[0]
-	return targetFrom(c.Server, c.Application, c.Mapping, apiFlavor), nil
+	return r.targetFrom(ctx, c.Server, c.Application, c.Mapping, apiFlavor)
 }
 
 // filterProvisioned drops candidates whose server the principal may not use under
@@ -568,6 +578,24 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 	return out, nil
 }
 
+// filterServesEndpoint drops candidates whose application does not serve the
+// request's FINE api flavor once the per-endpoint mode is applied. It refines only
+// the two coding-agent endpoints (openai_responses / anthropic_messages); for
+// openai_chat_completions and any coarse flavor it is a no-op, so the coarse
+// openai/anthropic gate the store already applied stands unchanged.
+func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []MappingCandidate {
+	if fineFlavor != "openai_responses" && fineFlavor != "anthropic_messages" {
+		return cands
+	}
+	out := cands[:0:0]
+	for _, c := range cands {
+		if applicationServesEndpoint(c.Application, fineFlavor) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func NormalizeAPIFlavor(apiFlavor string) string {
 	normalized := strings.ToLower(strings.TrimSpace(apiFlavor))
 	switch {
@@ -580,7 +608,7 @@ func NormalizeAPIFlavor(apiFlavor string) string {
 	}
 }
 
-func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, now time.Time) (Target, bool, error) {
+func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, now time.Time) (Target, bool, error) {
 	affinity, ok, err := r.store.Affinity(ctx, key)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("lookup affinity: %w", err)
@@ -600,7 +628,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, now tim
 	if err != nil {
 		return Target{}, false, fmt.Errorf("load affinity application: %w", err)
 	}
-	if app.AffinityTTLSeconds <= 0 || app.ServerID != affinity.ServerID || app.Status != ServerStatusActive || !applicationHasAPIFlavor(app, key.APIFlavor) || (r.checker != nil && !r.checker.Reachable(app.ID)) {
+	if app.AffinityTTLSeconds <= 0 || app.ServerID != affinity.ServerID || app.Status != ServerStatusActive || !applicationServesEndpoint(app, fineFlavor) || (r.checker != nil && !r.checker.Reachable(app.ID)) {
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
@@ -633,7 +661,11 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, now tim
 	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
 		return Target{}, false, fmt.Errorf("update affinity: %w", err)
 	}
-	return targetFrom(server, app, mapping, key.APIFlavor), true, nil
+	target, err := r.targetFrom(ctx, server, app, mapping, key.APIFlavor)
+	if err != nil {
+		return Target{}, false, err
+	}
+	return target, true, nil
 }
 
 // estInputTokens is a deliberately LENIENT estimate of a request's prompt token count
@@ -887,7 +919,22 @@ func serverSelectable(server AIServer) bool {
 	return server.Status == ServerStatusActive && server.HealthStatus != HealthUnhealthy
 }
 
-func targetFrom(server AIServer, app Application, mapping ModelMapping, apiFlavor string) Target {
+// targetFrom builds the Target for a resolved (server, app, mapping) triple. For an
+// ordinary application the effective flavors/modes are the application's own; for a
+// server_agent mapping the RESOLVED RuntimeSpec is the sole authority for its model's
+// flavors + endpoint modes (the app's values are only the fallback for a mapping that
+// has no spec at all — design §3.3/§4).
+func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Application, mapping ModelMapping, apiFlavor string) (Target, error) {
+	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
+	if app.Type == ProviderServerAgent {
+		spec, ok, err := r.store.RuntimeSpecByMapping(ctx, mapping.ID)
+		if err != nil {
+			return Target{}, fmt.Errorf("load runtime spec: %w", err)
+		}
+		if ok {
+			flavors, responsesMode, messagesMode = spec.APIFlavors, spec.ResponsesMode, spec.MessagesMode
+		}
+	}
 	return Target{
 		RouteID:              mapping.ID,
 		ServerID:             server.ID,
@@ -899,10 +946,11 @@ func targetFrom(server AIServer, app Application, mapping ModelMapping, apiFlavo
 		APIFlavor:            apiFlavor,
 		APIToken:             app.APIToken,
 		APITokenHeader:       app.APITokenHeader,
-		NativeResponses:      app.NativeResponses,
-		NativeMessages:       app.NativeMessages,
+		APIFlavors:           append([]string(nil), flavors...),
+		ResponsesMode:        responsesMode,
+		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
-	}
+	}, nil
 }
 
 func affinityID(key AffinityKey) string {
@@ -952,7 +1000,7 @@ const modeClimbUp = "climb_up"
 // The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
 // no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
 // before those settings existed.
-func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
 	cands, err = r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve member mappings: %w", err)
@@ -961,6 +1009,7 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 	if err != nil {
 		return nil, false, err
 	}
+	cands = filterServesEndpoint(cands, fineFlavor)
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
@@ -1025,7 +1074,7 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
 func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, policy)
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, policy)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
@@ -1063,14 +1112,14 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
 // priority-ordered walk stops at the first available member. That is the price of the
 // ordering, and only groups that opt into it pay it.
-func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, policy GroupPolicy) ([]GroupMember, error) {
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, policy GroupPolicy) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
 		}
 		best := 0.0
-		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, policy)
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -1298,7 +1347,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.policy)
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
@@ -1310,7 +1359,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
 			return Target{}, err
 		}
-		return targetFrom(sel.Server, sel.Application, sel.Mapping, g.apiFlavor), nil
+		return r.targetFrom(ctx, sel.Server, sel.Application, sel.Mapping, g.apiFlavor)
 	}
 
 	// The pin (and, under climb_up, the climb dance) decides this turn's member; an empty

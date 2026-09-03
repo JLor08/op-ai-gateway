@@ -6,6 +6,7 @@ package routing
 import (
 	"context"
 	"op-ai-gateway/internal/auth"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -322,7 +323,7 @@ func TestResolverGroupSpeedOrderPriorityIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("baseline Resolve: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("explicit-priority target differs from no-setting target:\n got=%#v\nwant=%#v", got, want)
 	}
 }

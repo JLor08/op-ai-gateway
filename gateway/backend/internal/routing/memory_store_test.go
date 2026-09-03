@@ -1467,3 +1467,34 @@ func TestMemoryStoreUpsertCertificateRejectsUnknownServer(t *testing.T) {
 		t.Fatalf("UpsertCertificate with a known server_id must succeed: %v", err)
 	}
 }
+
+func TestMemoryStoreRuntimeSpecIsolatesAPIFlavors(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	m := NewMemoryStore()
+	must(t, m.CreateAIServer(ctx, AIServer{ID: "srv_1", Domain: "h", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}))
+	must(t, m.CreateApplication(ctx, Application{ID: "app_1", ServerID: "srv_1", Type: ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI}, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must(t, m.CreateMapping(ctx, ModelMapping{ID: "map_1", ApplicationID: "app_1", GatewayModelName: "m", AppModelName: "m", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+
+	spec := RuntimeSpec{ID: "spec_1", MappingID: "map_1", APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic}, ResponsesMode: EndpointModePassthrough, MessagesMode: EndpointModeTranslate, CreatedAt: now, UpdatedAt: now}
+	must(t, m.UpsertRuntimeSpec(ctx, spec))
+
+	spec.APIFlavors[0] = "mutated" // caller mutates its own slice AFTER the write
+	got, ok, err := m.RuntimeSpecByMapping(ctx, "map_1")
+	must(t, err)
+	if !ok {
+		t.Fatal("spec not found")
+	}
+	if got.APIFlavors[0] != APIFlavorOpenAI {
+		t.Fatalf("UpsertRuntimeSpec leaked the caller slice: %#v", got.APIFlavors)
+	}
+	if got.ResponsesMode != EndpointModePassthrough || got.MessagesMode != EndpointModeTranslate {
+		t.Fatalf("modes not round-tripped: %q / %q", got.ResponsesMode, got.MessagesMode)
+	}
+	got.APIFlavors[1] = "mutated2" // caller mutates the RETURNED slice
+	again, _, err := m.RuntimeSpecByMapping(ctx, "map_1")
+	must(t, err)
+	if again.APIFlavors[1] != APIFlavorAnthropic {
+		t.Fatalf("RuntimeSpecByMapping leaked a mutable slice: %#v", again.APIFlavors)
+	}
+}

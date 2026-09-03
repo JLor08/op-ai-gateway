@@ -8,6 +8,7 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -117,7 +118,7 @@ func TestResolverGroupSeamNoOpForNonGroupModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("group-seam Resolve: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("non-group target differs with a group seam:\n got=%#v\nwant=%#v", got, want)
 	}
 }
