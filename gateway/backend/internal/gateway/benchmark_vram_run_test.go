@@ -773,18 +773,18 @@ func TestVRAMIsolationConfirmsAnIdleSiblingWithoutAnyTransition(t *testing.T) {
 		RuntimeStatusDTO{SpecID: "rspec_sib", State: "stopped"},
 	)
 
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, live, vramIsolationBindDelay)
-	if !ok {
-		t.Fatalf("isolation timed out; evidence = %v", evidence)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_sib", "rspec_target"}, live, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay})
+	if !isolation.confirmed {
+		t.Fatalf("isolation timed out; evidence = %v", isolation.evidence)
 	}
-	if evidence["rspec_target"] != vramEvidenceStoppedAfterWrite {
-		t.Fatalf("target evidence = %q, want %q", evidence["rspec_target"], vramEvidenceStoppedAfterWrite)
+	if isolation.evidence["rspec_target"] != vramEvidenceStoppedAfterWrite {
+		t.Fatalf("target evidence = %q, want %q", isolation.evidence["rspec_target"], vramEvidenceStoppedAfterWrite)
 	}
-	if evidence["rspec_sib"] != vramEvidenceNoProcessAtWrite {
-		t.Fatalf("idle sibling evidence = %q, want %q", evidence["rspec_sib"], vramEvidenceNoProcessAtWrite)
+	if isolation.evidence["rspec_sib"] != vramEvidenceNoProcessAtWrite {
+		t.Fatalf("idle sibling evidence = %q, want %q", isolation.evidence["rspec_sib"], vramEvidenceNoProcessAtWrite)
 	}
-	if !vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, evidence) {
+	if !vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, isolation.evidence) {
 		t.Fatal("both specs carry this run's own evidence, so isolation must be confirmed")
 	}
 }
@@ -819,17 +819,17 @@ func TestVRAMIsolationDoesNotTakeASelfExitAsAnAppliedOverride(t *testing.T) {
 
 	bind := 150 * time.Millisecond
 	start := time.Now()
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_target"}, live, bind)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_target"}, live, vramIsolationProofPolicy{bindDelay: bind})
 	elapsed := time.Since(start)
-	if !ok {
-		t.Fatalf("isolation timed out; evidence = %v", evidence)
+	if !isolation.confirmed {
+		t.Fatalf("isolation timed out; evidence = %v", isolation.evidence)
 	}
 	if elapsed < bind {
 		t.Fatalf("the set was confirmed after %v, before the %v binding delay elapsed: a self-exit was read as an applied override", elapsed, bind)
 	}
-	if evidence["rspec_target"] != vramEvidenceStoppedAfterWrite {
-		t.Fatalf("target evidence = %q, want %q", evidence["rspec_target"], vramEvidenceStoppedAfterWrite)
+	if isolation.evidence["rspec_target"] != vramEvidenceStoppedAfterWrite {
+		t.Fatalf("target evidence = %q, want %q", isolation.evidence["rspec_target"], vramEvidenceStoppedAfterWrite)
 	}
 }
 
@@ -861,9 +861,9 @@ func TestVRAMIsolationRefusesASpecTheAgentRestartedInsideTheBindingDelay(t *test
 	vramIsolationDrainBound = 100 * time.Millisecond
 	defer func() { vramIsolationDrainBound = oldBound }()
 
-	if evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_target"}, live, 150*time.Millisecond); ok {
-		t.Fatalf("a spec the agent restarted inside the binding delay was reported isolated: %v", evidence)
+	if isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_target"}, live, vramIsolationProofPolicy{bindDelay: 150 * time.Millisecond}); isolation.confirmed {
+		t.Fatalf("a spec the agent restarted inside the binding delay was reported isolated: %v", isolation.evidence)
 	}
 }
 
@@ -886,15 +886,15 @@ func TestVRAMIsolationIgnoresAStaleStoppedFrame(t *testing.T) {
 	vramIsolationDrainBound = 60 * time.Millisecond
 	defer func() { vramIsolationDrainBound = oldBound }()
 
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationBindDelay)
-	if ok {
-		t.Fatalf("a stale snapshot was accepted as this run's own evidence: %v", evidence)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay})
+	if isolation.confirmed {
+		t.Fatalf("a stale snapshot was accepted as this run's own evidence: %v", isolation.evidence)
 	}
-	if len(evidence) != 0 {
-		t.Fatalf("evidence = %v, want none", evidence)
+	if len(isolation.evidence) != 0 {
+		t.Fatalf("evidence = %v, want none", isolation.evidence)
 	}
-	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, evidence) {
+	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, isolation.evidence) {
 		t.Fatal("Isolated must be false without this run's own evidence")
 	}
 }
@@ -912,18 +912,18 @@ func TestVRAMIsolationWaitsOutTheBindingDelayBeforeClaimingNoProcess(t *testing.
 
 	bind := 120 * time.Millisecond
 	start := time.Now()
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, bind)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationProofPolicy{bindDelay: bind})
 	elapsed := time.Since(start)
-	if !ok {
-		t.Fatalf("isolation timed out; evidence = %v", evidence)
+	if !isolation.confirmed {
+		t.Fatalf("isolation timed out; evidence = %v", isolation.evidence)
 	}
 	if elapsed < bind {
 		t.Fatalf("no_process_at_write recorded after %v, before the %v binding delay elapsed", elapsed, bind)
 	}
 	for _, specID := range []string{"rspec_sib", "rspec_target"} {
-		if evidence[specID] != vramEvidenceNoProcessAtWrite {
-			t.Fatalf("%s evidence = %q, want %q", specID, evidence[specID], vramEvidenceNoProcessAtWrite)
+		if isolation.evidence[specID] != vramEvidenceNoProcessAtWrite {
+			t.Fatalf("%s evidence = %q, want %q", specID, isolation.evidence[specID], vramEvidenceNoProcessAtWrite)
 		}
 	}
 }
@@ -944,17 +944,17 @@ func TestVRAMIsolationTimesOutOnASpecStillRunning(t *testing.T) {
 	vramIsolationDrainBound = 80 * time.Millisecond
 	defer func() { vramIsolationDrainBound = oldBound }()
 
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{"rspec_sib": true}, vramIsolationBindDelay)
-	if ok {
-		t.Fatalf("a still-running sibling was reported isolated: %v", evidence)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{"rspec_sib": true}, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay})
+	if isolation.confirmed {
+		t.Fatalf("a still-running sibling was reported isolated: %v", isolation.evidence)
 	}
 	// The target IS confirmed -- partial evidence is still recorded, so the
 	// report can be audited -- but the set is not confirmed.
-	if evidence["rspec_target"] != vramEvidenceNoProcessAtWrite {
-		t.Fatalf("target evidence = %q", evidence["rspec_target"])
+	if isolation.evidence["rspec_target"] != vramEvidenceNoProcessAtWrite {
+		t.Fatalf("target evidence = %q", isolation.evidence["rspec_target"])
 	}
-	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, evidence) {
+	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, isolation.evidence) {
 		t.Fatal("Isolated must be false while one spec is still running")
 	}
 }
@@ -974,9 +974,9 @@ func TestVRAMIsolationRefusesAnUnrecognizedState(t *testing.T) {
 	vramIsolationDrainBound = 60 * time.Millisecond
 	defer func() { vramIsolationDrainBound = oldBound }()
 
-	if evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_target"}, map[string]bool{}, vramIsolationBindDelay); ok {
-		t.Fatalf("an unrecognized state was accepted as evidence: %v", evidence)
+	if isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_target"}, map[string]bool{}, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay}); isolation.confirmed {
+		t.Fatalf("an unrecognized state was accepted as evidence: %v", isolation.evidence)
 	}
 }
 

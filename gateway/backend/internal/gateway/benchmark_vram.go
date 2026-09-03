@@ -21,24 +21,62 @@ const benchmarkKindVRAM = "vram"
 // evidence, because a file-mode agent never reads the document that write
 // lands in, so every such write succeeds while stopping nothing.
 const (
-	// BOTH values are recorded only from a frame that arrived after the
-	// agent's own binding delay elapsed (vramIsolationBindDelay). Neither is
-	// evidence before then: no push is acknowledged anywhere, so until the
-	// agent's guaranteed poll has had time to happen the gateway does not know
-	// the document reached it, and every observation in that window is
-	// compatible with an override that never arrived.
+	// NEITHER value is recorded from a frame the isolation wait has not
+	// ADMITTED, and admissibility is where "the agent is holding this
+	// document" is established -- once per run, in one place, by whichever of
+	// the two standards of proof applies (VRAMReport.IsolationProof). Until
+	// then no observation says anything about this run: an override that never
+	// arrived is compatible with everything on the wire.
 
 	// vramEvidenceStoppedAfterWrite: a spec that HAD a live process when the
-	// write landed is in a no-process state on a post-delay frame. A stopped
+	// write landed is in a no-process state on an admissible frame. A stopped
 	// frame that predates the write proves nothing -- and neither does one from
-	// inside the binding delay, because a spec's own exit (an idle timeout, a
-	// crash into `crashed`/`backoff`, both of which the agent restarts from)
-	// looks identical to an applied override.
+	// before the override is known to have landed, because a spec's own exit
+	// (an idle timeout, a crash into `crashed`/`backoff`, both of which the
+	// agent restarts from) looks identical to an applied override.
 	vramEvidenceStoppedAfterWrite = "stopped_after_write"
 	// vramEvidenceNoProcessAtWrite: the spec had no live process when the write
 	// landed, and force_stopped refuses its restart -- a claim about a document
-	// the agent has to be holding, hence the same post-delay rule.
+	// the agent has to be holding, hence the same admissibility rule.
 	vramEvidenceNoProcessAtWrite = "no_process_at_write"
+)
+
+// WHAT PROVED THE OVERRIDE LANDED. Two values, and they are DIFFERENT
+// STRENGTHS OF EVIDENCE, which is the whole reason the report names one
+// instead of leaving the reader to assume the stronger:
+//
+//   - the agent stated which document it had applied, and it was one this run
+//     had verified force-stops the whole fleet; or
+//   - nothing stated anything, and the run waited out the agent's guaranteed
+//     poll interval and then observed no process.
+//
+// An operator weighing a number needs to know which of those they got, and
+// they need it on the REPORT rather than only in a log: the second is an
+// inference from an absence, and it is exactly the inference an
+// unacknowledged protocol forced on every run before this.
+//
+// IT IS ONE FIELD RATHER THAN A DOUBLED EVIDENCE VOCABULARY, and the reason is
+// worth stating because the other shape looks tempting. The proof is a
+// property of the RUN, not of a spec: the isolation wait applies one standard
+// for its whole duration (an agent either declared the acknowledgement feature
+// before the run started or it did not), so a per-spec encoding would repeat
+// one value N times and invite the copies to disagree. Crossing "which proof"
+// with "what happened to the process" would also make the evidence set
+// combinatorial, and a third standard is already foreseen -- the deferred
+// agent-side "measure now, isolated" capability -- which would double it
+// again. Two orthogonal facts, two fields.
+const (
+	// vramProofConfigAcknowledged: the agent reported having APPLIED a
+	// runtime-config document that this run derived and verified still carries
+	// force_stopped on every enumerated spec. The ETag is a content digest, so
+	// equality against a gateway-derived value is a real proof rather than a
+	// shared counter.
+	vramProofConfigAcknowledged = "config_acknowledged"
+	// vramProofBindDelay: the agent never acknowledges (it has not declared
+	// runtimeConfigAckFeature), so the run waited out its guaranteed
+	// runtime-poll interval and then read the status stream. Weaker, and the
+	// only standard available for an older agent.
+	vramProofBindDelay = "bind_delay"
 )
 
 // The VRAM run's inconclusive reasons: it ran and reached no number. Empty
@@ -56,6 +94,22 @@ const (
 	// delta is below the noise floor. No model costs ~0 MB, and 0 means
 	// UNKNOWN everywhere else in this feature, so it must mean it here too.
 	vramInconclusiveBelowFloor = "below_floor"
+	// vramInconclusiveIsolationUnacknowledged: the agent DECLARED that it
+	// reports which runtime-config document it has applied, and then never
+	// acknowledged one that carries this run's overrides within the bound.
+	//
+	// It is its own reason rather than an isolation_timeout because the
+	// operator's next action is different, and the difference is the whole
+	// diagnostic value of the acknowledgement. `isolation_timeout` says the
+	// document landed and a MODEL would not go quiet -- look at that model.
+	// This says the document never landed at all: the agent is not reconciling
+	// (wedged, mid-restart, or holding a document it cannot apply), so the
+	// place to look is the agent, not the fleet. It also covers the honest
+	// remainder of the mid-run downgrade: an agent that declared the feature at
+	// trigger time and stopped declaring it before the wait ended costs one
+	// bounded wait and is named, rather than silently dropping to the weaker
+	// standard halfway through a proof.
+	vramInconclusiveIsolationUnacknowledged = "isolation_unacknowledged"
 	// vramInconclusiveNoSamples: GPU samples STOPPED arriving mid-run. A server
 	// with no GPU samples at all is refused before the run starts.
 	vramInconclusiveNoSamples = "no_samples"
@@ -111,6 +165,15 @@ type VRAMReport struct {
 	// missing entry, or any other value, means NOT isolated. It is reported
 	// alongside the boolean so Isolated can be audited rather than believed.
 	IsolationEvidence map[string]string `json:"isolation_evidence,omitempty"`
+	// IsolationProof is WHICH STANDARD OF PROOF the isolation wait applied --
+	// vramProofConfigAcknowledged or vramProofBindDelay -- and it is recorded
+	// whether or not the isolation was confirmed, so a timeout says which
+	// standard failed rather than leaving the reader to guess.
+	//
+	// It is not redundant with Isolated: that boolean says the evidence was
+	// complete, this says how strong the evidence was allowed to be. The two
+	// are read together, which is why they travel together.
+	IsolationProof string `json:"isolation_proof,omitempty"`
 	// DrainedSpecIDs is what this run force-stopped. It is reported so the
 	// portal can name the fleet an operator must clear by hand if the gateway
 	// dies between the drain and the restore.

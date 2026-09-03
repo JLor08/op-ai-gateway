@@ -28,7 +28,13 @@ import (
 // set before telling a portal log view that a live stream is possible
 // (Server.runtimeLogState). An agent needs no permission to answer a command
 // it was sent.
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature}
+//
+// runtime_config_ack is the same shape as runtime_logs: declared for
+// completeness, decided in the other direction. The gateway consults the
+// AGENT's declared set before it will wait for an applied-config
+// acknowledgement instead of blindly waiting out the agent's poll interval
+// (runtimeConfigAckFeature, agent_runtime.go).
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature}
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

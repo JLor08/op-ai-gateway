@@ -69,6 +69,16 @@ const (
 	// does not even begin until then and the server is held for correspondingly
 	// longer. The run says so rather than refusing, which would cost the run
 	// for the same result.
+	//
+	// IT EARNED ITS KEEP WITH THE ACKNOWLEDGEMENT. While the binding delay was
+	// unconditional this warning predicted nothing an operator could act on:
+	// every run paid a full poll interval whether the socket was open or not.
+	// Now it is the one thing that separates a run that finishes in seconds
+	// (acknowledging agent, push delivered) from one that still takes a minute
+	// (acknowledging agent, no socket, so the drain waits for the poll before
+	// there is anything to acknowledge). Do not read its presence as a
+	// weakening of the EVIDENCE, though -- the proof is the same either way;
+	// what it changes is only how long the fleet is held.
 	vramWarningPostTransportAgent = "post_transport_agent"
 	// vramWarningResidencyUnknown: the run could not check whether the target
 	// model was ALREADY being served by something it had not stopped, so the
@@ -91,28 +101,44 @@ const (
 // coldLoadPollGap precedent) so tests shorten them, and each needs validating
 // against a real fleet before it is treated as settled.
 var (
-	// vramIsolationBindDelay is how long the agent is given to have APPLIED
-	// this run's overrides before any spec is recorded as isolated. It is the
-	// agent's own runtime-poll interval (agent/agent.go's
-	// runtimePollInterval), and it is TRANSPORT-INDEPENDENT on purpose.
+	// vramIsolationBindDelay is the FALLBACK standard of proof: how long an
+	// agent that never acknowledges is given to have APPLIED this run's
+	// overrides before any spec is recorded as isolated. It is the agent's own
+	// runtime-poll interval (agent/agent.go's runtimePollInterval), and it is
+	// TRANSPORT-INDEPENDENT on purpose.
 	//
-	// It used to be two values, picked by AgentStreams.hasConn: two seconds for
-	// a WS-connected agent, the poll interval otherwise. That gave the WS push
-	// the standing of a delivery, and it has none. There is no acknowledgement
-	// anywhere in this protocol (§3.5), the push runs in a detached goroutine
-	// that returns silently when the derive or the marshal fails, and
-	// NotifyRuntimeConfig sends to zero connections when the socket closed
-	// after the probe or drops the frame with a slog.Debug when a send queue
-	// is full -- in each case the override binds on the next poll anyway, while
-	// the run had already confirmed the fleet and reported Isolated: true. The
-	// probe was also taken BEFORE the drain wrote anything, so even a truthful
-	// answer said nothing about the transport at write time.
+	// IT IS NO LONGER THE ONLY STANDARD, and that is the point of
+	// runtimeConfigAckFeature. An agent that declares that name reports which
+	// runtime-config document it has applied, so the wait can PROVE the
+	// override landed -- in a fraction of a second, and against a content
+	// digest -- instead of inferring it from a clock plus the absence of a
+	// process. This delay is what remains for an agent that declares nothing:
+	// the negotiation is by name and never by version (ADR-025), so an older
+	// binary in the field keeps exactly today's behaviour rather than hanging.
+	//
+	// It also stays half of the wait's total BOUND for both standards (see
+	// vramAwaitIsolation): the acknowledgement removes the blind delay from
+	// what counts as evidence, not from the budget a slow drain is allowed.
+	//
+	// Why an unconditional interval, for the fallback, and not something
+	// shorter for a WS-connected agent: it used to be two values, picked by
+	// AgentStreams.hasConn -- two seconds with an open socket, the poll interval
+	// otherwise. That gave the WS push the standing of a delivery, and it has
+	// none. The push runs in a detached goroutine that returns silently when
+	// the derive or the marshal fails, and NotifyRuntimeConfig sends to zero
+	// connections when the socket closed after the probe or drops the frame
+	// with a slog.Debug when a send queue is full -- in each case the override
+	// binds on the next poll anyway, while the run had already confirmed the
+	// fleet and reported Isolated: true. The probe was also taken BEFORE the
+	// drain wrote anything, so even a truthful answer said nothing about the
+	// transport at write time. An acknowledgement is the opposite of that probe
+	// in every respect: it is sent AFTER the agent reconciled, it names the
+	// document, and it cannot be true of a document the agent is not holding.
 	//
 	// The poll is the one delivery mechanism that is guaranteed: the agent
 	// re-fetches the whole document on every poll and on every reconnect, so
-	// one interval measured from the write always covers a full cycle. An open
-	// WebSocket makes the push likely to arrive sooner, and NOTHING here rests
-	// on it; what it still decides is the operator-facing warning
+	// one interval measured from the write always covers a full cycle. What an
+	// open WebSocket still decides is the operator-facing warning
 	// (vramWarningPostTransportAgent), because a drain that does not even begin
 	// for a minute is worth telling them about.
 	vramIsolationBindDelay = 60 * time.Second
@@ -148,7 +174,16 @@ type vramRunPlanned struct {
 	// application, ascending, THE TARGET AMONG THEM.
 	specIDs   []string
 	bindDelay time.Duration
-	warnings  []string
+	// acknowledged is whether this server's agent DECLARED that it reports the
+	// runtime-config document it has applied (runtimeConfigAckFeature), i.e.
+	// whether an acknowledgement will ever arrive at all. It decides which
+	// standard of proof the isolation wait applies, and it is read ONCE here,
+	// before anything is written -- the same discipline as warnings below. A
+	// mid-run downgrade therefore costs one bounded wait and is NAMED
+	// (vramInconclusiveIsolationUnacknowledged) rather than silently switching
+	// the evidence standard halfway through a proof.
+	acknowledged bool
+	warnings     []string
 	// baseline is the latest GPU-bearing sample the preconditions read. It
 	// decides which cards are watched and supplies each card's fingerprint;
 	// the actual baseline numbers come from a fresh stable window.
@@ -283,11 +318,14 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		return vramRunPlanned{}, err
 	}
 
-	// The binding delay is the agent's guaranteed poll interval, WHATEVER the
-	// transport looks like -- an unacknowledged push cannot shorten it (see
-	// vramIsolationBindDelay). Q10's answer therefore reduces to its warning
-	// half: an agent with no open WebSocket is told about, never refused.
+	// Which standard of proof this run may apply, and the fallback bound for
+	// the standard that is not a proof at all. An UNACKNOWLEDGED push cannot
+	// shorten the binding delay (see vramIsolationBindDelay); a declared
+	// acknowledgement replaces it outright. Q10's answer therefore reduces to
+	// its warning half either way: an agent with no open WebSocket is told
+	// about, never refused.
 	planned.bindDelay = vramIsolationBindDelay
+	planned.acknowledged = s.AgentFeatures.Has(serverID, runtimeConfigAckFeature)
 	planned.warnings = s.vramPlanWarnings(ctx, serverID, tgt.app.ID)
 	// The Apple label. The gateway is hardware-agnostic everywhere else, but
 	// a figure read from unified SYSTEM memory reported as VRAM is a wrong
@@ -457,6 +495,18 @@ func (s *Server) vramLiveProcessBySpec(serverID string) map[string]bool {
 	return out
 }
 
+// vramAdminStateForceStopped is the admin override this run writes, and -- as
+// of the acknowledgement -- also READS BACK: vramDocumentDrains checks the
+// derived document for it before an agent's acknowledgement of that document
+// is allowed to prove anything. A literal that is both written and compared
+// against in two files is exactly the one worth naming once.
+//
+// It is a value of portal's own closed admin_state set (putRuntimeSpec's
+// "", "force_running", "force_stopped" switch), mirrored here rather than
+// exported for the same reason vramStatesNoProcess mirrors the agent's state
+// set: a closed set is worth stating independently on the side that reads it.
+const vramAdminStateForceStopped = "force_stopped"
+
 // vramDrain writes admin_state: force_stopped to every spec, THE TARGET AMONG
 // THEM, and returns what it actually wrote so the caller's deferred restore
 // clears exactly that set.
@@ -476,7 +526,7 @@ func (s *Server) vramLiveProcessBySpec(serverID string) map[string]bool {
 func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, error) {
 	drained := make([]string, 0, len(specIDs))
 	for _, specID := range specIDs {
-		if _, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, specID, "", "force_stopped"); err != nil {
+		if _, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, specID, "", vramAdminStateForceStopped); err != nil {
 			return drained, err
 		}
 		drained = append(drained, specID)
@@ -484,9 +534,96 @@ func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, err
 	return drained, nil
 }
 
+// vramIsolationProofPolicy is WHICH STANDARD OF PROOF the isolation wait must
+// apply, decided once by the plan and never re-read inside the wait.
+//
+// The two are not alternatives of equal standing (see
+// vramProofConfigAcknowledged / vramProofBindDelay): the first is a proof, the
+// second is an inference from a clock. Which one applies is not a tuning knob
+// either -- it is what the agent's declared feature set makes possible.
+type vramIsolationProofPolicy struct {
+	// acknowledged: the agent declared runtimeConfigAckFeature, so it reports
+	// which runtime-config document it has APPLIED and the wait may demand
+	// that proof. When false the wait keeps the pre-acknowledgement behaviour
+	// byte for byte, and performs no store read at all.
+	acknowledged bool
+	// bindDelay is the fallback's own evidence threshold AND half of the total
+	// bound under both standards -- see vramAwaitIsolation.
+	bindDelay time.Duration
+}
+
+// vramIsolationPolicyOf is the ONE place the plan's boolean is turned into a
+// standard of proof. The wait's policy and the report's string both come from
+// the value it returns, which is what makes them incapable of disagreeing.
+//
+// They used to be two independent reads of plan.acknowledged, one at the
+// report's IsolationProof and one at the wait's argument, and that is the one
+// divergence this whole feature must not permit: the report could claim
+// "the agent confirmed it applied this document" while the wait had in fact
+// applied the timed fallback. Nothing about the plan changes between the two
+// statements, so the drift would never have come from data -- it would have
+// come from an edit to one of the two lines. Removing the second line removes
+// the class.
+func vramIsolationPolicyOf(plan vramRunPlanned) vramIsolationProofPolicy {
+	return vramIsolationProofPolicy{acknowledged: plan.acknowledged, bindDelay: plan.bindDelay}
+}
+
+// proof names the standard THIS policy applies, for the report. It is a method
+// on the policy rather than a function of the plan so the string is derived
+// from the very value the wait was handed -- see vramIsolationPolicyOf.
+func (p vramIsolationProofPolicy) proof() string {
+	if p.acknowledged {
+		return vramProofConfigAcknowledged
+	}
+	return vramProofBindDelay
+}
+
+// vramIsolationResult is everything the isolation wait established: the
+// per-spec evidence it recorded, whether the whole enumerated set was
+// confirmed, and -- when it was not -- WHICH failure this was.
+//
+// One struct rather than three positional returns because the third value is
+// new and easy to drop at a call site: `reason` distinguishes three different
+// operator actions (isolation_timeout, isolation_unacknowledged,
+// isolation_lost) and a caller that ignored it would send every operator to
+// inspect the wrong thing.
+type vramIsolationResult struct {
+	// evidence is spec id -> label, and is populated even on a failure:
+	// partial evidence is returned so the report can be audited rather than
+	// believed.
+	evidence map[string]string
+	// confirmed is true only when every enumerated spec earned evidence.
+	confirmed bool
+	// reason is the vramInconclusive* value for a wait that did not confirm,
+	// and "" when it did. It is deliberately NOT the run's final inconclusive
+	// reason: the caller must still rule out cancellation first, because every
+	// bounded wait here answers ctx.Done() and its own timer identically (see
+	// vramStoppedByCancellation).
+	reason string
+}
+
 // vramAwaitIsolation waits until every spec carries THIS RUN'S OWN evidence
-// that it is not running, and returns that evidence plus whether the whole set
-// was confirmed. ok == false is a genuine isolation timeout.
+// that it is not running, and returns that evidence plus what it established.
+//
+// TWO STANDARDS OF PROOF, and the whole change is which one is available.
+//
+//   - ACKNOWLEDGED (the agent declared runtimeConfigAckFeature): a frame is
+//     admissible once the agent has reported having APPLIED a runtime-config
+//     document that this run derived and verified still force-stops every
+//     enumerated spec. That is a proof, and it is normally available within
+//     one telemetry interval instead of one poll interval.
+//   - FALLBACK (any other agent): a frame is admissible once
+//     vramIsolationBindDelay has elapsed since the write -- the agent's own
+//     guaranteed poll interval. Unchanged, byte for byte, and it performs no
+//     store read: an older binary is a normal state of the fleet, not a fault,
+//     and a wait that hung on it would make this feature a regression for
+//     every server that has not been upgraded.
+//
+// THE TOTAL BOUND IS THE SAME UNDER BOTH, deliberately: bindDelay plus
+// vramIsolationDrainBound. The acknowledgement removes the blind delay from
+// what counts as EVIDENCE, not from the budget a slow drain is allowed -- a
+// spec whose child takes 40 s to finish its in-flight work needs that budget
+// whether or not the document's arrival was proved.
 //
 // THE WATERMARK, and why it is not a timestamp. A stopped frame that predates
 // this run's write proves nothing, and no frame carries an arrival time of
@@ -498,10 +635,15 @@ func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, err
 // the write. Channel ordering IS the watermark, and it needs no clock
 // comparison between the gateway and the agent.
 //
-// THE BINDING DELAY GATES BOTH HALVES OF THE PARTITION, and that is the whole
-// of what "evidence" means here. Until vramIsolationBindDelay has elapsed
-// since the write, the agent may not hold the document at all, so no frame in
-// that window says anything about this run: the delay is applied first and the
+// The acknowledgement needs no such ordering argument of its own, and that is
+// its second advantage: the ETag is a CONTENT digest, so "the agent is holding
+// a document that force-stops this fleet" is a statement about content rather
+// than about when anything happened. Stale acknowledgements are not admissible
+// by accident -- they name a different document, hence a different digest.
+//
+// ADMISSIBILITY GATES BOTH HALVES OF THE PARTITION, and that is the whole of
+// what "evidence" means here. Until the override is known to have landed, no
+// frame says anything about this run: admissibility is decided first and the
 // partition only afterwards.
 //
 // It used to gate one half only. A spec with no live process was confirmed
@@ -519,27 +661,24 @@ func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, err
 // is up to one telemetry interval old, so a spec that had ALREADY exited before
 // the write can be labelled live -- and under the old order that mislabel
 // bought the delay-free branch, i.e. the stronger label, for exactly the case
-// the delay exists for. With the delay applied first, the misclassification
+// the delay exists for. With admissibility applied first, the misclassification
 // changes which evidence STRING is recorded and nothing else, which is what
 // that function's doc block always claimed.
 //
-// THE PARTITION, and why both halves are still needed. After the delay, a spec
-// that HAD a live process is waited for until a no-process state appears; a
-// spec that had NO live process produces no state change and no frame of its
-// own -- a force_stopped write against it does nothing -- so it can only be
-// CONFIRMED, never awaited. Waiting for a transition that will never arrive is
-// what turns an already-quiet server into an isolation timeout.
+// THE PARTITION, and why both halves are still needed. Once a frame is
+// admissible, a spec that HAD a live process is waited for until a no-process
+// state appears; a spec that had NO live process produces no state change and
+// no frame of its own -- a force_stopped write against it does nothing -- so it
+// can only be CONFIRMED, never awaited. Waiting for a transition that will
+// never arrive is what turns an already-quiet server into an isolation timeout.
 //
-// Partial evidence is returned even on a timeout, so the report can be
-// audited rather than believed.
-//
-// This function owns only the ADMISSIBILITY of a frame -- the watermark, the
-// binding delay, the bound and the cancellation. What an admissible frame
-// proves about each still-pending spec is vramFrameEvidence.
-func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specIDs []string, liveAtWrite map[string]bool, bindDelay time.Duration) (map[string]string, bool) {
-	evidence := map[string]string{}
+// This function owns only the LOOP -- the subscription, the pending set, the
+// bound. Whether a frame is admissible at all is vramIsolationGate; what an
+// admissible frame proves about each still-pending spec is vramFrameEvidence.
+func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specIDs []string, liveAtWrite map[string]bool, proof vramIsolationProofPolicy) vramIsolationResult {
+	out := vramIsolationResult{evidence: map[string]string{}, reason: vramInconclusiveIsolationTimeout}
 	if len(specIDs) == 0 {
-		return evidence, false
+		return out
 	}
 	_, frames, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()
@@ -548,40 +687,298 @@ func (s *Server) vramAwaitIsolation(ctx context.Context, serverID string, specID
 	for _, specID := range specIDs {
 		pending[specID] = struct{}{}
 	}
-	bindDeadline := time.Now().Add(bindDelay)
-	timer := time.NewTimer(bindDelay + vramIsolationDrainBound)
+	gate := s.newVRAMIsolationGate(ctx, serverID, specIDs, proof)
+	timer := time.NewTimer(proof.bindDelay + vramIsolationDrainBound)
 	defer timer.Stop()
 
 	for len(pending) > 0 {
+		frame, reason := vramNextAdmissibleFrame(ctx, frames, timer.C, gate)
+		if reason != "" {
+			out.reason = reason
+			return out
+		}
+		for specID, label := range vramFrameEvidence(frame, pending, liveAtWrite) {
+			out.evidence[specID] = label
+			delete(pending, specID)
+		}
+	}
+	out.confirmed, out.reason = true, ""
+	return out
+}
+
+// vramNextAdmissibleFrame blocks until a runtime-status frame arrives that may
+// be read as this run's own evidence, and returns the reason the wait must stop
+// instead. Exactly one of the two returns is meaningful: a non-empty reason
+// means no frame.
+//
+// Inadmissible frames are consumed and dropped rather than ending the wait --
+// under the fallback standard that is every frame inside the binding delay, and
+// under the acknowledged standard every frame before the agent has confirmed
+// the document. Only the gate's own LOST verdict and the two stop channels end
+// the loop.
+func vramNextAdmissibleFrame(ctx context.Context, frames <-chan []RuntimeStatusDTO, expiry <-chan time.Time, gate *vramIsolationGate) ([]RuntimeStatusDTO, string) {
+	for {
 		select {
 		case <-ctx.Done():
-			return evidence, false
-		case <-timer.C:
-			return evidence, false
+			// A cancelled run and an expired bound are deliberately the same
+			// value here; the caller rules cancellation out before recording
+			// any of them (vramStoppedByCancellation).
+			return nil, vramInconclusiveIsolationTimeout
+		case <-expiry:
+			return nil, gate.expiredReason()
 		case frame, open := <-frames:
 			if !open {
-				return evidence, false
+				return nil, vramInconclusiveIsolationTimeout
 			}
-			if time.Now().Before(bindDeadline) {
-				// The override has not necessarily landed yet, so NOTHING on
-				// this frame is evidence -- for either half of the partition.
-				// See the doc block above.
-				continue
+			if gate.admits(ctx) {
+				return frame, ""
 			}
-			for specID, label := range vramFrameEvidence(frame, pending, liveAtWrite) {
-				evidence[specID] = label
-				delete(pending, specID)
+			if gate.lost {
+				return nil, vramInconclusiveIsolationLost
 			}
 		}
 	}
-	return evidence, true
+}
+
+// vramIsolationGate decides ONE question: may a runtime-status frame be read as
+// evidence that this run's overrides have landed?
+//
+// It is a type rather than a closure because the acknowledged standard carries
+// state across frames -- the set of documents already verified, and the last
+// acknowledgement already answered -- and that state is what keeps the cost at
+// one store read per CHANGE of the reported value rather than one per frame.
+type vramIsolationGate struct {
+	srv      *Server
+	serverID string
+	// specIDs is the enumerated fleet, which is what "still carries this run's
+	// overrides" is checked against.
+	specIDs []string
+	// acknowledged selects the standard. When false only bindDeadline is read
+	// and nothing else in this struct is ever touched.
+	acknowledged bool
+	bindDeadline time.Time
+	// accepted is every document ETag this run has DERIVED and found to still
+	// force-stop every enumerated spec. It grows by at most one entry per
+	// CHANGE of the reported acknowledgement, so the wait's own bound is also
+	// its size bound -- on the order of one entry per telemetry sample in the
+	// pathological case, and one entry in every realistic one.
+	//
+	// IT IS A SET, NOT THE ONE VALUE CAPTURED AFTER THE DRAIN, and that is the
+	// answer to the design trap the ETag's scope creates: the digest covers the
+	// WHOLE document, so any write that reaches the derivation changes it --
+	// and the benchmark's reservation covers only the launch-spec PUT (409
+	// runtime_spec.server_benchmarking), deliberately not the per-GPU budgets,
+	// the co-residency matrix, the process limit, a mapping rename, the agent
+	// application's router port, or the agent's own measured-VRAM write-back
+	// (which the notification rule exempts and which arrives at telemetry
+	// cadence). Pinning the wait to one value would let any of those defeat a
+	// correctly drained fleet: the agent applies the NEW document, reports its
+	// digest, and an equality check against the captured one never matches --
+	// burning the whole bound and reporting a timeout that is a lie.
+	//
+	// Keeping the earlier values rather than only the newest is deliberate
+	// too. An acknowledgement of a document that was current a moment ago is a
+	// perfectly good proof of what it is a proof OF: that document force-stopped
+	// the whole enumerated fleet when this run derived it, and the agent is
+	// reporting that it is the one it has applied.
+	//
+	// WHAT IT IS NOT is a statement about the document the STORE holds now, and
+	// the difference is worth stating because the obvious reading overclaims.
+	// While the agent keeps reporting an ETag already in this set, appliedOurDocument
+	// returns on the set membership and derives nothing -- so a mid-wait
+	// revocation (an operator's "Clear override" on a drained sibling) is
+	// invisible to this gate until the agent reports the NEW document's digest.
+	// That is not a hole, because of what the accepted value still says at the
+	// moment the frame arrives: the agent is holding a document that stops the
+	// fleet, so it has not started the released sibling yet. The revocation is
+	// owned downstream instead -- by the end-of-run re-verification, which reads
+	// the fleet's states again after the measurement (vramInconclusiveIsolationLost),
+	// and by the restore's compare-and-set, which reports a taken-over override
+	// rather than clobbering it. What the gate loses in that window is only the
+	// EARLIEST possible detection, never the detection.
+	accepted map[string]bool
+	// evaluated is the last reported acknowledgement this gate has already
+	// answered AGAINST A SUCCESSFULLY DERIVED DOCUMENT, so a steady stream of
+	// identical acknowledgements -- the normal case, once per telemetry sample
+	// -- costs no store read at all.
+	//
+	// The "successfully derived" half is load-bearing. Recording the value
+	// before the derive was known to have worked meant one transient store
+	// error burned the ONLY chance that acknowledgement had: the agent goes on
+	// reporting it every second, the gate answers from a cache that never
+	// learned anything, and the run reaches its bound reporting an
+	// unacknowledged isolation over a document that had been applied all along.
+	// Re-deriving on every frame while the store is failing is the right cost
+	// -- a failing store is not the steady state, and the wait is bounded.
+	evaluated string
+	// sawAck records that an acknowledgement was once accepted, so an expiry
+	// can tell "the agent never confirmed the document" from "the agent
+	// confirmed it and a spec still would not go quiet". Different operator
+	// actions; see vramInconclusiveIsolationUnacknowledged.
+	sawAck bool
+	// lost records that a freshly derived document NO LONGER force-stops every
+	// enumerated spec. The wait must then stop rather than keep waiting: the
+	// isolation it was about to prove has already been revoked, and confirming
+	// on a later document would report an isolation this run does not have.
+	lost bool
+}
+
+// newVRAMIsolationGate builds the gate for one wait, and -- under the
+// acknowledged standard only -- seeds it with the document as it stands RIGHT
+// NOW, immediately after the drain. That seed is the value a promptly
+// reconciling agent will report, so the common case needs no further derive.
+func (s *Server) newVRAMIsolationGate(ctx context.Context, serverID string, specIDs []string, proof vramIsolationProofPolicy) *vramIsolationGate {
+	gate := &vramIsolationGate{
+		srv: s, serverID: serverID, specIDs: specIDs,
+		acknowledged: proof.acknowledged,
+		bindDeadline: time.Now().Add(proof.bindDelay),
+		accepted:     map[string]bool{},
+	}
+	if gate.acknowledged {
+		_ = gate.admitCurrentDocument(ctx)
+	}
+	return gate
+}
+
+// admits reports whether a frame arriving now may be read as this run's own
+// evidence.
+func (g *vramIsolationGate) admits(ctx context.Context) bool {
+	if !g.acknowledged {
+		// The fallback: the agent may not hold the document until its own poll
+		// interval has passed, so nothing before then says anything.
+		return !time.Now().Before(g.bindDeadline)
+	}
+	if !g.appliedOurDocument(ctx) {
+		return false
+	}
+	g.sawAck = true
+	return true
+}
+
+// appliedOurDocument reports whether the agent's last acknowledgement names a
+// document this run has verified force-stops the whole enumerated fleet.
+//
+// The comparison is against a digest THE GATEWAY DERIVED ITSELF, which is what
+// makes the reported value safe to trust despite being agent-supplied free
+// text: no string an agent invents can equal the hash of a document it is not
+// holding.
+func (g *vramIsolationGate) appliedOurDocument(ctx context.Context) bool {
+	reported := g.srv.RuntimeStatus.AppliedConfigETag(g.serverID)
+	if reported == "" {
+		// No acknowledgement yet -- or an agent that stopped sending one, which
+		// SetAppliedConfigETag turns back into this same absence on the very
+		// next sample rather than leaving a stale confirmation standing.
+		return false
+	}
+	if g.accepted[reported] {
+		// A document this run already derived and found to force-stop the whole
+		// fleet, and the agent says it is the one it holds. No re-derivation:
+		// see the accepted field for what that does and does not settle about a
+		// revocation that has not reached the agent yet.
+		return true
+	}
+	if reported == g.evaluated {
+		// Already answered, and nothing THIS GATE does can change that answer:
+		// the accepted set only ever grows through admitCurrentDocument, which
+		// is the very call this branch skips. Re-deriving on every frame for
+		// the same unmatched value would put a store read on the telemetry
+		// cadence for the whole wait.
+		//
+		// The one thing outside the gate that could change it is the document
+		// returning to exactly the content the agent is reporting -- a mid-wait
+		// write that undoes an earlier one. The outcome is a NON-CONFIRMATION
+		// either way (the reported document was already found not to be one of
+		// ours), so the only cost is precision of the REASON: the wait reports
+		// isolation_unacknowledged where isolation_lost would have been
+		// sharper. Nothing is claimed that is not true, and the revocation
+		// itself is still owned by the end-of-run re-verification and by the
+		// restore's compare-and-set.
+		return false
+	}
+	if g.admitCurrentDocument(ctx) {
+		// Only NOW is this acknowledgement answered: see the evaluated field.
+		g.evaluated = reported
+	}
+	return g.accepted[reported]
+}
+
+// admitCurrentDocument derives serverID's CURRENT runtime-config document and
+// admits its ETag to the accepted set -- but only after checking that the
+// document still force-stops every enumerated spec.
+//
+// That check is what makes re-derivation a proof rather than a convenience. Its
+// FALSE branch is the case an operator's mid-wait "Clear override" or "Force
+// start" produces: the agent then applies a document that lets the sibling
+// start, reports it dutifully, and accepting that acknowledgement would report
+// isolated:true for a run whose isolation had already been revoked.
+//
+// It reports whether the document was DERIVED AT ALL -- not whether its ETag
+// was admitted -- and the caller uses that to decide whether an
+// acknowledgement counts as answered. A derive failure admits nothing, is not
+// fatal, and must be retried rather than remembered: see the evaluated field
+// for the run this got wrong. Logged at Debug, mirroring PushRuntimeConfig's
+// own derive failure.
+func (g *vramIsolationGate) admitCurrentDocument(ctx context.Context) bool {
+	if g.srv.Portal == nil {
+		return false
+	}
+	dto, err := g.srv.Portal.AgentRuntimeConfig(ctx, g.serverID)
+	if err != nil || dto.ETag == "" {
+		slog.Debug("vram benchmark: could not derive the runtime-config document for the isolation wait",
+			"server_id", g.serverID, "err", err)
+		return false
+	}
+	if !vramDocumentDrains(dto, g.specIDs) {
+		g.lost = true
+		return true
+	}
+	g.accepted[dto.ETag] = true
+	return true
+}
+
+// expiredReason names WHICH failure an expired bound was.
+//
+// An agent that declared the acknowledgement feature and never acknowledged a
+// document that drains the fleet is a different fault, with a different next
+// action, from a model that would not go quiet -- see
+// vramInconclusiveIsolationUnacknowledged. Once an acknowledgement HAS been
+// accepted, any later expiry is the ordinary drain timeout again.
+func (g *vramIsolationGate) expiredReason() string {
+	if g.acknowledged && !g.sawAck {
+		return vramInconclusiveIsolationUnacknowledged
+	}
+	return vramInconclusiveIsolationTimeout
+}
+
+// vramDocumentDrains reports whether the runtime-config document force-stops
+// every one of specIDs -- the property an acknowledgement has to be an
+// acknowledgement OF.
+//
+// A spec MISSING from the document fails the check, and that is the fail-closed
+// direction: a spec deleted or disabled mid-wait is no longer in the document,
+// so the document says nothing about it, and "the document does not mention it"
+// is not "the document refuses to start it". (Such a spec is genuinely drained
+// -- a spec the agent is not told about is not run -- but this function's job
+// is to decide what an acknowledgement PROVES, and it may not infer.)
+func vramDocumentDrains(dto portal.AgentRuntimeConfigDTO, specIDs []string) bool {
+	adminState := make(map[string]string, len(dto.Specs))
+	for _, spec := range dto.Specs {
+		adminState[spec.ID] = spec.AdminState
+	}
+	for _, specID := range specIDs {
+		if adminState[specID] != vramAdminStateForceStopped {
+			return false
+		}
+	}
+	return true
 }
 
 // vramFrameEvidence reports what ONE admissible status frame proves about the
 // specs still pending -- spec id to evidence label, empty when the frame moved
 // nothing. The caller has already established that the frame is admissible at
-// all (it arrived on a post-write subscription, and the binding delay has
-// elapsed); this decides only what an admissible frame says.
+// all (it arrived on a post-write subscription, and vramIsolationGate answered
+// yes under whichever standard of proof applies); this decides only what an
+// admissible frame says.
 //
 // It returns the labels rather than writing them, so the wait's own evidence
 // map and pending set are mutated in exactly one place. A spec absent from the
@@ -658,7 +1055,7 @@ func (s *Server) vramRestore(ctx context.Context, drained []string) (failed, tak
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	defer cancel()
 	for _, specID := range drained {
-		_, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(restoreCtx, specID, "force_stopped", "")
+		_, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(restoreCtx, specID, vramAdminStateForceStopped, "")
 		switch {
 		case err == nil:
 		case errors.Is(err, portal.ErrRuntimeSpecNotFound):

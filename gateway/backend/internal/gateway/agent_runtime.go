@@ -90,6 +90,30 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// runtimeConfigAckFeature is the negotiated name for "this agent reports which
+// runtime-config document it has APPLIED" (telemetry's
+// runtime_config_applied_etag).
+//
+// Like runtimeLogsFeature, and unlike runtime_manager, it is declared for the
+// GATEWAY's benefit rather than the agent's: the agent needs no permission to
+// state a fact about itself, and an older binary that never states it breaks
+// nothing. What breaks without the NAME is the gateway's ability to tell the
+// two silences apart. "No acknowledgement yet" and "no acknowledgement will
+// ever arrive" look identical on the wire, and the consumer -- the VRAM
+// benchmark's isolation wait -- has to WAIT in the first case and FALL BACK in
+// the second. Gating on the field's presence instead would mean waiting out a
+// full bound on every pre-0.3.0 agent in the field before reaching the
+// fallback, i.e. making the feature a regression for exactly the fleet the
+// name-based negotiation exists to keep working (ADR-025: names, never version
+// comparison).
+//
+// Nothing else in the gateway gates on this name. In particular the
+// acknowledgement is NOT a precondition for pushing or serving a document, and
+// it is not a second file-mode check: an agent that does not declare it still
+// gets every runtime_config frame and still applies every document. The only
+// difference is what the gateway is allowed to treat as PROOF that it did.
+const runtimeConfigAckFeature = "runtime_config_ack"
+
 // pushRuntimeConfigTimeout bounds the s.Portal.AgentRuntimeConfig store read
 // PushRuntimeConfig performs -- a package-level var (not const), following
 // the established shrink-in-tests pattern (chat_runs.go's

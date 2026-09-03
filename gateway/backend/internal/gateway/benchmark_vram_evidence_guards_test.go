@@ -80,20 +80,20 @@ func TestVRAMIsolationRefusesASpecTheAgentNeverReported(t *testing.T) {
 	vramIsolationDrainBound = 80 * time.Millisecond
 	defer func() { vramIsolationDrainBound = oldBound }()
 
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationBindDelay)
-	if ok {
-		t.Fatalf("a spec the agent never reported was accepted as isolated: %v", evidence)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		[]string{"rspec_sib", "rspec_target"}, map[string]bool{}, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay})
+	if isolation.confirmed {
+		t.Fatalf("a spec the agent never reported was accepted as isolated: %v", isolation.evidence)
 	}
-	if got := evidence["rspec_sib"]; got != "" {
+	if got := isolation.evidence["rspec_sib"]; got != "" {
 		t.Fatalf("absent spec evidence = %q, want none: the frame said nothing about it", got)
 	}
 	// The reported one IS confirmed -- partial evidence is still recorded so
 	// the report can be audited -- but the set is not.
-	if evidence["rspec_target"] != vramEvidenceNoProcessAtWrite {
-		t.Fatalf("target evidence = %q, want %q", evidence["rspec_target"], vramEvidenceNoProcessAtWrite)
+	if isolation.evidence["rspec_target"] != vramEvidenceNoProcessAtWrite {
+		t.Fatalf("target evidence = %q, want %q", isolation.evidence["rspec_target"], vramEvidenceNoProcessAtWrite)
 	}
-	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, evidence) {
+	if vramIsolationConfirmed([]string{"rspec_sib", "rspec_target"}, isolation.evidence) {
 		t.Fatal("Isolated must be false while one spec carries no evidence at all")
 	}
 }
@@ -112,13 +112,13 @@ func TestVRAMIsolationRefusesAnEmptySpecSet(t *testing.T) {
 	f := newVRAMFixture(t, vramFixtureOpts{})
 	f.drive(t)
 
-	evidence, ok := f.srv.vramAwaitIsolation(context.Background(), "srv1",
-		nil, map[string]bool{}, vramIsolationBindDelay)
-	if ok {
-		t.Fatalf("an empty spec set was reported as a confirmed isolation: %v", evidence)
+	isolation := f.srv.vramAwaitIsolation(context.Background(), "srv1",
+		nil, map[string]bool{}, vramIsolationProofPolicy{bindDelay: vramIsolationBindDelay})
+	if isolation.confirmed {
+		t.Fatalf("an empty spec set was reported as a confirmed isolation: %v", isolation.evidence)
 	}
-	if len(evidence) != 0 {
-		t.Fatalf("evidence = %v, want none", evidence)
+	if len(isolation.evidence) != 0 {
+		t.Fatalf("evidence = %v, want none", isolation.evidence)
 	}
 }
 

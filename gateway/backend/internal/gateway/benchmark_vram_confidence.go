@@ -26,12 +26,25 @@ import (
 // from a contaminated window is the worst outcome this feature has, strictly
 // worse than no figure at all.
 const (
-	// vramInconclusiveIsolationLost: a spec this run had drained held a live
-	// process again by the end of the measurement, so the isolation the report
-	// would otherwise claim did not hold for the whole run. The commonest
-	// route is an operator's own "Force start" on a drained sibling -- nothing
-	// disables those actions while a run holds the server reservation -- but a
-	// request straight to the agent's own router port does it too.
+	// vramInconclusiveIsolationLost: this run's isolation did not hold for the
+	// whole run, so the report may not claim it. The commonest route is an
+	// operator's own "Force start" on a drained sibling -- nothing disables
+	// those actions while a run holds the server reservation -- but a request
+	// straight to the agent's own router port does it too.
+	//
+	// TWO PRODUCERS, one reason, because the operator's next action is the
+	// same for both -- something outside the run changed the fleet, so find it
+	// and measure again:
+	//
+	//  1. the END-OF-RUN re-verification below (vramIsolationLost): a spec this
+	//     run had drained held a live process again by the end of the
+	//     measurement. Observed on the status stream.
+	//  2. the ISOLATION WAIT (vramAwaitIsolation's gate): a freshly derived
+	//     runtime-config document no longer force-stops every enumerated spec,
+	//     so the override this run wrote has already been taken over. Read off
+	//     the document rather than off a process -- it catches the revocation
+	//     BEFORE any sibling has had time to start, which is strictly earlier
+	//     than (1) can see it.
 	vramInconclusiveIsolationLost = "isolation_lost"
 	// vramInconclusiveStrategyDisagreement: the two INDEPENDENT numbers
 	// disagree beyond what the difference in the quantities can explain. The

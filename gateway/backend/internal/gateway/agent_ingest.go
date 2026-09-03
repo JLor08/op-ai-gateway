@@ -96,6 +96,26 @@ type agentTelemetryRequest struct {
 	// payload without it decodes with a nil slice, which publishes an empty
 	// status snapshot -- never an error.
 	Runtimes []agentRuntimeSample `json:"runtimes"`
+	// RuntimeConfigAppliedETag is the ACKNOWLEDGEMENT: the ETag of the
+	// runtime-config document this agent has actually APPLIED -- reconciled,
+	// not merely fetched. It is the one thing the push/poll protocol never
+	// had, and it exists so a gateway-side write can be PROVED to have landed
+	// instead of inferred from the absence of a process.
+	//
+	// Its meaning rests entirely on the ETag being a DETERMINISTIC FUNCTION OF
+	// CONTENT (portal.agentRuntimeConfigETag hashes the document with the ETag
+	// field blanked), so the gateway can derive the exact value an agent
+	// holding a given document must report and compare for equality. That also
+	// makes the field unforgeable in the only direction that matters: the
+	// comparison is against a digest the gateway computed itself, so no value
+	// an agent invents can confirm a document it is not holding.
+	//
+	// Reported by an agent that declares runtimeConfigAckFeature. Additive and
+	// optional: an older agent sends nothing, which reads as "no
+	// acknowledgement" and makes the gateway fall back rather than hang --
+	// see runtimeConfigAckFeature for why the NAME, not this field's presence,
+	// is what the gateway gates on.
+	RuntimeConfigAppliedETag string `json:"runtime_config_applied_etag"`
 }
 
 // agentRuntimeGPUSample is one GPU's measured VRAM inside an
@@ -147,6 +167,30 @@ type agentRuntimeSample struct {
 	Restarts  int                     `json:"restarts"`
 	GPUs      []agentRuntimeGPUSample `json:"gpus,omitempty"`
 	LastError *agentRuntimeError      `json:"last_error,omitempty"`
+}
+
+// maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
+// The value the gateway itself derives is a 64-character sha256 hex digest, so
+// this is generous headroom rather than a fit -- deliberately, because the
+// length is NOT the check. What makes a bogus value harmless is that the sole
+// consumer compares it against a digest the gateway computed itself, so
+// nothing an agent sends can confirm anything it is not holding; this constant
+// only stops one chatty or hostile agent from growing the in-memory registry's
+// per-server footprint. Byte-based, like maxRuntimeStderrTail below.
+//
+// Deliberately NOT a format check. Validating "64 lowercase hex" here would
+// duplicate the digest's shape in a second module, and the day the ETag's
+// derivation changed, every acknowledgement in the fleet would be silently
+// discarded -- degrading to the fallback with nothing to point at.
+const maxAppliedConfigETag = 256
+
+// clampAppliedConfigETag trims and bounds one reported applied-config ETag.
+func clampAppliedConfigETag(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > maxAppliedConfigETag {
+		return s[:maxAppliedConfigETag]
+	}
+	return s
 }
 
 // maxRuntimeStderrTail bounds agentRuntimeError.StderrTail on ingest (Task 9
@@ -721,6 +765,17 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// (PushRuntimeConfig then correctly withholds delivery) rather than
 	// rejecting the whole sample -- see parseAgentCapabilities.
 	s.AgentFeatures.Set(serverID, parseAgentCapabilities(req.Capabilities))
+	// Record WHICH runtime-config document this agent says it has APPLIED, and
+	// do it BEFORE the status publish two lines below. That ordering is a
+	// contract, not tidiness: the VRAM benchmark's isolation wait is woken by
+	// the published frame and then reads this registry, so recording first is
+	// what lets it assume the acknowledgement it reads is at least as fresh as
+	// the frame that woke it -- there is then no case where a frame arrives
+	// ahead of the acknowledgement it rode in with. Same
+	// after-every-store-write placement as every other registry update in this
+	// block, for the same reason: a report is evidence, and stamping it while
+	// the sample failed to persist would claim freshness the gateway lacks.
+	s.RuntimeStatus.SetAppliedConfigETag(serverID, clampAppliedConfigETag(req.RuntimeConfigAppliedETag))
 	// Publish the agent-managed runtime status snapshot (agent-runtime-manager
 	// Task 9) to the volatile status registry the portal's SSE stream reads.
 	// Deliberately AFTER every store write succeeded, mirroring every other

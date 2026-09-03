@@ -93,13 +93,26 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (2) Which specs even have a process to stop, read BEFORE the write.
 	liveAtWrite := s.vramLiveProcessBySpec(serverID)
+	// WHICH standard of proof this run may apply, derived ONCE. The report's
+	// IsolationProof and the wait's policy are the same value read twice, not
+	// two reads of the plan -- see vramIsolationPolicyOf for why that is the
+	// one divergence this feature may not have.
+	policy := vramIsolationPolicyOf(plan)
 	drained, drainErr := s.vramDrain(ctx, plan.specIDs)
 	// DrainedSpecIDs is the AUDIT set -- everything this run force-stopped,
 	// the target included -- because that is what the portal must name if the
 	// gateway dies before the restore. pendingRestore is the separate,
 	// shrinking set of overrides still to clear: the target leaves it the
 	// moment the run clears its override to load it.
-	report = &VRAMReport{DrainedSpecIDs: drained, Warnings: plan.warnings}
+	report = &VRAMReport{
+		DrainedSpecIDs: drained,
+		Warnings:       plan.warnings,
+		// Recorded BEFORE the wait, so an isolation that never confirms still
+		// says which standard of proof failed -- see VRAMReport.IsolationProof.
+		// Read off the very policy the wait is handed below, never off the plan
+		// a second time.
+		IsolationProof: policy.proof(),
+	}
 	pendingRestore := drained
 	// The restore defer is registered as soon as anything MIGHT have been
 	// written, so it runs on every exit from here on -- including a panic
@@ -119,12 +132,14 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (3) Isolation is EVIDENCE, never an assumption. A 200 from an
 	// admin_state write is not evidence: in file mode every such write
-	// returns 200 and stops nothing.
-	evidence, confirmed := s.vramAwaitIsolation(ctx, serverID, plan.specIDs, liveAtWrite, plan.bindDelay)
-	report.IsolationEvidence = evidence
-	report.Isolated = vramIsolationConfirmed(plan.specIDs, evidence)
-	if !confirmed {
-		vramIsolationFailure(ctx, report, &res)
+	// returns 200 and stops nothing. WHICH evidence is available -- the
+	// agent's own acknowledgement of the document, or the blind poll interval
+	// -- is what the plan settled before the trigger returned.
+	isolation := s.vramAwaitIsolation(ctx, serverID, plan.specIDs, liveAtWrite, policy)
+	report.IsolationEvidence = isolation.evidence
+	report.Isolated = vramIsolationConfirmed(plan.specIDs, isolation.evidence)
+	if !isolation.confirmed {
+		vramIsolationFailure(ctx, report, &res, isolation.reason)
 		return
 	}
 
@@ -227,15 +242,49 @@ func (s *Server) vramPublishOutcome(ctx context.Context, run *benchmarkRun, serv
 // right cause, and is why an operator who cancelled their own run is not sent
 // to inspect a healthy agent.
 //
-// vramAwaitIsolation returns (evidence, false) for BOTH a cancelled context
-// and an expired bound, so the timer's own reason may only be recorded once
-// the context has been ruled out. See vramStoppedByCancellation.
-func vramIsolationFailure(ctx context.Context, report *VRAMReport, res *BenchmarkResult) {
+// CANCELLATION IS RULED OUT FIRST AND UNCONDITIONALLY. vramAwaitIsolation
+// answers ctx.Done() and its own expired bound with the same reason, so the
+// wait's own verdict may only be recorded once the context has been ruled
+// out. See vramStoppedByCancellation.
+//
+// The wait's reason is then taken as given rather than re-derived here: it is
+// the only place that knows whether the agent ever acknowledged the document
+// (isolation_unacknowledged), whether the document stopped draining the fleet
+// mid-wait (isolation_lost), or whether a spec simply would not go quiet
+// (isolation_timeout). Each is a different next action for the operator, which
+// is why they are distinct values rather than one message.
+func vramIsolationFailure(ctx context.Context, report *VRAMReport, res *BenchmarkResult, reason string) {
 	if vramStoppedByCancellation(ctx, report, res) {
 		return
 	}
-	report.Inconclusive = vramInconclusiveIsolationTimeout
-	res.Error = errVRAMIsolationTimedOut.Error()
+	if reason == "" {
+		// Defensive: a confirmed wait never reaches here. Fall back to the
+		// reason that withholds a number rather than leaving Inconclusive
+		// empty, which this contract reads as "a definitive result".
+		reason = vramInconclusiveIsolationTimeout
+	}
+	report.Inconclusive = reason
+	res.Error = vramIsolationErrorFor(reason).Error()
+}
+
+// errVRAMIsolationUnacknowledged and errVRAMIsolationRevoked are the other two
+// isolation failures' own error strings, so res.Error says the same thing the
+// inconclusive reason does instead of naming a timeout that did not happen.
+var (
+	errVRAMIsolationUnacknowledged = errors.New("vram benchmark: the agent never acknowledged the isolation configuration")
+	errVRAMIsolationRevoked        = errors.New("vram benchmark: the isolation configuration was changed during the run")
+)
+
+// vramIsolationErrorFor maps the wait's reason to the error an operator reads.
+func vramIsolationErrorFor(reason string) error {
+	switch reason {
+	case vramInconclusiveIsolationUnacknowledged:
+		return errVRAMIsolationUnacknowledged
+	case vramInconclusiveIsolationLost:
+		return errVRAMIsolationRevoked
+	default:
+		return errVRAMIsolationTimedOut
+	}
 }
 
 // vramWindowStop records why a phase window produced no usable reading, and

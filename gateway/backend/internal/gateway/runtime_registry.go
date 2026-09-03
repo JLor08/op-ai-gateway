@@ -199,13 +199,33 @@ type runtimeStatusRegistry struct {
 	// subs is the live SSE fan-out: one channel per active subscriber, keyed
 	// by server id, mirroring serverPerfRegistry.subs.
 	subs map[string]map[chan []RuntimeStatusDTO]struct{}
+	// appliedETag is each server's agent's last-reported APPLIED
+	// runtime-config ETag (telemetry's runtime_config_applied_etag) -- the
+	// acknowledgement the protocol used not to have.
+	//
+	// It is a SERVER-level fact and lives here rather than on
+	// RuntimeStatusDTO, where a per-GPU measurement watermark already rides,
+	// because the document it names covers the whole server: one string per
+	// spec would be the same value repeated N times, absent entirely on a
+	// server whose agent manages nothing yet, and it would invite the two
+	// copies to disagree.
+	//
+	// Reading it is still in step with the status stream, and by ordering
+	// rather than by luck: ingestTelemetrySample records this BEFORE it
+	// publishes the sample's status snapshot, so any frame a subscriber
+	// receives implies this map already holds an acknowledgement at least as
+	// fresh as that frame. A later one is strictly better -- the VRAM
+	// benchmark's isolation wait only ever ACCEPTS on a match, never refuses
+	// on a mismatch it has not re-derived -- so freshness may only help.
+	appliedETag map[string]string
 }
 
 func newRuntimeStatusRegistry() *runtimeStatusRegistry {
 	return &runtimeStatusRegistry{
-		fileMode: make(map[string]bool),
-		statuses: make(map[string][]RuntimeStatusDTO),
-		subs:     make(map[string]map[chan []RuntimeStatusDTO]struct{}),
+		fileMode:    make(map[string]bool),
+		statuses:    make(map[string][]RuntimeStatusDTO),
+		subs:        make(map[string]map[chan []RuntimeStatusDTO]struct{}),
+		appliedETag: make(map[string]string),
 	}
 }
 
@@ -250,6 +270,44 @@ func (r *runtimeStatusRegistry) IsFileMode(serverID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.fileMode[serverID]
+}
+
+// SetAppliedConfigETag records which runtime-config document serverID's agent
+// reports having APPLIED. An EMPTY etag deletes the entry rather than storing
+// a blank, because each telemetry sample is a full snapshot (the same rule as
+// agentFeaturesRegistry.Set and SetFileMode above): an agent that stops
+// reporting one -- a downgrade, a restart before its first reconcile, an
+// agent that never had the feature -- must read as "nothing acknowledged" on
+// the very next sample, never as a stale confirmation that some document is
+// still in force. No-op on a nil registry or an empty id.
+func (r *runtimeStatusRegistry) SetAppliedConfigETag(serverID, etag string) {
+	if r == nil || serverID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if etag == "" {
+		delete(r.appliedETag, serverID)
+		return
+	}
+	r.appliedETag[serverID] = etag
+}
+
+// AppliedConfigETag reports the runtime-config ETag serverID's agent last said
+// it had applied, or "" for a nil registry, a server that has never reported,
+// and an agent that reports none.
+//
+// "" is the FAIL-CLOSED default and the only safe one: the sole consumer
+// compares this against a digest the gateway derived itself, so an empty value
+// means "no acknowledgement", which withholds the fast path rather than
+// granting it.
+func (r *runtimeStatusRegistry) AppliedConfigETag(serverID string) string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.appliedETag[serverID]
 }
 
 // publish replaces serverID's runtime-status snapshot and non-blockingly fans
@@ -337,7 +395,8 @@ func (r *runtimeStatusRegistry) subscribe(serverID string) ([]RuntimeStatusDTO, 
 	return snap, ch, unsub
 }
 
-// Retain prunes fileMode and statuses entries for servers no longer in live
+// Retain prunes fileMode, statuses and appliedETag entries for servers no
+// longer in live
 // (mirrors AgentPresenceRegistry.Retain / AgentCertReportRegistry.Retain,
 // called at the end of every app-health cycle): a deleted server's flag or
 // last-known status must not linger in memory forever. A nil registry is a
@@ -360,6 +419,11 @@ func (r *runtimeStatusRegistry) Retain(live map[string]struct{}) {
 	for id := range r.statuses {
 		if _, ok := live[id]; !ok {
 			delete(r.statuses, id)
+		}
+	}
+	for id := range r.appliedETag {
+		if _, ok := live[id]; !ok {
+			delete(r.appliedETag, id)
 		}
 	}
 }

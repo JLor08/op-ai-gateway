@@ -88,8 +88,9 @@ type CapacityReportDTO struct {
 //
 // Inconclusive empty = a definitive result. Isolated is the run's own
 // evidence-backed claim, auditable through IsolationEvidence (spec id -> why
-// this run believes that spec was not running); a spec missing from that map
-// was NOT confirmed. MeasuredMB and DeltaMB are different quantities -- an
+// this run believes that spec was not running) and qualified by
+// IsolationProof (what established that the run's overrides had landed at
+// all); a spec missing from that map was NOT confirmed. MeasuredMB and DeltaMB are different quantities -- an
 // attributed per-process measurement vs the model's marginal cost on the card
 // -- and must never be averaged; 0 means unknown for both.
 type VRAMGPUItemDTO struct {
@@ -106,7 +107,17 @@ type VRAMGPUItemDTO struct {
 type VRAMReportDTO struct {
 	Isolated          bool              `json:"isolated"`
 	IsolationEvidence map[string]string `json:"isolation_evidence,omitempty"`
-	DrainedSpecIDs    []string          `json:"drained_spec_ids,omitempty"`
+	// IsolationProof is WHICH standard of proof the run's isolation wait
+	// applied: "config_acknowledged" (the agent reported having applied a
+	// runtime-config document this run had verified force-stops the whole
+	// fleet) or "bind_delay" (an agent that never acknowledges, so the run
+	// waited out its guaranteed poll interval and observed no process). They
+	// are different STRENGTHS of evidence, and the second is an inference from
+	// an absence -- so it is read alongside Isolated rather than folded into
+	// it. Recorded whether or not the isolation was confirmed, so a timeout
+	// says which standard failed.
+	IsolationProof string   `json:"isolation_proof,omitempty"`
+	DrainedSpecIDs []string `json:"drained_spec_ids,omitempty"`
 	// RestoreFailed is the specs whose override the run could not clear, so
 	// they ARE still force_stopped and need clearing by hand. RestoreTakenOver
 	// is the disjoint other case: the spec's admin_state was no longer the
