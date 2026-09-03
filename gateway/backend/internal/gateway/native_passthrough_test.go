@@ -703,6 +703,110 @@ func TestAnthropicMessagesDisabledEndpointRejects(t *testing.T) {
 	}
 }
 
+// newServerAgentSpecFlavorTestServer seeds a server_agent app (both flavors, so
+// candidacy admits either coding-agent request — see applicationServesEndpoint's
+// server_agent carve-out) whose MAPPING carries a runtime spec with the given
+// (narrower) APIFlavors and both modes non-disabled. This reproduces the gap
+// where a spec drops a flavor (e.g. api_flavors=['openai'], anthropic removed)
+// while leaving the matching mode (e.g. messages_mode='passthrough') untouched:
+// the effective-served rule (compatibility-and-inference.md §6 / ADR-033) is
+// "served iff flavor ∈ APIFlavors AND mode != disabled" — candidacy alone
+// cannot enforce this for a server_agent app (its authoritative state is the
+// per-model spec, only known post-resolve), so dispatch must.
+func newServerAgentSpecFlavorTestServer(t *testing.T, prov provider.Client, specFlavors []string) *Server {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin"]`, CreatedAt: now, UpdatedAt: now}, "dev-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	ctx := context.Background()
+	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native-spec", Name: "Native Spec Upstream", Domain: "native-spec.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native-spec.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	// App-level flavors carry BOTH, so candidacy (the app-level fallback check in
+	// applicationServesEndpoint) admits the request regardless of which endpoint
+	// is under test — the spec below is what narrows the effective flavor set.
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-spec", ServerID: "srv-native-spec", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native-spec", ApplicationID: "app-native-spec", GatewayModelName: "gw-model", AppModelName: "upstream-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-native-spec", MappingID: "route-native-spec", APIFlavors: specFlavors, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-native-spec", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	return New(ServerDeps{
+		Tokens:   tokens,
+		Usage:    recorder,
+		Provider: prov,
+		Routes:   routeStore,
+		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+	})
+}
+
+// TestServerAgentSpecFlavorNotServedRejectsMessages proves the flavor conjunct
+// of the effective-served rule ("served iff flavor ∈ APIFlavors AND mode !=
+// disabled", compatibility-and-inference.md §6 / ADR-033) is enforced at
+// DISPATCH for a server_agent app, not just at candidacy. The resolved spec's
+// APIFlavors is [openai] only (anthropic removed) while MessagesMode is still
+// "passthrough" (non-disabled) — so without the fix this would still proxy
+// /v1/messages to the upstream (a simple body that WOULD succeed if proxied,
+// proving the 404 comes from the flavor check, not a body-parse failure).
+func TestServerAgentSpecFlavorNotServedRejectsMessages(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: "unused"}
+	srv := newServerAgentSpecFlavorTestServer(t, prov, []string{routing.APIFlavorOpenAI})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "messages.endpoint_disabled" {
+		t.Fatalf("error code = %q, want messages.endpoint_disabled", code)
+	}
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0 (flavor not served must not proxy despite mode=passthrough)", prov.proxyCalls)
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 || events[0].ErrorCode != "messages.endpoint_disabled" {
+		t.Fatalf("usage events = %+v, want one messages.endpoint_disabled error", events)
+	}
+}
+
+// TestServerAgentSpecFlavorNotServedRejectsResponses — the /v1/responses mirror:
+// the spec's APIFlavors is [anthropic] only (openai removed) while
+// ResponsesMode is still "passthrough".
+func TestServerAgentSpecFlavorNotServedRejectsResponses(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: "unused"}
+	srv := newServerAgentSpecFlavorTestServer(t, prov, []string{routing.APIFlavorAnthropic})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "responses.endpoint_disabled" {
+		t.Fatalf("error code = %q, want responses.endpoint_disabled", code)
+	}
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+	}
+}
+
 // TestResponsesEndpointModeTable pins all three modes on the ordinary app for the
 // Responses endpoint in one place.
 func TestResponsesEndpointModeTable(t *testing.T) {

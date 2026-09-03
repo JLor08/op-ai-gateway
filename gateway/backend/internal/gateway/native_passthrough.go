@@ -67,6 +67,27 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 	return "", ""
 }
 
+// targetServesFlavor reports whether target's effective APIFlavors (the resolved
+// application's, or — for a server_agent mapping — the resolved runtime spec's;
+// see targetFrom) includes the request's COARSE api flavor ("openai"/"anthropic").
+// This is the other half of the effective-served rule the docs promise (§6 /
+// ADR-033): "served iff flavor ∈ APIFlavors AND mode != disabled" — endpointModeFor
+// only ever reads the mode half. For an ORDINARY app this is a no-op check
+// (candidacy already excluded a flavor-less app before dispatch ever saw it — see
+// applicationServesEndpoint); for a server_agent app it is the ONLY place the
+// spec's (possibly narrower than the app's) flavor set is enforced, since
+// candidacy deliberately gates that app type on its own coarser, app-level
+// flavors only (the spec is the per-model authority, knowable only post-resolve).
+func targetServesFlavor(target routing.Target, apiFlavor string) bool {
+	coarse := routing.NormalizeAPIFlavor(apiFlavor)
+	for _, f := range target.APIFlavors {
+		if f == coarse {
+			return true
+		}
+	}
+	return false
+}
+
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
 // RESOLVED target + client API flavor: the native passthrough path when the
 // effective mode for that flavor is passthrough, otherwise the built-in
@@ -177,6 +198,16 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 		return false
 	}
 	path, mode := endpointModeFor(target, apiFlavor)
+	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
+	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
+	// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
+	// target no longer serves, treat it as disabled here — the one place a
+	// server_agent app's per-model spec flavor is enforceable (candidacy only
+	// checked the app-level flavor; see targetServesFlavor). A no-op for an
+	// ordinary app, whose flavor-less state already excluded it at candidacy.
+	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
+		mode = routing.EndpointModeDisabled
+	}
 	switch mode {
 	case routing.EndpointModePassthrough:
 		s.proxyNative(w, r, token, target, path, raw, req)
