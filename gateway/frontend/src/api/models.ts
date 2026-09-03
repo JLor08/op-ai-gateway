@@ -210,6 +210,11 @@ export type SyncResult = {
 // "locked" is unlisted AND only reachable via a group.
 export type ModelVisibility = 'shown' | 'hidden' | 'locked';
 
+// Per-endpoint serving mode for the two coding-agent APIs (Codex /v1/responses,
+// Claude Code /v1/messages): 'disabled' = not served, 'translate' = converted to
+// /v1/chat/completions (lossy), 'passthrough' = proxied raw to the native path.
+export type EndpointMode = 'disabled' | 'translate' | 'passthrough';
+
 // How a group's members are walked: the manual priority order, or fastest
 // measured generation speed first.
 export type ModelGroupMemberOrder = 'priority' | 'speed';

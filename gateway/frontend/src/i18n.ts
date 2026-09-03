@@ -374,6 +374,11 @@ const de = {
   applicationNativeMessages: 'Claude Code (Anthropic Messages) nativ durchreichen',
   applicationNativeNote:
     'Ist dies aktiv, werden Anfragen an /v1/responses bzw. /v1/messages unverändert an die Anwendung durchgereicht (keine Umwandlung), statt sie ins interne Format zu übersetzen. Voraussetzung: die passende API-Variante (openai bzw. anthropic) ist aktiviert und die Anwendung unterstützt den Endpunkt nativ.',
+  applicationResponsesMode: 'Codex (Responses-API)',
+  applicationMessagesMode: 'Claude Code (Anthropic Messages)',
+  applicationModeDisabled: 'Deaktiviert',
+  applicationModeTranslate: 'Umwandlung',
+  applicationModePassthrough: 'Durchreichen',
   applicationLoadedModelsLegend: 'Geladene Modelle',
   applicationLoadedModelsPath: 'Status-Pfad',
   applicationLoadedModelsFormat: 'Format',
@@ -2469,6 +2474,11 @@ const en: PortalMessages = {
   applicationNativeMessages: 'Pass Claude Code (Anthropic Messages) through natively',
   applicationNativeNote:
     'When enabled, requests to /v1/responses resp. /v1/messages are forwarded to the application unchanged (no conversion) instead of being translated to the internal format. Requires the matching API flavor (openai resp. anthropic) to be enabled and the application to support the endpoint natively.',
+  applicationResponsesMode: 'Codex (Responses API)',
+  applicationMessagesMode: 'Claude Code (Anthropic Messages)',
+  applicationModeDisabled: 'Disabled',
+  applicationModeTranslate: 'Translate',
+  applicationModePassthrough: 'Pass-through',
   applicationLoadedModelsLegend: 'Loaded models',
   applicationLoadedModelsPath: 'Status path',
   applicationLoadedModelsFormat: 'Format',
