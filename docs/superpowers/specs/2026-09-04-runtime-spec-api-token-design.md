@@ -121,15 +121,17 @@ sealed value.
 
 ## 4. The `${API_TOKEN}` placeholder + resolution
 
-- **New placeholder token `${API_TOKEN}`, valid ONLY in Env values — NOT in Args**
-  (security review C1). A token in argv is world-readable (`/proc/<pid>/cmdline`,
-  `ps aux`) and is echoed by vLLM/llama.cpp at startup (captured into the agent's
-  stderr tail and reported up), which defeats this feature's own co-tenant threat
-  model (§9) and contradicts the agent's existing rule "secrets go in env, never in
-  args" (`server-agent/internal/runtime/report.go`). All three primary backends
-  accept the key via env, so this costs nothing. `${API_TOKEN}` in Args is a hard
-  validation error (§6). *(This narrows the original "env, fallback argument" to
-  env-only for the secret — see the open decision at the end of §6.)*
+- **New placeholder token `${API_TOKEN}`, valid in Env values (recommended) AND in
+  Args (with a loud warning)** — operator's decision on the security review's C1.
+  **Env is strongly preferred:** a token in argv is world-readable
+  (`/proc/<pid>/cmdline`, `ps aux`), and vLLM/llama.cpp echo their argv at startup
+  (which can reach the agent's captured stderr tail and be reported up), so an
+  Args-placed token can be read by a co-tenant on the agent host and may surface in
+  the model server's own logs — partially defeating §9's co-tenant protection. The
+  portal therefore shows a **prominent, non-blocking warning** whenever
+  `${API_TOKEN}` is placed in Args, and the hint (§7) marks the Args column as
+  leaking. All three primary backends accept the key via Env, so Args is only for a
+  backend that accepts the key exclusively via a flag.
 - **Resolution is agent-side, with its OWN provenance span** — NOT a literal reuse
   of `${AGENT_ENV}`. Today only the `${AGENT_ENV:NAME}` branch records a masked
   span; `${PORT}`/`${MODEL}`/`${*_DEVICES}` record none and appear in clear. So
@@ -200,10 +202,10 @@ an open child.
 Mirroring the `${..._DEVICES}` rules; new 400 error codes:
 
 - `runtime_spec.api_token_mode_invalid` — mode ∉ {off, set, random, app}.
-- `runtime_spec.api_token_in_args` — `${API_TOKEN}` appears in Args (forbidden;
-  argv is world-readable, §4/C1). Env only.
 - `runtime_spec.api_token_no_placeholder` — mode ≠ off but `${API_TOKEN}` appears
-  in no Env value (the token would be stored/generated but never reach the child).
+  in neither an Env value nor Args (the token would be stored/generated but never
+  reach the child). `${API_TOKEN}` in Args is allowed (not a 400) but drives a
+  prominent portal warning — see the decision note below.
 - `runtime_spec.api_token_placeholder_without_mode` — `${API_TOKEN}` used while
   mode = off (a placeholder that resolves to nothing).
 - `runtime_spec.api_token_app_unset` — mode = app but the application has no
@@ -243,13 +245,14 @@ responsibility (hinted, not hard-enforced — the gateway cannot know the child'
 expectation). App-mode with a custom header fails **closed** (the child sees no
 `Authorization`, returns 401 — down, not open), so a warning is acceptable.
 
-**OPEN DECISION (needs your sign-off):** the security review recommends **env-only**
-for the secret — `${API_TOKEN}` forbidden in Args — because a token in argv is
-world-readable (`ps aux`, `/proc/<pid>/cmdline`) and defeats the co-tenant
-protection this feature promises. That narrows your original "Umgebungsvariable
-(Fallback Argument)" to **env-only**. This spec assumes env-only. If a backend you
-use accepts the key ONLY via a flag, the alternative is to permit `${API_TOKEN}` in
-Args behind a loud "leaks via process listing" warning — your call.
+**DECIDED (operator):** `${API_TOKEN}` is allowed in **Env (recommended) or Args**.
+Args is NOT blocked — the operator keeps the fallback — but whenever `${API_TOKEN}`
+is placed in Args the portal shows a prominent, non-blocking warning that the token
+is then readable via the process listing (`ps aux`, `/proc/<pid>/cmdline`) and may
+appear in the model server's own startup logs, so the co-tenant protection (§9) no
+longer fully holds. Env stays the recommended path (the agent still masks the
+`${API_TOKEN}` span in its reported command in both cases, but that cannot scrub the
+child's real argv or the child's own logs — hence the warning).
 
 ---
 
@@ -275,13 +278,14 @@ A small **"API-Token (Upstream-Absicherung)"** section on the runtime-spec form:
 - A hint block (shown when mode ≠ off) telling the operator to reference the token
   with **`${API_TOKEN}`** in Env or Args, plus the per-backend variable table:
 
-  | Backend | Ins **Env**-Feld setzen | Client-Header |
-  |---|---|---|
-  | vLLM | `VLLM_API_KEY=${API_TOKEN}` | `Authorization: Bearer` |
-  | llama.cpp (`llama-server`) | `LLAMA_API_KEY=${API_TOKEN}` | `Authorization: Bearer` (oder `X-Api-Key`) |
-  | TGI (HF) | `API_KEY=${API_TOKEN}` | `Authorization: Bearer` |
+  | Backend | Env (empfohlen) | Args (⚠ auslesbar) | Client-Header |
+  |---|---|---|---|
+  | vLLM | `VLLM_API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` |
+  | llama.cpp (`llama-server`) | `LLAMA_API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` (oder `X-Api-Key`) |
+  | TGI (HF) | `API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` |
 
-  (Env only — `${API_TOKEN}` in Args wird abgelehnt, §4/§6.)
+  (Env empfohlen. **⚠ `${API_TOKEN}` in Args ist via Prozessliste/Server-Logs
+  auslesbar** — das Portal zeigt dann einen lauten Warnhinweis, §4/§6.)
 - **Structural unsupported-backend warning** (security review I6): the backend is
   known from `app.Type`, so when a non-`off` mode is chosen for a backend that does
   not enforce inbound auth headlessly — **Ollama** (none), **llama-swap** (only YAML
@@ -299,8 +303,9 @@ i18n: all new strings in de + en (parity is compile-enforced).
 - Wire `runtime.Spec` gains `APIToken string` (json `api_token`) — the resolved,
   decrypted token for this spec's mode (empty when `off`). It is the ONE shared
   struct (agent wire + file-mode parse) — hence the file-mode handling below.
-- `ExpandPlaceholders`/`expandSpec`: resolve `${API_TOKEN}` (Env only) from
-  `Spec.APIToken`; `${API_TOKEN}` present with an empty `APIToken` is a hard error.
+- `ExpandPlaceholders`/`expandSpec`: resolve `${API_TOKEN}` (in Env values and Args)
+  from `Spec.APIToken`; `${API_TOKEN}` present with an empty `APIToken` is a hard
+  error.
   **Record a NEW secret provenance span for it** (label `${API_TOKEN}`) so
   `ResolvedCommand.Masked` replaces it — new masking code, because the `${AGENT_ENV}`
   span path is provenance-specific and `${PORT}`/`${MODEL}`/`${*_DEVICES}` are not
@@ -338,7 +343,9 @@ i18n: all new strings in de + en (parity is compile-enforced).
   interfaces unauthenticated: the token is (a) defense-in-depth against a co-tenant
   process on the agent host, and (b) the guard that stops an externally-reachable
   router from exposing an unauthenticated model server. **This holds ONLY for
-  backends that actually enforce the token** (§7/I6).
+  backends that actually enforce the token** (§7/I6), and the co-tenant part (a) is
+  weakened when the operator places the token in **Args** rather than Env (the
+  co-tenant can then read it via the process listing — §4; the portal warns).
 
 ---
 
@@ -349,9 +356,11 @@ i18n: all new strings in de + en (parity is compile-enforced).
   explicitly deferred (the confirmed requirement is a stored, gateway-managed
   random token).
 - **Securing Ollama / LM Studio / llama-swap** — not headless-configurable; the
-  portal only hints.
-- **Custom inbound-header per spec** for set/random (Bearer only). `app` mode
-  inherits `app.APITokenHeader` with a warning.
+  portal only warns (structural per-backend banner, §7/I6).
+- **Automatically redacting the token from the child's own stdout/stderr** — the
+  agent masks its *reported command*, but a model server that logs its argv/env
+  itself is beyond the agent's control; this is the residual risk the Args warning
+  (§4) names.
 - Rewriting the router to inject per-child headers (unnecessary — verbatim forward
   + gateway-owned token suffices).
 
@@ -364,20 +373,24 @@ i18n: all new strings in de + en (parity is compile-enforced).
 2. Portal service: DTO (`api_token_mode`, `api_token_header_source`,
    `api_token_header`, `api_token_set`, write-only `api_token` sentinel; plus a
    read-only `app_api_token_header` echo so the UI can show the inherited header),
-   validation + **6 error codes** (incl. `api_token_in_args`), env-only + header
-   source/shape checks, **seal-or-400 for set AND random** (`crypto/rand` via
-   `generateSecret`), rotate, resolve-and-push the decrypted token into the
-   agent-wire spec (**fail-closed empty on decrypt error**), per-mapping
-   effective-header + Target token in `resolver.go`, **and in the benchmark/capacity
-   Target builders** (`benchmark_runner.go`, security review I3), plus an
-   https-gateway-URL precondition warning/guard for non-`off` modes (I2).
-3. Gateway endpoints: map the 6 sentinels → 400.
-4. `server-agent`: wire `api_token`; `${API_TOKEN}` (Env-only) resolution with a
+   validation + **5 error codes**, `${API_TOKEN}` placeholder-consistency (Env OR
+   Args) + header source/shape checks, **seal-or-400 for set AND random**
+   (`crypto/rand` via `generateSecret`), rotate, resolve-and-push the decrypted
+   token into the agent-wire spec (**fail-closed empty on decrypt error**),
+   per-mapping effective-header + Target token in `resolver.go`, **and in the
+   benchmark/capacity Target builders** (`benchmark_runner.go`, security review I3),
+   plus an https-gateway-URL precondition warning/guard for non-`off` modes (I2).
+3. Gateway endpoints: map the 5 sentinels → 400.
+4. `server-agent`: wire `api_token`; `${API_TOKEN}` (Env + Args) resolution with a
    **new secret provenance span + masking** (I1); **redact `Spec.APIToken` in
    `redactConfigEnv`** for file-mode reports (I4); feature flag `runtime_api_token`;
    Version 0.5.0.
-5. Frontend: TS type, mode select + write-only field + rotate, hints + table +
-   unsupported-backend note, i18n de/en, validation surfacing.
+5. Frontend: TS type, token-mode select + write-only field + rotate; header-source
+   select (`Von der Anwendung`/`Eigener`) with the read-only inherited-header
+   display; hints + table; the **loud `${API_TOKEN}`-in-Args warning** (detect the
+   placeholder in the Args field); the **structural per-backend unsupported banner**
+   (from `app.Type`); the custom-header ↔ backend warning; i18n de/en; validation
+   surfacing.
 6. Docs: `agent-runtime-manager.md` (placeholder catalog + the token modes +
    the on-the-wire posture), `api-surface.md` (DTO fields + 4 error codes),
    `data-model.md` (migration 74 columns), ADR.
