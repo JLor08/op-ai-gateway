@@ -173,8 +173,8 @@ function defaultApplication(overrides: Partial<PortalApplication> = {}): PortalA
     health_check_path: '/v1/health',
     health_check_mode: 'health_path',
     health_check_interval_seconds: 0,
-    native_responses: false,
-    native_messages: false,
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     loaded_models_path: '',
     loaded_models_format: '',
     context_probe_path: '',
@@ -240,6 +240,9 @@ function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     vram_locked: false,
     set_visible_devices: false,
     gpus: [],
+    api_flavors: [],
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     ...overrides,
   };
 }

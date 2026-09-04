@@ -24,7 +24,7 @@ import (
 //     BOTH the OpenAI and Anthropic api flavors, translate path only), used for the
 //     three-inference-handler pass-through tests and the translate-path allowlist
 //     gate tests;
-//   - a second application/mapping ("native-model") with NativeResponses enabled,
+//   - a second application/mapping ("native-model") with ResponsesMode=passthrough,
 //     used for the native-passthrough allowlist gate test.
 //
 // A service token is never store-backed in Task 2 (that lands in Task 3's
@@ -50,7 +50,7 @@ func newServiceScopeTestServer(t *testing.T) (*Server, *auth.TokenStore, *usage.
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native-svc", Name: "Native Upstream", Domain: "native-svc.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native-svc.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed native server: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-svc", ServerID: "srv-native-svc", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, NativeResponses: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-svc", ServerID: "srv-native-svc", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("seed native app: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native-svc", ApplicationID: "app-native-svc", GatewayModelName: "native-model", AppModelName: "native-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -300,7 +300,7 @@ func TestModelAllowlistGateOtherTranslateEndpoints(t *testing.T) {
 
 // The allowlist gate fires on the NATIVE PASSTHROUGH path too (tryProxyNative),
 // before Resolve/ProxyNative is ever called — the app serving "native-model" has
-// NativeResponses enabled, so a plain /v1/responses request for it takes the
+// ResponsesMode=passthrough, so a plain /v1/responses request for it takes the
 // native path, not the translate fallback.
 func TestModelAllowlistGateNativePassthroughPath(t *testing.T) {
 	t.Run("blocked before upstream", func(t *testing.T) {

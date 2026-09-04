@@ -2135,6 +2135,13 @@ func copyApplication(app Application) Application {
 	return app
 }
 
+// copyRuntimeSpec returns a spec whose APIFlavors slice is independent of the
+// argument's, so a stored/returned spec never aliases the caller's slice.
+func copyRuntimeSpec(spec RuntimeSpec) RuntimeSpec {
+	spec.APIFlavors = append([]string(nil), spec.APIFlavors...)
+	return spec
+}
+
 func copyTimePtr(value *time.Time) *time.Time {
 	if value == nil {
 		return nil
@@ -2247,6 +2254,7 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 	if _, ok := m.mappings[spec.MappingID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	spec = copyRuntimeSpec(spec)
 	for existingID, existing := range m.runtimeSpecs {
 		if existing.MappingID == spec.MappingID {
 			spec.ID = existingID
@@ -2262,38 +2270,43 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 	return nil
 }
 
-// RuntimeSpecByMapping returns the spec for mappingID, if any. RuntimeSpec has
-// no slice/pointer fields, so the map value is already a safe copy.
+// RuntimeSpecByMapping returns the spec for mappingID, if any. APIFlavors is
+// deep-copied so the returned spec never aliases the stored map value's slice.
 func (m *MemoryStore) RuntimeSpecByMapping(_ context.Context, mappingID string) (RuntimeSpec, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, spec := range m.runtimeSpecs {
 		if spec.MappingID == mappingID {
-			return spec, true, nil
+			return copyRuntimeSpec(spec), true, nil
 		}
 	}
 	return RuntimeSpec{}, false, nil
 }
 
 // RuntimeSpecByID returns the spec for id (the telemetry VRAM write-back
-// path's primary-key lookup -- see RuntimeStore.RuntimeSpecByID). RuntimeSpec
-// has no slice/pointer fields, so the map value is already a safe copy.
+// path's primary-key lookup -- see RuntimeStore.RuntimeSpecByID). APIFlavors
+// is deep-copied so the returned spec never aliases the stored map value's
+// slice.
 func (m *MemoryStore) RuntimeSpecByID(_ context.Context, id string) (RuntimeSpec, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	spec, ok := m.runtimeSpecs[id]
-	return spec, ok, nil
+	if !ok {
+		return RuntimeSpec{}, false, nil
+	}
+	return copyRuntimeSpec(spec), true, nil
 }
 
 // RuntimeSpecsByApplication lists every spec whose mapping belongs to appID,
-// ordered by spec id (mirrors the SQL join's `order by s.id`).
+// ordered by spec id (mirrors the SQL join's `order by s.id`). Each spec's
+// APIFlavors is deep-copied so the returned slice never aliases stored state.
 func (m *MemoryStore) RuntimeSpecsByApplication(_ context.Context, appID string) ([]RuntimeSpec, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]RuntimeSpec, 0)
 	for _, spec := range m.runtimeSpecs {
 		if mapping, ok := m.mappings[spec.MappingID]; ok && mapping.ApplicationID == appID {
-			out = append(out, spec)
+			out = append(out, copyRuntimeSpec(spec))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

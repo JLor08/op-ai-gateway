@@ -191,6 +191,7 @@ var portalApplicationErrRows = []errRow{
 	{err: portal.ErrApplicationHealthModeInvalid, status: http.StatusBadRequest, code: "application.health_mode_invalid", msg: "application health check mode is invalid"},
 	{err: portal.ErrApplicationPortInvalid, status: http.StatusBadRequest, code: "application.port_invalid", msg: "application port is invalid"},
 	{err: portal.ErrApplicationFlavorInvalid, status: http.StatusBadRequest, code: "application.flavor_invalid", msg: "application api flavor is invalid"},
+	{err: portal.ErrApplicationEndpointModeInvalid, status: http.StatusBadRequest, code: "application.endpoint_mode_invalid", msg: "application endpoint mode is invalid"},
 	{err: portal.ErrApplicationStatusInvalid, status: http.StatusBadRequest, code: "application.status_invalid", msg: "application status is invalid"},
 	{err: portal.ErrApplicationConflict, status: http.StatusConflict, code: "application.port_conflict", msg: "application port already in use"},
 	{err: portal.ErrApplicationSyncFailed, status: http.StatusBadGateway, code: "application.sync_failed", msg: "model sync failed"},

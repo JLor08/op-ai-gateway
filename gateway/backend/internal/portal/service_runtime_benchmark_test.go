@@ -42,6 +42,12 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 		Pinned:                      true,
 		VRAMLocked:                  true,
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 18000}, {Index: 1, VRAMEstimateMB: 18000}},
+		// Deliberately non-default, so a full-document write that quietly
+		// re-defaulted these (rather than spreading the loaded document) would
+		// be caught by TestSetBenchmarkRuntimeSpecAdminStateIsAFullDocumentWriteThatNotifies.
+		APIFlavors:    []string{routing.APIFlavorOpenAI},
+		ResponsesMode: string(routing.EndpointModeDisabled),
+		MessagesMode:  string(routing.EndpointModeTranslate),
 	})
 	if err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
@@ -115,6 +121,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		VRAMLocked:                  true,
 		SetVisibleDevices:           true,
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 3, VRAMEstimateMB: 12000, VRAMMeasuredMB: 11500}},
+		APIFlavors:                  []string{routing.APIFlavorOpenAI},
+		ResponsesMode:               string(routing.EndpointModeDisabled),
+		MessagesMode:                string(routing.EndpointModeTranslate),
 	}
 	req := putRequestFromDTO(dto)
 	want := PutRuntimeSpecRequest{
@@ -134,6 +143,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		GPUs:                        dto.GPUs,
+		APIFlavors:                  dto.APIFlavors,
+		ResponsesMode:               dto.ResponsesMode,
+		MessagesMode:                dto.MessagesMode,
 	}
 	if !reflect.DeepEqual(req, want) {
 		t.Fatalf("putRequestFromDTO dropped or altered a field:\n got %#v\nwant %#v", req, want)

@@ -28,23 +28,69 @@ import (
 // Content-Type).
 const jsonContentType = "application/json"
 
-// nativePassthroughEnabled reports the upstream path to proxy to and whether the
-// resolved application has native passthrough enabled for the given client API
-// flavor. Codex uses the OpenAI Responses API (/v1/responses); Claude Code uses
-// the Anthropic Messages API (/v1/messages).
-func nativePassthroughEnabled(target routing.Target, apiFlavor string) (string, bool) {
+// Stable error codes (AGENTS.md: dotted lowercase noun.reason; the code string is
+// the wire contract) for a coding-agent endpoint the resolved app/spec has
+// DISABLED. Written inline like model.not_allowed — not sentinel-mapped.
+const (
+	codeResponsesEndpointDisabled = "responses.endpoint_disabled"
+	codeMessagesEndpointDisabled  = "messages.endpoint_disabled"
+	msgEndpointDisabled           = "endpoint disabled for this model"
+	// statusEndpointDisabled: "this model does not serve this endpoint here"
+	// (absence) — 404, matching the codebase's model-scoped-not-found posture.
+	// (Alternative aligned with model.not_allowed: http.StatusForbidden.)
+	statusEndpointDisabled = http.StatusNotFound
+)
+
+// endpointDisabledError returns the stable code + HTTP status for a disabled
+// coding-agent endpoint, per client API flavor.
+func endpointDisabledError(apiFlavor string) (string, int) {
+	if apiFlavor == "anthropic_messages" {
+		return codeMessagesEndpointDisabled, statusEndpointDisabled
+	}
+	return codeResponsesEndpointDisabled, statusEndpointDisabled
+}
+
+// endpointModeFor returns the upstream native path for the given client API flavor
+// and the EFFECTIVE EndpointMode the resolved Target carries for it. The Target's
+// mode is the resolved runtime spec's value for a server_agent app (resolved before
+// dispatch), else the application's — targetFrom (routing/resolver.go) sets it.
+// Codex uses the OpenAI Responses API (/v1/responses); Claude Code uses the
+// Anthropic Messages API (/v1/messages). A flavor that is neither yields ("", ""),
+// which every caller treats as translate.
+func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case "openai_responses":
-		return "/v1/responses", target.NativeResponses
+		return "/v1/responses", target.ResponsesMode
 	case "anthropic_messages":
-		return "/v1/messages", target.NativeMessages
+		return "/v1/messages", target.MessagesMode
 	}
-	return "", false
+	return "", ""
+}
+
+// targetServesFlavor reports whether target's effective APIFlavors (the resolved
+// application's, or — for a server_agent mapping — the resolved runtime spec's;
+// see targetFrom) includes the request's COARSE api flavor ("openai"/"anthropic").
+// This is the other half of the effective-served rule the docs promise (§6 /
+// ADR-033): "served iff flavor ∈ APIFlavors AND mode != disabled" — endpointModeFor
+// only ever reads the mode half. For an ORDINARY app this is a no-op check
+// (candidacy already excluded a flavor-less app before dispatch ever saw it — see
+// applicationServesEndpoint); for a server_agent app it is the ONLY place the
+// spec's (possibly narrower than the app's) flavor set is enforced, since
+// candidacy deliberately gates that app type on its own coarser, app-level
+// flavors only (the spec is the per-model authority, knowable only post-resolve).
+func targetServesFlavor(target routing.Target, apiFlavor string) bool {
+	coarse := routing.NormalizeAPIFlavor(apiFlavor)
+	for _, f := range target.APIFlavors {
+		if f == coarse {
+			return true
+		}
+	}
+	return false
 }
 
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
-// RESOLVED target + client API flavor: the native passthrough path when the app
-// has native passthrough enabled for that flavor, otherwise the built-in
+// RESOLVED target + client API flavor: the native passthrough path when the
+// effective mode for that flavor is passthrough, otherwise the built-in
 // translation's chat-completions path (per provider — ollama speaks /api/chat, all
 // OpenAI-compatible providers speak /v1/chat/completions). It returns "" for an
 // unresolved target (e.g. a resolve failure, where no upstream was called). This
@@ -54,16 +100,17 @@ func nativePassthroughEnabled(target routing.Target, apiFlavor string) (string, 
 //
 // KNOWN LIMIT (cosmetic, diagnostic field only): a translate handler derives the
 // value from its own (re-)resolved target. If, on the same request, routing flips
-// to a native-flagged application between tryProxyNative's resolve and the
+// to a passthrough-mode application between tryProxyNative's resolve and the
 // handler's resolve (the documented idempotent double-resolve — requires two
-// applications for one model with different native flags), this reports the native
-// path while the provider actually called the translate path. Not client-reachable
-// in practice and only mislabels one column; see docs/implementation-status.md.
+// applications for one model with different endpoint modes), this reports the
+// native path while the provider actually called the translate path. Not
+// client-reachable in practice and only mislabels one column; see
+// docs/implementation-status.md.
 func upstreamPath(target routing.Target, apiFlavor string) string {
 	if target.Provider == "" {
 		return ""
 	}
-	if p, native := nativePassthroughEnabled(target, apiFlavor); native {
+	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
 	}
 	if target.Provider == routing.ProviderOllama {
@@ -150,20 +197,50 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 		slog.Debug("native passthrough not applied: routing failed", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "err", err)
 		return false
 	}
-	path, enabled := nativePassthroughEnabled(target, apiFlavor)
-	if !enabled {
-		// The resolved application does NOT have native passthrough enabled for this
-		// endpoint, so the request falls back to the (lossy, text-only) translate
-		// path — which rejects rich Codex/Claude multi-turn bodies. This log names
-		// the exact application + flag state so a missing toggle is obvious.
-		slog.Debug("native passthrough not applied: not enabled on the resolved application",
+	path, mode := endpointModeFor(target, apiFlavor)
+	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
+	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
+	// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
+	// target no longer serves, treat it as disabled here — the one place a
+	// server_agent app's per-model spec flavor is enforceable (candidacy only
+	// checked the app-level flavor; see targetServesFlavor). A no-op for an
+	// ordinary app, whose flavor-less state already excluded it at candidacy.
+	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
+		mode = routing.EndpointModeDisabled
+	}
+	switch mode {
+	case routing.EndpointModePassthrough:
+		s.proxyNative(w, r, token, target, path, raw, req)
+		return true
+	case routing.EndpointModeDisabled:
+		// The resolved application (or, for a server_agent app, the resolved runtime
+		// spec whose effective mode targetFrom surfaced onto the Target) has this
+		// coding-agent endpoint turned OFF. For an ordinary app, candidate
+		// eligibility already excluded it; for a server_agent app the per-model
+		// disabled state is only knowable HERE, after model resolution — so this is
+		// the one place that rejects it, with a stable error code + 4xx, and WITHOUT
+		// falling through to the (lossy) translate path. Recorded as a failed usage
+		// event against the resolved target so the rejection is visible in
+		// Activity/Logs, mirroring the admission-timeout terminal branch above.
+		id := nextRequestID()
+		capturing := s.capturingEnabled(token)
+		code, status := endpointDisabledError(apiFlavor)
+		slog.Debug("native passthrough rejected: endpoint disabled",
+			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
+			"server", s.serverName(target.ServerID), "code", code, "status", status)
+		body := writeJSONCaptured(w, status, apierror.Response(code, msgEndpointDisabled, ""))
+		s.recordUsage(start, token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor))
+		return true
+	default:
+		// translate (or an unpopulated "" mode — treated as translate, the safe
+		// fall-back): hand off to the compat translate path exactly as a non-native
+		// app did before. The rich-body reject happens at that path's parse.
+		slog.Debug("native passthrough not applied: endpoint mode is translate",
 			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
 			"server", s.serverName(target.ServerID),
-			"native_responses", target.NativeResponses, "native_messages", target.NativeMessages)
+			"responses_mode", string(target.ResponsesMode), "messages_mode", string(target.MessagesMode))
 		return false
 	}
-	s.proxyNative(w, r, token, target, path, raw, req)
-	return true
 }
 
 // proxyNative forwards the raw client body to the upstream's native endpoint and

@@ -821,8 +821,8 @@ beforeEach(() => {
           health_check_path?: string;
           health_check_mode?: PortalApplication['health_check_mode'];
           health_check_interval_seconds?: number;
-          native_responses?: boolean;
-          native_messages?: boolean;
+          responses_mode?: PortalApplication['responses_mode'];
+          messages_mode?: PortalApplication['messages_mode'];
           loaded_models_path?: string;
           loaded_models_format?: string;
           context_probe_path?: string;
@@ -853,8 +853,8 @@ beforeEach(() => {
           health_check_path: body.health_check_path ?? '/v1/health',
           health_check_mode: body.health_check_mode ?? 'health_path',
           health_check_interval_seconds: body.health_check_interval_seconds ?? 0,
-          native_responses: body.native_responses ?? false,
-          native_messages: body.native_messages ?? false,
+          responses_mode: body.responses_mode ?? 'passthrough',
+          messages_mode: body.messages_mode ?? 'passthrough',
           loaded_models_path: body.loaded_models_path ?? '',
           loaded_models_format: body.loaded_models_format ?? '',
           context_probe_path: body.context_probe_path ?? '',
@@ -2008,8 +2008,8 @@ describe('App', () => {
         health_check_path: '/v1/health',
         health_check_mode: 'health_path',
         health_check_interval_seconds: 0,
-        native_responses: false,
-        native_messages: false,
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2081,8 +2081,8 @@ describe('App', () => {
         health_check_path: '/v1/health',
         health_check_mode: 'health_path',
         health_check_interval_seconds: 0,
-        native_responses: false,
-        native_messages: false,
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2146,8 +2146,8 @@ describe('App', () => {
         health_check_path: '/v1/health',
         health_check_mode: 'health_path',
         health_check_interval_seconds: 0,
-        native_responses: false,
-        native_messages: false,
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2181,8 +2181,8 @@ describe('App', () => {
         health_check_path: '/v1/health',
         health_check_mode: 'health_path',
         health_check_interval_seconds: 0,
-        native_responses: false,
-        native_messages: false,
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2246,8 +2246,8 @@ describe('App', () => {
         health_check_path: '/v1/health',
         health_check_mode: 'health_path',
         health_check_interval_seconds: 0,
-        native_responses: false,
-        native_messages: false,
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',

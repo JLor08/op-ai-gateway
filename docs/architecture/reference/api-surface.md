@@ -361,6 +361,69 @@ zero/empty: `health_path` `/health`, `health_timeout_seconds` 5,
 `startup_timeout_seconds` 180. A duplicate GPU index is refused as a **whole-write
 failure, not deduped**, so no filled-in row is silently discarded.
 
+#### API-variant endpoint modes (`responses_mode` / `messages_mode`)
+
+`ApplicationDTO`/`CreateApplicationRequest`/`UpdateApplicationRequest` and
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` each carry a `responses_mode`/
+`messages_mode` string pair (`disabled` | `translate` | `passthrough`), which
+replaced the two `native_responses`/`native_messages` booleans; the
+runtime-spec shapes additionally carry `api_flavors` (a subset of
+`["openai","anthropic"]`, the same shape the application DTO has always used).
+Full semantics — the effective-served rule, why a `server_agent` model's
+resolved spec is the sole authority for its own trio, and the dispatch-time
+404 — are in [Compatibility & Inference
+§6](../cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)
+and [Agent-Managed Model Runtime
+§11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows).
+Wire notes a client must know:
+
+- **Create** (`CreateApplicationRequest`, `PutRuntimeSpecRequest`): an absent
+  or blank mode defaults to `passthrough`; an absent `api_flavors` on the
+  runtime-spec shape defaults to both flavors — the same "every supported
+  upstream now serves both endpoints" default the application side has always
+  used. An unrecognized mode or flavor is rejected before any write.
+- **Update** (`UpdateApplicationRequest`): the two modes are `*string`,
+  keep-if-absent like every other pointer field on this DTO — but unlike a
+  plain optional string there is no "clear to empty" for a three-state enum:
+  a **present** pointer must name one of the three values, and an explicit
+  `""` is rejected exactly like an unrecognized string rather than read as
+  "leave unchanged" or "reset to default".
+- `PutRuntimeSpecRequest` is a full-document replace like the rest of this
+  surface (conventions above): a PUT that omits the trio does **not** inherit
+  the parent application's current values — it gets the same
+  passthrough/both-flavors default a brand-new application would. The portal
+  form performs the "start from the parent application's current values"
+  snapshot itself, once, when the create form is opened
+  ([Agent-Managed Model Runtime
+  §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows));
+  a direct API client gets no such convenience.
+
+New stable error codes:
+
+| Code | Status | Source |
+|---|---|---|
+| `responses.endpoint_disabled` | 404 | an inference request to `/v1/responses` resolved to an application/spec whose effective `responses_mode` is `disabled` — an inference-time rejection, never returned by a portal write ([Compatibility & Inference §13](../cross-cutting/compatibility-and-inference.md#13-errors)) |
+| `messages.endpoint_disabled` | 404 | the `/v1/messages` analogue |
+| `application.endpoint_mode_invalid` | 400 | `CreateApplicationRequest`/`UpdateApplicationRequest` carries an unrecognized `responses_mode`/`messages_mode` |
+| `runtime_spec.endpoint_mode_invalid` | 400 | `PutRuntimeSpecRequest` carries an unrecognized `responses_mode`/`messages_mode` |
+| `runtime_spec.flavor_invalid` | 400 | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic` |
+
+All five codes above are wired end to end and answer the listed status.
+`internal/portal.Service` returns the three validation sentinels
+(`ErrApplicationEndpointModeInvalid`, `ErrRuntimeSpecEndpointModeInvalid`,
+`ErrRuntimeSpecFlavorInvalid`), and each is mapped to 400 in the corresponding
+gateway HTTP error-code table — the first in `portalApplicationErrRows`, the
+other two in `portalRuntimeSpecErrRows` — mirroring
+`application.flavor_invalid`, which was already wired the same way. This
+closed the same class of gap this document already records having found and
+fixed once, for `application.proxy_listen_port_invalid`/`_conflict` (above): a
+service-layer sentinel existed and was unit-tested at the `internal/portal`
+level without initially being added to the gateway's HTTP error-code table, so
+a request that tripped one of the three fell through to the generic 500
+fallback instead (`application.request_failed` for the application write,
+`runtime_spec.request_failed` for the runtime-spec write) until the rows
+above were added.
+
 ### Groups, projects, services, resource-groups (governance model)
 
 | Path | Methods | Purpose |

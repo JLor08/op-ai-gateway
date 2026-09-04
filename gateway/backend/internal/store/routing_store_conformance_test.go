@@ -533,6 +533,8 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
 			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
+			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
+			ResponsesMode: routing.EndpointModeTranslate, MessagesMode: routing.EndpointModeDisabled,
 			CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
@@ -546,6 +548,10 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
+		}
+		if got.ResponsesMode != routing.EndpointModeTranslate || got.MessagesMode != routing.EndpointModeDisabled ||
+			!reflect.DeepEqual(got.APIFlavors, []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}) {
+			t.Fatalf("flavor/mode round-trip mismatch: %+v", got)
 		}
 
 		// RuntimeSpecByID: the same row, keyed by its own primary key rather
@@ -700,6 +706,38 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		}
 		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_rt2"); err != nil || ok {
 			t.Fatalf("RuntimeSpecByID after delete: ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestRoutingStoreApplicationEndpointModes proves all three drivers round-trip
+// ResponsesMode / MessagesMode on an application.
+func TestRoutingStoreApplicationEndpointModes(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_em", Name: "EM", Domain: "em.local", Provider: routing.ProviderVLLM,
+			Endpoint: "http://em:8000", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_em", ServerID: "srv_em", Type: routing.ProviderVLLM, Port: 8100, Scheme: "http",
+			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
+			ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModePassthrough,
+			Status: routing.ServerStatusActive, HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		got, err := s.ApplicationByID(ctx, "app_em")
+		if err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		if got.ResponsesMode != routing.EndpointModeDisabled || got.MessagesMode != routing.EndpointModePassthrough {
+			t.Fatalf("modes: got responses=%q messages=%q, want disabled/passthrough", got.ResponsesMode, got.MessagesMode)
 		}
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -214,7 +215,7 @@ func TestResolverGroupLoadedOnlyFalseIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("baseline Resolve: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("explicit-false target differs from no-setting target:\n got=%#v\nwant=%#v", got, want)
 	}
 }

@@ -13,6 +13,7 @@ import type {
   ApplicationStatus,
   ApplicationType,
   CreateApplicationRequest,
+  EndpointMode,
   PortalApplication,
   PortalServer,
   UpdateApplicationRequest,
@@ -25,6 +26,7 @@ import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { CheckboxGroup } from './shared/CheckboxGroup';
+import { ApiVariantControls } from './shared/ApiVariantControls';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -114,10 +116,6 @@ type Mode =
   | 'create'
   | { kind: 'edit'; app: PortalApplication }
   | { kind: 'mappings'; app: PortalApplication };
-
-function toggleFlavor(list: string[], flavor: string): string[] {
-  return list.includes(flavor) ? list.filter((item) => item !== flavor) : [...list, flavor];
-}
 
 export function ApplicationSection({
   t,
@@ -224,8 +222,8 @@ export function ApplicationSection({
   const [healthIntervalSeconds, setHealthIntervalSeconds] = useState(
     defaultCustomHealthIntervalSeconds,
   );
-  const [nativeResponses, setNativeResponses] = useState(false);
-  const [nativeMessages, setNativeMessages] = useState(false);
+  const [responsesMode, setResponsesMode] = useState<EndpointMode>('passthrough');
+  const [messagesMode, setMessagesMode] = useState<EndpointMode>('passthrough');
   const [loadedModelsPath, setLoadedModelsPath] = useState('');
   const [loadedModelsFormat, setLoadedModelsFormat] = useState('auto');
   const [contextProbePath, setContextProbePath] = useState('');
@@ -301,8 +299,8 @@ export function ApplicationSection({
     setHealthPath(defaultApplicationHealthPath);
     setHealthIntervalMode('default');
     setHealthIntervalSeconds(defaultCustomHealthIntervalSeconds);
-    setNativeResponses(d.nativeResponses);
-    setNativeMessages(d.nativeMessages);
+    setResponsesMode(d.responsesMode);
+    setMessagesMode(d.messagesMode);
     setLoadedModelsPath(d.loadedModelsPath);
     setLoadedModelsFormat(d.loadedModelsFormat);
     setContextProbePath(d.contextProbePath);
@@ -322,8 +320,8 @@ export function ApplicationSection({
     const patch = migrateTypeFields(type, newType, {
       port,
       scheme,
-      nativeResponses,
-      nativeMessages,
+      responsesMode,
+      messagesMode,
       loadedModelsPath,
       loadedModelsFormat,
       contextProbePath,
@@ -331,8 +329,8 @@ export function ApplicationSection({
     });
     if (patch.port !== undefined) setPort(patch.port);
     if (patch.scheme !== undefined) setScheme(patch.scheme);
-    if (patch.nativeResponses !== undefined) setNativeResponses(patch.nativeResponses);
-    if (patch.nativeMessages !== undefined) setNativeMessages(patch.nativeMessages);
+    if (patch.responsesMode !== undefined) setResponsesMode(patch.responsesMode);
+    if (patch.messagesMode !== undefined) setMessagesMode(patch.messagesMode);
     if (patch.loadedModelsPath !== undefined) setLoadedModelsPath(patch.loadedModelsPath);
     if (patch.loadedModelsFormat !== undefined) setLoadedModelsFormat(patch.loadedModelsFormat);
     if (patch.contextProbePath !== undefined) setContextProbePath(patch.contextProbePath);
@@ -359,8 +357,8 @@ export function ApplicationSection({
         ? app.health_check_interval_seconds
         : defaultCustomHealthIntervalSeconds,
     );
-    setNativeResponses(app.native_responses);
-    setNativeMessages(app.native_messages);
+    setResponsesMode(app.responses_mode);
+    setMessagesMode(app.messages_mode);
     setLoadedModelsPath(app.loaded_models_path ?? '');
     setLoadedModelsFormat(app.loaded_models_format || 'auto');
     setContextProbePath(app.context_probe_path ?? '');
@@ -404,8 +402,8 @@ export function ApplicationSection({
       health_check_path: healthPath,
       // "default" stores 0 so the app keeps following the system setting live.
       health_check_interval_seconds: healthIntervalMode === 'custom' ? healthIntervalSeconds : 0,
-      native_responses: nativeResponses,
-      native_messages: nativeMessages,
+      responses_mode: responsesMode,
+      messages_mode: messagesMode,
       loaded_models_path: loadedModelsPath.trim(),
       loaded_models_format: loadedModelsFormat,
       context_probe_path: contextProbePath.trim(),
@@ -823,30 +821,15 @@ export function ApplicationSection({
                 {t.applicationProxyOutOfScopeNote}
               </Typography>
             )}
-            <CheckboxGroup
-              legend={t.applicationFlavors}
-              options={applicationFlavorOptions.map((f) => ({ value: f, label: f }))}
-              selected={flavors}
-              onToggle={(v) => setFlavors((current) => toggleFlavor(current, v))}
+            <ApiVariantControls
+              t={t}
+              apiFlavors={flavors}
+              responsesMode={responsesMode}
+              messagesMode={messagesMode}
+              onFlavorsChange={setFlavors}
+              onResponsesModeChange={setResponsesMode}
+              onMessagesModeChange={setMessagesMode}
             />
-            <CheckboxGroup
-              legend={t.applicationNativeLegend}
-              options={[
-                { value: 'responses', label: t.applicationNativeResponses },
-                { value: 'messages', label: t.applicationNativeMessages },
-              ]}
-              selected={[
-                ...(nativeResponses ? ['responses'] : []),
-                ...(nativeMessages ? ['messages'] : []),
-              ]}
-              onToggle={(v) => {
-                if (v === 'responses') setNativeResponses((c) => !c);
-                else if (v === 'messages') setNativeMessages((c) => !c);
-              }}
-            />
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-              {t.applicationNativeNote}
-            </Typography>
             <Box
               component="fieldset"
               sx={{

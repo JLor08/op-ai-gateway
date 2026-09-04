@@ -38,10 +38,11 @@ export type PortalApplication = {
   health_check_mode: ApplicationHealthMode;
   // 0 = follow the system-wide health_check_interval_seconds; > 0 = custom cadence.
   health_check_interval_seconds: number;
-  // Native passthrough: proxy Codex (/v1/responses) resp. Claude Code
-  // (/v1/messages) raw to the upstream instead of translating.
-  native_responses: boolean;
-  native_messages: boolean;
+  // Per-endpoint serving mode for Codex (/v1/responses) and Claude Code
+  // (/v1/messages): disabled | translate | passthrough (replaces the old
+  // native_* booleans).
+  responses_mode: EndpointMode;
+  messages_mode: EndpointMode;
   // Optional upstream status path the gateway polls to learn which models are
   // loaded (empty disables it); format selects the parser (auto/openai/
   // llama_swap/llama_cpp).
@@ -83,8 +84,8 @@ export type CreateApplicationRequest = {
   health_check_path?: string;
   health_check_mode?: ApplicationHealthMode;
   health_check_interval_seconds?: number;
-  native_responses?: boolean;
-  native_messages?: boolean;
+  responses_mode?: EndpointMode;
+  messages_mode?: EndpointMode;
   loaded_models_path?: string;
   loaded_models_format?: string;
   context_probe_path?: string;
@@ -119,8 +120,8 @@ export type UpdateApplicationRequest = {
   health_check_path?: string;
   health_check_mode?: ApplicationHealthMode;
   health_check_interval_seconds?: number;
-  native_responses?: boolean;
-  native_messages?: boolean;
+  responses_mode?: EndpointMode;
+  messages_mode?: EndpointMode;
   loaded_models_path?: string;
   loaded_models_format?: string;
   context_probe_path?: string;
@@ -209,6 +210,11 @@ export type SyncResult = {
 // directly requestable; "hidden" is unlisted but still directly requestable;
 // "locked" is unlisted AND only reachable via a group.
 export type ModelVisibility = 'shown' | 'hidden' | 'locked';
+
+// Per-endpoint serving mode for the two coding-agent APIs (Codex /v1/responses,
+// Claude Code /v1/messages): 'disabled' = not served, 'translate' = converted to
+// /v1/chat/completions (lossy), 'passthrough' = proxied raw to the native path.
+export type EndpointMode = 'disabled' | 'translate' | 'passthrough';
 
 // How a group's members are walked: the manual priority order, or fastest
 // measured generation speed first.

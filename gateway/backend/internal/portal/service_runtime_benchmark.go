@@ -45,6 +45,9 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		GPUs:                        dto.GPUs,
+		APIFlavors:                  dto.APIFlavors,
+		ResponsesMode:               dto.ResponsesMode,
+		MessagesMode:                dto.MessagesMode,
 	}
 }
 

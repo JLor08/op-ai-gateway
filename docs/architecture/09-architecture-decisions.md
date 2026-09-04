@@ -447,3 +447,65 @@ spec's own `last_error`, naming the occupant and the card, which the portal
 shows in an always-visible column. Every other `Wait` stays silent, since a
 spec queued behind a busy neighbour is ordinary operation.
 → [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
+
+## ADR-033 — Endpoint modes replace the `native_*` booleans: independent per-endpoint disable, per-spec snapshot
+**Context:** whether the gateway proxied a Codex (`/v1/responses`) or Claude
+Code (`/v1/messages`) request natively, or translated it to
+`/v1/chat/completions`, was a per-application boolean
+(`native_responses`/`native_messages`). That encoding could express only
+*translate vs. pass-through* — there was no way to turn an endpoint **off**
+while keeping the application's plain chat-completions traffic and its other
+coding-agent endpoint alive, and no way to configure a `server_agent`
+application's models independently of one another; every managed model shared
+its parent application's one pair of booleans. **Decision:** replace the two
+booleans with one three-state `routing.EndpointMode`
+(`disabled`/`translate`/`passthrough`) per endpoint, on **two** levels: the
+application (as before, now a richer type) and — new — each `server_agent`
+runtime spec, which gains its own `api_flavors`/`responses_mode`/
+`messages_mode` trio and becomes the **sole** authority for its model once
+saved (the application's values are only the create-time template and the
+no-spec fallback; a later application edit never propagates to an existing
+spec — "Snapshot aus App"). An endpoint is served only when its coarse
+`openai`/`anthropic` flavor is enabled **and** its mode is not `disabled`,
+which is what makes the disable independent of the flavor checkbox: an
+application can keep serving plain chat completions while refusing Codex's
+`/v1/responses` specifically. Because a `server_agent` model's authoritative
+mode is only knowable after routing has resolved which model a request means,
+enforcement is split in two: an **ordinary** application's `disabled` endpoint
+is excluded at route-selection time, refining the existing coarse flavor-based
+candidacy gate to be endpoint-aware; a **`server_agent`** model's `disabled`
+mode cannot be checked that early — its resolved runtime spec is the only
+authority — so it is rejected at **dispatch** instead, once the
+runtime spec has resolved — a new stable code, `responses.endpoint_disabled`/
+`messages.endpoint_disabled` (HTTP 404), that never falls through to the lossy
+translate path. Every application type now defaults both modes to
+`passthrough` (research confirmed every supported upstream — Ollama, vLLM,
+llama.cpp, llama-swap, LiteLLM — serves both native endpoints today), replacing
+the old per-type translate exceptions. **Consequence:** the migration
+(`application_endpoint_modes`) is additive only — it backfills
+`applications.responses_mode`/`messages_mode` from the existing booleans
+(`true`→`passthrough`, `false`→`translate`, so no application's behavior
+changes on upgrade) and snapshots every existing `agent_runtime_specs` row from
+its parent application's just-backfilled values; the `native_responses`/
+`native_messages` columns stay in the schema, permanently inert, per the
+append-only migration rule. The three new spec-level fields are **gateway-side
+only** — the agent's runtime router forwards `/v1/responses` and `/v1/messages`
+to its managed child verbatim and routes purely on the request's `model`
+field, so the disabled/translate/passthrough decision never needs to reach it;
+the fields were deliberately never added to `AgentRuntimeSpecDTO` or the
+agent's `runtime.Spec` wire type, so `server-agent/` is untouched and
+`agent.Version` is not bumped for this feature — pinned by a guard test
+asserting the agent-facing runtime-config JSON never carries
+`api_flavors`/`responses_mode`/`messages_mode`. **Rejected:** teaching the
+agent's router about the two coding-agent paths so it could make the decision
+locally (it would duplicate the gateway's own resolved-model knowledge and
+require a wire/version bump for a decision the gateway already makes correctly
+before dispatch); and dynamic inheritance of a `server_agent` application's
+current values into its existing specs (an editor opening an old spec would
+see values silently drift out from under it whenever a colleague edited the
+application, defeating the point of a per-model override).
+→ [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
+[Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
+[§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
+[Data Model §4](reference/data-model.md#4-migration-history-72-migrations),
+[API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).

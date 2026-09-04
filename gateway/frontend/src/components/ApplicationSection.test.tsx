@@ -73,8 +73,8 @@ function makeApp(overrides: Partial<PortalApplication> = {}): PortalApplication 
     health_check_path: '/v1/health',
     health_check_mode: 'health_path',
     health_check_interval_seconds: 0,
-    native_responses: false,
-    native_messages: false,
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     loaded_models_path: '',
     loaded_models_format: '',
     context_probe_path: '',
@@ -143,6 +143,9 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     vram_locked: false,
     set_visible_devices: false,
     gpus: [],
+    api_flavors: [],
+    responses_mode: 'passthrough',
+    messages_mode: 'passthrough',
     ...overrides,
   };
 }
@@ -784,50 +787,63 @@ describe('ApplicationSection proxy opt-out control', () => {
   });
 });
 
-describe('ApplicationSection native passthrough toggles', () => {
-  it('defaults the native toggles per the ollama type (responses off, messages on) and sends the toggled state on create', async () => {
+// The three-state endpoint-mode dropdowns (design: API-variant endpoint modes)
+// that replaced the two native-passthrough checkboxes. openai gates the Codex
+// (Responses) dropdown; anthropic gates the Claude Code (Messages) dropdown.
+describe('ApplicationSection API-variant endpoint modes', () => {
+  const responsesField = () => screen.getByRole('combobox', { name: t.applicationResponsesMode });
+  const messagesField = () => screen.getByRole('combobox', { name: t.applicationMessagesMode });
+
+  async function selectMode(field: HTMLElement, optionLabel: string) {
+    fireEvent.mouseDown(field);
+    fireEvent.click(await screen.findByRole('option', { name: optionLabel }));
+  }
+
+  it('defaults both modes to Durchreichen and sends passthrough on create', async () => {
     const { created } = renderSection();
     openCreate();
-    const responses = screen.getByRole('checkbox', {
-      name: t.applicationNativeResponses,
-    }) as HTMLInputElement;
-    const messages = screen.getByRole('checkbox', {
-      name: t.applicationNativeMessages,
-    }) as HTMLInputElement;
-    // ollama's type defaults: no /v1/responses, but /v1/messages since v0.14.0.
-    expect(responses.checked).toBe(false);
-    expect(messages.checked).toBe(true);
+    expect(responsesField()).toHaveTextContent(t.applicationModePassthrough);
+    expect(messagesField()).toHaveTextContent(t.applicationModePassthrough);
 
-    fireEvent.click(responses); // also enable Codex passthrough
     fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
-
     await waitFor(() => expect(created).toHaveLength(1));
-    expect(created[0].native_responses).toBe(true);
-    expect(created[0].native_messages).toBe(true);
+    expect(created[0].responses_mode).toBe('passthrough');
+    expect(created[0].messages_mode).toBe('passthrough');
   });
 
-  it('populates the native toggles on edit and saves a change', async () => {
+  it('populates the modes on edit and saves a change', async () => {
     const { updated } = renderSection({
-      apps: [makeApp({ id: 'app_1', native_responses: true, native_messages: false })],
+      apps: [makeApp({ id: 'app_1', responses_mode: 'translate', messages_mode: 'disabled' })],
     });
     await screen.findByText('https://s1.example.test:8000');
     fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
 
-    const responses = screen.getByRole('checkbox', {
-      name: t.applicationNativeResponses,
-    }) as HTMLInputElement;
-    const messages = screen.getByRole('checkbox', {
-      name: t.applicationNativeMessages,
-    }) as HTMLInputElement;
-    expect(responses.checked).toBe(true);
-    expect(messages.checked).toBe(false);
+    expect(responsesField()).toHaveTextContent(t.applicationModeTranslate);
+    expect(messagesField()).toHaveTextContent(t.applicationModeDisabled);
 
-    fireEvent.click(messages); // also enable Claude Code passthrough
+    await selectMode(responsesField(), t.applicationModePassthrough);
     fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
 
     await waitFor(() => expect(updated).toHaveLength(1));
-    expect(updated[0].body.native_responses).toBe(true);
-    expect(updated[0].body.native_messages).toBe(true);
+    expect(updated[0].body.responses_mode).toBe('passthrough');
+    expect(updated[0].body.messages_mode).toBe('disabled');
+  });
+
+  it('disables the Codex dropdown when the openai flavor is unchecked, without clobbering the stored mode', async () => {
+    const { created } = renderSection();
+    openCreate();
+    expect(responsesField()).not.toHaveAttribute('aria-disabled', 'true');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+    expect(responsesField()).toHaveAttribute('aria-disabled', 'true');
+    expect(responsesField()).toHaveTextContent(t.applicationModeDisabled);
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].api_flavors).toEqual(['anthropic']);
+    // The stored mode rides along untouched; the backend's effective rule gates
+    // on the unchecked flavor.
+    expect(created[0].responses_mode).toBe('passthrough');
   });
 });
 

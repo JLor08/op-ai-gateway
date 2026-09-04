@@ -9,12 +9,12 @@ import {
 } from './applicationTypeDefaults';
 
 describe('applicationTypeDefaults', () => {
-  it('llama_swap has the loaded/probe/passthrough/port defaults', () => {
+  it('llama_swap has the loaded/probe/mode/port defaults', () => {
     expect(applicationTypeDefaults.llama_swap).toEqual({
       port: 8080,
       scheme: 'http',
-      nativeResponses: true,
-      nativeMessages: true,
+      responsesMode: 'passthrough',
+      messagesMode: 'passthrough',
       loadedModelsPath: '/running',
       loadedModelsFormat: 'llama_swap',
       contextProbePath: '/upstream/{model}/props',
@@ -22,12 +22,12 @@ describe('applicationTypeDefaults', () => {
     });
   });
 
-  it('ollama defaults Claude-on, Codex-off, /api/ps auto, no probe', () => {
+  it('ollama defaults both endpoint modes to passthrough, /api/ps auto, no probe', () => {
     expect(applicationTypeDefaults.ollama).toEqual({
       port: 11434,
       scheme: 'http',
-      nativeResponses: false,
-      nativeMessages: true,
+      responsesMode: 'passthrough',
+      messagesMode: 'passthrough',
       loadedModelsPath: '/api/ps',
       loadedModelsFormat: 'auto',
       contextProbePath: '',
@@ -39,12 +39,12 @@ describe('applicationTypeDefaults', () => {
   // 30000: it becomes a TOTAL request deadline that must cover a cold model
   // load, and 30s would fail every first request reproducibly (see the
   // backend default in portal service_applications.go / the task-19 brief).
-  it('server_agent defaults llama-swap-shaped loaded models plus a 10-minute timeout', () => {
+  it('server_agent defaults llama-swap-shaped loaded models, passthrough modes, plus a 10-minute timeout', () => {
     expect(applicationTypeDefaults.server_agent).toEqual({
       port: 8081,
       scheme: 'http',
-      nativeResponses: false,
-      nativeMessages: false,
+      responsesMode: 'passthrough',
+      messagesMode: 'passthrough',
       loadedModelsPath: '/running',
       loadedModelsFormat: 'llama_swap',
       contextProbePath: '',
@@ -64,7 +64,29 @@ describe('applicationTypeDefaults', () => {
     expect(patch.port).toBeUndefined(); // customized → kept
     expect(patch.loadedModelsPath).toBe('/v1/models'); // untouched → migrated
     expect(patch.loadedModelsFormat).toBe('openai');
-    expect(patch.nativeResponses).toBe(true);
+  });
+
+  // Both endpoint modes now default to passthrough for every type, so a switch
+  // between types that both hold the default is a no-op for those two fields:
+  // migrateTypeFields (unchanged, field-agnostic) still re-asserts the field
+  // in the patch because current equals the old type's default — the same
+  // mechanism that keeps e.g. `scheme` in the full-snapshot migrate test
+  // above even though every type shares 'http' — so the meaningful assertion
+  // is the resulting (merged) value, not whether the key is omitted.
+  it('leaves an already-passthrough mode alone across a type switch', () => {
+    const current = { ...applicationTypeDefaults.ollama };
+    const patch = migrateTypeFields('ollama', 'vllm', current);
+    const merged = { ...current, ...patch };
+    expect(merged.responsesMode).toBe('passthrough');
+    expect(merged.messagesMode).toBe('passthrough');
+  });
+
+  // A mode the operator moved off the shared default follows the general
+  // contract: it is preserved (never clobbered back to passthrough).
+  it('preserves a customized endpoint mode across a type switch', () => {
+    const current: TypeDefaults = { ...applicationTypeDefaults.ollama, responsesMode: 'translate' };
+    const patch = migrateTypeFields('ollama', 'vllm', current);
+    expect(patch.responsesMode).toBeUndefined();
   });
 
   // The preservation contract (migrateTypeFields' whole reason to exist)

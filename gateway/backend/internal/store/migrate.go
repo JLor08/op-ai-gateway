@@ -102,6 +102,7 @@ var migrations = []migration{
 	{version: 69, name: "runtime_spec_set_visible_devices", up: migration69Up},
 	{version: 70, name: "application_proxy_excluded", up: migration70Up},
 	{version: 71, name: "model_mapping_benchmarks_vram_json", up: migration71Up},
+	{version: 72, name: "application_endpoint_modes", up: migration72Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3106,4 +3107,88 @@ func migration70Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 func migration71Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "model_mapping_benchmarks",
 		"vram_json text not null default ''")
+}
+
+// migration72Up replaces the two native-passthrough booleans with per-endpoint
+// EndpointMode columns and snapshots them onto every existing runtime spec.
+//
+// applications: add responses_mode / messages_mode (text, not null, default
+// the empty string, so an upgrade's existing rows are non-NULL immediately, matching every other
+// text column here) and backfill from the inert native_responses /
+// native_messages booleans -- 1 -> 'passthrough' (raw proxy, as native_*=true
+// today), 0 -> 'translate' (compat path, as native_*=false today). No app
+// becomes 'disabled' on upgrade, so behaviour is preserved. The old bool
+// columns are left in place (append-only discipline, three drivers) and are no
+// longer read or written by any code.
+//
+// agent_runtime_specs: add api_flavors / responses_mode / messages_mode and
+// backfill each spec from its parent application (spec.mapping_id ->
+// model_mappings.application_id -> applications), copying the app's api_flavors
+// and its just-backfilled modes -- the "snapshot from app" decision. Existing
+// specs become explicit and independent, and the upgrade changes no behaviour.
+// Applications are backfilled FIRST so the spec join reads their set modes.
+//
+// It ABORTS the boot on failure (deterministic UPDATEs, no possibly-dirty
+// pre-check), following migration70Up rather than migration68Up's skip policy.
+// It does NOT touch baselineCreateStatements (frozen v60) or migration65Up's
+// create-table (append-only): a fresh install gets the columns by replaying
+// this migration, and every backfill is a no-op there because the tables are
+// empty. All backfills are guarded on the column being blank so a re-run is idempotent.
+func migration72Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	// applications: two mode columns.
+	for _, col := range []string{
+		"responses_mode text not null default ''",
+		"messages_mode text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "applications", col); err != nil {
+			return err
+		}
+	}
+	if err := execTx(ctx, tx, dl, `update applications
+		set responses_mode = case when native_responses <> 0 then 'passthrough' else 'translate' end
+		where responses_mode = ''`); err != nil {
+		return err
+	}
+	if err := execTx(ctx, tx, dl, `update applications
+		set messages_mode = case when native_messages <> 0 then 'passthrough' else 'translate' end
+		where messages_mode = ''`); err != nil {
+		return err
+	}
+	// agent_runtime_specs: the trio. api_flavors defaults to a valid empty JSON
+	// array so a transient pre-backfill read still decodes.
+	for _, col := range []string{
+		"api_flavors text not null default '[]'",
+		"responses_mode text not null default ''",
+		"messages_mode text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
+			return err
+		}
+	}
+	// Snapshot each spec from its parent application. Cross-driver: postgres
+	// UPDATE ... FROM a multi-table join; sqlite correlated subqueries (modernc
+	// sqlite supports UPDATE ... FROM only since 3.33 and not across this join
+	// shape reliably -- correlated subqueries are universally supported and
+	// identical semantics). Guarded on '' for idempotency.
+	if dl.name() == "postgres" {
+		return execTx(ctx, tx, dl, `update agent_runtime_specs s
+			set api_flavors = a.api_flavors,
+			    responses_mode = a.responses_mode,
+			    messages_mode = a.messages_mode
+			from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = s.mapping_id
+			  and (s.responses_mode = '' or s.messages_mode = '')`)
+	}
+	return execTx(ctx, tx, dl, `update agent_runtime_specs
+		set api_flavors = coalesce((select a.api_flavors from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = agent_runtime_specs.mapping_id), api_flavors),
+		    responses_mode = coalesce((select a.responses_mode from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = agent_runtime_specs.mapping_id), responses_mode),
+		    messages_mode = coalesce((select a.messages_mode from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = agent_runtime_specs.mapping_id), messages_mode)
+		where responses_mode = '' or messages_mode = ''`)
 }

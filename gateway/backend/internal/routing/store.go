@@ -516,12 +516,16 @@ type Application struct {
 	// "follow the system-wide health_check_interval_seconds setting" (and keep
 	// following it as that setting changes); a value > 0 is a custom fixed cadence.
 	HealthCheckIntervalSeconds int
-	// NativeResponses / NativeMessages enable per-application native passthrough:
-	// when set, a client request to /v1/responses (Codex) resp. /v1/messages
-	// (Claude Code / Anthropic) is proxied raw to the upstream's same native path
-	// instead of being translated through the internal inference representation.
-	NativeResponses bool
-	NativeMessages  bool
+	// ResponsesMode / MessagesMode are the per-application three-state endpoint
+	// controls (design 2026-09-03) that replaced the native_responses /
+	// native_messages booleans: for the Codex /v1/responses and Claude Code
+	// /v1/messages endpoints respectively — EndpointModeDisabled (not served),
+	// EndpointModeTranslate (translate to /v1/chat/completions, the old
+	// native_*=false) or EndpointModePassthrough (proxy raw to the upstream's
+	// native path, the old native_*=true). Whether the endpoint is served at all
+	// also depends on the matching APIFlavors entry (see applicationServesEndpoint).
+	ResponsesMode EndpointMode
+	MessagesMode  EndpointMode
 	// LoadedModelsPath is an optional upstream endpoint path the gateway (and/or the
 	// server-agent) polls to learn which model(s) are currently LOADED/RUNNING (e.g.
 	// llama-swap "/running", llama.cpp "/props", "/v1/models"). Empty = not tracked.
@@ -1275,8 +1279,17 @@ type RuntimeSpec struct {
 	// visibility variable in Env) live in portal.PutRuntimeSpec, and the
 	// agent refuses them again at launch — see that method for why both.
 	SetVisibleDevices bool
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of the
+	// API-variant capability + the two coding-agent endpoint modes (design
+	// 2026-09-03). For a server_agent mapping the RESOLVED spec is the sole
+	// authority for its model's flavors + modes; the parent application's values
+	// are only the create-time template and the no-spec fallback. Gateway-side
+	// only — never added to AgentRuntimeSpecDTO or the agent wire type.
+	APIFlavors    []string
+	ResponsesMode EndpointMode
+	MessagesMode  EndpointMode
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
@@ -1458,4 +1471,31 @@ func applicationHasAPIFlavor(app Application, apiFlavor string) bool {
 		}
 	}
 	return false
+}
+
+// applicationServesEndpoint refines applicationHasAPIFlavor with the per-endpoint
+// mode for the two coding-agent endpoints. For an openai_responses request an
+// ORDINARY app must carry the openai flavor AND not have ResponsesMode==disabled;
+// anthropic_messages is the anthropic/MessagesMode analogue. A server_agent app is
+// gated on the coarse flavor only here — its authoritative per-model mode lives on
+// the resolved RuntimeSpec and is enforced at dispatch (native_passthrough), so
+// candidacy must not exclude it on the app-level fallback. Any other flavor value
+// (openai_chat_completions, or an already-coarse openai/anthropic) uses the plain
+// flavor gate, so plain chat-completions is never removed by a disabled Codex
+// endpoint.
+func applicationServesEndpoint(app Application, fineFlavor string) bool {
+	switch fineFlavor {
+	case "openai_responses":
+		if !applicationHasAPIFlavor(app, APIFlavorOpenAI) {
+			return false
+		}
+		return app.Type == ProviderServerAgent || app.ResponsesMode != EndpointModeDisabled
+	case "anthropic_messages":
+		if !applicationHasAPIFlavor(app, APIFlavorAnthropic) {
+			return false
+		}
+		return app.Type == ProviderServerAgent || app.MessagesMode != EndpointModeDisabled
+	default:
+		return applicationHasAPIFlavor(app, NormalizeAPIFlavor(fineFlavor))
+	}
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { ApplicationType, ApplicationScheme } from '../../api';
+import type { ApplicationType, ApplicationScheme, EndpointMode } from '../../api';
 
 // The type-specific fields that a type selection prefills. Everything else on
 // the Application form (status, flavors, health mode/path/interval, tuning
@@ -14,8 +14,8 @@ import type { ApplicationType, ApplicationScheme } from '../../api';
 export interface TypeDefaults {
   port: number;
   scheme: ApplicationScheme;
-  nativeResponses: boolean; // Codex /v1/responses native passthrough
-  nativeMessages: boolean; // Claude /v1/messages native passthrough
+  responsesMode: EndpointMode; // Codex /v1/responses endpoint mode
+  messagesMode: EndpointMode; // Claude Code /v1/messages endpoint mode
   loadedModelsPath: string;
   loadedModelsFormat: string;
   contextProbePath: string;
@@ -27,8 +27,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   ollama: {
     port: 11434,
     scheme: 'http',
-    nativeResponses: false, // Ollama has no /v1/responses
-    nativeMessages: true, // Ollama /v1/messages since v0.14.0
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/api/ps',
     loadedModelsFormat: 'auto',
     contextProbePath: '',
@@ -37,8 +37,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   vllm: {
     port: 8000,
     scheme: 'http',
-    nativeResponses: true,
-    nativeMessages: true,
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/v1/models',
     loadedModelsFormat: 'openai',
     contextProbePath: '',
@@ -47,8 +47,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   llama_cpp: {
     port: 8080,
     scheme: 'http',
-    nativeResponses: true,
-    nativeMessages: true,
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/props',
     loadedModelsFormat: 'llama_cpp',
     contextProbePath: '/props',
@@ -57,8 +57,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   llama_swap: {
     port: 8080,
     scheme: 'http',
-    nativeResponses: true,
-    nativeMessages: true,
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/running',
     loadedModelsFormat: 'llama_swap',
     contextProbePath: '/upstream/{model}/props',
@@ -67,8 +67,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   litellm: {
     port: 4000,
     scheme: 'http',
-    nativeResponses: true,
-    nativeMessages: true,
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/v1/models',
     loadedModelsFormat: 'openai',
     contextProbePath: '',
@@ -84,8 +84,8 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
   server_agent: {
     port: 8081,
     scheme: 'http',
-    nativeResponses: false,
-    nativeMessages: false,
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
     loadedModelsPath: '/running',
     loadedModelsFormat: 'llama_swap',
     contextProbePath: '',
