@@ -90,18 +90,26 @@ New columns on `agent_runtime_specs` (migration **74**, additive, append-only):
 - `api_token text not null default ''` — the **sealed** token (`SealSecret`
   envelope: `enc:…` / `plain:…`), used only by `set` and `random`. Empty for
   `off` and `app`.
-- `api_token_header text not null default ''` — the **transmission header** the
-  gateway uses to send the token, mirroring `Application.APITokenHeader`. Empty ⇒
-  `Authorization: Bearer <token>`; a value sends the raw token under that header
-  name (e.g. `X-Api-Key`). Used by `set`/`random`; `app` mode inherits
-  `Application.APITokenHeader`. **The header must match what the backend expects**
-  (vLLM: `Bearer` only; llama.cpp: `Bearer` or `X-Api-Key`) — a mismatch leaves
-  the child effectively unauthenticated, so the portal hint (§7) states this and
-  validation checks the header *shape* (§6).
+- `api_token_header_source text not null default 'app'` — where the transmission
+  header comes from: `app` (inherit `Application.APITokenHeader`, **the default**)
+  or `custom` (use `api_token_header` below). Lets a spec reuse the application's
+  header convention *or* set its own. When `app` is chosen, the portal shows
+  read-only WHICH header that resolves to (§7).
+- `api_token_header text not null default ''` — the **custom** transmission header
+  (used only when `api_token_header_source = custom`), mirroring
+  `Application.APITokenHeader`. Empty ⇒ `Authorization: Bearer <token>` (the
+  default); a value sends the raw token under that header name (e.g. `X-Api-Key`).
+  **The header must match what the backend expects** (vLLM: `Bearer` only;
+  llama.cpp: `Bearer` or `X-Api-Key`) — a mismatch leaves the child effectively
+  unauthenticated, so the portal hint (§7) states this and validation checks the
+  header *shape* (§6).
+
+**Effective header** the gateway sends: `api_token_header_source = app` →
+`Application.APITokenHeader`; else → `spec.api_token_header` (empty ⇒ Bearer).
 
 `routing.RuntimeSpec` gains `APITokenMode string`, `APIToken string` (the sealed
-value; routing never decrypts it, mirroring `Application.APIToken`), and
-`APITokenHeader string`.
+value; routing never decrypts it, mirroring `Application.APIToken`),
+`APITokenHeaderSource string`, and `APITokenHeader string`.
 
 Type `routing.RuntimeAPITokenMode` (`"off"|"set"|"random"|"app"`) with consts, in
 a new small file (mirrors `visible_devices_mode.go`).
@@ -113,20 +121,32 @@ sealed value.
 
 ## 4. The `${API_TOKEN}` placeholder + resolution
 
-- **New placeholder token `${API_TOKEN}`**, valid in Env values and Args.
-- **Resolution is agent-side**, mirroring `${AGENT_ENV:NAME}`: the agent's
-  `ExpandPlaceholders` replaces `${API_TOKEN}` with the token value, and the span
-  is **masked** in the resolved-command log frame and the file-mode report
-  exactly like an `${AGENT_ENV}` span (reuse the existing masking path so the
-  token never appears in logs/reports).
+- **New placeholder token `${API_TOKEN}`, valid ONLY in Env values — NOT in Args**
+  (security review C1). A token in argv is world-readable (`/proc/<pid>/cmdline`,
+  `ps aux`) and is echoed by vLLM/llama.cpp at startup (captured into the agent's
+  stderr tail and reported up), which defeats this feature's own co-tenant threat
+  model (§9) and contradicts the agent's existing rule "secrets go in env, never in
+  args" (`server-agent/internal/runtime/report.go`). All three primary backends
+  accept the key via env, so this costs nothing. `${API_TOKEN}` in Args is a hard
+  validation error (§6). *(This narrows the original "env, fallback argument" to
+  env-only for the secret — see the open decision at the end of §6.)*
+- **Resolution is agent-side, with its OWN provenance span** — NOT a literal reuse
+  of `${AGENT_ENV}`. Today only the `${AGENT_ENV:NAME}` branch records a masked
+  span; `${PORT}`/`${MODEL}`/`${*_DEVICES}` record none and appear in clear. So
+  `${API_TOKEN}` must, in `expandSpec`, record its own secret span (label
+  `${API_TOKEN}`) so `ResolvedCommand.Masked` replaces it in the log frame — the
+  gateway never re-masks (`runtime_logs.go`). **This is new masking code, not a
+  reuse of the AGENT_ENV path.**
 - **The token reaches the agent in a dedicated wire field**, not embedded in the
-  Env JSON: the gateway's runtime-config push adds `api_token` to the wire
-  `runtime.Spec` (server-agent `types.go`), carrying the **decrypted** token the
-  selected mode resolves to (see §5). The agent resolves `${API_TOKEN}` from that
-  field. An empty field with a `${API_TOKEN}` in Env/Args is a launch-time hard
-  error (same class as an unresolved `${AGENT_ENV}`).
+  Env JSON: the runtime-config push adds `api_token` to the wire `runtime.Spec`
+  (server-agent `types.go`), carrying the **decrypted** token the selected mode
+  resolves to (§5). The agent resolves `${API_TOKEN}` from that field. `${API_TOKEN}`
+  in Env with an empty field is a launch-time hard error (unresolved-placeholder
+  class).
 - The gateway decrypts the token **only** when building the pushed config
-  (`capture.OpenSecret`), never storing it decrypted.
+  (`capture.OpenSecret`), never storing it decrypted. **On a decrypt failure it
+  pushes an EMPTY token (fail-closed)** so the agent hard-errors at launch — never
+  a garbled/partial token, never silently dropping the requirement.
 
 ---
 
@@ -148,10 +168,12 @@ encrypted, authenticated agent channel.)
 **(b) Authenticate on each request (so the child accepts).** The gateway resolves
 the **per-mapping** token into `routing.Target` in `resolver.go` `targetFrom`
 (which already loads the spec for `server_agent` apps):
-- `set`/`random` → `Target.APIToken = spec.APIToken` (sealed), `Target.APITokenHeader
-  = spec.APITokenHeader` (empty ⇒ Bearer, the default).
-- `app` → leave the existing `Target.APIToken = app.APIToken`, `APITokenHeader =
-  app.APITokenHeader` (today's behaviour — nothing to change).
+- `set`/`random` → `Target.APIToken = spec.APIToken` (sealed);
+  `Target.APITokenHeader` = the **effective header** (§3): `app.APITokenHeader`
+  when `api_token_header_source = app`, else `spec.api_token_header` (empty ⇒ Bearer).
+- `app` → `Target.APIToken = app.APIToken`; `Target.APITokenHeader` = the same
+  effective-header rule (default source `app` ⇒ `app.APITokenHeader`, i.e. today's
+  behaviour).
 - `off` → today's behaviour (app token or none).
 
 The existing edge path (`server.go` `upstreamAuthCtx` → `OpenSecret` →
@@ -162,6 +184,15 @@ provider/edge auth code and no router change.**
 Net: the child is launched requiring `<T>` and every gateway request to it
 carries `<T>`. Same `<T>` on both sides because the gateway owns it.
 
+**(c) The benchmark/capacity paths must resolve the per-spec token too**
+(security review I3). `benchmark_runner.go` builds its `routing.Target` DIRECTLY
+from `app.APIToken`, bypassing `targetFrom`; a `set`/`random` child would then 401
+every scheduled-benchmark and capacity probe (fail-closed but breaks measurement).
+The per-mapping token resolution must be applied in those Target builders too (or
+routed through a shared resolver). Cross-mapping is safe: `targetFrom` keys the
+spec by `mapping.ID`, and a routing disagreement yields a 401 at the child, never
+an open child.
+
 ---
 
 ## 6. Validation (portal `PutRuntimeSpec`)
@@ -169,19 +200,26 @@ carries `<T>`. Same `<T>` on both sides because the gateway owns it.
 Mirroring the `${..._DEVICES}` rules; new 400 error codes:
 
 - `runtime_spec.api_token_mode_invalid` — mode ∉ {off, set, random, app}.
+- `runtime_spec.api_token_in_args` — `${API_TOKEN}` appears in Args (forbidden;
+  argv is world-readable, §4/C1). Env only.
 - `runtime_spec.api_token_no_placeholder` — mode ≠ off but `${API_TOKEN}` appears
-  in neither Env nor Args (the token would be stored/generated but never reach the
-  child).
+  in no Env value (the token would be stored/generated but never reach the child).
 - `runtime_spec.api_token_placeholder_without_mode` — `${API_TOKEN}` used while
   mode = off (a placeholder that resolves to nothing).
 - `runtime_spec.api_token_app_unset` — mode = app but the application has no
   `APIToken` set (`app.APIToken == ""`), i.e. nothing to reuse.
-- `runtime_spec.api_token_header_invalid` — `api_token_header` is not a valid
-  header-name shape (reuse the application's `checkHeaderName` rule: token chars,
-  no colon/space). Empty is valid (⇒ Bearer, the default).
-- `set` mode with a new token value on a **disk store without a cipher** →
-  surface `capture.ErrKeyRequired` as a 400 before persisting (mirror
-  `service_applications.go`).
+- `runtime_spec.api_token_header_invalid` — `api_token_header_source` ∉
+  {app, custom}, OR (source = custom) `api_token_header` is not a valid header-name
+  shape (reuse the application's `checkHeaderName`: token chars, no colon/space;
+  empty is valid ⇒ Bearer). When source = app, `api_token_header` is ignored (the
+  app's header is used).
+- `set` (new value) **and `random`** (generated value) on a **disk store without a
+  cipher** → **seal-or-400 BEFORE any persist**: `capture.SealSecret` returns
+  `capture.ErrKeyRequired` (no plaintext-to-disk fallback, verified in
+  `capture/secret.go`); surface it as 400 and never write a `plain:` token or a
+  half-persisted mode (security review I5; mirror `service_applications.go`).
+  `Rotate` follows the same gate. Random values are generated with `crypto/rand`
+  by reusing the portal's existing `generateSecret()` / `compactRandomHexWithError`.
 
 Write-only semantics (mirror `app.APIToken`):
 - Create: `api_token` accepted, sealed, never returned.
@@ -202,7 +240,16 @@ the hint and shows an inline warning when a non-empty header is combined with a
 mode whose token is actually injected. The header *shape* is validated
 (`api_token_header_invalid`); the header↔backend *match* is the operator's
 responsibility (hinted, not hard-enforced — the gateway cannot know the child's
-expectation).
+expectation). App-mode with a custom header fails **closed** (the child sees no
+`Authorization`, returns 401 — down, not open), so a warning is acceptable.
+
+**OPEN DECISION (needs your sign-off):** the security review recommends **env-only**
+for the secret — `${API_TOKEN}` forbidden in Args — because a token in argv is
+world-readable (`ps aux`, `/proc/<pid>/cmdline`) and defeats the co-tenant
+protection this feature promises. That narrows your original "Umgebungsvariable
+(Fallback Argument)" to **env-only**. This spec assumes env-only. If a backend you
+use accepts the key ONLY via a flag, the alternative is to permit `${API_TOKEN}` in
+Args behind a loud "leaks via process listing" warning — your call.
 
 ---
 
@@ -215,25 +262,33 @@ A small **"API-Token (Upstream-Absicherung)"** section on the runtime-spec form:
   `api_token_set` "gesetzt"/"nicht gesetzt" indicator.
 - For `random`: a "Neu erzeugen (rotieren)" button; note that the value is never
   shown.
-- For `set`/`random`: an optional **Übermittlungs-Header** field (like the app's),
-  placeholder/default `Authorization: Bearer` when empty; inline warning when a
-  non-empty custom header is entered (must match the backend, see §6).
-- For `app`: a note that the application's token *and* its header are used (with
-  the same custom-header warning when `app.APITokenHeader` is set).
+- **Übermittlungs-Header** (shown when mode ≠ off): a source select —
+  `Von der Anwendung übernehmen` (**default**) or `Eigener Header`.
+  - `Von der Anwendung`: a **read-only display of the effective app header** so the
+    operator sees what is inherited — `Authorization: Bearer (Standard)` when
+    `app.APITokenHeader` is empty, otherwise the application's custom header name.
+  - `Eigener Header`: a free-text header field, placeholder/default
+    `Authorization: Bearer` when empty; inline warning when a non-empty custom
+    header is entered (must match the backend, §6).
+- For `app` token mode: a note that the application's token is used; the header
+  still follows the source select above (default: the app's).
 - A hint block (shown when mode ≠ off) telling the operator to reference the token
   with **`${API_TOKEN}`** in Env or Args, plus the per-backend variable table:
 
-  | Backend | Env (empfohlen) | Fallback-Argument | Client-Header |
-  |---|---|---|---|
-  | vLLM | `VLLM_API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` |
-  | llama.cpp (`llama-server`) | `LLAMA_API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` |
-  | TGI (HF) | `API_KEY=${API_TOKEN}` | `--api-key ${API_TOKEN}` | `Authorization: Bearer` |
+  | Backend | Ins **Env**-Feld setzen | Client-Header |
+  |---|---|---|
+  | vLLM | `VLLM_API_KEY=${API_TOKEN}` | `Authorization: Bearer` |
+  | llama.cpp (`llama-server`) | `LLAMA_API_KEY=${API_TOKEN}` | `Authorization: Bearer` (oder `X-Api-Key`) |
+  | TGI (HF) | `API_KEY=${API_TOKEN}` | `Authorization: Bearer` |
 
-  and the **honest** note: **Ollama, LM Studio und llama-swap prüfen eingehende
-  Requests nicht headless** (Ollama gar nicht; llama-swap nur per YAML `apiKeys`;
-  LM Studio nur per GUI-Schalter) — dort kann dieser Token den Modell-Server nicht
-  absichern. (Per the user's decision, the portal only *hints*; it does not block
-  those backends.)
+  (Env only — `${API_TOKEN}` in Args wird abgelehnt, §4/§6.)
+- **Structural unsupported-backend warning** (security review I6): the backend is
+  known from `app.Type`, so when a non-`off` mode is chosen for a backend that does
+  not enforce inbound auth headlessly — **Ollama** (none), **llama-swap** (only YAML
+  `apiKeys`), **LM Studio** (only GUI toggle) — the portal shows a **per-backend
+  banner** stating that this token cannot secure that model server, rather than a
+  generic table note an operator skims past. Per the user's decision it *warns*, it
+  does not block.
 
 i18n: all new strings in de + en (parity is compile-enforced).
 
@@ -242,15 +297,24 @@ i18n: all new strings in de + en (parity is compile-enforced).
 ## 8. Agent (`server-agent`) changes
 
 - Wire `runtime.Spec` gains `APIToken string` (json `api_token`) — the resolved,
-  decrypted token for this spec's mode (empty when `off`).
-- `ExpandPlaceholders`: resolve `${API_TOKEN}` from `Spec.APIToken`; unresolved
-  (`${API_TOKEN}` present but `Spec.APIToken` empty) is a hard error; **mask the
-  span** in `resolvedCommand`/report exactly like `${AGENT_ENV}`.
+  decrypted token for this spec's mode (empty when `off`). It is the ONE shared
+  struct (agent wire + file-mode parse) — hence the file-mode handling below.
+- `ExpandPlaceholders`/`expandSpec`: resolve `${API_TOKEN}` (Env only) from
+  `Spec.APIToken`; `${API_TOKEN}` present with an empty `APIToken` is a hard error.
+  **Record a NEW secret provenance span for it** (label `${API_TOKEN}`) so
+  `ResolvedCommand.Masked` replaces it — new masking code, because the `${AGENT_ENV}`
+  span path is provenance-specific and `${PORT}`/`${MODEL}`/`${*_DEVICES}` are not
+  masked (security review I1).
+- **File mode (security review I4):** a hand-written file-mode config could carry a
+  literal `api_token`. `redactConfigEnv` today masks only env *values*, so it would
+  send that literal upward in `BuildReport`. Redact the top-level `Spec.APIToken`
+  in `redactConfigEnv` — the gateway ingest DTO has no such field and drops it, but
+  it must not cross the wire in clear.
 - New capability flag `runtime_api_token` (Since `0.5.0`); `const Version` bump
   `0.4.0` → `0.5.0`.
 - No random generation and no router change in the agent (the gateway owns the
-  token) — this keeps the security-critical surface in the agent minimal (only:
-  receive a token, substitute it, mask it).
+  token) — the agent's security-critical surface stays minimal: receive, substitute,
+  mask, redact.
 
 ---
 
@@ -260,15 +324,21 @@ i18n: all new strings in de + en (parity is compile-enforced).
   keyless disk store), **never returned** to the UI (`api_token_set` only),
   **never logged** (masked in resolved-command + reports; provider already never
   logs it).
-- It travels the gateway→agent channel **decrypted but encrypted-in-transit**
-  (the existing authenticated agent transport) — the same posture `app.APIToken`
-  already has toward the upstream. This is the conscious divergence from the
-  `${AGENT_ENV}` "never on the wire" rule; documented in the architecture docs.
+- It travels the gateway→agent channel **authenticated always, but encrypted only
+  when the gateway URL is `https`** (security review I2). The agent accepts an
+  `http://` gateway URL (`server-agent/internal/config/config.go`), on which the
+  pushed decrypted token — and the agent's own bearer credential — travel in clear.
+  **Therefore any non-`off` mode requires (or at minimum loudly warns for) an
+  `https` gateway URL.** This is the conscious divergence from `${AGENT_ENV}`'s
+  "never on the wire" rule — the same posture `app.APIToken` has upstream, and it
+  only holds on TLS.
 - `random` removes the human from the loop entirely (no one ever sees the value);
   `set` keeps the operator in control; `app` reuses an existing secret.
-- Children are loopback-only, so this is defense-in-depth (a co-tenant process on
-  the agent host can no longer hit the model server) **and** a guard against an
-  operator binary that binds beyond loopback.
+- The child binds loopback (`127.0.0.1`) and the agent **router** may bind all
+  interfaces unauthenticated: the token is (a) defense-in-depth against a co-tenant
+  process on the agent host, and (b) the guard that stops an externally-reachable
+  router from exposing an unauthenticated model server. **This holds ONLY for
+  backends that actually enforce the token** (§7/I6).
 
 ---
 
@@ -291,14 +361,21 @@ i18n: all new strings in de + en (parity is compile-enforced).
 
 1. Store/migration: migration 74; `routing.RuntimeSpec` fields; `RuntimeAPITokenMode`;
    sqlite CRUD; conformance tests.
-2. Portal service: DTO (`api_token_mode`, `api_token_header`, `api_token_set`,
-   write-only `api_token` sentinel), validation + 5 error codes, seal on write,
-   `${API_TOKEN}` placeholder-consistency checks, header-shape check, random
-   generation + rotate, resolve-and-push the decrypted token into the agent-wire
-   spec, per-mapping Target token+header in `resolver.go` for set/random.
-3. Gateway endpoints: map the 5 sentinels → 400.
-4. `server-agent`: wire `api_token`; `${API_TOKEN}` resolution + masking; feature
-   flag `runtime_api_token`; Version 0.5.0.
+2. Portal service: DTO (`api_token_mode`, `api_token_header_source`,
+   `api_token_header`, `api_token_set`, write-only `api_token` sentinel; plus a
+   read-only `app_api_token_header` echo so the UI can show the inherited header),
+   validation + **6 error codes** (incl. `api_token_in_args`), env-only + header
+   source/shape checks, **seal-or-400 for set AND random** (`crypto/rand` via
+   `generateSecret`), rotate, resolve-and-push the decrypted token into the
+   agent-wire spec (**fail-closed empty on decrypt error**), per-mapping
+   effective-header + Target token in `resolver.go`, **and in the benchmark/capacity
+   Target builders** (`benchmark_runner.go`, security review I3), plus an
+   https-gateway-URL precondition warning/guard for non-`off` modes (I2).
+3. Gateway endpoints: map the 6 sentinels → 400.
+4. `server-agent`: wire `api_token`; `${API_TOKEN}` (Env-only) resolution with a
+   **new secret provenance span + masking** (I1); **redact `Spec.APIToken` in
+   `redactConfigEnv`** for file-mode reports (I4); feature flag `runtime_api_token`;
+   Version 0.5.0.
 5. Frontend: TS type, mode select + write-only field + rotate, hints + table +
    unsupported-backend note, i18n de/en, validation surfacing.
 6. Docs: `agent-runtime-manager.md` (placeholder catalog + the token modes +
