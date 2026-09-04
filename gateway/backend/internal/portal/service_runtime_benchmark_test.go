@@ -69,24 +69,33 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 // explicitly rather than skipped by a wildcard: Configured/ID/MappingID are
 // identity, not input, and vram_measured_mb is agent-owned (PutRuntimeSpec
 // copies the stored value forward and ignores what a request sends).
+//
+// Symmetrically, writeOnlyInRequest names the PutRuntimeSpecRequest fields
+// that deliberately have no RuntimeSpecDTO counterpart at all: api_token and
+// api_token_rotate (Task 4) drive a write (seal/rotate) that can never be
+// echoed back verbatim, so they can never round-trip through a loaded
+// document the way every other field here does.
 func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 	notInRequest := map[string]bool{
 		"configured": true, // GetRuntimeSpec's "no spec row yet" signal, never an input
 		"id":         true, // the spec's own identity
 		"mapping_id": true, // the key the write is addressed by
-		// api_token_mode/api_token_set/api_token_header_source/api_token_header
-		// are read-only in this task (Task 2 of the runtime-spec API-token
-		// feature): the write path -- validation, sealing, PutRuntimeSpecRequest
-		// counterparts -- lands in Tasks 3-5.
-		"api_token_mode":          true,
-		"api_token_set":           true,
-		"api_token_header_source": true,
-		"api_token_header":        true,
+		// api_token_set is derived (APIToken != "") and read-only: there is no
+		// way to "set presence" directly, only to write a token (api_token,
+		// write-only below) and let presence follow from that.
+		"api_token_set": true,
 		// app_api_token_set/app_api_token_header echo the PARENT application's
 		// token presence and header. They belong to the application, not this
 		// spec, so they are never settable through PutRuntimeSpec.
 		"app_api_token_set":    true,
 		"app_api_token_header": true,
+	}
+	writeOnlyInRequest := map[string]bool{
+		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
+		// ever exposes api_token_set, never the value. api_token_rotate: a
+		// one-shot instruction ("regenerate now"), not a stored fact to echo.
+		"api_token":        true,
+		"api_token_rotate": true,
 	}
 	dtoTags := map[string]bool{}
 	dtoType := reflect.TypeOf(RuntimeSpecDTO{})
@@ -100,7 +109,11 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 	reqTags := map[string]bool{}
 	reqType := reflect.TypeOf(PutRuntimeSpecRequest{})
 	for i := 0; i < reqType.NumField(); i++ {
-		reqTags[jsonTagName(t, reqType.Field(i))] = true
+		tag := jsonTagName(t, reqType.Field(i))
+		if writeOnlyInRequest[tag] {
+			continue
+		}
+		reqTags[tag] = true
 	}
 	for tag := range dtoTags {
 		if !reqTags[tag] {
@@ -137,6 +150,10 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APIFlavors:                  []string{routing.APIFlavorOpenAI},
 		ResponsesMode:               string(routing.EndpointModeDisabled),
 		MessagesMode:                string(routing.EndpointModeTranslate),
+		APITokenMode:                string(routing.RuntimeAPITokenModeSet),
+		APITokenSet:                 true, // read-only; must NOT appear in want below
+		APITokenHeaderSource:        string(routing.RuntimeAPITokenHeaderSourceCustom),
+		APITokenHeader:              "X-Upstream-Token",
 	}
 	req := putRequestFromDTO(dto)
 	want := PutRuntimeSpecRequest{
@@ -159,6 +176,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		APITokenMode:                dto.APITokenMode,
+		APITokenHeaderSource:        dto.APITokenHeaderSource,
+		APITokenHeader:              dto.APITokenHeader,
 	}
 	if !reflect.DeepEqual(req, want) {
 		t.Fatalf("putRequestFromDTO dropped or altered a field:\n got %#v\nwant %#v", req, want)

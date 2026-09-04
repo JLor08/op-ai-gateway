@@ -2297,3 +2297,120 @@ func TestPutRuntimeSpecVisibleDevicesModeValidation(t *testing.T) {
 		}
 	})
 }
+
+// TestPutRuntimeSpecAPITokenValidation is Task 3 of the runtime-spec
+// API-token feature: the four api_token_* error sentinels and the
+// ${API_TOKEN} placeholder matrix (required for set/random, optional for
+// app, forbidden for off), plus the header-source/header-shape check. It
+// does NOT cover sealing/rotation (Task 4) or the app-token resolver (Task
+// 6) -- every case here is a pure validation decision on the request alone.
+func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary: "/usr/local/bin/llama-server",
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(PutRuntimeSpecRequest) PutRuntimeSpecRequest
+		wantErr error // nil means "must save without error"
+	}{
+		{
+			name:    "bogus mode",
+			mutate:  func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.APITokenMode = "bogus"; return r },
+			wantErr: ErrRuntimeSpecAPITokenModeInvalid,
+		},
+		{
+			name: "set with no placeholder anywhere",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeSet)
+				return r
+			},
+			wantErr: ErrRuntimeSpecAPITokenNoPlaceholder,
+		},
+		{
+			name: "random with no placeholder",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeRandom)
+				return r
+			},
+			wantErr: ErrRuntimeSpecAPITokenNoPlaceholder,
+		},
+		{
+			name: "app with no placeholder is fine -- optional for app",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeApp)
+				return r
+			},
+			wantErr: nil,
+		},
+		{
+			name: "off with a placeholder left in env",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeOff)
+				r.Env = map[string]string{"X": "${API_TOKEN}"}
+				return r
+			},
+			wantErr: ErrRuntimeSpecAPITokenPlaceholderWithoutMode,
+		},
+		{
+			name: "set with placeholder but a malformed custom header",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeSet)
+				r.Env = map[string]string{"VLLM_API_KEY": "${API_TOKEN}"}
+				r.APITokenHeaderSource = string(routing.RuntimeAPITokenHeaderSourceCustom)
+				r.APITokenHeader = "Bad Header:"
+				return r
+			},
+			wantErr: ErrRuntimeSpecAPITokenHeaderInvalid,
+		},
+		{
+			name: "bogus header source",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenHeaderSource = "bogus"
+				return r
+			},
+			wantErr: ErrRuntimeSpecAPITokenHeaderInvalid,
+		},
+		{
+			name: "set with placeholder in args, header source app -- valid",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeSet)
+				r.Args = []string{"--api-key", "${API_TOKEN}"}
+				r.APITokenHeaderSource = string(routing.RuntimeAPITokenHeaderSourceApp)
+				return r
+			},
+			wantErr: nil,
+		},
+		{
+			// No app_unset error exists (Task 3 does not consume the parent
+			// application's token at all -- that is Task 6's resolver): mode
+			// "app" never fails validation regardless of the app's own token.
+			name: "app mode never trips on the app's own (empty) token",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.APITokenMode = string(routing.RuntimeAPITokenModeApp)
+				return r
+			},
+			wantErr: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, tc.mutate(base()))
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}

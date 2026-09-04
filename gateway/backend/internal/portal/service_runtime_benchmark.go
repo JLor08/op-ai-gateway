@@ -48,6 +48,9 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		APITokenMode:                dto.APITokenMode,
+		APITokenHeaderSource:        dto.APITokenHeaderSource,
+		APITokenHeader:              dto.APITokenHeader,
 	}
 }
 
