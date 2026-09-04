@@ -1807,3 +1807,72 @@ func TestExpandPlaceholdersDeviceLists(t *testing.T) {
 		})
 	}
 }
+
+// TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection pins Part B:
+// in "args" mode the agent injects NO visibility env var (the child sees every
+// card and --device does the selecting in host numbering); in "env" mode, and
+// for an empty/unknown mode (an older gateway never sends the field), it injects
+// the vendor variable exactly as before -- now order-preserving.
+func TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection(t *testing.T) {
+	getenv := func(string) string { return "" }
+	base := func() Spec {
+		return Spec{
+			Binary:            "/usr/bin/llama-server",
+			Args:              []string{"--device", "${CUDA_DEVICES}"},
+			GPUs:              []SpecGPU{{Index: 3}, {Index: 2}},
+			SetVisibleDevices: true,
+		}
+	}
+
+	t.Run("args mode injects no visibility variable", func(t *testing.T) {
+		spec := base()
+		spec.VisibleDevicesMode = VisibleDevicesModeArgs
+		args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+		if err != nil {
+			t.Fatalf("ExpandPlaceholders: %v", err)
+		}
+		if v, present := envValue(env, "CUDA_VISIBLE_DEVICES"); present {
+			t.Errorf("env injected CUDA_VISIBLE_DEVICES=%q in args mode; the child must see every card so --device numbering stays the host's", v)
+		}
+		if args[1] != "CUDA3,CUDA2" {
+			t.Errorf("args[1] = %q, want the expanded device list CUDA3,CUDA2", args[1])
+		}
+	})
+
+	for _, mode := range []string{VisibleDevicesModeEnv, ""} {
+		t.Run("mode="+mode+" injects the visibility variable in operator order", func(t *testing.T) {
+			spec := base()
+			spec.VisibleDevicesMode = mode
+			_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders: %v", err)
+			}
+			if v, ok := envValue(env, "CUDA_VISIBLE_DEVICES"); !ok || v != "3,2" {
+				t.Errorf("CUDA_VISIBLE_DEVICES = %q (present=%v), want 3,2 (env mode, declared order)", v, ok)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes pins that the
+// trap-3 refusal (a hand-set visibility var alongside the checkbox) is NOT
+// weakened by args mode: a hand-set CUDA_VISIBLE_DEVICES in args mode would
+// remap the CUDA namespace and break the child's --device numbering, so it is
+// refused there too.
+func TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes(t *testing.T) {
+	getenv := func(string) string { return "" }
+	for _, mode := range []string{VisibleDevicesModeEnv, VisibleDevicesModeArgs} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			spec := Spec{
+				Args:               []string{"--device", "${CUDA_DEVICES}"},
+				Env:                map[string]string{"CUDA_VISIBLE_DEVICES": "0,1"},
+				GPUs:               []SpecGPU{{Index: 3}, {Index: 2}},
+				SetVisibleDevices:  true,
+				VisibleDevicesMode: mode,
+			}
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv); err == nil {
+				t.Fatalf("a hand-set CUDA_VISIBLE_DEVICES must be refused in %q mode too", mode)
+			}
+		})
+	}
+}

@@ -58,9 +58,25 @@ type Spec struct {
 	// mapping, and nothing stops the child from landing on a different card,
 	// leaving the accounting confidently wrong with no warning anywhere.
 	// The rules and the four traps live on ExpandPlaceholders.
-	SetVisibleDevices bool   `json:"set_visible_devices"`
-	AdminState        string `json:"admin_state"` // "" | "force_running" | "force_stopped"
+	SetVisibleDevices bool `json:"set_visible_devices"`
+	// VisibleDevicesMode chooses HOW SetVisibleDevices enforces, and is only
+	// meaningful when it is on. "env" (the default) injects the vendor
+	// visibility variable, exactly as before. "args" injects NOTHING: the
+	// operator selects devices through a ${CUDA_DEVICES}/${VULKAN_DEVICES}/
+	// ${METAL_DEVICES} placeholder in Args, and the child sees every card so
+	// the placeholder's host-index numbering is what --device consumes. An
+	// empty or unknown value is env-mode -- the behavior an older gateway that
+	// never sends this field produces.
+	VisibleDevicesMode string `json:"visible_devices_mode"`
+	AdminState         string `json:"admin_state"` // "" | "force_running" | "force_stopped"
 }
+
+// VisibleDevicesMode wire values. The agent distinguishes only "args" from
+// everything else; these constants keep the comparison off a magic string.
+const (
+	VisibleDevicesModeEnv  = "env"
+	VisibleDevicesModeArgs = "args"
+)
 
 // GPUBudget is one per-GPU VRAM budget row.
 type GPUBudget struct {

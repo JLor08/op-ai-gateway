@@ -1051,7 +1051,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
 	// or an unrecognised stack: nothing is appended and the child's
 	// environment is byte-identical to the SetVisibleDevices-off one.
-	if spec.SetVisibleDevices {
+	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
 		if name := VisibleDevicesVar(vendor); name != "" {
 			resultEnv = append(resultEnv, name+"="+gpuIDs)
 			resultSpans = append(resultSpans, nil)
