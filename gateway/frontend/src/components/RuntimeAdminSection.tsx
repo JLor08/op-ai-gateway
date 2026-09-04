@@ -27,6 +27,9 @@ import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
 import ArticleIcon from '@mui/icons-material/Article';
 import SpeedIcon from '@mui/icons-material/Speed';
+import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
+import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
+import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import type {
   ApplicationStatus,
   BenchmarkRunDTO,
@@ -61,6 +64,7 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { useColumnDrag, columnDragSx, moveColumn } from './shared/columnDrag';
 import {
   latestApplicableVramRun,
   vramApplyNumber,
@@ -2233,6 +2237,27 @@ export function RuntimeAdminSection({
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }
 
+  // Reorder the GPU rows by rowKey (moveColumn works on a string[] of ids;
+  // rebuild the GpuRow[] in the new key order). Array order is the wire
+  // contract (buildSpecBody sends gpuRows verbatim), so this is the whole of
+  // Part A on the client.
+  function reorderGpuRows(sourceKey: string, targetKey: string, place: 'before' | 'after') {
+    setGpuRows((rows) => {
+      const order = moveColumn(rows.map((r) => r.rowKey), sourceKey, targetKey, place);
+      return order.map((k) => rows.find((r) => r.rowKey === k)!);
+    });
+  }
+  function swapGpuRow(idx: number, delta: number) {
+    setGpuRows((rows) => {
+      const target = idx + delta;
+      if (target < 0 || target >= rows.length) return rows;
+      const next = [...rows];
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  }
+  const gpuDrag = useColumnDrag(reorderGpuRows, 'vertical');
+
   /**
    * The APPLY affordance for one GPU row: the benchmark's number for that card,
    * read-only, plus a button that FILLS the operator's estimate field beside
@@ -3593,8 +3618,42 @@ export function RuntimeAdminSection({
               {gpuRows.map((row, idx) => (
                 <Box
                   key={row.rowKey}
-                  sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
+                  {...gpuDrag.dragProps(row.rowKey)}
+                  sx={{
+                    display: 'flex',
+                    gap: 1.5,
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    ...columnDragSx(
+                      row.rowKey,
+                      gpuDrag.draggingId,
+                      gpuDrag.overId,
+                      gpuDrag.overPlace,
+                      'vertical',
+                    ),
+                  }}
                 >
+                  <DragIndicatorIcon
+                    fontSize="small"
+                    sx={{ color: 'text.secondary', cursor: 'grab' }}
+                    aria-hidden
+                  />
+                  <IconButton
+                    size="small"
+                    aria-label={`${t.modelGroupMoveUp}: GPU ${row.index}`}
+                    disabled={idx === 0}
+                    onClick={() => swapGpuRow(idx, -1)}
+                  >
+                    <ArrowUpwardIcon fontSize="small" />
+                  </IconButton>
+                  <IconButton
+                    size="small"
+                    aria-label={`${t.modelGroupMoveDown}: GPU ${row.index}`}
+                    disabled={idx === gpuRows.length - 1}
+                    onClick={() => swapGpuRow(idx, 1)}
+                  >
+                    <ArrowDownwardIcon fontSize="small" />
+                  </IconButton>
                   {/* Picks a card BY NAME and writes its index into the field
                       beside it. It augments that field and never replaces it:
                       telemetry can be stale, absent, or behind the hardware

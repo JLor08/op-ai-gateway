@@ -1062,6 +1062,36 @@ describe('RuntimeAdminSection edit + delete', () => {
   });
 });
 
+describe('RuntimeAdminSection GPU-row ordering', () => {
+  it('reorders GPU rows (move down) and sends the new gpus order in the PUT', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          // `binary` is HTML5-`required` on this form (RuntimeAdminSection.tsx
+          // :3419) regardless of GPU config, so it must be non-blank for the
+          // Save click below to actually reach the submit handler.
+          binary: '/usr/bin/llama-server',
+          gpus: [
+            { index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 },
+            { index: 1, vram_estimate_mb: 2000, vram_measured_mb: 0 },
+            { index: 2, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+          ],
+        }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    // Move the first GPU row down one slot: 0,1,2 -> 1,0,2
+    fireEvent.click(await screen.findByRole('button', { name: `${t.modelGroupMoveDown}: GPU 0` }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus.map((g) => g.index)).toEqual([1, 0, 2]);
+  });
+});
+
 // Review round 2, Important 1/2/3: the agent's ExpandPlaceholders classifies
 // ${...} occurrences in BOTH args and env values with the exact same rule
 // (server-agent/internal/runtime/policy_local.go); the portal form has to
