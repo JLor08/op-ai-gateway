@@ -26,3 +26,31 @@ const (
 	RuntimeAPITokenHeaderSourceApp    RuntimeAPITokenHeaderSource = "app"
 	RuntimeAPITokenHeaderSourceCustom RuntimeAPITokenHeaderSource = "custom"
 )
+
+// SpecUpstreamAuth returns the SEALED upstream token and the effective
+// transmission header the gateway must attach to requests for one mapping's
+// server_agent child, per the spec's api_token_mode. Routing never decrypts —
+// the edge (server.go upstreamAuthCtx -> OpenSecret) does. A zero-value spec
+// (empty mode) is treated as "app" = today's behaviour.
+func SpecUpstreamAuth(spec RuntimeSpec, app Application) (token, header string) {
+	mode := spec.APITokenMode
+	if mode == "" {
+		mode = string(RuntimeAPITokenModeApp)
+	}
+	switch RuntimeAPITokenMode(mode) {
+	case RuntimeAPITokenModeOff:
+		return "", ""
+	case RuntimeAPITokenModeSet, RuntimeAPITokenModeRandom:
+		return spec.APIToken, effectiveAPITokenHeader(spec, app)
+	default: // app
+		return app.APIToken, effectiveAPITokenHeader(spec, app)
+	}
+}
+
+// effectiveAPITokenHeader is app.APITokenHeader unless the spec sets a custom one.
+func effectiveAPITokenHeader(spec RuntimeSpec, app Application) string {
+	if RuntimeAPITokenHeaderSource(spec.APITokenHeaderSource) == RuntimeAPITokenHeaderSourceCustom {
+		return spec.APITokenHeader
+	}
+	return app.APITokenHeader
+}
