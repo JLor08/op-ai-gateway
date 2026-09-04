@@ -608,6 +608,19 @@ func NormalizeAPIFlavor(apiFlavor string) string {
 	}
 }
 
+// affinityApplicationStale reports whether a stored affinity's application is no
+// longer a usable target for it — affinity disabled, moved to another server,
+// inactive, no longer serving the request's endpoint, or currently unreachable —
+// in which case the caller drops the affinity. Extracted from resolveAffinity so
+// that method's cognitive complexity stays within budget.
+func (r *Resolver) affinityApplicationStale(app Application, affinity RouteAffinity, fineFlavor string) bool {
+	return app.AffinityTTLSeconds <= 0 ||
+		app.ServerID != affinity.ServerID ||
+		app.Status != ServerStatusActive ||
+		!applicationServesEndpoint(app, fineFlavor) ||
+		(r.checker != nil && !r.checker.Reachable(app.ID))
+}
+
 func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, now time.Time) (Target, bool, error) {
 	affinity, ok, err := r.store.Affinity(ctx, key)
 	if err != nil {
@@ -628,7 +641,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	if err != nil {
 		return Target{}, false, fmt.Errorf("load affinity application: %w", err)
 	}
-	if app.AffinityTTLSeconds <= 0 || app.ServerID != affinity.ServerID || app.Status != ServerStatusActive || !applicationServesEndpoint(app, fineFlavor) || (r.checker != nil && !r.checker.Reachable(app.ID)) {
+	if r.affinityApplicationStale(app, affinity, fineFlavor) {
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
