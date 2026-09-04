@@ -693,8 +693,8 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	// APITokenHeader is only meaningful for a custom source (its shape was
 	// validated above via checkHeaderName); an "app" source inherits the
-	// application's header at resolve time (resolvePushToken) and stores none
-	// here.
+	// application's header at request-auth time (routing.SpecUpstreamAuth via
+	// effectiveAPITokenHeader) and stores none here.
 	headerName := ""
 	if routing.RuntimeAPITokenHeaderSource(headerSource) == routing.RuntimeAPITokenHeaderSourceCustom {
 		headerName = strings.TrimSpace(req.APITokenHeader)
