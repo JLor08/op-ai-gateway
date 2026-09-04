@@ -170,6 +170,98 @@ func TestHandlePortalMappingRuntimeSpecPutArgsModeNoPlaceholderReturns400(t *tes
 	}
 }
 
+// --- Task 8: the four runtime-spec API-token sentinels + capture.ErrKeyRequired -> 400 ---
+
+// TestHandlePortalMappingRuntimeSpecPutBadAPITokenModeReturns400 pins the WIRE
+// contract of portal.ErrRuntimeSpecAPITokenModeInvalid, mirroring
+// TestHandlePortalMappingRuntimeSpecPutBadVisibleDevicesModeReturns400 above.
+func TestHandlePortalMappingRuntimeSpecPutBadAPITokenModeReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_token_mode":"bogus"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.api_token_mode_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.api_token_mode_invalid", code)
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutAPITokenSetNoPlaceholderReturns400 pins
+// portal.ErrRuntimeSpecAPITokenNoPlaceholder: mode "set" without a
+// "${API_TOKEN}" placeholder anywhere in env/args.
+func TestHandlePortalMappingRuntimeSpecPutAPITokenSetNoPlaceholderReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_token_mode":"set","api_token":"secret-token"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.api_token_no_placeholder" {
+		t.Fatalf("error code = %q, want runtime_spec.api_token_no_placeholder", code)
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutAPITokenPlaceholderWithoutModeReturns400
+// pins portal.ErrRuntimeSpecAPITokenPlaceholderWithoutMode: mode "off" (the
+// default's implication, spelled out explicitly here) with a "${API_TOKEN}"
+// placeholder left in args -- nothing will ever fill it in.
+func TestHandlePortalMappingRuntimeSpecPutAPITokenPlaceholderWithoutModeReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_token_mode":"off","args":["--api-key","${API_TOKEN}"]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.api_token_placeholder_without_mode" {
+		t.Fatalf("error code = %q, want runtime_spec.api_token_placeholder_without_mode", code)
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutBadAPITokenHeaderSourceReturns400 pins
+// portal.ErrRuntimeSpecAPITokenHeaderInvalid: an api_token_header_source
+// outside {"app","custom"}.
+func TestHandlePortalMappingRuntimeSpecPutBadAPITokenHeaderSourceReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_token_header_source":"bogus"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.api_token_header_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.api_token_header_invalid", code)
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutKeylessStoreSetReturns400 pins
+// capture.ErrKeyRequired's wire contract: NewTestServer's portal.Service is
+// built with no Cipher and SettingsVolatile left false (ServiceDeps zero
+// value) -- the exact "disk store, no key" shape capture.SealSecret fails
+// closed on. mode "set" with a placeholder present passes
+// validateRuntimeSpecAPIToken and reaches the seal-or-400 write path (Task
+// 4), which must surface as 400, not the mapper's 500 fallback.
+func TestHandlePortalMappingRuntimeSpecPutKeylessStoreSetReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","api_token_mode":"set","api_token":"secret-token","args":["--api-key","${API_TOKEN}"]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.api_token_key_required" {
+		t.Fatalf("error code = %q, want runtime_spec.api_token_key_required", code)
+	}
+}
+
 func TestHandlePortalMappingRuntimeSpecDeleteReturnsOKTrue(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)
