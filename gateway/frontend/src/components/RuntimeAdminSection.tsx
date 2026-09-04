@@ -193,6 +193,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     admin_state: '',
     vram_locked: false,
     set_visible_devices: false,
+    visible_devices_mode: 'env',
     gpus: [],
     api_flavors: [],
     responses_mode: 'passthrough',
@@ -2044,6 +2045,7 @@ export function RuntimeAdminSection({
   const [adminState, setAdminState] = useState('');
   const [vramLocked, setVramLocked] = useState(false);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
+  const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
   const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
@@ -2122,6 +2124,7 @@ export function RuntimeAdminSection({
     setAdminState('');
     setVramLocked(false);
     setSetVisibleDevices(false);
+    setVisibleDevicesMode('env');
     setGpuRows([]);
   }
 
@@ -2141,6 +2144,7 @@ export function RuntimeAdminSection({
     setAdminState(spec.admin_state);
     setVramLocked(spec.vram_locked);
     setSetVisibleDevices(spec.set_visible_devices);
+    setVisibleDevicesMode(spec.visible_devices_mode);
     setGpuRows(
       spec.gpus.map((g) => ({
         rowKey: makeRowKey(),
@@ -2390,6 +2394,7 @@ export function RuntimeAdminSection({
       admin_state: adminState,
       vram_locked: vramLocked,
       set_visible_devices: setVisibleDevices,
+      visible_devices_mode: visibleDevicesMode,
       gpus: gpuRows.map((r) => ({
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,

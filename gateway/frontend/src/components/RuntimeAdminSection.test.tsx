@@ -150,6 +150,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admin_state: '',
     vram_locked: false,
     set_visible_devices: false,
+    visible_devices_mode: 'env',
     gpus: [],
     api_flavors: [],
     responses_mode: 'passthrough',
@@ -814,6 +815,18 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(putSpecs[0].body.responses_mode).toBe('passthrough');
     expect(putSpecs[0].body.messages_mode).toBe('translate');
     expect(created).toHaveLength(1);
+  });
+
+  it('defaults visible_devices_mode to env in the spec PUT body', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.visible_devices_mode).toBe('env');
   });
 
   it('rejects a reserved env key before ever calling the API', async () => {
@@ -1702,6 +1715,7 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     admin_state: adminState,
     vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
+    visible_devices_mode: spec.visible_devices_mode,
     gpus: spec.gpus,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
