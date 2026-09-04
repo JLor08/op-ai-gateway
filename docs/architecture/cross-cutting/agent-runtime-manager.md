@@ -491,9 +491,13 @@ The portal refuses that combination at save
 `visible_devices_mode` value (anything but `env`/`args`, checked regardless of
 whether the option is even on) is
 `runtime_spec.visible_devices_mode_invalid`, also HTTP 400. Both run **before
-any mutation**, and the agent enforces the identical pair again at launch —
-the same file-mode-coverage reasoning as the four traps below. **The conflict
-trap (trap 3 below) holds in both modes**: a hand-set
+any mutation**. Unlike the empty-value and conflict traps below, these two
+mode rules are **portal-only** — the agent does not re-enforce them at launch:
+it degrades an unknown or empty `visible_devices_mode` to `env` rather than
+refusing it, and does not itself require an `args` placeholder, so a
+hand-written file-mode document is not guarded against the
+args-without-placeholder combination the way the portal guards it. **The
+conflict trap (trap 3 below) holds in both modes**: a hand-set
 `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` in `env`
 is refused whenever `set_visible_devices` is on, regardless of
 `visible_devices_mode` — the mode changes what the agent injects, never

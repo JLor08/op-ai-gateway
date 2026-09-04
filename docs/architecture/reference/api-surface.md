@@ -361,8 +361,13 @@ with the option); and
 `visible_devices_mode` is `args`, and `args` contains none of
 `${CUDA_DEVICES}` / `${VULKAN_DEVICES}` / `${METAL_DEVICES}`. All four rules
 are **vendor-independent** — this gateway cannot know the target host's
-hardware — and the agent enforces the identical set again at launch, which is
-what covers the file-mode path that never reaches this endpoint. See
+hardware. Of the four, only the two that predate the mode split — the
+empty-`gpus` refusal and the hand-set conflict — are re-enforced by the agent
+again at launch, which is what covers the file-mode path that never reaches
+this endpoint; the two mode rules (`visible_devices_mode_invalid`,
+`visible_devices_args_no_placeholder`) are **portal-only**, and the agent
+instead degrades an unknown or empty `visible_devices_mode` to `env` rather
+than refusing it. See
 [agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement). **Env values are never validated** —
 that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
 `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and `${CUDA_DEVICES}`/

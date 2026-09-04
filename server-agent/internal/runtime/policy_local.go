@@ -711,11 +711,15 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //
 // # SetVisibleDevices: making the GPU list an enforcement, not a declaration
 //
-// When spec.SetVisibleDevices is set, this function adds ONE agent-owned
-// variable to the child's environment: VisibleDevicesVar(vendor) =
-// hostGPUIDs(spec). vendor is the agent's own locally-detected hardware, never
-// anything the gateway said. On Apple or an unrecognised stack the variable
-// name is "" and nothing is added at all -- a successful no-op, not an error.
+// When spec.SetVisibleDevices is set in the default env mode, this function
+// adds ONE agent-owned variable to the child's environment:
+// VisibleDevicesVar(vendor) = hostGPUIDs(spec). vendor is the agent's own
+// locally-detected hardware, never anything the gateway said. On Apple or an
+// unrecognised stack the variable name is "" and nothing is added at all -- a
+// successful no-op, not an error. In args mode (VisibleDevicesMode == "args")
+// it adds NO variable: the operator enforces visibility through a
+// ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholder in args
+// instead, so the vendor env var is deliberately left unset.
 //
 // The four traps this option has to defuse, and where each is handled:
 //
