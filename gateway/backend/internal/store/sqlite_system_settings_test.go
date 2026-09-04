@@ -46,6 +46,94 @@ func TestSQLiteSystemSettingsSetAndRead(t *testing.T) {
 	}
 }
 
+func TestConformanceSetSystemSettingsWritesAllKeys(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, st *SQLStore) {
+		ctx := context.Background()
+		now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+
+		if err := st.SetSystemSettings(ctx, map[string]string{
+			"cert_enabled":     "true",
+			"cert_issuer_mode": "self_signed",
+			"cert_base_domain": "int.example.test",
+		}, now); err != nil {
+			t.Fatalf("SetSystemSettings returned %v", err)
+		}
+
+		got, err := st.SystemSettings(ctx)
+		if err != nil {
+			t.Fatalf("SystemSettings returned %v", err)
+		}
+		want := map[string]string{
+			"cert_enabled":     "true",
+			"cert_issuer_mode": "self_signed",
+			"cert_base_domain": "int.example.test",
+		}
+		if len(got) != len(want) {
+			t.Fatalf("SystemSettings = %#v, want %#v", got, want)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Fatalf("SystemSettings[%q] = %q, want %q", k, got[k], v)
+			}
+		}
+	})
+}
+
+// TestConformanceSetSystemSettingsRespectsCancelledContext covers the "cannot
+// even begin" failure path on both dialects: a pre-cancelled context fails at
+// BeginTx, before any upsert runs, so nothing is written and a pre-existing
+// baseline is untouched. The stronger property -- that a failure PART WAY through
+// the batch rolls the already-applied writes back -- needs a fault injected after
+// a successful write and is proved by TestSetSystemSettingsRollsBackPartialWrite.
+func TestConformanceSetSystemSettingsRespectsCancelledContext(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, st *SQLStore) {
+		ctx := context.Background()
+		now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+
+		// A baseline value that must survive a later failed batch untouched.
+		if err := st.SetSystemSetting(ctx, "cert_issuer_mode", "acme", now); err != nil {
+			t.Fatalf("seed baseline: %v", err)
+		}
+
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		err := st.SetSystemSettings(cancelledCtx, map[string]string{
+			"cert_enabled":     "true",
+			"cert_issuer_mode": "self_signed",
+			"cert_base_domain": "int.example.test",
+		}, now)
+		if err == nil {
+			t.Fatalf("SetSystemSettings with a cancelled context returned nil, want an error")
+		}
+
+		got, err := st.SystemSettings(ctx)
+		if err != nil {
+			t.Fatalf("SystemSettings returned %v", err)
+		}
+		if _, ok := got["cert_enabled"]; ok {
+			t.Fatalf("cert_enabled was persisted despite the batch failing: %#v", got)
+		}
+		if _, ok := got["cert_base_domain"]; ok {
+			t.Fatalf("cert_base_domain was persisted despite the batch failing: %#v", got)
+		}
+		if got["cert_issuer_mode"] != "acme" {
+			t.Fatalf("cert_issuer_mode = %q, want the untouched baseline %q", got["cert_issuer_mode"], "acme")
+		}
+	})
+}
+
+func TestConformanceSetSystemSettingsEmptyIsNoOp(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, st *SQLStore) {
+		ctx := context.Background()
+		if err := st.SetSystemSettings(ctx, nil, time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("SetSystemSettings(nil) returned %v", err)
+		}
+		if err := st.SetSystemSettings(ctx, map[string]string{}, time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("SetSystemSettings(empty) returned %v", err)
+		}
+	})
+}
+
 func TestSQLiteSystemSettingsUpsertOverwrites(t *testing.T) {
 	ctx := context.Background()
 	st := openMigratedTestSQLite(t)

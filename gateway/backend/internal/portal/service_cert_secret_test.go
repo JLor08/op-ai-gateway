@@ -441,6 +441,18 @@ func (f *failCAWritesSettings) SetSystemSetting(ctx context.Context, key, value 
 	return f.MemorySystemSettings.SetSystemSetting(ctx, key, value, now)
 }
 
+// SetSystemSettings routes the atomic batch back through this fake's fault-aware
+// per-key SetSystemSetting, so the CA-column fault still fires in a batch instead
+// of the promoted (fault-free) MemorySystemSettings batch method bypassing it.
+func (f *failCAWritesSettings) SetSystemSettings(ctx context.Context, values map[string]string, now time.Time) error {
+	for key, value := range values {
+		if err := f.SetSystemSetting(ctx, key, value, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // TestReconcileSelfSignedLogsTheVariableForAMissingKey pins the LOG channel of
 // the self_signed abort gate. The gate's own line is
 // `internal CA unavailable; skipping certificate pass err=system.cert_key_required`

@@ -1673,6 +1673,33 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 // partially applied to the store.
 type settingWrite struct{ key, value string }
 
+// persistSystemSettings writes a validated batch of settings. When the store
+// supports the atomicSystemSettingsStore capability -- both production stores do
+// -- the whole batch goes through one atomic write, so a mid-batch failure rolls
+// every key back and a concurrent reader never sees one key without the others.
+// A store without that capability (an error-injecting test fake) falls back to
+// per-key writes in the same order, preserving those fakes' key-specific error
+// behaviour. One clock reading stamps the whole batch, which is written together.
+func (s *Service) persistSystemSettings(ctx context.Context, writes []settingWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	now := s.clock()
+	if batch, ok := s.settings.(atomicSystemSettingsStore); ok {
+		values := make(map[string]string, len(writes))
+		for _, w := range writes {
+			values[w.key] = w.value
+		}
+		return batch.SetSystemSettings(ctx, values, now)
+	}
+	for _, w := range writes {
+		if err := s.settings.SetSystemSetting(ctx, w.key, w.value, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token, req UpdateSystemSettingsRequest) (SystemSettingsDTO, error) {
 	if !isSystem(principal) {
 		return SystemSettingsDTO{}, ErrPrincipalForbidden
@@ -2350,11 +2377,13 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 
 	// Everything validated above; only now do any of the fields — SMTP or
 	// not — actually reach the store, so a rejection from any block leaves
-	// the prior state fully intact.
-	for _, w := range writes {
-		if err := s.settings.SetSystemSetting(ctx, w.key, w.value, s.clock()); err != nil {
-			return SystemSettingsDTO{}, err
-		}
+	// the prior state fully intact. The batch is applied ATOMICALLY (see
+	// persistSystemSettings): a mid-batch store failure rolls every key back
+	// rather than leaving a partial write, and a concurrent reader — notably
+	// the certificate reconcile loop — never observes one related key without
+	// the others (e.g. cert_enabled=true before cert_issuer_mode landed).
+	if err := s.persistSystemSettings(ctx, writes); err != nil {
+		return SystemSettingsDTO{}, err
 	}
 	// A NetBird token was just (re)stored. Keep netbird_token_id/_expires_at in sync:
 	// clearing the token clears them synchronously; a new non-empty token is resolved
