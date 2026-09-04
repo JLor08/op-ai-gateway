@@ -165,8 +165,8 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
   };
 }
 
-// Shared by both the API-token MODE tests (Task 12/13) and the header-source
-// tests (Task 14): opens the edit sub-view for a single pre-existing spec.
+// Shared by both the API-token mode tests and the header-source tests below:
+// opens the edit sub-view for a single pre-existing spec.
 async function openApiTokenSpecEdit(
   specOverrides: Partial<RuntimeSpec> = {},
   applicationOverride?: PortalApplication,
@@ -5912,12 +5912,11 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
   });
 });
 
-// Runtime-Spec API Token (Task 12/13): the MODE controls only -- a mode
-// select (default 'app'), a write-only token field for 'set', a rotate
-// button for 'random', and the app-unset hint for 'app'. The header-source
-// select + inherited-header display is Task 14, covered in its own describe
-// block below.
-describe('RuntimeAdminSection API-token mode (Task 12/13)', () => {
+// Runtime-Spec API Token: the MODE controls only -- a mode select (default
+// 'app'), a write-only token field for 'set', a rotate button for 'random',
+// and the app-unset hint for 'app'. The header-source select + inherited-
+// header display is covered in its own describe block below.
+describe('RuntimeAdminSection API-token mode', () => {
   it('defaults api_token_mode to app in the spec PUT body (create)', async () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -6069,11 +6068,11 @@ describe('RuntimeAdminSection API-token mode (Task 12/13)', () => {
   });
 });
 
-// Runtime-Spec API Token header source (Task 14): which header CARRIES the
-// token from the mode block above -- inherit the app's own header (default)
-// or set a per-mapping custom one, with a warning that a custom header must
-// match what the backend actually expects. Hidden entirely under mode 'off'.
-describe('RuntimeAdminSection API-token header source (Task 14)', () => {
+// Runtime-Spec API Token header source: which header CARRIES the token from
+// the mode block above -- inherit the app's own header (default) or set a
+// per-mapping custom one, with a warning that a custom header must match
+// what the backend actually expects. Hidden entirely under mode 'off'.
+describe('RuntimeAdminSection API-token header source', () => {
   it('shows the Bearer default when the parent app has no header override', async () => {
     await openApiTokenSpecEdit({
       api_token_mode: 'set',
@@ -6178,7 +6177,7 @@ describe('RuntimeAdminSection API-token header source (Task 14)', () => {
   });
 });
 
-describe('RuntimeAdminSection API-token backend hints (Task 15)', () => {
+describe('RuntimeAdminSection API-token backend hints', () => {
   it('shows the per-backend variable table whenever mode is not "off"', async () => {
     await openApiTokenSpecEdit({ api_token_mode: 'set' });
 

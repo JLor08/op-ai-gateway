@@ -170,7 +170,7 @@ func TestHandlePortalMappingRuntimeSpecPutArgsModeNoPlaceholderReturns400(t *tes
 	}
 }
 
-// --- Task 8: the four runtime-spec API-token sentinels + capture.ErrKeyRequired -> 400 ---
+// --- the four runtime-spec API-token sentinels + capture.ErrKeyRequired -> 400 ---
 
 // TestHandlePortalMappingRuntimeSpecPutBadAPITokenModeReturns400 pins the WIRE
 // contract of portal.ErrRuntimeSpecAPITokenModeInvalid, mirroring
@@ -246,8 +246,8 @@ func TestHandlePortalMappingRuntimeSpecPutBadAPITokenHeaderSourceReturns400(t *t
 // built with no Cipher and SettingsVolatile left false (ServiceDeps zero
 // value) -- the exact "disk store, no key" shape capture.SealSecret fails
 // closed on. mode "set" with a placeholder present passes
-// validateRuntimeSpecAPIToken and reaches the seal-or-400 write path (Task
-// 4), which must surface as 400, not the mapper's 500 fallback.
+// validateRuntimeSpecAPIToken and reaches the seal-or-400 write path, which
+// must surface as 400, not the mapper's 500 fallback.
 func TestHandlePortalMappingRuntimeSpecPutKeylessStoreSetReturns400(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)

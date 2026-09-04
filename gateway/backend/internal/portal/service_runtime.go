@@ -430,11 +430,12 @@ type PutRuntimeSpecRequest struct {
 	APITokenHeaderSource string `json:"api_token_header_source"`
 	APITokenHeader       string `json:"api_token_header"`
 	// APIToken is write-only: nil = keep, "" = clear, value = replace-and-seal.
-	// Sealing/rotation is Task 4 -- this task only validates the shape of the
-	// request around it.
+	// Sealing/rotation happens in putRuntimeSpec's write path --
+	// validateRuntimeSpecAPIToken only validates the shape of the request
+	// around it.
 	APIToken *string `json:"api_token"`
-	// APITokenRotate, when true under mode "random", forces regeneration
-	// (Task 4).
+	// APITokenRotate, when true under mode "random", forces regeneration on
+	// write.
 	APITokenRotate bool `json:"api_token_rotate"`
 }
 
@@ -692,7 +693,8 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	// APITokenHeader is only meaningful for a custom source (its shape was
 	// validated above via checkHeaderName); an "app" source inherits the
-	// application's header at resolve time (Task 6) and stores none here.
+	// application's header at resolve time (resolvePushToken) and stores none
+	// here.
 	headerName := ""
 	if routing.RuntimeAPITokenHeaderSource(headerSource) == routing.RuntimeAPITokenHeaderSourceCustom {
 		headerName = strings.TrimSpace(req.APITokenHeader)
@@ -898,8 +900,8 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 // validRuntimeAPITokenMode reports whether s is one of the four
 // routing.RuntimeAPITokenMode values. Unlike validVisibleDevicesMode, empty
 // is NOT accepted here -- callers normalize "" to "app" themselves before
-// calling this (see validateRuntimeSpecAPIToken), the same way Task 4's
-// sealing logic will need the resolved mode, not the raw request value.
+// calling this (see validateRuntimeSpecAPIToken), the same way the sealing
+// logic in putRuntimeSpec needs the resolved mode, not the raw request value.
 func validRuntimeAPITokenMode(s string) bool {
 	switch routing.RuntimeAPITokenMode(s) {
 	case routing.RuntimeAPITokenModeOff, routing.RuntimeAPITokenModeSet,
@@ -933,12 +935,12 @@ func specHasAPITokenPlaceholder(env map[string]string, args []string) bool {
 // validateRuntimeSpecAPIToken validates api_token_mode, the ${API_TOKEN}
 // placeholder requirement that mode implies, and api_token_header_source/
 // api_token_header. It does NOT look at api_token or api_token_rotate --
-// those drive sealing/rotation (Task 4), a persistence concern this pure
-// request-shape validator has no business with -- and it does NOT read the
-// parent application's own token: there is no app_unset error, mode "app" is
-// valid regardless of whether the app has a token configured (an app with no
-// token simply means auth ends up off for this spec, resolved later by
-// Task 6, not a validation failure here).
+// those drive sealing/rotation in putRuntimeSpec's write path, a persistence
+// concern this pure request-shape validator has no business with -- and it
+// does NOT read the parent application's own token: there is no app_unset
+// error, mode "app" is valid regardless of whether the app has a token
+// configured (an app with no token simply means auth ends up off for this
+// spec, resolved later by resolvePushToken, not a validation failure here).
 //
 // Runs BEFORE any mutation, like validateRuntimeSpecVisibleDevices, and
 // reads req rather than the stored row for the same reason: PutRuntimeSpec
@@ -1062,10 +1064,10 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 }
 
 // normalizeRuntimeAPITokenMode defaults an empty stored/DTO mode to "app" —
-// every pre-feature row and every write still going through PutRuntimeSpec
-// (Tasks 3-5 add the write path) has "" here, and "" must never reach the
-// wire: it means the same thing as "app" (routing.RuntimeAPITokenModeApp)
-// but portal callers should only ever see the one canonical spelling.
+// every row created before this API-token support existed has "" here, and
+// "" must never reach the wire: it means the same thing as "app"
+// (routing.RuntimeAPITokenModeApp) but portal callers should only ever see
+// the one canonical spelling.
 func normalizeRuntimeAPITokenMode(mode string) string {
 	if mode == "" {
 		return string(routing.RuntimeAPITokenModeApp)
@@ -1617,12 +1619,12 @@ type AgentRuntimeSpecDTO struct {
 	// APIToken is the DECRYPTED upstream token the agent substitutes into the
 	// child's ${API_TOKEN} for this spec, or "" when the mode is off or no token
 	// is set (see resolvePushToken; the agent-side runtime.Spec pairs this exact
-	// json tag in Task 9). Unlike every other field here it is a SECRET in the
+	// json tag). Unlike every other field here it is a SECRET in the
 	// clear: it rides the already-authenticated agent channel, but that channel
 	// is only encrypted when the gateway URL is https. When it is not, this value
 	// travels in clear -- the operator-facing insecure-transport warning is
-	// surfaced in the portal UI (Task 15); this task does not add a server-side
-	// guard because portal.Service does not hold the gateway public URL.
+	// surfaced in the portal UI; portal.Service adds no server-side guard of its
+	// own here because it does not hold the gateway public URL.
 	APIToken string `json:"api_token"`
 }
 
@@ -1832,18 +1834,22 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 //
 // https note: that agent channel is only encrypted when the gateway URL is https.
 // When it is not, this decrypted token travels in clear. portal.Service does not
-// currently hold the gateway public URL, so this task adds no server-side guard;
-// the operator-facing insecure-transport warning is surfaced in the portal UI
-// (Task 15).
+// currently hold the gateway public URL, so it adds no server-side guard of its
+// own here; the operator-facing insecure-transport warning is surfaced in the
+// portal UI instead.
 func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Application) string {
+	mode := spec.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
+	}
 	var sealed string
-	switch routing.RuntimeAPITokenMode(spec.APITokenMode) {
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeOff:
+		return ""
 	case routing.RuntimeAPITokenModeSet, routing.RuntimeAPITokenModeRandom:
 		sealed = spec.APIToken
-	case routing.RuntimeAPITokenModeApp, "":
+	default: // app, and any unrecognized mode -> app, matching SpecUpstreamAuth
 		sealed = app.APIToken
-	default: // off
-		return ""
 	}
 	if sealed == "" {
 		return ""

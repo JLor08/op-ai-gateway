@@ -1016,7 +1016,7 @@ function formatEnvText(env: Record<string, string>): string {
     .join('\n');
 }
 
-// The per-backend reference table (Task 15): the Env var name each of these
+// The per-backend reference table: the Env var name each of these
 // three model servers reads for its own API key, the equivalent --api-key
 // argument, and the client header the token then answers to. Shown whenever
 // api_token_mode !== 'off', regardless of which backend a spec actually
@@ -2149,14 +2149,16 @@ export function RuntimeAdminSection({
   const [vramLocked, setVramLocked] = useState(false);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
-  // Runtime-Spec API Token (Task 12/13): mode + its per-mode write-only state.
-  // `apiTokenHeaderSource`/`apiTokenHeader` have no control YET (Task 14 adds
-  // the select + inherited-header display) but must still round-trip: this
-  // form's PUT is a full-document upsert (buildSpecBody below), so leaving
-  // them constant would silently reset a header choice Task 14 lets an
-  // operator make. `apiTokenInput`/`apiTokenCleared` mirror ApplicationSection's
-  // own app-token sentinel (tokenInput/tokenCleared) for THIS spec's token;
-  // `apiTokenRotate` is 'random' mode's one-shot rotate-on-next-save flag.
+  // Runtime-Spec API Token: mode + its per-mode write-only state.
+  // `apiTokenHeaderSource`/`apiTokenHeader` are declared here alongside mode,
+  // even though their own select + inherited-header display render later in
+  // the form (see the API-token header block below) -- all three must still
+  // round-trip regardless: this form's PUT is a full-document upsert
+  // (buildSpecBody below), so leaving them constant would silently reset
+  // whatever header choice the operator made. `apiTokenInput`/`apiTokenCleared`
+  // mirror ApplicationSection's own app-token sentinel (tokenInput/tokenCleared)
+  // for THIS spec's token; `apiTokenRotate` is 'random' mode's one-shot
+  // rotate-on-next-save flag.
   const [apiTokenMode, setApiTokenMode] = useState<RuntimeSpec['api_token_mode']>('app');
   const [apiTokenHeaderSource, setApiTokenHeaderSource] =
     useState<RuntimeSpec['api_token_header_source']>('app');
@@ -3488,9 +3490,9 @@ export function RuntimeAdminSection({
     const currentSpec = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
     const currentApiTokenSet = currentSpec?.api_token_set ?? false;
     const appApiTokenSet = currentSpec?.app_api_token_set ?? application.api_token_set;
-    // Task 14's inherited-header display: same read-only-echo-with-create-time
-    // fallback as appApiTokenSet immediately above, but for the header NAME
-    // rather than the set/unset fact.
+    // The inherited-header display below uses the same read-only-echo-with-
+    // create-time fallback as appApiTokenSet immediately above, but for the
+    // header NAME rather than the set/unset fact.
     const appApiTokenHeader = currentSpec?.app_api_token_header ?? application.api_token_header;
     // Recomputed on every keystroke on purpose: the whole defect being fixed
     // is that the field's contract was invisible until a foreign program
@@ -3504,8 +3506,8 @@ export function RuntimeAdminSection({
     const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
       a.includes('${METAL_DEVICES}'),
     );
-    // Task 15's OPTIONAL per-backend highlight, layered onto the general
-    // unsupported-backend note below. A runtime spec's application.type is
+    // The OPTIONAL per-backend highlight below, layered onto the general
+    // unsupported-backend note. A runtime spec's application.type is
     // ALWAYS 'server_agent' (that is what owns a runtime spec at all), so it
     // carries no signal about which child model server this spec launches --
     // the binary path is the only one available, and even that is used only
@@ -3828,7 +3830,7 @@ export function RuntimeAdminSection({
               ))}
             </SelectField>
 
-            {/* Runtime-Spec API Token (Task 12/13): the MODE controls. */}
+            {/* Runtime-Spec API Token: the MODE controls. */}
             <Box sx={{ display: 'grid', gap: 1 }}>
               <SelectField
                 id="runtime-spec-api-token-mode"
@@ -3913,14 +3915,15 @@ export function RuntimeAdminSection({
               )}
             </Box>
 
-            {/* Runtime-Spec API Token header (Task 14): which header CARRIES
-                the token above, as opposed to the mode block's WHAT the token
-                IS. Hidden entirely under 'off' -- there is no token to attach
-                a header to, and the effective-header question the app-source
+            {/* Runtime-Spec API Token header: which header CARRIES the token
+                above, as opposed to the mode block's WHAT the token IS.
+                Hidden entirely under 'off' -- there is no token to attach a
+                header to, and the effective-header question the app-source
                 display and the custom-header warning both answer does not
-                arise. `apiTokenHeaderSource`/`apiTokenHeader` are Task 12/13
-                state (buildSpecBody/hydrateSpecFields already round-trip
-                them) -- this block is UI only, no new state. */}
+                arise. `apiTokenHeaderSource`/`apiTokenHeader` are declared
+                alongside apiTokenMode above (buildSpecBody/hydrateSpecFields
+                already round-trip them) -- this block is UI only, no new
+                state. */}
             {apiTokenMode !== 'off' && (
               <Box sx={{ display: 'grid', gap: 1 }}>
                 <SelectField
@@ -3975,7 +3978,7 @@ export function RuntimeAdminSection({
               </Box>
             )}
 
-            {/* Runtime-Spec API Token operator guidance (Task 15): the
+            {/* Runtime-Spec API Token operator guidance: the
                 per-backend variable table, the loud Args-leak warning, and the
                 structural unsupported-backend note. Shown whenever the mode is
                 not 'off' -- once there IS a token to wire up, the operator

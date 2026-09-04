@@ -72,9 +72,9 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 //
 // Symmetrically, writeOnlyInRequest names the PutRuntimeSpecRequest fields
 // that deliberately have no RuntimeSpecDTO counterpart at all: api_token and
-// api_token_rotate (Task 4) drive a write (seal/rotate) that can never be
-// echoed back verbatim, so they can never round-trip through a loaded
-// document the way every other field here does.
+// api_token_rotate drive a write (seal/rotate) that can never be echoed back
+// verbatim, so they can never round-trip through a loaded document the way
+// every other field here does.
 func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 	notInRequest := map[string]bool{
 		"configured": true, // GetRuntimeSpec's "no spec row yet" signal, never an input

@@ -81,14 +81,14 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
-	// Task 8: the four per-spec API-token sentinels from Task 3
-	// (validateRuntimeSpecAPIToken) -- code is err.Error() verbatim, per the
-	// convention every row above already follows.
+	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken
+	// -- code is err.Error() verbatim, per the convention every row above
+	// already follows.
 	{err: portal.ErrRuntimeSpecAPITokenModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.api_token_mode_invalid", msg: "api_token_mode must be \"app\", \"off\", \"set\" or \"random\""},
 	{err: portal.ErrRuntimeSpecAPITokenNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.api_token_no_placeholder", msg: "api_token_mode \"set\"/\"random\" requires a \"${API_TOKEN}\" placeholder in env or args"},
 	{err: portal.ErrRuntimeSpecAPITokenPlaceholderWithoutMode, status: http.StatusBadRequest, code: "runtime_spec.api_token_placeholder_without_mode", msg: "a \"${API_TOKEN}\" placeholder in env or args requires api_token_mode \"set\" or \"random\""},
 	{err: portal.ErrRuntimeSpecAPITokenHeaderInvalid, status: http.StatusBadRequest, code: "runtime_spec.api_token_header_invalid", msg: "api_token_header_source must be \"app\" or \"custom\", with a valid api_token_header when custom"},
-	// Task 4's seal-or-400 path: PutRuntimeSpec computes the sealed api_token
+	// The seal-or-400 path: PutRuntimeSpec computes the sealed api_token
 	// BEFORE any store write, so a keyless disk store (no cipher, not the
 	// volatile settings store) fails this closed -- capture.SealSecret
 	// returns capture.ErrKeyRequired instead of ever persisting a plaintext

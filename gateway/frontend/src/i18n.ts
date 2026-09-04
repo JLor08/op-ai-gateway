@@ -605,8 +605,8 @@ const de = {
   runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
     'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}. Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der drei muss vorhanden sein.',
-  // Runtime-Spec API Token (Task 12/13): the MODE controls only -- the
-  // header-source select + inherited-header display is Task 14.
+  // Runtime-Spec API Token: the MODE controls only -- the header-source
+  // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API-Token-Modus',
   runtimeSpecApiTokenModeApp: 'App-Token verwenden',
   runtimeSpecApiTokenModeSet: 'Operator setzt',
@@ -625,8 +625,8 @@ const de = {
     'Der Gateway erzeugt und verwaltet diesen Token selbst; der Wert wird nirgendwo angezeigt und kann nur rotiert, nicht ausgelesen werden.',
   runtimeSpecApiTokenRotate: 'Neu erzeugen (rotieren)',
   runtimeSpecApiTokenRotatePending: 'Wird beim Speichern neu erzeugt',
-  // Runtime-Spec API Token header source (Task 14): which header carries the
-  // token from the mode block above.
+  // Runtime-Spec API Token header source: which header carries the token
+  // from the mode block above.
   runtimeSpecApiTokenHeaderSource: 'Header-Quelle',
   runtimeSpecApiTokenHeaderSourceApp: 'Von der Anwendung übernehmen',
   runtimeSpecApiTokenHeaderSourceCustom: 'Eigener Header',
@@ -637,9 +637,9 @@ const de = {
     'Leer = Authorization: Bearer; sonst der Header-Name (z. B. x-api-key).',
   runtimeSpecApiTokenHeaderMismatchWarning:
     'Der eigene Header muss exakt dem entsprechen, was das Backend erwartet — bei einem Backend, das nur „Authorization: Bearer“ akzeptiert, bleibt diese Zuordnung sonst effektiv unauthentifiziert.',
-  // Runtime-Spec API Token operator guidance (Task 15): the per-backend
-  // variable table + the Args-leak warning + the structural
-  // unsupported-backend note. Shown whenever the mode is not 'off'.
+  // Runtime-Spec API Token operator guidance: the per-backend variable
+  // table + the Args-leak warning + the structural unsupported-backend
+  // note. Shown whenever the mode is not 'off'.
   runtimeSpecApiTokenBackendHint:
     'Referenziere den Token in der Modellserver-Konfiguration als „${API_TOKEN}“ — bevorzugt in Env, alternativ in Args (siehe Tabelle):',
   runtimeSpecApiTokenTableBackend: 'Backend',
@@ -2764,8 +2764,8 @@ const en: PortalMessages = {
   runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
     'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build. It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the three must be present.',
-  // Runtime-Spec API Token (Task 12/13): the MODE controls only -- the
-  // header-source select + inherited-header display is Task 14.
+  // Runtime-Spec API Token: the MODE controls only -- the header-source
+  // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API token mode',
   runtimeSpecApiTokenModeApp: 'Use the app token',
   runtimeSpecApiTokenModeSet: 'Operator sets',
@@ -2783,8 +2783,8 @@ const en: PortalMessages = {
     'The gateway generates and manages this token itself; the value is never shown anywhere and can only be rotated, never read back.',
   runtimeSpecApiTokenRotate: 'Regenerate (rotate)',
   runtimeSpecApiTokenRotatePending: 'Will be regenerated on save',
-  // Runtime-Spec API Token header source (Task 14): which header carries the
-  // token from the mode block above.
+  // Runtime-Spec API Token header source: which header carries the token
+  // from the mode block above.
   runtimeSpecApiTokenHeaderSource: 'Header source',
   runtimeSpecApiTokenHeaderSourceApp: 'Inherit from the application',
   runtimeSpecApiTokenHeaderSourceCustom: 'Custom header',
@@ -2795,9 +2795,9 @@ const en: PortalMessages = {
     'Empty = Authorization: Bearer; otherwise the header name (e.g. x-api-key).',
   runtimeSpecApiTokenHeaderMismatchWarning:
     'A custom header must match exactly what the backend expects — against a backend that only accepts "Authorization: Bearer", this mapping is otherwise left effectively unauthenticated.',
-  // Runtime-Spec API Token operator guidance (Task 15): the per-backend
-  // variable table + the Args-leak warning + the structural
-  // unsupported-backend note. Shown whenever the mode is not 'off'.
+  // Runtime-Spec API Token operator guidance: the per-backend variable
+  // table + the Args-leak warning + the structural unsupported-backend
+  // note. Shown whenever the mode is not 'off'.
   runtimeSpecApiTokenBackendHint:
     'Reference the token in the model server configuration as "${API_TOKEN}" — preferably in Env, alternatively in Args (see table):',
   runtimeSpecApiTokenTableBackend: 'Backend',

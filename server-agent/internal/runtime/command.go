@@ -46,13 +46,19 @@ import (
 // single boolean could not tell the operator which mask they are looking at,
 // and the two need opposite things from them:
 //
-//  1. Masked -- EVERY ${AGENT_ENV:NAME}-derived span, wherever it landed -- in
-//     an argument as much as in an env value -- is replaced by its own
-//     "${AGENT_ENV:NAME}" placeholder. This is the one class of value the
-//     gateway is never given: it lives only in the AI server's own
-//     environment, by the whole design of ADR-027, and a resolved copy of it
-//     must not travel upward just because a panel wants to be helpful. The
-//     placeholder names the host variable to go and check.
+//  1. Masked -- EVERY recorded secret span, wherever it landed -- in an
+//     argument as much as in an env value -- is replaced by the exact
+//     placeholder that produced it. An ${AGENT_ENV:NAME} span becomes
+//     "${AGENT_ENV:NAME}" again: this is the one class of value the gateway
+//     is never given at all, it lives only in the AI server's own
+//     environment by the whole design of ADR-027, and a resolved copy of it
+//     must not travel upward just because a panel wants to be helpful. An
+//     ${API_TOKEN} span becomes "${API_TOKEN}" again: this is the decrypted
+//     upstream token the gateway itself resolved and pushed on the wire, and
+//     it is masked anyway, because a diagnostic panel is not the place a
+//     secret's plaintext should be shown a second time. Either way the
+//     placeholder names the mechanism the operator wrote, so the reader knows
+//     what to go and check.
 //  2. EnvRedacted -- on a FILE-MODE agent only, every spec-supplied env VALUE
 //     is masked in full, with envRedactedMask rather than with a placeholder.
 //     That is not a new rule -- it is precisely the one the upward report
@@ -141,9 +147,12 @@ import (
 // both can be set at once -- a file-mode spec that also resolves a placeholder
 // into an argument raises both -- and neither implies the other:
 //
-//   - Masked: at least one ${AGENT_ENV:NAME}-derived span in Args or Env was
-//     replaced by its own placeholder. The placeholder names a variable that
-//     exists on this host and that the operator can go and check.
+//   - Masked: at least one secret span in Args or Env -- an ${AGENT_ENV:NAME}
+//     span, an ${API_TOKEN} span, or both -- was replaced by the placeholder
+//     that produced it. For ${AGENT_ENV:NAME} the placeholder names a host
+//     variable the operator can go and check; for ${API_TOKEN} there is
+//     nothing local to check -- it names the gateway-pushed wire field the
+//     value came from instead.
 //   - EnvRedacted: this is a file-mode agent, so at least one spec-supplied
 //     env VALUE was withheld in full (key intact, value replaced by
 //     envRedactedMask). There is no placeholder and nothing to look up: the

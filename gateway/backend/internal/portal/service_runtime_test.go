@@ -2035,13 +2035,14 @@ func TestRuntimeSpecDTOCarriesVisibleDevicesMode(t *testing.T) {
 }
 
 // TestGetRuntimeSpecAPITokenFieldsAndAppEchoes covers the DTO's read-only
-// api-token surface (Task 2 of the runtime-spec API-token feature): the
-// per-spec mode/header-source/header, the presence-only booleans for both
-// the spec's own sealed token and the parent application's sealed token, and
-// the app's header name -- with neither sealed VALUE ever crossing onto the
-// wire. The spec is seeded directly at the store layer (like
-// TestGetRuntimeSpecEnvNullNormalizedToEmptyObject above) because
-// PutRuntimeSpec does not yet write these columns -- that is Tasks 3-5.
+// api-token surface: the per-spec mode/header-source/header, the
+// presence-only booleans for both the spec's own sealed token and the parent
+// application's sealed token, and the app's header name -- with neither
+// sealed VALUE ever crossing onto the wire. The spec is seeded directly at
+// the store layer (like TestGetRuntimeSpecEnvNullNormalizedToEmptyObject
+// above) to exercise GetRuntimeSpec's read/DTO-mapping in isolation from
+// PutRuntimeSpec's own write/validation logic, which is covered separately
+// by TestPutRuntimeSpecAPITokenValidation and the seal/rotate tests below.
 func TestGetRuntimeSpecAPITokenFieldsAndAppEchoes(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -2115,9 +2116,9 @@ func TestGetRuntimeSpecAPITokenFieldsAndAppEchoes(t *testing.T) {
 
 // TestGetRuntimeSpecAPITokenModeDefaultsToApp pins the "app" default from
 // both directions the brief calls out: the unconfigured DTO (no spec row —
-// the literal at GetRuntimeSpec's ~:414) and a spec written through the
-// current PutRuntimeSpec, which does not yet set the api-token columns
-// (Tasks 3-5) and so stores them as "". Neither may surface "" on the wire.
+// the literal at GetRuntimeSpec's ~:414) and a spec written through
+// PutRuntimeSpec with no api_token_mode in the request, which normalizes the
+// omitted mode before persisting. Neither may surface "" on the wire.
 func TestGetRuntimeSpecAPITokenModeDefaultsToApp(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -2154,10 +2155,11 @@ func TestGetRuntimeSpecAPITokenModeDefaultsToApp(t *testing.T) {
 	}
 }
 
-// TestAgentRuntimeConfigPushesDecryptedAPIToken pins Task 5: the agent-wire
-// runtime config carries the DECRYPTED per-spec upstream token in api_token,
-// resolved per mode (set/random -> the spec's own sealed token; app/"" -> the
-// parent app's sealed token; off -> ""), and FAILS CLOSED -- an undecryptable
+// TestAgentRuntimeConfigPushesDecryptedAPIToken pins resolvePushToken's
+// contract: the agent-wire runtime config carries the DECRYPTED per-spec
+// upstream token in api_token, resolved per mode (set/random -> the spec's
+// own sealed token; app/"" -> the parent app's sealed token; off -> ""), and
+// FAILS CLOSED -- an undecryptable
 // sealed value pushes "" (never the sealed bytes), so the agent hard-errors on
 // an unresolved ${API_TOKEN} rather than booting the child with a garbled
 // secret. The plaintext exists only as this wire field; the SEALED form is
@@ -2188,8 +2190,10 @@ func TestAgentRuntimeConfigPushesDecryptedAPIToken(t *testing.T) {
 	}
 
 	// seedSpec creates a mapping + a directly-stored enabled spec (bypassing
-	// PutRuntimeSpec, which is a sibling task), returning the spec id so the
-	// pushed document can be matched back to its mode.
+	// PutRuntimeSpec, which is covered separately by
+	// TestPutRuntimeSpecAPITokenValidation and the seal/rotate tests),
+	// returning the spec id so the pushed document can be matched back to its
+	// mode.
 	seedSpec := func(model, mode, sealedToken string) string {
 		t.Helper()
 		mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: model, AppModelName: model})
@@ -2402,12 +2406,13 @@ func TestPutRuntimeSpecVisibleDevicesModeValidation(t *testing.T) {
 	})
 }
 
-// TestPutRuntimeSpecAPITokenValidation is Task 3 of the runtime-spec
-// API-token feature: the four api_token_* error sentinels and the
-// ${API_TOKEN} placeholder matrix (required for set/random, optional for
-// app, forbidden for off), plus the header-source/header-shape check. It
-// does NOT cover sealing/rotation (Task 4) or the app-token resolver (Task
-// 6) -- every case here is a pure validation decision on the request alone.
+// TestPutRuntimeSpecAPITokenValidation covers validateRuntimeSpecAPIToken:
+// the four api_token_* error sentinels and the ${API_TOKEN} placeholder
+// matrix (required for set/random, optional for app, forbidden for off),
+// plus the header-source/header-shape check. It does NOT cover
+// sealing/rotation (that's putRuntimeSpec's write path, below) or the
+// app-token resolver (resolvePushToken) -- every case here is a pure
+// validation decision on the request alone.
 func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -2492,9 +2497,10 @@ func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			// No app_unset error exists (Task 3 does not consume the parent
-			// application's token at all -- that is Task 6's resolver): mode
-			// "app" never fails validation regardless of the app's own token.
+			// No app_unset error exists (validateRuntimeSpecAPIToken does not
+			// consume the parent application's token at all -- that is
+			// resolvePushToken's job): mode "app" never fails validation
+			// regardless of the app's own token.
 			name: "app mode never trips on the app's own (empty) token",
 			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
 				r.APITokenMode = string(routing.RuntimeAPITokenModeApp)
@@ -2519,7 +2525,7 @@ func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 	}
 }
 
-// --- Task 4: seal-on-write, random generation, rotate ----------------------
+// --- seal-on-write, random generation, rotate -------------------------------
 //
 // These tests pin the WRITE side of the per-spec API token in PutRuntimeSpec:
 // mode "set" seals the operator-supplied value, mode "random" generates and
