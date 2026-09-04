@@ -63,16 +63,20 @@ A spec gains `api_token_mode`:
 
 | Mode | Meaning | Where the token value comes from |
 |---|---|---|
-| `off` (default) | No token; `${API_TOKEN}` is not allowed | — |
+| `app` (**default**) | Reuse the application's token (today's behaviour). If the app has no token, auth is off for this mapping — exactly like the application itself (portal shows a hint) | `app.APIToken` (sealed, per-app) |
 | `set` | Operator sets a write-only token | the spec's sealed `api_token` |
 | `random` | Gateway generates + stores a random token (nobody sees it) | the spec's sealed `api_token`, generated |
-| `app` | Reuse the application's token | `app.APIToken` (sealed, per-app) |
+| `off` | Explicitly no upstream token for this mapping — sends nothing even if the application has a token; `${API_TOKEN}` is not allowed | — |
 
-In every non-`off` mode the operator writes the token into the child by putting
-the placeholder **`${API_TOKEN}`** in the spec's **Env** (e.g.
-`VLLM_API_KEY=${API_TOKEN}`) or **Args** (e.g. `--api-key`, `${API_TOKEN}` on the
-next line). "Which variable" is thus the operator's existing Env/Args choice,
-guided by the portal hint (§7).
+To make the child *require* the token the operator writes the placeholder
+**`${API_TOKEN}`** into the spec's **Env** (e.g. `VLLM_API_KEY=${API_TOKEN}`) or
+**Args** (e.g. `--api-key`, `${API_TOKEN}` on the next line). The placeholder is
+**required** for `set` and `random` (the whole point is that the gateway-managed
+token reaches the child), **optional** for `app` (present ⇒ the app token is also
+injected into the child; absent ⇒ today's behaviour — the app token is only sent
+at the edge, the child's requirement is configured out of band), and **forbidden**
+for `off`. "Which variable" is the operator's existing Env/Args choice, guided by
+the portal hint (§7).
 
 **`random` semantics (confirmed):** a random token the *gateway* generates and
 stores, invisible to any human, rotatable on demand / on save — **not** a fresh
@@ -86,7 +90,13 @@ action regenerates it.
 
 New columns on `agent_runtime_specs` (migration **74**, additive, append-only):
 
-- `api_token_mode text not null default 'off'` — one of `off|set|random|app`.
+- `api_token_mode text not null default 'app'` — one of `off|set|random|app`.
+  **Default `app`, deliberately** (not `off`): today every mapping already sends
+  `Application.APIToken` at the edge, so migrating existing rows to `app` preserves
+  that behaviour exactly, whereas a default of `off` would silently switch upstream
+  auth OFF for every already-authenticated application on upgrade. New specs and
+  every backfilled row are `app`; a blank `api_token_mode` from the DTO normalizes
+  to `app` (mirrors `visible_devices_mode`'s empty→`env`).
 - `api_token text not null default ''` — the **sealed** token (`SealSecret`
   envelope: `enc:…` / `plain:…`), used only by `set` and `random`. Empty for
   `off` and `app`.
@@ -176,7 +186,9 @@ the **per-mapping** token into `routing.Target` in `resolver.go` `targetFrom`
 - `app` → `Target.APIToken = app.APIToken`; `Target.APITokenHeader` = the same
   effective-header rule (default source `app` ⇒ `app.APITokenHeader`, i.e. today's
   behaviour).
-- `off` → today's behaviour (app token or none).
+- `off` → **no token sent** (explicitly unauthenticated for this mapping; overrides
+  the application token). This is the deliberate "disable auth here" escape hatch —
+  distinct from the `app` default, which still sends `app.APIToken`.
 
 The existing edge path (`server.go` `upstreamAuthCtx` → `OpenSecret` →
 `WithUpstreamAuth` → `applyUpstreamAuth`) then sends `Authorization: Bearer
@@ -202,19 +214,25 @@ an open child.
 Mirroring the `${..._DEVICES}` rules; new 400 error codes:
 
 - `runtime_spec.api_token_mode_invalid` — mode ∉ {off, set, random, app}.
-- `runtime_spec.api_token_no_placeholder` — mode ≠ off but `${API_TOKEN}` appears
-  in neither an Env value nor Args (the token would be stored/generated but never
-  reach the child). `${API_TOKEN}` in Args is allowed (not a 400) but drives a
-  prominent portal warning — see the decision note below.
+- `runtime_spec.api_token_no_placeholder` — mode is `set` or `random` but
+  `${API_TOKEN}` appears in neither an Env value nor Args (the token would be
+  stored/generated but never reach the child). **Scoped to `set`/`random` only** —
+  the placeholder is optional for `app` (so editing a pre-feature spec, now
+  defaulted to `app`, never trips this) and forbidden for `off`. `${API_TOKEN}` in
+  Args is allowed (not a 400) but drives a prominent portal warning — see the
+  decision note below.
 - `runtime_spec.api_token_placeholder_without_mode` — `${API_TOKEN}` used while
-  mode = off (a placeholder that resolves to nothing).
-- `runtime_spec.api_token_app_unset` — mode = app but the application has no
-  `APIToken` set (`app.APIToken == ""`), i.e. nothing to reuse.
+  mode = `off` (a placeholder that resolves to nothing). Only `off` trips this;
+  `app`/`set`/`random` all resolve the placeholder to a real token.
 - `runtime_spec.api_token_header_invalid` — `api_token_header_source` ∉
   {app, custom}, OR (source = custom) `api_token_header` is not a valid header-name
   shape (reuse the application's `checkHeaderName`: token chars, no colon/space;
   empty is valid ⇒ Bearer). When source = app, `api_token_header` is ignored (the
   app's header is used).
+
+There is deliberately **no `app`-mode-unset error**: `app` with an empty
+`app.APIToken` is valid and means "auth off for this mapping" (exactly like the
+application itself), surfaced as a portal hint (§7), not a 400.
 - `set` (new value) **and `random`** (generated value) on a **disk store without a
   cipher** → **seal-or-400 BEFORE any persist**: `capture.SealSecret` returns
   `capture.ErrKeyRequired` (no plaintext-to-disk fallback, verified in
@@ -227,7 +245,9 @@ Write-only semantics (mirror `app.APIToken`):
 - Create: `api_token` accepted, sealed, never returned.
 - Update: `*string` sentinel — `nil` = keep, `""` = clear, value = replace-and-seal.
 - DTO reports `api_token_set bool` (presence only) + `api_token_mode`, never the
-  value.
+  value. It also echoes the parent application's `app_api_token_set bool` and
+  `app_api_token_header string` (read-only) so the portal can render the inherited
+  header (§7) and the "app has no token ⇒ auth off" hint under `app` mode.
 - `random`: the value is generated **server-side** (crypto-random, e.g. 32 bytes
   base64url) when the operator selects `random` (or hits Rotate); it is sealed and
   stored, never shown.
@@ -259,8 +279,13 @@ child's real argv or the child's own logs — hence the warning).
 ## 7. Portal (spec editor) + the hint
 
 A small **"API-Token (Upstream-Absicherung)"** section on the runtime-spec form:
-- Mode select: `Aus` / `Operator setzt` / `Zufällig (vom Gateway erzeugt)` /
-  `App-Token verwenden`.
+- Mode select, **default `App-Token verwenden`**: `App-Token verwenden` /
+  `Operator setzt` / `Zufällig (vom Gateway erzeugt)` / `Aus`.
+- For `app`: a note that the application's token is used; **when the application has
+  no token (`app_api_token_set == false`) show a hint** — "Die Anwendung hat keinen
+  API-Token hinterlegt — die Authentifizierung ist für diese Zuordnung
+  ausgeschaltet (wie bei der Anwendung selbst)." — so the operator understands why
+  no auth is applied.
 - For `set`: a write-only token field (like the app token field) + the
   `api_token_set` "gesetzt"/"nicht gesetzt" indicator.
 - For `random`: a "Neu erzeugen (rotieren)" button; note that the value is never
@@ -370,17 +395,18 @@ i18n: all new strings in de + en (parity is compile-enforced).
 
 1. Store/migration: migration 74; `routing.RuntimeSpec` fields; `RuntimeAPITokenMode`;
    sqlite CRUD; conformance tests.
-2. Portal service: DTO (`api_token_mode`, `api_token_header_source`,
-   `api_token_header`, `api_token_set`, write-only `api_token` sentinel; plus a
-   read-only `app_api_token_header` echo so the UI can show the inherited header),
-   validation + **5 error codes**, `${API_TOKEN}` placeholder-consistency (Env OR
+2. Portal service: DTO (`api_token_mode` default `app`, `api_token_header_source`,
+   `api_token_header`, `api_token_set`, write-only `api_token` sentinel; plus
+   read-only `app_api_token_set` + `app_api_token_header` echoes so the UI can show
+   the inherited header and the app-unset "auth off" hint),
+   validation + **4 error codes**, `${API_TOKEN}` placeholder-consistency (Env OR
    Args) + header source/shape checks, **seal-or-400 for set AND random**
    (`crypto/rand` via `generateSecret`), rotate, resolve-and-push the decrypted
    token into the agent-wire spec (**fail-closed empty on decrypt error**),
    per-mapping effective-header + Target token in `resolver.go`, **and in the
    benchmark/capacity Target builders** (`benchmark_runner.go`, security review I3),
    plus an https-gateway-URL precondition warning/guard for non-`off` modes (I2).
-3. Gateway endpoints: map the 5 sentinels → 400.
+3. Gateway endpoints: map the 4 sentinels → 400.
 4. `server-agent`: wire `api_token`; `${API_TOKEN}` (Env + Args) resolution with a
    **new secret provenance span + masking** (I1); **redact `Spec.APIToken` in
    `redactConfigEnv`** for file-mode reports (I4); feature flag `runtime_api_token`;
