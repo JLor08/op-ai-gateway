@@ -3323,6 +3323,27 @@ export function RuntimeAdminSection({
     // is that the field's contract was invisible until a foreign program
     // rejected it, so the feedback has to land at paste time, not at submit.
     const argsWarnings = collectArgsWarnings(parseArgsText(argsText), listenPort, t);
+    // Part A/B agent-capability + platform hints (non-blocking). agentFeatures /
+    // agentVersion are the report-derived values (:1703-1704); the host OS comes
+    // from the hardware report already fetched (:1394-1396) — NOT a new DTO field.
+    const agentHasGpuSelection = agentFeatures.includes('gpu_selection');
+    const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
+    const argsHaveMetalDevices = parseArgsText(argsText).some((a) => a.includes('${METAL_DEVICES}'));
+    const agentOs = hardware.data?.available && hardware.data.report ? hardware.data.report.os : '';
+    const agentOsKnown = agentOs !== '';
+    const isMacOsAgent = /darwin|mac ?os/i.test(agentOs);
+    // Prominent when args mode (the process would fail to start on an old agent);
+    // informational when only the order is custom (order is ignored until >=0.4.0).
+    const showAgentTooOldArgs =
+      setVisibleDevices && visibleDevicesMode === 'args' && reportReady && !agentHasGpuSelection;
+    const showAgentTooOldOrder =
+      !showAgentTooOldArgs && gpuOrderIsCustom && reportReady && !agentHasGpuSelection;
+    const showMetalNonMacos =
+      setVisibleDevices &&
+      visibleDevicesMode === 'args' &&
+      argsHaveMetalDevices &&
+      agentOsKnown &&
+      !isMacOsAgent;
     return (
       <>
         <Breadcrumbs
@@ -3622,6 +3643,19 @@ export function RuntimeAdminSection({
               <Typography variant="subtitle2" component="h3">
                 {t.runtimeSpecGpus}
               </Typography>
+              {showAgentTooOldArgs && (
+                <Alert severity="warning">
+                  {`${t.runtimeSpecAgentTooOldArgs} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {showAgentTooOldOrder && (
+                <Alert severity="info">
+                  {`${t.runtimeSpecAgentTooOldOrder} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {showMetalNonMacos && (
+                <Alert severity="warning">{t.runtimeSpecMetalNonMacos}</Alert>
+              )}
               {/* No reported GPUs: say so ONCE, and omit the picker rather
                   than rendering an empty dropdown that reads as broken. The
                   numeric index below stays fully editable -- a machine that

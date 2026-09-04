@@ -162,13 +162,13 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
 // Minimal-but-valid HardwareResponse for the "server limits" telemetry-prefill
 // and drift-warning tests: only the GPU list varies per test, everything else
 // is boilerplate HardwareReport shape the type requires.
-function makeHardware(gpus: HardwareGPU[]): HardwareResponse {
+function makeHardware(gpus: HardwareGPU[], os = 'linux'): HardwareResponse {
   return {
     available: true,
     report: {
       collected_at: '2026-07-16T12:00:00Z',
       agent_version: '1.0.0',
-      os: 'linux',
+      os,
       arch: 'amd64',
       cpu: { model: '', vendor: '', physical_cores: 0, logical_threads: 0, base_mhz: 0 },
       memory: { total_bytes: 0 },
@@ -2582,6 +2582,81 @@ describe('RuntimeAdminSection feature-mismatch banner (spec §9)', () => {
     });
     await screen.findByText('gw-model');
     expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block Save)', () => {
+  it('warns prominently when args mode is on and the agent lacks gpu_selection', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${CUDA_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      report: makeReport({ agent_version: '0.3.0', agent_features: ['runtime_manager'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    // exact: false, not new RegExp(...): the rendered Alert appends
+    // " (Agent version: X)" after the translated sentence, and the sentence
+    // itself contains literal parentheses -- unescaped in a RegExp those are
+    // capture-group syntax, not literal characters, so `new RegExp(t.foo)`
+    // can never match text containing `t.foo`'s own parens. `exact: false`
+    // is the established partial-match idiom already used throughout this
+    // file (e.g. runtimeSpecArgsCommandLine, runtimeSpecPlaceholderInvalid).
+    expect(
+      await screen.findByText(t.runtimeSpecAgentTooOldArgs, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('warns that ${METAL_DEVICES} needs a macOS host when the agent OS is not darwin', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${METAL_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      // makeHardware(...) reports os:'linux' (non-macOS) — see GOTCHAS.
+      hardware: makeHardware([{ index: 0, name: 'Card', memory_total_bytes: 0 }]),
+      report: makeReport({ agent_version: '0.4.0', agent_features: ['runtime_manager', 'gpu_selection'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    expect(await screen.findByText(t.runtimeSpecMetalNonMacos)).toBeInTheDocument();
+  });
+
+  it('does not warn about Metal when the agent OS is darwin', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${METAL_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      hardware: makeHardware([{ index: 0, name: 'Apple M3', memory_total_bytes: 0 }], 'darwin 15.1'),
+      report: makeReport({ agent_version: '0.4.0', agent_features: ['gpu_selection'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary); // form is open
+    expect(screen.queryByText(t.runtimeSpecMetalNonMacos)).not.toBeInTheDocument();
   });
 });
 
