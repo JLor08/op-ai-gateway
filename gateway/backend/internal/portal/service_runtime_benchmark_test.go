@@ -74,6 +74,19 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		"configured": true, // GetRuntimeSpec's "no spec row yet" signal, never an input
 		"id":         true, // the spec's own identity
 		"mapping_id": true, // the key the write is addressed by
+		// api_token_mode/api_token_set/api_token_header_source/api_token_header
+		// are read-only in this task (Task 2 of the runtime-spec API-token
+		// feature): the write path -- validation, sealing, PutRuntimeSpecRequest
+		// counterparts -- lands in Tasks 3-5.
+		"api_token_mode":          true,
+		"api_token_set":           true,
+		"api_token_header_source": true,
+		"api_token_header":        true,
+		// app_api_token_set/app_api_token_header echo the PARENT application's
+		// token presence and header. They belong to the application, not this
+		// spec, so they are never settable through PutRuntimeSpec.
+		"app_api_token_set":    true,
+		"app_api_token_header": true,
 	}
 	dtoTags := map[string]bool{}
 	dtoType := reflect.TypeOf(RuntimeSpecDTO{})

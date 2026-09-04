@@ -2033,6 +2033,126 @@ func TestRuntimeSpecDTOCarriesVisibleDevicesMode(t *testing.T) {
 	}
 }
 
+// TestGetRuntimeSpecAPITokenFieldsAndAppEchoes covers the DTO's read-only
+// api-token surface (Task 2 of the runtime-spec API-token feature): the
+// per-spec mode/header-source/header, the presence-only booleans for both
+// the spec's own sealed token and the parent application's sealed token, and
+// the app's header name -- with neither sealed VALUE ever crossing onto the
+// wire. The spec is seeded directly at the store layer (like
+// TestGetRuntimeSpecEnvNullNormalizedToEmptyObject above) because
+// PutRuntimeSpec does not yet write these columns -- that is Tasks 3-5.
+func TestGetRuntimeSpecAPITokenFieldsAndAppEchoes(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	const appSealedToken = "sealed:app-token-do-not-leak"
+	app.APIToken = appSealedToken
+	app.APITokenHeader = "Authorization"
+	if err := routeStore.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	const specSealedToken = "sealed:spec-token-do-not-leak"
+	spec := routing.RuntimeSpec{
+		ID:                   "rspec_" + compactRandomHex(16),
+		MappingID:            mapping.ID,
+		Enabled:              true,
+		Binary:               "/usr/bin/x",
+		Args:                 "[]",
+		Env:                  "{}",
+		APITokenMode:         string(routing.RuntimeAPITokenModeSet),
+		APIToken:             specSealedToken,
+		APITokenHeaderSource: string(routing.RuntimeAPITokenHeaderSourceCustom),
+		APITokenHeader:       "X-Api-Key",
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}
+	if err := routeStore.UpsertRuntimeSpec(ctx, spec); err != nil {
+		t.Fatalf("seed spec: %v", err)
+	}
+
+	dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if dto.APITokenMode != "set" {
+		t.Fatalf("APITokenMode = %q, want set", dto.APITokenMode)
+	}
+	if !dto.APITokenSet {
+		t.Fatalf("APITokenSet = false, want true")
+	}
+	if dto.APITokenHeaderSource != "custom" {
+		t.Fatalf("APITokenHeaderSource = %q, want custom", dto.APITokenHeaderSource)
+	}
+	if dto.APITokenHeader != "X-Api-Key" {
+		t.Fatalf("APITokenHeader = %q, want X-Api-Key", dto.APITokenHeader)
+	}
+	if !dto.AppAPITokenSet {
+		t.Fatalf("AppAPITokenSet = false, want true")
+	}
+	if dto.AppAPITokenHeader != "Authorization" {
+		t.Fatalf("AppAPITokenHeader = %q, want Authorization", dto.AppAPITokenHeader)
+	}
+
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if strings.Contains(string(raw), specSealedToken) {
+		t.Fatalf("wire body leaked the spec's sealed token: %s", raw)
+	}
+	if strings.Contains(string(raw), appSealedToken) {
+		t.Fatalf("wire body leaked the app's sealed token: %s", raw)
+	}
+}
+
+// TestGetRuntimeSpecAPITokenModeDefaultsToApp pins the "app" default from
+// both directions the brief calls out: the unconfigured DTO (no spec row —
+// the literal at GetRuntimeSpec's ~:414) and a spec written through the
+// current PutRuntimeSpec, which does not yet set the api-token columns
+// (Tasks 3-5) and so stores them as "". Neither may surface "" on the wire.
+func TestGetRuntimeSpecAPITokenModeDefaultsToApp(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	unconfigured, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec (unconfigured): %v", err)
+	}
+	if unconfigured.APITokenMode != "app" || unconfigured.APITokenHeaderSource != "app" {
+		t.Fatalf("unconfigured defaults = mode %q source %q, want app/app", unconfigured.APITokenMode, unconfigured.APITokenHeaderSource)
+	}
+	if unconfigured.AppAPITokenSet || unconfigured.AppAPITokenHeader != "" {
+		t.Fatalf("unconfigured app echoes = set %v header %q, want false/\"\"", unconfigured.AppAPITokenSet, unconfigured.AppAPITokenHeader)
+	}
+
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.APITokenMode != "app" || got.APITokenHeaderSource != "app" {
+		t.Fatalf("configured defaults = mode %q source %q, want app/app", got.APITokenMode, got.APITokenHeaderSource)
+	}
+}
+
 // TestPutRuntimeSpecPreservesGPUArrayOrder pins that the request array order of
 // gpus is the stored + response + agent-wire order (not re-sorted by index).
 func TestPutRuntimeSpecPreservesGPUArrayOrder(t *testing.T) {

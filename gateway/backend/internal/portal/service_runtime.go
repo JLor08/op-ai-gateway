@@ -357,6 +357,19 @@ type RuntimeSpecDTO struct {
 	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
 	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
 	VisibleDevicesMode string `json:"visible_devices_mode"`
+	// APITokenMode is "app"|"set"|"random"|"off" (design §2). Default "app".
+	APITokenMode string `json:"api_token_mode"`
+	// APITokenSet reports presence of a per-spec token (set/random); the VALUE
+	// is never on the wire.
+	APITokenSet bool `json:"api_token_set"`
+	// APITokenHeaderSource is "app"|"custom"; APITokenHeader is the custom header.
+	APITokenHeaderSource string `json:"api_token_header_source"`
+	APITokenHeader       string `json:"api_token_header"`
+	// AppAPITokenSet / AppAPITokenHeader echo the parent application's token
+	// presence and header (read-only) so the portal can render the inherited
+	// header and the "app has no token ⇒ auth off" hint under app mode.
+	AppAPITokenSet    bool   `json:"app_api_token_set"`
+	AppAPITokenHeader string `json:"app_api_token_header"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -402,7 +415,7 @@ type PutRuntimeSpecRequest struct {
 // mapping's runtime configuration without special-casing non-server_agent
 // applications.
 func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) (RuntimeSpecDTO, error) {
-	mapping, _, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, _, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -411,13 +424,24 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
-		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}, VisibleDevicesMode: string(routing.VisibleDevicesModeEnv)}, nil
+		return RuntimeSpecDTO{
+			MappingID:            mapping.ID,
+			Args:                 []string{},
+			Env:                  map[string]string{},
+			GPUs:                 []RuntimeSpecGPUDTO{},
+			APIFlavors:           []string{},
+			VisibleDevicesMode:   string(routing.VisibleDevicesModeEnv),
+			APITokenMode:         string(routing.RuntimeAPITokenModeApp),
+			APITokenHeaderSource: string(routing.RuntimeAPITokenHeaderSourceApp),
+			AppAPITokenSet:       app.APIToken != "",
+			AppAPITokenHeader:    app.APITokenHeader,
+		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, gpus)
+	return runtimeSpecDTO(spec, gpus, app)
 }
 
 // PutRuntimeSpec validates and upserts mappingID's runtime spec (create on
@@ -642,7 +666,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, storedGPUs)
+	return runtimeSpecDTO(spec, storedGPUs, app)
 }
 
 // DeleteRuntimeSpec removes mappingID's runtime spec. ErrRuntimeSpecNotFound
@@ -803,13 +827,15 @@ func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
 	return nil
 }
 
-// runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows.
-// Args/Env are opaque JSON strings at the store layer (the netbird_group_ids
-// pattern) — an unmarshal failure here means the stored row is corrupt, not
-// a client-input problem, but still surfaces as the matching domain sentinel
+// runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows, plus
+// the parent application (for the read-only api-token echoes — see
+// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader). Args/Env are opaque JSON
+// strings at the store layer (the netbird_group_ids pattern) — an unmarshal
+// failure here means the stored row is corrupt, not a client-input problem,
+// but still surfaces as the matching domain sentinel
 // (ErrRuntimeSpecArgsInvalid / ErrRuntimeSpecEnvInvalid) rather than a raw
 // JSON error or a 500.
-func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (RuntimeSpecDTO, error) {
+func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application) (RuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
@@ -856,7 +882,34 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
+		APITokenMode:                normalizeRuntimeAPITokenMode(spec.APITokenMode),
+		APITokenSet:                 spec.APIToken != "",
+		APITokenHeaderSource:        normalizeRuntimeAPITokenHeaderSource(spec.APITokenHeaderSource),
+		APITokenHeader:              spec.APITokenHeader,
+		AppAPITokenSet:              app.APIToken != "",
+		AppAPITokenHeader:           app.APITokenHeader,
 	}, nil
+}
+
+// normalizeRuntimeAPITokenMode defaults an empty stored/DTO mode to "app" —
+// every pre-feature row and every write still going through PutRuntimeSpec
+// (Tasks 3-5 add the write path) has "" here, and "" must never reach the
+// wire: it means the same thing as "app" (routing.RuntimeAPITokenModeApp)
+// but portal callers should only ever see the one canonical spelling.
+func normalizeRuntimeAPITokenMode(mode string) string {
+	if mode == "" {
+		return string(routing.RuntimeAPITokenModeApp)
+	}
+	return mode
+}
+
+// normalizeRuntimeAPITokenHeaderSource is normalizeRuntimeAPITokenMode's
+// sibling for the header-source column ("app"|"custom", default "app").
+func normalizeRuntimeAPITokenHeaderSource(source string) string {
+	if source == "" {
+		return string(routing.RuntimeAPITokenHeaderSourceApp)
+	}
+	return source
 }
 
 // --- Task 6: co-residency matrix --------------------------------------------
