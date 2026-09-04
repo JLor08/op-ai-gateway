@@ -871,10 +871,29 @@ func TestSqliteDepsWiresCertCipherIntoThePortalService(t *testing.T) {
 	on := true
 	mode := "self_signed"
 	base := "int.example.test"
+	// Configure the issuer mode FIRST, while the module is still off, and flip
+	// cert_enabled on only in a second call. buildGatewayServer wires the real
+	// background certificate-reconcile loop (buildRuntime -> startCertReconcileLoop,
+	// Immediate: true, plus the OnCertSettingsChanged trigger). A combined
+	// enable+configure PUT persists its keys one at a time (cert_enabled before
+	// cert_issuer_mode, see UpdateSystemSettings' write loop), so a background pass
+	// scheduled in that tiny window can read the transient
+	// (cert_enabled=true, issuer_mode=<default acme>, no acme_email) state, judge the
+	// issuer unusable, and persist cert_last_error -- a note that then races (and,
+	// under load, outlives) the clear from this test's own synchronous pass, only
+	// self-correcting on the next reconcile tick (default 900s). Splitting the write
+	// means "enabled" is never observable without its self_signed issuer mode, so no
+	// pass ever writes that spurious note and the LastError assertion below is
+	// deterministic. (The underlying non-atomic-write race is a separate,
+	// lower-severity product concern tracked on its own.)
 	if _, err := srv.Portal.UpdateSystemSettings(ctx, auth.Token{Scopes: []string{"system"}}, portal.UpdateSystemSettingsRequest{
-		CertEnabled:    &on,
 		CertIssuerMode: &mode,
 		CertBaseDomain: &base,
+	}); err != nil {
+		t.Fatalf("configure the certificate module: %v", err)
+	}
+	if _, err := srv.Portal.UpdateSystemSettings(ctx, auth.Token{Scopes: []string{"system"}}, portal.UpdateSystemSettingsRequest{
+		CertEnabled: &on,
 	}); err != nil {
 		t.Fatalf("enable the certificate module: %v", err)
 	}
