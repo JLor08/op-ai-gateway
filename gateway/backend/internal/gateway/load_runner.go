@@ -5,9 +5,11 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"time"
 )
 
 // runLoadModel warm-loads tgt's model on tgt's specific server (forcing a load if not resident),
@@ -73,8 +75,44 @@ func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) 
 	if resident {
 		return true, probed, nil
 	}
-	if _, _, err := s.streamOnce(ctx, streamer, target, req); err != nil {
-		return false, probed, err
+	// The run just cleared the target's stop, so this is a genuine cold load. A
+	// server that answers 503 WHILE it is still loading -- the behaviour of
+	// llama-swap and other single-slot swappers, which this benchmark provokes by
+	// design -- would otherwise fail the whole run on the first probe. Retry the
+	// load until it becomes servable, the cold-load budget elapses, or the run is
+	// cancelled.
+	//
+	// The predicate is DELIBERATELY narrow: ONLY provider.ErrUpstreamStarting (a
+	// 503) is retried. Every other failure returns at once -- a 4xx (bad model
+	// name / auth), a refused connection or a mid-load crash (a VRAM benchmark
+	// pushing the ceiling is exactly where an OOM crash happens; re-driving the
+	// load would loop the crash), and streamOnce's own idle-watchdog cancellation
+	// of a genuinely hung stream. Only a live server explicitly reporting "still
+	// loading" waits.
+	gap := coldLoadPollGap
+	if gap <= 0 {
+		gap = 100 * time.Millisecond // never busy-spin
+	}
+	deadline := time.Now().Add(coldLoadResidentMaxWait)
+	for {
+		if _, _, streamErr := s.streamOnce(ctx, streamer, target, req); streamErr != nil {
+			if !errors.Is(streamErr, provider.ErrUpstreamStarting) {
+				return false, probed, streamErr
+			}
+			if ctx.Err() != nil {
+				return false, probed, ctx.Err()
+			}
+			if !time.Now().Before(deadline) {
+				return false, probed, streamErr
+			}
+			select {
+			case <-ctx.Done():
+				return false, probed, ctx.Err()
+			case <-time.After(gap):
+			}
+			continue
+		}
+		break
 	}
 	s.reflectLoadedAfterLoad(ctx, target, tgt)
 	return false, probed, nil

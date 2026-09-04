@@ -70,7 +70,7 @@ func fetchServerMemory(ctx context.Context, httpClient *http.Client, target rout
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ServerMemory{}, fmt.Errorf("%w: upstream status %d", ErrUnavailable, resp.StatusCode)
+		return ServerMemory{}, unavailableStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {

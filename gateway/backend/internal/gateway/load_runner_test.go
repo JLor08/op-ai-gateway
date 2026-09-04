@@ -5,13 +5,161 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"testing"
 	"time"
 )
+
+// unavailableThenOKProvider returns provider.ErrUnavailable (a cold-load 503) on
+// the first failFirst CompleteStream calls, then streams a token -- modelling a
+// server that answers 503 while a large model is still loading.
+type unavailableThenOKProvider struct {
+	calls     int
+	failFirst int
+}
+
+func (p *unavailableThenOKProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (p *unavailableThenOKProvider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	p.calls++
+	if p.calls <= p.failFirst {
+		// A 503 -> ErrUpstreamStarting, the one status the load retry waits on.
+		return fmt.Errorf("%w: upstream status 503", provider.ErrUpstreamStarting)
+	}
+	if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: "ok"}); err != nil {
+		return err
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted})
+}
+
+// unavailable404Provider fails with a NON-503 ErrUnavailable (a bad model name,
+// say) -- the same error class the swapper's 503 belongs to, but NOT retryable.
+type unavailable404Provider struct{ calls int }
+
+func (p *unavailable404Provider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (p *unavailable404Provider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, _ provider.StreamEmit) error {
+	p.calls++
+	return fmt.Errorf("%w: upstream status 404", provider.ErrUnavailable)
+}
+
+// plainErrProvider fails CompleteStream with a NON-unavailable error, to prove
+// the cold-load retry does not swallow genuine failures.
+type plainErrProvider struct{ calls int }
+
+func (p *plainErrProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (p *plainErrProvider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, _ provider.StreamEmit) error {
+	p.calls++
+	return errors.New("boom: not an availability problem")
+}
+
+func shortenColdLoadRetry(t *testing.T, gap, budget time.Duration) {
+	t.Helper()
+	oldGap, oldBudget := coldLoadPollGap, coldLoadResidentMaxWait
+	coldLoadPollGap, coldLoadResidentMaxWait = gap, budget
+	t.Cleanup(func() { coldLoadPollGap, coldLoadResidentMaxWait = oldGap, oldBudget })
+}
+
+// TestEnsureResidentRetriesColdLoad503: a server that answers 503 three times
+// while loading, then succeeds, must NOT fail the run -- the load is retried
+// until it becomes servable.
+func TestEnsureResidentRetriesColdLoad503(t *testing.T) {
+	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
+	fake := &unavailableThenOKProvider{failFirst: 3}
+	srv := &Server{Provider: fake}
+
+	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	if err != nil {
+		t.Fatalf("ensureResidentForRun err = %v, want nil (retried past the cold-load 503)", err)
+	}
+	if fake.calls != 4 {
+		t.Fatalf("CompleteStream calls = %d, want 4 (three 503s then a success)", fake.calls)
+	}
+}
+
+// TestEnsureResidentGivesUpAfterColdLoadBudget: an upstream that never leaves
+// 503 still fails -- but only after the budget, and only after it was retried.
+func TestEnsureResidentGivesUpAfterColdLoadBudget(t *testing.T) {
+	shortenColdLoadRetry(t, time.Millisecond, 40*time.Millisecond)
+	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
+	srv := &Server{Provider: fake}
+
+	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	if !errors.Is(err, provider.ErrUnavailable) {
+		t.Fatalf("ensureResidentForRun err = %v, want a wrapped provider.ErrUnavailable", err)
+	}
+	if fake.calls < 2 {
+		t.Fatalf("CompleteStream calls = %d, want at least 2 (the load was retried before giving up)", fake.calls)
+	}
+}
+
+// TestEnsureResidentDoesNotRetryGenuineError: a non-availability error is
+// returned immediately, unretried, so a real failure is never masked as loading.
+func TestEnsureResidentDoesNotRetryGenuineError(t *testing.T) {
+	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
+	fake := &plainErrProvider{}
+	srv := &Server{Provider: fake}
+
+	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	if err == nil {
+		t.Fatalf("ensureResidentForRun err = nil, want the genuine error")
+	}
+	if errors.Is(err, provider.ErrUnavailable) {
+		t.Fatalf("err = %v, want a NON-availability error passed through", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("CompleteStream calls = %d, want exactly 1 (no retry on a genuine error)", fake.calls)
+	}
+}
+
+// TestEnsureResidentDoesNotRetryNon503Unavailable: a 404 (or any non-503) is
+// ErrUnavailable but NOT ErrUpstreamStarting, so it fails fast -- otherwise a
+// bad model name / crashed server would be retried for the whole budget, and a
+// mid-load OOM crash would be re-driven into a loop.
+func TestEnsureResidentDoesNotRetryNon503Unavailable(t *testing.T) {
+	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
+	fake := &unavailable404Provider{}
+	srv := &Server{Provider: fake}
+
+	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	if !errors.Is(err, provider.ErrUnavailable) {
+		t.Fatalf("err = %v, want a wrapped provider.ErrUnavailable (the 404)", err)
+	}
+	if errors.Is(err, provider.ErrUpstreamStarting) {
+		t.Fatalf("a 404 must NOT be tagged ErrUpstreamStarting: %v", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("CompleteStream calls = %d, want exactly 1 (a non-503 unavailable is not retried)", fake.calls)
+	}
+}
+
+// TestEnsureResidentReturnsCtxErrorOnCancel: a cancelled run returns ctx.Err(),
+// not a stale 503, even mid-retry.
+func TestEnsureResidentReturnsCtxErrorOnCancel(t *testing.T) {
+	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
+	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
+	srv := &Server{Provider: fake}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := srv.ensureResidentForRun(ctx, benchTestTarget())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled (a cancelled run must not report the stale 503)", err)
+	}
+}
 
 // TestRunLoadModelHappyPath: a streaming provider that yields a token → runLoadModel finishes
 // with results[0].Loaded == true, Running == false, and the server freed (ServerBusy false). No

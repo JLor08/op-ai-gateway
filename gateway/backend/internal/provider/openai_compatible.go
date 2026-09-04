@@ -65,7 +65,7 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return Response{}, unavailableStatus(httpResp.StatusCode)
 	}
 	respBytes, err := io.ReadAll(httpResp.Body)
 	if err != nil {
@@ -183,7 +183,7 @@ func (c *OpenAICompatibleClient) ListModels(ctx context.Context, target routing.
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return nil, unavailableStatus(httpResp.StatusCode)
 	}
 	var decoded struct {
 		Data []struct {
@@ -402,7 +402,7 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return unavailableStatus(httpResp.StatusCode)
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 

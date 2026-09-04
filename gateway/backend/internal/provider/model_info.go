@@ -54,7 +54,7 @@ func fetchModelInfo(ctx context.Context, httpClient *http.Client, target routing
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%w: upstream status %d", ErrUnavailable, resp.StatusCode)
+		return nil, unavailableStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
