@@ -48,8 +48,8 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent). |
-| `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`. |
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `visible_devices_mode` (migration 73, `text not null default 'env'`: `env` sets that variable as before, `args` sets nothing and relies on a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args` instead), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent). |
+| `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`, plus operator-owned `position` (migration 73, `integer not null default 0`: the operator-chosen GPU order; rows are read back `order by position, gpu_index`). |
 | `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
 | `server_runtime_reports` | 1:1 latest runtime-config report per server (upsert-overwrite), for an agent whose configuration source is a local file: an opaque validated JSON blob with env values already masked. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (72 migrations)
+## 4. Migration history (73 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -404,6 +404,12 @@ catch-all `model_override`, which has its own column).
 | # | Migration | Purpose |
 |---|---|---|
 | 72 | `application_endpoint_modes` | Replaces the two native-passthrough booleans (migration 5) with the three-state `EndpointMode` (`disabled`/`translate`/`passthrough`) at both levels. Adds `applications.responses_mode`/`messages_mode` (`text not null default ''`), **backfilled** from the existing booleans (`native_responses <> 0 → 'passthrough'`, else `'translate'`; same for messages) so no application's served behavior changes on upgrade. Adds `agent_runtime_specs.api_flavors`/`responses_mode`/`messages_mode` (`text not null default '[]'`/`''`/`''`), **backfilled from the parent application** — a join through `model_mappings.application_id` — so every pre-existing spec becomes an explicit, independent snapshot of its application's just-backfilled values rather than inheriting them dynamically ("Snapshot aus App": [ADR-033](../09-architecture-decisions.md#adr-033--endpoint-modes-replace-the-native_-booleans-independent-per-endpoint-disable-per-spec-snapshot)). The `native_responses`/`native_messages` columns are **not dropped** — append-only migration discipline (three store drivers) — they simply stop being read or written by new code. |
+
+### GPU selection
+
+| # | Migration | Purpose |
+|---|---|---|
+| 73 | `runtime_spec_gpu_position_and_visible_devices_mode` | Two additive columns that ship together ([ADR-034](../09-architecture-decisions.md#adr-034--gpu-order-is-explicit-set_visible_devices-gets-an-env-or-args-mode)). Adds `agent_runtime_spec_gpus.position` (`integer not null default 0`): the operator-chosen GPU order, read back `order by position, gpu_index`. **Backfilled** to each spec's prior ascending-by-`gpu_index` rank (`position = count of that spec's other rows with a smaller gpu_index`) — a correlated subquery identical on both dialects — so no existing spec's effective order changes on upgrade; the order only moves once an operator actively reorders the GPU rows in the portal. Adds `agent_runtime_specs.visible_devices_mode` (`text not null default 'env'`): `env` (the default, today's behaviour) or `args` (the agent injects no visibility variable; the operator instead uses a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args`). Aborts the boot on failure, like migration 70/72, rather than skipping like migration 68: both writes are deterministic with no pre-check to fail. |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
