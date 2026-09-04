@@ -142,6 +142,34 @@ func TestHandlePortalMappingRuntimeSpecPutBadFlavorReturns400(t *testing.T) {
 	}
 }
 
+func TestHandlePortalMappingRuntimeSpecPutBadVisibleDevicesModeReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","set_visible_devices":true,"visible_devices_mode":"bogus","gpus":[{"index":0}]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.visible_devices_mode_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.visible_devices_mode_invalid", code)
+	}
+}
+
+func TestHandlePortalMappingRuntimeSpecPutArgsModeNoPlaceholderReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","set_visible_devices":true,"visible_devices_mode":"args","args":["--ctx-size","4096"],"gpus":[{"index":0}]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.visible_devices_args_no_placeholder" {
+		t.Fatalf("error code = %q, want runtime_spec.visible_devices_args_no_placeholder", code)
+	}
+}
+
 func TestHandlePortalMappingRuntimeSpecDeleteReturnsOKTrue(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)
