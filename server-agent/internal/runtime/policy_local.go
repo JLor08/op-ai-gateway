@@ -811,10 +811,21 @@ func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(strin
 // Offsets are into the EXPANDED string, and for an env entry they are into the
 // final "KEY=value" form (expandSpec shifts them by len(key)+1), so a consumer
 // never needs to know how the string was assembled.
+//
+// mask is the EXACT placeholder text the reported command renders in place of
+// the substituted value -- the operator's own template text for THIS span, and
+// the whole reason masking can name where a value came from. It is recorded at
+// the substitution site because that is the only place the producing
+// placeholder is known: an ${AGENT_ENV:NAME} span carries "${AGENT_ENV:NAME}"
+// (a host variable to go and check), an ${API_TOKEN} span carries "${API_TOKEN}"
+// (the gateway-pushed wire field, a mechanism ${AGENT_ENV:...} cannot express).
+// maskSecretSpans emits this verbatim rather than reconstructing a placeholder
+// from name, so the two secret sources never get rendered as each other.
 type secretSpan struct {
 	start int
 	end   int
 	name  string
+	mask  string
 }
 
 // expandedSpec is expandSpec's full result: what the child receives, plus the
@@ -933,7 +944,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 				}
 				start := b.Len()
 				b.WriteString(spec.APIToken)
-				spans = append(spans, secretSpan{start: start, end: b.Len(), name: "API_TOKEN"})
+				spans = append(spans, secretSpan{start: start, end: b.Len(), name: "API_TOKEN", mask: "${API_TOKEN}"})
 				continue
 			}
 
@@ -972,7 +983,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 				// therefore the one place its extent can be recorded exactly.
 				start := b.Len()
 				b.WriteString(val)
-				spans = append(spans, secretSpan{start: start, end: b.Len(), name: name})
+				spans = append(spans, secretSpan{start: start, end: b.Len(), name: name, mask: "${AGENT_ENV:" + name + "}"})
 				continue
 			}
 

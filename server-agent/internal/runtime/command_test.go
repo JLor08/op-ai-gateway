@@ -474,6 +474,16 @@ func TestResolvedCommandMasksAPITokenInAnEnvValue(t *testing.T) {
 	if strings.Contains(v, secret) {
 		t.Fatalf("VLLM_API_KEY = %q carries the resolved api token -- it must be masked in the reported command", v)
 	}
+	// The mask must be the operator's OWN placeholder, ${API_TOKEN} -- the
+	// gateway-pushed wire field. Rendering it as ${AGENT_ENV:API_TOKEN} would
+	// name a mechanism that reads the agent's own process env, which does not
+	// supply this value: a provenance lie about where the token came from.
+	if v != "${API_TOKEN}" {
+		t.Errorf("VLLM_API_KEY = %q, want the ${API_TOKEN} placeholder that produced it", v)
+	}
+	if strings.Contains(v, "${AGENT_ENV:API_TOKEN}") {
+		t.Errorf("VLLM_API_KEY = %q rendered as an AGENT_ENV placeholder -- ${API_TOKEN} is a wire field, not an agent env variable", v)
+	}
 	if !cmd.Masked {
 		t.Error("Masked = false although an env value was resolved from ${API_TOKEN}")
 	}
@@ -511,6 +521,15 @@ func TestResolvedCommandMasksAPITokenInAnArgument(t *testing.T) {
 	got := joinArgs(cmd.Args)
 	if strings.Contains(got, secret) {
 		t.Fatalf("args = %q carry the resolved api token -- a token in an ARGUMENT must be masked too", got)
+	}
+	// The rendered mask names the operator's OWN mechanism: ${API_TOKEN}, the
+	// gateway-pushed wire field -- never ${AGENT_ENV:API_TOKEN}, which would
+	// point them at an agent process-env variable that never supplied this.
+	if !strings.Contains(got, "--api-key ${API_TOKEN}") {
+		t.Errorf("args = %q, want the masked argument to read as its own ${API_TOKEN} placeholder", got)
+	}
+	if strings.Contains(got, "${AGENT_ENV:API_TOKEN}") {
+		t.Errorf("args = %q rendered the token as an AGENT_ENV placeholder -- ${API_TOKEN} is a wire field, not an agent env variable", got)
 	}
 	if !strings.Contains(got, "--port 8081") {
 		t.Errorf("args = %q, want the resolved port still visible beside the mask", got)
@@ -561,5 +580,33 @@ func TestExpandSpecNoAPITokenRecordsNoSpan(t *testing.T) {
 		if strings.Contains(e, "tok-abc") {
 			t.Errorf("env entry %q carries the api token although no ${API_TOKEN} placeholder was written", e)
 		}
+	}
+}
+
+// TestExpandSpecAPITokenNearMissIsLiteral: ${API_TOKENS} is EXACT-match away
+// from ${API_TOKEN}, and -- like a ${MODEL}/${*_DEVICES} near-miss, and unlike a
+// ${PORT}/${AGENT_ENV} one -- it is NOT in the malformed-placeholder guard. So
+// it passes through as literal text: not resolved, not an error, and not masked
+// (no span recorded), even though the wire carried a non-empty APIToken.
+func TestExpandSpecAPITokenNearMissIsLiteral(t *testing.T) {
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Args:     []string{"--tmpl", "${API_TOKENS}"},
+		Env:      map[string]string{"WEIRD": "${API_TOKENS}"},
+		APIToken: "tok-abc",
+	}
+	cmd := commandFor(t, spec, 8080, GPUVendorNone, func(string) string { return "" }, false)
+
+	if got := joinArgs(cmd.Args); !strings.Contains(got, "--tmpl ${API_TOKENS}") {
+		t.Errorf("args = %q, want the near-miss ${API_TOKENS} passed through as literal text", got)
+	}
+	if v, ok := envValue(cmd.Env, "WEIRD"); !ok || v != "${API_TOKENS}" {
+		t.Errorf("WEIRD = %q (present=%v), want the near-miss ${API_TOKENS} left literal", v, ok)
+	}
+	if cmd.Masked {
+		t.Error("Masked = true although ${API_TOKENS} is a near-miss that resolves nothing and records no span")
+	}
+	if strings.Contains(joinArgs(cmd.Args), "tok-abc") {
+		t.Errorf("args = %q leaked the api token through a near-miss placeholder", joinArgs(cmd.Args))
 	}
 }

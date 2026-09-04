@@ -259,17 +259,22 @@ func (ex expandedSpec) resolvedCommand(spec Spec, maskSpecEnv bool) ResolvedComm
 	return out
 }
 
-// maskSecretSpans replaces every recorded ${AGENT_ENV:NAME} span in s with the
-// placeholder that produced it, and reports whether it replaced anything.
+// maskSecretSpans replaces every recorded secret span in s with the exact
+// placeholder that produced it (secretSpan.mask), and reports whether it
+// replaced anything.
 //
 // The mask is the PLACEHOLDER, not a row of bullets, and that choice does two
 // jobs at once. It is unmistakably not a value, so a reader (or a colleague
 // watching a screen-share) can never mistake the panel for one that leaks; and
-// it names the variable, so "--api-key ${AGENT_ENV:HF_TOKEN}" tells the
-// operator exactly which variable supplied the argument and therefore exactly
-// what to check on the host. It also reveals nothing new: the placeholder is
-// the operator's own template text, which the portal's spec editor already
-// shows them.
+// it names the mechanism the operator wrote, so "--api-key ${AGENT_ENV:HF_TOKEN}"
+// tells them the argument came from that host variable, while
+// "--api-key ${API_TOKEN}" tells them it came from the gateway-pushed wire
+// field -- two different sources that must not be rendered as each other. It
+// also reveals nothing new: each placeholder is the operator's own template
+// text, which the portal's spec editor already shows them. This is why the span
+// carries the literal mask string rather than having this function rebuild one
+// from name: only the substitution site knows which placeholder produced the
+// span, and ${AGENT_ENV:...} cannot express the ${API_TOKEN} source.
 //
 // Spans arrive ascending and non-overlapping (expandSpec appends them in
 // output order, one per substitution), so a single forward walk is enough. A
@@ -288,7 +293,7 @@ func maskSecretSpans(s string, spans []secretSpan) (string, bool) {
 			continue
 		}
 		b.WriteString(s[copied:sp.start])
-		b.WriteString("${AGENT_ENV:" + sp.name + "}")
+		b.WriteString(sp.mask)
 		copied = sp.end
 		changed = true
 	}
