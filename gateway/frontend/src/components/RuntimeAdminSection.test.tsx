@@ -2631,7 +2631,10 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
       },
       // makeHardware(...) reports os:'linux' (non-macOS) — see GOTCHAS.
       hardware: makeHardware([{ index: 0, name: 'Card', memory_total_bytes: 0 }]),
-      report: makeReport({ agent_version: '0.4.0', agent_features: ['runtime_manager', 'gpu_selection'] }),
+      report: makeReport({
+        agent_version: '0.4.0',
+        agent_features: ['runtime_manager', 'gpu_selection'],
+      }),
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
     expect(await screen.findByText(t.runtimeSpecMetalNonMacos)).toBeInTheDocument();
@@ -2651,7 +2654,10 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
           gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
-      hardware: makeHardware([{ index: 0, name: 'Apple M3', memory_total_bytes: 0 }], 'darwin 15.1'),
+      hardware: makeHardware(
+        [{ index: 0, name: 'Apple M3', memory_total_bytes: 0 }],
+        'darwin 15.1',
+      ),
       report: makeReport({ agent_version: '0.4.0', agent_features: ['gpu_selection'] }),
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
@@ -5061,7 +5067,9 @@ describe('RuntimeAdminSection visibility mode', () => {
     expect(combo).toHaveTextContent(t.runtimeSpecVisibleDevicesModeEnv);
     // Switch to args (MUI Select idiom).
     fireEvent.mouseDown(combo);
-    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecVisibleDevicesModeArgs }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecVisibleDevicesModeArgs }),
+    );
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.visible_devices_mode).toBe('args');
@@ -5071,8 +5079,12 @@ describe('RuntimeAdminSection visibility mode', () => {
     renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
       specsByMappingId: {
-        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1',
-          set_visible_devices: false }),
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: false,
+        }),
       },
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));

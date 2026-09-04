@@ -2243,7 +2243,12 @@ export function RuntimeAdminSection({
   // Part A on the client.
   function reorderGpuRows(sourceKey: string, targetKey: string, place: 'before' | 'after') {
     setGpuRows((rows) => {
-      const order = moveColumn(rows.map((r) => r.rowKey), sourceKey, targetKey, place);
+      const order = moveColumn(
+        rows.map((r) => r.rowKey),
+        sourceKey,
+        targetKey,
+        place,
+      );
       return order.map((k) => rows.find((r) => r.rowKey === k)!);
     });
   }
@@ -3328,7 +3333,9 @@ export function RuntimeAdminSection({
     // from the hardware report already fetched (:1394-1396) — NOT a new DTO field.
     const agentHasGpuSelection = agentFeatures.includes('gpu_selection');
     const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
-    const argsHaveMetalDevices = parseArgsText(argsText).some((a) => a.includes('${METAL_DEVICES}'));
+    const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
+      a.includes('${METAL_DEVICES}'),
+    );
     const agentOs = hardware.data?.available && hardware.data.report ? hardware.data.report.os : '';
     const agentOsKnown = agentOs !== '';
     const isMacOsAgent = /darwin|mac ?os/i.test(agentOs);
@@ -3653,9 +3660,7 @@ export function RuntimeAdminSection({
                   {`${t.runtimeSpecAgentTooOldOrder} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
                 </Alert>
               )}
-              {showMetalNonMacos && (
-                <Alert severity="warning">{t.runtimeSpecMetalNonMacos}</Alert>
-              )}
+              {showMetalNonMacos && <Alert severity="warning">{t.runtimeSpecMetalNonMacos}</Alert>}
               {/* No reported GPUs: say so ONCE, and omit the picker rather
                   than rendering an empty dropdown that reads as broken. The
                   numeric index below stays fully editable -- a machine that
