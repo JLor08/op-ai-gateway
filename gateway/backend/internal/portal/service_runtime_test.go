@@ -2095,3 +2095,85 @@ func slicesEqualInt(a, b []int) bool {
 	}
 	return true
 }
+
+// TestPutRuntimeSpecVisibleDevicesModeValidation pins the two new mode traps:
+// an invalid mode value, and args mode with no ${..._DEVICES} placeholder in
+// args. The conflict + no-gpus traps still fire in BOTH modes.
+func TestPutRuntimeSpecVisibleDevicesModeValidation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary:            "/usr/local/bin/llama-server",
+			SetVisibleDevices: true,
+			GPUs:              []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 8000}},
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(PutRuntimeSpecRequest) PutRuntimeSpecRequest
+		wantErr error
+	}{
+		{
+			name:    "bad mode value",
+			mutate:  func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.VisibleDevicesMode = "bogus"; return r },
+			wantErr: ErrRuntimeSpecVisibleDevicesModeInvalid,
+		},
+		{
+			name: "args mode with no device placeholder",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+				r.Args = []string{"--ctx-size", "4096"}
+				return r
+			},
+			wantErr: ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, tc.mutate(base())); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+
+	// Each of the three placeholder tokens satisfies args mode.
+	for _, ph := range []string{"${CUDA_DEVICES}", "${VULKAN_DEVICES}", "${METAL_DEVICES}"} {
+		t.Run("accepts "+ph, func(t *testing.T) {
+			r := base()
+			r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+			r.Args = []string{"--device", ph}
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+				t.Fatalf("args mode with %s must save: %v", ph, err)
+			}
+		})
+	}
+
+	// The conflict trap still fires in args mode (a hand-set CUDA_VISIBLE_DEVICES
+	// remaps the CUDA namespace and would break --device numbering).
+	t.Run("conflict trap holds in args mode", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--device", "${CUDA_DEVICES}"}
+		r.Env = map[string]string{"CUDA_VISIBLE_DEVICES": "0,1"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); !errors.Is(err, ErrRuntimeSpecVisibleDevicesConflict) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecVisibleDevicesConflict", err)
+		}
+	})
+
+	// Mode is inert when the option is OFF: a bogus mode with the flag off is
+	// still rejected as a malformed enum, but args-with-no-placeholder is NOT
+	// (the placeholder requirement only applies with the flag on).
+	t.Run("args no-placeholder ok when flag off", func(t *testing.T) {
+		r := base()
+		r.SetVisibleDevices = false
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--ctx-size", "4096"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+			t.Fatalf("args mode with flag off must save: %v", err)
+		}
+	})
+}

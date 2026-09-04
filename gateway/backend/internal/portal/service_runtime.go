@@ -73,6 +73,14 @@ var (
 	// ErrRuntimeSpecFlavorInvalid rejects an api_flavors entry that is not
 	// openai/anthropic. HTTP 400.
 	ErrRuntimeSpecFlavorInvalid = errors.New("runtime_spec.flavor_invalid")
+	// ErrRuntimeSpecVisibleDevicesModeInvalid rejects a visible_devices_mode
+	// that is not "env" or "args". HTTP 400.
+	ErrRuntimeSpecVisibleDevicesModeInvalid = errors.New("runtime_spec.visible_devices_mode_invalid")
+	// ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder rejects set_visible_devices
+	// in args mode when none of the three device placeholders
+	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}) appears in args: the
+	// agent would inject no visibility and the selection would be lost. HTTP 400.
+	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -690,9 +698,45 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// validateRuntimeSpecVisibleDevices enforces the two combinations
-// set_visible_devices may not be saved in. Both are ALSO refused by the agent
-// at launch, and that duplication is deliberate in both directions:
+// runtimeSpecDevicePlaceholders are the three llama.cpp --device placeholders
+// the agent expands (mirrors the agent's own token set in policy_local.go).
+// In args mode at least one must appear in the spec's args, else the
+// selection would silently vanish.
+var runtimeSpecDevicePlaceholders = []string{
+	"${CUDA_DEVICES}",
+	"${VULKAN_DEVICES}",
+	"${METAL_DEVICES}",
+}
+
+func argsHaveDevicePlaceholder(args []string) bool {
+	for _, a := range args {
+		for _, ph := range runtimeSpecDevicePlaceholders {
+			if strings.Contains(a, ph) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validVisibleDevicesMode validates a raw visible_devices_mode at the DTO
+// edge (mirrors validEndpointMode). Empty is valid and defaults to "env" in
+// putRuntimeSpec; any other non-env/args value is rejected.
+func validVisibleDevicesMode(raw string) (routing.VisibleDevicesMode, bool) {
+	switch m := routing.VisibleDevicesMode(strings.TrimSpace(raw)); m {
+	case "", routing.VisibleDevicesModeEnv, routing.VisibleDevicesModeArgs:
+		return m, true
+	default:
+		return "", false
+	}
+}
+
+// validateRuntimeSpecVisibleDevices validates visible_devices_mode (always,
+// regardless of the flag) and, when set_visible_devices is on, enforces the
+// combinations it may not be saved in: an env conflict, an empty GPU list, or
+// (in args mode) args with no device placeholder. The flag-gated traps are
+// ALSO refused by the agent at launch, and that duplication is deliberate in
+// both directions:
 //
 //   - Only the portal can tell the operator IN THE MOMENT. The agent's refusal
 //     surfaces as a terminal `not_permitted` on a spec the operator already
@@ -712,6 +756,12 @@ var runtimeSpecVisibleDevicesVars = []string{
 // reads req rather than the stored row: this API is a full-document upsert, so
 // the request IS the resulting spec.
 func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
+	// The mode value is validated regardless of the flag: a malformed enum is
+	// a malformed request. Empty defaults to "env" (resolved in putRuntimeSpec).
+	mode, ok := validVisibleDevicesMode(req.VisibleDevicesMode)
+	if !ok {
+		return ErrRuntimeSpecVisibleDevicesModeInvalid
+	}
 	if !req.SetVisibleDevices {
 		return nil
 	}
@@ -726,6 +776,11 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 	// `CUDA_VISIBLE_DEVICES=`, which hides every card from the model.
 	if len(req.GPUs) == 0 {
 		return ErrRuntimeSpecVisibleDevicesNoGPUs
+	}
+	// args mode: at least one device placeholder must be present, else the
+	// agent injects nothing and the selection is silently lost.
+	if mode == routing.VisibleDevicesModeArgs && !argsHaveDevicePlaceholder(req.Args) {
+		return ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder
 	}
 	return nil
 }
