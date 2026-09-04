@@ -28,8 +28,8 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			health_path, health_timeout_seconds, startup_timeout_seconds,
 			idle_timeout_seconds, admission_wait_timeout_seconds, pinned,
 			admin_state, vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
-			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			visible_devices_mode, created_at, updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env, work_dir = excluded.work_dir,
@@ -43,13 +43,14 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			set_visible_devices = excluded.set_visible_devices,
 			api_flavors = excluded.api_flavors, responses_mode = excluded.responses_mode,
 			messages_mode = excluded.messages_mode,
+			visible_devices_mode = excluded.visible_devices_mode,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
 		spec.StartupTimeoutSeconds, spec.IdleTimeoutSeconds,
 		spec.AdmissionWaitTimeoutSeconds, spec.Pinned, spec.AdminState,
 		spec.VRAMLocked, spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
-		spec.CreatedAt, spec.UpdatedAt,
+		string(spec.VisibleDevicesMode), spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
 		// FK before unique: sqlite's FK error text also matches the
@@ -69,7 +70,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, work_d
 	listen_port, health_path, health_timeout_seconds, startup_timeout_seconds,
 	idle_timeout_seconds, admission_wait_timeout_seconds, pinned, admin_state,
 	vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
-	created_at, updated_at`
+	visible_devices_mode, created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
 // the RuntimeSpecsByApplication join below where an unqualified column list
@@ -79,7 +80,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.listen_port, s.health_path, s.health_timeout_seconds, s.startup_timeout_seconds,
 	s.idle_timeout_seconds, s.admission_wait_timeout_seconds, s.pinned, s.admin_state,
 	s.vram_locked, s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode,
-	s.created_at, s.updated_at`
+	s.visible_devices_mode, s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
 	row := s.queryRow(ctx, `select `+runtimeSpecCols+` from agent_runtime_specs where mapping_id = ?`, mappingID)
@@ -346,6 +347,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&spec.IdleTimeoutSeconds, &spec.AdmissionWaitTimeoutSeconds, &pinned,
 		&spec.AdminState, &vramLocked, &setVisibleDevices,
 		&apiFlavors, &spec.ResponsesMode, &spec.MessagesMode,
+		&spec.VisibleDevicesMode,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound

@@ -346,6 +346,9 @@ type RuntimeSpecDTO struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
+	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
+	VisibleDevicesMode string `json:"visible_devices_mode"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -379,6 +382,9 @@ type PutRuntimeSpecRequest struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// VisibleDevicesMode: see RuntimeSpecDTO's doc. Absent (empty/"")
+	// defaults to "env" — see putRuntimeSpec.
+	VisibleDevicesMode string `json:"visible_devices_mode"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -397,7 +403,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
-		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}}, nil
+		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}, VisibleDevicesMode: string(routing.VisibleDevicesModeEnv)}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
@@ -525,6 +531,13 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
+	// behavior); a bad value is a LATER task's validation (mode validation
+	// is not wired up yet — this resolves the stored typed value only).
+	visibleMode := routing.VisibleDevicesModeEnv
+	if strings.TrimSpace(req.VisibleDevicesMode) != "" {
+		visibleMode = routing.VisibleDevicesMode(strings.TrimSpace(req.VisibleDevicesMode))
+	}
 	args := req.Args
 	if args == nil {
 		args = []string{}
@@ -589,6 +602,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		AdminState:                  adminState,
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
+		VisibleDevicesMode:          visibleMode,
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
@@ -785,6 +799,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
+		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 	}, nil
 }
 
@@ -1313,8 +1328,13 @@ type AgentRuntimeSpecDTO struct {
 	// visibility variable for this spec's child from the GPUs above. The
 	// gateway is hardware-agnostic and never resolves WHICH variable that
 	// is — only the agent knows what stack the host runs.
-	SetVisibleDevices bool   `json:"set_visible_devices"`
-	AdminState        string `json:"admin_state"`
+	SetVisibleDevices bool `json:"set_visible_devices"`
+	// VisibleDevicesMode tells the agent whether to enforce visibility via the
+	// env variable ("env") or to leave it to a ${..._DEVICES} placeholder the
+	// operator put in Args ("args"). Unlike api_flavors/responses_mode, the
+	// agent NEEDS this, so it DOES cross the wire.
+	VisibleDevicesMode string `json:"visible_devices_mode"`
+	AdminState         string `json:"admin_state"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1583,6 +1603,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
 		SetVisibleDevices:           spec.SetVisibleDevices,
+		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		AdminState:                  spec.AdminState,
 	}, nil
 }

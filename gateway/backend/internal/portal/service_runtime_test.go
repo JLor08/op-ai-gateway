@@ -1972,3 +1972,63 @@ func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
 		}
 	})
 }
+
+// TestRuntimeSpecDTOCarriesVisibleDevicesMode pins that RuntimeSpecDTO /
+// PutRuntimeSpecRequest / the agent-wire AgentRuntimeSpecDTO all carry
+// visible_devices_mode, that PutRuntimeSpec+GetRuntimeSpec round-trip it, and
+// that an omitted mode defaults to "env".
+func TestRuntimeSpecDTOCarriesVisibleDevicesMode(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen-upstream"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	// args mode round-trips (with a placeholder present so validation passes).
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled:            true,
+		Binary:             "/usr/local/bin/llama-server",
+		Args:               []string{"--device", "${CUDA_DEVICES}"},
+		SetVisibleDevices:  true,
+		VisibleDevicesMode: string(routing.VisibleDevicesModeArgs),
+		GPUs:               []RuntimeSpecGPUDTO{{Index: 2, VRAMEstimateMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("dto.VisibleDevicesMode = %q, want args", dto.VisibleDevicesMode)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("GetRuntimeSpec().VisibleDevicesMode = %q, want args", got.VisibleDevicesMode)
+	}
+
+	// The agent-wire document carries the mode too (the agent needs it to
+	// decide whether to inject the visibility env var).
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if len(cfg.Specs) != 1 || cfg.Specs[0].VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("agent wire dropped the mode: %#v", cfg.Specs)
+	}
+
+	// An omitted mode defaults to env.
+	def, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (default): %v", err)
+	}
+	if def.VisibleDevicesMode != string(routing.VisibleDevicesModeEnv) {
+		t.Fatalf("default mode = %q, want env", def.VisibleDevicesMode)
+	}
+}

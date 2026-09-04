@@ -1279,6 +1279,11 @@ type RuntimeSpec struct {
 	// visibility variable in Env) live in portal.PutRuntimeSpec, and the
 	// agent refuses them again at launch — see that method for why both.
 	SetVisibleDevices bool
+	// VisibleDevicesMode selects HOW SetVisibleDevices is enforced: "env"
+	// (inject the vendor visibility variable, today's behavior) or "args" (the
+	// agent expands a ${..._DEVICES} placeholder in Args and injects no env
+	// var). Only meaningful when SetVisibleDevices is on; default "env".
+	VisibleDevicesMode VisibleDevicesMode
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of the
 	// API-variant capability + the two coding-agent endpoint modes (design
 	// 2026-09-03). For a server_agent mapping the RESOLVED spec is the sole
