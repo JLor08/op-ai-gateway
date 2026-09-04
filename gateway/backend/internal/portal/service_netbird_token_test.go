@@ -246,6 +246,19 @@ func (f *failOnKeySettings) SetSystemSetting(ctx context.Context, key, value str
 	return f.MemorySystemSettings.SetSystemSetting(ctx, key, value, now)
 }
 
+// SetSystemSettings routes the atomic batch back through this fake's fault-aware
+// per-key SetSystemSetting. Without it the promoted (fault-free) MemorySystemSettings
+// batch method would satisfy atomicSystemSettingsStore and let UpdateSystemSettings
+// bypass the injected failure when the failing key rides in a batch.
+func (f *failOnKeySettings) SetSystemSettings(ctx context.Context, values map[string]string, now time.Time) error {
+	for key, value := range values {
+		if err := f.SetSystemSetting(ctx, key, value, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- daysRemaining -----------------------------------------------------
 
 func TestDaysRemainingRounding(t *testing.T) {

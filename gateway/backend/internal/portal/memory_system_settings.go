@@ -37,3 +37,18 @@ func (m *MemorySystemSettings) SetSystemSetting(_ context.Context, key, value st
 	m.values[key] = value
 	return nil
 }
+
+// SetSystemSettings applies every pair under a single lock, so a concurrent
+// reader never observes a partial batch -- the in-memory counterpart to the
+// SQLite store's transactional SetSystemSettings. An empty batch is a no-op.
+func (m *MemorySystemSettings) SetSystemSettings(_ context.Context, values map[string]string, _ time.Time) error {
+	if len(values) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, value := range values {
+		m.values[key] = value
+	}
+	return nil
+}

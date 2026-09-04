@@ -144,6 +144,23 @@ type SystemSettingsStore interface {
 	SetSystemSetting(ctx context.Context, key, value string, now time.Time) error
 }
 
+// atomicSystemSettingsStore is an optional SystemSettingsStore capability:
+// persist several settings in ONE atomic write. UpdateSystemSettings prefers it
+// (see persistSystemSettings) so a related group of keys -- e.g. cert_enabled
+// together with cert_issuer_mode -- is never observable half-applied by a
+// concurrent reader such as the certificate reconcile loop, and a mid-batch
+// failure rolls the whole group back instead of leaving earlier keys written.
+// Both production stores implement it (asserted below); a store that does not,
+// such as an error-injecting test fake, falls back to per-key writes.
+type atomicSystemSettingsStore interface {
+	SetSystemSettings(ctx context.Context, values map[string]string, now time.Time) error
+}
+
+var (
+	_ atomicSystemSettingsStore = (*MemorySystemSettings)(nil)
+	_ atomicSystemSettingsStore = (*store.SQLiteStore)(nil)
+)
+
 // UIPreferencesStore persists per-user UI preferences as opaque key/JSON-value
 // pairs. It mirrors SystemSettingsStore but is scoped to a single user.
 type UIPreferencesStore interface {

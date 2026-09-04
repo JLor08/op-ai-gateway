@@ -18,6 +18,85 @@ import (
 	"time"
 )
 
+// recordingBatchSettings wraps the real in-memory store and records whether each
+// write arrived as one atomic batch (SetSystemSettings) or as separate per-key
+// writes (SetSystemSetting), so a test can pin that UpdateSystemSettings persists
+// a related group of keys atomically. Embedding the concrete *MemorySystemSettings
+// (which implements the batch capability) means this fake also satisfies
+// atomicSystemSettingsStore, so UpdateSystemSettings takes the atomic path.
+type recordingBatchSettings struct {
+	*MemorySystemSettings
+	batches [][]string // keys carried by each atomic batch call
+	perKey  []string   // keys written one at a time
+}
+
+func (r *recordingBatchSettings) SetSystemSetting(ctx context.Context, key, value string, now time.Time) error {
+	r.perKey = append(r.perKey, key)
+	return r.MemorySystemSettings.SetSystemSetting(ctx, key, value, now)
+}
+
+func (r *recordingBatchSettings) SetSystemSettings(ctx context.Context, values map[string]string, now time.Time) error {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	r.batches = append(r.batches, keys)
+	return r.MemorySystemSettings.SetSystemSettings(ctx, values, now)
+}
+
+func batchContains(keys []string, want string) bool {
+	for _, k := range keys {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUpdateSystemSettingsPersistsCertEnableAtomically pins the fix for the
+// certificate-reconcile flake: a single enable+configure PUT must write
+// cert_enabled together with cert_issuer_mode (and cert_base_domain) in ONE atomic
+// batch, so a concurrent reconcile pass can never observe cert_enabled=true with a
+// still-default (acme, unusable) issuer mode and persist a spurious cert_last_error.
+func TestUpdateSystemSettingsPersistsCertEnableAtomically(t *testing.T) {
+	ctx := context.Background()
+	rec := &recordingBatchSettings{MemorySystemSettings: NewMemorySystemSettings()}
+	svc := NewService(ServiceDeps{SystemSettings: rec, Clock: fixedClock()})
+
+	on := true
+	mode := "self_signed"
+	base := "int.example.test"
+	if _, err := svc.UpdateSystemSettings(ctx, systemToken(), UpdateSystemSettingsRequest{
+		CertEnabled:    &on,
+		CertIssuerMode: &mode,
+		CertBaseDomain: &base,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings returned %v", err)
+	}
+
+	if len(rec.perKey) != 0 {
+		t.Fatalf("cert settings were written per-key %v, want a single atomic batch", rec.perKey)
+	}
+	if len(rec.batches) != 1 {
+		t.Fatalf("got %d atomic batches (%v), want exactly 1 -- the whole PUT is one atomic write", len(rec.batches), rec.batches)
+	}
+	batch := rec.batches[0]
+	for _, key := range []string{certEnabledKey, certIssuerModeKey, certBaseDomainKey} {
+		if !batchContains(batch, key) {
+			t.Fatalf("key %q is missing from the atomic batch %v -- it could be observed without the others", key, batch)
+		}
+	}
+
+	// And the batch actually landed as a consistent final state.
+	values, err := rec.SystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("SystemSettings returned %v", err)
+	}
+	if values[certEnabledKey] != "true" || values[certIssuerModeKey] != "self_signed" || values[certBaseDomainKey] != "int.example.test" {
+		t.Fatalf("final settings = %#v, want enabled=true, issuer=self_signed, base=int.example.test", values)
+	}
+}
+
 func fixedClock() func() time.Time {
 	ts := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
 	return func() time.Time { return ts }
