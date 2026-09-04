@@ -1744,3 +1744,66 @@ func TestExpandPlaceholdersHostGPUIDsAreHostIndices(t *testing.T) {
 		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want the HOST indices %q", v, wantHost)
 	}
 }
+
+// TestExpandPlaceholdersDeviceLists pins the three llama.cpp --device
+// placeholders: each emits <Backend><host index> per selected GPU, in the
+// operator's declared order, deduplicated, comma-joined -- the same ordered
+// index list as ${HOST_GPU_IDS}, only backend-prefixed.
+func TestExpandPlaceholdersDeviceLists(t *testing.T) {
+	getenv := func(string) string { return "" }
+	cases := []struct {
+		placeholder string
+		want        string
+	}{
+		{"${CUDA_DEVICES}", "CUDA3,CUDA2"},
+		{"${VULKAN_DEVICES}", "Vulkan3,Vulkan2"},
+		{"${METAL_DEVICES}", "MTL3,MTL2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.placeholder, func(t *testing.T) {
+			spec := Spec{
+				Args: []string{"--device", tc.placeholder},
+				GPUs: []SpecGPU{{Index: 3}, {Index: 2}}, // non-ascending: proves order, not sort
+			}
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders: %v", err)
+			}
+			if args[1] != tc.want {
+				t.Errorf("%s = %q, want %q (<prefix><host index> in operator order)", tc.placeholder, args[1], tc.want)
+			}
+		})
+		t.Run(tc.placeholder+"/no gpus refused", func(t *testing.T) {
+			spec := Spec{Args: []string{"--device", tc.placeholder}}
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv); err == nil {
+				t.Fatalf("%s on a spec with no gpus must refuse, not substitute an empty device list", tc.placeholder)
+			}
+		})
+	}
+
+	t.Run("dedup keeps first-occurrence order", func(t *testing.T) {
+		spec := Spec{Args: []string{"${CUDA_DEVICES}"}, GPUs: []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}}
+		args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+		if err != nil {
+			t.Fatalf("ExpandPlaceholders: %v", err)
+		}
+		if args[0] != "CUDA3,CUDA2" {
+			t.Errorf("args[0] = %q, want CUDA3,CUDA2", args[0])
+		}
+	})
+
+	// A near-miss passes through literally, same rule as ${HOST_GPU_IDS}: these
+	// tokens are exact-match, and neither starts with PORT/AGENT_ENV.
+	for _, value := range []string{"${CUDA_DEVICE}", "${cuda_devices}", "${METAL_DEVICES_JSON}"} {
+		t.Run("passes through literally: "+value, func(t *testing.T) {
+			spec := Spec{Args: []string{value}, GPUs: []SpecGPU{{Index: 1}}}
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got: %v", value, err)
+			}
+			if args[0] != value {
+				t.Errorf("args[0] = %q, want the literal %q", args[0], value)
+			}
+		})
+	}
+}

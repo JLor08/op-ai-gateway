@@ -305,6 +305,26 @@ func hostGPUIDs(spec Spec) string {
 	return strings.Join(parts, ",")
 }
 
+// deviceList renders the ordered/deduped host indices (gpuIndices) as
+// backend-prefixed llama.cpp --device names -- "CUDA3,CUDA2" for prefix
+// "CUDA", "Vulkan3,Vulkan2" for "Vulkan", "MTL3,MTL2" for "MTL". It is the
+// value the ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholders
+// emit; the order and dedup are identical to hostGPUIDs, only the formatting
+// differs. Empty string when the spec declares no GPUs.
+//
+// CAVEAT (documented, not enforced): a backend enumerates its own devices
+// independently of the host's GPU index, so Vulkan2/MTL2 are not guaranteed to
+// be the same physical card as host index 2; the operator verifies with
+// --list-devices. CUDA with CUDA_VISIBLE_DEVICES unset matches the host order.
+func deviceList(spec Spec, prefix string) string {
+	indices := gpuIndices(spec)
+	parts := make([]string, len(indices))
+	for i, idx := range indices {
+		parts[i] = prefix + strconv.Itoa(idx)
+	}
+	return strings.Join(parts, ",")
+}
+
 // LocalPolicy is the agent-operator-controlled counterweight to the
 // gateway-supplied Spec. The gateway decides WHEN and HOW a process runs
 // (binary, args, env, work_dir); LocalPolicy, populated from the agent's OWN
@@ -862,6 +882,32 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 					return "", nil, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
 				}
 				b.WriteString(gpuIDs)
+				continue
+			}
+
+			// The three llama.cpp --device placeholders, exact-match siblings of
+			// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
+			// Same empty-list refusal, on the same reasoning (an empty --device
+			// list selects NO device, not every device).
+			if inner == "CUDA_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "CUDA"))
+				continue
+			}
+			if inner == "VULKAN_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "Vulkan"))
+				continue
+			}
+			if inner == "METAL_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "MTL"))
 				continue
 			}
 
