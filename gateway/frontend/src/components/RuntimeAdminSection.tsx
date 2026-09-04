@@ -346,6 +346,7 @@ type ReportSpec = {
   gpus: { index: number; vramMb: number }[];
   pinned: boolean;
   setVisibleDevices: boolean;
+  visibleDevicesMode: 'env' | 'args';
   idleTimeoutSeconds: number;
 };
 
@@ -398,6 +399,9 @@ function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): Repo
     gpus,
     pinned: value.pinned === true,
     setVisibleDevices: value.set_visible_devices === true,
+    // Absent or unrecognised defaults to "env" — the same default the backend
+    // and agent apply (see RuntimeSpecDTO.VisibleDevicesMode).
+    visibleDevicesMode: value.visible_devices_mode === 'args' ? 'args' : 'env',
     idleTimeoutSeconds:
       typeof value.idle_timeout_seconds === 'number' ? value.idle_timeout_seconds : 0,
   };
@@ -506,6 +510,40 @@ function formatGpus(gpus: RuntimeSpecGPU[]): string {
 
 function renderBoolChip(active: boolean, label: string) {
   return active ? <Chip size="small" variant="outlined" label={label} /> : '–';
+}
+
+// The GPU-assignment column collapses set_visible_devices + visible_devices_mode
+// into ONE value an operator can read at a glance: off, or the mechanism that
+// enforces it (arguments vs environment variable).
+type VisibilityValue = 'off' | 'args' | 'env';
+
+function visibilityValue(setVisible: boolean, mode: 'env' | 'args'): VisibilityValue {
+  if (!setVisible) return 'off';
+  return mode === 'args' ? 'args' : 'env';
+}
+
+function visibilityValueLabel(v: VisibilityValue, t: Translation): string {
+  switch (v) {
+    case 'off':
+      return t.runtimeSpecVisibleDevicesValueOff;
+    case 'args':
+      return t.runtimeSpecVisibleDevicesValueArgs;
+    default:
+      return t.runtimeSpecVisibleDevicesValueEnv;
+  }
+}
+
+// The two enforced states get an outlined chip; "off" is muted so a glance
+// separates "enforced (and how)" from "not enforced".
+function renderVisibilityChip(v: VisibilityValue, t: Translation) {
+  return (
+    <Chip
+      size="small"
+      variant="outlined"
+      label={visibilityValueLabel(v, t)}
+      sx={v === 'off' ? { color: 'text.secondary' } : undefined}
+    />
+  );
 }
 
 // One argument per line. Splitting on spaces would corrupt any argument that
@@ -2814,14 +2852,21 @@ export function RuntimeAdminSection({
       // what the admission arithmetic believes it gets.
       id: 'set_visible_devices',
       label: t.runtimeSpecSetVisibleDevices,
-      value: (m) => (specsById[m.id]?.set_visible_devices ? 'yes' : 'no'),
+      value: (m) =>
+        visibilityValue(
+          Boolean(specsById[m.id]?.set_visible_devices),
+          specsById[m.id]?.visible_devices_mode ?? 'env',
+        ),
       filter: 'enum',
       searchable: false,
-      enumLabel: (v) => (v === 'yes' ? t.runtimeSpecSetVisibleDevices : '–'),
+      enumLabel: (v) => visibilityValueLabel(v as VisibilityValue, t),
       render: (m) =>
-        renderBoolChip(
-          Boolean(specsById[m.id]?.set_visible_devices),
-          t.runtimeSpecSetVisibleDevices,
+        renderVisibilityChip(
+          visibilityValue(
+            Boolean(specsById[m.id]?.set_visible_devices),
+            specsById[m.id]?.visible_devices_mode ?? 'env',
+          ),
+          t,
         ),
     },
     {
@@ -3227,9 +3272,10 @@ export function RuntimeAdminSection({
       // operator sees what their hand-written file actually asked for.
       id: 'set_visible_devices',
       label: t.runtimeSpecSetVisibleDevices,
-      value: (s) => (s.setVisibleDevices ? 'yes' : 'no'),
+      value: (s) => visibilityValue(s.setVisibleDevices, s.visibleDevicesMode),
       searchable: false,
-      render: (s) => renderBoolChip(s.setVisibleDevices, t.runtimeSpecSetVisibleDevices),
+      render: (s) =>
+        renderVisibilityChip(visibilityValue(s.setVisibleDevices, s.visibleDevicesMode), t),
     },
     {
       id: 'idle_timeout',

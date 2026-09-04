@@ -703,6 +703,44 @@ describe('RuntimeAdminSection launch specs list', () => {
     expect(screen.getAllByText(t.runtimeSpecPinned).length).toBeGreaterThanOrEqual(2);
   });
 
+  it('reads the GPU-assignment column as off / arguments / environment variable per spec', async () => {
+    renderSection({
+      mappings: [
+        makeMapping({ id: 'map_off', gateway_model_name: 'gw-off' }),
+        makeMapping({ id: 'map_env', gateway_model_name: 'gw-env' }),
+        makeMapping({ id: 'map_args', gateway_model_name: 'gw-args' }),
+      ],
+      specsByMappingId: {
+        map_off: makeSpec({ configured: true, mapping_id: 'map_off', set_visible_devices: false }),
+        map_env: makeSpec({
+          configured: true,
+          mapping_id: 'map_env',
+          set_visible_devices: true,
+          visible_devices_mode: 'env',
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+        map_args: makeSpec({
+          configured: true,
+          mapping_id: 'map_args',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${CUDA_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+    });
+
+    await screen.findByText('gw-off');
+    // Each row shows the enforcement mechanism directly, not a bare on/off.
+    expect(inRowWith('gw-off').getByText(t.runtimeSpecVisibleDevicesValueOff)).toBeInTheDocument();
+    expect(inRowWith('gw-env').getByText(t.runtimeSpecVisibleDevicesValueEnv)).toBeInTheDocument();
+    expect(
+      inRowWith('gw-args').getByText(t.runtimeSpecVisibleDevicesValueArgs),
+    ).toBeInTheDocument();
+    // The column header carries the renamed label.
+    expect(screen.getAllByText(t.runtimeSpecSetVisibleDevices).length).toBeGreaterThanOrEqual(1);
+  });
+
   it('shows the timeout warning banner when the backend reports one', async () => {
     renderSection({ warnings: ['timeout_ms_below_startup_timeout'] });
     expect(await screen.findByText(t.runtimeTimeoutWarning)).toBeInTheDocument();
