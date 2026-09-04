@@ -11,6 +11,11 @@ import {
   FormControlLabel,
   IconButton,
   Tab,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
   Tabs,
   Tooltip,
   Typography,
@@ -1010,6 +1015,42 @@ function formatEnvText(env: Record<string, string>): string {
     .map(([k, v]) => `${k}=${v}`)
     .join('\n');
 }
+
+// The per-backend reference table (Task 15): the Env var name each of these
+// three model servers reads for its own API key, the equivalent --api-key
+// argument, and the client header the token then answers to. Shown whenever
+// api_token_mode !== 'off', regardless of which backend a spec actually
+// launches -- see the "IMPORTANT design resolution" note above the table's
+// render site for why this cannot be keyed off app.Type.
+const apiTokenBackendRows: {
+  key: string;
+  backendKey: MessageKey;
+  envKey: MessageKey;
+  argsKey: MessageKey;
+  clientKey: MessageKey;
+}[] = [
+  {
+    key: 'vllm',
+    backendKey: 'runtimeSpecApiTokenRowVllmBackend',
+    envKey: 'runtimeSpecApiTokenRowVllmEnv',
+    argsKey: 'runtimeSpecApiTokenRowVllmArgs',
+    clientKey: 'runtimeSpecApiTokenRowVllmClient',
+  },
+  {
+    key: 'llama-cpp',
+    backendKey: 'runtimeSpecApiTokenRowLlamaCppBackend',
+    envKey: 'runtimeSpecApiTokenRowLlamaCppEnv',
+    argsKey: 'runtimeSpecApiTokenRowLlamaCppArgs',
+    clientKey: 'runtimeSpecApiTokenRowLlamaCppClient',
+  },
+  {
+    key: 'tgi',
+    backendKey: 'runtimeSpecApiTokenRowTgiBackend',
+    envKey: 'runtimeSpecApiTokenRowTgiEnv',
+    argsKey: 'runtimeSpecApiTokenRowTgiArgs',
+    clientKey: 'runtimeSpecApiTokenRowTgiClient',
+  },
+];
 
 export function RuntimeAdminSection({
   t,
@@ -3463,6 +3504,20 @@ export function RuntimeAdminSection({
     const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
       a.includes('${METAL_DEVICES}'),
     );
+    // Task 15's OPTIONAL per-backend highlight, layered onto the general
+    // unsupported-backend note below. A runtime spec's application.type is
+    // ALWAYS 'server_agent' (that is what owns a runtime spec at all), so it
+    // carries no signal about which child model server this spec launches --
+    // the binary path is the only one available, and even that is used only
+    // to highlight a specific backend by name, never to gate the general note
+    // itself (see collectArgsWarnings-style live feedback elsewhere in this
+    // form for the same non-blocking-hint idiom).
+    const apiTokenBinaryLower = basename(binary).toLowerCase();
+    const apiTokenBackendHintKey: MessageKey | null = apiTokenBinaryLower.includes('ollama')
+      ? 'runtimeSpecApiTokenBackendBannerOllamaHint'
+      : apiTokenBinaryLower.includes('llama-swap') || apiTokenBinaryLower.includes('llama_swap')
+        ? 'runtimeSpecApiTokenBackendBannerLlamaSwapHint'
+        : null;
     const agentOs = hardware.data?.available && hardware.data.report ? hardware.data.report.os : '';
     const agentOsKnown = agentOs !== '';
     const isMacOsAgent = /darwin|mac ?os/i.test(agentOs);
@@ -3917,6 +3972,55 @@ export function RuntimeAdminSection({
                     )}
                   </Box>
                 )}
+              </Box>
+            )}
+
+            {/* Runtime-Spec API Token operator guidance (Task 15): the
+                per-backend variable table, the loud Args-leak warning, and the
+                structural unsupported-backend note. Shown whenever the mode is
+                not 'off' -- once there IS a token to wire up, the operator
+                needs to know how to hand it to the child process and where
+                that mechanism cannot be trusted. The banner is deliberately a
+                GENERAL note rather than a per-app.Type switch: a runtime spec
+                always belongs to a 'server_agent' application (that field
+                never distinguishes Ollama from vLLM from llama.cpp), and the
+                spec's `binary` path is the only signal at all -- used above
+                only for the optional per-backend highlight, never to gate
+                this block's visibility. */}
+            {apiTokenMode !== 'off' && (
+              <Box sx={{ display: 'grid', gap: 1 }}>
+                <Alert severity="info">{t.runtimeSpecApiTokenBackendHint}</Alert>
+                <Table size="small" sx={{ maxWidth: 640 }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>{t.runtimeSpecApiTokenTableBackend}</TableCell>
+                      <TableCell>{t.runtimeSpecApiTokenTableEnv}</TableCell>
+                      <TableCell>{t.runtimeSpecApiTokenTableArgs}</TableCell>
+                      <TableCell>{t.runtimeSpecApiTokenTableClient}</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {apiTokenBackendRows.map((row) => (
+                      <TableRow key={row.key}>
+                        <TableCell>{t[row.backendKey]}</TableCell>
+                        <TableCell>
+                          <code>{t[row.envKey]}</code>
+                        </TableCell>
+                        <TableCell>
+                          <code>{t[row.argsKey]}</code> {t.runtimeSpecApiTokenArgsReadableMark}
+                        </TableCell>
+                        <TableCell>{t[row.clientKey]}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                {argsText.includes('${API_TOKEN}') && (
+                  <Alert severity="warning">{t.runtimeSpecApiTokenArgsLeakWarning}</Alert>
+                )}
+                <Alert severity="warning">
+                  {t.runtimeSpecApiTokenBackendBanner}
+                  {apiTokenBackendHintKey && <> {t[apiTokenBackendHintKey]}</>}
+                </Alert>
               </Box>
             )}
 

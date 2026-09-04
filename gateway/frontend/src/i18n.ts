@@ -637,6 +637,36 @@ const de = {
     'Leer = Authorization: Bearer; sonst der Header-Name (z. B. x-api-key).',
   runtimeSpecApiTokenHeaderMismatchWarning:
     'Der eigene Header muss exakt dem entsprechen, was das Backend erwartet — bei einem Backend, das nur „Authorization: Bearer“ akzeptiert, bleibt diese Zuordnung sonst effektiv unauthentifiziert.',
+  // Runtime-Spec API Token operator guidance (Task 15): the per-backend
+  // variable table + the Args-leak warning + the structural
+  // unsupported-backend note. Shown whenever the mode is not 'off'.
+  runtimeSpecApiTokenBackendHint:
+    'Referenziere den Token in der Modellserver-Konfiguration als „${API_TOKEN}“ — bevorzugt in Env, alternativ in Args (siehe Tabelle):',
+  runtimeSpecApiTokenTableBackend: 'Backend',
+  runtimeSpecApiTokenTableEnv: 'Env',
+  runtimeSpecApiTokenTableArgs: 'Args',
+  runtimeSpecApiTokenTableClient: 'Client-Header',
+  runtimeSpecApiTokenArgsReadableMark: '⚠ auslesbar',
+  runtimeSpecApiTokenRowVllmBackend: 'vLLM',
+  runtimeSpecApiTokenRowVllmEnv: 'VLLM_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowVllmArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowVllmClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowLlamaCppBackend: 'llama.cpp (`llama-server`)',
+  runtimeSpecApiTokenRowLlamaCppEnv: 'LLAMA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowLlamaCppArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowLlamaCppClient: 'Authorization: Bearer (oder X-Api-Key)',
+  runtimeSpecApiTokenRowTgiBackend: 'TGI (HF)',
+  runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenArgsLeakWarning:
+    'Der Token steht damit als Klartext in der Prozessliste (ps aux, /proc/<pid>/cmdline) und unter Umständen in den Startprotokollen des Modellservers selbst — verwende stattdessen die Umgebungsvariable (Env).',
+  runtimeSpecApiTokenBackendBanner:
+    'Nicht jeder Modellserver erzwingt einen eingehenden Token: Ollama hat keine native Authentifizierung, LM Studio nur einen GUI-Schalter, llama-swap nur „apiKeys“ in seiner YAML. Für diese Backends sichert dieser Token nichts — stelle sicher, dass dein Modellserver den Token tatsächlich prüft.',
+  runtimeSpecApiTokenBackendBannerOllamaHint:
+    'Diese Spec startet vermutlich Ollama (laut Programmpfad) — siehe Hinweis oben.',
+  runtimeSpecApiTokenBackendBannerLlamaSwapHint:
+    'Diese Spec startet vermutlich llama-swap (laut Programmpfad) — siehe Hinweis oben.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
   // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
@@ -2765,6 +2795,36 @@ const en: PortalMessages = {
     'Empty = Authorization: Bearer; otherwise the header name (e.g. x-api-key).',
   runtimeSpecApiTokenHeaderMismatchWarning:
     'A custom header must match exactly what the backend expects — against a backend that only accepts "Authorization: Bearer", this mapping is otherwise left effectively unauthenticated.',
+  // Runtime-Spec API Token operator guidance (Task 15): the per-backend
+  // variable table + the Args-leak warning + the structural
+  // unsupported-backend note. Shown whenever the mode is not 'off'.
+  runtimeSpecApiTokenBackendHint:
+    'Reference the token in the model server configuration as "${API_TOKEN}" — preferably in Env, alternatively in Args (see table):',
+  runtimeSpecApiTokenTableBackend: 'Backend',
+  runtimeSpecApiTokenTableEnv: 'Env',
+  runtimeSpecApiTokenTableArgs: 'Args',
+  runtimeSpecApiTokenTableClient: 'Client header',
+  runtimeSpecApiTokenArgsReadableMark: '⚠ readable',
+  runtimeSpecApiTokenRowVllmBackend: 'vLLM',
+  runtimeSpecApiTokenRowVllmEnv: 'VLLM_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowVllmArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowVllmClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowLlamaCppBackend: 'llama.cpp (`llama-server`)',
+  runtimeSpecApiTokenRowLlamaCppEnv: 'LLAMA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowLlamaCppArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowLlamaCppClient: 'Authorization: Bearer (or X-Api-Key)',
+  runtimeSpecApiTokenRowTgiBackend: 'TGI (HF)',
+  runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenArgsLeakWarning:
+    "This puts the token in plaintext in the process listing (ps aux, /proc/<pid>/cmdline) and possibly in the model server's own startup logs — use the environment variable (Env) instead.",
+  runtimeSpecApiTokenBackendBanner:
+    'Not every model server enforces an incoming token: Ollama has no native authentication, LM Studio only a GUI toggle, llama-swap only "apiKeys" in its YAML. For these backends this token secures nothing — make sure your model server actually checks the token.',
+  runtimeSpecApiTokenBackendBannerOllamaHint:
+    'This spec looks like it launches Ollama (based on the binary path) — see the note above.',
+  runtimeSpecApiTokenBackendBannerLlamaSwapHint:
+    'This spec looks like it launches llama-swap (based on the binary path) — see the note above.',
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
   runtimeSpecVramApply: 'Apply',

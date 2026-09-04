@@ -6177,3 +6177,70 @@ describe('RuntimeAdminSection API-token header source (Task 14)', () => {
     expect(screen.queryByLabelText(t.runtimeSpecApiTokenHeaderLabel)).not.toBeInTheDocument();
   });
 });
+
+describe('RuntimeAdminSection API-token backend hints (Task 15)', () => {
+  it('shows the per-backend variable table whenever mode is not "off"', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenBackendHint)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowVllmEnv)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowLlamaCppEnv)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowTgiEnv)).toBeInTheDocument();
+    // Args column is marked readable -- the whole point of the warning below.
+    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark).length).toBe(3);
+  });
+
+  it('shows the loud Args-leak warning only while ${API_TOKEN} sits in the Args field', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--api-key\n${API_TOKEN}' },
+    });
+    expect(await screen.findByText(t.runtimeSpecApiTokenArgsLeakWarning)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--api-key\nsome-other-value' },
+    });
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+  });
+
+  it('shows the structural unsupported-backend note whenever mode is not "off" -- a general note, not keyed off app.Type', async () => {
+    // A runtime spec's application is always 'server_agent' -- that field
+    // carries no signal about the child model server -- so this note must
+    // render regardless, unlike a per-app.Type switch would.
+    await openApiTokenSpecEdit({ api_token_mode: 'random' });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenBackendBanner)).toBeInTheDocument();
+  });
+
+  it('additionally highlights Ollama by name when the binary path names it', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', binary: '/usr/local/bin/ollama' });
+
+    expect(
+      screen.getByText(t.runtimeSpecApiTokenBackendBannerOllamaHint, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('additionally highlights llama-swap by name when the binary path names it', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', binary: '/opt/bin/llama-swap' });
+
+    expect(
+      screen.getByText(t.runtimeSpecApiTokenBackendBannerLlamaSwapHint, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('hides the hint table, the Args warning, and the backend note when mode is "off"', async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'off',
+      // Args carries the leak trigger too, to prove the whole block -- not
+      // just the mode-gated bits above it -- is gone under "off".
+      args: ['--api-key', '${API_TOKEN}'],
+    });
+
+    expect(screen.queryByText(t.runtimeSpecApiTokenBackendHint)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenRowVllmEnv)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenBackendBanner)).not.toBeInTheDocument();
+  });
+});
