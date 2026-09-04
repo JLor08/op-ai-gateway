@@ -915,6 +915,28 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 				continue
 			}
 
+			// EXACT match only, like ${MODEL}/${*_DEVICES}: a near-miss such as
+			// ${API_TOKENS} is NOT resolved and passes through as literal text
+			// (it does not join the PORT/AGENT_ENV near-miss guard below).
+			// Unlike those clear-text siblings, ${API_TOKEN} carries a SECRET --
+			// the decrypted per-mapping upstream token the gateway pushed on the
+			// wire in spec.APIToken -- so it records its OWN secret span here,
+			// exactly the way ${AGENT_ENV:NAME} does, so maskSecretSpans scrubs
+			// it from the reported command wherever it landed. This is NOT the
+			// AGENT_ENV branch: that reads the agent's OWN environment via
+			// getenv; this reads a wire field, and the two must not be folded.
+			// An empty spec.APIToken (mode off, app-unset, or a fail-closed
+			// decrypt) is a HARD ERROR -- never a silent empty substitution.
+			if inner == "API_TOKEN" {
+				if spec.APIToken == "" {
+					return "", nil, fmt.Errorf("${API_TOKEN} cannot be resolved: no api_token was provided for this spec (mode off, app-unset, or a fail-closed decrypt)")
+				}
+				start := b.Len()
+				b.WriteString(spec.APIToken)
+				spans = append(spans, secretSpan{start: start, end: b.Len(), name: "API_TOKEN"})
+				continue
+			}
+
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
 				// CASE-INSENSITIVE, and that is a security property, not a
 				// nicety (S1). The refusal decides whether a

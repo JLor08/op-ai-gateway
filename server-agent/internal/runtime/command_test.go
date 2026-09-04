@@ -434,3 +434,132 @@ func TestExpandSpecKeepsTheChildsRealValues(t *testing.T) {
 		t.Errorf("env HF_TOKEN = %q, want the REAL secret", v)
 	}
 }
+
+// TestExpandPlaceholdersAPITokenResolvesInAnEnvValue proves ${API_TOKEN}
+// resolves from the WIRE field spec.APIToken (the decrypted per-mapping token
+// the gateway pushed), unlike ${AGENT_ENV:NAME} which reads the agent's own
+// process environment. The child must receive the real token.
+func TestExpandPlaceholdersAPITokenResolvesInAnEnvValue(t *testing.T) {
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Env:      map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APIToken: "tok-abc",
+	}
+	_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	if v, ok := envValue(env, "VLLM_API_KEY"); !ok || v != "tok-abc" {
+		t.Errorf("VLLM_API_KEY = %q (present=%v), want the resolved token tok-abc", v, ok)
+	}
+}
+
+// TestResolvedCommandMasksAPITokenInAnEnvValue: the resolved token must never
+// surface in the reported command. ${API_TOKEN} records its OWN secret span, so
+// the reported env value carries no trace of tok-abc and Masked is set.
+func TestResolvedCommandMasksAPITokenInAnEnvValue(t *testing.T) {
+	const secret = "tok-abc"
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Args:     []string{},
+		Env:      map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APIToken: secret,
+	}
+	cmd := commandFor(t, spec, 8081, GPUVendorNone, func(string) string { return "" }, false)
+
+	v, ok := envValue(cmd.Env, "VLLM_API_KEY")
+	if !ok {
+		t.Fatalf("env = %v, want the VLLM_API_KEY key to survive masking", cmd.Env)
+	}
+	if strings.Contains(v, secret) {
+		t.Fatalf("VLLM_API_KEY = %q carries the resolved api token -- it must be masked in the reported command", v)
+	}
+	if !cmd.Masked {
+		t.Error("Masked = false although an env value was resolved from ${API_TOKEN}")
+	}
+}
+
+// TestExpandPlaceholdersAPITokenResolvesInAnArgument: ${API_TOKEN} resolves in
+// args exactly as it does in env -- the child receives the real token.
+func TestExpandPlaceholdersAPITokenResolvesInAnArgument(t *testing.T) {
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Args:     []string{"--api-key", "${API_TOKEN}"},
+		APIToken: "tok-abc",
+	}
+	args, _, err := ExpandPlaceholders(spec, 8081, GPUVendorNone, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	if len(args) != 2 || args[0] != "--api-key" || args[1] != "tok-abc" {
+		t.Errorf("args = %q, want [--api-key tok-abc]", args)
+	}
+}
+
+// TestResolvedCommandMasksAPITokenInAnArgument: an api token in an ARGUMENT must
+// be masked in the reported command too, exactly as ${AGENT_ENV:NAME} is.
+func TestResolvedCommandMasksAPITokenInAnArgument(t *testing.T) {
+	const secret = "tok-abc"
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Args:     []string{"--api-key", "${API_TOKEN}", "--port", "${PORT}"},
+		Env:      map[string]string{},
+		APIToken: secret,
+	}
+	cmd := commandFor(t, spec, 8081, GPUVendorNone, func(string) string { return "" }, false)
+
+	got := joinArgs(cmd.Args)
+	if strings.Contains(got, secret) {
+		t.Fatalf("args = %q carry the resolved api token -- a token in an ARGUMENT must be masked too", got)
+	}
+	if !strings.Contains(got, "--port 8081") {
+		t.Errorf("args = %q, want the resolved port still visible beside the mask", got)
+	}
+	if !cmd.Masked {
+		t.Error("Masked = false although an argument was resolved from ${API_TOKEN}")
+	}
+}
+
+// TestExpandPlaceholdersAPITokenEmptyErrors: a ${API_TOKEN} present with an
+// empty spec.APIToken (mode off, app-unset, or a fail-closed decrypt) is a HARD
+// ERROR, never a silent empty substitution -- the same unresolved-placeholder
+// class as an empty ${MODEL} or an unset ${AGENT_ENV:NAME}.
+func TestExpandPlaceholdersAPITokenEmptyErrors(t *testing.T) {
+	for _, spec := range []Spec{
+		{Args: []string{"--api-key", "${API_TOKEN}"}},
+		{Env: map[string]string{"VLLM_API_KEY": "${API_TOKEN}"}},
+	} {
+		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" })
+		if err == nil {
+			t.Fatalf("ExpandPlaceholders(%+v) with an empty APIToken should refuse, not substitute an empty string", spec)
+		}
+		if !strings.Contains(err.Error(), "api_token") {
+			t.Errorf("error = %q, want it to name api_token so the operator knows which field is empty", err.Error())
+		}
+	}
+}
+
+// TestExpandSpecNoAPITokenRecordsNoSpan: a spec that never writes ${API_TOKEN}
+// injects the token nowhere, so there is nothing to mask even when the wire
+// carried a non-empty APIToken. A false span would tell an operator a value was
+// withheld when none was.
+func TestExpandSpecNoAPITokenRecordsNoSpan(t *testing.T) {
+	spec := Spec{
+		Binary:   "/opt/vllm/vllm",
+		Args:     []string{"--port", "${PORT}"},
+		Env:      map[string]string{"MODE": "solo"},
+		APIToken: "tok-abc",
+	}
+	cmd := commandFor(t, spec, 8080, GPUVendorNone, func(string) string { return "" }, false)
+	if cmd.Masked {
+		t.Error("Masked = true although nothing in this spec came from ${API_TOKEN}")
+	}
+	if strings.Contains(joinArgs(cmd.Args), "tok-abc") {
+		t.Errorf("args = %q carry the api token although no ${API_TOKEN} placeholder was written", joinArgs(cmd.Args))
+	}
+	for _, e := range cmd.Env {
+		if strings.Contains(e, "tok-abc") {
+			t.Errorf("env entry %q carries the api token although no ${API_TOKEN} placeholder was written", e)
+		}
+	}
+}

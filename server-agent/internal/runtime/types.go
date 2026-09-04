@@ -69,6 +69,12 @@ type Spec struct {
 	// never sends this field produces.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
 	AdminState         string `json:"admin_state"` // "" | "force_running" | "force_stopped"
+	// APIToken is the DECRYPTED upstream token the gateway resolved for this
+	// spec's api_token_mode (empty for off / app-unset). The agent substitutes
+	// it wherever the operator wrote ${API_TOKEN} in Env/Args, and masks it in
+	// the reported command. Never persisted by the agent; redacted in file-mode
+	// reports (report.go).
+	APIToken string `json:"api_token"`
 }
 
 // VisibleDevicesMode wire values. The agent distinguishes only "args" from
