@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -751,9 +752,14 @@ func TestFileSourceAccessFailureLogsOnTheEdgeOnly(t *testing.T) {
 // specific line was emitted. Guarded by a mutex because a Manager owner
 // goroutine from an unrelated test may still be logging while this handler is
 // installed as the default.
+// text accumulates every record's message plus its attrs' key=value pairs,
+// used only by containsText below (the I2 secret-leak guard): a plain
+// message-count map cannot tell a caller whether some attr smuggled a value
+// the message text itself never mentions.
 type countingHandler struct {
 	mu     sync.Mutex
 	counts map[string]int
+	text   strings.Builder
 }
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -765,6 +771,15 @@ func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
 		h.counts = make(map[string]int)
 	}
 	h.counts[r.Message]++
+	h.text.WriteString(r.Message)
+	h.text.WriteByte('\n')
+	r.Attrs(func(a slog.Attr) bool {
+		h.text.WriteString(a.Key)
+		h.text.WriteByte('=')
+		h.text.WriteString(a.Value.String())
+		h.text.WriteByte('\n')
+		return true
+	})
 	return nil
 }
 
@@ -775,6 +790,16 @@ func (h *countingHandler) count(msg string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.counts[msg]
+}
+
+// containsText reports whether substr appears anywhere across every record
+// handled so far -- messages and attr values alike. Used by the I2 tests to
+// prove a token value never reaches the log, not merely that it is absent
+// from one specific message string.
+func (h *countingHandler) containsText(substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return strings.Contains(h.text.String(), substr)
 }
 
 // withCountedLogs installs a countingHandler as the default slog handler for
@@ -917,5 +942,103 @@ func TestGatewaySource304AlsoClearsTheMissingLatch(t *testing.T) {
 	}
 	if got := h.count(runtimeConfigMissingLogMsg); got != 2 {
 		t.Fatalf("missing-endpoint line logged %d times after a 304 reset and a fresh 404, want 2 -- a 304 must clear the latch just like a 200", got)
+	}
+}
+
+// configJSONWithSpecToken is minimalConfigJSON's sibling for the I2
+// insecure-token-transport tests below: the smallest valid document that
+// carries exactly one spec, with a caller-chosen (possibly empty) APIToken.
+// An empty apiToken produces a token-FREE spec, not an absent one -- test (c)
+// below relies on that to prove a real spec with nothing in api_token does
+// not itself trip the warning.
+func configJSONWithSpecToken(routerListen int, etag, specID, apiToken string) string {
+	return `{"router_listen":` + strconv.Itoa(routerListen) + `,"max_processes":1,"gpu_budgets":[],` +
+		`"specs":[{"id":"` + specID + `","api_token":"` + apiToken + `"}],"coresident":[],"etag":"` + etag + `"}`
+}
+
+// runtimeConfigInsecureTokenLogMsg is warnInsecureTokenOnce's exact message.
+// Duplicated here on purpose, exactly like runtimeConfigMissingLogMsg above:
+// a loosely-matched assertion would keep passing if the dedup broke, or if
+// some unrelated WARN line started appearing instead.
+const runtimeConfigInsecureTokenLogMsg = "runtime: applying a runtime config that carries an API token over a non-https gateway URL; the token will cross the gateway<->agent channel in clear -- configure an https gateway URL"
+
+// TestGatewaySourceWarnsOnceForTokenOverInsecureBase is I2 (security review):
+// design §9 requires that any non-off token mode "requires or at minimum
+// LOUDLY WARNS for an https gateway URL". The agent is the only party that
+// reliably knows its own configured gateway scheme, so the warning lives
+// here. ApplyPushed is the easiest way to drive "a freshly-parsed config
+// becomes the applied desired state" without a real HTTP round trip; Load's
+// own http.StatusOK path shares the exact same helper (checkInsecureToken),
+// so this is not testing a code path Load skips.
+//
+// The assertion is an EXACTLY-once claim across TWO applies, for the same
+// reason TestGatewaySource404LogsExactlyOncePerStreak insists on it: an
+// at-least-once assertion cannot distinguish a correct once-per-source guard
+// from a per-apply line that would spam a log every time the gateway
+// re-pushes the same (or a new) token-bearing document.
+func TestGatewaySourceWarnsOnceForTokenOverInsecureBase(t *testing.T) {
+	h := withCountedLogs(t)
+	s := NewGatewaySource("http://127.0.0.1:1", "tok", nil, "")
+
+	raw := []byte(configJSONWithSpecToken(9200, "e1", "spec-1", "upstream-secret-token"))
+	if _, _, err := s.ApplyPushed(raw); err != nil {
+		t.Fatalf("first ApplyPushed: %v", err)
+	}
+	if got := h.count(runtimeConfigInsecureTokenLogMsg); got != 1 {
+		t.Fatalf("insecure-token line logged %d times after the first apply, want 1", got)
+	}
+
+	// A second apply of a (here, identical) token-bearing config over the
+	// SAME http:// source must not log again -- once per source lifetime.
+	raw2 := []byte(configJSONWithSpecToken(9200, "e2", "spec-1", "upstream-secret-token"))
+	if _, _, err := s.ApplyPushed(raw2); err != nil {
+		t.Fatalf("second ApplyPushed: %v", err)
+	}
+	if got := h.count(runtimeConfigInsecureTokenLogMsg); got != 1 {
+		t.Fatalf("insecure-token line logged %d times after a second apply, want 1 (once per source lifetime)", got)
+	}
+
+	// The token value itself must never appear in ANY logged record -- not
+	// just the one line under test. A future edit that adds an unrelated Warn
+	// carrying "attrs" with the raw config would otherwise slip a secret into
+	// the log silently.
+	if h.containsText("upstream-secret-token") {
+		t.Fatal("a log record contains the raw API token value; the warning (or something else) is leaking the secret")
+	}
+}
+
+// TestGatewaySourceHTTPSBaseNeverWarnsAboutToken proves the https:// half of
+// the classification: the SAME token-bearing document applied over a
+// https:// source must never trip the warning, however many times it is
+// applied.
+func TestGatewaySourceHTTPSBaseNeverWarnsAboutToken(t *testing.T) {
+	h := withCountedLogs(t)
+	s := NewGatewaySource("https://gateway.example:8443", "tok", nil, "")
+
+	raw := []byte(configJSONWithSpecToken(9300, "e1", "spec-1", "upstream-secret-token"))
+	if _, _, err := s.ApplyPushed(raw); err != nil {
+		t.Fatalf("ApplyPushed: %v", err)
+	}
+	if got := h.count(runtimeConfigInsecureTokenLogMsg); got != 0 {
+		t.Fatalf("insecure-token line logged %d times over an https:// base, want 0", got)
+	}
+}
+
+// TestGatewaySourceHTTPBaseWithoutTokenNeverWarns proves the other half of
+// the classification: an http:// base is not itself the trigger -- only an
+// http:// base carrying a config with a non-empty spec.APIToken is. A
+// token-free config (every spec's api_token is "" or absent) must never
+// trip the warning, since there is nothing crossing the wire in clear for
+// this feature to warn about.
+func TestGatewaySourceHTTPBaseWithoutTokenNeverWarns(t *testing.T) {
+	h := withCountedLogs(t)
+	s := NewGatewaySource("http://127.0.0.1:1", "tok", nil, "")
+
+	raw := []byte(configJSONWithSpecToken(9400, "e1", "spec-1", ""))
+	if _, _, err := s.ApplyPushed(raw); err != nil {
+		t.Fatalf("ApplyPushed: %v", err)
+	}
+	if got := h.count(runtimeConfigInsecureTokenLogMsg); got != 0 {
+		t.Fatalf("insecure-token line logged %d times for a token-free config over http://, want 0", got)
 	}
 }

@@ -532,8 +532,20 @@ the configured gateway URL is `https`; the agent accepts an `http://` URL
 without complaint, and on that transport the pushed token — like the agent's
 own bearer credential today — travels in clear. Any mode other than `off`
 therefore depends on an operator-supplied `https` gateway URL for
-confidentiality in transit; nothing in the shipped code currently refuses or
-warns about an `http` one for this feature specifically ([§13](#13-known-limitations-and-accepted-risks)).
+confidentiality in transit; nothing refuses an `http://` one. The AGENT is
+the only party that reliably knows its own configured gateway URL scheme
+(`portal.Service` does not hold the gateway's own public URL, so it cannot
+make this call at all), so it is the agent, not the portal, that loudly warns:
+`GatewaySource` (`server-agent/internal/runtime/config_client.go`) logs a
+single WARN, once per running agent process, the first time it applies a
+runtime config — fetched or WS-pushed, whichever comes first — whose base
+gateway URL it can confidently classify as `http://` (not `https://`; a base
+with no scheme, or anything else, is left unclassified rather than guessed
+at) AND that carries a non-empty per-spec `api_token`. The line never
+includes the token value, only the fact of the insecure scheme. This is a
+**log warning, not enforcement** — it does not refuse the config, does not
+downgrade the mode, and has no portal-visible counterpart; an operator still
+has to be reading the agent's own log to see it.
 
 **Argument-list placement is allowed, not blocked, and costs real
 protection.** All three backends in the operator hint table accept the key
@@ -4483,14 +4495,6 @@ operator meets first:
   structural, not a bug: the portal warns generally (§3.2), because a
   `server_agent` runtime spec carries no field naming which child backend it
   launches, so there is nothing to gate a backend-specific refusal on.
-- **The https-on-the-wire requirement for a non-`off` token mode is stated,
-  not enforced.** The decrypted token travels the gateway→agent channel in
-  clear whenever the configured gateway URL is `http://`, exactly as the
-  agent's own bearer credential already does — nothing shipped adds a
-  server-side guard (`portal.Service` does not hold the gateway's own public
-  URL) or a portal-side warning for this feature specifically. An operator
-  running any agent over plaintext is depending on network-layer protection
-  (a private network, a mesh) that this feature does not itself verify.
 - **`runtime_api_token`'s capability flag has no consumer yet.** Unlike
   `gpu_selection`, which drives a non-blocking "agent too old" advisory
   ([§7](#7-feature-negotiation)), nothing on the gateway or portal side reads
