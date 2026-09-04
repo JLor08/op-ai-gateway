@@ -103,6 +103,7 @@ var migrations = []migration{
 	{version: 70, name: "application_proxy_excluded", up: migration70Up},
 	{version: 71, name: "model_mapping_benchmarks_vram_json", up: migration71Up},
 	{version: 72, name: "application_endpoint_modes", up: migration72Up},
+	{version: 73, name: "runtime_spec_gpu_position_and_visible_devices_mode", up: migration73Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3191,4 +3192,46 @@ func migration72Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 			join applications a on a.id = m.application_id
 			where m.id = agent_runtime_specs.mapping_id), messages_mode)
 		where responses_mode = '' or messages_mode = ''`)
+}
+
+// migration73Up adds two additive columns that ship together with the
+// GPU-selection feature:
+//   - agent_runtime_spec_gpus.position: the operator-chosen GPU order. Backfilled
+//     to the ascending-gpu_index rank per spec, so NO existing spec's env var /
+//     ${…} placeholder order changes on upgrade — the order only moves when an
+//     operator actively reorders (design §3.4).
+//   - agent_runtime_specs.visible_devices_mode: the env/args visibility mechanism
+//     (design §4.1), default 'env' = today's behaviour. [OWNED BY AREA B.]
+//
+// Append-only: it does NOT touch migration65Up's create-table or the v60-frozen
+// baseline (a fresh install replays this; the backfill is a no-op on empty
+// tables). It ABORTS the boot on failure (deterministic writes, no possibly-dirty
+// pre-check), following migration70Up/72Up rather than migration68Up's skip.
+//
+// Backfill portability: `position = (count of same-spec rows with a smaller
+// gpu_index)` is a correlated subquery identical on sqlite (modernc) and
+// postgres, mirroring migration72Up's choice of correlated subqueries over
+// UPDATE…FROM for cross-driver parity. It reads only gpu_index (never the column
+// being written), so update order cannot perturb the counts.
+func migration73Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	// --- GPU order (this area) ---
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_spec_gpus",
+		"position integer not null default 0"); err != nil {
+		return err
+	}
+	if err := execTx(ctx, tx, dl, `update agent_runtime_spec_gpus
+		set position = (
+			select count(*) from agent_runtime_spec_gpus g2
+			where g2.spec_id = agent_runtime_spec_gpus.spec_id
+			  and g2.gpu_index < agent_runtime_spec_gpus.gpu_index
+		)`); err != nil {
+		return err
+	}
+
+	// --- Visibility mechanism (AREA B — added by that task, shown for context) ---
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"visible_devices_mode text not null default 'env'"); err != nil {
+		return err
+	}
+	return nil
 }

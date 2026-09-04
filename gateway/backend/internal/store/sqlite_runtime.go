@@ -159,8 +159,8 @@ func (s *SQLiteStore) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpu
 	}
 	for _, g := range gpus {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into agent_runtime_spec_gpus (spec_id, gpu_index, vram_estimate_mb, vram_measured_mb)
-			values (?, ?, ?, ?)`), specID, g.GPUIndex, g.VRAMEstimateMB, g.VRAMMeasuredMB); err != nil {
+			insert into agent_runtime_spec_gpus (spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position)
+			values (?, ?, ?, ?, ?)`), specID, g.GPUIndex, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.Position); err != nil {
 			// A duplicate GPUIndex within gpus hits the composite primary key
 			// (spec_id, gpu_index) here — a unique violation, not an FK
 			// violation (specID was already existence-checked above, and a
@@ -178,8 +178,8 @@ func (s *SQLiteStore) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpu
 
 func (s *SQLiteStore) RuntimeSpecGPUs(ctx context.Context, specID string) ([]routing.RuntimeSpecGPU, error) {
 	rows, err := s.query(ctx, `
-		select spec_id, gpu_index, vram_estimate_mb, vram_measured_mb
-		from agent_runtime_spec_gpus where spec_id = ? order by gpu_index`, specID)
+		select spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position
+		from agent_runtime_spec_gpus where spec_id = ? order by position, gpu_index`, specID)
 	if err != nil {
 		return nil, fmt.Errorf("list spec gpus: %w", err)
 	}
@@ -187,7 +187,7 @@ func (s *SQLiteStore) RuntimeSpecGPUs(ctx context.Context, specID string) ([]rou
 	out := make([]routing.RuntimeSpecGPU, 0)
 	for rows.Next() {
 		var g routing.RuntimeSpecGPU
-		if err := rows.Scan(&g.SpecID, &g.GPUIndex, &g.VRAMEstimateMB, &g.VRAMMeasuredMB); err != nil {
+		if err := rows.Scan(&g.SpecID, &g.GPUIndex, &g.VRAMEstimateMB, &g.VRAMMeasuredMB, &g.Position); err != nil {
 			return nil, fmt.Errorf("scan spec gpu: %w", err)
 		}
 		out = append(out, g)
