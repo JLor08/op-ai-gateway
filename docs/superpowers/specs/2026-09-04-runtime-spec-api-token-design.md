@@ -90,9 +90,18 @@ New columns on `agent_runtime_specs` (migration **74**, additive, append-only):
 - `api_token text not null default ''` — the **sealed** token (`SealSecret`
   envelope: `enc:…` / `plain:…`), used only by `set` and `random`. Empty for
   `off` and `app`.
+- `api_token_header text not null default ''` — the **transmission header** the
+  gateway uses to send the token, mirroring `Application.APITokenHeader`. Empty ⇒
+  `Authorization: Bearer <token>`; a value sends the raw token under that header
+  name (e.g. `X-Api-Key`). Used by `set`/`random`; `app` mode inherits
+  `Application.APITokenHeader`. **The header must match what the backend expects**
+  (vLLM: `Bearer` only; llama.cpp: `Bearer` or `X-Api-Key`) — a mismatch leaves
+  the child effectively unauthenticated, so the portal hint (§7) states this and
+  validation checks the header *shape* (§6).
 
-`routing.RuntimeSpec` gains `APITokenMode string` and `APIToken string` (the
-sealed value; routing never decrypts it, mirroring `Application.APIToken`).
+`routing.RuntimeSpec` gains `APITokenMode string`, `APIToken string` (the sealed
+value; routing never decrypts it, mirroring `Application.APIToken`), and
+`APITokenHeader string`.
 
 Type `routing.RuntimeAPITokenMode` (`"off"|"set"|"random"|"app"`) with consts, in
 a new small file (mirrors `visible_devices_mode.go`).
@@ -139,8 +148,8 @@ encrypted, authenticated agent channel.)
 **(b) Authenticate on each request (so the child accepts).** The gateway resolves
 the **per-mapping** token into `routing.Target` in `resolver.go` `targetFrom`
 (which already loads the spec for `server_agent` apps):
-- `set`/`random` → `Target.APIToken = spec.APIToken` (sealed), `APITokenHeader =
-  ""` (Bearer).
+- `set`/`random` → `Target.APIToken = spec.APIToken` (sealed), `Target.APITokenHeader
+  = spec.APITokenHeader` (empty ⇒ Bearer, the default).
 - `app` → leave the existing `Target.APIToken = app.APIToken`, `APITokenHeader =
   app.APITokenHeader` (today's behaviour — nothing to change).
 - `off` → today's behaviour (app token or none).
@@ -167,6 +176,9 @@ Mirroring the `${..._DEVICES}` rules; new 400 error codes:
   mode = off (a placeholder that resolves to nothing).
 - `runtime_spec.api_token_app_unset` — mode = app but the application has no
   `APIToken` set (`app.APIToken == ""`), i.e. nothing to reuse.
+- `runtime_spec.api_token_header_invalid` — `api_token_header` is not a valid
+  header-name shape (reuse the application's `checkHeaderName` rule: token chars,
+  no colon/space). Empty is valid (⇒ Bearer, the default).
 - `set` mode with a new token value on a **disk store without a cipher** →
   surface `capture.ErrKeyRequired` as a 400 before persisting (mirror
   `service_applications.go`).
@@ -180,11 +192,17 @@ Write-only semantics (mirror `app.APIToken`):
   base64url) when the operator selects `random` (or hits Rotate); it is sealed and
   stored, never shown.
 
-**App-token header edge:** in `app` mode, if `app.APITokenHeader` is a non-empty
-custom header, the gateway sends the token under that header, but a child that
-speaks OpenAI-style (vLLM etc.) expects `Authorization: Bearer`. This is a
-pre-existing app-config concern; the portal shows an inline warning in `app` mode
-when a custom header is set. Not a hard error.
+**Header ↔ backend coupling (general):** the transmission header — `spec.APITokenHeader`
+for set/random, `app.APITokenHeader` for app — decides how the gateway *sends* the
+token; the child requires it in the header *it* expects. Default (empty ⇒ Bearer)
+is correct for vLLM/llama.cpp/TGI. A non-empty custom header only works for a
+backend that accepts it (e.g. llama.cpp's `X-Api-Key`); against a Bearer-only
+backend it leaves the child effectively unauthenticated. The portal states this in
+the hint and shows an inline warning when a non-empty header is combined with a
+mode whose token is actually injected. The header *shape* is validated
+(`api_token_header_invalid`); the header↔backend *match* is the operator's
+responsibility (hinted, not hard-enforced — the gateway cannot know the child's
+expectation).
 
 ---
 
@@ -197,8 +215,11 @@ A small **"API-Token (Upstream-Absicherung)"** section on the runtime-spec form:
   `api_token_set` "gesetzt"/"nicht gesetzt" indicator.
 - For `random`: a "Neu erzeugen (rotieren)" button; note that the value is never
   shown.
-- For `app`: the custom-header warning when applicable; otherwise a note that the
-  application's token is used.
+- For `set`/`random`: an optional **Übermittlungs-Header** field (like the app's),
+  placeholder/default `Authorization: Bearer` when empty; inline warning when a
+  non-empty custom header is entered (must match the backend, see §6).
+- For `app`: a note that the application's token *and* its header are used (with
+  the same custom-header warning when `app.APITokenHeader` is set).
 - A hint block (shown when mode ≠ off) telling the operator to reference the token
   with **`${API_TOKEN}`** in Env or Args, plus the per-backend variable table:
 
@@ -270,12 +291,12 @@ i18n: all new strings in de + en (parity is compile-enforced).
 
 1. Store/migration: migration 74; `routing.RuntimeSpec` fields; `RuntimeAPITokenMode`;
    sqlite CRUD; conformance tests.
-2. Portal service: DTO (`api_token_mode`, `api_token_set`, write-only `api_token`
-   sentinel), validation + 4 error codes, seal on write, `${API_TOKEN}`
-   placeholder-consistency checks, random generation + rotate, resolve-and-push
-   the decrypted token into the agent-wire spec, per-mapping Target token in
-   `resolver.go` for set/random.
-3. Gateway endpoints: map the 4 sentinels → 400.
+2. Portal service: DTO (`api_token_mode`, `api_token_header`, `api_token_set`,
+   write-only `api_token` sentinel), validation + 5 error codes, seal on write,
+   `${API_TOKEN}` placeholder-consistency checks, header-shape check, random
+   generation + rotate, resolve-and-push the decrypted token into the agent-wire
+   spec, per-mapping Target token+header in `resolver.go` for set/random.
+3. Gateway endpoints: map the 5 sentinels → 400.
 4. `server-agent`: wire `api_token`; `${API_TOKEN}` resolution + masking; feature
    flag `runtime_api_token`; Version 0.5.0.
 5. Frontend: TS type, mode select + write-only field + rotate, hints + table +
