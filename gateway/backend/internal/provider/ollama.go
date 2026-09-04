@@ -61,7 +61,7 @@ func (c *OllamaClient) Complete(ctx context.Context, target routing.Target, req 
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return Response{}, unavailableStatus(httpResp.StatusCode)
 	}
 	respBytes, err := io.ReadAll(httpResp.Body)
 	if err != nil {
@@ -182,7 +182,7 @@ func (c *OllamaClient) CompleteStream(ctx context.Context, target routing.Target
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return unavailableStatus(httpResp.StatusCode)
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 
@@ -325,7 +325,7 @@ func (c *OllamaClient) ListModels(ctx context.Context, target routing.Target) ([
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return nil, unavailableStatus(httpResp.StatusCode)
 	}
 	var decoded struct {
 		Models []struct {

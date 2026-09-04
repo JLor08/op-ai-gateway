@@ -245,6 +245,16 @@ func pickVisionImage() (dataURL string, tokens []string) {
 var (
 	coldLoadPollGap = 500 * time.Millisecond
 	coldLoadMaxWait = 30 * time.Second
+	// coldLoadResidentMaxWait bounds ensureResidentForRun's retry of the load
+	// request when the upstream answers "unavailable" (a 503) WHILE it is still
+	// loading -- the behaviour of llama-swap and other single-slot swappers, which
+	// a VRAM/load benchmark provokes by design (it isolates the target and then
+	// asks for it cold). A large model can take minutes to become servable, so
+	// this is generous; a genuinely stuck upstream still fails, just after the
+	// budget rather than on the first probe. A var so tests can shorten it. A
+	// blocking-but-progressing load is bounded separately by streamOnce's own idle
+	// watchdog and never reaches this loop.
+	coldLoadResidentMaxWait = 5 * time.Minute
 	// coldLoadCallTimeout is a defensive per-call bound for the loaded-probe and the unload
 	// when the app carries no positive Timeout — so a wedged upstream can NEVER hang the
 	// benchmark run (which would permanently exclude the server from routing). App timeouts

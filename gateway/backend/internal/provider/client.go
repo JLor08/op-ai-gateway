@@ -19,6 +19,27 @@ var (
 	ErrInvalidResponse = errors.New("provider.invalid_response")
 )
 
+// ErrUpstreamStarting is the ONE subset of ErrUnavailable a caller may safely
+// retry: the upstream answered 503 (Service Unavailable), which for a model
+// server means "still starting / loading", not a permanent failure. It unwraps
+// to ErrUnavailable, so every existing errors.Is(err, ErrUnavailable) check is
+// unaffected. Every other non-2xx status, a connection error, and a cancelled
+// request stay a plain ErrUnavailable and MUST NOT be retried blindly (a 404 is
+// a bad model name, a refused connection is a crashed/absent server -- retrying
+// either just wastes time, and re-driving a load that OOM-crashed would loop the
+// crash). Build the wrapped error with unavailableStatus so 503 gets this tag.
+var ErrUpstreamStarting = fmt.Errorf("%w (upstream starting)", ErrUnavailable)
+
+// unavailableStatus wraps a non-2xx upstream status as ErrUnavailable, tagging a
+// 503 additionally as ErrUpstreamStarting (a retryable "still loading" signal).
+func unavailableStatus(status int) error {
+	base := ErrUnavailable
+	if status == http.StatusServiceUnavailable {
+		base = ErrUpstreamStarting
+	}
+	return fmt.Errorf("%w: upstream status %d", base, status)
+}
+
 // contentTypeHeader and jsonContentType are the request header name/value the
 // adapters below set on every upstream JSON request (ollama.go,
 // openai_compatible.go, proxy.go).
@@ -89,7 +110,7 @@ func httpProbe(ctx context.Context, httpClient *http.Client, target routing.Targ
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return fmt.Errorf("%w: upstream status %d", ErrUnavailable, httpResp.StatusCode)
+		return unavailableStatus(httpResp.StatusCode)
 	}
 	return nil
 }
