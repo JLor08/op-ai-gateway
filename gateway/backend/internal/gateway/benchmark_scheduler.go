@@ -59,7 +59,9 @@ func (s *Server) TriggerScheduledBenchmark(ctx context.Context, server routing.A
 		if m.Status != routing.ServerStatusActive || m.MetricsLocked {
 			continue
 		}
-		targets = append(targets, benchmarkTarget{server: server, app: app, mapping: m})
+		bt := benchmarkTarget{server: server, app: app, mapping: m}
+		bt.spec = s.benchmarkSpecFor(ctx, app, m.ID)
+		targets = append(targets, bt)
 	}
 	if len(targets) == 0 {
 		return true

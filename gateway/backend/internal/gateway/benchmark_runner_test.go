@@ -24,13 +24,20 @@ type benchFakeProvider struct {
 	calls        int
 	firstDelayMS int // sleep before the first delta on call #1 (simulates a cold load)
 	usage        inference.Usage
+	// lastTarget records the routing.Target passed to the most recent CompleteStream
+	// call, so a test can assert what APIToken/APITokenHeader the benchmark runner
+	// attached (I3: the benchmark Target builders must resolve through
+	// routing.SpecUpstreamAuth, not read tgt.app.APIToken directly). Calls in these
+	// tests are strictly sequential (single goroutine), so a plain field is race-free.
+	lastTarget routing.Target
 }
 
 func (f *benchFakeProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
 	return provider.Response{}, nil
 }
 
-func (f *benchFakeProvider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+func (f *benchFakeProvider) CompleteStream(_ context.Context, target routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	f.lastTarget = target
 	f.calls++
 	if f.calls == 1 && f.firstDelayMS > 0 {
 		time.Sleep(time.Duration(f.firstDelayMS) * time.Millisecond)
@@ -171,13 +178,17 @@ type benchProbingProvider struct {
 	probeName    string
 	probeContext int
 	probedPath   string // records the path passed to the most recent ProbeModelInfo call
+	// probedTarget records the full routing.Target passed to the most recent
+	// ProbeModelInfo call, so a test can assert its APIToken/APITokenHeader (I3).
+	probedTarget routing.Target
 }
 
-// ProbeModelInfo records the path it was called with. The benchmark re-probe issues one
-// probe per target strictly sequentially inside the single-goroutine runBenchmark loop, so
-// a plain (unguarded) field is race-free here.
-func (f *benchProbingProvider) ProbeModelInfo(_ context.Context, _ routing.Target, path string) ([]provider.ModelInfo, error) {
+// ProbeModelInfo records the path (and full target) it was called with. The benchmark
+// re-probe issues one probe per target strictly sequentially inside the single-goroutine
+// runBenchmark loop, so a plain (unguarded) field is race-free here.
+func (f *benchProbingProvider) ProbeModelInfo(_ context.Context, target routing.Target, path string) ([]provider.ModelInfo, error) {
 	f.probedPath = path
+	f.probedTarget = target
 	return []provider.ModelInfo{{Name: f.probeName, ContextSize: f.probeContext}}, nil
 }
 
@@ -735,5 +746,223 @@ func TestVisionRunInconclusiveWritesHistoryRowWithError(t *testing.T) {
 	}
 	if got.VisionCapable {
 		t.Fatalf("mapping VisionCapable = true, want false (an inconclusive verdict must not be distilled)")
+	}
+}
+
+// --- I3: benchmark/capacity Target builders resolve auth via routing.SpecUpstreamAuth ---
+//
+// Before this fix, every routing.Target the benchmark/capacity/probe/load/VRAM paths
+// built carried tgt.app.APIToken/APITokenHeader directly, bypassing per-mapping spec
+// resolution entirely. For a "set"/"random"-mode server_agent child (Runtime Spec API
+// Token feature) that means every scheduled benchmark, capacity probe, context probe,
+// load, and VRAM run would authenticate with the WRONG (parent-app) token and 401 —
+// fail-closed, but it silently breaks all measurement for that mapping. These tests
+// assert the fix: the resolved spec's sealed token (not app.APIToken) reaches the
+// Target, while every other case (non-server_agent app, or a server_agent mapping with
+// no spec yet) is unchanged (app-token fallback).
+
+// benchServerAgentTarget returns a benchmarkTarget on a server_agent app whose mapping
+// has a "set"-mode spec carrying a token/mode DISTINCT from the app's own — so a test
+// can tell at a glance which one a built Target actually carried.
+func benchServerAgentTarget() benchmarkTarget {
+	tgt := benchTestTarget()
+	tgt.app.Type = routing.ProviderServerAgent
+	tgt.app.APIToken = "enc:app-token"
+	tgt.app.APITokenHeader = "Authorization"
+	tgt.spec = routing.RuntimeSpec{
+		MappingID:    tgt.mapping.ID,
+		APITokenMode: string(routing.RuntimeAPITokenModeSet),
+		APIToken:     "enc:spec-token",
+	}
+	return tgt
+}
+
+// TestBenchmarkTargetReqUsesSpecTokenForSetModeServerAgent is the brief's Step-1 test:
+// a server_agent app whose probed mapping's spec is mode "set" must produce a Target
+// carrying the SPEC's sealed token, not app.APIToken.
+func TestBenchmarkTargetReqUsesSpecTokenForSetModeServerAgent(t *testing.T) {
+	tgt := benchServerAgentTarget()
+	target, _ := benchmarkTargetReq(tgt)
+	if target.APIToken != "enc:spec-token" {
+		t.Fatalf("APIToken = %q, want the spec's sealed token enc:spec-token (not app.APIToken)", target.APIToken)
+	}
+	if target.APIToken == tgt.app.APIToken {
+		t.Fatalf("APIToken equals app.APIToken (%q) -- the spec token was not used", tgt.app.APIToken)
+	}
+	if target.APITokenHeader != "Authorization" {
+		t.Fatalf("APITokenHeader = %q, want Authorization (spec has no custom header, so it inherits the app's)", target.APITokenHeader)
+	}
+}
+
+// TestBenchmarkTargetReqAppTokenFallbackWithoutSpec covers both "unchanged" cases in
+// one assertion shape: a non-server_agent app (benchTestTarget's default, ProviderMock)
+// with a zero tgt.spec must still get the app's own token/header.
+func TestBenchmarkTargetReqAppTokenFallbackWithoutSpec(t *testing.T) {
+	tgt := benchTestTarget() // ProviderMock, zero spec
+	tgt.app.APIToken = "app-tok"
+	tgt.app.APITokenHeader = "X-App-Key"
+	target, _ := benchmarkTargetReq(tgt)
+	if target.APIToken != "app-tok" || target.APITokenHeader != "X-App-Key" {
+		t.Fatalf("Target auth = (%q, %q), want app fallback (%q, %q)", target.APIToken, target.APITokenHeader, "app-tok", "X-App-Key")
+	}
+}
+
+// TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp covers the OTHER "unchanged"
+// case: a server_agent app whose mapping has no spec yet (zero tgt.spec, the value
+// benchmarkSpecFor returns for "!ok") must also fall back to the app token --
+// behaviour-preserving, mirroring routing.Resolver.targetFrom.
+func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
+	tgt := benchTestTarget()
+	tgt.app.Type = routing.ProviderServerAgent
+	tgt.app.APIToken = "app-tok"
+	tgt.app.APITokenHeader = "X-App-Key"
+	// tgt.spec left zero-valued: no spec resolved for this mapping.
+	target, _ := benchmarkTargetReq(tgt)
+	if target.APIToken != "app-tok" || target.APITokenHeader != "X-App-Key" {
+		t.Fatalf("Target auth = (%q, %q), want app fallback (%q, %q)", target.APIToken, target.APITokenHeader, "app-tok", "X-App-Key")
+	}
+}
+
+// TestMeasureMappingStreamsWithSpecToken exercises the FULL measureMapping path
+// (benchmarkTargetReq -> streamOnce -> CompleteStream) end to end, asserting the fake
+// provider actually received the spec's token on the wire -- not just that
+// benchmarkTargetReq computed the right value in isolation.
+func TestMeasureMappingStreamsWithSpecToken(t *testing.T) {
+	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 42}}
+	srv := &Server{Provider: fake}
+	tgt := benchServerAgentTarget()
+	if _, err := srv.measureMapping(context.Background(), tgt); err != nil {
+		t.Fatalf("measureMapping err = %v", err)
+	}
+	if fake.lastTarget.APIToken != "enc:spec-token" {
+		t.Fatalf("streamed APIToken = %q, want enc:spec-token", fake.lastTarget.APIToken)
+	}
+}
+
+// TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe covers the OTHER two Target
+// builders (benchmark_runner.go's warm-load benchmarkTargetReq call AND its own
+// context-probe `pt := routing.Target{...}` literal): both must carry the spec token.
+func TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe(t *testing.T) {
+	fake := &benchProbingProvider{
+		benchFakeProvider: benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 55}},
+		probeName:         "up-model",
+		probeContext:      8192,
+	}
+	reg := NewBenchmarkRegistry()
+	srv := &Server{Provider: fake, Benchmarks: reg}
+	run, ok := reg.TryStart("srv1", "context-probe", "context", 1, time.Now(), func() {})
+	if !ok {
+		t.Fatalf("TryStart did not start")
+	}
+
+	tgt := benchServerAgentTarget()
+	tgt.app.ContextProbePath = "/props"
+
+	srv.runContextProbe(context.Background(), run, "srv1", tgt)
+
+	if fake.lastTarget.APIToken != "enc:spec-token" {
+		t.Fatalf("warm-load stream APIToken = %q, want enc:spec-token", fake.lastTarget.APIToken)
+	}
+	if fake.probedTarget.APIToken != "enc:spec-token" {
+		t.Fatalf("context-probe APIToken = %q, want enc:spec-token", fake.probedTarget.APIToken)
+	}
+	if st := reg.Status("srv1"); len(st.Results) != 1 || st.Results[0].Error != "" {
+		t.Fatalf("status = %+v, want one successful result", st)
+	}
+}
+
+// TestMeasureSpeedTargetContextProbeUsesSpecToken covers the THIRD Target builder: the
+// re-probe `pt := routing.Target{...}` literal inside measureSpeedTarget.
+func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := mem.CreateApplication(ctx, routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, ContextProbePath: "/props", APIToken: "enc:app-token", APITokenHeader: "Authorization", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map1", ApplicationID: "app1", GatewayModelName: "gw-model", AppModelName: "up-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	fake := &benchProbingProvider{
+		benchFakeProvider: benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 55}},
+		probeName:         "up-model",
+		probeContext:      8192,
+	}
+	srv := &Server{Provider: fake, Routes: mem}
+
+	tgt := benchServerAgentTarget()
+	tgt.app.ContextProbePath = "/props"
+
+	res := srv.measureSpeedTarget(ctx, tgt)
+	if res.Error != "" {
+		t.Fatalf("measureSpeedTarget error = %q, want empty", res.Error)
+	}
+	if fake.probedTarget.APIToken != "enc:spec-token" {
+		t.Fatalf("context-probe APIToken = %q, want enc:spec-token", fake.probedTarget.APIToken)
+	}
+}
+
+// TestBenchmarkSpecForServerAgentWithSpec: benchmarkSpecFor (used at every
+// benchmarkTarget construction site) loads the stored spec for a server_agent
+// mapping.
+func TestBenchmarkSpecForServerAgentWithSpec(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := mem.CreateApplication(ctx, routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map1", ApplicationID: "app1", GatewayModelName: "gw-model", AppModelName: "up-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{MappingID: "map1", APITokenMode: string(routing.RuntimeAPITokenModeSet), APIToken: "enc:spec-token", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+
+	srv := &Server{Routes: mem}
+	spec := srv.benchmarkSpecFor(ctx, routing.Application{Type: routing.ProviderServerAgent}, "map1")
+	if spec.APIToken != "enc:spec-token" || spec.APITokenMode != string(routing.RuntimeAPITokenModeSet) {
+		t.Fatalf("spec = %+v, want the stored set-mode spec", spec)
+	}
+}
+
+// TestBenchmarkSpecForServerAgentNoSpecIsZero: a server_agent mapping with no spec
+// created yet resolves to a zero spec (=> app-token fallback), not an error.
+func TestBenchmarkSpecForServerAgentNoSpecIsZero(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := mem.CreateApplication(ctx, routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map1", ApplicationID: "app1", GatewayModelName: "gw-model", AppModelName: "up-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	srv := &Server{Routes: mem}
+	spec := srv.benchmarkSpecFor(ctx, routing.Application{Type: routing.ProviderServerAgent}, "map1")
+	if spec.APIToken != "" || spec.APITokenMode != "" {
+		t.Fatalf("spec = %+v, want zero (no spec created for this mapping)", spec)
+	}
+}
+
+// TestBenchmarkSpecForNonServerAgentSkipsStore: a non-server_agent app never has a
+// per-mapping spec, so benchmarkSpecFor must short-circuit WITHOUT touching the
+// store -- a nil s.Routes here would panic if it were dereferenced.
+func TestBenchmarkSpecForNonServerAgentSkipsStore(t *testing.T) {
+	srv := &Server{Routes: nil}
+	spec := srv.benchmarkSpecFor(context.Background(), routing.Application{Type: routing.ProviderMock}, "map1")
+	if spec.APIToken != "" || spec.APITokenMode != "" {
+		t.Fatalf("spec = %+v, want zero", spec)
 	}
 }
