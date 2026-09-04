@@ -530,10 +530,12 @@ same ordered, deduplicated GPU list as `<prefix><localIndex>` (`CUDA`,
 `args`. Validate both knobs at save, before any mutation —
 `runtime_spec.visible_devices_mode_invalid` for a mode outside `env`/`args`,
 `runtime_spec.visible_devices_args_no_placeholder` for an `args`-mode spec
-whose `args` mention none of the three placeholders — and enforce the
-identical pair again at launch for the file-mode path the portal never
-reaches; the existing conflict and empty-GPU-list refusals apply unchanged in
-both modes. Declare one agent feature flag for all of it, `gpu_selection`
+whose `args` mention none of the three placeholders. These two new rules are
+portal-only: the agent degrades an unknown or empty mode to `env` rather than
+refusing it and applies no args-placeholder check, so the file-mode path the
+portal never reaches is not guarded against them. Only the existing conflict
+and empty-GPU-list refusals are re-enforced by the agent at launch, and those
+apply unchanged in both modes. Declare one agent feature flag for all of it, `gpu_selection`
 (`Since: "0.4.0"`), since the order fix and the new mode ship in the same
 agent release; `server-agent`'s `Version` moves `0.3.0` → `0.4.0`, MINOR per
 the versioning rule ([§7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning)).
