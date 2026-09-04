@@ -70,12 +70,12 @@ func TestResolvedCommandReportsPlaceholdersExpanded(t *testing.T) {
 		t.Errorf("args = %q still carry an unresolved placeholder -- this reports the template, not the command", got)
 	}
 	// ${HOST_GPU_IDS} in an env value, and the agent-computed visibility
-	// variable beside it: HOST indices, ascending.
-	if v, ok := envValue(cmd.Env, "ONEAPI_DEVICE_SELECTOR"); !ok || v != "level_zero:2,3" {
-		t.Errorf("ONEAPI_DEVICE_SELECTOR = %q (present=%v), want level_zero:2,3", v, ok)
+	// variable beside it: HOST indices, in the operator's declared order.
+	if v, ok := envValue(cmd.Env, "ONEAPI_DEVICE_SELECTOR"); !ok || v != "level_zero:3,2" {
+		t.Errorf("ONEAPI_DEVICE_SELECTOR = %q (present=%v), want level_zero:3,2", v, ok)
 	}
-	if v, ok := envValue(cmd.Env, VisibleDevicesVar(GPUVendorNVIDIA)); !ok || v != "2,3" {
-		t.Errorf("%s = %q (present=%v), want 2,3", VisibleDevicesVar(GPUVendorNVIDIA), v, ok)
+	if v, ok := envValue(cmd.Env, VisibleDevicesVar(GPUVendorNVIDIA)); !ok || v != "3,2" {
+		t.Errorf("%s = %q (present=%v), want 3,2", VisibleDevicesVar(GPUVendorNVIDIA), v, ok)
 	}
 	if cmd.Masked {
 		t.Error("Masked = true for a command containing no ${AGENT_ENV:...} value")
