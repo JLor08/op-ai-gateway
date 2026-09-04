@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"strings"
@@ -2413,4 +2414,292 @@ func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Task 4: seal-on-write, random generation, rotate ----------------------
+//
+// These tests pin the WRITE side of the per-spec API token in PutRuntimeSpec:
+// mode "set" seals the operator-supplied value, mode "random" generates and
+// seals a fresh secret, the write-only *string sentinel keeps/clears, rotate
+// regenerates, and a keyless disk store fails closed (ErrKeyRequired) BEFORE
+// anything is persisted. The sealed VALUE never crosses the wire.
+
+// TestPutRuntimeSpecAPITokenSealSetStoresSealed: mode "set" with a value stores
+// a SEALED envelope that decrypts back to the operator's token, flips
+// APITokenSet true, and never echoes the raw value in the DTO JSON.
+func TestPutRuntimeSpecAPITokenSealSetStoresSealed(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	const rawToken = "s3cr3t"
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:       "/usr/local/bin/llama-server",
+		Env:          map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APITokenMode: string(routing.RuntimeAPITokenModeSet),
+		APIToken:     strPtr(rawToken),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if !dto.APITokenSet {
+		t.Fatalf("APITokenSet = false, want true after setting a token")
+	}
+	if dto.APITokenMode != string(routing.RuntimeAPITokenModeSet) {
+		t.Fatalf("APITokenMode = %q, want set", dto.APITokenMode)
+	}
+
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+	if !(strings.HasPrefix(stored.APIToken, "enc:") || strings.HasPrefix(stored.APIToken, "plain:")) {
+		t.Fatalf("stored APIToken = %q, want a sealed envelope (enc:/plain:)", stored.APIToken)
+	}
+	if strings.Contains(stored.APIToken, rawToken) {
+		t.Fatalf("stored APIToken leaks the raw token: %q", stored.APIToken)
+	}
+	opened, err := capture.OpenSecret(cipher, stored.APIToken)
+	if err != nil {
+		t.Fatalf("OpenSecret: %v", err)
+	}
+	if opened != rawToken {
+		t.Fatalf("decrypted token = %q, want %q", opened, rawToken)
+	}
+
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if strings.Contains(string(raw), rawToken) {
+		t.Fatalf("DTO JSON leaked the raw token: %s", raw)
+	}
+}
+
+// TestPutRuntimeSpecAPITokenSealRandomGenerates: mode "random" with no
+// api_token supplied generates a fresh secret, seals it, and reports
+// APITokenSet true. The stored value is a real generated secret (opaigw_
+// prefix), not a caller-supplied string.
+func TestPutRuntimeSpecAPITokenSealRandomGenerates(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:       "/usr/local/bin/llama-server",
+		Env:          map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APITokenMode: string(routing.RuntimeAPITokenModeRandom),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if !dto.APITokenSet {
+		t.Fatalf("APITokenSet = false, want true after random generation")
+	}
+
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+	if stored.APIToken == "" {
+		t.Fatalf("random mode stored an empty token")
+	}
+	if !strings.HasPrefix(stored.APIToken, "enc:") {
+		t.Fatalf("stored APIToken = %q, want a sealed enc: envelope", stored.APIToken)
+	}
+	opened, err := capture.OpenSecret(cipher, stored.APIToken)
+	if err != nil {
+		t.Fatalf("OpenSecret: %v", err)
+	}
+	if !strings.HasPrefix(opened, "opaigw_") {
+		t.Fatalf("generated token = %q, want a generateSecret() opaigw_ value", opened)
+	}
+
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if strings.Contains(string(raw), opened) {
+		t.Fatalf("DTO JSON leaked the generated token: %s", raw)
+	}
+}
+
+// TestPutRuntimeSpecAPITokenSealUpdateSentinel: on a subsequent PUT, a nil
+// api_token pointer KEEPS the stored sealed value byte-for-byte (no needless
+// re-seal), while "" CLEARS it.
+func TestPutRuntimeSpecAPITokenSealUpdateSentinel(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	setReq := func(tok *string) PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary:       "/usr/local/bin/llama-server",
+			Env:          map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+			APITokenMode: string(routing.RuntimeAPITokenModeSet),
+			APIToken:     tok,
+		}
+	}
+
+	const rawToken = "keepme"
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, setReq(strPtr(rawToken))); err != nil {
+		t.Fatalf("PutRuntimeSpec (initial set): %v", err)
+	}
+	before, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		t.Fatalf("precondition RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+
+	// nil ⇒ KEEP: the sealed envelope must be identical (no re-seal), so the
+	// stored ciphertext is byte-for-byte equal to before.
+	keptDTO, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, setReq(nil))
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (keep): %v", err)
+	}
+	if !keptDTO.APITokenSet {
+		t.Fatalf("nil api_token should KEEP the token; APITokenSet = false")
+	}
+	kept, _, _ := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if kept.APIToken != before.APIToken {
+		t.Fatalf("nil api_token changed the sealed value: %q -> %q", before.APIToken, kept.APIToken)
+	}
+	if opened, err := capture.OpenSecret(cipher, kept.APIToken); err != nil || opened != rawToken {
+		t.Fatalf("kept token opened to %q (err %v), want %q", opened, err, rawToken)
+	}
+
+	// "" ⇒ CLEAR.
+	clearedDTO, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, setReq(strPtr("")))
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (clear): %v", err)
+	}
+	if clearedDTO.APITokenSet {
+		t.Fatalf(`"" api_token should CLEAR the token; APITokenSet = true`)
+	}
+	cleared, _, _ := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if cleared.APIToken != "" {
+		t.Fatalf("cleared token = %q, want empty", cleared.APIToken)
+	}
+}
+
+// TestPutRuntimeSpecAPITokenSealRotate: mode "random" keeps the existing token
+// across an ordinary re-PUT, but api_token_rotate:true regenerates it (a
+// different plaintext ends up stored).
+func TestPutRuntimeSpecAPITokenSealRotate(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	randomReq := func(rotate bool) PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary:         "/usr/local/bin/llama-server",
+			Env:            map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+			APITokenMode:   string(routing.RuntimeAPITokenModeRandom),
+			APITokenRotate: rotate,
+		}
+	}
+
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, randomReq(false)); err != nil {
+		t.Fatalf("PutRuntimeSpec (first random): %v", err)
+	}
+	first, _, _ := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	firstPlain, err := capture.OpenSecret(cipher, first.APIToken)
+	if err != nil {
+		t.Fatalf("OpenSecret (first): %v", err)
+	}
+
+	// A second random PUT WITHOUT rotate keeps the same sealed value verbatim.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, randomReq(false)); err != nil {
+		t.Fatalf("PutRuntimeSpec (random, no rotate): %v", err)
+	}
+	same, _, _ := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if same.APIToken != first.APIToken {
+		t.Fatalf("random without rotate changed the stored token: %q -> %q", first.APIToken, same.APIToken)
+	}
+
+	// rotate:true regenerates -- a DIFFERENT plaintext is stored.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, randomReq(true)); err != nil {
+		t.Fatalf("PutRuntimeSpec (rotate): %v", err)
+	}
+	rotated, _, _ := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	rotatedPlain, err := capture.OpenSecret(cipher, rotated.APIToken)
+	if err != nil {
+		t.Fatalf("OpenSecret (rotated): %v", err)
+	}
+	if rotatedPlain == firstPlain {
+		t.Fatalf("rotate did not change the stored token (still %q)", firstPlain)
+	}
+	if !strings.HasPrefix(rotatedPlain, "opaigw_") {
+		t.Fatalf("rotated token = %q, want a generateSecret() opaigw_ value", rotatedPlain)
+	}
+}
+
+// TestPutRuntimeSpecAPITokenSealKeylessDiskRejected: on a disk store with no
+// cipher, a set/random write fails closed with capture.ErrKeyRequired and
+// persists NOTHING -- the prior spec is left byte-for-byte unchanged (no
+// half-applied mode, port, or token).
+func TestPutRuntimeSpecAPITokenSealKeylessDiskRejected(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestServiceWithCipher(t, now, nil, false) // no cipher, not volatile = keyless disk
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	// Seed a prior spec in app mode (no token ⇒ no seal needed even keyless),
+	// with distinctive fields so a half-applied write would be visible.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:       "/usr/local/bin/llama-server",
+		ListenPort:   9111,
+		APITokenMode: string(routing.RuntimeAPITokenModeApp),
+	}); err != nil {
+		t.Fatalf("seed app-mode spec: %v", err)
+	}
+	before, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		t.Fatalf("precondition: expected a seeded spec (ok=%v err=%v)", ok, err)
+	}
+
+	assertUnchanged := func(label string) {
+		t.Helper()
+		after, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+		if err != nil || !ok {
+			t.Fatalf("%s: spec vanished (ok=%v err=%v)", label, ok, err)
+		}
+		if after.APIToken != "" {
+			t.Fatalf("%s: failed write persisted a token: %q", label, after.APIToken)
+		}
+		if after.Binary != before.Binary || after.ListenPort != before.ListenPort ||
+			after.APITokenMode != before.APITokenMode {
+			t.Fatalf("%s: failed write half-applied\n before=%+v\n after =%+v", label, before, after)
+		}
+	}
+
+	// set with a real value on a keyless disk store: fail closed, change nothing.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:       "/usr/local/bin/OTHER",
+		ListenPort:   9222,
+		Env:          map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APITokenMode: string(routing.RuntimeAPITokenModeSet),
+		APIToken:     strPtr("s3cr3t"),
+	}); !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("set on keyless disk store err = %v, want capture.ErrKeyRequired", err)
+	}
+	assertUnchanged("after failed set")
+
+	// random likewise.
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:       "/usr/local/bin/OTHER",
+		ListenPort:   9333,
+		Env:          map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
+		APITokenMode: string(routing.RuntimeAPITokenModeRandom),
+	}); !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("random on keyless disk store err = %v, want capture.ErrKeyRequired", err)
+	}
+	assertUnchanged("after failed random")
 }

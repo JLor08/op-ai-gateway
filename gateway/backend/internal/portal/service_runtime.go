@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"regexp"
@@ -647,6 +648,55 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 			measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
 		}
 	}
+	// Per-spec API token (design §2): compute the SEALED value to persist
+	// STRICTLY BEFORE the store write, so a keyless-disk seal rejection
+	// (capture.ErrKeyRequired) returns without persisting anything -- no
+	// plaintext token, no half-applied mode. Mirrors service_applications.go's
+	// write-only *string sentinel exactly: nil = keep the stored (already
+	// sealed) value, "" seals to "" = clear, a value replaces-and-seals. Mode
+	// "random" generates a fresh secret on first write or when rotate is asked;
+	// modes "app"/"off" store no per-spec token. Validation
+	// (validateRuntimeSpecAPIToken, above) has already run -- this only seals.
+	mode := req.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
+	}
+	sealedToken := existing.APIToken // keep by default (existing = the loaded spec, "" when none)
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeRandom:
+		if existing.APIToken == "" || req.APITokenRotate {
+			rawToken, err := generateSecret()
+			if err != nil {
+				return RuntimeSpecDTO{}, err
+			}
+			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, rawToken)
+			if err != nil {
+				return RuntimeSpecDTO{}, err // ErrKeyRequired on a keyless disk store => 400, nothing persisted
+			}
+			sealedToken = sealed
+		}
+	case routing.RuntimeAPITokenModeSet:
+		if req.APIToken != nil { // nil = keep the stored token untouched
+			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, *req.APIToken)
+			if err != nil {
+				return RuntimeSpecDTO{}, err
+			}
+			sealedToken = sealed // "" seals to "" = cleared
+		}
+	default: // app, off -- no per-spec token stored
+		sealedToken = ""
+	}
+	headerSource := req.APITokenHeaderSource
+	if headerSource == "" {
+		headerSource = string(routing.RuntimeAPITokenHeaderSourceApp)
+	}
+	// APITokenHeader is only meaningful for a custom source (its shape was
+	// validated above via checkHeaderName); an "app" source inherits the
+	// application's header at resolve time (Task 6) and stores none here.
+	headerName := ""
+	if routing.RuntimeAPITokenHeaderSource(headerSource) == routing.RuntimeAPITokenHeaderSourceCustom {
+		headerName = strings.TrimSpace(req.APITokenHeader)
+	}
 	now := s.clock().UTC()
 	spec := routing.RuntimeSpec{
 		ID:                          "rspec_" + compactRandomHex(16),
@@ -667,6 +717,10 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          visibleMode,
+		APITokenMode:                mode,
+		APIToken:                    sealedToken,
+		APITokenHeaderSource:        headerSource,
+		APITokenHeader:              headerName,
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
