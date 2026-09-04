@@ -2154,6 +2154,109 @@ func TestGetRuntimeSpecAPITokenModeDefaultsToApp(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeConfigPushesDecryptedAPIToken pins Task 5: the agent-wire
+// runtime config carries the DECRYPTED per-spec upstream token in api_token,
+// resolved per mode (set/random -> the spec's own sealed token; app/"" -> the
+// parent app's sealed token; off -> ""), and FAILS CLOSED -- an undecryptable
+// sealed value pushes "" (never the sealed bytes), so the agent hard-errors on
+// an unresolved ${API_TOKEN} rather than booting the child with a garbled
+// secret. The plaintext exists only as this wire field; the SEALED form is
+// never carried, and nothing decrypted is stored.
+func TestAgentRuntimeConfigPushesDecryptedAPIToken(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	// The parent app carries a sealed token that decrypts to "tok-app"; the
+	// "app"/unset modes push exactly this.
+	appSealed, err := capture.SealSecret(cipher, false, "tok-app")
+	if err != nil {
+		t.Fatalf("seal app token: %v", err)
+	}
+	app.APIToken = appSealed
+	if err := routeStore.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+
+	// The set-mode spec carries a sealed token that decrypts to "tok-set".
+	specSealed, err := capture.SealSecret(cipher, false, "tok-set")
+	if err != nil {
+		t.Fatalf("seal spec token: %v", err)
+	}
+
+	// seedSpec creates a mapping + a directly-stored enabled spec (bypassing
+	// PutRuntimeSpec, which is a sibling task), returning the spec id so the
+	// pushed document can be matched back to its mode.
+	seedSpec := func(model, mode, sealedToken string) string {
+		t.Helper()
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: model, AppModelName: model})
+		if err != nil {
+			t.Fatalf("CreateMapping(%s): %v", model, err)
+		}
+		specID := "rspec_" + compactRandomHex(16)
+		spec := routing.RuntimeSpec{
+			ID:           specID,
+			MappingID:    mapping.ID,
+			Enabled:      true,
+			Binary:       "/usr/bin/x",
+			Args:         "[]",
+			Env:          "{}",
+			APITokenMode: mode,
+			APIToken:     sealedToken,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		if err := routeStore.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("seed spec(%s): %v", model, err)
+		}
+		return specID
+	}
+
+	setID := seedSpec("m-set", string(routing.RuntimeAPITokenModeSet), specSealed)
+	appModeID := seedSpec("m-app", string(routing.RuntimeAPITokenModeApp), "")
+	offID := seedSpec("m-off", string(routing.RuntimeAPITokenModeOff), specSealed)
+	// Fail-closed: mode set, but the sealed value cannot be decrypted (invalid
+	// base64 under the "enc:" prefix). Must push "" -- never the sealed bytes.
+	const undecryptable = "enc:garbage"
+	failID := seedSpec("m-fail", string(routing.RuntimeAPITokenModeSet), undecryptable)
+
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	pushed := map[string]string{}
+	for _, s := range cfg.Specs {
+		pushed[s.ID] = s.APIToken
+	}
+	if got := pushed[setID]; got != "tok-set" {
+		t.Fatalf("set-mode api_token = %q, want %q", got, "tok-set")
+	}
+	if got := pushed[appModeID]; got != "tok-app" {
+		t.Fatalf("app-mode api_token = %q, want %q", got, "tok-app")
+	}
+	if got := pushed[offID]; got != "" {
+		t.Fatalf("off-mode api_token = %q, want empty", got)
+	}
+	if got := pushed[failID]; got != "" {
+		t.Fatalf("fail-closed api_token = %q, want empty (must never push the sealed bytes)", got)
+	}
+
+	// No SEALED token may appear anywhere on the pushed document -- only the
+	// resolved plaintext ("tok-set"/"tok-app") is legitimate wire content.
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal cfg: %v", err)
+	}
+	for _, sealed := range []string{undecryptable, appSealed, specSealed} {
+		if strings.Contains(string(raw), sealed) {
+			t.Fatalf("pushed document leaked a SEALED token %q: %s", sealed, raw)
+		}
+	}
+}
+
 // TestPutRuntimeSpecPreservesGPUArrayOrder pins that the request array order of
 // gpus is the stored + response + agent-wire order (not re-sorted by index).
 func TestPutRuntimeSpecPreservesGPUArrayOrder(t *testing.T) {

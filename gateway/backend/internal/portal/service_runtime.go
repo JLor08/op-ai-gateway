@@ -1614,6 +1614,16 @@ type AgentRuntimeSpecDTO struct {
 	// agent NEEDS this, so it DOES cross the wire.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
 	AdminState         string `json:"admin_state"`
+	// APIToken is the DECRYPTED upstream token the agent substitutes into the
+	// child's ${API_TOKEN} for this spec, or "" when the mode is off or no token
+	// is set (see resolvePushToken; the agent-side runtime.Spec pairs this exact
+	// json tag in Task 9). Unlike every other field here it is a SECRET in the
+	// clear: it rides the already-authenticated agent channel, but that channel
+	// is only encrypted when the gateway URL is https. When it is not, this value
+	// travels in clear -- the operator-facing insecure-transport warning is
+	// surfaced in the portal UI (Task 15); this task does not add a server-side
+	// guard because portal.Service does not hold the gateway public URL.
+	APIToken string `json:"api_token"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1788,6 +1798,10 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
+		// The ONLY place the gateway decrypts the per-mapping token, and it does
+		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
+		// here -- the builder returns the empty document above when it is nil.
+		specDTO.APIToken = s.resolvePushToken(spec, *agentApp)
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
@@ -1805,6 +1819,40 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		coresident = append(coresident, [2]string{specA, specB})
 	}
 	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+}
+
+// resolvePushToken returns the DECRYPTED upstream token to inject into the child
+// for this spec's mode, or "" for off / app-unset. It is the ONLY place the
+// gateway decrypts the runtime-spec token, and it NEVER stores or logs the
+// plaintext -- the returned value is used only as the AgentRuntimeSpecDTO.APIToken
+// field pushed over the already-authenticated agent channel. On ANY decrypt
+// failure it returns "" (fail-closed): the agent then hard-errors at launch on an
+// unresolved ${API_TOKEN}, rather than the child booting with a garbled/partial
+// secret.
+//
+// https note: that agent channel is only encrypted when the gateway URL is https.
+// When it is not, this decrypted token travels in clear. portal.Service does not
+// currently hold the gateway public URL, so this task adds no server-side guard;
+// the operator-facing insecure-transport warning is surfaced in the portal UI
+// (Task 15).
+func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Application) string {
+	var sealed string
+	switch routing.RuntimeAPITokenMode(spec.APITokenMode) {
+	case routing.RuntimeAPITokenModeSet, routing.RuntimeAPITokenModeRandom:
+		sealed = spec.APIToken
+	case routing.RuntimeAPITokenModeApp, "":
+		sealed = app.APIToken
+	default: // off
+		return ""
+	}
+	if sealed == "" {
+		return ""
+	}
+	tok, err := capture.OpenSecret(s.cipher, sealed)
+	if err != nil {
+		return "" // fail-closed; never log the value
+	}
+	return tok
 }
 
 // agentRuntimeSpecDTO builds one AgentRuntimeSpecDTO from a stored (already
