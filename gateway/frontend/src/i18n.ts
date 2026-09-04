@@ -605,6 +605,26 @@ const de = {
   runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
     'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}. Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der drei muss vorhanden sein.',
+  // Runtime-Spec API Token (Task 12/13): the MODE controls only -- the
+  // header-source select + inherited-header display is Task 14.
+  runtimeSpecApiTokenMode: 'API-Token-Modus',
+  runtimeSpecApiTokenModeApp: 'App-Token verwenden',
+  runtimeSpecApiTokenModeSet: 'Operator setzt',
+  runtimeSpecApiTokenModeRandom: 'Zufällig (vom Gateway erzeugt)',
+  runtimeSpecApiTokenModeOff: 'Aus',
+  runtimeSpecApiTokenAppUnsetHint:
+    'Die Anwendung hat keinen API-Token hinterlegt — die Authentifizierung ist für diese Zuordnung ausgeschaltet (wie bei der Anwendung selbst).',
+  runtimeSpecApiTokenLabel: 'API-Token',
+  runtimeSpecApiTokenNote:
+    'Leer lassen, um den gespeicherten Token zu behalten. „Token löschen“ leert ihn.',
+  runtimeSpecApiTokenSetPlaceholder: 'gesetzt',
+  runtimeSpecApiTokenClear: 'Token löschen',
+  runtimeSpecApiTokenSetIndicator: 'Token: gesetzt',
+  runtimeSpecApiTokenUnsetIndicator: 'Token: nicht gesetzt',
+  runtimeSpecApiTokenRandomHint:
+    'Der Gateway erzeugt und verwaltet diesen Token selbst; der Wert wird nirgendwo angezeigt und kann nur rotiert, nicht ausgelesen werden.',
+  runtimeSpecApiTokenRotate: 'Neu erzeugen (rotieren)',
+  runtimeSpecApiTokenRotatePending: 'Wird beim Speichern neu erzeugt',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
   // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
@@ -2702,6 +2722,25 @@ const en: PortalMessages = {
   runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
     'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build. It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the three must be present.',
+  // Runtime-Spec API Token (Task 12/13): the MODE controls only -- the
+  // header-source select + inherited-header display is Task 14.
+  runtimeSpecApiTokenMode: 'API token mode',
+  runtimeSpecApiTokenModeApp: 'Use the app token',
+  runtimeSpecApiTokenModeSet: 'Operator sets',
+  runtimeSpecApiTokenModeRandom: 'Random (gateway-generated)',
+  runtimeSpecApiTokenModeOff: 'Off',
+  runtimeSpecApiTokenAppUnsetHint:
+    'The application has no API token stored — authentication is off for this mapping (same as for the application itself).',
+  runtimeSpecApiTokenLabel: 'API token',
+  runtimeSpecApiTokenNote: 'Leave blank to keep the stored token. "Clear token" empties it.',
+  runtimeSpecApiTokenSetPlaceholder: 'set',
+  runtimeSpecApiTokenClear: 'Clear token',
+  runtimeSpecApiTokenSetIndicator: 'Token: set',
+  runtimeSpecApiTokenUnsetIndicator: 'Token: not set',
+  runtimeSpecApiTokenRandomHint:
+    'The gateway generates and manages this token itself; the value is never shown anywhere and can only be rotated, never read back.',
+  runtimeSpecApiTokenRotate: 'Regenerate (rotate)',
+  runtimeSpecApiTokenRotatePending: 'Will be regenerated on save',
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
   runtimeSpecVramApply: 'Apply',

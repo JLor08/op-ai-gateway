@@ -62,6 +62,33 @@ export interface RuntimeSpec {
   // Go RuntimeSpecDTO.visible_devices_mode.
   visible_devices_mode: 'env' | 'args';
   gpus: RuntimeSpecGPU[];
+  // How this mapping authenticates to its agent-managed process (Runtime-Spec
+  // API Token feature). 'off' sends no auth; 'set' sends the operator's own
+  // spec-level token (api_token_set says whether one is stored, never the
+  // value); 'random' sends a gateway-generated token nobody -- including this
+  // portal -- can read back, only rotate; 'app' inherits the PARENT
+  // APPLICATION's own token (app_api_token_set/app_api_token_header echo that
+  // application's current state so this mapping can be judged without a
+  // second fetch). Default 'app'. Mirrors the Go RuntimeSpecDTO.ApiTokenMode.
+  api_token_mode: 'off' | 'set' | 'random' | 'app';
+  // Whether a spec-level token is stored for 'set'/'random' mode -- the value
+  // itself is never returned, on this field or any other.
+  api_token_set: boolean;
+  // Which header carries the token: 'app' follows the parent application's
+  // own header choice, 'custom' uses api_token_header below. Mirrors the Go
+  // RuntimeSpecDTO.ApiTokenHeaderSource.
+  api_token_header_source: 'app' | 'custom';
+  // The header name when api_token_header_source is 'custom'; empty means
+  // "Authorization: Bearer <token>", same convention as the application's own
+  // api_token_header.
+  api_token_header: string;
+  // Read-only echo of the parent application's OWN api_token_set, so the
+  // 'app' mode's UI can say whether inheriting it actually authenticates
+  // anything without a second fetch of the application itself.
+  app_api_token_set: boolean;
+  // Read-only echo of the parent application's OWN api_token_header, for the
+  // same reason as app_api_token_set.
+  app_api_token_header: string;
   // Per-endpoint API-variant snapshot for this managed model (gateway-side only;
   // NOT sent to the agent). api_flavors gates routing eligibility; the two modes
   // decide disabled / translate / passthrough for /v1/responses and /v1/messages.
@@ -78,7 +105,26 @@ export interface RuntimeSpec {
 // backend ALWAYS ignores on write (agent-owned) even though the request
 // shape still carries the field -- see RuntimeSpec.gpus / PutRuntimeSpec's
 // VRAM ownership rule in service_runtime.go.
-export type PutRuntimeSpecRequest = Omit<RuntimeSpec, 'configured' | 'id' | 'mapping_id'>;
+//
+// The three api_token_set/app_api_token_set/app_api_token_header fields are
+// READ-ONLY echoes (server state, never client-writable) and are excluded
+// here; `api_token`/`api_token_rotate` are their WRITE-ONLY counterparts,
+// present only on this request shape.
+export type PutRuntimeSpecRequest = Omit<
+  RuntimeSpec,
+  | 'configured'
+  | 'id'
+  | 'mapping_id'
+  | 'api_token_set'
+  | 'app_api_token_set'
+  | 'app_api_token_header'
+> & {
+  // Write-only: undefined/absent or null = keep the stored token; '' = clear;
+  // a value = replace-and-seal (set mode).
+  api_token?: string | null;
+  // Force regeneration of the random-mode token on save.
+  api_token_rotate?: boolean;
+};
 
 // An application's allowed co-residency pairs (its own mappings only), each
 // pair canonically ordered (pairs[i][0] < pairs[i][1]). Always a non-nil

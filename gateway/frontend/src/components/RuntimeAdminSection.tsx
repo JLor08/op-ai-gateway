@@ -199,6 +199,12 @@ function emptySpec(mappingId: string): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    api_token_mode: 'app',
+    api_token_set: false,
+    api_token_header_source: 'app',
+    api_token_header: '',
+    app_api_token_set: false,
+    app_api_token_header: '',
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
@@ -493,7 +499,21 @@ function narrowReportConfig(config: unknown): ReportConfig {
 // field list: a field added to RuntimeSpec later carries through by itself
 // instead of being silently dropped here.
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
-  const { configured, id, mapping_id, ...rest } = spec;
+  // api_token_set/app_api_token_set/app_api_token_header are READ-ONLY echoes
+  // (PutRuntimeSpecRequest excludes them, same as configured/id/mapping_id) --
+  // dropped here too so an override click never round-trips them back as if
+  // they were writable. api_token_mode/api_token_header_source/api_token_header
+  // DO belong in `rest`: an override must preserve them unchanged, exactly
+  // like every other field this full-document PUT carries verbatim.
+  const {
+    configured,
+    id,
+    mapping_id,
+    api_token_set,
+    app_api_token_set,
+    app_api_token_header,
+    ...rest
+  } = spec;
   return { ...rest, admin_state: adminState };
 }
 
@@ -2088,6 +2108,21 @@ export function RuntimeAdminSection({
   const [vramLocked, setVramLocked] = useState(false);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
+  // Runtime-Spec API Token (Task 12/13): mode + its per-mode write-only state.
+  // `apiTokenHeaderSource`/`apiTokenHeader` have no control YET (Task 14 adds
+  // the select + inherited-header display) but must still round-trip: this
+  // form's PUT is a full-document upsert (buildSpecBody below), so leaving
+  // them constant would silently reset a header choice Task 14 lets an
+  // operator make. `apiTokenInput`/`apiTokenCleared` mirror ApplicationSection's
+  // own app-token sentinel (tokenInput/tokenCleared) for THIS spec's token;
+  // `apiTokenRotate` is 'random' mode's one-shot rotate-on-next-save flag.
+  const [apiTokenMode, setApiTokenMode] = useState<RuntimeSpec['api_token_mode']>('app');
+  const [apiTokenHeaderSource, setApiTokenHeaderSource] =
+    useState<RuntimeSpec['api_token_header_source']>('app');
+  const [apiTokenHeader, setApiTokenHeader] = useState('');
+  const [apiTokenInput, setApiTokenInput] = useState('');
+  const [apiTokenCleared, setApiTokenCleared] = useState(false);
+  const [apiTokenRotate, setApiTokenRotate] = useState(false);
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
   const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
@@ -2167,6 +2202,12 @@ export function RuntimeAdminSection({
     setVramLocked(false);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
+    setApiTokenMode('app');
+    setApiTokenHeaderSource('app');
+    setApiTokenHeader('');
+    setApiTokenInput('');
+    setApiTokenCleared(false);
+    setApiTokenRotate(false);
     setGpuRows([]);
   }
 
@@ -2187,6 +2228,14 @@ export function RuntimeAdminSection({
     setVramLocked(spec.vram_locked);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
+    setApiTokenMode(spec.api_token_mode);
+    setApiTokenHeaderSource(spec.api_token_header_source);
+    setApiTokenHeader(spec.api_token_header);
+    // Write-only: a load never shows what is stored, only whether it is
+    // (spec.api_token_set, read directly from specsById at render time).
+    setApiTokenInput('');
+    setApiTokenCleared(false);
+    setApiTokenRotate(false);
     setGpuRows(
       spec.gpus.map((g) => ({
         rowKey: makeRowKey(),
@@ -2446,6 +2495,16 @@ export function RuntimeAdminSection({
   }
 
   function buildSpecBody(args: string[], env: Record<string, string>): PutRuntimeSpecRequest {
+    // Write-only token sentinel, mirroring ApplicationSection's own
+    // apiToken/buildBody: cleared -> '' (clear the stored token); a typed
+    // value -> replace-and-seal; otherwise omit so an unrelated save never
+    // disturbs a token already stored under 'set' mode. Meaningless outside
+    // 'set' mode, so it is never even computed there.
+    let apiToken: string | null | undefined;
+    if (apiTokenMode === 'set') {
+      if (apiTokenCleared) apiToken = '';
+      else if (apiTokenInput !== '') apiToken = apiTokenInput;
+    }
     return {
       enabled,
       binary: binary.trim(),
@@ -2463,6 +2522,13 @@ export function RuntimeAdminSection({
       vram_locked: vramLocked,
       set_visible_devices: setVisibleDevices,
       visible_devices_mode: visibleDevicesMode,
+      api_token_mode: apiTokenMode,
+      api_token_header_source: apiTokenHeaderSource,
+      api_token_header: apiTokenHeader,
+      ...(apiToken !== undefined ? { api_token: apiToken } : {}),
+      // Only meaningful under 'random' mode; a stray true from a since-changed
+      // mode would ask the backend to rotate a token that no longer applies.
+      ...(apiTokenMode === 'random' && apiTokenRotate ? { api_token_rotate: true } : {}),
       gpus: gpuRows.map((r) => ({
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,
@@ -3370,6 +3436,17 @@ export function RuntimeAdminSection({
   // matching the rest of the portal's drill-down/sub-view convention.
   if (specMode !== 'list') {
     const editing = specMode !== 'create';
+    // The loaded spec's read-only token echoes, read straight from the same
+    // cache the table columns use (specsById) rather than duplicated into
+    // form state -- exactly how ApplicationSection reads `editApp?.api_token_set`
+    // from the app object it was opened with instead of copying it into a
+    // useState. On CREATE there is no spec yet, so `app_api_token_set` falls
+    // back to the parent application's OWN current token state (the same
+    // snapshot-from-the-parent convention openCreate already uses for
+    // api_flavors/responses_mode/messages_mode above).
+    const currentSpec = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
+    const currentApiTokenSet = currentSpec?.api_token_set ?? false;
+    const appApiTokenSet = currentSpec?.app_api_token_set ?? application.api_token_set;
     // Recomputed on every keystroke on purpose: the whole defect being fixed
     // is that the field's contract was invisible until a foreign program
     // rejected it, so the feedback has to land at paste time, not at submit.
@@ -3691,6 +3768,96 @@ export function RuntimeAdminSection({
                 </option>
               ))}
             </SelectField>
+
+            {/* Runtime-Spec API Token (Task 12/13): the MODE controls only --
+                the header-source select + inherited-header display is Task 14
+                and deliberately has no UI here yet (buildSpecBody/hydrateSpecFields
+                still round-trip api_token_header_source/api_token_header so a
+                save from THIS form never resets a choice Task 14 lets an
+                operator make). */}
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <SelectField
+                id="runtime-spec-api-token-mode"
+                label={t.runtimeSpecApiTokenMode}
+                value={apiTokenMode}
+                onChange={(e) => {
+                  const mode = e.target.value as RuntimeSpec['api_token_mode'];
+                  setApiTokenMode(mode);
+                  // Leaving 'random' abandons a not-yet-saved rotate request --
+                  // it would otherwise silently reappear if the operator
+                  // switched back to 'random' later in the same edit.
+                  if (mode !== 'random') setApiTokenRotate(false);
+                }}
+                sx={{ maxWidth: 340 }}
+              >
+                <option value="app">{t.runtimeSpecApiTokenModeApp}</option>
+                <option value="set">{t.runtimeSpecApiTokenModeSet}</option>
+                <option value="random">{t.runtimeSpecApiTokenModeRandom}</option>
+                <option value="off">{t.runtimeSpecApiTokenModeOff}</option>
+              </SelectField>
+              {apiTokenMode === 'app' && appApiTokenSet === false && (
+                <Alert severity="info">{t.runtimeSpecApiTokenAppUnsetHint}</Alert>
+              )}
+              {apiTokenMode === 'set' && (
+                <Box>
+                  <Field
+                    id="runtime-spec-api-token"
+                    type="password"
+                    label={t.runtimeSpecApiTokenLabel}
+                    value={apiTokenCleared ? '' : apiTokenInput}
+                    onChange={(e) => {
+                      setApiTokenInput(e.target.value);
+                      setApiTokenCleared(false);
+                    }}
+                    autoComplete="new-password"
+                    placeholder={
+                      editing && currentApiTokenSet && !apiTokenCleared
+                        ? t.runtimeSpecApiTokenSetPlaceholder
+                        : undefined
+                    }
+                    helperText={t.runtimeSpecApiTokenNote}
+                  />
+                  <Typography variant="caption" color="text.secondary">
+                    {currentApiTokenSet && !apiTokenCleared
+                      ? t.runtimeSpecApiTokenSetIndicator
+                      : t.runtimeSpecApiTokenUnsetIndicator}
+                  </Typography>
+                  {editing && currentApiTokenSet && !apiTokenCleared && (
+                    <Button
+                      type="button"
+                      size="small"
+                      variant="text"
+                      color="secondary"
+                      onClick={() => {
+                        setApiTokenCleared(true);
+                        setApiTokenInput('');
+                      }}
+                    >
+                      {t.runtimeSpecApiTokenClear}
+                    </Button>
+                  )}
+                </Box>
+              )}
+              {apiTokenMode === 'random' && (
+                <Box sx={{ display: 'grid', gap: 0.5 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    {t.runtimeSpecApiTokenRandomHint}
+                  </Typography>
+                  <Button
+                    type="button"
+                    size="small"
+                    variant="outlined"
+                    disabled={apiTokenRotate}
+                    onClick={() => setApiTokenRotate(true)}
+                    sx={{ justifySelf: 'start' }}
+                  >
+                    {apiTokenRotate
+                      ? t.runtimeSpecApiTokenRotatePending
+                      : t.runtimeSpecApiTokenRotate}
+                  </Button>
+                </Box>
+              )}
+            </Box>
 
             <Box sx={{ display: 'grid', gap: 1 }}>
               <Typography variant="subtitle2" component="h3">
