@@ -3586,6 +3586,25 @@ export function RuntimeAdminSection({
             <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
               {t.runtimeSpecSetVisibleDevicesHint}
             </Typography>
+            {setVisibleDevices && (
+              <>
+                <SelectField
+                  id="runtime-spec-visible-devices-mode"
+                  label={t.runtimeSpecVisibleDevicesMode}
+                  value={visibleDevicesMode}
+                  onChange={(e) => setVisibleDevicesMode(e.target.value as 'env' | 'args')}
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="env">{t.runtimeSpecVisibleDevicesModeEnv}</option>
+                  <option value="args">{t.runtimeSpecVisibleDevicesModeArgs}</option>
+                </SelectField>
+                {visibleDevicesMode === 'args' && (
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                    {t.runtimeSpecVisibleDevicesModeArgsHint}
+                  </Typography>
+                )}
+              </>
+            )}
             <SelectField
               id="runtime-spec-admin-state"
               label={t.runtimeSpecAdminState}

@@ -4962,6 +4962,51 @@ describe('RuntimeAdminSection set_visible_devices', () => {
   });
 });
 
+describe('RuntimeAdminSection visibility mode', () => {
+  it('shows the mode select only when set_visible_devices is on and round-trips args', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          set_visible_devices: true,
+          visible_devices_mode: 'env',
+          args: ['--device', '${CUDA_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    // Control is present because the checkbox is on, and shows the stored 'env'.
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode });
+    expect(combo).toHaveTextContent(t.runtimeSpecVisibleDevicesModeEnv);
+    // Switch to args (MUI Select idiom).
+    fireEvent.mouseDown(combo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecVisibleDevicesModeArgs }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.visible_devices_mode).toBe('args');
+  });
+
+  it('hides the mode select when set_visible_devices is off', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1',
+          set_visible_devices: false }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    expect(
+      screen.queryByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode }),
+    ).not.toBeInTheDocument();
+  });
+});
+
 /**
  * The model-mapping tab: the SAME table and the SAME edit mask an ordinary
  * application gets (`MappingSection`), minus the actions that would mint or
