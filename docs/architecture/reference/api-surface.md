@@ -298,7 +298,8 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid` | 400 |
+| `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
 | `application.proxy_listen_port_invalid` | 400 |
@@ -368,7 +369,57 @@ this endpoint; the two mode rules (`visible_devices_mode_invalid`,
 `visible_devices_args_no_placeholder`) are **portal-only**, and the agent
 instead degrades an unknown or empty `visible_devices_mode` to `env` rather
 than refusing it. See
-[agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement). **Env values are never validated** —
+[agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement).
+
+`RuntimeSpecDTO` additionally carries the runtime-spec **API token** fields —
+see [agent-runtime-manager.md](../cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)
+for the four modes and the security posture, and
+[Data Model §4](data-model.md#runtime-spec-api-token) for the underlying
+columns. On the **GET** response: `api_token_mode` (`"app"` | `"set"` |
+`"random"` | `"off"`, default `"app"`), `api_token_set` (presence of a
+per-spec `set`/`random` token — the value is never on the wire),
+`api_token_header_source` (`"app"` | `"custom"`), `api_token_header` (the
+custom header, empty ⇒ `Authorization: Bearer`), and two **read-only echoes**
+of the parent application's own token state — `app_api_token_set` and
+`app_api_token_header` — so the portal can render the header a spec inherits
+under `app`-sourced mode and the "application has no token ⇒ auth is off for
+this mapping" hint without a second round-trip. On the **PUT** request:
+`api_token_mode`/`api_token_header_source`/`api_token_header` (blank on the
+request defaults both mode and header source to `"app"`, mirroring
+`visible_devices_mode`'s empty→`env`); `api_token` is the same **write-only
+sentinel** shape as `applications.api_token` —
+`nil`/absent keeps the stored token, `""` clears it, a value replaces and
+reseals it — and `api_token_rotate: true` under mode `random` forces a fresh
+server-generated value regardless of what `api_token` carries. `api_token`
+and `api_token_rotate` are the only two spec fields excluded from the
+"full-document replace" rule's literal reading: every other field is applied
+verbatim from the request, these two are write-only instructions rather than
+stored values, so a GET response can never round-trip back into a PUT request
+unmodified the way it can for the rest of the spec.
+
+Validation, mirroring the `${..._DEVICES}`/`visible_devices_mode` shape
+above and returned **before any mutation**: `runtime_spec.api_token_mode_invalid` when
+`api_token_mode` is outside the four values;
+`runtime_spec.api_token_no_placeholder` when the mode is `set` or `random`
+but the literal `${API_TOKEN}` appears in neither an `env` value nor `args`
+— **scoped to `set`/`random` only**, so a pre-feature spec now defaulted to
+`app` is never tripped by it, and `${API_TOKEN}` in `args` is accepted here
+(it is a portal *warning*, not a 400 — see agent-runtime-manager.md);
+`runtime_spec.api_token_placeholder_without_mode` when `${API_TOKEN}` is
+used while `api_token_mode` is `off` — the one mode where the placeholder
+can never resolve; and `runtime_spec.api_token_header_invalid` when
+`api_token_header_source` is outside `{app, custom}`, or `custom` pairs with
+an `api_token_header` that fails the application token's own header-name
+shape check (token characters, no colon or space; empty is valid and means
+Bearer). There is deliberately **no** "app-mode-with-no-app-token" error —
+that combination is valid and means auth is off for this mapping, exactly
+like the application itself. A `set` write or a `random` generation on a
+disk-backed store with no encryption key fails closed as
+`runtime_spec.api_token_key_required` (`capture.ErrKeyRequired`), checked
+**before any persist** so no half-written mode or plaintext `plain:` token
+ever lands — `Rotate` follows the identical gate.
+
+**Env values are never validated** —
 that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
 `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and `${CUDA_DEVICES}`/
 `${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder mechanism, and it means an env key naming an

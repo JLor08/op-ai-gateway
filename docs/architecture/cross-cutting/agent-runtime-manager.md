@@ -246,7 +246,7 @@ placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly seven placeholders are resolved, in both `args` and `env` values:
+Exactly eight placeholders are resolved, in both `args` and `env` values:
 
 - `${PORT}` — an exact match substitutes the child's listen port.
 - `${MODEL}` — an exact match substitutes the spec's **`upstream_model`**: the
@@ -305,6 +305,31 @@ Exactly seven placeholders are resolved, in both `args` and `env` values:
 - `${AGENT_ENV:NAME}` — resolved from the agent's own process environment. A
   **missing variable is a hard error naming the variable**, never a silent empty
   substitution.
+- `${API_TOKEN}` — **exact match only**, like `${MODEL}`/`${HOST_GPU_IDS}`/the
+  three device placeholders: it does not join the `PORT`/`AGENT_ENV` near-miss
+  group below, so a near-miss such as `${API_TOKENS}` is not resolved and
+  passes through as literal text. It substitutes the **decrypted upstream
+  token** the gateway resolved for this spec's `api_token_mode` and pushed in
+  the wire `Spec.api_token` field — **not** a value read from the agent's own
+  environment, so it is deliberately **not** folded into the `${AGENT_ENV:…}`
+  branch even though both carry secrets: `${AGENT_ENV:NAME}` calls `getenv`,
+  this reads a field the gateway put on the wire, and the two must not be
+  conflated. `${API_TOKEN}` with an **empty** resolved token — mode `off`,
+  mode `app` against an application with no token, or a gateway-side decrypt
+  failure — is a **hard launch error**, on the same reasoning as a missing
+  `${AGENT_ENV:NAME}` variable: never a silent empty substitution. Like
+  `${AGENT_ENV:NAME}`, it records its **own** secret span at the point of
+  substitution (label `${API_TOKEN}`) so the reported launch command masks it
+  ([§14.7](#147-the-resolved-command-what-actually-ran)) — new code, not a
+  reuse of the `${AGENT_ENV}` span path, because the two provenances must
+  never be conflated in a log frame either. Valid in **Env values
+  (recommended) and in Args** — the portal shows a prominent, non-blocking
+  warning when it lands in Args, since a value there is readable via the
+  process listing (`ps aux`, `/proc/<pid>/cmdline`) and may be echoed by the
+  model server's own startup log, neither of which the agent's masking can
+  reach. See the token modes and the full security posture below, and
+  [ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)
+  for the decision.
 
 Everything else passes through byte-for-byte so a model server's own templating
 syntax survives — *except* a near-miss, which is a hard error: if the
@@ -437,6 +462,111 @@ configuration error it is. Expansion is also **dry-run with port 0 before any
 resource is acquired**, so a permanently broken spec fails without grabbing an
 ephemeral port; the port value only substitutes a decimal string, so the dry run
 is faithful.
+
+#### The runtime-spec API token: a deliberate, one-off exception to "no secret enters the gateway"
+
+`${API_TOKEN}` exists to let a spec require an upstream token on its launched
+child **and** have the gateway authenticate to that child with the same
+token. Everything above this point in §3.2 is a placeholder whose *value*
+never touches the gateway; this one is the opposite by design, and the
+divergence from ADR-027 is conscious and scoped, not an erosion of it — it is
+exactly the posture `routing.Application.APIToken` already has (§1
+background), extended one level down to a per-mapping override. See
+[ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)
+for the decision and its trade-offs; this section states the mechanism.
+
+A spec's `api_token_mode` (migration 74, [Data Model §4](../reference/data-model.md#runtime-spec-api-token)) is one of four:
+
+| Mode | Where the token comes from | `${API_TOKEN}` requirement |
+|---|---|---|
+| `app` (**default**) | `Application.APIToken` (today's edge behaviour, reused for this mapping's child too) | optional — absent means only the edge sends it, as before |
+| `set` | the spec's own sealed `api_token`, operator-written | required |
+| `random` | the spec's own sealed `api_token`, gateway-generated (`crypto/rand`), rotatable, never shown to anyone | required |
+| `off` | none — sent to neither the child nor the edge, even if the application has one | forbidden |
+
+`app` mode against an application with **no** token is valid, not an error:
+it means auth is off for this mapping, exactly as it is for the application
+itself, and the portal states this as a hint rather than refusing the save —
+there is deliberately no "app-mode-unset" error code. The four-error-code
+validation that keeps a spec's mode and its `${API_TOKEN}` placeholder
+consistent is in
+[API Surface](../reference/api-surface.md#agent-managed-model-runtime).
+
+Both directions read the mode through one function,
+`routing.SpecUpstreamAuth(spec, app)`: it returns the sealed token and the
+**effective header** (`spec.APITokenHeader` when
+`api_token_header_source = custom`, else `app.APITokenHeader` — so a spec can
+reuse the application's header convention or set its own). The gateway's
+resolver (`resolver.go` `targetFrom`) calls it to authenticate every ordinary
+request to a `server_agent` mapping's child, and the **VRAM benchmark and
+capacity-probe** Target builders (`internal/gateway/benchmark_runner.go`) call
+the identical function rather than reading `Application.APIToken` directly —
+without that, a `set`/`random` child would 401 every scheduled benchmark and
+capacity probe, fail-closed but silently breaking measurement. Injection is
+the mirror image: when the gateway assembles the pushed runtime-config
+document for a spec, it resolves the same mode to a **decrypted** value and
+sets it on the wire `Spec.api_token` field, which is what `${API_TOKEN}`
+substitutes agent-side. Same token on both sides because the gateway is the
+one party that holds it; no router change was needed on either the gateway or
+the agent, because the agent's router already forwards the inbound
+`Authorization` header verbatim to the selected child.
+
+**Sealed at rest, decrypted only at the moment of use, fail-closed on
+decrypt.** `set` and `random` values are sealed with the same capture cipher
+used everywhere else secrets are stored (`capture.SealSecret` /
+`capture.OpenSecret`; [ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-the-encplain-scheme)),
+never returned to the UI (`api_token_set bool`, presence only), and a
+keyless disk store refuses to seal one at all — `capture.ErrKeyRequired`
+surfaces as a 400 **before any persist**, for both a fresh `set` value and a
+`random` generation, never a silent `plain:` fallback. When the gateway
+builds the pushed document and a decrypt fails, it pushes an **empty**
+token rather than a garbled or partial one — the agent then hard-errors at
+`${API_TOKEN}` exactly as it would for mode `off`, which is the safe failure:
+a child that never started requiring nothing is worse than a child that
+refused to start at all.
+
+**On the wire, this is genuinely on the wire — the one place this feature
+does not mirror `${AGENT_ENV:NAME}`.** The decrypted token rides the
+gateway→agent channel, which is authenticated always but encrypted only when
+the configured gateway URL is `https`; the agent accepts an `http://` URL
+without complaint, and on that transport the pushed token — like the agent's
+own bearer credential today — travels in clear. Any mode other than `off`
+therefore depends on an operator-supplied `https` gateway URL for
+confidentiality in transit; nothing in the shipped code currently refuses or
+warns about an `http` one for this feature specifically ([§13](#13-known-limitations-and-accepted-risks)).
+
+**Argument-list placement is allowed, not blocked, and costs real
+protection.** All three backends in the operator hint table accept the key
+via an environment variable, so Args exists only for a backend that takes it
+exclusively as a flag. A value there is readable by any co-tenant process on
+the agent host via the process listing, and a model server that echoes its
+own argv at startup can put it in the very output the agent's `stderr_tail`
+capture samples (§8.3) — the agent's masking of the *reported command*
+cannot reach either channel. The portal surfaces this as a loud, non-blocking
+warning rather than a refusal, on the same reasoning `${AGENT_ENV:NAME}`'s
+own Args exception already accepts (ADR-027): the operator keeps the
+fallback, informed of its cost.
+
+**A structural limitation this feature cannot lift.** Ollama has no native
+inbound-auth mechanism at all; LM Studio's token is a GUI-only toggle with no
+headless equivalent; llama-swap only reads `apiKeys` from its own YAML, never
+from an env var or flag a spec could set. Against any of the three, wiring
+`${API_TOKEN}` into Env or Args launches a child that never checks it, and
+the gateway-side authentication is then theatre — the token is sent, but
+nothing on the other end demands it. A `server_agent` runtime spec carries no
+typed field for *which* child model server it launches (`application.type`
+is always `server_agent`; that is what owns a spec at all), so the portal
+cannot gate a warning on the backend the way it gates the args-leak warning
+on the Args field's own contents. It shows a **general** structural warning
+whenever `api_token_mode != off`, regardless of the spec's binary, plus an
+**optional** cosmetic hint — derived from the binary's basename matching
+`ollama` or `llama-swap`/`llama_swap` — that only appends a sentence to the
+same banner and never gates whether it renders. See ADR-035 for why this
+replaced an earlier, unworkable design that keyed the warning off
+`application.type`.
+
+Capability flag `runtime_api_token` (`Since: "0.5.0"`) marks an agent that
+understands `${API_TOKEN}` at all; see [§7](#7-feature-negotiation).
 
 ### 3.3 `set_visible_devices`: turning the GPU list into an enforcement
 
@@ -1811,10 +1941,12 @@ unexpected status returns the last known set with a nil error; unknown names are
 ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_manager` (the managed runtime itself), `runtime_logs`
 ([§14](#14-managed-process-logs-t3)), `runtime_config_ack`
-([§7.2](#72-the-applied-document-acknowledgement)) and `gpu_selection`
+([§7.2](#72-the-applied-document-acknowledgement)), `gpu_selection`
 ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)),
-`Since: "0.4.0"`.
+`Since: "0.4.0"`, and `runtime_api_token`
+([§3.2](#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)),
+`Since: "0.5.0"`.
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -1843,6 +1975,26 @@ in this section.
 `server-agent`'s `Version` moved `0.3.0` → `0.4.0` for this one entry, MINOR
 per the versioning rule in [§7.1](#71-agent-versioning) (a new name in
 `agent.Features`).
+
+`runtime_api_token` follows the same "declared for the portal's benefit"
+shape as `gpu_selection`, for the same reason: an agent that does not
+recognize `${API_TOKEN}` does not fail loudly, it silently passes the literal
+text through as an unresolved placeholder (§3.2's exact-match rule means it
+never even joins the near-miss error path), which reaches the child as a
+token string that will never match what the operator intended and leaves the
+mapping quietly unauthenticated or broken depending on the backend. `runtime_manager`
+predates this feature by three releases (`0.2.0` → `0.5.0`), so an
+already-deployed agent that manages models today but lacks `${API_TOKEN}`
+support genuinely exists in the field, exactly the condition that makes a
+flag worth declaring rather than assuming. **Unlike `gpu_selection`, nothing
+on the gateway or portal side currently reads this flag back** — the agent
+declares the fact unconditionally, but no "agent too old" advisory is wired
+to it yet, so an operator who sets a `set`/`random` mode against a
+sub-`0.5.0` agent gets no portal warning before the spec fails to start.
+This is recorded as a known gap, not a design decision, in
+[§13](#13-known-limitations-and-accepted-risks).
+`server-agent`'s `Version` moved `0.4.0` → `0.5.0` for this entry, MINOR per
+the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -2195,6 +2347,21 @@ actually sees, not a config echo. The gateway re-masks on ingest as defence in
 depth, not as a substitute; correspondingly, the redaction *test* lives
 agent-side, because a gateway-side test would assert on values that arrive
 already masked.
+
+The same re-parse-and-mask pass covers the wire `Spec.api_token` field: a
+hand-written file-mode `runtime.json` can carry a literal `api_token`
+(gateway-mode documents never do — the gateway writes it separately as a
+decrypted push value, never into the stored spec), and a non-empty one is
+replaced with the identical `•••` mask, keys-and-shape untouched, an empty
+one staying empty so absence is still distinguishable on the wire. It is
+masked rather than dropped for the same reason `env` values are masked
+rather than omitted: the report is an audit of what the agent is running
+with, and silently removing the field would look like "no token configured"
+for a spec that has one. This is defence in depth twice over — the
+gateway's own ingest type for a file-mode report (`agentRuntimeReportSpec`)
+carries no `api_token` field at all, so even an unmasked value arriving on
+the wire would be dropped by the unmarshal before it reached storage — but
+the agent-side mask is what keeps that from being the *only* protection.
 
 > **Limitation — `args` are not masked *in this report*.** The report's wire
 > contract scopes redaction to `env` values, and `args` are deliberately outside
@@ -4308,6 +4475,28 @@ operator meets first:
   the directory check, is the boundary.
 - **The feature ships no metrics** of its own beyond the telemetry sample and the
   status stream.
+- **The runtime-spec API token cannot secure three of the backends it can be
+  attached to.** Ollama has no native inbound-auth mechanism at all, LM
+  Studio's token is a GUI-only toggle with no headless equivalent, and
+  llama-swap only reads `apiKeys` from its own YAML — wiring `${API_TOKEN}`
+  into any of the three launches a child that never checks it. This is
+  structural, not a bug: the portal warns generally (§3.2), because a
+  `server_agent` runtime spec carries no field naming which child backend it
+  launches, so there is nothing to gate a backend-specific refusal on.
+- **The https-on-the-wire requirement for a non-`off` token mode is stated,
+  not enforced.** The decrypted token travels the gateway→agent channel in
+  clear whenever the configured gateway URL is `http://`, exactly as the
+  agent's own bearer credential already does — nothing shipped adds a
+  server-side guard (`portal.Service` does not hold the gateway's own public
+  URL) or a portal-side warning for this feature specifically. An operator
+  running any agent over plaintext is depending on network-layer protection
+  (a private network, a mesh) that this feature does not itself verify.
+- **`runtime_api_token`'s capability flag has no consumer yet.** Unlike
+  `gpu_selection`, which drives a non-blocking "agent too old" advisory
+  ([§7](#7-feature-negotiation)), nothing on the gateway or portal side reads
+  this flag back today; an operator who configures `set`/`random` against an
+  agent older than `0.5.0` gets no portal warning before the spec fails to
+  start with an unresolved `${API_TOKEN}`.
 
 ## 14. Managed-process logs (T3)
 
@@ -4591,15 +4780,23 @@ about the same command and travel as two independent flags — `masked` and
 `env_redacted` — because the portal must tell an operator which mask they are
 looking at, and the two ask opposite things of them. Both can be set at once:
 
-1. `masked` — **Every `${AGENT_ENV:NAME}`-derived span, wherever it landed** — in an
-   argument as much as in an env value — is replaced by *its own placeholder*,
-   e.g. `--api-key ${AGENT_ENV:HF_TOKEN}`. This is the one class of value the
-   gateway is never given (ADR-027), so a resolved copy must not travel upward
-   just because a view wants to be helpful. The agent can be exact about it
-   because it is the code that performed the substitution: it records the byte
-   span at the moment of substitution, so masking is never a search for the
-   secret's *value* — a one-character secret would otherwise mask every
-   occurrence of that character in `--port 54331`.
+1. `masked` — **Every `${AGENT_ENV:NAME}`- or `${API_TOKEN}`-derived span,
+   wherever it landed** — in an argument as much as in an env value — is
+   replaced by *its own placeholder*, e.g. `--api-key ${AGENT_ENV:HF_TOKEN}`
+   or `--api-key ${API_TOKEN}`. `${AGENT_ENV:NAME}` is the one class of value
+   the gateway is never given at all (ADR-027); `${API_TOKEN}` is the opposite
+   — the gateway is the party that generated or holds it — but the flag is
+   the same, because the operator-facing question is identical either way:
+   "is this the placeholder, or the value?". A resolved copy must not travel
+   upward just because a view wants to be helpful, in both cases. The two
+   provenances are recorded through **independent code**, never a shared
+   branch — `${AGENT_ENV:NAME}` reads `getenv`, `${API_TOKEN}` reads the wire
+   `Spec.api_token` field, and conflating them would let one variable's
+   masking rule silently govern the other — but both record a byte span at
+   the moment of substitution and both feed the same `maskSecretSpans` pass,
+   so masking is never a search for the secret's *value* for either one — a
+   one-character secret would otherwise mask every occurrence of that
+   character in `--port 54331`.
 2. `env_redacted` — **On a file-mode agent only, every spec-supplied `env`
    value**, masked in full with keys intact. That is not a new rule: it is
    precisely the line the upward report already draws (§8.3), because a local
