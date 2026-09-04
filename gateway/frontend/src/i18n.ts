@@ -625,6 +625,18 @@ const de = {
     'Der Gateway erzeugt und verwaltet diesen Token selbst; der Wert wird nirgendwo angezeigt und kann nur rotiert, nicht ausgelesen werden.',
   runtimeSpecApiTokenRotate: 'Neu erzeugen (rotieren)',
   runtimeSpecApiTokenRotatePending: 'Wird beim Speichern neu erzeugt',
+  // Runtime-Spec API Token header source (Task 14): which header carries the
+  // token from the mode block above.
+  runtimeSpecApiTokenHeaderSource: 'Header-Quelle',
+  runtimeSpecApiTokenHeaderSourceApp: 'Von der Anwendung übernehmen',
+  runtimeSpecApiTokenHeaderSourceCustom: 'Eigener Header',
+  runtimeSpecApiTokenHeaderInheritedLabel: 'Übernommener Header',
+  runtimeSpecApiTokenHeaderDefault: 'Authorization: Bearer (Standard)',
+  runtimeSpecApiTokenHeaderLabel: 'Header-Name',
+  runtimeSpecApiTokenHeaderHelp:
+    'Leer = Authorization: Bearer; sonst der Header-Name (z. B. x-api-key).',
+  runtimeSpecApiTokenHeaderMismatchWarning:
+    'Der eigene Header muss exakt dem entsprechen, was das Backend erwartet — bei einem Backend, das nur „Authorization: Bearer“ akzeptiert, bleibt diese Zuordnung sonst effektiv unauthentifiziert.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
   // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
@@ -2741,6 +2753,18 @@ const en: PortalMessages = {
     'The gateway generates and manages this token itself; the value is never shown anywhere and can only be rotated, never read back.',
   runtimeSpecApiTokenRotate: 'Regenerate (rotate)',
   runtimeSpecApiTokenRotatePending: 'Will be regenerated on save',
+  // Runtime-Spec API Token header source (Task 14): which header carries the
+  // token from the mode block above.
+  runtimeSpecApiTokenHeaderSource: 'Header source',
+  runtimeSpecApiTokenHeaderSourceApp: 'Inherit from the application',
+  runtimeSpecApiTokenHeaderSourceCustom: 'Custom header',
+  runtimeSpecApiTokenHeaderInheritedLabel: 'Inherited header',
+  runtimeSpecApiTokenHeaderDefault: 'Authorization: Bearer (default)',
+  runtimeSpecApiTokenHeaderLabel: 'Header name',
+  runtimeSpecApiTokenHeaderHelp:
+    'Empty = Authorization: Bearer; otherwise the header name (e.g. x-api-key).',
+  runtimeSpecApiTokenHeaderMismatchWarning:
+    'A custom header must match exactly what the backend expects — against a backend that only accepts "Authorization: Bearer", this mapping is otherwise left effectively unauthenticated.',
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
   runtimeSpecVramApply: 'Apply',

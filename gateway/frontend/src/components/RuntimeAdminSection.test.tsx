@@ -165,6 +165,33 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
   };
 }
 
+// Shared by both the API-token MODE tests (Task 12/13) and the header-source
+// tests (Task 14): opens the edit sub-view for a single pre-existing spec.
+async function openApiTokenSpecEdit(
+  specOverrides: Partial<RuntimeSpec> = {},
+  applicationOverride?: PortalApplication,
+) {
+  const rendered = renderSection({
+    mappings: [makeMapping({ id: 'map_1' })],
+    specsByMappingId: {
+      map_1: makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        // Binary is a required field; a save in these tests must not be
+        // silently blocked by HTML5 constraint validation over a fact this
+        // describe block has no interest in.
+        binary: '/usr/bin/llama-server',
+        ...specOverrides,
+      }),
+    },
+    ...(applicationOverride ? { application: applicationOverride } : {}),
+  });
+  await screen.findByText('gw-model');
+  fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+  await screen.findByLabelText(t.runtimeSpecBinary);
+  return rendered;
+}
+
 // Minimal-but-valid HardwareResponse for the "server limits" telemetry-prefill
 // and drift-warning tests: only the GPU list varies per test, everything else
 // is boilerplate HardwareReport shape the type requires.
@@ -5888,29 +5915,9 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
 // Runtime-Spec API Token (Task 12/13): the MODE controls only -- a mode
 // select (default 'app'), a write-only token field for 'set', a rotate
 // button for 'random', and the app-unset hint for 'app'. The header-source
-// select + inherited-header display is Task 14 and has no coverage here.
+// select + inherited-header display is Task 14, covered in its own describe
+// block below.
 describe('RuntimeAdminSection API-token mode (Task 12/13)', () => {
-  async function openApiTokenSpecEdit(specOverrides: Partial<RuntimeSpec> = {}) {
-    const rendered = renderSection({
-      mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: {
-        map_1: makeSpec({
-          configured: true,
-          mapping_id: 'map_1',
-          // Binary is a required field; a save in these tests must not be
-          // silently blocked by HTML5 constraint validation over a fact this
-          // describe block has no interest in.
-          binary: '/usr/bin/llama-server',
-          ...specOverrides,
-        }),
-      },
-    });
-    await screen.findByText('gw-model');
-    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(t.runtimeSpecBinary);
-    return rendered;
-  }
-
   it('defaults api_token_mode to app in the spec PUT body (create)', async () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -6059,5 +6066,114 @@ describe('RuntimeAdminSection API-token mode (Task 12/13)', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_token_mode).toBe('off');
     expect('api_token_rotate' in putSpecs[0].body).toBe(false);
+  });
+});
+
+// Runtime-Spec API Token header source (Task 14): which header CARRIES the
+// token from the mode block above -- inherit the app's own header (default)
+// or set a per-mapping custom one, with a warning that a custom header must
+// match what the backend actually expects. Hidden entirely under mode 'off'.
+describe('RuntimeAdminSection API-token header source (Task 14)', () => {
+  it('shows the Bearer default when the parent app has no header override', async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+      app_api_token_header: '',
+    });
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe(t.runtimeSpecApiTokenHeaderDefault);
+  });
+
+  it("shows the app's own header name once it has one", async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+      app_api_token_header: 'X-Api-Key',
+    });
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe('X-Api-Key');
+  });
+
+  it('falls back to the parent application’s own header on CREATE (no spec yet)', async () => {
+    renderSection({ application: { ...application, api_token_header: 'X-From-App' } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe('X-From-App');
+  });
+
+  it('switching to "custom" hides the inherited display and shows the free-text field', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', api_token_header_source: 'app' });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+
+    expect(
+      screen.queryByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel),
+    ).not.toBeInTheDocument();
+    const headerField = screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel) as HTMLInputElement;
+    expect(headerField.value).toBe('');
+    expect(headerField.placeholder).toBe('Authorization: Bearer');
+    // No mismatch warning yet: an empty custom header round-trips to the same
+    // Bearer default the 'app' source would show.
+    expect(screen.queryByText(t.runtimeSpecApiTokenHeaderMismatchWarning)).not.toBeInTheDocument();
+  });
+
+  it('renders the mismatch warning once a non-empty custom header is typed', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', api_token_header_source: 'app' });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel), {
+      target: { value: 'X-Custom-Auth' },
+    });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenHeaderMismatchWarning)).toBeInTheDocument();
+  });
+
+  it('sends the header source + custom header in the spec PUT body', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+    });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel), {
+      target: { value: 'X-Custom-Auth' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_header_source).toBe('custom');
+    expect(putSpecs[0].body.api_token_header).toBe('X-Custom-Auth');
+  });
+
+  it('hides the whole header block when mode is "off"', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'off' });
+
+    expect(
+      screen.queryByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecApiTokenHeaderLabel)).not.toBeInTheDocument();
   });
 });

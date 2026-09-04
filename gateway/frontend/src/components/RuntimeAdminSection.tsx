@@ -3447,6 +3447,10 @@ export function RuntimeAdminSection({
     const currentSpec = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
     const currentApiTokenSet = currentSpec?.api_token_set ?? false;
     const appApiTokenSet = currentSpec?.app_api_token_set ?? application.api_token_set;
+    // Task 14's inherited-header display: same read-only-echo-with-create-time
+    // fallback as appApiTokenSet immediately above, but for the header NAME
+    // rather than the set/unset fact.
+    const appApiTokenHeader = currentSpec?.app_api_token_header ?? application.api_token_header;
     // Recomputed on every keystroke on purpose: the whole defect being fixed
     // is that the field's contract was invisible until a foreign program
     // rejected it, so the feedback has to land at paste time, not at submit.
@@ -3769,12 +3773,7 @@ export function RuntimeAdminSection({
               ))}
             </SelectField>
 
-            {/* Runtime-Spec API Token (Task 12/13): the MODE controls only --
-                the header-source select + inherited-header display is Task 14
-                and deliberately has no UI here yet (buildSpecBody/hydrateSpecFields
-                still round-trip api_token_header_source/api_token_header so a
-                save from THIS form never resets a choice Task 14 lets an
-                operator make). */}
+            {/* Runtime-Spec API Token (Task 12/13): the MODE controls. */}
             <Box sx={{ display: 'grid', gap: 1 }}>
               <SelectField
                 id="runtime-spec-api-token-mode"
@@ -3858,6 +3857,68 @@ export function RuntimeAdminSection({
                 </Box>
               )}
             </Box>
+
+            {/* Runtime-Spec API Token header (Task 14): which header CARRIES
+                the token above, as opposed to the mode block's WHAT the token
+                IS. Hidden entirely under 'off' -- there is no token to attach
+                a header to, and the effective-header question the app-source
+                display and the custom-header warning both answer does not
+                arise. `apiTokenHeaderSource`/`apiTokenHeader` are Task 12/13
+                state (buildSpecBody/hydrateSpecFields already round-trip
+                them) -- this block is UI only, no new state. */}
+            {apiTokenMode !== 'off' && (
+              <Box sx={{ display: 'grid', gap: 1 }}>
+                <SelectField
+                  id="runtime-spec-api-token-header-source"
+                  label={t.runtimeSpecApiTokenHeaderSource}
+                  value={apiTokenHeaderSource}
+                  onChange={(e) =>
+                    setApiTokenHeaderSource(
+                      e.target.value as RuntimeSpec['api_token_header_source'],
+                    )
+                  }
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="app">{t.runtimeSpecApiTokenHeaderSourceApp}</option>
+                  <option value="custom">{t.runtimeSpecApiTokenHeaderSourceCustom}</option>
+                </SelectField>
+                {apiTokenHeaderSource === 'app' && (
+                  <Field
+                    id="runtime-spec-api-token-header-inherited"
+                    label={t.runtimeSpecApiTokenHeaderInheritedLabel}
+                    value={
+                      appApiTokenHeader.trim() === ''
+                        ? t.runtimeSpecApiTokenHeaderDefault
+                        : appApiTokenHeader
+                    }
+                    // See the vram-benchmark read-only Field above: the no-op
+                    // matters because jsdom's fireEvent.change fires even on a
+                    // readOnly input.
+                    onChange={() => {}}
+                    readOnly
+                    sx={{ maxWidth: 340 }}
+                  />
+                )}
+                {apiTokenHeaderSource === 'custom' && (
+                  <Box>
+                    <Field
+                      id="runtime-spec-api-token-header-custom"
+                      label={t.runtimeSpecApiTokenHeaderLabel}
+                      value={apiTokenHeader}
+                      onChange={(e) => setApiTokenHeader(e.target.value)}
+                      placeholder="Authorization: Bearer"
+                      helperText={t.runtimeSpecApiTokenHeaderHelp}
+                      sx={{ maxWidth: 340 }}
+                    />
+                    {apiTokenHeader.trim() !== '' && (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        {t.runtimeSpecApiTokenHeaderMismatchWarning}
+                      </Alert>
+                    )}
+                  </Box>
+                )}
+              </Box>
+            )}
 
             <Box sx={{ display: 'grid', gap: 1 }}>
               <Typography variant="subtitle2" component="h3">
