@@ -73,6 +73,14 @@ var (
 	// ErrRuntimeSpecFlavorInvalid rejects an api_flavors entry that is not
 	// openai/anthropic. HTTP 400.
 	ErrRuntimeSpecFlavorInvalid = errors.New("runtime_spec.flavor_invalid")
+	// ErrRuntimeSpecVisibleDevicesModeInvalid rejects a visible_devices_mode
+	// that is not "env" or "args". HTTP 400.
+	ErrRuntimeSpecVisibleDevicesModeInvalid = errors.New("runtime_spec.visible_devices_mode_invalid")
+	// ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder rejects set_visible_devices
+	// in args mode when none of the three device placeholders
+	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}) appears in args: the
+	// agent would inject no visibility and the selection would be lost. HTTP 400.
+	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -346,6 +354,9 @@ type RuntimeSpecDTO struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
+	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
+	VisibleDevicesMode string `json:"visible_devices_mode"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -379,6 +390,9 @@ type PutRuntimeSpecRequest struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// VisibleDevicesMode: see RuntimeSpecDTO's doc. Absent (empty/"")
+	// defaults to "env" — see putRuntimeSpec.
+	VisibleDevicesMode string `json:"visible_devices_mode"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -397,7 +411,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
-		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}}, nil
+		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}, VisibleDevicesMode: string(routing.VisibleDevicesModeEnv)}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
@@ -525,6 +539,13 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
+	// behavior); a bad value is a LATER task's validation (mode validation
+	// is not wired up yet — this resolves the stored typed value only).
+	visibleMode := routing.VisibleDevicesModeEnv
+	if strings.TrimSpace(req.VisibleDevicesMode) != "" {
+		visibleMode = routing.VisibleDevicesMode(strings.TrimSpace(req.VisibleDevicesMode))
+	}
 	args := req.Args
 	if args == nil {
 		args = []string{}
@@ -589,6 +610,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		AdminState:                  adminState,
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
+		VisibleDevicesMode:          visibleMode,
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
@@ -603,10 +625,11 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		return RuntimeSpecDTO{}, err
 	}
 	gpuRows := make([]routing.RuntimeSpecGPU, 0, len(req.GPUs))
-	for _, g := range req.GPUs {
+	for i, g := range req.GPUs {
 		gpuRows = append(gpuRows, routing.RuntimeSpecGPU{
 			SpecID:         spec.ID,
 			GPUIndex:       g.Index,
+			Position:       i, // request array order becomes the stored order
 			VRAMEstimateMB: g.VRAMEstimateMB,
 			VRAMMeasuredMB: measuredByIndex[g.Index], // 0 for a brand-new index; preserved otherwise
 		})
@@ -675,9 +698,45 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// validateRuntimeSpecVisibleDevices enforces the two combinations
-// set_visible_devices may not be saved in. Both are ALSO refused by the agent
-// at launch, and that duplication is deliberate in both directions:
+// runtimeSpecDevicePlaceholders are the three llama.cpp --device placeholders
+// the agent expands (mirrors the agent's own token set in policy_local.go).
+// In args mode at least one must appear in the spec's args, else the
+// selection would silently vanish.
+var runtimeSpecDevicePlaceholders = []string{
+	"${CUDA_DEVICES}",
+	"${VULKAN_DEVICES}",
+	"${METAL_DEVICES}",
+}
+
+func argsHaveDevicePlaceholder(args []string) bool {
+	for _, a := range args {
+		for _, ph := range runtimeSpecDevicePlaceholders {
+			if strings.Contains(a, ph) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validVisibleDevicesMode validates a raw visible_devices_mode at the DTO
+// edge (mirrors validEndpointMode). Empty is valid and defaults to "env" in
+// putRuntimeSpec; any other non-env/args value is rejected.
+func validVisibleDevicesMode(raw string) (routing.VisibleDevicesMode, bool) {
+	switch m := routing.VisibleDevicesMode(strings.TrimSpace(raw)); m {
+	case "", routing.VisibleDevicesModeEnv, routing.VisibleDevicesModeArgs:
+		return m, true
+	default:
+		return "", false
+	}
+}
+
+// validateRuntimeSpecVisibleDevices validates visible_devices_mode (always,
+// regardless of the flag) and, when set_visible_devices is on, enforces the
+// combinations it may not be saved in: an env conflict, an empty GPU list, or
+// (in args mode) args with no device placeholder. The flag-gated traps are
+// ALSO refused by the agent at launch, and that duplication is deliberate in
+// both directions:
 //
 //   - Only the portal can tell the operator IN THE MOMENT. The agent's refusal
 //     surfaces as a terminal `not_permitted` on a spec the operator already
@@ -697,6 +756,12 @@ var runtimeSpecVisibleDevicesVars = []string{
 // reads req rather than the stored row: this API is a full-document upsert, so
 // the request IS the resulting spec.
 func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
+	// The mode value is validated regardless of the flag: a malformed enum is
+	// a malformed request. Empty defaults to "env" (resolved in putRuntimeSpec).
+	mode, ok := validVisibleDevicesMode(req.VisibleDevicesMode)
+	if !ok {
+		return ErrRuntimeSpecVisibleDevicesModeInvalid
+	}
 	if !req.SetVisibleDevices {
 		return nil
 	}
@@ -711,6 +776,11 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 	// `CUDA_VISIBLE_DEVICES=`, which hides every card from the model.
 	if len(req.GPUs) == 0 {
 		return ErrRuntimeSpecVisibleDevicesNoGPUs
+	}
+	// args mode: at least one device placeholder must be present, else the
+	// agent injects nothing and the selection is silently lost.
+	if mode == routing.VisibleDevicesModeArgs && !argsHaveDevicePlaceholder(req.Args) {
+		return ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder
 	}
 	return nil
 }
@@ -785,6 +855,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
+		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 	}, nil
 }
 
@@ -1313,8 +1384,13 @@ type AgentRuntimeSpecDTO struct {
 	// visibility variable for this spec's child from the GPUs above. The
 	// gateway is hardware-agnostic and never resolves WHICH variable that
 	// is — only the agent knows what stack the host runs.
-	SetVisibleDevices bool   `json:"set_visible_devices"`
-	AdminState        string `json:"admin_state"`
+	SetVisibleDevices bool `json:"set_visible_devices"`
+	// VisibleDevicesMode tells the agent whether to enforce visibility via the
+	// env variable ("env") or to leave it to a ${..._DEVICES} placeholder the
+	// operator put in Args ("args"). Unlike api_flavors/responses_mode, the
+	// agent NEEDS this, so it DOES cross the wire.
+	VisibleDevicesMode string `json:"visible_devices_mode"`
+	AdminState         string `json:"admin_state"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1583,6 +1659,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
 		SetVisibleDevices:           spec.SetVisibleDevices,
+		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		AdminState:                  spec.AdminState,
 	}, nil
 }

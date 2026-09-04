@@ -507,5 +507,61 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-72-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-73-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
+
+## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
+**Context:** the agent numerically sorted a spec's declared GPU indices before
+building any visible-devices value — the env-mode variable and
+`${HOST_GPU_IDS}` alike — discarding whatever order the operator gave the rows
+in the portal. `set_visible_devices` could only set a whole-process visibility
+variable, which hides every other card from the child; there was no way to
+steer llama.cpp's own finer-grained `--device` flag without an operator
+composing it by hand from `${HOST_GPU_IDS}`. **Decision:** persist the
+operator's GPU order explicitly — `agent_runtime_spec_gpus.position`
+(migration 73), read back `order by position, gpu_index` — and honor that
+order everywhere a visibility value is built, replacing the ascending sort.
+Give `set_visible_devices` a `visible_devices_mode` (`env`, the default and
+today's behaviour, or `args`, which injects no visibility variable at all) and
+three new exact-match placeholders, siblings of `${HOST_GPU_IDS}`:
+`${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}`, each rendering the
+same ordered, deduplicated GPU list as `<prefix><localIndex>` (`CUDA`,
+`Vulkan`, `MTL` — llama.cpp's own Metal device name, not "Metal") for use in
+`args`. Validate both knobs at save, before any mutation —
+`runtime_spec.visible_devices_mode_invalid` for a mode outside `env`/`args`,
+`runtime_spec.visible_devices_args_no_placeholder` for an `args`-mode spec
+whose `args` mention none of the three placeholders. These two new rules are
+portal-only: the agent degrades an unknown or empty mode to `env` rather than
+refusing it and applies no args-placeholder check, so the file-mode path the
+portal never reaches is not guarded against them. Only the existing conflict
+and empty-GPU-list refusals are re-enforced by the agent at launch, and those
+apply unchanged in both modes. Declare one agent feature flag for all of it, `gpu_selection`
+(`Since: "0.4.0"`), since the order fix and the new mode ship in the same
+agent release; `server-agent`'s `Version` moves `0.3.0` → `0.4.0`, MINOR per
+the versioning rule ([§7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning)).
+**Consequence:** migration 73 backfills every existing spec's `position` to
+its prior ascending-by-`gpu_index` rank, so no already-deployed spec's
+emitted order changes on upgrade — order only moves once an operator actively
+reorders GPU rows in the portal. Unlike `${MODEL}`/`${HOST_GPU_IDS}`, which
+shipped in `runtime_manager`'s own release so no agent that can run a spec at
+all can lack them, `gpu_selection` ships two releases later (after
+`runtime_config_ack`'s `0.3.0`), so already-deployed older agents that support
+the managed runtime but predate it genuinely exist: such an agent silently
+re-sorts a custom order back to ascending and fails to launch an `args`-mode
+spec (the placeholder reaches llama.cpp as unparseable literal text). The
+portal reads `agent_features` and shows a non-blocking "agent too old"
+advisory — prominent for `args` mode, since the process would not start at
+all; informational for a custom order, since the model still starts, only on
+the wrong cards — never a blocked Save. A backend's local device index is its
+**own** independent enumeration, unrelated to the host/PCI GPU index an
+operator's other tooling reports, so `Vulkan0`/`MTL0` need not be host GPU 0;
+an operator verifies the mapping with llama.cpp's own `--list-devices`.
+`${METAL_DEVICES}` additionally does nothing useful except against a macOS
+host running a llama.cpp build compiled with multi-device Metal support,
+which the portal also flags when the placeholder is used against a
+non-macOS agent.
+→ [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
+[§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Data Model §4](reference/data-model.md#4-migration-history-73-migrations),
+[API Surface](reference/api-surface.md#agent-managed-model-runtime).

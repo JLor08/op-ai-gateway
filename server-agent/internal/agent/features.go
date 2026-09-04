@@ -87,6 +87,19 @@ var Features = []Feature{
 	// first carries the Windows VRAM measurement and ADR-032's admission
 	// precedence.
 	{Name: "runtime_config_ack", Since: "0.3.0"},
+	// gpu_selection: this agent honors the operator's explicit GPU array order
+	// (no longer sorting spec.GPUs ascending) in the visibility variable and
+	// ${HOST_GPU_IDS}, expands the ${CUDA_DEVICES}/${VULKAN_DEVICES}/
+	// ${METAL_DEVICES} device placeholders, and honors
+	// visible_devices_mode="args" (inject no visibility env var; the operator
+	// selects devices via a --device placeholder). ONE flag for both behaviors:
+	// they ship together. Declared for the PORTAL's benefit -- the agent gates
+	// none of its own behavior on it, it always honors what it receives -- so
+	// the portal can warn that an older agent will ignore a custom order and
+	// will fail to launch an args-mode spec (the placeholder passes through
+	// literally). Since 0.4.0: agent.Features gains an entry, so the rule is a
+	// MINOR bump (see agent.go's Version block).
+	{Name: "gpu_selection", Since: "0.4.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

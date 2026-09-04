@@ -246,7 +246,7 @@ placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly four placeholders are resolved, in both `args` and `env` values:
+Exactly seven placeholders are resolved, in both `args` and `env` values:
 
 - `${PORT}` — an exact match substitutes the child's listen port.
 - `${MODEL}` — an exact match substitutes the spec's **`upstream_model`**: the
@@ -261,8 +261,9 @@ Exactly four placeholders are resolved, in both `args` and `env` values:
   not asked for, and a second token would have to be named so neither reading is
   ambiguous (`${GATEWAY_MODEL}`, never `${MODEL_NAME}`).
 - `${HOST_GPU_IDS}` — an exact match substitutes the spec's own declared GPU
-  indices **as the host sees them**, ascending, deduplicated, comma-separated
-  (`"2,5"`). It is the manual escape hatch beside `set_visible_devices`
+  indices **as the host sees them**, in the operator's declared order,
+  deduplicated, comma-separated (`"2,5"`). It is the manual escape hatch beside
+  `set_visible_devices`
   ([§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)):
   an operator on a runtime the agent has no vendor mapping for writes
   `{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"}` themselves rather
@@ -274,10 +275,33 @@ Exactly four placeholders are resolved, in both `args` and `env` values:
   that declares **no** GPUs is a hard error, on the same reasoning as an empty
   `upstream_model`: substituting `""` produces an empty visibility value, and
   an empty visibility value does not mean "no restriction", it means *nothing
-  is visible*. Ascending and deduplicated because the declared order never
-  survives a save anyway (the store reads GPU rows back `order by gpu_index`)
-  and because CUDA stops parsing the list at the first repeated entry, so
-  `1,1,2` would silently yield one visible device rather than three.
+  is visible*. **Declared order, not sorted**: the store persists an explicit
+  `agent_runtime_spec_gpus.position` column (migration 73) and reads the rows
+  back `order by position, gpu_index`, so `spec.GPUs` arrives in the order the
+  operator set in the portal, and that order is what reaches this list.
+  Deduplicated (first occurrence wins) because CUDA stops parsing the list at
+  the first repeated entry, so `1,1,2` would silently yield one visible device
+  rather than three.
+- `${CUDA_DEVICES}` / `${VULKAN_DEVICES}` / `${METAL_DEVICES}` — exact-match
+  siblings of `${HOST_GPU_IDS}` that render the same ordered/deduplicated index
+  list as llama.cpp `--device` names instead of bare host indices:
+  `<prefix><localIndex>` per GPU, prefix `CUDA`, `Vulkan` or `MTL` (llama.cpp's
+  own Metal device name is `MTL`, not `Metal`). `["--device",
+  "${CUDA_DEVICES}"]` on a spec declaring GPUs `[3, 2]` yields
+  `--device CUDA3,CUDA2` — the operator's order, not ascending. Same empty-set
+  refusal as `${HOST_GPU_IDS}`, on the same reasoning: a spec declaring no GPUs
+  is a hard error rather than an empty `--device` value. **The local index is
+  the vendor backend's own enumeration, not the host/PCI GPU index**: Vulkan
+  and Metal enumerate their devices independently of the host, so `Vulkan0` or
+  `MTL0` is not guaranteed to be the same physical card as host GPU 0 — an
+  operator relying on these placeholders verifies the mapping with llama.cpp's
+  own `--list-devices` output. (CUDA without `CUDA_VISIBLE_DEVICES` set
+  happens to match the host's own order, but that is llama.cpp's CUDA backend,
+  not a guarantee this agent makes.) `${METAL_DEVICES}` additionally only does
+  anything useful against a **macOS** host running a llama.cpp build compiled
+  with multi-device Metal support — the portal shows a hint when the placeholder
+  is used against a non-macOS agent, since stock llama.cpp Metal builds expose
+  one device.
 - `${AGENT_ENV:NAME}` — resolved from the agent's own process environment. A
   **missing variable is a hard error naming the variable**, never a silent empty
   substitution.
@@ -305,7 +329,9 @@ over-eager refusal breaks specs that work while a literal pass-through breaks
 only a spec that was already wrong. `HOST_GPU_IDS` inherits that rule for the
 same reason (`${GPU_IDS_FILE}`, `${HOST_GPU_IDS_JSON}`), with the same accepted
 cost: `${GPU_IDS}` — the shorter name this token deliberately does *not* use —
-reaches the child as literal text.
+reaches the child as literal text. `CUDA_DEVICES`, `VULKAN_DEVICES` and
+`METAL_DEVICES` are exact-match only for the identical reason and carry the
+identical accepted cost.
 
 `${MODEL}` and `${HOST_GPU_IDS}` need **no feature flag**
 ([ADR-025](../09-architecture-decisions.md) negotiation), and that was checked
@@ -320,6 +346,13 @@ unconstrained, but no such agent exists.
 whose intersection is true from the day it ships is permanent dead weight. The
 branch's single `0.2.0` bump covers this change; no further bump (`Version` is
 per shipped change, not per commit).
+
+**That argument does not transfer to `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/
+`${METAL_DEVICES}` or to `visible_devices_mode`.** They ship two releases
+later, behind the `gpu_selection` flag ([§7](#7-feature-negotiation)), precisely
+*because* already-deployed agents that support `runtime_manager` but predate
+them genuinely exist in the field — the "no such agent can exist" premise
+above is what makes `${MODEL}`/`${HOST_GPU_IDS}` the exception, not the rule.
 
 Four properties of that one pass are load-bearing, and each has a wrong
 implementation that shipped once:
@@ -434,6 +467,42 @@ GPU indices**:
 | AMD (`rocm-smi` present) | `ROCR_VISIBLE_DEVICES` — **and nothing else** |
 | Apple, or no recognised stack | *nothing*, and that is a success, not an error |
 
+That table describes `visible_devices_mode = "env"` (the default, and the
+whole of pre-existing behaviour). **`visible_devices_mode` (per spec, default
+`env`)** chooses *how* `set_visible_devices` enforces, and only matters when
+the option is on:
+
+| Mode | Behavior |
+|---|---|
+| `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
+| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
+
+`args` mode exists because a visibility variable hides every other card from
+the whole child process, while llama.cpp's own `--device` flag is
+finer-grained; it is a second lever beside the variable, not a replacement for
+it, which is why `env` stays the default and every pre-existing spec keeps its
+old behaviour untouched. An **`args`-mode spec must carry one of the three
+placeholders somewhere in `args`**: turning the option on, selecting `args`,
+and never mentioning a placeholder would have the agent inject nothing *and*
+the args say nothing, silently leaving every card visible to the child — the
+exact failure trap 1 below exists to prevent, reached through the other door.
+The portal refuses that combination at save
+(`runtime_spec.visible_devices_args_no_placeholder`, HTTP 400); a malformed
+`visible_devices_mode` value (anything but `env`/`args`, checked regardless of
+whether the option is even on) is
+`runtime_spec.visible_devices_mode_invalid`, also HTTP 400. Both run **before
+any mutation**. Unlike the empty-value and conflict traps below, these two
+mode rules are **portal-only** — the agent does not re-enforce them at launch:
+it degrades an unknown or empty `visible_devices_mode` to `env` rather than
+refusing it, and does not itself require an `args` placeholder, so a
+hand-written file-mode document is not guarded against the
+args-without-placeholder combination the way the portal guards it. **The
+conflict trap (trap 3 below) holds in both modes**: a hand-set
+`CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` in `env`
+is refused whenever `set_visible_devices` is on, regardless of
+`visible_devices_mode` — the mode changes what the agent injects, never
+whether a hand-set entry may coexist with the option.
+
 The vendor comes from the **same** detection the telemetry collectors use
 (`collector.DetectGPUCollectors`, which probes nvidia → amd → apple in that
 fixed order and keeps whichever reports `Available()`). It is a hardware
@@ -477,7 +546,12 @@ cannot know what is in the machine.
    cannot parse an arbitrary model server's argv. It is therefore **surfaced
    where the operator turns the option on** — the portal states it in the hint
    directly under the checkbox, in German and English, and a test asserts the
-   hint is there. It does **not** make two specs interfere (see below).
+   hint is there. It does **not** make two specs interfere (see below). **This
+   trap is specific to `env` mode.** An `args`-mode spec injects no visibility
+   variable, so the child sees every card and the `${CUDA_DEVICES}`/
+   `${VULKAN_DEVICES}`/`${METAL_DEVICES}` names it consumes are not renumbered
+   by a filter — they are still the backend's *own* independent enumeration,
+   which is a different caveat ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), not this one.
 3. **Conflict with a hand-set entry.** The option together with a
    visibility variable in the spec's own `env` is **refused, never silently
    resolved**. Both resolution orders are defensible, which is exactly the
@@ -501,6 +575,14 @@ cannot know what is in the machine.
    report and the same ones the per-GPU budgets and measurement rows are keyed
    by. `${HOST_GPU_IDS}` carries host indices too, which is why it is named that
    and not `${GPU_IDS}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)).
+   **In the operator's declared order, not sorted** — the store persists that
+   order explicitly (`agent_runtime_spec_gpus.position`, migration 73) and
+   reads the rows back `order by position, gpu_index`, replacing the earlier
+   behaviour of numerically sorting the spec's GPU indices before building this
+   value. The migration **backfilled** every pre-existing row's `position` to
+   its ascending-by-`gpu_index` rank, so no already-deployed spec's emitted
+   order changed on upgrade — the order only moves when an operator actively
+   reorders the GPU rows in the portal.
 
 #### Isolation is structural
 
@@ -1728,8 +1810,39 @@ would ignore a stale validator anyway); a transport error, unparseable body or
 unexpected status returns the last known set with a nil error; unknown names are
 ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_manager` (the managed runtime itself), `runtime_logs`
-([§14](#14-managed-process-logs-t3)) and `runtime_config_ack`
-([§7.2](#72-the-applied-document-acknowledgement)).
+([§14](#14-managed-process-logs-t3)), `runtime_config_ack`
+([§7.2](#72-the-applied-document-acknowledgement)) and `gpu_selection`
+([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway),
+[§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)),
+`Since: "0.4.0"`.
+
+`gpu_selection` is declared for the **portal's** benefit, not gated by the
+agent itself: the agent always honors whatever it receives — an explicit GPU
+order, `visible_devices_mode`, the three device placeholders — regardless of
+whether the connected gateway declares the flag back. What the flag lets the
+portal do is warn *before* the fact, rather than let the operator discover it
+from a misbehaving model: unlike `${MODEL}`/`${HOST_GPU_IDS}`
+([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), which shipped
+in the same release as `runtime_manager` itself so no agent that can run a
+spec at all can lack them, `gpu_selection` ships two releases later
+(`runtime_config_ack` was `0.3.0`), so already-deployed `0.2.0`/`0.3.0` agents
+that support `runtime_manager` and genuinely lack it exist in the field. Such
+an agent silently re-sorts a custom GPU order back to ascending (its
+`ExpandPlaceholders` predates the order fix) and fails to launch an
+`args`-mode spec (`${CUDA_DEVICES}` and friends are unknown tokens to it, so
+they reach the child as literal, unparseable text — the `PORT`/`AGENT_ENV`
+near-miss rule does not apply to them either, [§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)).
+The portal reads `agent_features` and shows a non-blocking "agent too old"
+advisory when the operator uses `args` mode or a custom (non-ascending) GPU
+order against an agent that has not declared `gpu_selection` — prominent for
+`args` mode, since the process will not start at all, informational for a
+custom order, since the model still starts, just on the wrong cards. The
+advisory never blocks Save, following the same
+negotiated-away-is-never-a-silent-no-op principle as every other feature gap
+in this section.
+`server-agent`'s `Version` moved `0.3.0` → `0.4.0` for this one entry, MINOR
+per the versioning rule in [§7.1](#71-agent-versioning) (a new name in
+`agent.Features`).
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.

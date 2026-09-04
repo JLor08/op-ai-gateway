@@ -257,35 +257,12 @@ var visibleDevicesOwnedVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// hostGPUIDs renders spec.GPUs as the comma-separated list of HOST GPU
-// indices, ascending and deduplicated -- the value both SetVisibleDevices and
-// ${HOST_GPU_IDS} emit. Empty string when the spec declares no GPUs; every
-// caller treats that as a refusal rather than a value (trap 1).
-//
-// HOST indices, always. These are the numbers the AGENT's own nvidia-smi /
-// rocm-smi report and the numbers the gateway's per-GPU budgets and
-// measurement rows are keyed by. They are NOT the numbers the child will see:
-// a child launched with CUDA_VISIBLE_DEVICES=3,4 enumerates its two devices as
-// 0 and 1. That renumbering is trap 2, and it is why the placeholder is named
-// HOST_GPU_IDS and not GPU_IDS.
-//
-// Sorted ascending rather than kept in the document's order because the order
-// is not the operator's to begin with: the gateway's RuntimeSpecGPUs reads the
-// rows back `order by gpu_index`, so a hand-chosen order never survives a save
-// anyway. Emitting a stable ascending list makes the value a pure function of
-// the declared SET, which is what the whole feature reasons about -- and it
-// keeps the child's device 0 predictable (the lowest declared host index)
-// instead of dependent on row order nobody controls.
-//
-// Deduplicated because a duplicate index is not merely redundant: CUDA stops
-// parsing the list at the first invalid or repeated entry, so
-// CUDA_VISIBLE_DEVICES=1,1,2 silently yields ONE visible device, not three.
-// The gateway already refuses a duplicate index at save time; a file-mode
-// document is hand-written and has no such gate.
-func hostGPUIDs(spec Spec) string {
-	if len(spec.GPUs) == 0 {
-		return ""
-	}
+// gpuIndices returns spec.GPUs' host indices in the operator's DECLARED array
+// order, deduplicated (first occurrence wins). It is the single ordered/deduped
+// index list every visibility rendering is built from -- hostGPUIDs and
+// deviceList differ only in how they format it. Empty when the spec declares
+// no GPUs; every caller treats that as a refusal, not a value (trap 1).
+func gpuIndices(spec Spec) []int {
 	indices := make([]int, 0, len(spec.GPUs))
 	seen := make(map[int]bool, len(spec.GPUs))
 	for _, g := range spec.GPUs {
@@ -295,10 +272,55 @@ func hostGPUIDs(spec Spec) string {
 		seen[g.Index] = true
 		indices = append(indices, g.Index)
 	}
-	sort.Ints(indices)
+	return indices
+}
+
+// hostGPUIDs renders the ordered/deduped host indices as a comma-separated
+// decimal list ("5,2"): the value both SetVisibleDevices (env mode) and
+// ${HOST_GPU_IDS} emit. Empty string when the spec declares no GPUs.
+//
+// DECLARED ORDER, not sorted. The gateway persists an explicit position column
+// (agent_runtime_spec_gpus.position) and reads the rows back ORDER BY position,
+// so spec.GPUs arrives in the operator's chosen order; that order is honored
+// here and reaches the child's visibility variable and --device list intact.
+//
+// HOST indices, always. These are the numbers the AGENT's own nvidia-smi /
+// rocm-smi report and the numbers the gateway's per-GPU budgets and
+// measurement rows are keyed by. They are NOT the numbers the child will see:
+// a child launched with CUDA_VISIBLE_DEVICES=3,4 enumerates its two devices as
+// 0 and 1. That renumbering is trap 2, and it is why the placeholder is named
+// HOST_GPU_IDS and not GPU_IDS.
+//
+// Deduplicated because a duplicate index is not merely redundant: CUDA stops
+// parsing the list at the first invalid or repeated entry, so
+// CUDA_VISIBLE_DEVICES=1,1,2 silently yields ONE visible device, not three.
+// The gateway already refuses a duplicate index at save time; a file-mode
+// document is hand-written and has no such gate.
+func hostGPUIDs(spec Spec) string {
+	indices := gpuIndices(spec)
 	parts := make([]string, len(indices))
 	for i, idx := range indices {
 		parts[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(parts, ",")
+}
+
+// deviceList renders the ordered/deduped host indices (gpuIndices) as
+// backend-prefixed llama.cpp --device names -- "CUDA3,CUDA2" for prefix
+// "CUDA", "Vulkan3,Vulkan2" for "Vulkan", "MTL3,MTL2" for "MTL". It is the
+// value the ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholders
+// emit; the order and dedup are identical to hostGPUIDs, only the formatting
+// differs. Empty string when the spec declares no GPUs.
+//
+// CAVEAT (documented, not enforced): a backend enumerates its own devices
+// independently of the host's GPU index, so Vulkan2/MTL2 are not guaranteed to
+// be the same physical card as host index 2; the operator verifies with
+// --list-devices. CUDA with CUDA_VISIBLE_DEVICES unset matches the host order.
+func deviceList(spec Spec, prefix string) string {
+	indices := gpuIndices(spec)
+	parts := make([]string, len(indices))
+	for i, idx := range indices {
+		parts[i] = prefix + strconv.Itoa(idx)
 	}
 	return strings.Join(parts, ",")
 }
@@ -689,11 +711,15 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //
 // # SetVisibleDevices: making the GPU list an enforcement, not a declaration
 //
-// When spec.SetVisibleDevices is set, this function adds ONE agent-owned
-// variable to the child's environment: VisibleDevicesVar(vendor) =
-// hostGPUIDs(spec). vendor is the agent's own locally-detected hardware, never
-// anything the gateway said. On Apple or an unrecognised stack the variable
-// name is "" and nothing is added at all -- a successful no-op, not an error.
+// When spec.SetVisibleDevices is set in the default env mode, this function
+// adds ONE agent-owned variable to the child's environment:
+// VisibleDevicesVar(vendor) = hostGPUIDs(spec). vendor is the agent's own
+// locally-detected hardware, never anything the gateway said. On Apple or an
+// unrecognised stack the variable name is "" and nothing is added at all -- a
+// successful no-op, not an error. In args mode (VisibleDevicesMode == "args")
+// it adds NO variable: the operator enforces visibility through a
+// ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholder in args
+// instead, so the vendor env var is deliberately left unset.
 //
 // The four traps this option has to defuse, and where each is handled:
 //
@@ -863,6 +889,32 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 				continue
 			}
 
+			// The three llama.cpp --device placeholders, exact-match siblings of
+			// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
+			// Same empty-list refusal, on the same reasoning (an empty --device
+			// list selects NO device, not every device).
+			if inner == "CUDA_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "CUDA"))
+				continue
+			}
+			if inner == "VULKAN_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "Vulkan"))
+				continue
+			}
+			if inner == "METAL_DEVICES" {
+				if gpuIDs == "" {
+					return "", nil, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+				}
+				b.WriteString(deviceList(spec, "MTL"))
+				continue
+			}
+
 			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
 				// CASE-INSENSITIVE, and that is a security property, not a
 				// nicety (S1). The refusal decides whether a
@@ -1003,7 +1055,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
 	// or an unrecognised stack: nothing is appended and the child's
 	// environment is byte-identical to the SetVisibleDevices-off one.
-	if spec.SetVisibleDevices {
+	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
 		if name := VisibleDevicesVar(vendor); name != "" {
 			resultEnv = append(resultEnv, name+"="+gpuIDs)
 			resultSpans = append(resultSpans, nil)

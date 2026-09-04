@@ -98,9 +98,10 @@ type MemoryStore struct {
 	// same MappingID.
 	runtimeSpecs map[string]RuntimeSpec
 	// runtimeSpecGPUs mirrors agent_runtime_spec_gpus: spec id -> its per-GPU
-	// VRAM rows (unordered on write; RuntimeSpecGPUs sorts by GPUIndex on
-	// read, mirroring the SQL `order by gpu_index`). Deleting a spec cascades
-	// deletion of its entry here (mirrors the table's ON DELETE CASCADE).
+	// VRAM rows (unordered on write; RuntimeSpecGPUs sorts by Position on
+	// read, mirroring the SQL `order by position, gpu_index`). Deleting a
+	// spec cascades deletion of its entry here (mirrors the table's ON
+	// DELETE CASCADE).
 	runtimeSpecGPUs map[string][]RuntimeSpecGPU
 	// coresidency mirrors agent_coresidency_rules (migration 65, Task 2):
 	// applicationID -> its full set of allowed co-residency pairs. A row's
@@ -2354,14 +2355,20 @@ func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus 
 	return nil
 }
 
-// RuntimeSpecGPUs returns specID's per-GPU VRAM rows ordered by GPU index
-// (mirrors the SQL `order by gpu_index`). The slice is deep-copied so the
-// caller cannot alias internal state.
+// RuntimeSpecGPUs returns specID's per-GPU VRAM rows ordered by Position,
+// with GPUIndex as a deterministic tiebreak (mirrors the SQL `order by
+// position, gpu_index`). The slice is deep-copied so the caller cannot alias
+// internal state.
 func (m *MemoryStore) RuntimeSpecGPUs(_ context.Context, specID string) ([]RuntimeSpecGPU, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := copyRuntimeSpecGPUs(m.runtimeSpecGPUs[specID])
-	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Position != out[j].Position {
+			return out[i].Position < out[j].Position
+		}
+		return out[i].GPUIndex < out[j].GPUIndex
+	})
 	return out, nil
 }
 

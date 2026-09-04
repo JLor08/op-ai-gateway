@@ -171,3 +171,23 @@ func TestRuntimeConfigAckFeatureIsDeclared(t *testing.T) {
 	}
 	t.Fatalf("Features does not declare %q; the gateway cannot know an acknowledgement will ever arrive: %+v", name, Features)
 }
+
+// TestGPUSelectionFeatureIsDeclared pins the GPU-selection feature's exact wire
+// NAME and the version it ships in. The gateway checks this literal string
+// before it tells the portal the connected agent can honor a custom GPU order
+// and expand the ${..._DEVICES} placeholders; a rename here would break that
+// negotiation silently. Same two-sides-of-one-contract reasoning as
+// TestRuntimeConfigAckFeatureIsDeclared.
+func TestGPUSelectionFeatureIsDeclared(t *testing.T) {
+	const name = "gpu_selection"
+	for _, f := range Features {
+		if f.Name != name {
+			continue
+		}
+		if f.Since != "0.4.0" {
+			t.Fatalf("feature %q Since = %q, want 0.4.0 (the branch's single bump)", name, f.Since)
+		}
+		return
+	}
+	t.Fatalf("Features does not declare %q; the gateway cannot know the agent honors GPU order / device placeholders: %+v", name, Features)
+}

@@ -74,7 +74,19 @@ import (
 // capability and admission is local policy, neither a negotiated flag
 // (ADR-025) -- and none of them earns a bump of its own here, because one
 // branch is one bump however many commits it contains.
-const Version = "0.3.0"
+//
+// 0.3.0 -> 0.4.0 is the single bump for the gpu-selection branch: the agent
+// now preserves the operator's explicit GPU array order instead of sorting
+// it ascending, expands the ${CUDA_DEVICES}/${VULKAN_DEVICES}/
+// ${METAL_DEVICES} placeholders in launch args, and honors
+// visible_devices_mode="args" by injecting no visibility env var at all. The
+// agent gates none of this on the flag -- it always honors what it
+// receives -- but agent.Features declares "gpu_selection" anyway, MINOR, so
+// a gateway/portal that talks to an older agent can warn that a custom
+// order will be silently re-sorted and an args-mode spec will fail to
+// launch (the placeholder passes through literally) rather than let the
+// operator discover it from a misbehaving model.
+const Version = "0.4.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

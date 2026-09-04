@@ -638,24 +638,34 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("gpus for a spec with no rows yet must be non-nil and empty: err=%v gpus=%#v", err, gpus)
 		}
 
+		// GPU rows read back in POSITION order, which is independent of
+		// gpu_index. Written with the higher gpu_index (1) at position 0, so a
+		// store that still orders by gpu_index reads them in the wrong order.
 		gpus := []routing.RuntimeSpecGPU{
-			{SpecID: "rspec_rt2", GPUIndex: 1, VRAMEstimateMB: 21500},
-			{SpecID: "rspec_rt2", GPUIndex: 0, VRAMEstimateMB: 22000},
+			{SpecID: "rspec_rt2", GPUIndex: 1, VRAMEstimateMB: 21500, Position: 0},
+			{SpecID: "rspec_rt2", GPUIndex: 0, VRAMEstimateMB: 22000, Position: 1},
 		}
 		if err := s.SetRuntimeSpecGPUs(ctx, "rspec_rt2", gpus); err != nil {
 			t.Fatalf("set gpus: %v", err)
 		}
 		gotGPUs, err := s.RuntimeSpecGPUs(ctx, "rspec_rt2")
-		if err != nil || len(gotGPUs) != 2 || gotGPUs[0].GPUIndex != 0 || gotGPUs[1].GPUIndex != 1 {
-			t.Fatalf("gpus must read ordered by index: %v %+v", err, gotGPUs)
+		if err != nil || len(gotGPUs) != 2 {
+			t.Fatalf("set/read gpus: %v %+v", err, gotGPUs)
+		}
+		if gotGPUs[0].GPUIndex != 1 || gotGPUs[0].Position != 0 ||
+			gotGPUs[1].GPUIndex != 0 || gotGPUs[1].Position != 1 {
+			t.Fatalf("gpus must read ordered by position, not gpu_index: %+v", gotGPUs)
 		}
 
+		// The measured write targets gpu_index 0, which now sits at position 1
+		// (read index 1) — proving the write path keys on gpu_index while the
+		// read path keys on position.
 		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 0, 21800); err != nil {
 			t.Fatalf("measured: %v", err)
 		}
 		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_rt2")
-		if gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[0].VRAMEstimateMB != 22000 {
-			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[0])
+		if gotGPUs[1].GPUIndex != 0 || gotGPUs[1].VRAMMeasuredMB != 21800 || gotGPUs[1].VRAMEstimateMB != 22000 {
+			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[1])
 		}
 		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 7, 1); err != ErrNotFound {
 			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)

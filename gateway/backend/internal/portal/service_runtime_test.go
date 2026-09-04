@@ -1972,3 +1972,208 @@ func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
 		}
 	})
 }
+
+// TestRuntimeSpecDTOCarriesVisibleDevicesMode pins that RuntimeSpecDTO /
+// PutRuntimeSpecRequest / the agent-wire AgentRuntimeSpecDTO all carry
+// visible_devices_mode, that PutRuntimeSpec+GetRuntimeSpec round-trip it, and
+// that an omitted mode defaults to "env".
+func TestRuntimeSpecDTOCarriesVisibleDevicesMode(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen-upstream"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	// args mode round-trips (with a placeholder present so validation passes).
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled:            true,
+		Binary:             "/usr/local/bin/llama-server",
+		Args:               []string{"--device", "${CUDA_DEVICES}"},
+		SetVisibleDevices:  true,
+		VisibleDevicesMode: string(routing.VisibleDevicesModeArgs),
+		GPUs:               []RuntimeSpecGPUDTO{{Index: 2, VRAMEstimateMB: 8000}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("dto.VisibleDevicesMode = %q, want args", dto.VisibleDevicesMode)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("GetRuntimeSpec().VisibleDevicesMode = %q, want args", got.VisibleDevicesMode)
+	}
+
+	// The agent-wire document carries the mode too (the agent needs it to
+	// decide whether to inject the visibility env var).
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if len(cfg.Specs) != 1 || cfg.Specs[0].VisibleDevicesMode != string(routing.VisibleDevicesModeArgs) {
+		t.Fatalf("agent wire dropped the mode: %#v", cfg.Specs)
+	}
+
+	// An omitted mode defaults to env.
+	def, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (default): %v", err)
+	}
+	if def.VisibleDevicesMode != string(routing.VisibleDevicesModeEnv) {
+		t.Fatalf("default mode = %q, want env", def.VisibleDevicesMode)
+	}
+}
+
+// TestPutRuntimeSpecPreservesGPUArrayOrder pins that the request array order of
+// gpus is the stored + response + agent-wire order (not re-sorted by index).
+func TestPutRuntimeSpecPreservesGPUArrayOrder(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	// Deliberately NOT ascending by index.
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+		GPUs: []RuntimeSpecGPUDTO{{Index: 5, VRAMEstimateMB: 1}, {Index: 2, VRAMEstimateMB: 2}, {Index: 3, VRAMEstimateMB: 3}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	wantOrder := []int{5, 2, 3}
+	gotOrder := func(gs []RuntimeSpecGPUDTO) []int {
+		out := make([]int, len(gs))
+		for i, g := range gs {
+			out[i] = g.Index
+		}
+		return out
+	}
+	if o := gotOrder(dto.GPUs); !slicesEqualInt(o, wantOrder) {
+		t.Fatalf("response gpu order = %v, want %v", o, wantOrder)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if o := gotOrder(got.GPUs); !slicesEqualInt(o, wantOrder) {
+		t.Fatalf("read-back gpu order = %v, want %v", o, wantOrder)
+	}
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	agentOrder := make([]int, len(cfg.Specs[0].GPUs))
+	for i, g := range cfg.Specs[0].GPUs {
+		agentOrder[i] = g.Index
+	}
+	if !slicesEqualInt(agentOrder, wantOrder) {
+		t.Fatalf("agent-wire gpu order = %v, want %v", agentOrder, wantOrder)
+	}
+}
+
+func slicesEqualInt(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestPutRuntimeSpecVisibleDevicesModeValidation pins the two new mode traps:
+// an invalid mode value, and args mode with no ${..._DEVICES} placeholder in
+// args. The conflict + no-gpus traps still fire in BOTH modes.
+func TestPutRuntimeSpecVisibleDevicesModeValidation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary:            "/usr/local/bin/llama-server",
+			SetVisibleDevices: true,
+			GPUs:              []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 8000}},
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(PutRuntimeSpecRequest) PutRuntimeSpecRequest
+		wantErr error
+	}{
+		{
+			name:    "bad mode value",
+			mutate:  func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.VisibleDevicesMode = "bogus"; return r },
+			wantErr: ErrRuntimeSpecVisibleDevicesModeInvalid,
+		},
+		{
+			name: "args mode with no device placeholder",
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+				r.Args = []string{"--ctx-size", "4096"}
+				return r
+			},
+			wantErr: ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, tc.mutate(base())); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+
+	// Each of the three placeholder tokens satisfies args mode.
+	for _, ph := range []string{"${CUDA_DEVICES}", "${VULKAN_DEVICES}", "${METAL_DEVICES}"} {
+		t.Run("accepts "+ph, func(t *testing.T) {
+			r := base()
+			r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+			r.Args = []string{"--device", ph}
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+				t.Fatalf("args mode with %s must save: %v", ph, err)
+			}
+		})
+	}
+
+	// The conflict trap still fires in args mode (a hand-set CUDA_VISIBLE_DEVICES
+	// remaps the CUDA namespace and would break --device numbering).
+	t.Run("conflict trap holds in args mode", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--device", "${CUDA_DEVICES}"}
+		r.Env = map[string]string{"CUDA_VISIBLE_DEVICES": "0,1"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); !errors.Is(err, ErrRuntimeSpecVisibleDevicesConflict) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecVisibleDevicesConflict", err)
+		}
+	})
+
+	// Mode is inert when the option is OFF: a bogus mode with the flag off is
+	// still rejected as a malformed enum, but args-with-no-placeholder is NOT
+	// (the placeholder requirement only applies with the flag on).
+	t.Run("args no-placeholder ok when flag off", func(t *testing.T) {
+		r := base()
+		r.SetVisibleDevices = false
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--ctx-size", "4096"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+			t.Fatalf("args mode with flag off must save: %v", err)
+		}
+	})
+}

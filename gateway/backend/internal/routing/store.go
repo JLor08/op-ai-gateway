@@ -1279,6 +1279,11 @@ type RuntimeSpec struct {
 	// visibility variable in Env) live in portal.PutRuntimeSpec, and the
 	// agent refuses them again at launch — see that method for why both.
 	SetVisibleDevices bool
+	// VisibleDevicesMode selects HOW SetVisibleDevices is enforced: "env"
+	// (inject the vendor visibility variable, today's behavior) or "args" (the
+	// agent expands a ${..._DEVICES} placeholder in Args and injects no env
+	// var). Only meaningful when SetVisibleDevices is on; default "env".
+	VisibleDevicesMode VisibleDevicesMode
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of the
 	// API-variant capability + the two coding-agent endpoint modes (design
 	// 2026-09-03). For a server_agent mapping the RESOLVED spec is the sole
@@ -1298,8 +1303,15 @@ type RuntimeSpec struct {
 // agent-owned and written ONLY by UpdateRuntimeSpecGPUMeasured — the two
 // never clobber each other.
 type RuntimeSpecGPU struct {
-	SpecID         string
-	GPUIndex       int
+	SpecID   string
+	GPUIndex int
+	// Position is the operator-chosen order of this GPU within its spec
+	// (0-based, dense per spec). It is the sole ordering contract: both stores
+	// read the rows `order by position`, and the DTO/wire layers keep the
+	// resulting ARRAY order (no position field crosses the wire). The portal's
+	// putRuntimeSpec sets Position = the index in the received req.GPUs array;
+	// SetRuntimeSpecGPUs persists it verbatim (it does not renumber).
+	Position       int
 	VRAMEstimateMB int
 	VRAMMeasuredMB int
 }
@@ -1400,8 +1412,8 @@ type RuntimeStore interface {
 	// SetGroupMembers). An empty gpus clears the set. specID must exist
 	// (ErrNotFound otherwise).
 	SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []RuntimeSpecGPU) error
-	// RuntimeSpecGPUs lists specID's per-GPU VRAM rows, ordered by GPU
-	// index. Always non-nil, empty when none.
+	// RuntimeSpecGPUs lists specID's per-GPU VRAM rows, ordered by position
+	// (the operator order). Always non-nil, empty when none.
 	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
 	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
 	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.

@@ -150,6 +150,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admin_state: '',
     vram_locked: false,
     set_visible_devices: false,
+    visible_devices_mode: 'env',
     gpus: [],
     api_flavors: [],
     responses_mode: 'passthrough',
@@ -161,13 +162,13 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
 // Minimal-but-valid HardwareResponse for the "server limits" telemetry-prefill
 // and drift-warning tests: only the GPU list varies per test, everything else
 // is boilerplate HardwareReport shape the type requires.
-function makeHardware(gpus: HardwareGPU[]): HardwareResponse {
+function makeHardware(gpus: HardwareGPU[], os = 'linux'): HardwareResponse {
   return {
     available: true,
     report: {
       collected_at: '2026-07-16T12:00:00Z',
       agent_version: '1.0.0',
-      os: 'linux',
+      os,
       arch: 'amd64',
       cpu: { model: '', vendor: '', physical_cores: 0, logical_threads: 0, base_mhz: 0 },
       memory: { total_bytes: 0 },
@@ -816,6 +817,18 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(created).toHaveLength(1);
   });
 
+  it('defaults visible_devices_mode to env in the spec PUT body', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.visible_devices_mode).toBe('env');
+  });
+
   it('rejects a reserved env key before ever calling the API', async () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -1046,6 +1059,36 @@ describe('RuntimeAdminSection edit + delete', () => {
     expect(screen.getByRole('combobox', { name: t.applicationMessagesMode })).toHaveTextContent(
       t.applicationModePassthrough,
     );
+  });
+});
+
+describe('RuntimeAdminSection GPU-row ordering', () => {
+  it('reorders GPU rows (move down) and sends the new gpus order in the PUT', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          // `binary` is HTML5-`required` on this form (RuntimeAdminSection.tsx
+          // :3419) regardless of GPU config, so it must be non-blank for the
+          // Save click below to actually reach the submit handler.
+          binary: '/usr/bin/llama-server',
+          gpus: [
+            { index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 },
+            { index: 1, vram_estimate_mb: 2000, vram_measured_mb: 0 },
+            { index: 2, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+          ],
+        }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    // Move the first GPU row down one slot: 0,1,2 -> 1,0,2
+    fireEvent.click(await screen.findByRole('button', { name: `${t.modelGroupMoveDown}: GPU 0` }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus.map((g) => g.index)).toEqual([1, 0, 2]);
   });
 });
 
@@ -1702,6 +1745,7 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     admin_state: adminState,
     vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
+    visible_devices_mode: spec.visible_devices_mode,
     gpus: spec.gpus,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
@@ -2538,6 +2582,87 @@ describe('RuntimeAdminSection feature-mismatch banner (spec §9)', () => {
     });
     await screen.findByText('gw-model');
     expect(screen.queryByText(t.runtimeFeatureMismatch)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block Save)', () => {
+  it('warns prominently when args mode is on and the agent lacks gpu_selection', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${CUDA_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      report: makeReport({ agent_version: '0.3.0', agent_features: ['runtime_manager'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    // exact: false, not new RegExp(...): the rendered Alert appends
+    // " (Agent version: X)" after the translated sentence, and the sentence
+    // itself contains literal parentheses -- unescaped in a RegExp those are
+    // capture-group syntax, not literal characters, so `new RegExp(t.foo)`
+    // can never match text containing `t.foo`'s own parens. `exact: false`
+    // is the established partial-match idiom already used throughout this
+    // file (e.g. runtimeSpecArgsCommandLine, runtimeSpecPlaceholderInvalid).
+    expect(
+      await screen.findByText(t.runtimeSpecAgentTooOldArgs, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('warns that ${METAL_DEVICES} needs a macOS host when the agent OS is not darwin', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${METAL_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      // makeHardware(...) reports os:'linux' (non-macOS) — see GOTCHAS.
+      hardware: makeHardware([{ index: 0, name: 'Card', memory_total_bytes: 0 }]),
+      report: makeReport({
+        agent_version: '0.4.0',
+        agent_features: ['runtime_manager', 'gpu_selection'],
+      }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    expect(await screen.findByText(t.runtimeSpecMetalNonMacos)).toBeInTheDocument();
+  });
+
+  it('does not warn about Metal when the agent OS is darwin', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: true,
+          visible_devices_mode: 'args',
+          args: ['--device', '${METAL_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+      hardware: makeHardware(
+        [{ index: 0, name: 'Apple M3', memory_total_bytes: 0 }],
+        'darwin 15.1',
+      ),
+      report: makeReport({ agent_version: '0.4.0', agent_features: ['gpu_selection'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary); // form is open
+    expect(screen.queryByText(t.runtimeSpecMetalNonMacos)).not.toBeInTheDocument();
   });
 });
 
@@ -4915,6 +5040,57 @@ describe('RuntimeAdminSection set_visible_devices', () => {
     });
     const checkbox = screen.getByLabelText(t.runtimeSpecSetVisibleDevices) as HTMLInputElement;
     expect(checkbox.checked).toBe(true);
+  });
+});
+
+describe('RuntimeAdminSection visibility mode', () => {
+  it('shows the mode select only when set_visible_devices is on and round-trips args', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          set_visible_devices: true,
+          visible_devices_mode: 'env',
+          args: ['--device', '${CUDA_DEVICES}'],
+          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+        }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    // Control is present because the checkbox is on, and shows the stored 'env'.
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode });
+    expect(combo).toHaveTextContent(t.runtimeSpecVisibleDevicesModeEnv);
+    // Switch to args (MUI Select idiom).
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecVisibleDevicesModeArgs }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.visible_devices_mode).toBe('args');
+  });
+
+  it('hides the mode select when set_visible_devices is off', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          set_visible_devices: false,
+        }),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    expect(
+      screen.queryByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode }),
+    ).not.toBeInTheDocument();
   });
 });
 

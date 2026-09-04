@@ -142,6 +142,7 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admin_state: '',
     vram_locked: false,
     set_visible_devices: false,
+    visible_devices_mode: 'env',
     gpus: [],
     api_flavors: [],
     responses_mode: 'passthrough',

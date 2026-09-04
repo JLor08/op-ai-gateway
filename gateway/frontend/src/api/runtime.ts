@@ -55,6 +55,12 @@ export interface RuntimeSpec {
   // on with an empty `gpus` (an empty visibility value hides EVERY card), and
   // on together with one of those variables hand-set in `env`.
   set_visible_devices: boolean;
+  // env: agent injects the visibility env var (today's behaviour, order-
+  // preserving). args: agent injects nothing; the operator writes a
+  // ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholder into args.
+  // Only meaningful when set_visible_devices is on; default 'env'. Mirrors the
+  // Go RuntimeSpecDTO.visible_devices_mode.
+  visible_devices_mode: 'env' | 'args';
   gpus: RuntimeSpecGPU[];
   // Per-endpoint API-variant snapshot for this managed model (gateway-side only;
   // NOT sent to the agent). api_flavors gates routing eligibility; the two modes

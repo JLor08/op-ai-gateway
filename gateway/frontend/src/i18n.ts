@@ -595,6 +595,11 @@ const de = {
   runtimeSpecSetVisibleDevices: 'GPU-Sichtbarkeit erzwingen (Prozess auf diese Karten begrenzen)',
   runtimeSpecSetVisibleDevicesHint:
     'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
+  runtimeSpecVisibleDevicesMode: 'Sichtbarkeit erzwingen über',
+  runtimeSpecVisibleDevicesModeEnv: 'Umgebungsvariable',
+  runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
+  runtimeSpecVisibleDevicesModeArgsHint:
+    'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}. Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der drei muss vorhanden sein.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
   // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
   // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
@@ -625,6 +630,12 @@ const de = {
     'Dieser Server hat noch keine GPUs gemeldet – GPU-Index bitte manuell eintragen.',
   runtimeSpecGpuAdd: 'GPU hinzufügen',
   runtimeSpecGpuRemove: 'Entfernen',
+  runtimeSpecAgentTooOldArgs:
+    'Der verbundene Agent kann den Geräte-Platzhalter nicht auflösen (benötigt Version 0.4.0 oder neuer) – der Prozess würde nicht starten.',
+  runtimeSpecAgentTooOldOrder:
+    'Die gewählte GPU-Reihenfolge wird ignoriert, bis der Agent auf Version 0.4.0 oder neuer aktualisiert ist.',
+  runtimeSpecMetalNonMacos:
+    '${METAL_DEVICES} funktioniert nur auf einem macOS-Host; der verbundene Agent läuft auf einem anderen Betriebssystem.',
   runtimeSpecEnvHint:
     'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
@@ -2676,6 +2687,11 @@ const en: PortalMessages = {
   runtimeSpecSetVisibleDevices: 'Enforce GPU visibility (restrict the process to these cards)',
   runtimeSpecSetVisibleDevicesHint:
     "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
+  runtimeSpecVisibleDevicesMode: 'Enforce visibility via',
+  runtimeSpecVisibleDevicesModeEnv: 'Environment variable',
+  runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
+  runtimeSpecVisibleDevicesModeArgsHint:
+    'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build. It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the three must be present.',
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
   runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
   runtimeSpecVramApply: 'Apply',
@@ -2698,6 +2714,12 @@ const en: PortalMessages = {
     'This server has not reported any GPUs yet — enter the GPU index by hand.',
   runtimeSpecGpuAdd: 'Add GPU',
   runtimeSpecGpuRemove: 'Remove',
+  runtimeSpecAgentTooOldArgs:
+    'The connected agent cannot expand the device placeholder (needs version 0.4.0 or newer) — the process would fail to start.',
+  runtimeSpecAgentTooOldOrder:
+    'The chosen GPU order is ignored until the agent is updated to version 0.4.0 or newer.',
+  runtimeSpecMetalNonMacos:
+    '${METAL_DEVICES} only works on a macOS host; the connected agent runs on a different operating system.',
   runtimeSpecEnvHint:
     "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:

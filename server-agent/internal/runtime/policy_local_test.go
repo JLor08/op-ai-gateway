@@ -1325,9 +1325,9 @@ func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
 // visibleDevicesSpec is the standard fixture for the tests below: a spec on
 // two NON-CONTIGUOUS, DESCENDING-ordered host GPUs. Both properties are
 // deliberate. Non-contiguous and not starting at 0 means the emitted value
-// ("2,5") can never be confused with the child-side numbering the same list
-// produces (0,1) -- trap 4. Descending in the declaration proves the ascending
-// sort rather than accidentally agreeing with it.
+// ("5,2") can never be confused with the child-side numbering the same list
+// produces (0,1) -- trap 4. Descending in the declaration proves the declared
+// order is preserved rather than accidentally agreeing with a sort.
 func visibleDevicesSpec() Spec {
 	return Spec{
 		ID:                "s1",
@@ -1417,8 +1417,9 @@ func TestVisibleDevicesVarPerVendor(t *testing.T) {
 // TestExpandPlaceholdersSetsVisibleDevicesPerVendor is the feature's main
 // behavioural pin: with set_visible_devices on, the child's environment
 // carries the vendor-appropriate variable set to the spec's own HOST indices,
-// ascending and comma-separated -- and on Apple or a host with no recognised
-// GPU stack it carries NO visibility variable at all, with no error.
+// in the operator's declared order and comma-separated -- and on Apple or a
+// host with no recognised GPU stack it carries NO visibility variable at all,
+// with no error.
 func TestExpandPlaceholdersSetsVisibleDevicesPerVendor(t *testing.T) {
 	getenv := func(string) string { return "" }
 
@@ -1446,8 +1447,8 @@ func TestExpandPlaceholdersSetsVisibleDevicesPerVendor(t *testing.T) {
 					if !present {
 						t.Fatalf("env %v is missing %s", env, name)
 					}
-					if value != "2,5" {
-						t.Errorf("%s = %q, want %q (the spec's own HOST indices, ascending)", name, value, "2,5")
+					if value != "5,2" {
+						t.Errorf("%s = %q, want %q (the spec's own HOST indices, in declared order)", name, value, "5,2")
 					}
 				case present:
 					t.Errorf("env %v sets %s=%q; only %q may be set on vendor %q", env, name, value, tc.wantVar, tc.vendor)
@@ -1555,11 +1556,11 @@ func TestExpandPlaceholdersVisibleDevicesConflictRefused(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ONEAPI_DEVICE_SELECTOR must compose with set_visible_devices, got: %v", err)
 		}
-		if v, _ := envValue(env, "ONEAPI_DEVICE_SELECTOR"); v != "level_zero:2,5" {
-			t.Errorf("ONEAPI_DEVICE_SELECTOR = %q, want %q", v, "level_zero:2,5")
+		if v, _ := envValue(env, "ONEAPI_DEVICE_SELECTOR"); v != "level_zero:5,2" {
+			t.Errorf("ONEAPI_DEVICE_SELECTOR = %q, want %q", v, "level_zero:5,2")
 		}
-		if v, _ := envValue(env, "CUDA_VISIBLE_DEVICES"); v != "2,5" {
-			t.Errorf("CUDA_VISIBLE_DEVICES = %q, want the option still to have set %q", v, "2,5")
+		if v, _ := envValue(env, "CUDA_VISIBLE_DEVICES"); v != "5,2" {
+			t.Errorf("CUDA_VISIBLE_DEVICES = %q, want the option still to have set %q", v, "5,2")
 		}
 	})
 }
@@ -1606,8 +1607,35 @@ func TestExpandPlaceholdersVisibleDevicesOffIsUnchanged(t *testing.T) {
 	}
 }
 
+// TestHostGPUIDsPreservesOrderAndDedups pins the order contract: the value is
+// spec.GPUs in the operator's DECLARED array order, deduplicated
+// (first-occurrence wins), NOT sorted. The gateway now persists an explicit
+// position column, so the array order is the operator's choice and must reach
+// the visibility variable and ${HOST_GPU_IDS} intact.
+func TestHostGPUIDsPreservesOrderAndDedups(t *testing.T) {
+	cases := []struct {
+		name string
+		gpus []SpecGPU
+		want string
+	}{
+		{"single", []SpecGPU{{Index: 3}}, "3"},
+		{"declared order preserved, not sorted", []SpecGPU{{Index: 5}, {Index: 2}}, "5,2"},
+		{"three cards keep operator order", []SpecGPU{{Index: 7}, {Index: 0}, {Index: 4}}, "7,0,4"},
+		{"duplicate collapses, first occurrence wins", []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}, "3,2"},
+		{"no gpus is empty", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostGPUIDs(Spec{GPUs: tc.gpus}); got != tc.want {
+				t.Errorf("hostGPUIDs(%v) = %q, want %q", tc.gpus, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestExpandPlaceholdersHostGPUIDs pins the placeholder itself: it resolves in
-// args AND in env values, ascending, deduplicated, comma-separated.
+// args AND in env values, in the operator's declared order, deduplicated,
+// comma-separated.
 //
 // Deduplication is not cosmetic: CUDA stops parsing the visible-devices list
 // at the first repeated or invalid entry, so "1,1,2" would silently yield ONE
@@ -1622,8 +1650,8 @@ func TestExpandPlaceholdersHostGPUIDs(t *testing.T) {
 		want string
 	}{
 		{"single", []SpecGPU{{Index: 3}}, "3"},
-		{"sorted ascending regardless of declared order", []SpecGPU{{Index: 5}, {Index: 2}}, "2,5"},
-		{"three cards", []SpecGPU{{Index: 7}, {Index: 0}, {Index: 4}}, "0,4,7"},
+		{"declared order preserved, not sorted", []SpecGPU{{Index: 5}, {Index: 2}}, "5,2"},
+		{"three cards", []SpecGPU{{Index: 7}, {Index: 0}, {Index: 4}}, "7,0,4"},
 		{"duplicates collapse", []SpecGPU{{Index: 1}, {Index: 1}, {Index: 2}}, "1,2"},
 	}
 	for _, tc := range cases {
@@ -1714,5 +1742,137 @@ func TestExpandPlaceholdersHostGPUIDsAreHostIndices(t *testing.T) {
 	}
 	if v, _ := envValue(env, "CUDA_VISIBLE_DEVICES"); v != wantHost {
 		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want the HOST indices %q", v, wantHost)
+	}
+}
+
+// TestExpandPlaceholdersDeviceLists pins the three llama.cpp --device
+// placeholders: each emits <Backend><host index> per selected GPU, in the
+// operator's declared order, deduplicated, comma-joined -- the same ordered
+// index list as ${HOST_GPU_IDS}, only backend-prefixed.
+func TestExpandPlaceholdersDeviceLists(t *testing.T) {
+	getenv := func(string) string { return "" }
+	cases := []struct {
+		placeholder string
+		want        string
+	}{
+		{"${CUDA_DEVICES}", "CUDA3,CUDA2"},
+		{"${VULKAN_DEVICES}", "Vulkan3,Vulkan2"},
+		{"${METAL_DEVICES}", "MTL3,MTL2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.placeholder, func(t *testing.T) {
+			spec := Spec{
+				Args: []string{"--device", tc.placeholder},
+				GPUs: []SpecGPU{{Index: 3}, {Index: 2}}, // non-ascending: proves order, not sort
+			}
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders: %v", err)
+			}
+			if args[1] != tc.want {
+				t.Errorf("%s = %q, want %q (<prefix><host index> in operator order)", tc.placeholder, args[1], tc.want)
+			}
+		})
+		t.Run(tc.placeholder+"/no gpus refused", func(t *testing.T) {
+			spec := Spec{Args: []string{"--device", tc.placeholder}}
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv); err == nil {
+				t.Fatalf("%s on a spec with no gpus must refuse, not substitute an empty device list", tc.placeholder)
+			}
+		})
+	}
+
+	t.Run("dedup keeps first-occurrence order", func(t *testing.T) {
+		spec := Spec{Args: []string{"${CUDA_DEVICES}"}, GPUs: []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}}
+		args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+		if err != nil {
+			t.Fatalf("ExpandPlaceholders: %v", err)
+		}
+		if args[0] != "CUDA3,CUDA2" {
+			t.Errorf("args[0] = %q, want CUDA3,CUDA2", args[0])
+		}
+	})
+
+	// A near-miss passes through literally, same rule as ${HOST_GPU_IDS}: these
+	// tokens are exact-match, and neither starts with PORT/AGENT_ENV.
+	for _, value := range []string{"${CUDA_DEVICE}", "${cuda_devices}", "${METAL_DEVICES_JSON}"} {
+		t.Run("passes through literally: "+value, func(t *testing.T) {
+			spec := Spec{Args: []string{value}, GPUs: []SpecGPU{{Index: 1}}}
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got: %v", value, err)
+			}
+			if args[0] != value {
+				t.Errorf("args[0] = %q, want the literal %q", args[0], value)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection pins Part B:
+// in "args" mode the agent injects NO visibility env var (the child sees every
+// card and --device does the selecting in host numbering); in "env" mode, and
+// for an empty/unknown mode (an older gateway never sends the field), it injects
+// the vendor variable exactly as before -- now order-preserving.
+func TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection(t *testing.T) {
+	getenv := func(string) string { return "" }
+	base := func() Spec {
+		return Spec{
+			Binary:            "/usr/bin/llama-server",
+			Args:              []string{"--device", "${CUDA_DEVICES}"},
+			GPUs:              []SpecGPU{{Index: 3}, {Index: 2}},
+			SetVisibleDevices: true,
+		}
+	}
+
+	t.Run("args mode injects no visibility variable", func(t *testing.T) {
+		spec := base()
+		spec.VisibleDevicesMode = VisibleDevicesModeArgs
+		args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+		if err != nil {
+			t.Fatalf("ExpandPlaceholders: %v", err)
+		}
+		if v, present := envValue(env, "CUDA_VISIBLE_DEVICES"); present {
+			t.Errorf("env injected CUDA_VISIBLE_DEVICES=%q in args mode; the child must see every card so --device numbering stays the host's", v)
+		}
+		if args[1] != "CUDA3,CUDA2" {
+			t.Errorf("args[1] = %q, want the expanded device list CUDA3,CUDA2", args[1])
+		}
+	})
+
+	for _, mode := range []string{VisibleDevicesModeEnv, ""} {
+		t.Run("mode="+mode+" injects the visibility variable in operator order", func(t *testing.T) {
+			spec := base()
+			spec.VisibleDevicesMode = mode
+			_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv)
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders: %v", err)
+			}
+			if v, ok := envValue(env, "CUDA_VISIBLE_DEVICES"); !ok || v != "3,2" {
+				t.Errorf("CUDA_VISIBLE_DEVICES = %q (present=%v), want 3,2 (env mode, declared order)", v, ok)
+			}
+		})
+	}
+}
+
+// TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes pins that the
+// trap-3 refusal (a hand-set visibility var alongside the checkbox) is NOT
+// weakened by args mode: a hand-set CUDA_VISIBLE_DEVICES in args mode would
+// remap the CUDA namespace and break the child's --device numbering, so it is
+// refused there too.
+func TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes(t *testing.T) {
+	getenv := func(string) string { return "" }
+	for _, mode := range []string{VisibleDevicesModeEnv, VisibleDevicesModeArgs} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			spec := Spec{
+				Args:               []string{"--device", "${CUDA_DEVICES}"},
+				Env:                map[string]string{"CUDA_VISIBLE_DEVICES": "0,1"},
+				GPUs:               []SpecGPU{{Index: 3}, {Index: 2}},
+				SetVisibleDevices:  true,
+				VisibleDevicesMode: mode,
+			}
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, getenv); err == nil {
+				t.Fatalf("a hand-set CUDA_VISIBLE_DEVICES must be refused in %q mode too", mode)
+			}
+		})
 	}
 }

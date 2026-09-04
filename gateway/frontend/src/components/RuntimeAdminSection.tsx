@@ -27,6 +27,9 @@ import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
 import ArticleIcon from '@mui/icons-material/Article';
 import SpeedIcon from '@mui/icons-material/Speed';
+import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
+import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
+import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import type {
   ApplicationStatus,
   BenchmarkRunDTO,
@@ -61,6 +64,7 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { useColumnDrag, columnDragSx, moveColumn } from './shared/columnDrag';
 import {
   latestApplicableVramRun,
   vramApplyNumber,
@@ -193,6 +197,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     admin_state: '',
     vram_locked: false,
     set_visible_devices: false,
+    visible_devices_mode: 'env',
     gpus: [],
     api_flavors: [],
     responses_mode: 'passthrough',
@@ -2044,6 +2049,7 @@ export function RuntimeAdminSection({
   const [adminState, setAdminState] = useState('');
   const [vramLocked, setVramLocked] = useState(false);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
+  const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
   const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
@@ -2122,6 +2128,7 @@ export function RuntimeAdminSection({
     setAdminState('');
     setVramLocked(false);
     setSetVisibleDevices(false);
+    setVisibleDevicesMode('env');
     setGpuRows([]);
   }
 
@@ -2141,6 +2148,7 @@ export function RuntimeAdminSection({
     setAdminState(spec.admin_state);
     setVramLocked(spec.vram_locked);
     setSetVisibleDevices(spec.set_visible_devices);
+    setVisibleDevicesMode(spec.visible_devices_mode);
     setGpuRows(
       spec.gpus.map((g) => ({
         rowKey: makeRowKey(),
@@ -2228,6 +2236,32 @@ export function RuntimeAdminSection({
   function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }
+
+  // Reorder the GPU rows by rowKey (moveColumn works on a string[] of ids;
+  // rebuild the GpuRow[] in the new key order). Array order is the wire
+  // contract (buildSpecBody sends gpuRows verbatim), so this is the whole of
+  // Part A on the client.
+  function reorderGpuRows(sourceKey: string, targetKey: string, place: 'before' | 'after') {
+    setGpuRows((rows) => {
+      const order = moveColumn(
+        rows.map((r) => r.rowKey),
+        sourceKey,
+        targetKey,
+        place,
+      );
+      return order.map((k) => rows.find((r) => r.rowKey === k)!);
+    });
+  }
+  function swapGpuRow(idx: number, delta: number) {
+    setGpuRows((rows) => {
+      const target = idx + delta;
+      if (target < 0 || target >= rows.length) return rows;
+      const next = [...rows];
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  }
+  const gpuDrag = useColumnDrag(reorderGpuRows, 'vertical');
 
   /**
    * The APPLY affordance for one GPU row: the benchmark's number for that card,
@@ -2390,6 +2424,7 @@ export function RuntimeAdminSection({
       admin_state: adminState,
       vram_locked: vramLocked,
       set_visible_devices: setVisibleDevices,
+      visible_devices_mode: visibleDevicesMode,
       gpus: gpuRows.map((r) => ({
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,
@@ -3293,6 +3328,29 @@ export function RuntimeAdminSection({
     // is that the field's contract was invisible until a foreign program
     // rejected it, so the feedback has to land at paste time, not at submit.
     const argsWarnings = collectArgsWarnings(parseArgsText(argsText), listenPort, t);
+    // Part A/B agent-capability + platform hints (non-blocking). agentFeatures /
+    // agentVersion are the report-derived values (:1703-1704); the host OS comes
+    // from the hardware report already fetched (:1394-1396) — NOT a new DTO field.
+    const agentHasGpuSelection = agentFeatures.includes('gpu_selection');
+    const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
+    const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
+      a.includes('${METAL_DEVICES}'),
+    );
+    const agentOs = hardware.data?.available && hardware.data.report ? hardware.data.report.os : '';
+    const agentOsKnown = agentOs !== '';
+    const isMacOsAgent = /darwin|mac ?os/i.test(agentOs);
+    // Prominent when args mode (the process would fail to start on an old agent);
+    // informational when only the order is custom (order is ignored until >=0.4.0).
+    const showAgentTooOldArgs =
+      setVisibleDevices && visibleDevicesMode === 'args' && reportReady && !agentHasGpuSelection;
+    const showAgentTooOldOrder =
+      !showAgentTooOldArgs && gpuOrderIsCustom && reportReady && !agentHasGpuSelection;
+    const showMetalNonMacos =
+      setVisibleDevices &&
+      visibleDevicesMode === 'args' &&
+      argsHaveMetalDevices &&
+      agentOsKnown &&
+      !isMacOsAgent;
     return (
       <>
         <Breadcrumbs
@@ -3556,6 +3614,25 @@ export function RuntimeAdminSection({
             <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
               {t.runtimeSpecSetVisibleDevicesHint}
             </Typography>
+            {setVisibleDevices && (
+              <>
+                <SelectField
+                  id="runtime-spec-visible-devices-mode"
+                  label={t.runtimeSpecVisibleDevicesMode}
+                  value={visibleDevicesMode}
+                  onChange={(e) => setVisibleDevicesMode(e.target.value as 'env' | 'args')}
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="env">{t.runtimeSpecVisibleDevicesModeEnv}</option>
+                  <option value="args">{t.runtimeSpecVisibleDevicesModeArgs}</option>
+                </SelectField>
+                {visibleDevicesMode === 'args' && (
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                    {t.runtimeSpecVisibleDevicesModeArgsHint}
+                  </Typography>
+                )}
+              </>
+            )}
             <SelectField
               id="runtime-spec-admin-state"
               label={t.runtimeSpecAdminState}
@@ -3573,6 +3650,17 @@ export function RuntimeAdminSection({
               <Typography variant="subtitle2" component="h3">
                 {t.runtimeSpecGpus}
               </Typography>
+              {showAgentTooOldArgs && (
+                <Alert severity="warning">
+                  {`${t.runtimeSpecAgentTooOldArgs} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {showAgentTooOldOrder && (
+                <Alert severity="info">
+                  {`${t.runtimeSpecAgentTooOldOrder} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {showMetalNonMacos && <Alert severity="warning">{t.runtimeSpecMetalNonMacos}</Alert>}
               {/* No reported GPUs: say so ONCE, and omit the picker rather
                   than rendering an empty dropdown that reads as broken. The
                   numeric index below stays fully editable -- a machine that
@@ -3588,8 +3676,42 @@ export function RuntimeAdminSection({
               {gpuRows.map((row, idx) => (
                 <Box
                   key={row.rowKey}
-                  sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
+                  {...gpuDrag.dragProps(row.rowKey)}
+                  sx={{
+                    display: 'flex',
+                    gap: 1.5,
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    ...columnDragSx(
+                      row.rowKey,
+                      gpuDrag.draggingId,
+                      gpuDrag.overId,
+                      gpuDrag.overPlace,
+                      'vertical',
+                    ),
+                  }}
                 >
+                  <DragIndicatorIcon
+                    fontSize="small"
+                    sx={{ color: 'text.secondary', cursor: 'grab' }}
+                    aria-hidden
+                  />
+                  <IconButton
+                    size="small"
+                    aria-label={`${t.modelGroupMoveUp}: GPU ${row.index}`}
+                    disabled={idx === 0}
+                    onClick={() => swapGpuRow(idx, -1)}
+                  >
+                    <ArrowUpwardIcon fontSize="small" />
+                  </IconButton>
+                  <IconButton
+                    size="small"
+                    aria-label={`${t.modelGroupMoveDown}: GPU ${row.index}`}
+                    disabled={idx === gpuRows.length - 1}
+                    onClick={() => swapGpuRow(idx, 1)}
+                  >
+                    <ArrowDownwardIcon fontSize="small" />
+                  </IconButton>
                   {/* Picks a card BY NAME and writes its index into the field
                       beside it. It augments that field and never replaces it:
                       telemetry can be stale, absent, or behind the hardware
