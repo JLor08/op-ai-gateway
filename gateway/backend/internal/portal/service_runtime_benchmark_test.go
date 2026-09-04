@@ -290,8 +290,8 @@ func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T)
 		t.Fatalf("RuntimeSpecGPUs: %v", err)
 	}
 	want := []routing.RuntimeSpecGPU{
-		{SpecID: spec.ID, GPUIndex: 0, VRAMEstimateMB: 18000, VRAMMeasuredMB: 21000},
-		{SpecID: spec.ID, GPUIndex: 1, VRAMEstimateMB: 18000, VRAMMeasuredMB: 21001},
+		{SpecID: spec.ID, GPUIndex: 0, Position: 0, VRAMEstimateMB: 18000, VRAMMeasuredMB: 21000},
+		{SpecID: spec.ID, GPUIndex: 1, Position: 1, VRAMEstimateMB: 18000, VRAMMeasuredMB: 21001},
 	}
 	if !reflect.DeepEqual(gpus, want) {
 		t.Fatalf("a full VRAM run's own writes moved a VRAM number:\n got %#v\nwant %#v", gpus, want)

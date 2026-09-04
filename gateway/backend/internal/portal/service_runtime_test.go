@@ -2032,3 +2032,66 @@ func TestRuntimeSpecDTOCarriesVisibleDevicesMode(t *testing.T) {
 		t.Fatalf("default mode = %q, want env", def.VisibleDevicesMode)
 	}
 }
+
+// TestPutRuntimeSpecPreservesGPUArrayOrder pins that the request array order of
+// gpus is the stored + response + agent-wire order (not re-sorted by index).
+func TestPutRuntimeSpecPreservesGPUArrayOrder(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	// Deliberately NOT ascending by index.
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+		GPUs: []RuntimeSpecGPUDTO{{Index: 5, VRAMEstimateMB: 1}, {Index: 2, VRAMEstimateMB: 2}, {Index: 3, VRAMEstimateMB: 3}},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	wantOrder := []int{5, 2, 3}
+	gotOrder := func(gs []RuntimeSpecGPUDTO) []int {
+		out := make([]int, len(gs))
+		for i, g := range gs {
+			out[i] = g.Index
+		}
+		return out
+	}
+	if o := gotOrder(dto.GPUs); !slicesEqualInt(o, wantOrder) {
+		t.Fatalf("response gpu order = %v, want %v", o, wantOrder)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if o := gotOrder(got.GPUs); !slicesEqualInt(o, wantOrder) {
+		t.Fatalf("read-back gpu order = %v, want %v", o, wantOrder)
+	}
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	agentOrder := make([]int, len(cfg.Specs[0].GPUs))
+	for i, g := range cfg.Specs[0].GPUs {
+		agentOrder[i] = g.Index
+	}
+	if !slicesEqualInt(agentOrder, wantOrder) {
+		t.Fatalf("agent-wire gpu order = %v, want %v", agentOrder, wantOrder)
+	}
+}
+
+func slicesEqualInt(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

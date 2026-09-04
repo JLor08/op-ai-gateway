@@ -617,10 +617,11 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		return RuntimeSpecDTO{}, err
 	}
 	gpuRows := make([]routing.RuntimeSpecGPU, 0, len(req.GPUs))
-	for _, g := range req.GPUs {
+	for i, g := range req.GPUs {
 		gpuRows = append(gpuRows, routing.RuntimeSpecGPU{
 			SpecID:         spec.ID,
 			GPUIndex:       g.Index,
+			Position:       i, // request array order becomes the stored order
 			VRAMEstimateMB: g.VRAMEstimateMB,
 			VRAMMeasuredMB: measuredByIndex[g.Index], // 0 for a brand-new index; preserved otherwise
 		})
