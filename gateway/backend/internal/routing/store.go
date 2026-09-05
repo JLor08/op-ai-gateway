@@ -1284,6 +1284,18 @@ type RuntimeSpec struct {
 	// agent expands a ${..._DEVICES} placeholder in Args and injects no env
 	// var). Only meaningful when SetVisibleDevices is on; default "env".
 	VisibleDevicesMode VisibleDevicesMode
+	// APITokenMode is "app"|"set"|"random"|"off": where the upstream API token
+	// for this mapping's child comes from. Default "app" (reuse the app token).
+	APITokenMode string
+	// APIToken is the SEALED per-spec token (SealSecret envelope), used only by
+	// "set"/"random". Routing NEVER decrypts it — the edge does.
+	APIToken string
+	// APITokenHeaderSource is "app"|"custom": inherit the app's transmission
+	// header or use APITokenHeader below.
+	APITokenHeaderSource string
+	// APITokenHeader is the custom transmission header (source=="custom" only);
+	// empty ⇒ Authorization: Bearer.
+	APITokenHeader string
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of the
 	// API-variant capability + the two coding-agent endpoint modes (design
 	// 2026-09-03). For a server_agent mapping the RESOLVED spec is the sole

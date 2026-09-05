@@ -7686,9 +7686,13 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			StartupTimeoutSeconds: 180, IdleTimeoutSeconds: 900,
 			AdmissionWaitTimeoutSeconds: 30, Pinned: true,
 			AdminState: "force_running", VRAMLocked: true,
-			SetVisibleDevices:  true,
-			VisibleDevicesMode: routing.VisibleDevicesModeArgs,
-			CreatedAt:          now, UpdatedAt: now,
+			SetVisibleDevices:    true,
+			VisibleDevicesMode:   routing.VisibleDevicesModeArgs,
+			APITokenMode:         "set",
+			APIToken:             "enc:deadbeef",
+			APITokenHeaderSource: "custom",
+			APITokenHeader:       "X-Api-Key",
+			CreatedAt:            now, UpdatedAt: now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert: %v", err)
@@ -7701,6 +7705,9 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
 			got.VisibleDevicesMode != routing.VisibleDevicesModeArgs ||
 			got.AdminState != "force_running" || got.AdmissionWaitTimeoutSeconds != 30 ||
+			got.APITokenMode != spec.APITokenMode || got.APIToken != spec.APIToken ||
+			got.APITokenHeaderSource != spec.APITokenHeaderSource ||
+			got.APITokenHeader != spec.APITokenHeader ||
 			!got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
@@ -7764,6 +7771,29 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 		// below still describe a single-spec application.
 		if err := s.DeleteRuntimeSpec(ctx, "rspec_0"); err != nil {
 			t.Fatalf("delete second spec: %v", err)
+		}
+		// API-token columns (migration 74): a row written the way a
+		// PRE-migration INSERT would -- naming only the columns that existed
+		// before this feature, omitting api_token_mode/api_token/
+		// api_token_header_source/api_token_header entirely -- must read back
+		// with the column defaults, not zero values. This is the upgrade
+		// scenario the default is FOR: every existing row (and any writer not
+		// yet updated to know about these columns) keeps sending the app
+		// token until something actively opts it into "off"/"set"/"random".
+		if _, err := s.exec(ctx, `insert into agent_runtime_specs (id, mapping_id, created_at, updated_at)
+			values (?, ?, ?, ?)`, "rspec_default", "map_rt2", now, now); err != nil {
+			t.Fatalf("insert column-omitted spec: %v", err)
+		}
+		gotDefault, ok, err := s.RuntimeSpecByMapping(ctx, "map_rt2")
+		if err != nil || !ok {
+			t.Fatalf("read back column-omitted spec: ok=%v err=%v", ok, err)
+		}
+		if gotDefault.APITokenMode != "app" || gotDefault.APIToken != "" ||
+			gotDefault.APITokenHeaderSource != "app" || gotDefault.APITokenHeader != "" {
+			t.Fatalf("api-token columns must default to app/''/app/'', got %+v", gotDefault)
+		}
+		if err := s.DeleteRuntimeSpec(ctx, "rspec_default"); err != nil {
+			t.Fatalf("delete default-column spec: %v", err)
 		}
 		// GPU rows: atomic replace + ordered read
 		gpus := []routing.RuntimeSpecGPU{

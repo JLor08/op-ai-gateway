@@ -48,7 +48,7 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `visible_devices_mode` (migration 73, `text not null default 'env'`: `env` sets that variable as before, `args` sets nothing and relies on a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args` instead), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent). |
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `visible_devices_mode` (migration 73, `text not null default 'env'`: `env` sets that variable as before, `args` sets nothing and relies on a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args` instead), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent), `api_token_mode`/`api_token`/`api_token_header_source`/`api_token_header` ([migration 74](#runtime-spec-api-token): the per-mapping upstream-token override — `api_token` is **sealed**, mirroring `applications.api_token`). |
 | `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`, plus operator-owned `position` (migration 73, `integer not null default 0`: the operator-chosen GPU order; rows are read back `order by position, gpu_index`). |
 | `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (73 migrations)
+## 4. Migration history (74 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -411,6 +411,12 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 73 | `runtime_spec_gpu_position_and_visible_devices_mode` | Two additive columns that ship together ([ADR-034](../09-architecture-decisions.md#adr-034--gpu-order-is-explicit-set_visible_devices-gets-an-env-or-args-mode)). Adds `agent_runtime_spec_gpus.position` (`integer not null default 0`): the operator-chosen GPU order, read back `order by position, gpu_index`. **Backfilled** to each spec's prior ascending-by-`gpu_index` rank (`position = count of that spec's other rows with a smaller gpu_index`) — a correlated subquery identical on both dialects — so no existing spec's effective order changes on upgrade; the order only moves once an operator actively reorders the GPU rows in the portal. Adds `agent_runtime_specs.visible_devices_mode` (`text not null default 'env'`): `env` (the default, today's behaviour) or `args` (the agent injects no visibility variable; the operator instead uses a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args`). Aborts the boot on failure, like migration 70/72, rather than skipping like migration 68: both writes are deterministic with no pre-check to fail. |
 
+### Runtime-spec API token
+
+| # | Migration | Purpose |
+|---|---|---|
+| 74 | `runtime_spec_api_token` | Four additive columns on `agent_runtime_specs`, following the migration-73 pattern of shipping the whole feature's schema in one step ([ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)). `api_token_mode text not null default 'app'` — one of `off`\|`set`\|`random`\|`app`. **Default `app`, deliberately, not `off`**: every mapping already sends `Application.APIToken` at the edge today, so backfilling every existing row (and every future blank request) to `app` preserves that behaviour exactly, whereas a default of `off` would silently switch upstream auth OFF for every already-authenticated application on upgrade — the same reasoning migration 72 applied to `responses_mode`/`messages_mode` (`ADR-033`), inverted: there the safe default was the observed booleans' own translation, here it is the *pre-feature constant behaviour* itself. `api_token text not null default ''` — the **sealed** token (`capture.SealSecret` envelope, `enc:…`/`plain:…`), used only by `set`/`random`; empty for `off` and `app`, and **never plaintext** on any store. `api_token_header_source text not null default 'app'` — `app` inherits `Application.APITokenHeader` (the default) or `custom` uses the column below. `api_token_header text not null default ''` — the custom transmission header, used only when the source column is `custom`; empty ⇒ `Authorization: Bearer`. No backfill needed beyond the defaults themselves — there is no prior column any of the four could be derived from. Aborts the boot on failure, like migration 70/72/73. |
+
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
 
@@ -432,6 +438,22 @@ plausible-looking validation rule would break the normal case:
   (`runtime_spec.args_invalid` / `runtime_spec.env_invalid`), never a raw JSON
   error or a 500. **`env` must never hold a secret value** — only
   `${AGENT_ENV:…}` references (see [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway)).
+  **`agent_runtime_specs.api_token` is the one column on this table that
+  *does* hold a secret**, a deliberate, scoped exception to that rule
+  (ADR-035): unlike `env`, it is never a placeholder, it is the actual
+  upstream token — but it is always the **sealed** envelope
+  (`capture.SealSecret`), the same scheme `applications.api_token` already
+  uses, never plaintext, and never read back by anything other than the
+  gateway's own push-time decrypt (see
+  [ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)).
+- **`agent_runtime_specs.api_token_mode` defaults to `'app'`, not `'off'`,
+  and that default is load-bearing across the migration 74 upgrade.** Every
+  mapping already sends `Application.APIToken` at the edge before this
+  feature exists; backfilling to `app` is what makes that continue to be
+  true for every row with no operator action, while a default of `off`
+  would have silently turned upstream authentication off for every
+  already-authenticated `server_agent` application the moment the migration
+  ran.
 - **`responses_mode`/`messages_mode` (`applications`, `agent_runtime_specs`)
   are `text`, not an integer enum**, storing the lowercase `EndpointMode`
   string (`disabled`/`translate`/`passthrough`) directly, scanned straight into

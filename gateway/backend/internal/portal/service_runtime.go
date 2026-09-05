@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"regexp"
@@ -81,6 +82,22 @@ var (
 	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}) appears in args: the
 	// agent would inject no visibility and the selection would be lost. HTTP 400.
 	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
+	// ErrRuntimeSpecAPITokenModeInvalid rejects an api_token_mode that is not
+	// one of off/set/random/app. HTTP 400.
+	ErrRuntimeSpecAPITokenModeInvalid = errors.New("runtime_spec.api_token_mode_invalid")
+	// ErrRuntimeSpecAPITokenNoPlaceholder rejects mode set/random when the
+	// literal "${API_TOKEN}" appears in none of Env's values or Args: the
+	// agent would launch the process with no token wired in at all. HTTP 400.
+	ErrRuntimeSpecAPITokenNoPlaceholder = errors.New("runtime_spec.api_token_no_placeholder")
+	// ErrRuntimeSpecAPITokenPlaceholderWithoutMode rejects mode off when the
+	// placeholder is still present in Env/Args: it would expand to nothing at
+	// launch, silently leaving the literal string in the child's environment
+	// or argv. HTTP 400.
+	ErrRuntimeSpecAPITokenPlaceholderWithoutMode = errors.New("runtime_spec.api_token_placeholder_without_mode")
+	// ErrRuntimeSpecAPITokenHeaderInvalid rejects an api_token_header_source
+	// that is not app/custom, or a custom source whose api_token_header fails
+	// checkHeaderName's shape check. HTTP 400.
+	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -357,6 +374,19 @@ type RuntimeSpecDTO struct {
 	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
 	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
 	VisibleDevicesMode string `json:"visible_devices_mode"`
+	// APITokenMode is "app"|"set"|"random"|"off" (design §2). Default "app".
+	APITokenMode string `json:"api_token_mode"`
+	// APITokenSet reports presence of a per-spec token (set/random); the VALUE
+	// is never on the wire.
+	APITokenSet bool `json:"api_token_set"`
+	// APITokenHeaderSource is "app"|"custom"; APITokenHeader is the custom header.
+	APITokenHeaderSource string `json:"api_token_header_source"`
+	APITokenHeader       string `json:"api_token_header"`
+	// AppAPITokenSet / AppAPITokenHeader echo the parent application's token
+	// presence and header (read-only) so the portal can render the inherited
+	// header and the "app has no token ⇒ auth off" hint under app mode.
+	AppAPITokenSet    bool   `json:"app_api_token_set"`
+	AppAPITokenHeader string `json:"app_api_token_header"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -393,6 +423,20 @@ type PutRuntimeSpecRequest struct {
 	// VisibleDevicesMode: see RuntimeSpecDTO's doc. Absent (empty/"")
 	// defaults to "env" — see putRuntimeSpec.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
+	// APITokenMode / APITokenHeaderSource / APITokenHeader: see
+	// RuntimeSpecDTO's doc. Absent (empty/"") defaults to "app" for both mode
+	// and header source — see validateRuntimeSpecAPIToken.
+	APITokenMode         string `json:"api_token_mode"`
+	APITokenHeaderSource string `json:"api_token_header_source"`
+	APITokenHeader       string `json:"api_token_header"`
+	// APIToken is write-only: nil = keep, "" = clear, value = replace-and-seal.
+	// Sealing/rotation happens in putRuntimeSpec's write path --
+	// validateRuntimeSpecAPIToken only validates the shape of the request
+	// around it.
+	APIToken *string `json:"api_token"`
+	// APITokenRotate, when true under mode "random", forces regeneration on
+	// write.
+	APITokenRotate bool `json:"api_token_rotate"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -402,7 +446,7 @@ type PutRuntimeSpecRequest struct {
 // mapping's runtime configuration without special-casing non-server_agent
 // applications.
 func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) (RuntimeSpecDTO, error) {
-	mapping, _, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, _, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -411,13 +455,24 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
-		return RuntimeSpecDTO{MappingID: mapping.ID, Args: []string{}, Env: map[string]string{}, GPUs: []RuntimeSpecGPUDTO{}, APIFlavors: []string{}, VisibleDevicesMode: string(routing.VisibleDevicesModeEnv)}, nil
+		return RuntimeSpecDTO{
+			MappingID:            mapping.ID,
+			Args:                 []string{},
+			Env:                  map[string]string{},
+			GPUs:                 []RuntimeSpecGPUDTO{},
+			APIFlavors:           []string{},
+			VisibleDevicesMode:   string(routing.VisibleDevicesModeEnv),
+			APITokenMode:         string(routing.RuntimeAPITokenModeApp),
+			APITokenHeaderSource: string(routing.RuntimeAPITokenHeaderSourceApp),
+			AppAPITokenSet:       app.APIToken != "",
+			AppAPITokenHeader:    app.APITokenHeader,
+		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, gpus)
+	return runtimeSpecDTO(spec, gpus, app)
 }
 
 // PutRuntimeSpec validates and upserts mappingID's runtime spec (create on
@@ -514,6 +569,9 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err := validateRuntimeSpecVisibleDevices(req); err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	if err := validateRuntimeSpecAPIToken(req); err != nil {
+		return RuntimeSpecDTO{}, err
+	}
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
 	// frontend pre-fills the create form; the backend only supplies a sane
@@ -591,6 +649,56 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 			measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
 		}
 	}
+	// Per-spec API token (design §2): compute the SEALED value to persist
+	// STRICTLY BEFORE the store write, so a keyless-disk seal rejection
+	// (capture.ErrKeyRequired) returns without persisting anything -- no
+	// plaintext token, no half-applied mode. Mirrors service_applications.go's
+	// write-only *string sentinel exactly: nil = keep the stored (already
+	// sealed) value, "" seals to "" = clear, a value replaces-and-seals. Mode
+	// "random" generates a fresh secret on first write or when rotate is asked;
+	// modes "app"/"off" store no per-spec token. Validation
+	// (validateRuntimeSpecAPIToken, above) has already run -- this only seals.
+	mode := req.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
+	}
+	sealedToken := existing.APIToken // keep by default (existing = the loaded spec, "" when none)
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeRandom:
+		if existing.APIToken == "" || req.APITokenRotate {
+			rawToken, err := generateSecret()
+			if err != nil {
+				return RuntimeSpecDTO{}, err
+			}
+			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, rawToken)
+			if err != nil {
+				return RuntimeSpecDTO{}, err // ErrKeyRequired on a keyless disk store => 400, nothing persisted
+			}
+			sealedToken = sealed
+		}
+	case routing.RuntimeAPITokenModeSet:
+		if req.APIToken != nil { // nil = keep the stored token untouched
+			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, *req.APIToken)
+			if err != nil {
+				return RuntimeSpecDTO{}, err
+			}
+			sealedToken = sealed // "" seals to "" = cleared
+		}
+	default: // app, off -- no per-spec token stored
+		sealedToken = ""
+	}
+	headerSource := req.APITokenHeaderSource
+	if headerSource == "" {
+		headerSource = string(routing.RuntimeAPITokenHeaderSourceApp)
+	}
+	// APITokenHeader is only meaningful for a custom source (its shape was
+	// validated above via checkHeaderName); an "app" source inherits the
+	// application's header at request-auth time (routing.SpecUpstreamAuth via
+	// effectiveAPITokenHeader) and stores none here.
+	headerName := ""
+	if routing.RuntimeAPITokenHeaderSource(headerSource) == routing.RuntimeAPITokenHeaderSourceCustom {
+		headerName = strings.TrimSpace(req.APITokenHeader)
+	}
 	now := s.clock().UTC()
 	spec := routing.RuntimeSpec{
 		ID:                          "rspec_" + compactRandomHex(16),
@@ -611,6 +719,10 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          visibleMode,
+		APITokenMode:                mode,
+		APIToken:                    sealedToken,
+		APITokenHeaderSource:        headerSource,
+		APITokenHeader:              headerName,
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
@@ -642,7 +754,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, storedGPUs)
+	return runtimeSpecDTO(spec, storedGPUs, app)
 }
 
 // DeleteRuntimeSpec removes mappingID's runtime spec. ErrRuntimeSpecNotFound
@@ -785,6 +897,90 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 	return nil
 }
 
+// validRuntimeAPITokenMode reports whether s is one of the four
+// routing.RuntimeAPITokenMode values. Unlike validVisibleDevicesMode, empty
+// is NOT accepted here -- callers normalize "" to "app" themselves before
+// calling this (see validateRuntimeSpecAPIToken), the same way the sealing
+// logic in putRuntimeSpec needs the resolved mode, not the raw request value.
+func validRuntimeAPITokenMode(s string) bool {
+	switch routing.RuntimeAPITokenMode(s) {
+	case routing.RuntimeAPITokenModeOff, routing.RuntimeAPITokenModeSet,
+		routing.RuntimeAPITokenModeRandom, routing.RuntimeAPITokenModeApp:
+		return true
+	}
+	return false
+}
+
+// specHasAPITokenPlaceholder reports whether the literal "${API_TOKEN}"
+// appears in any Env value or any Args element. Args is included
+// deliberately (design decision C1): some upstream binaries only accept a
+// bearer token as a CLI flag, not an environment variable, and the portal's
+// job here is only to detect the placeholder, not to steer where it is used
+// -- the agent is the one that emits a loud warning for the args case.
+func specHasAPITokenPlaceholder(env map[string]string, args []string) bool {
+	const ph = "${API_TOKEN}"
+	for _, v := range env {
+		if strings.Contains(v, ph) {
+			return true
+		}
+	}
+	for _, a := range args {
+		if strings.Contains(a, ph) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateRuntimeSpecAPIToken validates api_token_mode, the ${API_TOKEN}
+// placeholder requirement that mode implies, and api_token_header_source/
+// api_token_header. It does NOT look at api_token or api_token_rotate --
+// those drive sealing/rotation in putRuntimeSpec's write path, a persistence
+// concern this pure request-shape validator has no business with -- and it
+// does NOT read the parent application's own token: there is no app_unset
+// error, mode "app" is valid regardless of whether the app has a token
+// configured (an app with no token simply means auth ends up off for this
+// spec, resolved later by resolvePushToken, not a validation failure here).
+//
+// Runs BEFORE any mutation, like validateRuntimeSpecVisibleDevices, and
+// reads req rather than the stored row for the same reason: PutRuntimeSpec
+// is a full-document upsert, so the request IS the resulting spec.
+func validateRuntimeSpecAPIToken(req PutRuntimeSpecRequest) error {
+	mode := req.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
+	}
+	if !validRuntimeAPITokenMode(mode) {
+		return ErrRuntimeSpecAPITokenModeInvalid
+	}
+	hasPlaceholder := specHasAPITokenPlaceholder(req.Env, req.Args)
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeSet, routing.RuntimeAPITokenModeRandom:
+		if !hasPlaceholder {
+			return ErrRuntimeSpecAPITokenNoPlaceholder
+		}
+	case routing.RuntimeAPITokenModeOff:
+		if hasPlaceholder {
+			return ErrRuntimeSpecAPITokenPlaceholderWithoutMode
+		}
+	}
+	src := req.APITokenHeaderSource
+	if src == "" {
+		src = string(routing.RuntimeAPITokenHeaderSourceApp)
+	}
+	switch routing.RuntimeAPITokenHeaderSource(src) {
+	case routing.RuntimeAPITokenHeaderSourceApp:
+		// header inherited from the app; req.APITokenHeader ignored.
+	case routing.RuntimeAPITokenHeaderSourceCustom:
+		if _, err := checkHeaderName(req.APITokenHeader); err != nil {
+			return ErrRuntimeSpecAPITokenHeaderInvalid
+		}
+	default:
+		return ErrRuntimeSpecAPITokenHeaderInvalid
+	}
+	return nil
+}
+
 // validateRuntimeSpecGPUs rejects a negative GPU index, a negative VRAM
 // estimate, or a GPU index repeated across entries — all ErrRuntimeSpecGPUInvalid,
 // checked BEFORE any store call (the store's own duplicate-index guard
@@ -803,13 +999,15 @@ func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
 	return nil
 }
 
-// runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows.
-// Args/Env are opaque JSON strings at the store layer (the netbird_group_ids
-// pattern) — an unmarshal failure here means the stored row is corrupt, not
-// a client-input problem, but still surfaces as the matching domain sentinel
+// runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows, plus
+// the parent application (for the read-only api-token echoes — see
+// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader). Args/Env are opaque JSON
+// strings at the store layer (the netbird_group_ids pattern) — an unmarshal
+// failure here means the stored row is corrupt, not a client-input problem,
+// but still surfaces as the matching domain sentinel
 // (ErrRuntimeSpecArgsInvalid / ErrRuntimeSpecEnvInvalid) rather than a raw
 // JSON error or a 500.
-func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (RuntimeSpecDTO, error) {
+func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application) (RuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
@@ -856,7 +1054,34 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU) (Ru
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
+		APITokenMode:                normalizeRuntimeAPITokenMode(spec.APITokenMode),
+		APITokenSet:                 spec.APIToken != "",
+		APITokenHeaderSource:        normalizeRuntimeAPITokenHeaderSource(spec.APITokenHeaderSource),
+		APITokenHeader:              spec.APITokenHeader,
+		AppAPITokenSet:              app.APIToken != "",
+		AppAPITokenHeader:           app.APITokenHeader,
 	}, nil
+}
+
+// normalizeRuntimeAPITokenMode defaults an empty stored/DTO mode to "app" —
+// every row created before this API-token support existed has "" here, and
+// "" must never reach the wire: it means the same thing as "app"
+// (routing.RuntimeAPITokenModeApp) but portal callers should only ever see
+// the one canonical spelling.
+func normalizeRuntimeAPITokenMode(mode string) string {
+	if mode == "" {
+		return string(routing.RuntimeAPITokenModeApp)
+	}
+	return mode
+}
+
+// normalizeRuntimeAPITokenHeaderSource is normalizeRuntimeAPITokenMode's
+// sibling for the header-source column ("app"|"custom", default "app").
+func normalizeRuntimeAPITokenHeaderSource(source string) string {
+	if source == "" {
+		return string(routing.RuntimeAPITokenHeaderSourceApp)
+	}
+	return source
 }
 
 // --- Task 6: co-residency matrix --------------------------------------------
@@ -1391,6 +1616,16 @@ type AgentRuntimeSpecDTO struct {
 	// agent NEEDS this, so it DOES cross the wire.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
 	AdminState         string `json:"admin_state"`
+	// APIToken is the DECRYPTED upstream token the agent substitutes into the
+	// child's ${API_TOKEN} for this spec, or "" when the mode is off or no token
+	// is set (see resolvePushToken; the agent-side runtime.Spec pairs this exact
+	// json tag). Unlike every other field here it is a SECRET in the
+	// clear: it rides the already-authenticated agent channel, but that channel
+	// is only encrypted when the gateway URL is https. When it is not, this value
+	// travels in clear -- the operator-facing insecure-transport warning is
+	// surfaced in the portal UI; portal.Service adds no server-side guard of its
+	// own here because it does not hold the gateway public URL.
+	APIToken string `json:"api_token"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1565,6 +1800,10 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
+		// The ONLY place the gateway decrypts the per-mapping token, and it does
+		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
+		// here -- the builder returns the empty document above when it is nil.
+		specDTO.APIToken = s.resolvePushToken(spec, *agentApp)
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
@@ -1582,6 +1821,44 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		coresident = append(coresident, [2]string{specA, specB})
 	}
 	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+}
+
+// resolvePushToken returns the DECRYPTED upstream token to inject into the child
+// for this spec's mode, or "" for off / app-unset. It is the ONLY place the
+// gateway decrypts the runtime-spec token, and it NEVER stores or logs the
+// plaintext -- the returned value is used only as the AgentRuntimeSpecDTO.APIToken
+// field pushed over the already-authenticated agent channel. On ANY decrypt
+// failure it returns "" (fail-closed): the agent then hard-errors at launch on an
+// unresolved ${API_TOKEN}, rather than the child booting with a garbled/partial
+// secret.
+//
+// https note: that agent channel is only encrypted when the gateway URL is https.
+// When it is not, this decrypted token travels in clear. portal.Service does not
+// currently hold the gateway public URL, so it adds no server-side guard of its
+// own here; the operator-facing insecure-transport warning is surfaced in the
+// portal UI instead.
+func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Application) string {
+	mode := spec.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
+	}
+	var sealed string
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeOff:
+		return ""
+	case routing.RuntimeAPITokenModeSet, routing.RuntimeAPITokenModeRandom:
+		sealed = spec.APIToken
+	default: // app, and any unrecognized mode -> app, matching SpecUpstreamAuth
+		sealed = app.APIToken
+	}
+	if sealed == "" {
+		return ""
+	}
+	tok, err := capture.OpenSecret(s.cipher, sealed)
+	if err != nil {
+		return "" // fail-closed; never log the value
+	}
+	return tok
 }
 
 // agentRuntimeSpecDTO builds one AgentRuntimeSpecDTO from a stored (already

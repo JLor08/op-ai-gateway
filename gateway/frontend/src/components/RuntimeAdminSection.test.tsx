@@ -152,11 +152,44 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    api_token_mode: 'app',
+    api_token_set: false,
+    api_token_header_source: 'app',
+    api_token_header: '',
+    app_api_token_set: false,
+    app_api_token_header: '',
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
     ...overrides,
   };
+}
+
+// Shared by both the API-token mode tests and the header-source tests below:
+// opens the edit sub-view for a single pre-existing spec.
+async function openApiTokenSpecEdit(
+  specOverrides: Partial<RuntimeSpec> = {},
+  applicationOverride?: PortalApplication,
+) {
+  const rendered = renderSection({
+    mappings: [makeMapping({ id: 'map_1' })],
+    specsByMappingId: {
+      map_1: makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        // Binary is a required field; a save in these tests must not be
+        // silently blocked by HTML5 constraint validation over a fact this
+        // describe block has no interest in.
+        binary: '/usr/bin/llama-server',
+        ...specOverrides,
+      }),
+    },
+    ...(applicationOverride ? { application: applicationOverride } : {}),
+  });
+  await screen.findByText('gw-model');
+  fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+  await screen.findByLabelText(t.runtimeSpecBinary);
+  return rendered;
 }
 
 // Minimal-but-valid HardwareResponse for the "server limits" telemetry-prefill
@@ -1784,6 +1817,9 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
     visible_devices_mode: spec.visible_devices_mode,
+    api_token_mode: spec.api_token_mode,
+    api_token_header_source: spec.api_token_header_source,
+    api_token_header: spec.api_token_header,
     gpus: spec.gpus,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
@@ -5873,5 +5909,337 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
     // No mapping exists yet, so there is nothing to read a history for.
     expect(fakeApi.mappingBenchmarks).not.toHaveBeenCalled();
+  });
+});
+
+// Runtime-Spec API Token: the MODE controls only -- a mode select (default
+// 'app'), a write-only token field for 'set', a rotate button for 'random',
+// and the app-unset hint for 'app'. The header-source select + inherited-
+// header display is covered in its own describe block below.
+describe('RuntimeAdminSection API-token mode', () => {
+  it('defaults api_token_mode to app in the spec PUT body (create)', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_mode).toBe('app');
+    expect('api_token' in putSpecs[0].body).toBe(false);
+  });
+
+  it('shows the app-unset hint for mode "app" when the parent app has no token', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'app', app_api_token_set: false });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenAppUnsetHint)).toBeInTheDocument();
+    // Neither of the other two modes' controls leak into the app-mode view.
+    expect(screen.queryByLabelText(t.runtimeSpecApiTokenLabel)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: t.runtimeSpecApiTokenRotate }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('hides the app-unset hint for mode "app" once the parent app has a token', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'app', app_api_token_set: true });
+    expect(screen.queryByText(t.runtimeSpecApiTokenAppUnsetHint)).not.toBeInTheDocument();
+  });
+
+  it('switching to "set" shows the write-only token field and the set/unset indicator', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      api_token_mode: 'app',
+      api_token_set: true,
+      app_api_token_set: false,
+    });
+
+    // The app-unset hint from the starting 'app' mode is showing first.
+    expect(screen.getByText(t.runtimeSpecApiTokenAppUnsetHint)).toBeInTheDocument();
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenMode });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecApiTokenModeSet }));
+
+    // The hint for 'app' is gone; the write-only field + indicator appear.
+    expect(screen.queryByText(t.runtimeSpecApiTokenAppUnsetHint)).not.toBeInTheDocument();
+    const tokenField = screen.getByLabelText(t.runtimeSpecApiTokenLabel) as HTMLInputElement;
+    expect(tokenField).toHaveAttribute('type', 'password');
+    // api_token_set: true on the loaded spec -> the "gesetzt" indicator + the
+    // set placeholder (never the value itself -- the field starts empty).
+    expect(tokenField.value).toBe('');
+    expect(tokenField.placeholder).toBe(t.runtimeSpecApiTokenSetPlaceholder);
+    expect(screen.getByText(t.runtimeSpecApiTokenSetIndicator)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenUnsetIndicator)).not.toBeInTheDocument();
+
+    // Wiring: a typed value replaces the token on save.
+    fireEvent.change(tokenField, { target: { value: 'sk-new-token' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_mode).toBe('set');
+    expect(putSpecs[0].body.api_token).toBe('sk-new-token');
+  });
+
+  it('shows the unset indicator for "set" mode when no spec-level token is stored', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', api_token_set: false });
+    expect(screen.getByText(t.runtimeSpecApiTokenUnsetIndicator)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenSetIndicator)).not.toBeInTheDocument();
+    // Nothing stored yet, so there is no clear affordance to offer.
+    expect(
+      screen.queryByRole('button', { name: t.runtimeSpecApiTokenClear }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('omits api_token on an untouched "set"-mode save (keeps the stored token)', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_set: true,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_mode).toBe('set');
+    expect('api_token' in putSpecs[0].body).toBe(false);
+  });
+
+  it('sends api_token: "" after the Clear affordance is used', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_set: true,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecApiTokenClear }));
+    // The clear affordance itself disappears once the field reads as cleared
+    // (mirrors ApplicationSection's own token field).
+    expect(
+      screen.queryByRole('button', { name: t.runtimeSpecApiTokenClear }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token).toBe('');
+  });
+
+  it('switching to "random" shows the rotate button and no plaintext token field', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ api_token_mode: 'app' });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenMode });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecApiTokenModeRandom }));
+
+    // The rotate affordance is there; nothing that could show or accept a
+    // plaintext value is -- the random-mode token is never readable, only
+    // rotatable.
+    const rotateButton = screen.getByRole('button', { name: t.runtimeSpecApiTokenRotate });
+    expect(rotateButton).toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecApiTokenLabel)).not.toBeInTheDocument();
+    expect(document.querySelector('input[type="password"]')).not.toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRandomHint)).toBeInTheDocument();
+
+    // Clicking it does not save immediately -- it only arms the next save.
+    fireEvent.click(rotateButton);
+    expect(putSpecs).toHaveLength(0);
+    expect(screen.getByText(t.runtimeSpecApiTokenRotatePending)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_mode).toBe('random');
+    expect(putSpecs[0].body.api_token_rotate).toBe(true);
+    expect('api_token' in putSpecs[0].body).toBe(false);
+  });
+
+  it('does not send api_token_rotate when leaving "random" mode before saving', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ api_token_mode: 'app' });
+
+    let combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenMode });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecApiTokenModeRandom }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecApiTokenRotate }));
+
+    // Switch away from 'random' before saving: the armed rotate must not
+    // silently reappear, and must not be sent for a mode it no longer applies to.
+    combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenMode });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecApiTokenModeOff }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_mode).toBe('off');
+    expect('api_token_rotate' in putSpecs[0].body).toBe(false);
+  });
+});
+
+// Runtime-Spec API Token header source: which header CARRIES the token from
+// the mode block above -- inherit the app's own header (default) or set a
+// per-mapping custom one, with a warning that a custom header must match
+// what the backend actually expects. Hidden entirely under mode 'off'.
+describe('RuntimeAdminSection API-token header source', () => {
+  it('shows the Bearer default when the parent app has no header override', async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+      app_api_token_header: '',
+    });
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe(t.runtimeSpecApiTokenHeaderDefault);
+  });
+
+  it("shows the app's own header name once it has one", async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+      app_api_token_header: 'X-Api-Key',
+    });
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe('X-Api-Key');
+  });
+
+  it('falls back to the parent application’s own header on CREATE (no spec yet)', async () => {
+    renderSection({ application: { ...application, api_token_header: 'X-From-App' } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+
+    expect(
+      (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
+    ).toBe('X-From-App');
+  });
+
+  it('switching to "custom" hides the inherited display and shows the free-text field', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', api_token_header_source: 'app' });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+
+    expect(
+      screen.queryByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel),
+    ).not.toBeInTheDocument();
+    const headerField = screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel) as HTMLInputElement;
+    expect(headerField.value).toBe('');
+    expect(headerField.placeholder).toBe('Authorization: Bearer');
+    // No mismatch warning yet: an empty custom header round-trips to the same
+    // Bearer default the 'app' source would show.
+    expect(screen.queryByText(t.runtimeSpecApiTokenHeaderMismatchWarning)).not.toBeInTheDocument();
+  });
+
+  it('renders the mismatch warning once a non-empty custom header is typed', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', api_token_header_source: 'app' });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel), {
+      target: { value: 'X-Custom-Auth' },
+    });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenHeaderMismatchWarning)).toBeInTheDocument();
+  });
+
+  it('sends the header source + custom header in the spec PUT body', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      api_token_mode: 'set',
+      api_token_header_source: 'app',
+    });
+
+    const combo = screen.getByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource });
+    fireEvent.mouseDown(combo);
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecApiTokenHeaderSourceCustom }),
+    );
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecApiTokenHeaderLabel), {
+      target: { value: 'X-Custom-Auth' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_token_header_source).toBe('custom');
+    expect(putSpecs[0].body.api_token_header).toBe('X-Custom-Auth');
+  });
+
+  it('hides the whole header block when mode is "off"', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'off' });
+
+    expect(
+      screen.queryByRole('combobox', { name: t.runtimeSpecApiTokenHeaderSource }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecApiTokenHeaderLabel)).not.toBeInTheDocument();
+  });
+});
+
+describe('RuntimeAdminSection API-token backend hints', () => {
+  it('shows the per-backend variable table whenever mode is not "off"', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenBackendHint)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowVllmEnv)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowLlamaCppEnv)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecApiTokenRowTgiEnv)).toBeInTheDocument();
+    // Args column is marked readable -- the whole point of the warning below.
+    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(3);
+  });
+
+  it('shows the loud Args-leak warning only while ${API_TOKEN} sits in the Args field', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--api-key\n${API_TOKEN}' },
+    });
+    expect(await screen.findByText(t.runtimeSpecApiTokenArgsLeakWarning)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--api-key\nsome-other-value' },
+    });
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+  });
+
+  it('shows the structural unsupported-backend note whenever mode is not "off" -- a general note, not keyed off app.Type', async () => {
+    // A runtime spec's application is always 'server_agent' -- that field
+    // carries no signal about the child model server -- so this note must
+    // render regardless, unlike a per-app.Type switch would.
+    await openApiTokenSpecEdit({ api_token_mode: 'random' });
+
+    expect(screen.getByText(t.runtimeSpecApiTokenBackendBanner)).toBeInTheDocument();
+  });
+
+  it('additionally highlights Ollama by name when the binary path names it', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', binary: '/usr/local/bin/ollama' });
+
+    expect(
+      screen.getByText(t.runtimeSpecApiTokenBackendBannerOllamaHint, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('additionally highlights llama-swap by name when the binary path names it', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set', binary: '/opt/bin/llama-swap' });
+
+    expect(
+      screen.getByText(t.runtimeSpecApiTokenBackendBannerLlamaSwapHint, { exact: false }),
+    ).toBeInTheDocument();
+  });
+
+  it('hides the hint table, the Args warning, and the backend note when mode is "off"', async () => {
+    await openApiTokenSpecEdit({
+      api_token_mode: 'off',
+      // Args carries the leak trigger too, to prove the whole block -- not
+      // just the mode-gated bits above it -- is gone under "off".
+      args: ['--api-key', '${API_TOKEN}'],
+    });
+
+    expect(screen.queryByText(t.runtimeSpecApiTokenBackendHint)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenRowVllmEnv)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecApiTokenBackendBanner)).not.toBeInTheDocument();
   });
 });

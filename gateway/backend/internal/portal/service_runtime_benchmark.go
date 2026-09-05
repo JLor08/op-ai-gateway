@@ -48,6 +48,9 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		APITokenMode:                dto.APITokenMode,
+		APITokenHeaderSource:        dto.APITokenHeaderSource,
+		APITokenHeader:              dto.APITokenHeader,
 	}
 }
 
@@ -110,23 +113,23 @@ func (s *Service) SetBenchmarkRuntimeSpecAdminState(ctx context.Context, specID,
 	if strings.TrimSpace(spec.AdminState) != strings.TrimSpace(expectedAdminState) {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecAdminStateConflict
 	}
+	mapping, app, server, err := s.resolveMappingChain(ctx, spec.MappingID)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
 	// The SPREAD: re-read the whole document, replace one field. Never an
 	// assembled field list -- see putRequestFromDTO.
-	dto, err := runtimeSpecDTO(spec, gpus)
+	dto, err := runtimeSpecDTO(spec, gpus, app)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
 	req := putRequestFromDTO(dto)
 	req.AdminState = adminState
 
-	mapping, app, server, err := s.resolveMappingChain(ctx, spec.MappingID)
-	if err != nil {
-		return RuntimeSpecDTO{}, err
-	}
 	return s.putRuntimeSpec(ctx, mapping, app, server, req)
 }
 
