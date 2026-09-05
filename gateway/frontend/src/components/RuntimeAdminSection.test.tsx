@@ -6186,7 +6186,7 @@ describe('RuntimeAdminSection API-token backend hints', () => {
     expect(screen.getByText(t.runtimeSpecApiTokenRowLlamaCppEnv)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeSpecApiTokenRowTgiEnv)).toBeInTheDocument();
     // Args column is marked readable -- the whole point of the warning below.
-    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark).length).toBe(3);
+    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(3);
   });
 
   it('shows the loud Args-leak warning only while ${API_TOKEN} sits in the Args field', async () => {

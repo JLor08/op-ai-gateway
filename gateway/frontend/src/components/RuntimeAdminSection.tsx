@@ -3515,11 +3515,15 @@ export function RuntimeAdminSection({
     // itself (see collectArgsWarnings-style live feedback elsewhere in this
     // form for the same non-blocking-hint idiom).
     const apiTokenBinaryLower = basename(binary).toLowerCase();
-    const apiTokenBackendHintKey: MessageKey | null = apiTokenBinaryLower.includes('ollama')
-      ? 'runtimeSpecApiTokenBackendBannerOllamaHint'
-      : apiTokenBinaryLower.includes('llama-swap') || apiTokenBinaryLower.includes('llama_swap')
-        ? 'runtimeSpecApiTokenBackendBannerLlamaSwapHint'
-        : null;
+    let apiTokenBackendHintKey: MessageKey | null = null;
+    if (apiTokenBinaryLower.includes('ollama')) {
+      apiTokenBackendHintKey = 'runtimeSpecApiTokenBackendBannerOllamaHint';
+    } else if (
+      apiTokenBinaryLower.includes('llama-swap') ||
+      apiTokenBinaryLower.includes('llama_swap')
+    ) {
+      apiTokenBackendHintKey = 'runtimeSpecApiTokenBackendBannerLlamaSwapHint';
+    }
     const agentOs = hardware.data?.available && hardware.data.report ? hardware.data.report.os : '';
     const agentOsKnown = agentOs !== '';
     const isMacOsAgent = /darwin|mac ?os/i.test(agentOs);
