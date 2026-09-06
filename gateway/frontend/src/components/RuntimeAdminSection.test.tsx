@@ -765,10 +765,18 @@ describe('RuntimeAdminSection launch specs list', () => {
 
     await screen.findByText('gw-off');
     // Each row shows the enforcement mechanism directly, not a bare on/off.
-    expect(inRowWith('gw-off').getByText(t.runtimeSpecVisibleDevicesValueOff)).toBeInTheDocument();
-    expect(inRowWith('gw-env').getByText(t.runtimeSpecVisibleDevicesValueEnv)).toBeInTheDocument();
+    // A row's value cell fills in only after THAT row's spec loads (async,
+    // per row), so await it WITHIN the row: a plain getByText races the load
+    // and flakes in CI ("Unable to find an element with the text:
+    // Umgebungsvariable" when the env row's value had not committed yet).
     expect(
-      inRowWith('gw-args').getByText(t.runtimeSpecVisibleDevicesValueArgs),
+      await inRowWith('gw-off').findByText(t.runtimeSpecVisibleDevicesValueOff),
+    ).toBeInTheDocument();
+    expect(
+      await inRowWith('gw-env').findByText(t.runtimeSpecVisibleDevicesValueEnv),
+    ).toBeInTheDocument();
+    expect(
+      await inRowWith('gw-args').findByText(t.runtimeSpecVisibleDevicesValueArgs),
     ).toBeInTheDocument();
     // The column header carries the renamed label.
     expect(screen.getAllByText(t.runtimeSpecSetVisibleDevices).length).toBeGreaterThanOrEqual(1);
