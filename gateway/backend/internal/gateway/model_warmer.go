@@ -110,6 +110,7 @@ func (w *modelWarmer) warmOnce(name string) {
 	}
 	cand := w.pickCandidate(cands)
 	bt := benchmarkTarget{server: cand.Server, app: cand.Application, mapping: cand.Mapping}
+	bt.spec = s.benchmarkSpecFor(ctx, cand.Application, cand.Mapping.ID)
 	target, req := benchmarkTargetReq(bt)
 	if target.Timeout <= 0 {
 		target.Timeout = warmCallTimeout // a wedged upstream must not hang the warm

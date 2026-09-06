@@ -507,7 +507,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-73-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-74-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -563,5 +563,84 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-73-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-74-migrations),
+[API Surface](reference/api-surface.md#agent-managed-model-runtime).
+
+## ADR-035 — The gateway owns the runtime-spec upstream token
+**Context:** a runtime spec can now require its launched child process to
+present an API token, and the gateway must authenticate to that same child
+with the same token — the reverse of every other secret this system touches.
+`${AGENT_ENV:NAME}` (ADR-027) exists precisely so a model secret never
+reaches the gateway; `routing.Application.APIToken` is the one accepted
+exception, an operator-set, sealed, write-only token the gateway already
+decrypts and sends at the edge. The new requirement — a *child-launch*
+secret the gateway must also know to authenticate upstream — cannot be
+satisfied by either existing mechanism: `${AGENT_ENV:NAME}` never reaches the
+gateway at all, so the gateway could not authenticate with it, and
+`Application.APIToken` is one value per application, not one per mapping.
+**Decision:** the gateway **owns and stores** the token — sealed at rest
+with the existing capture cipher, generated with `crypto/rand` when the
+operator picks `random`, never returned to the UI — rather than having the
+agent generate one and report it up. A per-spec `api_token_mode`
+(`off`/`set`/`random`/`app`, migration 74) selects the source; `app` is the
+**default**, reusing `Application.APIToken` unchanged, because every mapping
+already sends that token at the edge today and a default of `off` would have
+silently disabled upstream authentication for every already-authenticated
+application on upgrade. The token crosses to the agent in a **dedicated wire
+field** (`Spec.api_token`), decrypted only at push time and never persisted
+decrypted; a decrypt failure pushes an **empty** token (fail-closed), so the
+agent hard-errors at `${API_TOKEN}` rather than launching a child with a
+garbled or partial secret. Authentication at the edge and the injected value
+at launch are resolved through **one function**,
+`routing.SpecUpstreamAuth(spec, app)`, called from both the ordinary
+resolver (`resolver.go` `targetFrom`) and the VRAM-benchmark/capacity-probe
+Target builders (`internal/gateway/benchmark_runner.go`) — the second call
+site closes a real gap a naive implementation left open: those builders read
+`Application.APIToken` directly, so a `set`/`random` mapping's own scheduled
+benchmark or capacity probe would 401 against its own child. `${API_TOKEN}`
+resolution and masking are **new agent-side code**, not a reuse of the
+`${AGENT_ENV:NAME}` path, even though both end up recorded as secret spans
+feeding the same `masked` wire flag: `${AGENT_ENV:NAME}` reads the agent's
+own environment, `${API_TOKEN}` reads a field the gateway put on the wire,
+and folding the two together would let one variable's masking rule silently
+govern the other's provenance. `${API_TOKEN}` is accepted in **both** Env
+values and Args — Env is recommended and is what every documented backend
+supports, but Args is not blocked, because the operator's fallback for a
+backend that only takes the key as a flag matters more than the process
+listing / server-log exposure that placement costs; the portal instead
+shows a loud, non-blocking warning, the same trade ADR-027 already accepted
+for `${AGENT_ENV:NAME}` in Args.
+**Rejected:** an agent-generated token reported upward (would need a new
+back-report channel and leaves a window where the gateway does not yet know
+the value it must authenticate with); defaulting `api_token_mode` to `off`
+(silently disables auth for every existing application on upgrade); teaching
+the agent to generate `random` values itself (the gateway cannot then
+authenticate without a report round trip, and "nobody sees it" is only true
+if the party that never displays it is also the party that stores it);
+gating the structural unsupported-backend warning on `application.type`, the
+initially proposed design (a `server_agent` runtime spec always belongs to a
+`server_agent` application — that field is constant and carries **no**
+information about which child model server the spec actually launches, so a
+switch on it can never distinguish Ollama from vLLM from llama.cpp).
+**Consequence:** the portal's backend warning is necessarily
+**general** — shown whenever `api_token_mode != off`, regardless of the
+spec's binary — plus an optional, purely cosmetic hint derived from the
+binary's own basename (matching `ollama` or `llama-swap`/`llama_swap`) that
+appends a sentence to the same banner and never gates whether it renders;
+narrowing it further would need a typed child-backend field on the runtime
+spec that does not exist today. The honest limitation this decision cannot
+lift: **Ollama has no native inbound-auth mechanism at all, LM Studio's
+token is a GUI-only toggle, and llama-swap only reads `apiKeys` from its own
+YAML** — against any of the three, `${API_TOKEN}` authenticates the gateway
+side of the connection while the child never checks it, so the feature warns
+rather than secures there. A second accepted gap: the decrypted token
+travels the gateway↔agent channel in clear whenever the configured gateway
+URL is `http://`, exactly as the agent's own bearer credential already does,
+and nothing in this feature adds an enforcement or a warning for that
+specifically — `portal.Service` does not hold the gateway's own public URL,
+so the operator's TLS posture is depended on, not verified.
+→ [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[§13](cross-cutting/agent-runtime-manager.md#13-known-limitations-and-accepted-risks),
+[Data Model §4](reference/data-model.md#runtime-spec-api-token),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).

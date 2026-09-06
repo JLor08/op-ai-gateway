@@ -86,7 +86,18 @@ import (
 // order will be silently re-sorted and an args-mode spec will fail to
 // launch (the placeholder passes through literally) rather than let the
 // operator discover it from a misbehaving model.
-const Version = "0.4.0"
+//
+// 0.4.0 -> 0.5.0 is the single bump for the runtime-spec-api-token branch:
+// the agent now resolves the ${API_TOKEN} placeholder from the gateway's
+// runtime-config api_token field into the managed child process's env/args,
+// masks it in the reported launch command, and redacts it in file-mode
+// reports. The agent gates none of this on the flag -- it always resolves
+// and masks what it receives -- but agent.Features declares
+// "runtime_api_token" anyway, MINOR, so a gateway/portal talking to an older
+// agent can tell that a runtime-spec API token will not actually be honored
+// (or masked) rather than let the operator discover it from a leaked
+// credential.
+const Version = "0.5.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -80,6 +80,53 @@ func TestBuildReportRedactsEnvValues(t *testing.T) {
 	}
 }
 
+// TestRedactConfigEnvRedactsAPIToken is the security guard for I4: a
+// hand-written FILE-MODE spec (or a gateway-pushed token in push mode) can
+// carry a literal api_token, and redactConfigEnv must mask it exactly as it
+// masks env VALUES, so the token never crosses the report wire in clear. It
+// greps the MARSHALED bytes (not the struct) for the literal, and also proves
+// redactConfigEnv keeps its no-mutation contract: the caller's cfg still holds
+// the original token after the call.
+func TestRedactConfigEnvRedactsAPIToken(t *testing.T) {
+	const secret = "literal-secret"
+	cfg := Config{
+		Specs: []Spec{
+			{ID: "with-token", APIToken: secret, Env: map[string]string{"HF_TOKEN": "env-secret"}},
+			{ID: "no-token"}, // APIToken == "" must stay ""
+		},
+	}
+
+	redacted := redactConfigEnv(cfg)
+
+	raw, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatalf("marshal redacted config: %v", err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("api token leaked into the marshaled config: %s", raw)
+	}
+	// The existing env-value redaction still holds.
+	if strings.Contains(string(raw), "env-secret") {
+		t.Fatalf("env value leaked into the marshaled config: %s", raw)
+	}
+	if !strings.Contains(string(raw), envRedactedMask) {
+		t.Fatalf("expected the redaction mask %q to appear: %s", envRedactedMask, raw)
+	}
+
+	// The redacted struct: token spec masked, no-token spec still empty.
+	if redacted.Specs[0].APIToken != envRedactedMask {
+		t.Errorf("spec[0] APIToken = %q, want the mask %q", redacted.Specs[0].APIToken, envRedactedMask)
+	}
+	if redacted.Specs[1].APIToken != "" {
+		t.Errorf("spec[1] had no token; APIToken = %q, want \"\" (absence must stay distinguishable)", redacted.Specs[1].APIToken)
+	}
+
+	// No-mutation contract: the caller's cfg is untouched.
+	if cfg.Specs[0].APIToken != secret {
+		t.Errorf("redactConfigEnv mutated the caller's cfg: spec[0] APIToken = %q, want %q", cfg.Specs[0].APIToken, secret)
+	}
+}
+
 // TestBuildReportParseErrorRoundTrips proves the parse_error CODE (and a
 // non-file source) survive BuildReport unchanged. The parameter is a
 // ParseErrorCode, not free text, so "round-trips" is all this function is

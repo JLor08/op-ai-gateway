@@ -51,6 +51,16 @@ type benchmarkTarget struct {
 	server  routing.AIServer
 	app     routing.Application
 	mapping routing.ModelMapping
+	// spec is the RESOLVED RuntimeSpec for a server_agent mapping (zero for any
+	// other app type, or for a server_agent mapping with no spec yet). Every
+	// benchmark/capacity/probe Target builder below resolves its APIToken/
+	// APITokenHeader via routing.SpecUpstreamAuth(spec, app) instead of reading
+	// app.APIToken directly (security review I3), mirroring
+	// routing.Resolver.targetFrom's live-request path: a set/random-mode
+	// server_agent child's SEALED spec token is used, everything else falls
+	// back to the app token unchanged. Callers populate it at construction
+	// (benchmarkSpecFor); benchmarkTarget itself never loads it.
+	spec routing.RuntimeSpec
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -110,18 +120,39 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 	return ttft, usage, nil
 }
 
+// benchmarkSpecFor resolves the RuntimeSpec a benchmarkTarget should carry (its
+// .spec field) for later auth resolution via routing.SpecUpstreamAuth, mirroring
+// routing.Resolver.targetFrom's live-request rule: only a server_agent
+// application's mapping can have a spec at all, so any other app type returns a
+// zero spec WITHOUT touching the store. A mapping with no spec yet, or a
+// spec-store error, also returns zero (best-effort — a benchmark/capacity/
+// warm/probe run must never fail because a spec lookup hiccupped). A zero spec
+// makes SpecUpstreamAuth fall back to the app token: today's pre-Runtime-Spec-
+// API-Token behaviour, unchanged for every non-server_agent or no-spec case.
+func (s *Server) benchmarkSpecFor(ctx context.Context, app routing.Application, mappingID string) routing.RuntimeSpec {
+	if app.Type != routing.ProviderServerAgent {
+		return routing.RuntimeSpec{}
+	}
+	spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		return routing.RuntimeSpec{}
+	}
+	return spec
+}
+
 // benchmarkTargetReq builds the routing.Target + a base inference.Request (from the first
 // benchmark prompt) a benchmark issues for a mapping. Shared by the speed (measureMapping)
 // and capacity (measureMappingCapacity) paths so both hit an identical target/request.
 func benchmarkTargetReq(tgt benchmarkTarget) (routing.Target, inference.Request) {
+	apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
 	target := routing.Target{
 		Provider:       tgt.app.Type,
 		Endpoint:       routing.ApplicationEndpoint(tgt.server, tgt.app),
 		Model:          tgt.mapping.GatewayModelName,
 		ProviderModel:  tgt.mapping.AppModelName,
 		Timeout:        time.Duration(tgt.app.TimeoutMS) * time.Millisecond,
-		APIToken:       tgt.app.APIToken,
-		APITokenHeader: tgt.app.APITokenHeader,
+		APIToken:       apiToken,
+		APITokenHeader: apiTokenHeader,
 	}
 	p := benchmarkPrompts[0]
 	req := inference.Request{
@@ -521,7 +552,8 @@ func (s *Server) runContextProbe(ctx context.Context, run *benchmarkRun, serverI
 	//    always attribute directly to THIS mapping (we just loaded it): {model} expansion + the
 	//    shared PickModelContextSize (name-match preferred, else first positive). No store write.
 	if prober, ok := s.Provider.(provider.ModelInfoProber); ok && strings.TrimSpace(tgt.app.ContextProbePath) != "" {
-		pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: tgt.app.APIToken, APITokenHeader: tgt.app.APITokenHeader}
+		apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
+		pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: apiToken, APITokenHeader: apiTokenHeader}
 		pctx := s.upstreamAuthCtx(ctx, pt)
 		probePath := provider.ExpandModelPath(tgt.app.ContextProbePath, tgt.mapping.AppModelName)
 		if infos, perr := prober.ProbeModelInfo(pctx, pt, probePath); perr == nil {
@@ -541,7 +573,8 @@ func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) Be
 		// Re-probe context FIRST (the model is resident from measureMapping's warm
 		// pass); UpdateMappingContextProbe sets metrics_source='probe'.
 		if prober, ok := s.Provider.(provider.ModelInfoProber); ok && strings.TrimSpace(tgt.app.ContextProbePath) != "" {
-			pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: tgt.app.APIToken, APITokenHeader: tgt.app.APITokenHeader}
+			apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
+			pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: apiToken, APITokenHeader: apiTokenHeader}
 			pctx := s.upstreamAuthCtx(ctx, pt)
 			// Expand a {model} template with THIS mapping's upstream name so a per-model props endpoint is
 			// queried. The benchmark just warmed this exact model (measureMapping's warm pass), so it is

@@ -94,9 +94,12 @@ func BuildReport(cfg Config, source string, parseErr ParseErrorCode, at time.Tim
 }
 
 // redactConfigEnv returns a copy of cfg in which every spec's Env map has
-// every VALUE replaced by envRedactedMask -- keys survive untouched. It
+// every VALUE replaced by envRedactedMask -- keys survive untouched -- and
+// every spec's non-empty APIToken is likewise replaced by envRedactedMask (an
+// empty token stays "" so absence remains distinguishable on the wire; I4). It
 // never mutates cfg's own slices/maps (a fresh Specs slice and a fresh Env
-// map per spec), and it re-applies ParseConfig's own nil->empty-collection
+// map per spec) nor cfg's own APIToken values (specs[i] is a struct copy and
+// APIToken is a value field), and it re-applies ParseConfig's own nil->empty-collection
 // normalization to every collection-shaped field: BuildReport can be called
 // with a Config that never went through ParseConfig (e.g. a zero-value
 // Config on a parse-error report), and the wire contract requires
@@ -123,6 +126,15 @@ func redactConfigEnv(cfg Config) Config {
 			masked[k] = envRedactedMask
 		}
 		specs[i].Env = masked
+		// A hand-written file-mode spec (or a gateway-pushed token) can carry a
+		// literal api_token; mask it exactly as an env VALUE so it never crosses
+		// the report wire in clear. specs[i] is a struct copy (via copy above)
+		// and APIToken is a value field, so this assignment does not touch the
+		// caller's cfg. An empty token stays empty, keeping absence
+		// distinguishable on the wire.
+		if specs[i].APIToken != "" {
+			specs[i].APIToken = envRedactedMask
+		}
 	}
 	cfg.Specs = specs
 	return cfg

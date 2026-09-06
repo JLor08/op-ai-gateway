@@ -27,6 +27,7 @@ import (
 	"op-ai-server-agent/internal/gwapi"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -162,10 +163,11 @@ type GatewaySource struct {
 
 	cachePath string
 
-	mu            sync.Mutex
-	cached        Config // last known-good config: from the disk cache, a live fetch, or a WS push
-	etag          string // cached.ETag, tracked so a cold-start Config{} still has a well-defined ""
-	loggedMissing bool   // true once a 404 has been logged, reset by any non-404 response
+	mu                  sync.Mutex
+	cached              Config // last known-good config: from the disk cache, a live fetch, or a WS push
+	etag                string // cached.ETag, tracked so a cold-start Config{} still has a well-defined ""
+	loggedMissing       bool   // true once a 404 has been logged, reset by any non-404 response
+	loggedInsecureToken bool   // true once the I2 insecure-token-transport warning has fired; never reset (the base's scheme cannot change for this source's lifetime)
 }
 
 // NewGatewaySource builds a GatewaySource. gatewayURL is joined with
@@ -242,6 +244,7 @@ func (s *GatewaySource) Load(ctx context.Context) (Config, bool, error) {
 		slog.Debug("runtime: gateway runtime-config response parse failed; keeping current config", "error", err)
 		return current, false, nil
 	}
+	s.checkInsecureToken(cfg)
 
 	changed := !sameETag(cfg.ETag, knownETag)
 	s.persist(cfg)
@@ -268,6 +271,7 @@ func (s *GatewaySource) ApplyPushed(raw []byte) (Config, bool, error) {
 		s.mu.Unlock()
 		return current, false, err
 	}
+	s.checkInsecureToken(cfg)
 
 	s.mu.Lock()
 	knownETag := s.etag
@@ -320,6 +324,76 @@ func (s *GatewaySource) clearMissingFlag() {
 	s.mu.Lock()
 	s.loggedMissing = false
 	s.mu.Unlock()
+}
+
+// configHasAPIToken reports whether cfg carries a non-empty per-spec API
+// token (Spec.APIToken, types.go) in ANY of its specs. It never looks at the
+// token's value, only its presence -- the caller (checkInsecureToken) uses
+// this purely to decide whether the I2 warning below is even in play.
+func configHasAPIToken(cfg Config) bool {
+	for i := range cfg.Specs {
+		if cfg.Specs[i].APIToken != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// insecureBase reports whether base clearly names an http:// (not https://)
+// scheme. Deliberately conservative: a base with no scheme at all, or
+// anything this cannot confidently classify, is NOT flagged -- the design
+// note this backs (§9) asks for a warning on a known-insecure transport, not
+// a guess about an ambiguous one. base is GatewaySource.base, already
+// gwapi.TrimBase-normalized (trailing '/' stripped, nothing else changed),
+// so a plain case-insensitive prefix check matches how it is actually
+// stored.
+func insecureBase(base string) bool {
+	return strings.HasPrefix(strings.ToLower(base), "http://")
+}
+
+// checkInsecureToken is the single call site both Load (the http.StatusOK
+// path) and ApplyPushed use, right after ParseConfig succeeds, to decide
+// whether the just-applied config should trip the I2 warning: a runtime
+// config with a non-empty per-spec API token, applied over a gateway base
+// this source can confidently classify as http://. Checking on every
+// applied config (rather than only on the first) is deliberate and cheap --
+// warnInsecureTokenOnce's own once-guard is what prevents log spam, and the
+// gateway's scheme cannot change over this source's lifetime anyway.
+func (s *GatewaySource) checkInsecureToken(cfg Config) {
+	if configHasAPIToken(cfg) && insecureBase(s.base) {
+		s.warnInsecureTokenOnce()
+	}
+}
+
+// warnInsecureTokenOnce logs, at WARN and only once per GatewaySource
+// lifetime, that an applied runtime config carries a per-spec API token
+// while the configured gateway URL is not https: on that transport the
+// decrypted token -- like the agent's own bearer credential already does --
+// crosses the gateway<->agent channel in clear (design doc §9: any non-off
+// token mode "requires or at minimum LOUDLY WARNS for an https gateway
+// URL"; security review I2). This is an agent-side LOG warning only -- it
+// never blocks, refuses, or downgrades anything; the portal cannot make this
+// call at all, since it has no way to know the agent's own configured
+// gateway URL scheme.
+//
+// Mirrors warnMissingOnce's dedup shape exactly (same mutex discipline), but
+// the flag is never cleared: unlike a 404 streak, the gateway's scheme is
+// fixed for the life of one GatewaySource, so there is no "streak reset" to
+// detect and a single log line is the complete, permanent answer for this
+// process.
+//
+// The message and its one attached attr are BOTH chosen to never include
+// the token value (or anything derived from it) -- only the fact of an
+// insecure scheme, which is not a secret.
+func (s *GatewaySource) warnInsecureTokenOnce() {
+	s.mu.Lock()
+	already := s.loggedInsecureToken
+	s.loggedInsecureToken = true
+	s.mu.Unlock()
+	if !already {
+		slog.Warn("runtime: applying a runtime config that carries an API token over a non-https gateway URL; the token will cross the gateway<->agent channel in clear -- configure an https gateway URL",
+			"scheme", "http")
+	}
 }
 
 // FileSource reads the runtime-config document from a local,

@@ -104,6 +104,7 @@ var migrations = []migration{
 	{version: 71, name: "model_mapping_benchmarks_vram_json", up: migration71Up},
 	{version: 72, name: "application_endpoint_modes", up: migration72Up},
 	{version: 73, name: "runtime_spec_gpu_position_and_visible_devices_mode", up: migration73Up},
+	{version: 74, name: "runtime_spec_api_token", up: migration74Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3231,6 +3232,30 @@ func migration73Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	// --- Visibility mechanism (AREA B — added by that task, shown for context) ---
 	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
 		"visible_devices_mode text not null default 'env'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migration74Up adds the runtime-spec API-token columns (design 2026-09-04),
+// additive + append-only like migration73Up. Defaults preserve behaviour:
+// mode "app" keeps sending Application.APIToken (a default of "off" would
+// silently disable upstream auth for every authenticated app on upgrade).
+func migration74Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"api_token_mode text not null default 'app'"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"api_token text not null default ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"api_token_header_source text not null default 'app'"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"api_token_header text not null default ''"); err != nil {
 		return err
 	}
 	return nil

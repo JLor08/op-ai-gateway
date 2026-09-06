@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"strings"
 	"time"
@@ -80,6 +81,20 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
+	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken
+	// -- code is err.Error() verbatim, per the convention every row above
+	// already follows.
+	{err: portal.ErrRuntimeSpecAPITokenModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.api_token_mode_invalid", msg: "api_token_mode must be \"app\", \"off\", \"set\" or \"random\""},
+	{err: portal.ErrRuntimeSpecAPITokenNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.api_token_no_placeholder", msg: "api_token_mode \"set\"/\"random\" requires a \"${API_TOKEN}\" placeholder in env or args"},
+	{err: portal.ErrRuntimeSpecAPITokenPlaceholderWithoutMode, status: http.StatusBadRequest, code: "runtime_spec.api_token_placeholder_without_mode", msg: "a \"${API_TOKEN}\" placeholder in env or args requires api_token_mode \"set\" or \"random\""},
+	{err: portal.ErrRuntimeSpecAPITokenHeaderInvalid, status: http.StatusBadRequest, code: "runtime_spec.api_token_header_invalid", msg: "api_token_header_source must be \"app\" or \"custom\", with a valid api_token_header when custom"},
+	// The seal-or-400 path: PutRuntimeSpec computes the sealed api_token
+	// BEFORE any store write, so a keyless disk store (no cipher, not the
+	// volatile settings store) fails this closed -- capture.SealSecret
+	// returns capture.ErrKeyRequired instead of ever persisting a plaintext
+	// token. Mirrors system.smtp_key_required/system.netbird_key_required's
+	// code+msg convention (system_settings_endpoints.go).
+	{err: capture.ErrKeyRequired, status: http.StatusBadRequest, code: "runtime_spec.api_token_key_required", msg: "an encryption key is required to store a runtime spec api token on a disk-backed store"},
 	// 409, not 400: the request is well-formed and would be accepted a moment
 	// later. It conflicts with the server's current state -- a benchmark run
 	// holds it -- which is the same reasoning the VRAM run's own precondition

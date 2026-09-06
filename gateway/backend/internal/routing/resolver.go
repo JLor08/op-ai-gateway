@@ -939,15 +939,22 @@ func serverSelectable(server AIServer) bool {
 // has no spec at all — design §3.3/§4).
 func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Application, mapping ModelMapping, apiFlavor string) (Target, error) {
 	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
+	var spec RuntimeSpec
 	if app.Type == ProviderServerAgent {
-		spec, ok, err := r.store.RuntimeSpecByMapping(ctx, mapping.ID)
+		loaded, ok, err := r.store.RuntimeSpecByMapping(ctx, mapping.ID)
 		if err != nil {
 			return Target{}, fmt.Errorf("load runtime spec: %w", err)
 		}
 		if ok {
+			spec = loaded
 			flavors, responsesMode, messagesMode = spec.APIFlavors, spec.ResponsesMode, spec.MessagesMode
 		}
 	}
+	// SpecUpstreamAuth resolves the SEALED token + effective header for this
+	// mapping (spec is zero-valued for non-server_agent apps and for a
+	// server_agent mapping with no spec, which SpecUpstreamAuth treats as
+	// "app" -- today's behaviour, unchanged).
+	apiToken, apiTokenHeader := SpecUpstreamAuth(spec, app)
 	return Target{
 		RouteID:              mapping.ID,
 		ServerID:             server.ID,
@@ -957,8 +964,8 @@ func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Applicat
 		ProviderModel:        mapping.AppModelName,
 		Timeout:              time.Duration(app.TimeoutMS) * time.Millisecond,
 		APIFlavor:            apiFlavor,
-		APIToken:             app.APIToken,
-		APITokenHeader:       app.APITokenHeader,
+		APIToken:             apiToken,
+		APITokenHeader:       apiTokenHeader,
 		APIFlavors:           append([]string(nil), flavors...),
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,

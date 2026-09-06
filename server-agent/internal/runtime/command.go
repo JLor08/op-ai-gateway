@@ -46,13 +46,19 @@ import (
 // single boolean could not tell the operator which mask they are looking at,
 // and the two need opposite things from them:
 //
-//  1. Masked -- EVERY ${AGENT_ENV:NAME}-derived span, wherever it landed -- in
-//     an argument as much as in an env value -- is replaced by its own
-//     "${AGENT_ENV:NAME}" placeholder. This is the one class of value the
-//     gateway is never given: it lives only in the AI server's own
-//     environment, by the whole design of ADR-027, and a resolved copy of it
-//     must not travel upward just because a panel wants to be helpful. The
-//     placeholder names the host variable to go and check.
+//  1. Masked -- EVERY recorded secret span, wherever it landed -- in an
+//     argument as much as in an env value -- is replaced by the exact
+//     placeholder that produced it. An ${AGENT_ENV:NAME} span becomes
+//     "${AGENT_ENV:NAME}" again: this is the one class of value the gateway
+//     is never given at all, it lives only in the AI server's own
+//     environment by the whole design of ADR-027, and a resolved copy of it
+//     must not travel upward just because a panel wants to be helpful. An
+//     ${API_TOKEN} span becomes "${API_TOKEN}" again: this is the decrypted
+//     upstream token the gateway itself resolved and pushed on the wire, and
+//     it is masked anyway, because a diagnostic panel is not the place a
+//     secret's plaintext should be shown a second time. Either way the
+//     placeholder names the mechanism the operator wrote, so the reader knows
+//     what to go and check.
 //  2. EnvRedacted -- on a FILE-MODE agent only, every spec-supplied env VALUE
 //     is masked in full, with envRedactedMask rather than with a placeholder.
 //     That is not a new rule -- it is precisely the one the upward report
@@ -141,9 +147,12 @@ import (
 // both can be set at once -- a file-mode spec that also resolves a placeholder
 // into an argument raises both -- and neither implies the other:
 //
-//   - Masked: at least one ${AGENT_ENV:NAME}-derived span in Args or Env was
-//     replaced by its own placeholder. The placeholder names a variable that
-//     exists on this host and that the operator can go and check.
+//   - Masked: at least one secret span in Args or Env -- an ${AGENT_ENV:NAME}
+//     span, an ${API_TOKEN} span, or both -- was replaced by the placeholder
+//     that produced it. For ${AGENT_ENV:NAME} the placeholder names a host
+//     variable the operator can go and check; for ${API_TOKEN} there is
+//     nothing local to check -- it names the gateway-pushed wire field the
+//     value came from instead.
 //   - EnvRedacted: this is a file-mode agent, so at least one spec-supplied
 //     env VALUE was withheld in full (key intact, value replaced by
 //     envRedactedMask). There is no placeholder and nothing to look up: the
@@ -259,17 +268,22 @@ func (ex expandedSpec) resolvedCommand(spec Spec, maskSpecEnv bool) ResolvedComm
 	return out
 }
 
-// maskSecretSpans replaces every recorded ${AGENT_ENV:NAME} span in s with the
-// placeholder that produced it, and reports whether it replaced anything.
+// maskSecretSpans replaces every recorded secret span in s with the exact
+// placeholder that produced it (secretSpan.mask), and reports whether it
+// replaced anything.
 //
 // The mask is the PLACEHOLDER, not a row of bullets, and that choice does two
 // jobs at once. It is unmistakably not a value, so a reader (or a colleague
 // watching a screen-share) can never mistake the panel for one that leaks; and
-// it names the variable, so "--api-key ${AGENT_ENV:HF_TOKEN}" tells the
-// operator exactly which variable supplied the argument and therefore exactly
-// what to check on the host. It also reveals nothing new: the placeholder is
-// the operator's own template text, which the portal's spec editor already
-// shows them.
+// it names the mechanism the operator wrote, so "--api-key ${AGENT_ENV:HF_TOKEN}"
+// tells them the argument came from that host variable, while
+// "--api-key ${API_TOKEN}" tells them it came from the gateway-pushed wire
+// field -- two different sources that must not be rendered as each other. It
+// also reveals nothing new: each placeholder is the operator's own template
+// text, which the portal's spec editor already shows them. This is why the span
+// carries the literal mask string rather than having this function rebuild one
+// from name: only the substitution site knows which placeholder produced the
+// span, and ${AGENT_ENV:...} cannot express the ${API_TOKEN} source.
 //
 // Spans arrive ascending and non-overlapping (expandSpec appends them in
 // output order, one per substitution), so a single forward walk is enough. A
@@ -288,7 +302,7 @@ func maskSecretSpans(s string, spans []secretSpan) (string, bool) {
 			continue
 		}
 		b.WriteString(s[copied:sp.start])
-		b.WriteString("${AGENT_ENV:" + sp.name + "}")
+		b.WriteString(sp.mask)
 		copied = sp.end
 		changed = true
 	}

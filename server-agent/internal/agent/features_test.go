@@ -191,3 +191,24 @@ func TestGPUSelectionFeatureIsDeclared(t *testing.T) {
 	}
 	t.Fatalf("Features does not declare %q; the gateway cannot know the agent honors GPU order / device placeholders: %+v", name, Features)
 }
+
+// TestRuntimeAPITokenFeatureIsDeclared pins the runtime-API-token feature's
+// exact wire NAME and the version it ships in. The gateway/portal check this
+// literal string before trusting that a runtime-spec api_token will actually
+// be resolved, masked, and redacted by the connected agent rather than
+// passed through literally or leaked in a report; a rename here would break
+// that negotiation silently. Same two-sides-of-one-contract reasoning as
+// TestRuntimeConfigAckFeatureIsDeclared and TestGPUSelectionFeatureIsDeclared.
+func TestRuntimeAPITokenFeatureIsDeclared(t *testing.T) {
+	const name = "runtime_api_token"
+	for _, f := range Features {
+		if f.Name != name {
+			continue
+		}
+		if f.Since != "0.5.0" {
+			t.Fatalf("feature %q Since = %q, want 0.5.0 (the branch's single bump)", name, f.Since)
+		}
+		return
+	}
+	t.Fatalf("Features does not declare %q; the gateway/portal cannot know a runtime-spec API token will be honored by this agent: %+v", name, Features)
+}

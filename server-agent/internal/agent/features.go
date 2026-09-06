@@ -100,6 +100,25 @@ var Features = []Feature{
 	// literally). Since 0.4.0: agent.Features gains an entry, so the rule is a
 	// MINOR bump (see agent.go's Version block).
 	{Name: "gpu_selection", Since: "0.4.0"},
+	// runtime_api_token: this agent understands the gateway's runtime-config
+	// api_token wire field, resolves the ${API_TOKEN} placeholder from it into
+	// the managed child process's env/args, masks it in the reported launch
+	// command, and redacts it in file-mode reports.
+	//
+	// Like runtime_logs and runtime_config_ack, it is declared for the
+	// GATEWAY/PORTAL's benefit rather than the agent's -- the agent gates
+	// nothing of its own behavior on it, it always honors what it receives --
+	// so the portal can tell the operator that a runtime-spec API token will
+	// actually be honored by the connected agent, rather than passed through
+	// literally in an env var or args, or leaked unmasked into a command
+	// report or file-mode report by an older agent that predates this
+	// resolution.
+	//
+	// Since is 0.5.0, this branch's single bump (see agent.go's Version
+	// block): the rule is one bump per SHIPPED CHANGE, never per commit, and
+	// 0.5.0 has not shipped -- the binary that first carries this name is the
+	// same 0.5.0 that first carries ${API_TOKEN} resolution and masking.
+	{Name: "runtime_api_token", Since: "0.5.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.
