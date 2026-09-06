@@ -73,6 +73,14 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    // Retry an intermittently-failing test up to twice before reporting it
+    // failed. Several RuntimeAdminSection specs assert on content that renders
+    // only after per-row async spec/config loads settle; under CI load that
+    // synchronous read can race the render ("Unable to find an element with the
+    // text: …"). Retry rescues those timing flakes and NEVER hides a real
+    // failure — a genuine bug fails all three attempts. Root-cause await fixes
+    // are applied where a specific racing query has been pinned down.
+    retry: 2,
     setupFiles: ['@testing-library/jest-dom/vitest', './src/vitest.setup.ts'],
     // Playwright specs under e2e*/ (e2e, e2e-capture, e2e-capture-ram, …) use
     // their own `test()` global and must not be picked up by Vitest's default

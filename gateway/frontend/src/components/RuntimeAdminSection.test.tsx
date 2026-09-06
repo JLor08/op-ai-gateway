@@ -2398,7 +2398,10 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
   it('announces file mode and marks the gateway-side specs as ineffective', async () => {
     renderFileMode();
     expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
-    expect(screen.getByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
+    // The "ineffective specs" banner renders after the file-mode heading (a
+    // separate part of the async file-mode load), so await it rather than read
+    // it synchronously — a plain getByText races the render under CI load.
+    expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
   });
 
   it('turns every edit affordance off: no spec form, a disabled matrix, no budget form, no overrides', async () => {
