@@ -4608,7 +4608,7 @@ into a single tri-state: **Geladen** (`state == "running"`), **Lädt**
 (`state == "starting"`), **Nicht Geladen** (otherwise). Only the chip's
 *colour* reuses the shared vocabulary — `modelStatusBadge` calls the same
 `runtimeStateBadge` the loading indicator above uses, so "Lädt" gets the
-identical amber treatment. The *label* is deliberately its own: a local
+identical `watch` treatment. The *label* is deliberately its own: a local
 `modelStatusLabel` keyed on `tableModelLoaded`/`modelServerLoading`/
 `modelServerNotLoaded` ("Geladen"/"Lädt"/"Nicht geladen") — the
 model-loading wording, not `runtimeStateLabel`'s lifecycle wording
