@@ -3,6 +3,11 @@
 
 package routing
 
+import (
+	"path/filepath"
+	"strings"
+)
+
 // RuntimeSpecType is the per-spec explicit choice of which runtime SERVER
 // KIND spec.Binary launches, driving which per-kind metrics/context-probe
 // conventions the agent applies (design 2026-09-07). Default (and every
@@ -19,3 +24,71 @@ const (
 	RuntimeSpecTypeOllama   RuntimeSpecType = "ollama"
 	RuntimeSpecTypeCustom   RuntimeSpecType = "custom"
 )
+
+// DetectRuntimeSpecType infers the runtime server kind from the launched
+// binary's basename when no explicit RuntimeSpec.Type is set. It matches on
+// case-insensitive substrings, in the order below (first match wins), and
+// falls back to RuntimeSpecTypeCustom when nothing matches.
+func DetectRuntimeSpecType(binary string) RuntimeSpecType {
+	name := strings.ToLower(filepath.Base(binary))
+
+	switch {
+	case strings.Contains(name, "vllm"):
+		return RuntimeSpecTypeVLLM
+	case strings.Contains(name, "llama-server"), strings.Contains(name, "llama_cpp"), strings.Contains(name, "llama.cpp"):
+		return RuntimeSpecTypeLlamaCpp
+	case strings.Contains(name, "text-generation-launcher"), strings.Contains(name, "tgi"):
+		return RuntimeSpecTypeTGI
+	case strings.Contains(name, "ollama"):
+		return RuntimeSpecTypeOllama
+	default:
+		return RuntimeSpecTypeCustom
+	}
+}
+
+// EffectiveRuntimeSpecType resolves the RuntimeSpecType that governs a given
+// spec: the explicit spec.Type when set, else the type detected from
+// spec.Binary.
+func EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType {
+	if spec.Type != "" {
+		return RuntimeSpecType(spec.Type)
+	}
+	return DetectRuntimeSpecType(spec.Binary)
+}
+
+// DeriveProbePaths resolves the metrics and context-probe paths to use for a
+// given effective RuntimeSpecType. A non-empty override always wins for its
+// field; otherwise the per-type default applies.
+func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string) (metricsPath, contextPath string) {
+	var defaultMetrics, defaultContext string
+
+	switch t {
+	case RuntimeSpecTypeVLLM:
+		defaultMetrics, defaultContext = "/metrics", "/v1/models"
+	case RuntimeSpecTypeLlamaCpp:
+		defaultMetrics, defaultContext = "/metrics", "/props"
+	case RuntimeSpecTypeTGI:
+		// TODO(Task 8): verify tgi paths against upstream.
+		defaultMetrics, defaultContext = "/metrics", "/info"
+	case RuntimeSpecTypeOllama:
+		// Ollama has no native Prometheus-style /metrics endpoint.
+		// TODO(Task 8): verify ollama paths against upstream.
+		defaultMetrics, defaultContext = "", "/api/show"
+	case RuntimeSpecTypeCustom:
+		defaultMetrics, defaultContext = "", ""
+	default:
+		defaultMetrics, defaultContext = "", ""
+	}
+
+	metricsPath = defaultMetrics
+	if metricsOverride != "" {
+		metricsPath = metricsOverride
+	}
+
+	contextPath = defaultContext
+	if contextOverride != "" {
+		contextPath = contextOverride
+	}
+
+	return metricsPath, contextPath
+}
