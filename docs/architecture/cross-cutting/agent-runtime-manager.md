@@ -4605,10 +4605,15 @@ than a fabricated `0`.
 column.** Two facts that used to sit in adjacent columns — the
 benchmark-derived `loaded` boolean and the raw runtime `state` — collapse
 into a single tri-state: **Geladen** (`state == "running"`), **Lädt**
-(`state == "starting"`), **Nicht Geladen** (otherwise), reusing the same
-`runtimeStateBadge`/`runtimeStateLabel` pair above so "Lädt" here and the
-loading indicator everywhere else in the portal share one colour/label
-vocabulary. A row with no runtime state at all — a model server that is not
+(`state == "starting"`), **Nicht Geladen** (otherwise). Only the chip's
+*colour* reuses the shared vocabulary — `modelStatusBadge` calls the same
+`runtimeStateBadge` the loading indicator above uses, so "Lädt" gets the
+identical amber treatment. The *label* is deliberately its own: a local
+`modelStatusLabel` keyed on `tableModelLoaded`/`modelServerLoading`/
+`modelServerNotLoaded` ("Geladen"/"Lädt"/"Nicht geladen") — the
+model-loading wording, not `runtimeStateLabel`'s lifecycle wording
+("Startet…" for the same `starting` state); `runtimeStateLabel` is not
+imported in this file. A row with no runtime state at all — a model server that is not
 a `server_agent` mapping, where `state` is always `""` — falls back to the
 pre-existing `loaded` boolean instead: **Geladen** if loaded, else **Nicht
 Geladen**, so the merge changes nothing for the majority of model servers
