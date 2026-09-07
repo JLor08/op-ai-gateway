@@ -718,6 +718,13 @@ func New(deps ServerDeps) *Server {
 		resolver.SetServerBusyChecker(benchmarks)
 		resolver.SetLoadedModelChecker(loadedModels)
 		resolver.SetServerActivityChecker(active, swapProtectWindow)
+		// The runtime-status registry (Task 13) is wired as the resolver's
+		// RuntimeModelStateChecker so scoring uses live PER-MODEL active/queue counts
+		// (not just the whole server's telemetry) and selection can prefer an
+		// already-starting instance of the requested model over cold-starting another.
+		// runtimeModelStateChecker wraps the SAME registry instance the Server publishes
+		// agent telemetry into, so the resolver's view stays consistent with it.
+		resolver.SetRuntimeModelStateChecker(newRuntimeModelStateChecker(runtimeStatus))
 		resolver.SetSessionReservation(sessionReservationWindow)
 		resolver.SetAdmissionController(admission)
 		resolver.SetGroupResolver(groups)
