@@ -84,6 +84,35 @@ func TestScraperAutoDetectsLlamaCpp(t *testing.T) {
 	}
 }
 
+func TestScraperAutoDetectsTGI(t *testing.T) {
+	// TGI (text-generation-inference) exposes tgi_-prefixed gauges; verified at
+	// https://huggingface.co/docs/text-generation-inference/en/reference/metrics
+	// (tgi_batch_current_size = current batch size, tgi_queue_size = current
+	// queue size).
+	body := []byte(
+		"# HELP tgi_batch_current_size Current batch size.\n" +
+			"# TYPE tgi_batch_current_size gauge\n" +
+			"tgi_batch_current_size 5\n" +
+			"# HELP tgi_queue_size Current queue size.\n" +
+			"# TYPE tgi_queue_size gauge\n" +
+			"tgi_queue_size 3\n")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer ts.Close()
+
+	active, queue, err := NewScraper(ts.URL, ts.Client()).Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if active != 5 {
+		t.Errorf("active = %d, want 5 (tgi_batch_current_size)", active)
+	}
+	if queue != 3 {
+		t.Errorf("queue = %d, want 3 (tgi_queue_size)", queue)
+	}
+}
+
 func TestScraperUnknownFormatYieldsZero(t *testing.T) {
 	// A /metrics body carrying neither family's counters -> 0/0, no error.
 	body := []byte("# TYPE other_metric gauge\nother_metric 9\n")

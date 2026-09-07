@@ -68,11 +68,21 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 	case RuntimeSpecTypeLlamaCpp:
 		defaultMetrics, defaultContext = "/metrics", "/props"
 	case RuntimeSpecTypeTGI:
-		// TODO(Task 8): verify tgi paths against upstream.
+		// Verified 2026-09-07: text-generation-inference exposes Prometheus
+		// metrics at /metrics (huggingface/text-generation-inference docs,
+		// https://huggingface.co/docs/text-generation-inference/en/reference/metrics)
+		// and serves max_total_tokens (the context-size field) from /info
+		// (docs/openapi.json "Info" schema,
+		// https://github.com/huggingface/text-generation-inference/blob/main/docs/openapi.json).
 		defaultMetrics, defaultContext = "/metrics", "/info"
 	case RuntimeSpecTypeOllama:
-		// Ollama has no native Prometheus-style /metrics endpoint.
-		// TODO(Task 8): verify ollama paths against upstream.
+		// Verified 2026-09-07: Ollama has no native Prometheus-style /metrics
+		// endpoint (no metrics endpoint of any kind is documented in
+		// ollama/ollama docs/api.md,
+		// https://github.com/ollama/ollama/blob/main/docs/api.md) and serves
+		// the context length from /api/show under model_info as an
+		// architecture-prefixed key (e.g. "llama.context_length"), per the
+		// same source's "Show Model Information" section.
 		defaultMetrics, defaultContext = "", "/api/show"
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""
