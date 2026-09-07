@@ -153,6 +153,12 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    type: '',
+    metrics_path: '',
+    context_probe_path: '',
+    effective_type: '',
+    resolved_metrics_path: '',
+    resolved_context_probe_path: '',
     ...overrides,
   };
 }
@@ -486,6 +492,62 @@ describe('ApplicationSection server_agent type', () => {
     fireEvent.change(timeoutField, { target: { value: '45000' } });
     await selectType('server_agent');
     expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe('45000');
+  });
+
+  // The three gateway-side probe fields (loaded-models path/format,
+  // context-probe path) are the agent's own job for a server_agent
+  // application (its mapping's runtime spec Type + metrics/context-probe
+  // overrides, RuntimeAdminSection) -- disabled here so an operator cannot
+  // set a value that is silently ignored, and cleared on save so a value
+  // left over from an earlier non-agent type never lingers on the row.
+  it('disables the three probe fields and sends them empty on create when the type is server_agent', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('server_agent');
+
+    const pathField = screen.getByLabelText(t.applicationLoadedModelsPath) as HTMLInputElement;
+    const formatField = screen.getByRole('combobox', { name: t.applicationLoadedModelsFormat });
+    const contextField = screen.getByLabelText(t.applicationContextProbePath) as HTMLInputElement;
+    expect(pathField).toBeDisabled();
+    expect(formatField).toHaveAttribute('aria-disabled', 'true');
+    expect(contextField).toBeDisabled();
+    expect(screen.getAllByText(t.applicationProbeFieldsDisabledNote).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].loaded_models_path).toBe('');
+    expect(created[0].loaded_models_format).toBe('');
+    expect(created[0].context_probe_path).toBe('');
+  });
+
+  it('disables the probe fields and clears stale values on save when editing a server_agent app', async () => {
+    const { updated } = renderSection({
+      apps: [
+        makeApp({
+          id: 'app_1',
+          type: 'server_agent',
+          loaded_models_path: '/stale',
+          loaded_models_format: 'openai',
+          context_probe_path: '/stale-props',
+        }),
+      ],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    const pathField = screen.getByLabelText(t.applicationLoadedModelsPath) as HTMLInputElement;
+    const contextField = screen.getByLabelText(t.applicationContextProbePath) as HTMLInputElement;
+    // The stale stored value is still shown (so the operator can see what is
+    // on the row) -- only editing is blocked.
+    expect(pathField.value).toBe('/stale');
+    expect(pathField).toBeDisabled();
+    expect(contextField).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.loaded_models_path).toBe('');
+    expect(updated[0].body.loaded_models_format).toBe('');
+    expect(updated[0].body.context_probe_path).toBe('');
   });
 });
 

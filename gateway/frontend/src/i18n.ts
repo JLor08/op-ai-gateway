@@ -391,6 +391,12 @@ const de = {
     '„{model}“ wird durch den Upstream-Modellnamen ersetzt (nur geladene Modelle).',
   applicationContextProbeNote:
     'Optional. Endpoint für die Kontextgröße (llama.cpp „/props“). Leer = aus.',
+  // server_agent: die drei gateway-seitigen Sonden sind für diesen Typ
+  // sinnlos (der Agent erkennt geladene Modelle und misst den Kontext
+  // selbst, über die Runtime-Spec der Zuordnung) -- die Felder werden
+  // deaktiviert und dieser Hinweis erklärt, warum.
+  applicationProbeFieldsDisabledNote:
+    'Bei server_agent-Anwendungen übernimmt der Agent Modell-Erkennung und Kontext-Messung selbst (siehe die Runtime-Spezifikation der jeweiligen Zuordnung) – dieses Feld wird hier nicht verwendet und beim Speichern geleert.',
   applicationPathSuffixLabel: 'App-Pfad-Erweiterung',
   applicationApiTokenLabel: 'API-Token',
   applicationApiTokenNote:
@@ -497,6 +503,24 @@ const de = {
   runtimeSpecs: 'Runtime-Spezifikationen',
   runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
   runtimeSpecBinary: 'Programmpfad',
+  // RuntimeSpec Type: der explizite Backend-Typ ('' = Automatisch aus dem
+  // Programmpfad erkennen), plus die zwei Pfad-Overrides. Die drei
+  // schreibgeschützten Echos direkt darunter zeigen, worauf der Agent das
+  // tatsächlich auflöst -- auch im Automatik-Modus.
+  runtimeSpecType: 'Typ',
+  runtimeSpecTypeAuto: 'Automatisch (aus Programmpfad erkennen)',
+  runtimeSpecTypeVllm: 'vLLM',
+  runtimeSpecTypeLlamaCpp: 'llama.cpp',
+  runtimeSpecTypeTgi: 'TGI',
+  runtimeSpecTypeOllama: 'Ollama',
+  runtimeSpecTypeCustom: 'Benutzerdefiniert',
+  runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
+  runtimeSpecMetricsPathHelp: 'Leer = Standardpfad des erkannten/gewählten Typs verwenden.',
+  runtimeSpecContextProbePath: 'Context-Probe-Pfad (Override)',
+  runtimeSpecContextProbePathHelp: 'Leer = Standardpfad des erkannten/gewählten Typs verwenden.',
+  runtimeSpecEffectiveType: 'Effektiver Typ',
+  runtimeSpecResolvedMetricsPath: 'Aufgelöster Metrics-Pfad',
+  runtimeSpecResolvedContextProbePath: 'Aufgelöster Context-Probe-Pfad',
   runtimeSpecArgs: 'Argumente',
   runtimeSpecEnv: 'Umgebungsvariablen',
   runtimeSpecWorkDir: 'Arbeitsverzeichnis',
@@ -2566,6 +2590,12 @@ const en: PortalMessages = {
     '"{model}" is replaced with the upstream model name (loaded models only).',
   applicationContextProbeNote:
     'Optional. Endpoint for context size (llama.cpp "/props"). Empty = off.',
+  // server_agent: the three gateway-side probes are meaningless for this
+  // type (the agent detects loaded models and measures context itself, over
+  // the mapping's own runtime spec) -- the fields are disabled and this note
+  // says why.
+  applicationProbeFieldsDisabledNote:
+    "For server_agent applications the agent handles model discovery and context measurement itself (see the mapping's own runtime spec) — this field is unused here and cleared on save.",
   applicationPathSuffixLabel: 'App path suffix',
   applicationApiTokenLabel: 'API token',
   applicationApiTokenNote:
@@ -2669,6 +2699,24 @@ const en: PortalMessages = {
   runtimeSpecs: 'Runtime specs',
   runtimeSpecEdit: 'Edit runtime spec',
   runtimeSpecBinary: 'Binary path',
+  // RuntimeSpec Type: the explicit backend kind ('' = Auto, detect from the
+  // binary path), plus the two path overrides. The three read-only echoes
+  // right below show what the agent actually resolves this to -- including
+  // in Auto mode.
+  runtimeSpecType: 'Type',
+  runtimeSpecTypeAuto: 'Auto (detect from binary path)',
+  runtimeSpecTypeVllm: 'vLLM',
+  runtimeSpecTypeLlamaCpp: 'llama.cpp',
+  runtimeSpecTypeTgi: 'TGI',
+  runtimeSpecTypeOllama: 'Ollama',
+  runtimeSpecTypeCustom: 'Custom',
+  runtimeSpecMetricsPath: 'Metrics path (override)',
+  runtimeSpecMetricsPathHelp: "Empty = use the detected/selected type's default path.",
+  runtimeSpecContextProbePath: 'Context probe path (override)',
+  runtimeSpecContextProbePathHelp: "Empty = use the detected/selected type's default path.",
+  runtimeSpecEffectiveType: 'Effective type',
+  runtimeSpecResolvedMetricsPath: 'Resolved metrics path',
+  runtimeSpecResolvedContextProbePath: 'Resolved context probe path',
   runtimeSpecArgs: 'Arguments',
   runtimeSpecEnv: 'Environment variables',
   runtimeSpecWorkDir: 'Working directory',

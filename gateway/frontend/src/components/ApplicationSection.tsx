@@ -404,9 +404,16 @@ export function ApplicationSection({
       health_check_interval_seconds: healthIntervalMode === 'custom' ? healthIntervalSeconds : 0,
       responses_mode: responsesMode,
       messages_mode: messagesMode,
-      loaded_models_path: loadedModelsPath.trim(),
-      loaded_models_format: loadedModelsFormat,
-      context_probe_path: contextProbePath.trim(),
+      // A server_agent application's model discovery/loaded-state/context
+      // probing all run on the agent side (the runtime spec's own Type +
+      // metrics/context-probe overrides, RuntimeAdminSection) -- these three
+      // gateway-side probe fields are unused for it and forced empty here so
+      // a stale value from an earlier non-agent type never lingers on the
+      // stored row. Mirrors the form's own disabled={type === 'server_agent'}
+      // on the three fields below.
+      loaded_models_path: type === 'server_agent' ? '' : loadedModelsPath.trim(),
+      loaded_models_format: type === 'server_agent' ? '' : loadedModelsFormat,
+      context_probe_path: type === 'server_agent' ? '' : contextProbePath.trim(),
       app_path_suffix: appPathSuffix.trim(),
       api_token_header: apiTokenHeader.trim(),
       ...(apiToken !== undefined ? { api_token: apiToken } : {}),
@@ -638,6 +645,14 @@ export function ApplicationSection({
     // afterwards leaves this form offering all six types. The 409 is still the
     // enforcement; a test fires that path so the mapping is not dropped.
     const managedRuntimeOnlyCreate = managedRuntimeOnly && !editing;
+    // A server_agent application's loaded-model discovery, load state and
+    // context probing are the agent's own job (the mapping's runtime spec --
+    // its Type + metrics/context-probe overrides on RuntimeAdminSection),
+    // never this gateway-side probing. These three fields are meaningless for
+    // it, so they are disabled + cleared here rather than left to silently
+    // hold a stale value from an earlier non-agent type; buildBody forces the
+    // same three to '' on save regardless of what is still showing.
+    const probeFieldsDisabled = type === 'server_agent';
     // One helperText slot, two reasons. They are co-reachable -- but only
     // through the first-fetch window: on a settled managed server that already
     // holds an agent application the create button is not rendered at all
@@ -849,13 +864,15 @@ export function ApplicationSection({
                 value={loadedModelsPath}
                 onChange={(e) => setLoadedModelsPath(e.target.value)}
                 placeholder="/running"
+                disabled={probeFieldsDisabled}
+                helperText={probeFieldsDisabled ? t.applicationProbeFieldsDisabledNote : undefined}
               />
               <SelectField
                 id="application-loaded-models-format"
                 label={t.applicationLoadedModelsFormat}
                 value={loadedModelsFormat}
                 onChange={(e) => setLoadedModelsFormat(e.target.value)}
-                disabled={loadedModelsPath.trim() === ''}
+                disabled={probeFieldsDisabled || loadedModelsPath.trim() === ''}
               >
                 <option value="auto">{t.applicationLoadedFormatAuto}</option>
                 <option value="openai">{t.applicationLoadedFormatOpenai}</option>
@@ -873,7 +890,12 @@ export function ApplicationSection({
               value={contextProbePath}
               onChange={(e) => setContextProbePath(e.target.value)}
               placeholder="/props"
-              helperText={t.applicationContextProbePathHelp}
+              disabled={probeFieldsDisabled}
+              helperText={
+                probeFieldsDisabled
+                  ? t.applicationProbeFieldsDisabledNote
+                  : t.applicationContextProbePathHelp
+              }
             />
             <Typography variant="caption" sx={{ color: 'text.secondary' }}>
               {t.applicationContextProbeNote}
