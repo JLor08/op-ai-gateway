@@ -104,9 +104,13 @@ from the type — see §7 for where derivation runs). Then:
   agent GETs `http://127.0.0.1:<ListenPort><metrics_path>` and reads the
   active/queued counters using the merged auto-detect (§3.2). Reuses the
   existing `collector` scrape machinery, now **per child** instead of one URL.
-- **Reporting — per model.** The telemetry `Sample` gains a per-model list, e.g.
-  `models: [{ model, context_size, active_requests, queue_depth }]` (exact
-  shape in §4). The existing agent-wide `active_requests`/`queue_depth` from
+- **Reporting — per model, on the EXISTING channel.** The agent ALREADY sends a
+  per-runtime array `Sample.Runtimes[]` (`sample.RuntimeSample`) — one entry per
+  managed child, with `SpecID`, `Model`, `State`, `PID`, `Port`, `InFlight`,
+  `Restarts`, … — gated on the `runtime_manager` feature and surfaced as the
+  portal's live runtime-status stream. This feature **extends that struct** with
+  `ContextSize`, `ActiveRequests`, `QueueDepth`; it does **not** add a parallel
+  array. The agent-wide `active_requests`/`queue_depth` from
   `OP_AGENT_METRICS_URL` remain for the single-external-server case (§3.6).
 
 ### 3.4 Gateway ingest → routing + portal
@@ -161,30 +165,28 @@ This is the concrete fix for the single-`OP_AGENT_METRICS_URL` limitation.
   agent-presence); whether its HTTP health-check is also moot is **verified
   during implementation**, not assumed here.
 
-### 3.7 Per-model runtime state (loading / ready)
+### 3.7 Per-model runtime state (loading / ready) — mostly ALREADY EXISTS
 
-The agent owns each child's lifecycle and already health-checks it, so it knows,
-per model, whether the child is **not running**, **running-but-not-yet-healthy**
-(loading its weights), or **healthy/serving**. Report that as a per-model
-`state`:
+The per-model lifecycle state is **already reported and surfaced**:
+`RuntimeSample.State` carries the runtime manager's state machine —
+`StateStarting` (cold/loading: process up, health not yet passing),
+`StateRunning` (ready/serving), `StateStopped`, `StateDraining` — flows via
+`agentRuntimeSample` → `RuntimeStatusDTO` and drives the portal's **live
+runtime-status stream** today (state / pid / port / in-flight / restarts per
+process). So `loading` = `StateStarting`, `ready` = `StateRunning`; **no new
+state field or detection is needed.**
 
-- `stopped` — no child running for this spec.
-- `loading` — child launched, health check not yet passing (weights loading).
-- `ready` — child healthy and serving.
+This feature only adds the two consumers the user asked for:
 
-It travels in the same per-model `Sample.models` entry (§4). Downstream:
-
-- **Portal — "Modelle" → Details:** show the state (a loading indicator while
-  `loading`), so an operator can *see* a model coming up without issuing a
-  request. This is the proactive visibility that does not exist today (the
-  gateway currently only learns "starting" reactively, from a cold-load `503
-  ErrUpstreamStarting` on an actual request).
-- **Routing signal:** the gateway knows the per-mapping state, so a `loading`
-  model is "soon available." Conservative first use (exact scoring/admission in
-  the plan): the router **prefers waiting for an already-`loading` instance over
-  triggering a second cold-start** of the same model, and can surface
-  "loading, ~ready soon" instead of a blunt failure. It complements — does not
-  replace — the existing cold-load 503 retry path.
+- **Portal — "Modelle" → Details:** surface the EXISTING state (a loading
+  indicator while `StateStarting`) in the *Models* view too — today it lives in
+  the runtime-admin live-status list, not in the Models details — alongside the
+  new per-model context size and live metrics (§3.3).
+- **Routing signal:** the gateway already ingests the state (admission reads
+  it). Add its use as a positive **"soon available"** hint: a `StateStarting`
+  instance is preferred over triggering a second cold-start of the same model
+  (conservative; exact scoring/admission in the plan). Complements — does not
+  replace — the cold-load 503 retry path.
 
 ## 4. Data model, wire, and sample
 
@@ -194,25 +196,33 @@ It travels in the same per-model `Sample.models` entry (§4). Downstream:
   not null default ''`, `context_probe_path text not null default ''`.
   `routing.RuntimeSpec` gains `Type`, `MetricsPath`, `ContextProbePath` strings.
   A `routing.RuntimeSpecType` enum-type file (mirrors `runtime_api_token_mode.go`).
-- **Per-mapping metrics + context storage.** Context reuses the existing
-  per-mapping `context_size` + provenance. Per-mapping live metrics
-  (active/queue) may reuse existing per-server telemetry keyed by mapping, or a
-  small per-mapping telemetry addition — decided in the plan against the current
-  telemetry store shape.
+- **Per-mapping metrics + context storage.** Each `RuntimeSample` carries
+  `SpecID` (the launch spec the gateway handed the agent), which resolves
+  directly to the mapping/model — no name matching. Context reuses the existing
+  per-mapping `context_size` + provenance (`UpdateMappingContextProbe`,
+  provenance `agent`). Per-mapping live metrics (active/queue) reuse the existing
+  telemetry store keyed by mapping, or a small per-mapping addition — decided in
+  the plan against the current store shape.
 - **Agent wire `runtime.Spec`** gains `Type`, `MetricsPath`, `ContextProbePath`
   (json `type` / `metrics_path` / `context_probe_path`).
-- **Telemetry `Sample`** gains a per-model array (json `models`), each entry:
-  `model`, `state` (`stopped`|`loading`|`ready`, §3.7), `context_size`,
-  `active_requests`, `queue_depth`. Nil/empty is a valid empty array (mirrors
-  `LoadedModels`).
+- **Extend the EXISTING per-runtime channel** (no new array): agent
+  `sample.RuntimeSample`, gateway `agentRuntimeSample`, and `RuntimeStatusDTO`
+  each gain `ContextSize`, `ActiveRequests`, `QueueDepth` (json
+  `context_size` / `active_requests` / `queue_depth`; additive + omitempty-safe
+  like the other fields). `State` already exists (§3.7). Gated as today on the
+  `runtime_manager` feature; the new fields are zero/absent for an agent that
+  does not fill them (graceful).
 
 ## 5. Capability negotiation + version
 
-New agent capability flag (e.g. `runtime_model_probe`, Since the next MINOR),
-`const Version` bump. The gateway only trusts/asks for per-model probe data from
-an agent that declares it; an older agent simply omits the new `models` array
-(graceful — the gateway falls back to today's behaviour). Follows the append-only
-`agent.Features` rules and `TestFeatureRegistry` (Since ≤ Version).
+The per-runtime channel is already gated on `runtime_manager`. The new probe
+fields (`context_size`/`active_requests`/`queue_depth`) are additive and
+omitempty-safe, so an agent with `runtime_manager` but no probing simply sends
+them as zero — graceful, no gateway crash. A new flag (e.g. `runtime_model_probe`,
+Since the next MINOR) lets the gateway distinguish "agent fills these" from
+"always zero" (so it does not misread a real 0 as "unsupported"); `const Version`
+bumped accordingly. Follows the append-only `agent.Features` rules and
+`TestFeatureRegistry` (Since ≤ Version).
 
 ## 6. Portal
 
@@ -277,16 +287,18 @@ i18n de + en (parity compile-enforced).
 2. Routing/portal: type detection-from-binary helper; per-type derivation
    (paths + which metric names); resolve effective type + paths for the wire
    push; per-mapping context + metrics ingest → routing + DTOs.
-3. Agent (`server-agent`): wire `Spec` fields; per-child context probe (once,
-   cached) + per-child metrics scrape (per cycle) via the extended `collector`;
-   per-model runtime **state** (stopped/loading/ready) from process + health;
-   per-model `Sample.models`; capability flag + Version; verify tgi/ollama
-   endpoints against source.
-4. Gateway ingest: decode `Sample.models` → per-mapping context + metrics + load
-   state.
+3. Agent (`server-agent`): wire `Spec` fields (`Type`/`MetricsPath`/
+   `ContextProbePath`); per-child context probe (once, cached) + per-child
+   metrics scrape (per cycle) via the extended `collector`; fill the new
+   `RuntimeSample.ContextSize`/`ActiveRequests`/`QueueDepth` (State already
+   reported); capability flag + Version; verify tgi/ollama endpoints against
+   source.
+4. Gateway ingest: extend `agentRuntimeSample` + `RuntimeStatusDTO` with the new
+   fields; resolve each sample's `SpecID` → mapping → store per-mapping context
+   (provenance `agent`) + per-mapping metrics.
 5. Scoring/routing: per-model active/queue as the source (per-server aggregation
-   derived); `loading` state as a "soon-available" signal (prefer an
-   already-loading instance over a second cold-start; exact integration decided
+   derived); the EXISTING `StateStarting` as a "soon-available" signal (prefer an
+   already-starting instance over a second cold-start; exact integration decided
    here).
 6. Frontend: Type select + path overrides + detected-type/paths display + live
    metrics display; **"Modelle" → Details** load-state indicator; the
