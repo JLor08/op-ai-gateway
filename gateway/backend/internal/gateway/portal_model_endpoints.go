@@ -84,33 +84,49 @@ func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.Mode
 	}
 	byServer := map[string]map[string]RuntimeStatusDTO{}
 	for i := range rows {
-		serverID := rows[i].ServerID
-		m, ok := byServer[serverID]
-		if !ok {
-			m = make(map[string]RuntimeStatusDTO)
-			for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
-				m[dto.SpecID] = dto
-			}
-			byServer[serverID] = m
-		}
-		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, rows[i].MappingID)
-		if err != nil || !ok {
-			continue // best-effort: no spec for this mapping, or lookup failed — leave zero
-		}
-		if dto, ok := m[spec.ID]; ok {
-			// State (the loading indicator) is valid for any runtime_manager
-			// agent, so it is injected unconditionally. Active/queue, however,
-			// are only real when the reporting agent declared
-			// runtime_model_probe: for a non-probing agent they default to a
-			// fabricated 0, so gate their injection on the flag and otherwise
-			// leave the row's counts at their zero value (same root cause as
-			// the routing metricsOK gate).
-			rows[i].State = dto.State
-			if s.AgentFeatures.Has(rows[i].ServerID, runtimeModelProbeFeature) {
-				rows[i].ActiveRequests = dto.ActiveRequests
-				rows[i].QueueDepth = dto.QueueDepth
-			}
-		}
+		statuses := s.runtimeStatusesForServer(byServer, rows[i].ServerID)
+		s.injectRowRuntimeState(ctx, &rows[i], statuses)
+	}
+}
+
+// runtimeStatusesForServer returns serverID's runtime-status snapshot indexed by spec id,
+// building it from s.RuntimeStatus.statusSnapshot on first use and caching the result in
+// byServer so each distinct server's snapshot (a copy of its whole per-server slice) is
+// fetched at most once across the whole rows loop.
+func (s *Server) runtimeStatusesForServer(byServer map[string]map[string]RuntimeStatusDTO, serverID string) map[string]RuntimeStatusDTO {
+	if m, ok := byServer[serverID]; ok {
+		return m
+	}
+	m := make(map[string]RuntimeStatusDTO)
+	for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
+		m[dto.SpecID] = dto
+	}
+	byServer[serverID] = m
+	return m
+}
+
+// injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth from statuses (row's
+// owning server's runtime-status snapshot indexed by spec id), resolving row's runtime spec
+// to find the right entry. Best-effort and nil-safe: a mapping with no runtime spec, or a
+// spec with no published status, just leaves the row's zero value.
+func (s *Server) injectRowRuntimeState(ctx context.Context, row *portal.ModelServerDTO, statuses map[string]RuntimeStatusDTO) {
+	spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
+	if err != nil || !ok {
+		return // best-effort: no spec for this mapping, or lookup failed — leave zero
+	}
+	dto, ok := statuses[spec.ID]
+	if !ok {
+		return
+	}
+	// State (the loading indicator) is valid for any runtime_manager agent, so it is
+	// injected unconditionally. Active/queue, however, are only real when the reporting
+	// agent declared runtime_model_probe: for a non-probing agent they default to a
+	// fabricated 0, so gate their injection on the flag and otherwise leave the row's
+	// counts at their zero value (same root cause as the routing metricsOK gate).
+	row.State = dto.State
+	if s.AgentFeatures.Has(row.ServerID, runtimeModelProbeFeature) {
+		row.ActiveRequests = dto.ActiveRequests
+		row.QueueDepth = dto.QueueDepth
 	}
 }
 

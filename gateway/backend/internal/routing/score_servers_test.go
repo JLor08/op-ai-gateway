@@ -146,7 +146,7 @@ func TestScoreModelServersUsesPerModelMetrics(t *testing.T) {
 	// Without the per-model merge, srv_a would score 1430 on telemetry alone (priority
 	// beats srv_b's 1130, as in TestScoreModelServersRanksAndFlagsCapacity) -- the merge
 	// must flip the ranking.
-	if !(b.Score > a.Score) {
+	if b.Score <= a.Score {
 		t.Fatalf("b.Score (%v) not > a.Score (%v): per-model metrics must flip the ranking that per-server telemetry alone would set", b.Score, a.Score)
 	}
 }

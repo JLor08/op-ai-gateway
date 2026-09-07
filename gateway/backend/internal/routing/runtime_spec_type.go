@@ -25,6 +25,10 @@ const (
 	RuntimeSpecTypeCustom   RuntimeSpecType = "custom"
 )
 
+// defaultPrometheusMetricsPath is the Prometheus-style metrics path shared by every runtime
+// kind that serves one at a fixed location: vLLM, llama.cpp, and TGI all default here.
+const defaultPrometheusMetricsPath = "/metrics"
+
 // DetectRuntimeSpecType infers the runtime server kind from the launched
 // binary's basename when no explicit RuntimeSpec.Type is set. It matches on
 // case-insensitive substrings, in the order below (first match wins), and
@@ -64,9 +68,9 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 
 	switch t {
 	case RuntimeSpecTypeVLLM:
-		defaultMetrics, defaultContext = "/metrics", "/v1/models"
+		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/v1/models"
 	case RuntimeSpecTypeLlamaCpp:
-		defaultMetrics, defaultContext = "/metrics", "/props"
+		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/props"
 	case RuntimeSpecTypeTGI:
 		// Verified 2026-09-07: text-generation-inference exposes Prometheus
 		// metrics at /metrics (huggingface/text-generation-inference docs,
@@ -74,7 +78,7 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// and serves max_total_tokens (the context-size field) from /info
 		// (docs/openapi.json "Info" schema,
 		// https://github.com/huggingface/text-generation-inference/blob/main/docs/openapi.json).
-		defaultMetrics, defaultContext = "/metrics", "/info"
+		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/info"
 	case RuntimeSpecTypeOllama:
 		// Verified 2026-09-07: Ollama has no native Prometheus-style /metrics
 		// endpoint (no metrics endpoint of any kind is documented in

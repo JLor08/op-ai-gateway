@@ -244,36 +244,60 @@ func extractBestEffortContext(v any) (int, bool) {
 }
 
 // findKeyOrSuffix searches v depth-first for the first key equal to key, or
-// (when key is "context_length") ending in ".context_length". Object keys are
-// visited in sorted order for a deterministic result.
+// (when key is "context_length") ending in ".context_length". Dispatches on
+// v's shape; the actual per-shape scan lives in findInMap/findInSlice.
 func findKeyOrSuffix(v any, key string) (int, bool) {
 	switch t := v.(type) {
 	case map[string]any:
-		if raw, ok := t[key]; ok {
-			if n, ok := asInt(raw); ok {
-				return n, true
-			}
-		}
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if key == "context_length" && k != key && strings.HasSuffix(k, "."+key) {
-				if n, ok := asInt(t[k]); ok {
-					return n, true
-				}
-			}
-			if n, ok := findKeyOrSuffix(t[k], key); ok {
-				return n, true
-			}
-		}
+		return findInMap(t, key)
 	case []any:
-		for _, item := range t {
-			if n, ok := findKeyOrSuffix(item, key); ok {
+		return findInSlice(t, key)
+	default:
+		return 0, false
+	}
+}
+
+// findInMap looks for key as an exact top-level key of t first, then (only for
+// key == "context_length") as an architecture-prefixed suffix match among t's
+// other keys, then descends depth-first into every value of t. Keys are
+// visited in sorted order for a deterministic result.
+func findInMap(t map[string]any, key string) (int, bool) {
+	if raw, ok := t[key]; ok {
+		if n, ok := asInt(raw); ok {
+			return n, true
+		}
+	}
+	keys := make([]string, 0, len(t))
+	for k := range t {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if isContextLengthSuffixKey(key, k) {
+			if n, ok := asInt(t[k]); ok {
 				return n, true
 			}
+		}
+		if n, ok := findKeyOrSuffix(t[k], key); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// isContextLengthSuffixKey reports whether k is an architecture-prefixed
+// "<arch>.context_length" match for the search key (e.g. "llama.context_length"
+// matching key "context_length"). Only ever true when key is exactly
+// "context_length" and k isn't that exact key itself.
+func isContextLengthSuffixKey(key, k string) bool {
+	return key == "context_length" && k != key && strings.HasSuffix(k, "."+key)
+}
+
+// findInSlice searches each element of t, in order, for key.
+func findInSlice(t []any, key string) (int, bool) {
+	for _, item := range t {
+		if n, ok := findKeyOrSuffix(item, key); ok {
+			return n, true
 		}
 	}
 	return 0, false
