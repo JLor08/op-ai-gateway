@@ -46,6 +46,8 @@ describe('Login TOTP', () => {
     renderLogin({ login }, onSuccess);
     fireEvent.click(screen.getByRole('button', { name: t.loginButton }));
     const code = await screen.findByLabelText(t.totpCodeLabel);
+    // Autofocused: typed digits land in the code field without a click first.
+    expect(code).toHaveFocus();
     fireEvent.change(code, { target: { value: '123456' } });
     fireEvent.click(screen.getByRole('button', { name: t.loginVerifyButton }));
     await waitFor(() => expect(onSuccess).toHaveBeenCalled());
@@ -64,5 +66,6 @@ describe('Login TOTP', () => {
     expect(await screen.findByAltText(t.totpQrAlt)).toBeInTheDocument();
     expect(screen.getByText('SEKRET')).toBeInTheDocument();
     expect(screen.getByLabelText(t.totpCodeLabel)).toBeInTheDocument();
+    expect(screen.getByLabelText(t.totpCodeLabel)).toHaveFocus();
   });
 });
