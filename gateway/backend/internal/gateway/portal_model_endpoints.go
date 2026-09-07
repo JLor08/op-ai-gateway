@@ -68,8 +68,8 @@ func (s *Server) rankModelServers(ctx context.Context, model string) map[string]
 	return ranks
 }
 
-// injectRuntimeModelState fills each row's live State/ActiveRequests/QueueDepth from the
-// volatile runtime-status registry, mirroring how rankModelServers' caller injects
+// injectRuntimeModelState fills each row's live State/ActiveRequests/QueueDepth/MetricsProbe/
+// ContextProbe from the volatile runtime-status registry, mirroring how rankModelServers' caller injects
 // Priority: Service.ModelServers always leaves these zero/empty because only the
 // gateway layer holds the registry + routing store needed to resolve them.
 //
@@ -105,10 +105,10 @@ func (s *Server) runtimeStatusesForServer(byServer map[string]map[string]Runtime
 	return m
 }
 
-// injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth from statuses (row's
-// owning server's runtime-status snapshot indexed by spec id), resolving row's runtime spec
-// to find the right entry. Best-effort and nil-safe: a mapping with no runtime spec, or a
-// spec with no published status, just leaves the row's zero value.
+// injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe
+// from statuses (row's owning server's runtime-status snapshot indexed by spec id), resolving
+// row's runtime spec to find the right entry. Best-effort and nil-safe: a mapping with no
+// runtime spec, or a spec with no published status, just leaves the row's zero value.
 func (s *Server) injectRowRuntimeState(ctx context.Context, row *portal.ModelServerDTO, statuses map[string]RuntimeStatusDTO) {
 	spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
 	if err != nil || !ok {
@@ -123,10 +123,14 @@ func (s *Server) injectRowRuntimeState(ctx context.Context, row *portal.ModelSer
 	// agent declared runtime_model_probe: for a non-probing agent they default to a
 	// fabricated 0, so gate their injection on the flag and otherwise leave the row's
 	// counts at their zero value (same root cause as the routing metricsOK gate).
+	// MetricsProbe/ContextProbe are reachability data from that same probing agent, so
+	// they ride the identical gate rather than State's unconditional one.
 	row.State = dto.State
 	if s.AgentFeatures.Has(row.ServerID, runtimeModelProbeFeature) {
 		row.ActiveRequests = dto.ActiveRequests
 		row.QueueDepth = dto.QueueDepth
+		row.MetricsProbe = dto.MetricsProbe
+		row.ContextProbe = dto.ContextProbe
 	}
 }
 

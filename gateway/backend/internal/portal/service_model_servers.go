@@ -35,6 +35,13 @@ type ModelServerDTO struct {
 	ActiveRequests int    `json:"active_requests"`
 	QueueDepth     int    `json:"queue_depth"`
 
+	// MetricsProbe/ContextProbe are the agent's last-reported reachability for its
+	// /metrics and context probes ("ok"/"unreachable"/"na", or "" when not reported).
+	// Like ActiveRequests/QueueDepth, Service.ModelServers leaves these "" — the gateway
+	// layer injects them from the runtime-status registry after the fact.
+	MetricsProbe string `json:"metrics_probe"`
+	ContextProbe string `json:"context_probe"`
+
 	GenTokensPerSecond           float64    `json:"gen_tokens_per_second"`
 	PromptTokensPerSecond        float64    `json:"prompt_tokens_per_second"`
 	LoadTimeMS                   int        `json:"load_time_ms"`
