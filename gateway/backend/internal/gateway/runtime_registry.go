@@ -43,14 +43,17 @@ type RuntimeGPUStatusDTO struct {
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
 // for every field it carries).
 type RuntimeStatusDTO struct {
-	SpecID   string    `json:"spec_id"`
-	Model    string    `json:"model"`
-	State    string    `json:"state"`
-	Since    time.Time `json:"since"`
-	PID      int       `json:"pid,omitempty"`
-	Port     int       `json:"port,omitempty"`
-	InFlight int       `json:"in_flight"`
-	Restarts int       `json:"restarts"`
+	SpecID         string    `json:"spec_id"`
+	Model          string    `json:"model"`
+	State          string    `json:"state"`
+	Since          time.Time `json:"since"`
+	PID            int       `json:"pid,omitempty"`
+	Port           int       `json:"port,omitempty"`
+	InFlight       int       `json:"in_flight"`
+	Restarts       int       `json:"restarts"`
+	ContextSize    int       `json:"context_size"`
+	ActiveRequests int       `json:"active_requests"`
+	QueueDepth     int       `json:"queue_depth"`
 	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
 	// GATEWAY's own arrival time for the frame that carried it -- never the
 	// agent's self-reported reported_at, which is a claim rather than an

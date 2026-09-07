@@ -157,16 +157,19 @@ type agentRuntimeError struct {
 // agent, so there is no ambiguity about which mapping/model this entry
 // describes even when the agent has not (yet) resolved Model.
 type agentRuntimeSample struct {
-	SpecID    string                  `json:"spec_id"`
-	Model     string                  `json:"model"`
-	State     string                  `json:"state"`
-	Since     time.Time               `json:"since"`
-	PID       int                     `json:"pid,omitempty"`
-	Port      int                     `json:"port,omitempty"`
-	InFlight  int                     `json:"in_flight"`
-	Restarts  int                     `json:"restarts"`
-	GPUs      []agentRuntimeGPUSample `json:"gpus,omitempty"`
-	LastError *agentRuntimeError      `json:"last_error,omitempty"`
+	SpecID         string                  `json:"spec_id"`
+	Model          string                  `json:"model"`
+	State          string                  `json:"state"`
+	Since          time.Time               `json:"since"`
+	PID            int                     `json:"pid,omitempty"`
+	Port           int                     `json:"port,omitempty"`
+	InFlight       int                     `json:"in_flight"`
+	Restarts       int                     `json:"restarts"`
+	ContextSize    int                     `json:"context_size"`
+	ActiveRequests int                     `json:"active_requests"`
+	QueueDepth     int                     `json:"queue_depth"`
+	GPUs           []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError      *agentRuntimeError      `json:"last_error,omitempty"`
 }
 
 // maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
@@ -224,14 +227,17 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 	out := make([]RuntimeStatusDTO, 0, len(samples))
 	for _, rt := range samples {
 		dto := RuntimeStatusDTO{
-			SpecID:   rt.SpecID,
-			Model:    rt.Model,
-			State:    rt.State,
-			Since:    rt.Since,
-			PID:      rt.PID,
-			Port:     rt.Port,
-			InFlight: rt.InFlight,
-			Restarts: rt.Restarts,
+			SpecID:         rt.SpecID,
+			Model:          rt.Model,
+			State:          rt.State,
+			Since:          rt.Since,
+			PID:            rt.PID,
+			Port:           rt.Port,
+			InFlight:       rt.InFlight,
+			Restarts:       rt.Restarts,
+			ContextSize:    rt.ContextSize,
+			ActiveRequests: rt.ActiveRequests,
+			QueueDepth:     rt.QueueDepth,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.

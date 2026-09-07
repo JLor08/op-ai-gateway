@@ -72,7 +72,7 @@ func TestIngestTelemetrySamplePublishesRuntimeStatus(t *testing.T) {
 	defer unsub()
 
 	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
-	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_status","model":"qwen-coder","state":"running","since":"2026-08-20T10:00:00Z","pid":4242,"port":9001,"in_flight":2,"restarts":1}]}`
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_status","model":"qwen-coder","state":"running","since":"2026-08-20T10:00:00Z","pid":4242,"port":9001,"in_flight":2,"restarts":1,"context_size":8192,"active_requests":3,"queue_depth":5}]}`
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -85,7 +85,8 @@ func TestIngestTelemetrySamplePublishesRuntimeStatus(t *testing.T) {
 		}
 		got := statuses[0]
 		if got.SpecID != "rspec_status" || got.Model != "qwen-coder" || got.State != "running" ||
-			got.PID != 4242 || got.Port != 9001 || got.InFlight != 2 || got.Restarts != 1 || !got.Since.Equal(since) {
+			got.PID != 4242 || got.Port != 9001 || got.InFlight != 2 || got.Restarts != 1 || !got.Since.Equal(since) ||
+			got.ContextSize != 8192 || got.ActiveRequests != 3 || got.QueueDepth != 5 {
 			t.Fatalf("published status = %#v", got)
 		}
 	case <-time.After(2 * time.Second):
