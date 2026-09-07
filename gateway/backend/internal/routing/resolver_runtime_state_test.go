@@ -12,25 +12,30 @@ import (
 )
 
 // fakeRuntimeStateEntry is one server's fake live per-model runtime state/metrics.
+// noMetrics models a reporting agent that has NOT declared runtime_model_probe: its
+// lifecycle state is still valid (ok/state), but the active/queue metrics must not be
+// trusted (metricsOK=false), so mergeRuntimeModelMetrics must not overlay them.
 type fakeRuntimeStateEntry struct {
 	state         string
 	active, queue int
+	noMetrics     bool
 }
 
 // fakeRuntimeState is a test RuntimeModelStateChecker keyed by server id (the seeded
 // harness uses one app model per server, so serverID alone disambiguates), mirroring
 // fakeLoaded's shape. A server absent from byServer reports ok=false (unknown), exactly
 // like *gateway.runtimeModelStateChecker scanning a registry with no matching entry.
+// metricsOK = ok && !noMetrics, mirroring the adapter's metricsOK = ok && features.Has.
 type fakeRuntimeState struct {
 	byServer map[string]fakeRuntimeStateEntry
 }
 
-func (f *fakeRuntimeState) RuntimeModelState(serverID, appModelName string) (string, int, int, bool) {
+func (f *fakeRuntimeState) RuntimeModelState(serverID, appModelName string) (string, int, int, bool, bool) {
 	e, ok := f.byServer[serverID]
 	if !ok {
-		return "", 0, 0, false
+		return "", 0, 0, false, false
 	}
-	return e.state, e.active, e.queue, true
+	return e.state, e.active, e.queue, true, !e.noMetrics
 }
 
 // Per-model live metrics (P4a source: the volatile runtime-status registry) must
@@ -123,6 +128,58 @@ func TestResolverRunningBeatsStarting(t *testing.T) {
 	}
 	if target.ServerID != "srv_slow" {
 		t.Fatalf("target.ServerID = %q, want srv_slow (running beats starting)", target.ServerID)
+	}
+}
+
+// The mirror image of TestResolverPerModelMetricsOverridePerServerTelemetry: when the
+// reporting agent has NOT declared runtime_model_probe (metricsOK=false), the per-model
+// active/queue it carries are a fabricated 0 (or, here, stale/unreliable) and must NOT
+// override per-server telemetry. srv_fast reports its MODEL heavily loaded (active=10,
+// queue=5) but with noMetrics=true; because the merge is gated on metricsOK, that load is
+// discarded and srv_fast keeps its good per-server score (1230), so it -- not srv_slow --
+// wins. This is exactly the routing regression the gate fixes: a non-probing agent's
+// model must not be scored on numbers it never actually measured.
+func TestResolverPerModelMetricsIgnoredWithoutProbeFeature(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	store := seededResolverStore(t, now)
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetRuntimeModelStateChecker(&fakeRuntimeState{byServer: map[string]fakeRuntimeStateEntry{
+		"srv_fast": {state: "running", active: 10, queue: 5, noMetrics: true},
+		"srv_slow": {state: "running", active: 0, queue: 0, noMetrics: true},
+	}})
+
+	target, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "qwen-coder", APIFlavor: "openai_chat"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if target.ServerID != "srv_fast" {
+		t.Fatalf("target.ServerID = %q, want srv_fast (per-model metrics from a non-probing agent must NOT override per-server telemetry)", target.ServerID)
+	}
+}
+
+// Prefer-starting must keep working for an agent that reports a valid lifecycle state but
+// has NOT declared runtime_model_probe (metricsOK=false): the state -- not the metrics --
+// drives the starting partition. srv_fast is "starting" with noMetrics=true (so its
+// active/queue are never overlaid), and the resolver must still pick it over the
+// cold-start alternative, proving modelStartingOn keys off ok/state independent of the
+// metrics gate.
+func TestResolverPreferStartingWorksWithoutProbeFeature(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	store := seededResolverStore(t, now)
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetRuntimeModelStateChecker(&fakeRuntimeState{byServer: map[string]fakeRuntimeStateEntry{
+		"srv_fast": {state: "starting", active: 10, queue: 5, noMetrics: true},
+		// srv_slow absent: unknown/stopped, not starting.
+	}})
+
+	target, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "qwen-coder", APIFlavor: "openai_chat"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if target.ServerID != "srv_fast" {
+		t.Fatalf("target.ServerID = %q, want srv_fast (prefer-starting must work without runtime_model_probe)", target.ServerID)
 	}
 }
 

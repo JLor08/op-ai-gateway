@@ -105,6 +105,18 @@ var (
 	// value" shape as validVisibleDevicesMode, not validRuntimeAPITokenMode's
 	// caller-normalizes-empty-first shape.
 	ErrRuntimeSpecTypeInvalid = errors.New("runtime_spec.type_invalid")
+	// ErrRuntimeSpecMetricsPathInvalid / ErrRuntimeSpecContextProbePathInvalid
+	// reject a metrics_path / context_probe_path override that is not a SAFE
+	// RELATIVE PATH (safeRelativeProbePath): non-empty and either not rooted at
+	// a single "/" (e.g. "@evil:9999/x", "http://evil"), protocol-relative
+	// ("//evil"), carrying a scheme ("://"), or containing whitespace/control
+	// bytes. The agent builds its probe URL by concatenating the override onto
+	// "http://127.0.0.1:PORT"; a value like "@evil:9999/x" would re-parse the
+	// port digits as userinfo and resolve Host to the ATTACKER, turning the
+	// agent's loopback probe into an outbound (SSRF) request. Rejected at the
+	// portal before it can ever reach the agent. HTTP 400.
+	ErrRuntimeSpecMetricsPathInvalid      = errors.New("runtime_spec.metrics_path_invalid")
+	ErrRuntimeSpecContextProbePathInvalid = errors.New("runtime_spec.context_probe_path_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -622,6 +634,17 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	metricsPath := strings.TrimSpace(req.MetricsPath)
 	contextProbePath := strings.TrimSpace(req.ContextProbePath)
+	// SSRF guard: an operator-supplied probe-path override is only ever
+	// appended to the agent's own "http://127.0.0.1:PORT" loopback base, so it
+	// MUST be a safe relative path. Reject anything that could re-anchor the
+	// URL's Host (@userinfo, //authority, a scheme) or smuggle whitespace/
+	// control bytes -- see safeRelativeProbePath and the two sentinels' docs.
+	if !safeRelativeProbePath(metricsPath) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecMetricsPathInvalid
+	}
+	if !safeRelativeProbePath(contextProbePath) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecContextProbePathInvalid
+	}
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
 	// frontend pre-fills the create form; the backend only supplies a sane
@@ -978,6 +1001,37 @@ func validRuntimeSpecType(s string) bool {
 		return true
 	}
 	return false
+}
+
+// safeRelativeProbePath reports whether p is a safe relative probe path: empty
+// (the operator left the override blank -- routing.DeriveProbePaths then
+// supplies the per-type default), or a single-"/"-rooted path carrying no
+// scheme, no protocol-relative "//" authority, and no whitespace/control
+// bytes. It is the SSRF guard on metrics_path/context_probe_path: the agent
+// concatenates the override onto "http://127.0.0.1:PORT", so a value like
+// "@evil:9999/x", "//evil", or "http://evil" would otherwise re-parse to an
+// off-loopback Host. Valid overrides such as "/metrics", "/v1/models",
+// "/props" and "/api/show" all pass. Callers pass the already-TrimSpace'd
+// value; the byte scan additionally rejects any INTERIOR whitespace/control
+// byte (e.g. "/foo bar"), which trimming does not remove.
+func safeRelativeProbePath(p string) bool {
+	if p == "" {
+		return true
+	}
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	if strings.Contains(p, "://") {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		// Reject every byte at or below ASCII space (control chars, tab, CR,
+		// NL, and space itself) and DEL.
+		if b := p[i]; b <= 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // specHasAPITokenPlaceholder reports whether the literal "${API_TOKEN}"

@@ -98,9 +98,18 @@ func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.Mode
 			continue // best-effort: no spec for this mapping, or lookup failed — leave zero
 		}
 		if dto, ok := m[spec.ID]; ok {
+			// State (the loading indicator) is valid for any runtime_manager
+			// agent, so it is injected unconditionally. Active/queue, however,
+			// are only real when the reporting agent declared
+			// runtime_model_probe: for a non-probing agent they default to a
+			// fabricated 0, so gate their injection on the flag and otherwise
+			// leave the row's counts at their zero value (same root cause as
+			// the routing metricsOK gate).
 			rows[i].State = dto.State
-			rows[i].ActiveRequests = dto.ActiveRequests
-			rows[i].QueueDepth = dto.QueueDepth
+			if s.AgentFeatures.Has(rows[i].ServerID, runtimeModelProbeFeature) {
+				rows[i].ActiveRequests = dto.ActiveRequests
+				rows[i].QueueDepth = dto.QueueDepth
+			}
 		}
 	}
 }

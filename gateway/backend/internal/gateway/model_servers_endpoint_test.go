@@ -410,6 +410,9 @@ func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
 	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
 		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
 	})
+	// The agent declares runtime_model_probe, so the per-model active/queue are
+	// real and get injected alongside State.
+	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
 	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
@@ -430,6 +433,51 @@ func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
 	row := out.Data[0]
 	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
 		t.Fatalf("row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+}
+
+// A server whose agent has NOT declared runtime_model_probe still gets its lifecycle
+// State injected (the loading indicator is valid for any runtime_manager agent), but its
+// active/queue -- a fabricated 0 for a non-probing agent -- must be left at zero rather
+// than injected. Same root cause as the routing metricsOK gate.
+func TestModelServersEndpointInjectsStateButNotMetricsWithoutProbeFeature(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_noflag"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+	})
+	// Deliberately do NOT declare runtime_model_probe for msServerID.
+
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if len(out.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(out.Data), out.Data)
+	}
+	row := out.Data[0]
+	if row.State != "starting" {
+		t.Fatalf("row.State = %q, want starting (State must inject even without the probe feature)", row.State)
+	}
+	if row.ActiveRequests != 0 || row.QueueDepth != 0 {
+		t.Fatalf("row metrics = (active=%d, queue=%d), want (0, 0) -- non-probing agent's active/queue must NOT be injected", row.ActiveRequests, row.QueueDepth)
 	}
 }
 
@@ -482,6 +530,7 @@ func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
 	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
 		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
 	})
+	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
 
 	ts := httptest.NewServer(s)
 	defer ts.Close()

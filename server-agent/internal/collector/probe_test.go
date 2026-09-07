@@ -146,3 +146,35 @@ func TestProbeContext_EmptyContextPath(t *testing.T) {
 		t.Errorf("context = %d, want 0 on error", got)
 	}
 }
+
+// TestSafeProbePath is the agent's defense-in-depth SSRF guard: only an empty
+// or single-"/"-rooted relative path with no scheme/authority/whitespace is
+// safe to append to the loopback base. The attack vectors (@userinfo, //
+// authority, a scheme, whitespace) must all be rejected, while the legitimate
+// per-type probe paths pass.
+func TestSafeProbePath(t *testing.T) {
+	safe := []string{"", "/metrics", "/v1/models", "/props", "/api/show", "/info", "/a/b/c?x=1"}
+	for _, p := range safe {
+		if !SafeProbePath(p) {
+			t.Errorf("SafeProbePath(%q) = false, want true (safe relative path)", p)
+		}
+	}
+	unsafe := []string{
+		"@evil:9999/x",       // userinfo boundary re-anchors Host to the attacker
+		"//evil",             // protocol-relative authority
+		"//evil/metrics",     //
+		"http://evil",        // absolute URL with scheme
+		"https://evil/x",     //
+		"metrics",            // not rooted at "/"
+		"/met rics",          // interior space
+		"/met\trics",         // tab
+		"/met\nrics",         // newline
+		"/x\x00y",            // NUL / control byte
+		"file:///etc/passwd", // scheme
+	}
+	for _, p := range unsafe {
+		if SafeProbePath(p) {
+			t.Errorf("SafeProbePath(%q) = true, want false (unsafe path must be rejected)", p)
+		}
+	}
+}

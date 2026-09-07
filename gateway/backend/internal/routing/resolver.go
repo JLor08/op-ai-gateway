@@ -124,9 +124,17 @@ const runtimeStateStarting = "starting"
 // live per-model request counts. ok is false when no runtime status is known
 // for that model on that server (a legacy/non-runtime agent, or a model with
 // no managed spec) -- callers then fall back to per-server telemetry and treat
-// state as unknown. Nil checker = lenient no-op (pre-feature behaviour).
+// state as unknown.
+//
+// metricsOK gates ONLY the active/queue metrics, separately from ok/state: it
+// is true iff ok AND the reporting agent declared the "runtime_model_probe"
+// feature (the capability that actually populates active/queue). A pre-feature
+// runtime_manager agent still reports a valid lifecycle STATE (so ok=true,
+// prefer-starting keeps working) but its active/queue default to a FABRICATED
+// 0 -- metricsOK=false tells the resolver not to overlay that 0 onto per-server
+// telemetry. Nil checker = lenient no-op (ok=false, metricsOK=false).
 type RuntimeModelStateChecker interface {
-	RuntimeModelState(serverID, appModelName string) (state string, active int, queue int, ok bool)
+	RuntimeModelState(serverID, appModelName string) (state string, active int, queue int, ok bool, metricsOK bool)
 }
 
 // AdmissionController parks an unpinned request until a slot frees on one of serverIDs
@@ -918,30 +926,39 @@ func modelLoadedOn(checker LoadedModelChecker, c MappingCandidate) bool {
 }
 
 // runtimeModelState is the nil-safe accessor for r.runtimeState: a nil checker (unset,
-// or NewResolver's default) returns ("", 0, 0, false) -- unknown state, no live per-model
-// metrics -- so every caller downstream (mergeRuntimeModelMetrics, modelStartingOn) is
-// automatically a no-op, matching the P4a/P4b nil-checker lenient invariant.
-func (r *Resolver) runtimeModelState(c MappingCandidate) (state string, active int, queue int, ok bool) {
+// or NewResolver's default) returns ("", 0, 0, false, false) -- unknown state, no live
+// per-model metrics -- so every caller downstream (mergeRuntimeModelMetrics,
+// modelStartingOn) is automatically a no-op, matching the P4a/P4b nil-checker lenient
+// invariant. metricsOK is threaded through untouched: it gates the active/queue overlay
+// (see mergeRuntimeModelMetrics) separately from ok/state (which drives prefer-starting).
+func (r *Resolver) runtimeModelState(c MappingCandidate) (state string, active int, queue int, ok bool, metricsOK bool) {
 	if r.runtimeState == nil {
-		return "", 0, 0, false
+		return "", 0, 0, false, false
 	}
 	return r.runtimeState.RuntimeModelState(c.Server.ID, c.Mapping.AppModelName)
 }
 
 // modelStartingOn reports whether the candidate's upstream model is currently reported
-// "starting" (loading) on its server, per the runtime-model-state checker.
+// "starting" (loading) on its server, per the runtime-model-state checker. It keys off
+// ok/state ONLY (not metricsOK): the lifecycle state predates runtime_model_probe and is
+// valid for any runtime_manager agent, so prefer-starting keeps working without the flag.
 func (r *Resolver) modelStartingOn(c MappingCandidate) bool {
-	state, _, _, ok := r.runtimeModelState(c)
+	state, _, _, ok, _ := r.runtimeModelState(c)
 	return ok && state == runtimeStateStarting
 }
 
 // mergeRuntimeModelMetrics overlays live per-model active/queue (from the
 // runtime-status registry) onto the per-server telemetry when available, so
-// scoring reflects THIS model's load rather than the whole server's. Falls
-// back to per-server telemetry (unchanged) when no per-model status exists.
+// scoring reflects THIS model's load rather than the whole server's. The
+// overlay is gated on metricsOK, NOT merely ok: an agent that reports a valid
+// lifecycle state but has NOT declared runtime_model_probe carries a fabricated
+// active=0/queue=0, and overlaying that would make its model look artificially
+// idle (a high score => wrong routing). When !metricsOK the per-server
+// telemetry is left untouched (the correct fallback); when metricsOK the real
+// per-model counts override it.
 func (r *Resolver) mergeRuntimeModelMetrics(c MappingCandidate, tel ServerTelemetry, hasTel bool, now time.Time) (ServerTelemetry, bool) {
-	_, active, queue, ok := r.runtimeModelState(c)
-	if !ok {
+	_, active, queue, _, metricsOK := r.runtimeModelState(c)
+	if !metricsOK {
 		return tel, hasTel
 	}
 	if !hasTel { // live per-model data is fresh telemetry

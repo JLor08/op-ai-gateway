@@ -219,6 +219,39 @@ func TestPutRuntimeSpecValidation(t *testing.T) {
 			},
 			wantErr: ErrRuntimeSpecFlavorInvalid,
 		},
+		{
+			// SSRF: "@evil:9999/x" appended to "http://127.0.0.1:PORT" makes
+			// url.Parse resolve Host to the attacker (the "@" is the userinfo
+			// boundary), so the agent would dial off-loopback. Must be rejected.
+			name:      "context_probe_path with userinfo authority",
+			mappingID: agentMapping.ID,
+			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.ContextProbePath = "@evil:9999/x"; return r },
+			wantErr:   ErrRuntimeSpecContextProbePathInvalid,
+		},
+		{
+			name:      "metrics_path protocol-relative",
+			mappingID: agentMapping.ID,
+			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.MetricsPath = "//evil"; return r },
+			wantErr:   ErrRuntimeSpecMetricsPathInvalid,
+		},
+		{
+			name:      "metrics_path absolute url",
+			mappingID: agentMapping.ID,
+			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.MetricsPath = "http://evil"; return r },
+			wantErr:   ErrRuntimeSpecMetricsPathInvalid,
+		},
+		{
+			// A safe relative override passes: proves the guard does not reject
+			// legitimate per-type paths.
+			name:      "valid relative probe paths",
+			mappingID: agentMapping.ID,
+			mutate: func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest {
+				r.MetricsPath = "/metrics"
+				r.ContextProbePath = "/v1/models"
+				return r
+			},
+			wantErr: nil,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

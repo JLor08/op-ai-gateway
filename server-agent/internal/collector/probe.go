@@ -13,6 +13,37 @@ import (
 	"strings"
 )
 
+// SafeProbePath reports whether p is a safe relative probe path to append to
+// the agent's own "http://127.0.0.1:PORT" loopback base: empty (nothing to
+// probe), or a single-"/"-rooted path carrying no scheme, no protocol-relative
+// "//" authority, and no whitespace/control bytes. It is the agent's
+// defense-in-depth SSRF guard, mirroring the portal's safeRelativeProbePath:
+// concatenating a value like "@evil:9999/x", "//evil", or "http://evil" onto
+// the loopback base would otherwise re-parse to an off-loopback Host and turn
+// a local probe into an outbound request. probeRuntimeChild skips a probe
+// whose path fails this check, so even a bad path that somehow reached the
+// agent never dials off-loopback. Valid paths ("/metrics", "/v1/models",
+// "/props", "/api/show") all pass.
+func SafeProbePath(p string) bool {
+	if p == "" {
+		return true
+	}
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	if strings.Contains(p, "://") {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		// Reject every byte at or below ASCII space (control chars, tab, CR,
+		// NL, and space itself) and DEL.
+		if b := p[i]; b <= 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // ProbeContext GETs baseURL+contextPath and extracts the served model's
 // context length, per specType's JSON convention. specType is the resolved
 // lowercase RuntimeSpecType string ("vllm" | "llama_cpp" | "tgi" | "ollama" |

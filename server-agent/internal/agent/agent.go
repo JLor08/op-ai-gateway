@@ -1033,7 +1033,12 @@ type runtimeCtxEntry struct {
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
-	if st.MetricsPath != "" {
+	// Defense-in-depth SSRF guard (the portal validates these paths on write;
+	// this is the second layer): a metrics/context path is only ever appended
+	// to the loopback base, so an unsafe one -- @userinfo, //authority, a
+	// scheme, whitespace -- could re-parse the URL's Host off-loopback. Skip
+	// the probe rather than dial it.
+	if st.MetricsPath != "" && collector.SafeProbePath(st.MetricsPath) {
 		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
 		active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
 		cancel()
@@ -1043,9 +1048,15 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 			rs.ActiveRequests = active
 			rs.QueueDepth = queue
 		}
+	} else if st.MetricsPath != "" {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
 	}
 
 	if st.ContextProbePath == "" {
+		return
+	}
+	if !collector.SafeProbePath(st.ContextProbePath) {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "context", "path", st.ContextProbePath)
 		return
 	}
 	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID {
