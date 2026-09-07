@@ -54,16 +54,19 @@ type wireRuntimeError struct {
 }
 
 type wireRuntimeSample struct {
-	SpecID    string            `json:"spec_id"`
-	Model     string            `json:"model"`
-	State     string            `json:"state"`
-	Since     time.Time         `json:"since"`
-	PID       int               `json:"pid,omitempty"`
-	Port      int               `json:"port,omitempty"`
-	InFlight  int               `json:"in_flight"`
-	Restarts  int               `json:"restarts"`
-	GPUs      []wireRuntimeGPU  `json:"gpus,omitempty"`
-	LastError *wireRuntimeError `json:"last_error,omitempty"`
+	SpecID         string            `json:"spec_id"`
+	Model          string            `json:"model"`
+	State          string            `json:"state"`
+	Since          time.Time         `json:"since"`
+	PID            int               `json:"pid,omitempty"`
+	Port           int               `json:"port,omitempty"`
+	InFlight       int               `json:"in_flight"`
+	Restarts       int               `json:"restarts"`
+	ContextSize    int               `json:"context_size"`
+	ActiveRequests int               `json:"active_requests"`
+	QueueDepth     int               `json:"queue_depth"`
+	GPUs           []wireRuntimeGPU  `json:"gpus,omitempty"`
+	LastError      *wireRuntimeError `json:"last_error,omitempty"`
 }
 
 type wireProxyRoute struct {
@@ -369,6 +372,81 @@ func TestSampleCarriesRuntimes(t *testing.T) {
 	}
 	if bytes.Contains(rawZero, []byte(`runtimes`)) {
 		t.Errorf("raw JSON should omit runtimes entirely when unset; got %s", rawZero)
+	}
+}
+
+// TestRuntimeSampleContextAndMetricsFieldsRoundTrip is the sample half of
+// Task 7: ContextSize/ActiveRequests/QueueDepth mirror the gateway ingest's
+// exact tags (context_size/active_requests/queue_depth) and, like
+// InFlight/Restarts, are always-present counters -- NOT omitempty -- so a
+// spec left at the zero value still marshals all three keys as present with
+// value 0, never omitting them.
+func TestRuntimeSampleContextAndMetricsFieldsRoundTrip(t *testing.T) {
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{
+				SpecID:         "rspec_ctx",
+				Model:          "qwen-coder",
+				State:          "running",
+				Since:          since,
+				ContextSize:    32768,
+				ActiveRequests: 3,
+				QueueDepth:     7,
+			},
+		},
+	}
+	s.Normalize()
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got wireSample
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into wire struct: %v", err)
+	}
+	if len(got.Runtimes) != 1 {
+		t.Fatalf("runtimes len = %d, want 1", len(got.Runtimes))
+	}
+	rt := got.Runtimes[0]
+	if rt.ContextSize != 32768 || rt.ActiveRequests != 3 || rt.QueueDepth != 7 {
+		t.Errorf("runtimes[0] context/metrics fields = %+v, want {32768 3 7}", rt)
+	}
+
+	// A spec left at the zero value for all three fields must still carry
+	// them PRESENT in the wire JSON (not omitempty) -- mirroring
+	// InFlight/Restarts above. Probe the raw JSON directly (rather than
+	// bytes.Contains) because Sample itself already has its own top-level
+	// active_requests/queue_depth keys with the same names; only a
+	// key-presence check scoped to the runtimes entry proves this field's
+	// own omitempty behavior.
+	var zero Sample
+	zero.Runtimes = []RuntimeSample{{SpecID: "rspec_zero"}}
+	zero.Normalize()
+	rawZero, err := json.Marshal(&zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	var probe struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(rawZero, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 1 {
+		t.Fatalf("probe runtimes len = %d, want 1", len(probe.Runtimes))
+	}
+	for _, key := range []string{"context_size", "active_requests", "queue_depth"} {
+		v, ok := probe.Runtimes[0][key]
+		if !ok {
+			t.Errorf("runtimes[0] missing %q key; must not be omitempty", key)
+			continue
+		}
+		if string(v) != "0" {
+			t.Errorf("runtimes[0].%s = %s, want 0", key, v)
+		}
 	}
 }
 
