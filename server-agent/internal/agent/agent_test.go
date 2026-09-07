@@ -1675,3 +1675,266 @@ func TestCollectOnceRuntimeProbeUnreachableLeavesZero(t *testing.T) {
 		t.Errorf("unreachable-probe fields = %+v, want all zero", rs)
 	}
 }
+
+// TestCollectOnceRuntimeProbeStatesBothOK proves a StateRunning child whose
+// /metrics and context endpoints both serve valid responses reports
+// MetricsProbe=="ok" and ContextProbe=="ok" -- the three-state reachability
+// fields Task 2 adds alongside the existing numeric probe results.
+func TestCollectOnceRuntimeProbeStatesBothOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/metrics":
+			_, _ = w.Write([]byte("vllm:num_requests_running 1\nvllm:num_requests_waiting 0\n"))
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_both_ok",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5001,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			MetricsPath:      "/metrics",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.MetricsProbe != "ok" {
+		t.Errorf("MetricsProbe = %q, want %q", rs.MetricsProbe, "ok")
+	}
+	if rs.ContextProbe != "ok" {
+		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "ok")
+	}
+}
+
+// TestCollectOnceRuntimeProbeStatesMetricsRefusedContextOK proves a
+// StateRunning child whose /metrics endpoint refuses to serve a response
+// (the connection is hung up on, not merely 404) reports
+// MetricsProbe=="unreachable" while an independently-working context probe
+// on the SAME server still reports ContextProbe=="ok" -- the two states are
+// computed and set independently.
+func TestCollectOnceRuntimeProbeStatesMetricsRefusedContextOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/metrics":
+			// Simulate a refusing endpoint: hijack the connection and hang up
+			// without writing any HTTP response, forcing the client's Do to
+			// return an error (a forgotten --metrics flag serving nothing
+			// resembles this far more than a clean 404 would, since Scrape
+			// does not itself check status codes).
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_metrics_refused",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5002,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			MetricsPath:      "/metrics",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.MetricsProbe != "unreachable" {
+		t.Errorf("MetricsProbe = %q, want %q", rs.MetricsProbe, "unreachable")
+	}
+	if rs.ContextProbe != "ok" {
+		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "ok")
+	}
+}
+
+// TestCollectOnceRuntimeProbeStatesEmptyMetricsPathNA proves a child with no
+// MetricsPath configured (a runtime type/spec with no known metrics
+// endpoint) reports MetricsProbe=="na" rather than "unreachable" -- "na"
+// means "not applicable", not "failed".
+func TestCollectOnceRuntimeProbeStatesEmptyMetricsPathNA(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_no_metrics_path",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5003,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			MetricsPath:      "",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.MetricsProbe != "na" {
+		t.Errorf("MetricsProbe = %q, want %q", rs.MetricsProbe, "na")
+	}
+	if rs.ContextProbe != "ok" {
+		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "ok")
+	}
+}
+
+// TestCollectOnceRuntimeProbeStatesEmptyContextPathNA proves a child with no
+// ContextProbePath configured reports ContextProbe=="na" rather than
+// "unreachable".
+func TestCollectOnceRuntimeProbeStatesEmptyContextPathNA(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("vllm:num_requests_running 1\nvllm:num_requests_waiting 0\n"))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_no_context_path",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5004,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			MetricsPath:      "/metrics",
+			ContextProbePath: "",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.ContextProbe != "na" {
+		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "na")
+	}
+	if rs.MetricsProbe != "ok" {
+		t.Errorf("MetricsProbe = %q, want %q", rs.MetricsProbe, "ok")
+	}
+}
+
+// TestCollectOnceRuntimeProbeStatesContextZeroSizeUnreachable proves a
+// context probe that succeeds at the HTTP level but yields a non-positive
+// size (the deliberate "unknown, don't cache" case already covered by
+// TestCollectOnceRuntimeContextZeroSizeNotCached) reports
+// ContextProbe=="unreachable", not "ok" -- a size of 0 is not a successful
+// probe.
+func TestCollectOnceRuntimeProbeStatesContextZeroSizeUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":0}]}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_zero_size",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5005,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.ContextProbe != "unreachable" {
+		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "unreachable")
+	}
+}
