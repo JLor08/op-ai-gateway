@@ -60,26 +60,36 @@ func TestResolverPerModelMetricsOverridePerServerTelemetry(t *testing.T) {
 }
 
 // Prefer an already-STARTING (loading) instance of the requested model over
-// cold-starting another. Neither server has the model loaded/running here (no
-// LoadedModelChecker installed). srv_fast's per-server telemetry is deliberately made
-// WORSE than srv_slow's (raw score 980 < 1070, so a plain score-only resolver would pick
-// srv_slow) while the runtime-status registry reports the model already "starting" on
-// srv_fast and unknown/stopped on srv_slow -- the resolver must still prefer srv_fast,
-// since routing to the already-loading instance avoids spinning up a redundant second
-// process.
+// cold-starting another -- and prove it is the PARTITION (selecting within the
+// starting-only subset before the full-pool argmax ever runs), not merely the
+// unconditional per-model merge that argmaxByScore applies to every candidate.
+//
+// srv_fast is reported "starting" with a heavily-loaded per-model state (active=10,
+// queue=5): after mergeRuntimeModelMetrics overlays those onto its (otherwise-fast,
+// latency=100) telemetry, its score is
+//
+//	1000 (base) + 10*20 (priority) + 50 (weight) - 10*25 (active) - 5*20 (queue) - 100*0.2 (latency) = 880
+//
+// srv_slow is absent from the checker (ok=false), so it keeps its unmodified per-server
+// telemetry (latency=900, active=0, queue=0):
+//
+//	1000 + 10*20 + 50 - 900*0.2 = 1070
+//
+// So srv_slow's MERGED score (1070) is higher than srv_fast's (880): a plain full-pool
+// argmaxByScore over the merged pool -- i.e. what selectFromPool would do if the entire
+// starting-partition block were deleted -- would pick srv_slow. The resolver must still
+// return srv_fast, which can only happen because the starting partition evaluates it in
+// an isolated singleton pool (where it is the only, and thus best, viable candidate) and
+// returns it before the full-pool argmax ever runs.
 func TestResolverPrefersStartingOverColdStart(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	store := seededResolverStore(t, now)
-	// Make srv_fast's raw per-server score worse than srv_slow's (980 < 1070) so the
-	// test proves the starting preference, not the fixture's default latency advantage.
-	if err := store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv_fast", ReportedAt: now, ActiveRequests: 10, LatencyMS: 100, ErrorRate: 0, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
-		t.Fatalf("UpsertTelemetry srv_fast: %v", err)
-	}
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
 	resolver.SetRuntimeModelStateChecker(&fakeRuntimeState{byServer: map[string]fakeRuntimeStateEntry{
-		"srv_fast": {state: "starting"},
-		// srv_slow deliberately absent: unknown/stopped, not starting.
+		"srv_fast": {state: "starting", active: 10, queue: 5},
+		// srv_slow deliberately absent: unknown/stopped, not starting -- keeps its good
+		// (1070) per-server telemetry score, which BEATS srv_fast's merged 880.
 	}})
 
 	target, err := resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "qwen-coder", APIFlavor: "openai_chat"})
@@ -87,7 +97,7 @@ func TestResolverPrefersStartingOverColdStart(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if target.ServerID != "srv_fast" {
-		t.Fatalf("target.ServerID = %q, want srv_fast (prefer the already-starting instance over a worse-scored cold candidate)", target.ServerID)
+		t.Fatalf("target.ServerID = %q, want srv_fast (the starting partition must pick it even though its merged score, 880, is BELOW srv_slow's merged score, 1070 -- proving the partition itself, not just the per-model merge, drives the choice)", target.ServerID)
 	}
 }
 
