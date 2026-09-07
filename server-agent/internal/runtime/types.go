@@ -363,12 +363,24 @@ type LastError struct {
 
 // Status is one spec's current runtime status, as tracked by the process
 // manager and reported upward. JSON tags mirror sample.RuntimeSample
-// field-for-field, EXCEPT MeasuredVRAM: the sample maps it to
+// field-for-field, EXCEPT MeasuredVRAM and the Type/MetricsPath/
+// ContextProbePath trio below: the sample maps MeasuredVRAM to
 // RuntimeSample.GPUs ([]RuntimeGPUSample), so "measured_vram" here is not
 // itself part of that wire contract -- the tag exists so Status marshals
 // sensibly wherever it IS put on the wire directly (a status
 // stderr/debugging dump, a future endpoint), consistent with the rest of
 // this type.
+//
+// Type, MetricsPath, and ContextProbePath are likewise NOT part of the
+// Status<->RuntimeSample mirror: they are the agent's per-child PROBE
+// CONFIG (the resolved effective values copied straight from spec.Type/
+// spec.MetricsPath/spec.ContextProbePath by snapshotStatus, a pure struct
+// copy with no I/O), not lifecycle state. internal/agent's collectOnce
+// reads them to know WHERE to probe a running child for metrics/context; it
+// does not put them on RuntimeSample itself -- only the PROBE RESULTS
+// (ContextSize/ActiveRequests/QueueDepth) land there. This is a second,
+// documented exception to the "mirrors sample.RuntimeSample field-for-field"
+// contract, alongside MeasuredVRAM above.
 type Status struct {
 	SpecID       string      `json:"spec_id"`
 	Model        string      `json:"model"` // upstream model name
@@ -380,6 +392,14 @@ type Status struct {
 	Restarts     int         `json:"restarts"`
 	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
 	LastError    *LastError  `json:"last_error,omitempty"`
+
+	// Type, MetricsPath, and ContextProbePath are the agent's per-child
+	// probe config, resolved effective values copied from the spec by
+	// snapshotStatus -- see the type doc above. Not lifecycle state, and
+	// not part of the Status<->RuntimeSample wire mirror.
+	Type             string `json:"type"`
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // statusAlias is Status under a different name, used only to marshal

@@ -116,10 +116,17 @@ type RuntimeErrorSample struct {
 }
 
 // RuntimeSample is one agent-managed launch spec's current visible-lifecycle
-// state (design spec §7), mirroring runtime.Status field-for-field for the
-// wire. GPUs carries ONLY the GPUs this measurement cycle actually measured
-// (omitempty: nil, not an empty array, when nothing was measured this
-// cycle -- e.g. no measurer installed, or the spec is not yet running).
+// state (design spec §7). Most fields mirror runtime.Status field-for-field
+// for the wire, but ContextSize, ActiveRequests, and QueueDepth are the
+// exception: they are NOT copied from any Status lifecycle field. Instead
+// the agent's collectOnce (internal/agent) fills them itself, per running
+// child, by probing that child's own HTTP endpoints directly -- base URL
+// from Status.Port, paths from Status's Type/MetricsPath/ContextProbePath
+// probe-config trio (Task 9). ContextSize is probed once per child lifetime
+// and cached; ActiveRequests/QueueDepth are scraped fresh every cycle. GPUs
+// carries ONLY the GPUs this measurement cycle actually measured (omitempty:
+// nil, not an empty array, when nothing was measured this cycle -- e.g. no
+// measurer installed, or the spec is not yet running).
 type RuntimeSample struct {
 	SpecID         string              `json:"spec_id"`
 	Model          string              `json:"model"`

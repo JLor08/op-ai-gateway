@@ -2431,6 +2431,12 @@ func (o *owner) snapshotStatus() []Status {
 			InFlight:  st.inFlight,
 			Restarts:  st.restarts,
 			LastError: st.lastError,
+			// Probe config (Task 9): pure struct copies of the spec's own
+			// resolved fields, no I/O -- this runs on the owner's single
+			// command goroutine, which must never block on a network probe.
+			Type:             st.spec.Type,
+			MetricsPath:      st.spec.MetricsPath,
+			ContextProbePath: st.spec.ContextProbePath,
 		}
 		if st.measuredVRAM != nil {
 			// M3 fix: hand out a COPY, not the same map the measurer
