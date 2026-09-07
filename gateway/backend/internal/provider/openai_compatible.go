@@ -381,6 +381,18 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	openAIToolFields(body, req)
 	openAISamplingFields(body, req)
+	if wantsLiveProgress(target) {
+		// Ask for an EXACT running output-token count mid-stream. llama.cpp then
+		// attaches its timings object (predicted_n + predicted_per_second) to every
+		// partial; vLLM puts its running completion_tokens on every chunk.
+		// continuous_usage_stats is inert without include_usage, which is set above
+		// and must stay set. See live_progress.go for why this is gated.
+		body["timings_per_token"] = true
+		body["stream_options"] = map[string]any{
+			"include_usage":          true,
+			"continuous_usage_stats": true,
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("%w: encode request", ErrInvalidResponse)
@@ -462,6 +474,7 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 			Timings *struct {
 				PromptPerSecond    float64 `json:"prompt_per_second"`
 				PredictedPerSecond float64 `json:"predicted_per_second"`
+				PredictedN         int     `json:"predicted_n"`
 			} `json:"timings"`
 			Error *struct {
 				Message string `json:"message"`
@@ -489,6 +502,21 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 				usage.TokensPerSecond = chunk.Timings.PredictedPerSecond
 			}
 		}
+		// Running, upstream-reported progress. Computed OUTSIDE the usage branch on
+		// purpose: llama.cpp attaches timings to partial chunks that carry no usage
+		// object, which is why this used to be dropped. Never derived here -- a
+		// chunk that reports no exact count produces no progress at all.
+		var progress *inference.StreamProgress
+		switch {
+		case chunk.Timings != nil && (chunk.Timings.PredictedN > 0 || chunk.Timings.PredictedPerSecond > 0):
+			progress = &inference.StreamProgress{
+				OutputTokens:    chunk.Timings.PredictedN,
+				TokensPerSecond: chunk.Timings.PredictedPerSecond,
+			}
+		case chunk.Usage != nil && chunk.Usage.CompletionTokens > 0:
+			// vLLM's continuous usage: an exact running count, no rate.
+			progress = &inference.StreamProgress{OutputTokens: chunk.Usage.CompletionTokens}
+		}
 		if len(chunk.Choices) > 0 {
 			if fr := chunk.Choices[0].FinishReason; fr != "" {
 				finishReason = fr
@@ -499,7 +527,12 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 				reasoning = d.Reasoning
 			}
 			if d.Content != "" || reasoning != "" {
-				if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: d.Content, Reasoning: reasoning}); err != nil {
+				if err := emit(inference.StreamEvent{
+					Type:      inference.StreamEventTextDelta,
+					Text:      d.Content,
+					Reasoning: reasoning,
+					Progress:  progress,
+				}); err != nil {
 					return err
 				}
 			}

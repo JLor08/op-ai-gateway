@@ -473,6 +473,230 @@ func TestOpenAICompatibleCompleteStreamIgnoresTotalTimeout(t *testing.T) {
 	}
 }
 
+// llama.cpp with timings_per_token attaches its timings object to PARTIAL chunks,
+// which carry no usage object at all. Before this change that branch was dead.
+func TestCompleteStreamProgressFromChunkTimingsWithoutUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hallo"}}],"timings":{"predicted_n":7,"predicted_per_second":42.5}}`,
+			`data: [DONE]`,
+		}
+		for _, line := range lines {
+			_, _ = io.WriteString(w, line+"\n\n")
+		}
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	var got *inference.StreamProgress
+	err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderLlamaCPP, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}, func(ev inference.StreamEvent) error {
+		if ev.Type == inference.StreamEventTextDelta {
+			got = ev.Progress
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream returned %v", err)
+	}
+	if got == nil {
+		t.Fatal("no progress on the text delta: per-chunk timings were dropped")
+	}
+	if got.OutputTokens != 7 || got.TokensPerSecond != 42.5 {
+		t.Fatalf("progress = %+v, want {7 42.5}", *got)
+	}
+}
+
+// vLLM's continuous usage stats put an exact running completion-token count on
+// every chunk but report no rate; the consumer derives a rate from the count.
+func TestCompleteStreamProgressFromContinuousUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":3}}`,
+			`data: [DONE]`,
+		}
+		for _, line := range lines {
+			_, _ = io.WriteString(w, line+"\n\n")
+		}
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	var got *inference.StreamProgress
+	err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderVLLM, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}, func(ev inference.StreamEvent) error {
+		if ev.Type == inference.StreamEventTextDelta {
+			got = ev.Progress
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream returned %v", err)
+	}
+	if got == nil {
+		t.Fatal("no progress on the text delta: continuous usage was dropped")
+	}
+	if got.OutputTokens != 3 || got.TokensPerSecond != 0 {
+		t.Fatalf("progress = %+v, want {3 0}", *got)
+	}
+}
+
+// The two live-progress request parameters must reach only the allow-listed
+// upstreams. LiteLLM forwards unrecognized body keys downstream and fails the
+// whole request on them, so it must see stream_options with ONLY include_usage.
+func TestCompleteStreamSendsLiveProgressParamsOnlyForAllowedUpstreams(t *testing.T) {
+	newUpstream := func(bodyCh chan []byte) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			bodyCh <- raw
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+	}
+	req := inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	t.Run("llama_cpp", func(t *testing.T) {
+		bodyCh := make(chan []byte, 1)
+		upstream := newUpstream(bodyCh)
+		defer upstream.Close()
+		if err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderLlamaCPP, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, req, func(inference.StreamEvent) error { return nil }); err != nil {
+			t.Fatalf("CompleteStream returned %v", err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(<-bodyCh, &body); err != nil {
+			t.Fatalf("unmarshal body: %v", err)
+		}
+		if body["timings_per_token"] != true {
+			t.Fatalf("timings_per_token = %#v, want true", body["timings_per_token"])
+		}
+		opts, ok := body["stream_options"].(map[string]any)
+		if !ok || opts["include_usage"] != true || opts["continuous_usage_stats"] != true {
+			t.Fatalf("stream_options = %#v, want include_usage and continuous_usage_stats true", body["stream_options"])
+		}
+	})
+
+	t.Run("litellm", func(t *testing.T) {
+		bodyCh := make(chan []byte, 1)
+		upstream := newUpstream(bodyCh)
+		defer upstream.Close()
+		if err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderLiteLLM, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, req, func(inference.StreamEvent) error { return nil }); err != nil {
+			t.Fatalf("CompleteStream returned %v", err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(<-bodyCh, &body); err != nil {
+			t.Fatalf("unmarshal body: %v", err)
+		}
+		if _, ok := body["timings_per_token"]; ok {
+			t.Fatalf("timings_per_token must be absent for litellm, got %#v", body["timings_per_token"])
+		}
+		opts, ok := body["stream_options"].(map[string]any)
+		if !ok {
+			t.Fatalf("stream_options missing: %#v", body["stream_options"])
+		}
+		if len(opts) != 1 || opts["include_usage"] != true {
+			t.Fatalf("stream_options = %#v, want exactly {include_usage: true}", opts)
+		}
+	})
+}
+
+// TestCompleteStreamTruncatedVLLMStreamKeepsLastPartialUsage pins the
+// consequence of continuous_usage_stats: chunk.Usage is now non-nil on EVERY
+// vLLM chunk, so a connection that dies mid-stream (no final usage chunk, no
+// [DONE]) still returns the existing truncation error, but the progress
+// observed via the already-emitted text deltas carries the last partial figure
+// rather than nothing.
+func TestCompleteStreamTruncatedVLLMStreamKeepsLastPartialUsage(t *testing.T) {
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":3}}`,
+			`data: {"choices":[{"delta":{"content":" there"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`,
+		}
+		for _, line := range lines {
+			_, _ = io.WriteString(w, line+"\n\n")
+			f.Flush()
+		}
+		// Simulate the upstream dying mid-stream: no final usage chunk, no [DONE],
+		// connection severed abruptly rather than closed cleanly.
+		upstream.CloseClientConnections()
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	var lastProgress *inference.StreamProgress
+	var sawCompleted bool
+	err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderVLLM, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}, func(ev inference.StreamEvent) error {
+		switch ev.Type {
+		case inference.StreamEventTextDelta:
+			lastProgress = ev.Progress
+		case inference.StreamEventCompleted:
+			sawCompleted = true
+		}
+		return nil
+	})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want the existing truncation error (ErrUnavailable)", err)
+	}
+	if sawCompleted {
+		t.Fatal("StreamEventCompleted was emitted despite the truncated connection")
+	}
+	if lastProgress == nil {
+		t.Fatal("no progress observed before truncation")
+	}
+	if lastProgress.OutputTokens != 5 {
+		t.Fatalf("last observed OutputTokens = %d, want 5 (the last partial continuous-usage figure, not zero)", lastProgress.OutputTokens)
+	}
+}
+
+// TestCompleteStreamTerminalUsageUnchangedWithContinuousUsage asserts the
+// complete-stream case is unchanged: intermediate chunks carry partial usage
+// without prompt_tokens_details, the final chunk carries the complete usage +
+// timings, and the terminal event's Usage must equal the FINAL chunk's values,
+// including CachedTokens.
+func TestCompleteStreamTerminalUsageUnchangedWithContinuousUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":3}}`,
+			`data: {"choices":[{"delta":{"content":" there"}}],"usage":{"prompt_tokens":10,"completion_tokens":8}}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":12,"total_tokens":22,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7}}`,
+			`data: [DONE]`,
+		}
+		for _, line := range lines {
+			_, _ = io.WriteString(w, line+"\n\n")
+		}
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	var completed *inference.StreamEvent
+	err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderVLLM, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}, func(ev inference.StreamEvent) error {
+		if ev.Type == inference.StreamEventCompleted {
+			c := ev
+			completed = &c
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream returned %v", err)
+	}
+	if completed == nil || completed.Usage == nil {
+		t.Fatal("no usage in completed event")
+	}
+	if completed.Usage.OutputTokens != 12 || completed.Usage.TotalTokens != 22 {
+		t.Fatalf("Usage = %#v, want the FINAL chunk's completion_tokens=12/total=22, not an intermediate partial", completed.Usage)
+	}
+	if completed.Usage.CachedTokens != 4 {
+		t.Fatalf("Usage.CachedTokens = %v, want 4 (from the final chunk, not lost to an earlier partial chunk without details)", completed.Usage.CachedTokens)
+	}
+	if completed.Usage.TokensPerSecond != 56.7 {
+		t.Fatalf("Usage.TokensPerSecond = %v, want 56.7 (from the final chunk's timings)", completed.Usage.TokensPerSecond)
+	}
+}
+
 func TestOpenAIMessagesThreadsReasoningContent(t *testing.T) {
 	msgs := openAIMessages([]inference.Message{
 		{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}},
