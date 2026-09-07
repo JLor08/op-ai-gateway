@@ -36,29 +36,39 @@ import { formatPortalError } from './shared/format';
 // tri-state, replacing the old separate "Geladen" (benchmark-derived `loaded`)
 // and "Live-Status" (raw runtime `state`) columns -- this column answers ONE
 // question ("can I use it right now?"), not the full nine-value runtime
-// lifecycle. Only `running` and `starting` get their own treatment; every
-// other explicit state (stopped/draining/backoff/crashed/...) collapses to
-// "not loaded" here (its detail, if ever needed, belongs elsewhere, not a
+// lifecycle. Only the running and the LOADING states get their own treatment;
+// every other explicit state (stopped/draining/backoff/crashed/...) collapses
+// to "not loaded" here (its detail, if ever needed, belongs elsewhere, not a
 // fourth chip colour on this screen). `""` -- no agent-managed runtime status
 // at all, e.g. a non-server_agent model server -- falls back to the
 // benchmark-derived `loaded` boolean, exactly what the old "Geladen" column
 // showed on its own.
 type ModelStatusKey = 'loaded' | 'loading' | 'not_loaded';
 
+// The runtime states that mean "on its way up", i.e. the user-visible "Lädt".
+// This is NOT just `starting`: the shared `runtimeStateBadge`
+// (shared/runtimeState.ts) maps `starting` AND `pending_vram_unknown` onto the
+// same `watch` badge, because both are "waiting to be loaded". This column
+// claims to reuse that vocabulary, so it must agree with it -- a
+// `pending_vram_unknown` spec that reads yellow "Lädt" on the runtime admin
+// screen must not read grey "Nicht Geladen" here for the same instant of the
+// same spec.
+const loadingRuntimeStates = new Set(['starting', 'pending_vram_unknown']);
+
 function modelStatusKey(r: Pick<ModelServerRow, 'state' | 'loaded'>): ModelStatusKey {
   if (r.state === 'running') return 'loaded';
-  if (r.state === 'starting') return 'loading';
+  if (loadingRuntimeStates.has(r.state)) return 'loading';
   if (r.state === '') return r.loaded ? 'loaded' : 'not_loaded';
   return 'not_loaded';
 }
 
-// Colour: "running"/"starting" reuse the SAME runtimeStateBadge mapping
-// RuntimeAdminSection's "Live status" column uses (active/watch), so this
-// column's colours never drift from that vocabulary; every other case only
-// ever needs the coarse loaded ("success", same visual class as "active") /
-// not-loaded ("standby") distinction the old "Geladen" column already had.
+// Colour: the running + loading states reuse the SAME runtimeStateBadge
+// mapping RuntimeAdminSection's "Live status" column uses (active/watch), so
+// this column's colours never drift from that vocabulary; every other case
+// only ever needs the coarse loaded ("success", same visual class as "active")
+// / not-loaded ("standby") distinction the old "Geladen" column already had.
 function modelStatusBadge(r: Pick<ModelServerRow, 'state' | 'loaded'>): BadgeStatus {
-  if (r.state === 'running' || r.state === 'starting') return runtimeStateBadge(r.state);
+  if (r.state === 'running' || loadingRuntimeStates.has(r.state)) return runtimeStateBadge(r.state);
   return modelStatusKey(r) === 'loaded' ? 'success' : 'standby';
 }
 
@@ -68,11 +78,15 @@ function modelStatusLabel(key: ModelStatusKey, t: Translation): string {
   return t.modelServerNotLoaded;
 }
 
-// Task 7: `metrics_probe`/`context_probe` are "ok" | "unreachable" | "na" | ""
-// (api/models.ts) -- ONLY "ok" means the accompanying number (active_requests/
-// queue_depth for metrics_probe, context_size for context_probe) is a real
-// measurement rather than an unset zero. One tiny shared predicate so all
-// three gated columns below agree on what "measured" means.
+// Task 7: `metrics_probe` is "ok" | "unreachable" | "na" | "" (api/models.ts)
+// -- ONLY "ok" means the accompanying numbers (active_requests/queue_depth)
+// are a real measurement rather than an unset zero, because those two are
+// PROBE-DERIVED: the portal service leaves them at 0 and only the
+// capability-gated `injectRowRuntimeState` ever fills them. One tiny shared
+// predicate so both gated columns below agree on what "measured" means.
+//
+// Deliberately NOT used for the Kontext column: `context_size` is a persisted
+// mapping field, not a probe result -- see that column's own comment.
 function probeOk(probeState: string): boolean {
   return probeState === 'ok';
 }
@@ -238,15 +252,26 @@ export function ModelServersSection({
       render: (r) => (r.load_time_ms > 0 ? String(r.load_time_ms) : '-'),
     },
     {
-      // Gated on context_probe rather than "> 0": a real context size of 0
-      // cannot happen, but gating on the probe state (not just the number)
-      // keeps this column consistent with active/queue above and makes the
-      // "never measured" case explicit rather than incidental.
+      // Gated on the VALUE (> 0), not on `context_probe` -- deliberately
+      // unlike active/queue above, and this is the difference that matters:
+      // `context_size` is NOT probe-derived. The portal service fills it once
+      // from the PERSISTED mapping field (`ContextSize: view.mapping.
+      // ContextSize`, portal/service_model_servers.go), and that field can
+      // come from a benchmark run or a manual operator entry just as well as
+      // from the agent's context probe. Gating the cell on the live probe
+      // state therefore hid a real, stored context size on every non-probing
+      // row -- any non-`server_agent` model server, and any agent without the
+      // runtime_model_probe capability. `context_probe` reports only whether
+      // the probe that can REFRESH this value is currently reachable, which is
+      // what the runtime admin screen's "Probes" column shows; it says nothing
+      // about whether the stored value is real. A real context size of 0
+      // cannot happen, so "> 0" is exactly the "nothing is known" test and the
+      // feature's intent (never render a meaningless 0 as 0) still holds.
       id: 'context',
       label: t.mappingContextSize,
       numeric: true,
       value: (r) => String(r.context_size),
-      render: (r) => (probeOk(r.context_probe) ? String(r.context_size) : '—'),
+      render: (r) => (r.context_size > 0 ? String(r.context_size) : '—'),
     },
     {
       id: 'maxConc',

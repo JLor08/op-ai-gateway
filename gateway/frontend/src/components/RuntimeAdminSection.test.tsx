@@ -2115,6 +2115,53 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
     // probe chip renders for either the metrics or the context probe.
     expect(row.querySelectorAll('[data-status]')).toHaveLength(1);
   });
+
+  // FIX 5 of the final whole-branch review: these tooltips were DEAD. MUI's
+  // Tooltip works by cloning its event handlers (and a ref) onto its child,
+  // and the shared StatusChip destructures only { status, label } -- it
+  // spreads nothing onto the inner Chip and is not forwardRef -- so every
+  // tooltip prop handed to it was silently dropped and no hover ever opened
+  // anything. Wrapping the chip in a plain <span> (the same Tooltip > span >
+  // item shape RowActionsMenu already uses for its disabled menu items) gives
+  // the Tooltip an element it can attach to, without touching the shared
+  // chip's contract. These two tests hover the chip the way a user does and
+  // assert the explanation actually appears -- the only assertion that can
+  // see the difference, since the label rendered identically either way.
+  it('opens the metrics-probe tooltip on hover', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [
+        makeStatus({ spec_id: 'spec_1', metrics_probe: 'unreachable', context_probe: '' }),
+      ],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    fireEvent.mouseOver(
+      screen.getByText(probeLabel(t.runtimeProbeMetricsPrefix, t.runtimeProbeStateUnreachable)),
+    );
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeProbeTooltipUnreachable);
+  });
+
+  it('opens the context-probe tooltip on hover', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', metrics_probe: '', context_probe: 'ok' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    fireEvent.mouseOver(
+      screen.getByText(probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateOk)),
+    );
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeProbeTooltipOk);
+  });
 });
 
 describe('RuntimeAdminSection admin overrides', () => {

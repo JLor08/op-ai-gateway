@@ -3088,16 +3088,29 @@ export function RuntimeAdminSection({
         const metrics = probeChipInfo(live?.metrics_probe ?? '', t.runtimeProbeMetricsPrefix, t);
         const context = probeChipInfo(live?.context_probe ?? '', t.runtimeProbeContextPrefix, t);
         if (!metrics && !context) return null;
+        // Tooltip + <span> wrapper, NOT Tooltip + StatusChip directly: MUI's
+        // Tooltip works by cloning its event handlers (and a ref) onto its
+        // child, and the shared StatusChip destructures only { status, label }
+        // -- it spreads nothing onto the inner Chip and is not forwardRef, so
+        // every tooltip prop handed to it is silently dropped and the tooltip
+        // never opens. Wrapping in a plain element the Tooltip CAN attach to
+        // is the same fix RowActionsMenu already uses for its disabled menu
+        // items (Tooltip > span > item), and it leaves the shared chip's
+        // contract untouched.
         return (
           <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', flexWrap: 'wrap' }}>
             {metrics && (
               <Tooltip title={metrics.tooltip}>
-                <StatusChip status={metrics.status} label={metrics.label} />
+                <span>
+                  <StatusChip status={metrics.status} label={metrics.label} />
+                </span>
               </Tooltip>
             )}
             {context && (
               <Tooltip title={context.tooltip}>
-                <StatusChip status={context.status} label={context.label} />
+                <span>
+                  <StatusChip status={context.status} label={context.label} />
+                </span>
               </Tooltip>
             )}
           </Box>

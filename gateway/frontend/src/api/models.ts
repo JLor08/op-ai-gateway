@@ -347,12 +347,18 @@ export type ModelServerRow = {
   queue_depth: number;
   // Whether the agent's last per-model probe of its metrics/context endpoints
   // actually reached the server -- mirrors RuntimeStatusDTO's own closed set
-  // (api/runtime.ts): "ok" (reachable, the accompanying number is a real
-  // measurement) / "unreachable" (configured but the last probe failed) / "na"
-  // (this runtime type has no such endpoint) / "" (not reported -- legacy/
-  // non-probing agent). ONLY "ok" means active_requests/queue_depth
-  // (metrics_probe) or context_size (context_probe) are real; every other
-  // value renders those columns as "-" rather than a misleading 0.
+  // (api/runtime.ts): "ok" (reachable) / "unreachable" (configured but the
+  // last probe failed) / "na" (this runtime type has no such endpoint) / ""
+  // (not reported -- legacy/non-probing agent).
+  //
+  // `metrics_probe` QUALIFIES its numbers: active_requests/queue_depth are
+  // probe-derived (0 unless a probing agent filled them), so only "ok" means
+  // they are real and every other value renders those columns as "—".
+  // `context_probe` does NOT qualify context_size: that value is a persisted
+  // mapping field (benchmark, manual entry, or a probe write), so it is shown
+  // whenever it is known (> 0) and this field reports only the reachability of
+  // the probe that can refresh it -- surfaced in the runtime admin screen's
+  // "Probes" column.
   metrics_probe: string;
   context_probe: string;
   gen_tokens_per_second: number;

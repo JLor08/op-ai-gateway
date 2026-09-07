@@ -375,6 +375,29 @@ describe('ModelServersSection', () => {
     );
   });
 
+  // FIX 4 of the final whole-branch review: the column this one replaced
+  // treated BOTH `starting` and `pending_vram_unknown` as loading, because the
+  // shared runtimeStateBadge maps both onto the `watch` badge ("waiting to be
+  // loaded"). Special-casing only `starting` here let the same spec read
+  // yellow "Lädt" on the runtime admin screen and grey "Nicht Geladen" on this
+  // one — a contradiction of the very vocabulary this column claims to reuse.
+  it('treats pending_vram_unknown as Lädt too, matching the shared runtime-state badge', async () => {
+    const rows = makeRows().map((r) =>
+      r.mapping_id === 'map-c' ? { ...r, state: 'pending_vram_unknown' } : r,
+    );
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(rows),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    expect(within(rowFor('GPU-Box-C')).getByText(t.modelServerLoading)).toHaveAttribute(
+      'data-status',
+      'watch',
+    );
+    expect(within(rowFor('GPU-Box-C')).queryByText(t.modelServerNotLoaded)).not.toBeInTheDocument();
+  });
+
   it('falls back to the `loaded` boolean when state is "", and collapses any other explicit runtime state to Nicht Geladen', async () => {
     const rows = makeRows().map((r) => {
       // map-a: an explicit runtime state this column does NOT special-case
@@ -449,7 +472,7 @@ describe('ModelServersSection', () => {
     expect(cells[4]).toHaveTextContent('0');
   });
 
-  it('gates active/queue/context on their probe state rather than on the number itself', async () => {
+  it('gates active/queue on their probe state rather than on the number itself', async () => {
     const rows = makeRows().map((r) => {
       // map-a: metrics_probe "ok" stays, but drop active/queue to a genuine 0
       // — the real measured value, not the "never measured" placeholder.
@@ -458,10 +481,6 @@ describe('ModelServersSection', () => {
       // active_requests/queue_depth were still never measured, so they must
       // render "—", not the raw number.
       if (r.mapping_id === 'map-b') return { ...r, metrics_probe: 'unreachable' };
-      // map-c: context_probe flips to "na" — its nonzero context_size was
-      // never measured (this runtime type has no context endpoint) and must
-      // render "—" too.
-      if (r.mapping_id === 'map-c') return { ...r, context_probe: 'na' };
       return r;
     });
     const { api } = makeApi({
@@ -470,7 +489,7 @@ describe('ModelServersSection', () => {
     renderSection(api);
     await screen.findByText('GPU-Box-C');
 
-    // Column order (see the previous test): 3 active, 4 queue, 8 context.
+    // Column order (see the previous test): 3 active, 4 queue.
     const cellsA = within(rowFor('GPU-Box-A')).getAllByRole('cell');
     expect(cellsA[3]).toHaveTextContent('0');
     expect(cellsA[4]).toHaveTextContent('0');
@@ -478,9 +497,66 @@ describe('ModelServersSection', () => {
     const cellsB = within(rowFor('GPU-Box-B')).getAllByRole('cell');
     expect(cellsB[3]).toHaveTextContent('—');
     expect(cellsB[4]).toHaveTextContent('—');
+  });
 
-    const cellsC = within(rowFor('GPU-Box-C')).getAllByRole('cell');
-    expect(cellsC[8]).toHaveTextContent('—');
+  // FIX 1 of the final whole-branch review: unlike active/queue, `context_size`
+  // is NOT probe-derived. The portal service fills it once from the PERSISTED
+  // mapping field (service_model_servers.go: `ContextSize:
+  // view.mapping.ContextSize`), which a benchmark run or a manual operator
+  // entry sets just as well as the agent's probe. Gating the cell on
+  // `context_probe` therefore hid a real, stored context size on every
+  // non-probing row. Both REALISTIC shapes of such a row must still show the
+  // number:
+  //   - ['', ''] — the non-probing row (a non-server_agent model server, or an
+  //     agent without the runtime_model_probe capability). Both probe fields
+  //     are set together under ONE capability gate (injectRowRuntimeState), so
+  //     a row with context_probe "" always has metrics_probe "" too; the
+  //     earlier fixture paired "" with a live "ok" metrics probe, which the
+  //     backend cannot produce.
+  //   - ['ok', 'na'] — a probing agent whose child has no context endpoint
+  //     configured at all, while its /metrics endpoint answers fine.
+  it.each([
+    ['', ''],
+    ['ok', 'na'],
+  ])(
+    'shows a persisted context size when metrics_probe is %j and context_probe is %j',
+    async (metricsProbe, contextProbe) => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-c'
+          ? {
+              ...r,
+              // A non-probing row has no runtime state either; keeping the
+              // whole row consistent is the point of this fixture.
+              state: metricsProbe === '' ? '' : r.state,
+              metrics_probe: metricsProbe,
+              context_probe: contextProbe,
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      // Column order (see above): 8 context. makeRows' rowC persists 8192.
+      const cells = within(rowFor('GPU-Box-C')).getAllByRole('cell');
+      expect(cells[8]).toHaveTextContent('8192');
+    },
+  );
+
+  it('renders the context size as "—" only when nothing is stored (0), even with context_probe "ok"', async () => {
+    const rows = makeRows().map((r) => (r.mapping_id === 'map-c' ? { ...r, context_size: 0 } : r));
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(rows),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // A real context size of 0 cannot happen, so 0 means "nothing known" —
+    // the one case the "—" placeholder is for.
+    const cells = within(rowFor('GPU-Box-C')).getAllByRole('cell');
+    expect(cells[8]).toHaveTextContent('—');
   });
 
   it.each(['unreachable', 'na', ''])(
