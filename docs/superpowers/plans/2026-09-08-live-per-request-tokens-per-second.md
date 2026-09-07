@@ -534,17 +534,19 @@ Extend `Snapshot`'s doc comment — its copies are no longer frozen:
 // builder runs outside the registry lock and needs current values.
 ```
 
-- [ ] **Step 6: Allocate at all three Add sites**
+- [ ] **Step 6: Allocate only where something writes**
 
-`stream_session.go:111`, `inference_complete.go:52` and `native_passthrough.go:302`
-each gain `Progress: <p>` in their `ActiveRequest` literal, where `p` is a
-`&requestProgress{}` allocated on the line above. On the two non-streaming/
-passthrough sites nothing writes to it in this task; allocating anyway keeps the
-field's meaning uniform and the DTO path exercised.
+Only the streaming translate path has anything to count, so only
+`stream_session.go:111` gains `Progress: p` in its `ActiveRequest` literal, where
+`p` is a `&requestProgress{}` allocated on the line above. The same pointer must
+also reach the session, so add a `progress *requestProgress` field to the
+`streamSession` struct and set it where the session is constructed.
 
-In `stream_session.go` the same pointer must also reach the session, so add a
-`progress *requestProgress` field to the `streamSession` struct and set it where the
-session is constructed.
+`inference_complete.go:52` (non-streaming: one blocking round trip) and
+`native_passthrough.go:302` (the client's body is forwarded and no frame is
+decoded) are left alone — `Progress` stays nil there, which resolves to "not
+measured", which is the correct answer for both. Allocating a struct nothing ever
+writes would be dead weight, and nil is already the case Task 3 pins.
 
 - [ ] **Step 7: Write the failing observation test**
 
