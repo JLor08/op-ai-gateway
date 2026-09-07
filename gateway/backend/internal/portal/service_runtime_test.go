@@ -2525,6 +2525,145 @@ func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 	}
 }
 
+// TestPutRuntimeSpecTypeValidation covers validRuntimeSpecType: the five
+// routing.RuntimeSpecType values plus "" (auto-detect) are accepted, anything
+// else is ErrRuntimeSpecTypeInvalid. Mirrors TestPutRuntimeSpecAPITokenValidation's
+// shape for the sibling api_token_mode validator.
+func TestPutRuntimeSpecTypeValidation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{
+			Binary: "/usr/local/bin/llama-server",
+		}
+	}
+
+	t.Run("bogus type", func(t *testing.T) {
+		r := base()
+		r.Type = "bogus"
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); !errors.Is(err, ErrRuntimeSpecTypeInvalid) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecTypeInvalid", err)
+		}
+	})
+
+	validTypes := []string{
+		"",
+		string(routing.RuntimeSpecTypeVLLM),
+		string(routing.RuntimeSpecTypeLlamaCpp),
+		string(routing.RuntimeSpecTypeTGI),
+		string(routing.RuntimeSpecTypeOllama),
+		string(routing.RuntimeSpecTypeCustom),
+	}
+	for _, typ := range validTypes {
+		t.Run("accepts type "+typ, func(t *testing.T) {
+			r := base()
+			r.Type = typ
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+				t.Fatalf("type %q must save: %v", typ, err)
+			}
+		})
+	}
+}
+
+// TestRuntimeSpecDTOEffectiveTypeAndResolvedPaths pins the read-only
+// effective_type/resolved_metrics_path/resolved_context_probe_path echoes
+// (design 2026-09-07): when type is "" (auto), effective_type is what
+// routing.DetectRuntimeSpecType derives from the binary and the resolved
+// paths are that type's routing.DeriveProbePaths defaults; an explicit type
+// or an explicit metrics_path/context_probe_path always wins over detection.
+func TestRuntimeSpecDTOEffectiveTypeAndResolvedPaths(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	newMapping := func(name string) string {
+		t.Helper()
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: name, AppModelName: name})
+		if err != nil {
+			t.Fatalf("CreateMapping(%s): %v", name, err)
+		}
+		return mapping.ID
+	}
+
+	t.Run("auto-detects from binary, default paths", func(t *testing.T) {
+		mappingID := newMapping("m-auto")
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+			Enabled: true, Binary: "/usr/local/bin/llama-server",
+		})
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		if dto.Type != "" {
+			t.Fatalf("Type = %q, want empty (stored as-is)", dto.Type)
+		}
+		if dto.EffectiveType != string(routing.RuntimeSpecTypeLlamaCpp) {
+			t.Fatalf("EffectiveType = %q, want %q", dto.EffectiveType, routing.RuntimeSpecTypeLlamaCpp)
+		}
+		if dto.ResolvedMetricsPath != "/metrics" || dto.ResolvedContextProbePath != "/props" {
+			t.Fatalf("resolved paths = %q/%q, want /metrics //props", dto.ResolvedMetricsPath, dto.ResolvedContextProbePath)
+		}
+		// GetRuntimeSpec must echo the same resolved values as the PutRuntimeSpec response.
+		got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+		if err != nil {
+			t.Fatalf("GetRuntimeSpec: %v", err)
+		}
+		if got.EffectiveType != dto.EffectiveType || got.ResolvedMetricsPath != dto.ResolvedMetricsPath || got.ResolvedContextProbePath != dto.ResolvedContextProbePath {
+			t.Fatalf("GetRuntimeSpec echoes = %+v, want to match PutRuntimeSpec response", got)
+		}
+	})
+
+	t.Run("explicit type overrides detection; explicit paths override type defaults", func(t *testing.T) {
+		mappingID := newMapping("m-explicit")
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+			Enabled:          true,
+			Binary:           "/usr/local/bin/llama-server",
+			Type:             string(routing.RuntimeSpecTypeVLLM),
+			MetricsPath:      "/custom-metrics",
+			ContextProbePath: "/custom-context",
+		})
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		if dto.Type != string(routing.RuntimeSpecTypeVLLM) {
+			t.Fatalf("Type = %q, want vllm", dto.Type)
+		}
+		if dto.EffectiveType != string(routing.RuntimeSpecTypeVLLM) {
+			t.Fatalf("EffectiveType = %q, want vllm", dto.EffectiveType)
+		}
+		if dto.MetricsPath != "/custom-metrics" || dto.ContextProbePath != "/custom-context" {
+			t.Fatalf("stored paths = %q/%q, want the overrides verbatim", dto.MetricsPath, dto.ContextProbePath)
+		}
+		if dto.ResolvedMetricsPath != "/custom-metrics" || dto.ResolvedContextProbePath != "/custom-context" {
+			t.Fatalf("resolved paths = %q/%q, want the overrides", dto.ResolvedMetricsPath, dto.ResolvedContextProbePath)
+		}
+	})
+
+	t.Run("no spec yet: empty-spec default DTO detects custom from empty binary", func(t *testing.T) {
+		mappingID := newMapping("m-none")
+		dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+		if err != nil {
+			t.Fatalf("GetRuntimeSpec: %v", err)
+		}
+		if dto.Configured {
+			t.Fatalf("Configured = true, want false for a mapping with no spec row")
+		}
+		if dto.Type != "" || dto.MetricsPath != "" || dto.ContextProbePath != "" {
+			t.Fatalf("zero-spec DTO fields = %q/%q/%q, want all empty", dto.Type, dto.MetricsPath, dto.ContextProbePath)
+		}
+		if dto.EffectiveType != string(routing.RuntimeSpecTypeCustom) {
+			t.Fatalf("EffectiveType = %q, want custom (detected from an empty binary)", dto.EffectiveType)
+		}
+		if dto.ResolvedMetricsPath != "" || dto.ResolvedContextProbePath != "" {
+			t.Fatalf("resolved paths = %q/%q, want empty for custom with no overrides", dto.ResolvedMetricsPath, dto.ResolvedContextProbePath)
+		}
+	})
+}
+
 // --- seal-on-write, random generation, rotate -------------------------------
 //
 // These tests pin the WRITE side of the per-spec API token in PutRuntimeSpec:

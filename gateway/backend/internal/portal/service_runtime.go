@@ -98,6 +98,13 @@ var (
 	// that is not app/custom, or a custom source whose api_token_header fails
 	// checkHeaderName's shape check. HTTP 400.
 	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
+	// ErrRuntimeSpecTypeInvalid rejects a type that is not one of
+	// ""/vllm/llama_cpp/tgi/ollama/custom (design 2026-09-07). "" is valid --
+	// it means auto-detect from Binary (routing.EffectiveRuntimeSpecType) --
+	// so this is the same "empty is fine, everything else must be a known
+	// value" shape as validVisibleDevicesMode, not validRuntimeAPITokenMode's
+	// caller-normalizes-empty-first shape.
+	ErrRuntimeSpecTypeInvalid = errors.New("runtime_spec.type_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -387,6 +394,24 @@ type RuntimeSpecDTO struct {
 	// header and the "app has no token ⇒ auth off" hint under app mode.
 	AppAPITokenSet    bool   `json:"app_api_token_set"`
 	AppAPITokenHeader string `json:"app_api_token_header"`
+	// Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
+	// "tgi" | "ollama" | "custom"); see routing.RuntimeSpec.Type. "" means
+	// auto-detect from Binary -- EffectiveType below is what that resolves to.
+	Type string `json:"type"`
+	// MetricsPath / ContextProbePath are the operator's raw overrides (""
+	// means "use the type's default"); see routing.RuntimeSpec.
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
+	// EffectiveType / ResolvedMetricsPath / ResolvedContextProbePath are
+	// READ-ONLY echoes of routing.EffectiveRuntimeSpecType +
+	// routing.DeriveProbePaths -- what the agent will actually use once Type/
+	// MetricsPath/ContextProbePath resolve (auto-detection and per-type
+	// defaults applied). The portal shows these next to the raw fields above
+	// so an operator relying on auto-detect can see the outcome without
+	// guessing.
+	EffectiveType            string `json:"effective_type"`
+	ResolvedMetricsPath      string `json:"resolved_metrics_path"`
+	ResolvedContextProbePath string `json:"resolved_context_probe_path"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -437,6 +462,13 @@ type PutRuntimeSpecRequest struct {
 	// APITokenRotate, when true under mode "random", forces regeneration on
 	// write.
 	APITokenRotate bool `json:"api_token_rotate"`
+	// Type / MetricsPath / ContextProbePath: see RuntimeSpecDTO's doc. Type
+	// is validated by validRuntimeSpecType (empty or one of the five
+	// routing.RuntimeSpecType values); MetricsPath/ContextProbePath are
+	// freeform and only trimmed -- no shape validation.
+	Type             string `json:"type"`
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -455,17 +487,29 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
+		// Type/MetricsPath/ContextProbePath are zero (""), same as every other
+		// unconfigured field; EffectiveType/the resolved paths are still
+		// computed from that empty spec (an empty Binary detects as
+		// RuntimeSpecTypeCustom, whose defaults are empty paths) so the
+		// portal's echoes are never left stale relative to what a first save
+		// with no overrides would resolve to.
+		emptySpec := routing.RuntimeSpec{}
+		effectiveType := routing.EffectiveRuntimeSpecType(emptySpec)
+		resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, emptySpec.MetricsPath, emptySpec.ContextProbePath)
 		return RuntimeSpecDTO{
-			MappingID:            mapping.ID,
-			Args:                 []string{},
-			Env:                  map[string]string{},
-			GPUs:                 []RuntimeSpecGPUDTO{},
-			APIFlavors:           []string{},
-			VisibleDevicesMode:   string(routing.VisibleDevicesModeEnv),
-			APITokenMode:         string(routing.RuntimeAPITokenModeApp),
-			APITokenHeaderSource: string(routing.RuntimeAPITokenHeaderSourceApp),
-			AppAPITokenSet:       app.APIToken != "",
-			AppAPITokenHeader:    app.APITokenHeader,
+			MappingID:                mapping.ID,
+			Args:                     []string{},
+			Env:                      map[string]string{},
+			GPUs:                     []RuntimeSpecGPUDTO{},
+			APIFlavors:               []string{},
+			VisibleDevicesMode:       string(routing.VisibleDevicesModeEnv),
+			APITokenMode:             string(routing.RuntimeAPITokenModeApp),
+			APITokenHeaderSource:     string(routing.RuntimeAPITokenHeaderSourceApp),
+			AppAPITokenSet:           app.APIToken != "",
+			AppAPITokenHeader:        app.APITokenHeader,
+			EffectiveType:            string(effectiveType),
+			ResolvedMetricsPath:      resolvedMetrics,
+			ResolvedContextProbePath: resolvedContext,
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
@@ -572,6 +616,12 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err := validateRuntimeSpecAPIToken(req); err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	specType := strings.TrimSpace(req.Type)
+	if !validRuntimeSpecType(specType) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecTypeInvalid
+	}
+	metricsPath := strings.TrimSpace(req.MetricsPath)
+	contextProbePath := strings.TrimSpace(req.ContextProbePath)
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
 	// frontend pre-fills the create form; the backend only supplies a sane
@@ -726,6 +776,9 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
+		Type:                        specType,
+		MetricsPath:                 metricsPath,
+		ContextProbePath:            contextProbePath,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -911,6 +964,22 @@ func validRuntimeAPITokenMode(s string) bool {
 	return false
 }
 
+// validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
+// default and every pre-feature row's stored value) or one of the five
+// routing.RuntimeSpecType values. Unlike validRuntimeAPITokenMode, empty IS
+// accepted directly here (mirrors validVisibleDevicesMode) -- callers pass
+// req.Type through untouched, they don't normalize "" to a concrete value
+// first, because "" is itself a legitimate stored/wire value (auto), not a
+// default that collapses into one of the five kinds.
+func validRuntimeSpecType(s string) bool {
+	switch routing.RuntimeSpecType(s) {
+	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
+		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama, routing.RuntimeSpecTypeCustom:
+		return true
+	}
+	return false
+}
+
 // specHasAPITokenPlaceholder reports whether the literal "${API_TOKEN}"
 // appears in any Env value or any Args element. Args is included
 // deliberately (design decision C1): some upstream binaries only accept a
@@ -1030,6 +1099,8 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 			VRAMMeasuredMB: g.VRAMMeasuredMB,
 		})
 	}
+	effectiveType := routing.EffectiveRuntimeSpecType(spec)
+	resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, spec.MetricsPath, spec.ContextProbePath)
 	return RuntimeSpecDTO{
 		Configured:                  true,
 		ID:                          spec.ID,
@@ -1060,6 +1131,12 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		APITokenHeader:              spec.APITokenHeader,
 		AppAPITokenSet:              app.APIToken != "",
 		AppAPITokenHeader:           app.APITokenHeader,
+		Type:                        spec.Type,
+		MetricsPath:                 spec.MetricsPath,
+		ContextProbePath:            spec.ContextProbePath,
+		EffectiveType:               string(effectiveType),
+		ResolvedMetricsPath:         resolvedMetrics,
+		ResolvedContextProbePath:    resolvedContext,
 	}, nil
 }
 
