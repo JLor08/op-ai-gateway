@@ -4,10 +4,10 @@
 import { useEffect, useRef, useState } from 'react';
 import DownloadIcon from '@mui/icons-material/Download';
 import { PortalApiError, type ModelOption, type ModelServerRow } from '../api';
-import type { PortalApi, Translation } from './shared/types';
+import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
-import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
+import { runtimeStateBadge } from './shared/runtimeState';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { makeVisionColumn } from './shared/visionColumn';
 import type { RowAction } from './shared/RowActionsMenu';
@@ -31,6 +31,52 @@ import { formatPortalError } from './shared/format';
  * preserves the user's search/filter/sort/column settings, so it is safe to setRows
  * on every update.
  */
+
+// Task 7 (probe-reachability-and-model-status): the merged "Status" column's
+// tri-state, replacing the old separate "Geladen" (benchmark-derived `loaded`)
+// and "Live-Status" (raw runtime `state`) columns -- this column answers ONE
+// question ("can I use it right now?"), not the full nine-value runtime
+// lifecycle. Only `running` and `starting` get their own treatment; every
+// other explicit state (stopped/draining/backoff/crashed/...) collapses to
+// "not loaded" here (its detail, if ever needed, belongs elsewhere, not a
+// fourth chip colour on this screen). `""` -- no agent-managed runtime status
+// at all, e.g. a non-server_agent model server -- falls back to the
+// benchmark-derived `loaded` boolean, exactly what the old "Geladen" column
+// showed on its own.
+type ModelStatusKey = 'loaded' | 'loading' | 'not_loaded';
+
+function modelStatusKey(r: Pick<ModelServerRow, 'state' | 'loaded'>): ModelStatusKey {
+  if (r.state === 'running') return 'loaded';
+  if (r.state === 'starting') return 'loading';
+  if (r.state === '') return r.loaded ? 'loaded' : 'not_loaded';
+  return 'not_loaded';
+}
+
+// Colour: "running"/"starting" reuse the SAME runtimeStateBadge mapping
+// RuntimeAdminSection's "Live status" column uses (active/watch), so this
+// column's colours never drift from that vocabulary; every other case only
+// ever needs the coarse loaded ("success", same visual class as "active") /
+// not-loaded ("standby") distinction the old "Geladen" column already had.
+function modelStatusBadge(r: Pick<ModelServerRow, 'state' | 'loaded'>): BadgeStatus {
+  if (r.state === 'running' || r.state === 'starting') return runtimeStateBadge(r.state);
+  return modelStatusKey(r) === 'loaded' ? 'success' : 'standby';
+}
+
+function modelStatusLabel(key: ModelStatusKey, t: Translation): string {
+  if (key === 'loaded') return t.tableModelLoaded;
+  if (key === 'loading') return t.modelServerLoading;
+  return t.modelServerNotLoaded;
+}
+
+// Task 7: `metrics_probe`/`context_probe` are "ok" | "unreachable" | "na" | ""
+// (api/models.ts) -- ONLY "ok" means the accompanying number (active_requests/
+// queue_depth for metrics_probe, context_size for context_probe) is a real
+// measurement rather than an unset zero. One tiny shared predicate so all
+// three gated columns below agree on what "measured" means.
+function probeOk(probeState: string): boolean {
+  return probeState === 'ok';
+}
+
 export function ModelServersSection({
   t,
   api,
@@ -134,59 +180,41 @@ export function ModelServersSection({
     },
     { id: 'server', label: t.modelServerColServer, value: (r) => r.server_name, filter: 'text' },
     {
-      id: 'loaded',
-      label: t.tableModelLoaded,
-      value: (r) => (r.loaded ? 'loaded' : 'unloaded'),
+      // The merged tri-state status (SSE-fed, same source as the old separate
+      // "Geladen" + "Live-Status" columns it replaces) — see modelStatusKey
+      // above for the exact running/starting/fallback rules.
+      id: 'status',
+      label: t.modelServerColStatus,
+      value: (r) => modelStatusKey(r),
       filter: 'enum',
       searchable: false,
-      enumLabel: (v) => (v === 'loaded' ? t.tableModelLoaded : t.modelServerNotLoaded),
-      render: (r) =>
-        r.loaded ? (
-          <StatusChip status="success" label={t.tableModelLoaded} />
-        ) : (
-          <StatusChip status="standby" label={t.modelServerNotLoaded} />
-        ),
-    },
-    {
-      // The live per-model runtime lifecycle (SSE-fed, same as `loaded` above):
-      // "starting"/"pending_vram_unknown" is the user-visible "currently
-      // loading", distinct from the benchmark-derived `loaded` flag, which only
-      // ever flips once a load finishes. "" means no agent-managed runtime
-      // status is known for this (server, mapping) — rendered as "unknown"
-      // rather than a misleading "stopped". Reuses the SAME badge/label
-      // vocabulary as RuntimeAdminSection's "Live status" column
-      // (shared/runtimeState.ts) so the two screens never drift apart.
-      id: 'state',
-      label: t.runtimeLiveStatus,
-      value: (r) => (r.state ? runtimeStateLabel(r.state, t) : t.runtimeStatusUnknown),
-      filter: 'enum',
-      searchable: false,
-      render: (r) =>
-        r.state ? (
-          <StatusChip status={runtimeStateBadge(r.state)} label={runtimeStateLabel(r.state, t)} />
-        ) : (
-          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
-        ),
+      enumLabel: (v) => modelStatusLabel(v as ModelStatusKey, t),
+      render: (r) => (
+        <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
+      ),
     },
     {
       // Live per-model load (SSE-fed): how many requests are in flight on this
       // (server, mapping) right now. 0 is a real, meaningful value (idle) —
-      // unlike the benchmark metrics below, it is never rendered as "-".
+      // but ONLY when metrics_probe actually reached the agent; otherwise this
+      // number was never measured and rendering it (even as 0) would be a
+      // misleading placeholder, so it renders "—" (the portal's shared "never
+      // measured" glyph, e.g. shared/format.ts) instead.
       id: 'active',
       label: t.modelServerColActive,
       numeric: true,
       value: (r) => String(r.active_requests),
-      render: (r) => String(r.active_requests),
+      render: (r) => (probeOk(r.metrics_probe) ? String(r.active_requests) : '—'),
     },
     {
       // Live per-model load (SSE-fed): how many requests are waiting for
-      // admission on this (server, mapping) right now. Same "0 is real" rule
-      // as `active` above.
+      // admission on this (server, mapping) right now. Same "0 is real, but
+      // only when measured" rule as `active` above.
       id: 'queue',
       label: t.modelServerColQueue,
       numeric: true,
       value: (r) => String(r.queue_depth),
-      render: (r) => String(r.queue_depth),
+      render: (r) => (probeOk(r.metrics_probe) ? String(r.queue_depth) : '—'),
     },
     {
       id: 'genTps',
@@ -210,11 +238,15 @@ export function ModelServersSection({
       render: (r) => (r.load_time_ms > 0 ? String(r.load_time_ms) : '-'),
     },
     {
+      // Gated on context_probe rather than "> 0": a real context size of 0
+      // cannot happen, but gating on the probe state (not just the number)
+      // keeps this column consistent with active/queue above and makes the
+      // "never measured" case explicit rather than incidental.
       id: 'context',
       label: t.mappingContextSize,
       numeric: true,
       value: (r) => String(r.context_size),
-      render: (r) => (r.context_size > 0 ? String(r.context_size) : '-'),
+      render: (r) => (probeOk(r.context_probe) ? String(r.context_size) : '—'),
     },
     {
       id: 'maxConc',

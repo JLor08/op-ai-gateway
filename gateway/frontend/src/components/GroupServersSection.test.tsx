@@ -30,6 +30,12 @@ function makeRows(): GroupModelServerRow[] {
       loaded: true,
       can_load: true,
       state: '',
+      // Task 7 (probe-reachability-and-model-status): ModelServerRow gained
+      // these two probe fields; GroupServersSection itself doesn't read them
+      // (it has no probe-gated columns), so '' (not reported) is a fine
+      // minimal default for this fixture.
+      metrics_probe: '',
+      context_probe: '',
       active_requests: 0,
       queue_depth: 0,
       gen_tokens_per_second: 42.5,
@@ -53,6 +59,8 @@ function makeRows(): GroupModelServerRow[] {
       loaded: false,
       can_load: false,
       state: '',
+      metrics_probe: '',
+      context_probe: '',
       active_requests: 0,
       queue_depth: 0,
       gen_tokens_per_second: 11.1,

@@ -1085,10 +1085,17 @@ const de = {
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Modell',
+  // Task 7 (probe-reachability-and-model-status): the merged tri-state column
+  // label, replacing the old separate "Geladen" + "Live-Status" columns.
+  modelServerColStatus: 'Status',
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   groupServersIntro: 'Modelle und Server, die diese Gruppe bedienen kann (Live-Priorität).',
   modelServerNotLoaded: 'Nicht geladen',
+  // The merged Status column's "currently loading" state (runtime state
+  // "starting"), distinct from modelServerLoadDisabledBusy's "Lädt…" (a row
+  // action's disabled-tooltip hint, not a column value).
+  modelServerLoading: 'Lädt',
   modelServerSource: 'Quelle',
   modelServerUpdated: 'Aktualisiert',
   modelServerLoad: 'Laden',
@@ -3268,10 +3275,12 @@ const en: PortalMessages = {
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Model',
+  modelServerColStatus: 'Status',
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   groupServersIntro: 'Models and servers this group can serve (live priority).',
   modelServerNotLoaded: 'Not loaded',
+  modelServerLoading: 'Loading',
   modelServerSource: 'Source',
   modelServerUpdated: 'Updated',
   modelServerLoad: 'Load',

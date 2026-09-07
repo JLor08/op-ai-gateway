@@ -33,6 +33,8 @@ function makeRows(): ModelServerRow[] {
       loaded: true,
       can_load: true,
       state: 'running',
+      metrics_probe: 'ok',
+      context_probe: 'ok',
       active_requests: 5,
       queue_depth: 3,
       gen_tokens_per_second: 42.5,
@@ -55,6 +57,8 @@ function makeRows(): ModelServerRow[] {
       loaded: false,
       can_load: false,
       state: '',
+      metrics_probe: 'ok',
+      context_probe: 'ok',
       active_requests: 0,
       queue_depth: 0,
       gen_tokens_per_second: 11.1,
@@ -77,6 +81,8 @@ function makeRows(): ModelServerRow[] {
       loaded: false,
       can_load: true,
       state: 'starting',
+      metrics_probe: 'ok',
+      context_probe: 'ok',
       active_requests: 0,
       queue_depth: 3,
       gen_tokens_per_second: 33.3,
@@ -239,19 +245,22 @@ describe('ModelServersSection', () => {
     }
   });
 
-  it('reflects loaded-state and updates it live on an SSE frame', async () => {
+  it('reflects loaded-state and updates it live on an SSE frame (state:"" fallback)', async () => {
     const { api, getOnData } = makeApi();
     renderSection(api);
     await screen.findByText('GPU-Box-C');
 
-    // rowA is loaded; rowC is not.
+    // rowA (state 'running') → Geladen. rowB (state '', loaded:false) → the
+    // `loaded`-boolean fallback → Nicht Geladen.
     expect(within(rowFor('GPU-Box-A')).getByText(t.tableModelLoaded)).toBeInTheDocument();
-    expect(within(rowFor('GPU-Box-C')).getByText(t.modelServerNotLoaded)).toBeInTheDocument();
+    expect(within(rowFor('GPU-Box-B')).getByText(t.modelServerNotLoaded)).toBeInTheDocument();
 
-    // A live update flips rowC to loaded.
-    const updated = makeRows().map((r) => (r.mapping_id === 'map-c' ? { ...r, loaded: true } : r));
+    // A live update flips rowB's `loaded` flag. rowB's `state` stays "", so the
+    // merged Status column follows the fallback boolean exactly like the old
+    // separate "Geladen" column did.
+    const updated = makeRows().map((r) => (r.mapping_id === 'map-b' ? { ...r, loaded: true } : r));
     act(() => getOnData()!(updated));
-    expect(within(rowFor('GPU-Box-C')).getByText(t.tableModelLoaded)).toBeInTheDocument();
+    expect(within(rowFor('GPU-Box-B')).getByText(t.tableModelLoaded)).toBeInTheDocument();
   });
 
   it('gates the Laden action on can_load + not-loaded, surfacing the reason on a disabled row', async () => {
@@ -337,34 +346,69 @@ describe('ModelServersSection', () => {
     expect(within(rowFor('GPU-Box-B')).getByText('–')).toBeInTheDocument();
   });
 
-  it("shows a loading indicator for a 'starting' row and the matching badge for the other live states", async () => {
+  it('shows Geladen for a running row and Lädt for a starting row, reusing the runtime-state colour vocabulary', async () => {
     const { api } = makeApi();
     renderSection(api);
     await screen.findByText('GPU-Box-C');
 
-    // rowC is 'starting' → the same "currently loading" badge/label
-    // RuntimeAdminSection's Live-status column renders for that state (shared
-    // via components/shared/runtimeState.ts). Also assert the chip's
-    // data-status KEY (StatusChip.tsx's documented
+    // rowC is 'starting' → "Lädt", the same "currently loading" (yellow/watch)
+    // colour RuntimeAdminSection's Live-status column gives that state (shared
+    // via components/shared/runtimeState.ts's runtimeStateBadge). Also assert
+    // the chip's data-status KEY (StatusChip.tsx's documented
     // getByText(label).toHaveAttribute('data-status', key) pattern, mirrored
     // from RuntimeAdminSection.test.tsx) so a dropped runtimeStateBadge(r.state)
     // call — which would flatten every chip to one fixed grey key — fails here,
     // not just a missing label.
-    expect(within(rowFor('GPU-Box-C')).getByText(t.runtimeStateStarting)).toHaveAttribute(
+    expect(within(rowFor('GPU-Box-C')).getByText(t.modelServerLoading)).toHaveAttribute(
       'data-status',
       'watch',
     );
-    // rowA is 'running' → the active badge.
-    expect(within(rowFor('GPU-Box-A')).getByText(t.runtimeStateRunning)).toHaveAttribute(
+    // rowA is 'running' → "Geladen" with the active (green) badge.
+    expect(within(rowFor('GPU-Box-A')).getByText(t.tableModelLoaded)).toHaveAttribute(
       'data-status',
       'active',
     );
-    // rowB has no runtime status ('') → the neutral "unknown" badge, not a
-    // misleading "stopped".
-    expect(within(rowFor('GPU-Box-B')).getByText(t.runtimeStatusUnknown)).toHaveAttribute(
+  });
+
+  it('falls back to the `loaded` boolean when state is "", and collapses any other explicit runtime state to Nicht Geladen', async () => {
+    const rows = makeRows().map((r) => {
+      // map-a: an explicit runtime state this column does NOT special-case
+      // (neither "running" nor "starting") — the "otherwise" branch.
+      if (r.mapping_id === 'map-a') return { ...r, state: 'crashed' };
+      // map-b: state stays "" (no agent-managed runtime status at all) but
+      // `loaded` flips true — the `loaded`-boolean fallback's OTHER half (the
+      // "" + loaded:false case is already covered by rowB's own default state
+      // in the "reflects loaded-state" test above).
+      if (r.mapping_id === 'map-b') return { ...r, loaded: true };
+      return r;
+    });
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(rows),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // rowA: state "crashed" → neither running nor starting → "Nicht Geladen",
+    // standby (grey) — the same "otherwise" bucket every non-running/starting
+    // runtime state falls into, not a fourth chip colour.
+    expect(within(rowFor('GPU-Box-A')).getByText(t.modelServerNotLoaded)).toHaveAttribute(
       'data-status',
       'standby',
     );
+    // rowB: state "" + loaded:true → the fallback → "Geladen", active (green).
+    expect(within(rowFor('GPU-Box-B')).getByText(t.tableModelLoaded)).toHaveAttribute(
+      'data-status',
+      'active',
+    );
+
+    // The old separate "Geladen"/"Live-Status" columns, and the raw
+    // runtime-state vocabulary (Läuft/Startet…/Unbekannt) the removed
+    // Live-Status column used to render, are gone — the merged column only
+    // ever shows Geladen/Lädt/Nicht Geladen.
+    expect(screen.queryByText(t.runtimeLiveStatus)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStateRunning)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStateStarting)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStatusUnknown)).not.toBeInTheDocument();
   });
 
   it('shows the live active/queue counts and the context size', async () => {
@@ -376,24 +420,81 @@ describe('ModelServersSection', () => {
     // getByText independently for each — a swap of the active/queue column
     // `render` functions would still leave both numbers present somewhere in
     // the row. Indices follow the default-visible `columns` order declared in
-    // ModelServersSection.tsx (defaultHidden columns excluded): 0 prio,
-    // 1 server, 2 loaded, 3 state, 4 active, 5 queue, 6 genTps, 7 promptTps,
-    // 8 loadTime, 9 context.
+    // ModelServersSection.tsx (defaultHidden columns excluded), post-merge:
+    // 0 prio, 1 server, 2 status, 3 active, 4 queue, 5 genTps, 6 promptTps,
+    // 7 loadTime, 8 context.
     const cells = within(rowFor('GPU-Box-A')).getAllByRole('cell');
-    // active_requests=5, queue_depth=3, context_size=32768 (makeRows' rowA).
-    expect(cells[4]).toHaveTextContent('5');
-    expect(cells[5]).toHaveTextContent('3');
-    expect(cells[9]).toHaveTextContent('32768');
+    // active_requests=5, queue_depth=3, context_size=32768 (makeRows' rowA,
+    // metrics_probe/context_probe both "ok").
+    expect(cells[3]).toHaveTextContent('5');
+    expect(cells[4]).toHaveTextContent('3');
+    expect(cells[8]).toHaveTextContent('32768');
   });
 
-  it('renders 0 active/queue as the real value, not a placeholder dash', async () => {
+  it('renders 0 active/queue as the real value, not a placeholder dash, when metrics_probe is "ok"', async () => {
     const { api } = makeApi();
     renderSection(api);
     await screen.findByText('GPU-Box-B');
 
-    // rowB: active_requests=0, queue_depth=0 — a genuinely idle server, distinct
-    // from the "-" placeholder the benchmark-metric columns use for "unknown".
-    const rowB = within(rowFor('GPU-Box-B'));
-    expect(rowB.getAllByText('0')).toHaveLength(2);
+    // rowB: metrics_probe "ok", active_requests=0, queue_depth=0 — a genuinely
+    // idle, actually-measured server, distinct from the "—" placeholder a
+    // probe state other than "ok" renders instead.
+    const cells = within(rowFor('GPU-Box-B')).getAllByRole('cell');
+    expect(cells[3]).toHaveTextContent('0');
+    expect(cells[4]).toHaveTextContent('0');
   });
+
+  it('gates active/queue/context on their probe state rather than on the number itself', async () => {
+    const rows = makeRows().map((r) => {
+      // map-a: metrics_probe "ok" stays, but drop active/queue to a genuine 0
+      // — the real measured value, not the "never measured" placeholder.
+      if (r.mapping_id === 'map-a') return { ...r, active_requests: 0, queue_depth: 0 };
+      // map-b: metrics_probe flips to "unreachable" — its NONZERO
+      // active_requests/queue_depth were still never measured, so they must
+      // render "—", not the raw number.
+      if (r.mapping_id === 'map-b') return { ...r, metrics_probe: 'unreachable' };
+      // map-c: context_probe flips to "na" — its nonzero context_size was
+      // never measured (this runtime type has no context endpoint) and must
+      // render "—" too.
+      if (r.mapping_id === 'map-c') return { ...r, context_probe: 'na' };
+      return r;
+    });
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(rows),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // Column order (see the previous test): 3 active, 4 queue, 8 context.
+    const cellsA = within(rowFor('GPU-Box-A')).getAllByRole('cell');
+    expect(cellsA[3]).toHaveTextContent('0');
+    expect(cellsA[4]).toHaveTextContent('0');
+
+    const cellsB = within(rowFor('GPU-Box-B')).getAllByRole('cell');
+    expect(cellsB[3]).toHaveTextContent('—');
+    expect(cellsB[4]).toHaveTextContent('—');
+
+    const cellsC = within(rowFor('GPU-Box-C')).getAllByRole('cell');
+    expect(cellsC[8]).toHaveTextContent('—');
+  });
+
+  it.each(['unreachable', 'na', ''])(
+    'treats metrics_probe %j the same way: active/queue render "—", never the raw number',
+    async (probe) => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-c'
+          ? { ...r, metrics_probe: probe, active_requests: 9, queue_depth: 6 }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cells = within(rowFor('GPU-Box-C')).getAllByRole('cell');
+      expect(cells[3]).toHaveTextContent('—');
+      expect(cells[4]).toHaveTextContent('—');
+    },
+  );
 });
