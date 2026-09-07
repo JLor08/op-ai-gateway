@@ -184,12 +184,18 @@ value map would make every existing copy and range (`Snapshot`, `CountByServerNa
 `ServerActivity`, the DTO loops) a `copylocks` violation under the repo's
 golangci-lint gate.
 
-So:
+So the atomics must live **behind a pointer**, never as fields of a struct that is
+copied. That needs exactly one change, not two: `ActiveRequest` gains
+`Progress *requestProgress`, allocated at each of the three `Add` sites
+(`stream_session.go:111`, `inference_complete.go:52`,
+`native_passthrough.go:302`) and held by the writer as well.
 
-- `items` becomes `map[string]*ActiveRequest`.
-- `ActiveRequest` gains `Progress *requestProgress`, allocated at each of the three
-  `Add` sites (`stream_session.go:111`, `inference_complete.go:52`,
-  `native_passthrough.go:302`) and held by the writer as well.
+`items` stays `map[string]ActiveRequest`. Copying an `ActiveRequest` copies the
+pointer, not the atomics, so `copylocks` is satisfied and `Snapshot` keeps returning
+values — every copy simply shares the one live counter, which is precisely what the
+DTO builder needs. Turning the map into `map[string]*ActiveRequest` would work too
+but is unnecessary churn on `Add`, `Remove`, `Snapshot`, `CountByServerName` and
+`ServerActivity`.
 
 ```go
 // requestProgress is one in-flight request's live counters. Written by the single
