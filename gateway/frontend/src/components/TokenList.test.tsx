@@ -18,7 +18,9 @@ import {
 
 const t = messages.de;
 
-const models = [{ id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'] }];
+const models = [
+  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+];
 const defaultProjects: ProjectRef[] = [
   { id: 'proj_a', name: 'Project A' },
   { id: 'proj_b', name: 'Project B' },
@@ -795,8 +797,14 @@ describe('TokenList unknown-model redirect (Task 8)', () => {
   it('offers models and groups in one fallback picker', async () => {
     renderTokenList({
       models: [
-        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [] },
-        { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [], loading_on_count: 0 },
+        {
+          id: 'fast-group',
+          display_name: 'fast-group',
+          flavors: [],
+          loading_on_count: 0,
+          is_group: true,
+        },
       ],
     });
     openCreate();

@@ -19,7 +19,7 @@ import type { ActiveChatRun, ModelOption, PortalToken, ServerModelOption } from 
 
 const t = messages.de;
 const models: ModelOption[] = [
-  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'] },
+  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
 ];
 
 // Fixed timestamps for seeded chat rows (T2 > T1 so the T2 chat is "newest").
@@ -1184,8 +1184,8 @@ describe('ChatStoreProvider remembers an unavailable model', () => {
 
   it("resolves a run-as token's per-model override map by the requested model (no catch-all)", async () => {
     const twoModels: ModelOption[] = [
-      { id: 'model-a', display_name: 'A', flavors: ['openai'] },
-      { id: 'model-b', display_name: 'B', flavors: ['openai'] },
+      { id: 'model-a', display_name: 'A', flavors: ['openai'], loading_on_count: 0 },
+      { id: 'model-b', display_name: 'B', flavors: ['openai'], loading_on_count: 0 },
     ];
     const mapToken: PortalToken = {
       id: 'tok_map',

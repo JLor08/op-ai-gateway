@@ -316,6 +316,9 @@ export type ModelOption = {
   // Count of reachable applications that currently OFFER this model (a real model
   // via its active mappings, or a group via its offerable members). 0 = unknown.
   offered_on_count?: number;
+  // Count of servers offering this model whose managed spec currently reports the
+  // "starting" lifecycle state (i.e. the model is mid-load on that server).
+  loading_on_count: number;
   // The model's global visibility (default "shown"). Only meaningful for a real
   // model; a group row (is_group) has no visibility control.
   visibility?: ModelVisibility;

@@ -18,7 +18,12 @@ const t = messages.de;
 
 afterEach(() => cleanup());
 
-const model: ModelOption = { id: 'qwen-coder', display_name: 'qwen-coder', flavors: [] };
+const model: ModelOption = {
+  id: 'qwen-coder',
+  display_name: 'qwen-coder',
+  flavors: [],
+  loading_on_count: 0,
+};
 
 // rowA: loaded + can_load → Laden disabled (already loaded).
 // rowB: not loaded, no permission → Laden disabled (owner/admin only).

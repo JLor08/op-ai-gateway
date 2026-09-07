@@ -16,6 +16,7 @@ const group: ModelOption = {
   id: 'fast-group',
   display_name: 'fast-group',
   flavors: [],
+  loading_on_count: 0,
   is_group: true,
 };
 

@@ -20,8 +20,8 @@ import type { PortalApi } from './shared/types';
 const t = messages.de;
 
 const models: ModelOption[] = [
-  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'] },
-  { id: 'qwen-coder', display_name: 'qwen-coder', flavors: ['openai'] },
+  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+  { id: 'qwen-coder', display_name: 'qwen-coder', flavors: ['openai'], loading_on_count: 0 },
 ];
 
 const adminCandidates = [
@@ -834,8 +834,14 @@ describe('ServiceTokensSection unknown-model redirect (Task 8)', () => {
     renderServicesView({
       services: [svc],
       models: [
-        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [] },
-        { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+        { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [], loading_on_count: 0 },
+        {
+          id: 'fast-group',
+          display_name: 'fast-group',
+          flavors: [],
+          loading_on_count: 0,
+          is_group: true,
+        },
       ],
       overrides: {
         createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
