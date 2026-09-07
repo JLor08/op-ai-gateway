@@ -154,7 +154,7 @@ Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) a
 | `OP_AGENT_INTERVAL` | duration (floor 250ms) | Telemetry collection cadence | `1s` |
 | `OP_AGENT_SYSTEM_REPORT_INTERVAL` | duration (floor 1m) | Cadence at which the POST transport re-sends the static hardware inventory (self-heals a gateway restart); the WebSocket transport also re-sends on every reconnect | `30m` |
 | `OP_AGENT_TRANSPORT` | string enum | Telemetry transport: `post` (one HTTP POST per sample) or `websocket` (one persistent connection) | `websocket` (resolved when unset — see [Configuration](../cross-cutting/configuration.md#2-sensible-defaults)) |
-| `OP_AGENT_METRICS_URL` | string | Optional inference `/metrics` endpoint to scrape | `` (disabled) |
+| `OP_AGENT_METRICS_URL` | string | Optional **agent-wide, single-target** inference `/metrics` endpoint to scrape (feeds the sample's top-level `active_requests`/`queue_depth`); independent of, and coexists with, the per-`server_agent`-child probe each managed spec's own resolved `metrics_path` drives (feeds the corresponding `runtimes[]` entry instead — see [Agent-Managed Model Runtime §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | `` (disabled) |
 | `OP_AGENT_MODEL_STATUS_URL` | string | Optional endpoint polled each cycle for currently-loaded models | `` (disabled) |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | string enum | Response shape for `MODEL_STATUS_URL`: `openai` \| `llama_swap` \| `llama_cpp` \| `litellm` \| `` /`auto` (tolerant union) | `` (auto) |
 | `OP_AGENT_LHM_URL` | string | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU/system power on Windows | `` (disabled) |

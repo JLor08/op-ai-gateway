@@ -48,7 +48,7 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `visible_devices_mode` (migration 73, `text not null default 'env'`: `env` sets that variable as before, `args` sets nothing and relies on a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args` instead), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent), `api_token_mode`/`api_token`/`api_token_header_source`/`api_token_header` ([migration 74](#runtime-spec-api-token): the per-mapping upstream-token override — `api_token` is **sealed**, mirroring `applications.api_token`). |
+| `agent_runtime_specs` | One launch specification per model mapping (`mapping_id` unique, cascade): `binary_path`, opaque-JSON `args`/`env`, `work_dir`, `listen_port`, health path/timeouts, `startup_timeout_seconds`, `idle_timeout_seconds`, `admission_wait_timeout_seconds`, `pinned`, `admin_state`, `vram_locked`, `set_visible_devices` (migration 69: the agent sets the vendor-appropriate GPU visibility variable for this spec's child from its own GPU rows), `visible_devices_mode` (migration 73, `text not null default 'env'`: `env` sets that variable as before, `args` sets nothing and relies on a `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder in `args` instead), `enabled` (off by default), `api_flavors`/`responses_mode`/`messages_mode` (migration 72: a per-spec snapshot of the same endpoint-mode trio as `applications`, gateway-side only — never sent to the agent), `api_token_mode`/`api_token`/`api_token_header_source`/`api_token_header` ([migration 74](#runtime-spec-api-token): the per-mapping upstream-token override — `api_token` is **sealed**, mirroring `applications.api_token`), `type`/`metrics_path`/`context_probe_path` ([migration 75](#runtime-spec-type-and-per-model-probing): the explicit runtime-server kind driving the per-kind metrics/context-probe endpoint defaults, plus the operator's own raw overrides — `type` `''` = auto-detect from `binary_path`'s basename). |
 | `agent_runtime_spec_gpus` | Per-GPU VRAM demand for a spec, PK `(spec_id, gpu_index)`: operator-owned `vram_estimate_mb` and agent-owned `vram_measured_mb`, plus operator-owned `position` (migration 73, `integer not null default 0`: the operator-chosen GPU order; rows are read back `order by position, gpu_index`). |
 | `agent_coresidency_rules` | The pairwise co-residency matrix, PK `(application_id, mapping_a_id, mapping_b_id)` with `a < b`; **row present = pair allowed**. |
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (74 migrations)
+## 4. Migration history (75 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -417,6 +417,12 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 74 | `runtime_spec_api_token` | Four additive columns on `agent_runtime_specs`, following the migration-73 pattern of shipping the whole feature's schema in one step ([ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)). `api_token_mode text not null default 'app'` — one of `off`\|`set`\|`random`\|`app`. **Default `app`, deliberately, not `off`**: every mapping already sends `Application.APIToken` at the edge today, so backfilling every existing row (and every future blank request) to `app` preserves that behaviour exactly, whereas a default of `off` would silently switch upstream auth OFF for every already-authenticated application on upgrade — the same reasoning migration 72 applied to `responses_mode`/`messages_mode` (`ADR-033`), inverted: there the safe default was the observed booleans' own translation, here it is the *pre-feature constant behaviour* itself. `api_token text not null default ''` — the **sealed** token (`capture.SealSecret` envelope, `enc:…`/`plain:…`), used only by `set`/`random`; empty for `off` and `app`, and **never plaintext** on any store. `api_token_header_source text not null default 'app'` — `app` inherits `Application.APITokenHeader` (the default) or `custom` uses the column below. `api_token_header text not null default ''` — the custom transmission header, used only when the source column is `custom`; empty ⇒ `Authorization: Bearer`. No backfill needed beyond the defaults themselves — there is no prior column any of the four could be derived from. Aborts the boot on failure, like migration 70/72/73. |
 
+### Runtime-spec type and per-model probing
+
+| # | Migration | Purpose |
+|---|---|---|
+| 75 | `runtime_spec_type_probe` | Three additive columns on `agent_runtime_specs`, all `text not null default ''` (design 2026-09-07). `type` — the explicit runtime-server kind (`""`\|`vllm`\|`llama_cpp`\|`tgi`\|`ollama`\|`custom`); `''` is not "unset", it is **auto-detect from `binary_path`'s basename** (`routing.DetectRuntimeSpecType`), which is exactly what every pre-feature row already resolves to — the `''` default preserves today's behaviour for the whole existing fleet with no backfill needed. `metrics_path`/`context_probe_path` — the operator's own raw overrides for the two probe endpoints `type` would otherwise default (`routing.DeriveProbePaths`); `''` means "use the resolved type's own default", which may itself be empty (e.g. `ollama` has no metrics endpoint, `custom` has neither). See [Agent-Managed Model Runtime §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation) and [ADR-036](../09-architecture-decisions.md#adr-036--runtime-probing-reuses-the-per-runtime-channel-type-drives-derivation-only-context-is-durable). |
+
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
 
@@ -454,6 +460,19 @@ plausible-looking validation rule would break the normal case:
   would have silently turned upstream authentication off for every
   already-authenticated `server_agent` application the moment the migration
   ran.
+- **`agent_runtime_specs.type` defaults to `''`, meaning auto-detect, not a
+  fifth `type` value.** Every pre-feature row is `''`, and `''` resolves
+  through `routing.DetectRuntimeSpecType(binary_path)` to exactly the server
+  kind an operator would have picked by hand from the binary's own name — so
+  an existing spec gets correctly-derived metrics/context-probe endpoints for
+  free on upgrade, with no migration-time backfill needed to make that true.
+  `metrics_path`/
+  `context_probe_path` follow the same "empty means let the type decide"
+  rule as every other optional override column in this table, one layer up:
+  `''` there does not mean *no endpoint*, it means *the resolved type's own
+  default*, and that default can itself legitimately be empty (`ollama` has
+  no metrics endpoint; `custom` has neither) — a validator that treated an
+  empty resolved path as an error would refuse every `ollama` spec.
 - **`responses_mode`/`messages_mode` (`applications`, `agent_runtime_specs`)
   are `text`, not an integer enum**, storing the lowercase `EndpointMode`
   string (`disabled`/`translate`/`passthrough`) directly, scanned straight into

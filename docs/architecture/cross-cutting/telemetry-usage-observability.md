@@ -119,11 +119,24 @@ addresses, not personal or host identity).
 Two more collectors run only when configured: `NewScraper` (`scrape.go`) GETs a
 Prometheus `/metrics` endpoint and sums the running/waiting request counters into
 the sample's `ActiveRequests`/`QueueDepth`, auto-detecting the server family per
-counter — vLLM (`vllm:num_requests_running`/`vllm:num_requests_waiting`) or
-llama.cpp (`llamacpp:requests_processing`/`llamacpp:requests_deferred`); a
+counter — vLLM (`vllm:num_requests_running`/`vllm:num_requests_waiting`),
+llama.cpp (`llamacpp:requests_processing`/`llamacpp:requests_deferred`), or TGI
+(`tgi_batch_current_size`/`tgi_queue_size`; added alongside the per-child probe
+below, since TGI has no `_running`/`_waiting`-shaped names of its own); a
 model-status collector (`loaded.go`) polls an OpenAI/llama-swap/llama.cpp/LiteLLM
 -shaped endpoint to learn which models are currently loaded, feeding
 `LoadedModels`.
+
+**This scraper targets one external endpoint, agent-wide** — the
+`OP_AGENT_METRICS_URL`-configured case for a *classic*, non-managed
+application. A `server_agent` mapping's own per-child metrics use the
+**same** `NewScraper` type, but pointed at each managed child's own loopback
+port and its own resolved `MetricsPath`, and land on the corresponding
+`runtimes[]` entry rather than the sample's top-level fields — a
+structurally separate, multi-model path that coexists with this one on the
+same agent process without conflict. See [Agent-Managed Model
+Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)
+and [§10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time).
 
 ### 8.2.7 Unprivileged ICMP ping
 
@@ -245,10 +258,16 @@ evidence is not stamped on a failed write:
   rendered.
 - **`runtimes`** — one entry per managed spec: `spec_id`, `model`, `state`,
   `since`, `pid`/`port` (omitted when there is no live process), `in_flight`,
-  `restarts`, `gpus[]` of `{index, vram_measured_mb}` (omitted when nothing was
-  measured this cycle, and explicitly sorted by index because it is built from a
-  Go map), and `last_error` of `{message, at, exit_code, failures, stderr_tail}`.
-  When a runtime driver is active it **also overrides `loaded_models`** to
+  `restarts`, `context_size`/`active_requests`/`queue_depth` (the per-child
+  probe result — not `omitempty`, so an agent that never probes a given field
+  reports it as an explicit `0` rather than omitting the key; see
+  [Agent-Managed Model Runtime
+  §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
+  for when each is filled), `gpus[]` of `{index, vram_measured_mb}` (omitted when
+  nothing was measured this cycle, and explicitly sorted by index because it is
+  built from a Go map), and `last_error` of `{message, at, exit_code, failures,
+  stderr_tail}`. When a runtime driver is active it **also overrides
+  `loaded_models`** to
   contain only specs in state `running` — `starting` deliberately does not count,
   because prefer-loaded routing must never send traffic to a model that cannot
   answer yet.
@@ -321,6 +340,52 @@ reaches neither consumer — it means *unknown* — and a frame that measured
 nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
 published with nothing to be fresh about. See [Agent-Managed Model
 Runtime](agent-runtime-manager.md) §10.
+
+**`context_size`/`active_requests`/`queue_depth` split the same way `gpus[]`
+does, but each field picks only one of the two homes — never both.**
+
+- **`context_size` is durable, `gpus[]`-style.** `writeBackRuntimeContext`
+  (`agent_ingest.go`, run right alongside `writeBackRuntimeVRAM` after every
+  store write in the ingest has succeeded) resolves each reported spec id's
+  owning mapping — through the **same** server-ownership chain
+  (`RuntimeSpecByID` → `MappingByID` → `ApplicationByID` → `application.ServerID`)
+  the VRAM write-back uses, so an agent authenticated for one server can never
+  overwrite a mapping belonging to another — and, for a value that actually
+  changed, calls the **pre-existing** `UpdateMappingContextProbe`: it sets
+  `model_mappings.context_size`, `metrics_source = "probe"` (the existing
+  provenance value an automated probe writes, alongside `"benchmark"` and
+  `"opportunistic"` — see [Routing & Model Selection
+  §7](routing-and-model-selection.md#7-model-selection-metrics) — there is no
+  separate `"agent"` value), and `metrics_updated_at`. A `metrics_locked`
+  mapping is left untouched, exactly like the VRAM write-back's own
+  `vram_locked` gate. Comparing against the mapping's **currently stored**
+  `context_size` — not against what this spec id reported last sample — is
+  what keeps a stable context window from costing one write per second per
+  mapping forever, the identical write-amplification argument
+  `writeBackRuntimeVRAM` makes above.
+- **Live `active_requests`/`queue_depth` are volatile, `measured_at`-style —
+  and go one step further: they are never persisted onto a mapping at all.**
+  There is no per-mapping active/queue column, and none was added for this
+  feature: a number that changes every telemetry cycle is not a fact worth a
+  row history, it is the *current* value, and it already has a channel built
+  for exactly that — the same volatile in-RAM `RuntimeStatus` registry
+  `gpus[]` publishes through, keyed the same way (`spec_id`). What **is**
+  durable, and only when the reporting agent declares the `runtime_model_probe`
+  capability, is the **per-server** telemetry aggregate:
+  `ServerTelemetry.ActiveRequests`/`QueueDepth` are set to the **sum**, each
+  runtime clamped to `>= 0` before summing, across every entry in that
+  sample's `runtimes[]` —
+  **replacing**, never adding to, whatever the legacy top-level scrape (§8.2.6)
+  produced, since adding would double-count an agent that still runs both.
+  This is what keeps a multi-model `server_agent`'s per-server load figure
+  (the one the routing scorer's base telemetry read has always used)
+  populated even though no single external `/metrics` target exists for a
+  server running several independent children. Live per-model routing and the
+  Models catalog read the volatile registry directly rather than the
+  per-server aggregate — see [Agent-Managed Model Runtime
+  §11.7](agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog)
+  and [Routing & Model Selection
+  §3](routing-and-model-selection.md#3-candidate-scoring).
 
 **The reader that needed the watermark, and the discipline it added.** The
 **VRAM benchmark**
@@ -668,7 +733,7 @@ log line and its mirrored trace span can be correlated.
 | `OP_AGENT_INTERVAL` | `1s` (floor 250ms) | ServerAgent telemetry cadence |
 | `OP_AGENT_SYSTEM_REPORT_INTERVAL` | `30m` (floor 1m) | ServerAgent hardware-inventory re-send cadence |
 | `OP_AGENT_TRANSPORT` | `websocket` | `post` or `websocket` |
-| `OP_AGENT_METRICS_URL` | unset | Optional inference `/metrics` scrape target |
+| `OP_AGENT_METRICS_URL` | unset | Optional **agent-wide, single-target** inference `/metrics` scrape (§8.2.6); coexists with, and is independent of, the per-`server_agent`-child probe driven by each managed spec's own resolved `metrics_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) |
 | `OP_AGENT_MODEL_STATUS_URL` / `_FORMAT` | unset / `auto` | Optional loaded-model poll target + response shape |
 | `OP_AGENT_LHM_URL` | unset | LibreHardwareMonitor `/data.json` URL (Windows power/temp; Linux fallback) |
 | `OP_AI_GATEWAY_TELEMETRY_RETENTION_HOURS` | 168 (7d) | `server_telemetry_samples` retention |
