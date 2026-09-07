@@ -117,8 +117,10 @@ addresses, not personal or host identity).
 ### 8.2.6 Optional inference-server scraping
 
 Two more collectors run only when configured: `NewScraper` (`scrape.go`) GETs a
-vLLM-style Prometheus `/metrics` endpoint and sums `vllm:num_requests_running`/
-`vllm:num_requests_waiting` into the sample's `ActiveRequests`/`QueueDepth`; a
+Prometheus `/metrics` endpoint and sums the running/waiting request counters into
+the sample's `ActiveRequests`/`QueueDepth`, auto-detecting the server family per
+counter — vLLM (`vllm:num_requests_running`/`vllm:num_requests_waiting`) or
+llama.cpp (`llamacpp:requests_processing`/`llamacpp:requests_deferred`); a
 model-status collector (`loaded.go`) polls an OpenAI/llama-swap/llama.cpp/LiteLLM
 -shaped endpoint to learn which models are currently loaded, feeding
 `LoadedModels`.

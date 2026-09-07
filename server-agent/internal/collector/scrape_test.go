@@ -55,3 +55,48 @@ func TestScraperExtractsActiveQueue(t *testing.T) {
 		t.Errorf("queue = %d, want 1", queue)
 	}
 }
+
+func TestScraperAutoDetectsLlamaCpp(t *testing.T) {
+	// llama.cpp (`llama-server --metrics`) exposes llamacpp:-prefixed counters
+	// under different names than vLLM; the scraper must map them onto the same
+	// active/queue counters with no configuration.
+	body := []byte(
+		"# HELP llamacpp:requests_processing Number of requests processing.\n" +
+			"# TYPE llamacpp:requests_processing gauge\n" +
+			"llamacpp:requests_processing 4\n" +
+			"# TYPE llamacpp:requests_deferred gauge\n" +
+			"llamacpp:requests_deferred 2\n" +
+			"llamacpp:kv_cache_usage_ratio 0.5\n")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer ts.Close()
+
+	active, queue, err := NewScraper(ts.URL, ts.Client()).Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if active != 4 {
+		t.Errorf("active = %d, want 4 (llamacpp:requests_processing)", active)
+	}
+	if queue != 2 {
+		t.Errorf("queue = %d, want 2 (llamacpp:requests_deferred)", queue)
+	}
+}
+
+func TestScraperUnknownFormatYieldsZero(t *testing.T) {
+	// A /metrics body carrying neither family's counters -> 0/0, no error.
+	body := []byte("# TYPE other_metric gauge\nother_metric 9\n")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer ts.Close()
+
+	active, queue, err := NewScraper(ts.URL, ts.Client()).Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if active != 0 || queue != 0 {
+		t.Errorf("active,queue = %d,%d, want 0,0 for an unrecognized metrics format", active, queue)
+	}
+}
