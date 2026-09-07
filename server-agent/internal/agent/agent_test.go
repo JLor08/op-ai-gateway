@@ -1613,6 +1613,13 @@ func TestCollectOnceRuntimeContextZeroSizeNotCached(t *testing.T) {
 	if got := first.Runtimes[0].ContextSize; got != 0 {
 		t.Fatalf("ContextSize (cycle 1) = %d, want 0", got)
 	}
+	// FIX 7: this cycle takes the non-positive-size exit, one of the probe's
+	// three "unreachable" exits, and asserted only the resulting zero -- the
+	// very thing the reachability field exists to distinguish from a real
+	// measurement.
+	if got := first.Runtimes[0].ContextProbe; got != "unreachable" {
+		t.Errorf("ContextProbe (cycle 1) = %q, want %q (a non-positive size is not a successful probe)", got, "unreachable")
+	}
 	if hits := atomic.LoadInt32(&hits); hits != 1 {
 		t.Fatalf("probe hits after cycle 1 = %d, want 1", hits)
 	}
@@ -1673,6 +1680,18 @@ func TestCollectOnceRuntimeProbeUnreachableLeavesZero(t *testing.T) {
 	rs := got.Runtimes[0]
 	if rs.ContextSize != 0 || rs.ActiveRequests != 0 || rs.QueueDepth != 0 {
 		t.Errorf("unreachable-probe fields = %+v, want all zero", rs)
+	}
+	// FIX 7 of the final whole-branch review: the numbers staying zero is only
+	// half the story, and the half that used to be indistinguishable from a
+	// genuinely idle child. BOTH probes failed here (a port refusing
+	// connections), so both must SAY so -- this is the test named for the
+	// unreachable case, and it asserted nothing about the two fields that
+	// exist to report it.
+	if rs.MetricsProbe != "unreachable" {
+		t.Errorf("MetricsProbe = %q, want %q (the scrape hit a refusing port)", rs.MetricsProbe, "unreachable")
+	}
+	if rs.ContextProbe != "unreachable" {
+		t.Errorf("ContextProbe = %q, want %q (the context probe hit the same refusing port)", rs.ContextProbe, "unreachable")
 	}
 }
 
@@ -1936,5 +1955,74 @@ func TestCollectOnceRuntimeProbeStatesContextZeroSizeUnreachable(t *testing.T) {
 	rs := got.Runtimes[0]
 	if rs.ContextProbe != "unreachable" {
 		t.Errorf("ContextProbe = %q, want %q", rs.ContextProbe, "unreachable")
+	}
+}
+
+// TestCollectOnceRuntimeProbeStatesContextCacheHitOK covers the context
+// probe's cache-HIT exit, which is the branch that runs on every collect
+// cycle after the first for every running child -- the steady state, and the
+// only "ok" exit that reports reachability without touching the endpoint at
+// all. It had no test: TestCollectOnceRuntimeProbesMetricsAndContext proves
+// the SIZE survives the cache (hits stay at 1), but never looked at
+// ContextProbe, so a cache hit returning "" or "na" would have gone
+// unnoticed and every steady-state row would have lost its context chip a
+// cycle after loading.
+//
+// Cycle 1 probes and reports "ok"; cycle 2 must still report "ok" while the
+// endpoint is NOT re-queried (hits stay 1) -- proving the state comes from
+// the cache-hit branch, not from a second live probe.
+func TestCollectOnceRuntimeProbeStatesContextCacheHitOK(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_cache_hit",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5007, // unchanged across both cycles: no restart.
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	first := poster.first()
+	if first == nil || len(first.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 1) = %+v", first)
+	}
+	if got := first.Runtimes[0].ContextProbe; got != "ok" {
+		t.Fatalf("ContextProbe (cycle 1) = %q, want %q (the live probe succeeded)", got, "ok")
+	}
+
+	a.collectOnce(context.Background())
+	last := poster.last()
+	if last == nil || len(last.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 2) = %+v", last)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("context probe hits after cycle 2 = %d, want 1 -- cycle 2 must be a CACHE HIT for this test to cover that exit", got)
+	}
+	if got := last.Runtimes[0].ContextProbe; got != "ok" {
+		t.Errorf("ContextProbe (cycle 2, cache hit) = %q, want %q (a cached size means a prior probe on this generation succeeded)", got, "ok")
+	}
+	if got := last.Runtimes[0].ContextSize; got != 8192 {
+		t.Errorf("ContextSize (cycle 2, cache hit) = %d, want 8192", got)
 	}
 }
