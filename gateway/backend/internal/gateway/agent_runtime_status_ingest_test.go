@@ -569,3 +569,191 @@ func TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement(t *
 		})
 	}
 }
+
+// --- Task 12: per-mapping context probe write-back ------------------------
+
+// TestIngestTelemetrySampleRuntimeContextWriteBack proves a sample's
+// per-runtime context_size is persisted onto the spec's owning mapping
+// (routing.ModelMapping.ContextSize) when the reporting agent declares the
+// runtime_model_probe capability THIS sample -- Task 12, Option B: persist
+// only the stable context size onto the mapping, no per-mapping active/queue
+// storage, no migration, no new store method (UpdateMappingContextProbe
+// already exists).
+func TestIngestTelemetrySampleRuntimeContextWriteBack(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_on", false)
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_ctx_on","state":"running","context_size":8192}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_ctx_on")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192", mapping.ContextSize)
+	}
+	if mapping.MetricsSource != "probe" {
+		t.Fatalf("MetricsSource = %q, want %q", mapping.MetricsSource, "probe")
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeContextWriteBackGuardedByCapability proves
+// the context write-back never fires for a sample that does not declare
+// runtime_model_probe, even though the runtime entry itself carries a
+// context_size -- the capability gate is evaluated per sample, not latched
+// once true.
+func TestIngestTelemetrySampleRuntimeContextWriteBackGuardedByCapability(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_off", false)
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_ctx_off","state":"running","context_size":8192}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_ctx_off")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.ContextSize != 0 {
+		t.Fatalf("ContextSize = %d, want untouched 0 (agent did not declare runtime_model_probe)", mapping.ContextSize)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeContextWriteBackRejectsCrossServerSpec
+// mirrors TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec
+// for the context write-back's sibling resolver (resolveRuntimeSpecMapping):
+// an agent authenticated for one server must not be able to overwrite
+// another server's mapping context_size by naming its spec_id.
+func TestIngestTelemetrySampleRuntimeContextWriteBackRejectsCrossServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant-ctx"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	// rspec_cross_ctx belongs to otherServerID, NOT mock-host-qwen.
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_ctx", false)
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_cross_ctx","state":"running","context_size":8192}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
+	}
+
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_cross_ctx")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.ContextSize != 0 {
+		t.Fatalf("ContextSize = %d, want untouched 0 -- an agent for one server must not overwrite another server's mapping context via spec_id", mapping.ContextSize)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeContextWriteBackSkipsLockedMapping proves an
+// operator-pinned (metrics_locked) mapping's manually-set context_size
+// survives an agent probe reporting a different value. UpdateMappingContextProbe
+// itself already no-ops on a locked mapping (SQL's metrics_locked = 0 guard);
+// this proves the ingest path reaches that call at all and that the manual
+// value + provenance are genuinely left alone end to end.
+func TestIngestTelemetrySampleRuntimeContextWriteBackSkipsLockedMapping(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_locked", false)
+	ctx := context.Background()
+
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_ctx_locked")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	mapping.MetricsLocked = true
+	mapping.ContextSize = 4096
+	mapping.MetricsSource = "manual"
+	if err := srv.Routes.UpdateMapping(ctx, mapping); err != nil {
+		t.Fatalf("UpdateMapping: %v", err)
+	}
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_ctx_locked","state":"running","context_size":8192}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	got, err := srv.Routes.MappingByID(ctx, "map_rspec_ctx_locked")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if got.ContextSize != 4096 || got.MetricsSource != "manual" {
+		t.Fatalf("mapping = %#v, want the manually pinned context_size=4096/source=manual left untouched", got)
+	}
+}
+
+// --- Task 12: per-server telemetry aggregate = sum across runtimes --------
+
+// TestIngestTelemetrySamplePerServerAggregateSumsRuntimes proves that when a
+// multi-model server-agent declares runtime_model_probe and reports
+// per-runtime active_requests/queue_depth, the persisted per-server
+// ServerTelemetry summary (the routing scorer's input) is the SUM across
+// runtimes -- replacing, not adding to, the legacy top-level
+// active_requests/queue_depth fields (which an overlapping agent-wide scrape
+// could otherwise double-count against).
+func TestIngestTelemetrySamplePerServerAggregateSumsRuntimes(t *testing.T) {
+	srv := NewTestServer()
+	body := `{"host":{"cpu_util_pct":1},"active_requests":99,"queue_depth":99,` +
+		`"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rt_a","state":"running","active_requests":2,"queue_depth":1},` +
+		`{"spec_id":"rt_b","state":"running","active_requests":3,"queue_depth":0}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	telemetry, ok, err := srv.Routes.TelemetryByServer(context.Background(), "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("TelemetryByServer: ok=%v err=%v", ok, err)
+	}
+	if telemetry.ActiveRequests != 5 {
+		t.Fatalf("ActiveRequests = %d, want 5 (sum across runtimes, not the top-level 99)", telemetry.ActiveRequests)
+	}
+	if telemetry.QueueDepth != 1 {
+		t.Fatalf("QueueDepth = %d, want 1 (sum across runtimes, not the top-level 99)", telemetry.QueueDepth)
+	}
+}
+
+// TestIngestTelemetrySamplePerServerAggregateUsesTopLevelWithoutCapability is
+// the flag-off companion: an agent that does not declare runtime_model_probe
+// must leave the legacy top-level active_requests/queue_depth in effect even
+// though the sample also happens to carry a runtimes array.
+func TestIngestTelemetrySamplePerServerAggregateUsesTopLevelWithoutCapability(t *testing.T) {
+	srv := NewTestServer()
+	body := `{"host":{"cpu_util_pct":1},"active_requests":7,"queue_depth":4,` +
+		`"runtimes":[{"spec_id":"rt_a","state":"running","active_requests":2,"queue_depth":1},` +
+		`{"spec_id":"rt_b","state":"running","active_requests":3,"queue_depth":0}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	telemetry, ok, err := srv.Routes.TelemetryByServer(context.Background(), "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("TelemetryByServer: ok=%v err=%v", ok, err)
+	}
+	if telemetry.ActiveRequests != 7 {
+		t.Fatalf("ActiveRequests = %d, want the top-level 7 (no runtime_model_probe capability declared)", telemetry.ActiveRequests)
+	}
+	if telemetry.QueueDepth != 4 {
+		t.Fatalf("QueueDepth = %d, want the top-level 4 (no runtime_model_probe capability declared)", telemetry.QueueDepth)
+	}
+}
