@@ -65,13 +65,22 @@ func newLoadingOnCountFixture(t *testing.T) *Server {
 
 	reg := NewLoadedModelRegistry()
 	recorder := usage.NewRecorder()
-	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, LoadedModels: reg})
+	// ONE shared app-health registry behind BOTH the portal service's
+	// reachability gate and the gateway's own, exactly as cmd/gateway/main.go
+	// wires it (`Reachability: appHealth` next to `AppHealth: appHealth`). The
+	// offering conditions the loading count re-applies must be answered from
+	// the same source the offered count reads, or the agreement between the
+	// two columns would only be tested against two registries that happen to
+	// hold the same thing.
+	appHealth := NewAppHealthRegistry(nil)
+	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, LoadedModels: reg, Reachability: appHealth})
 	return New(ServerDeps{
 		Tokens:       tokens,
 		Usage:        recorder,
 		Routes:       routeStore,
 		Portal:       svc,
 		LoadedModels: reg,
+		AppHealth:    appHealth,
 	})
 }
 
@@ -192,7 +201,7 @@ func TestPortalModelsManageAlsoInjectsLoadingOnCount(t *testing.T) {
 func TestInjectLoadingOnCountsNilSafeOnBareServer(t *testing.T) {
 	s := &Server{}
 	rows := []portal.ModelDTO{{ID: "some-model", OfferedOnCount: 2}}
-	s.injectLoadingOnCounts(context.Background(), auth.Token{UserID: "usr_x"}, rows)
+	s.injectLoadingOnCounts(context.Background(), auth.Token{UserID: "usr_x"}, rows, true)
 	if rows[0].LoadingOnCount != 0 {
 		t.Fatalf("LoadingOnCount = %d, want 0 on a bare *Server with no registry", rows[0].LoadingOnCount)
 	}
@@ -233,14 +242,18 @@ func (p *countingPortalSpy) AllowedServerIDs(ctx context.Context, token auth.Tok
 	return p.API.AllowedServerIDs(ctx, token, serverIDs)
 }
 
-// countingRouteSpy wraps a real routing.Store and counts calls to the two
+// countingRouteSpy wraps a real routing.Store and counts calls to the four
 // point-read methods startingServersByModel uses to resolve a starting spec
-// to its gateway model name: RuntimeSpecByID and MappingByID. Every other
-// method is the embedded real store.
+// to its gateway model name and decide whether its server actually OFFERS
+// that model: RuntimeSpecByID, MappingByID, and (offeringServerName)
+// ApplicationByID + AIServerByID. Every other method is the embedded real
+// store.
 type countingRouteSpy struct {
 	routing.Store
 	runtimeSpecByIDCalls int32
 	mappingByIDCalls     int32
+	applicationByIDCalls int32
+	aiServerByIDCalls    int32
 }
 
 func (r *countingRouteSpy) RuntimeSpecByID(ctx context.Context, id string) (routing.RuntimeSpec, bool, error) {
@@ -253,6 +266,16 @@ func (r *countingRouteSpy) MappingByID(ctx context.Context, id string) (routing.
 	return r.Store.MappingByID(ctx, id)
 }
 
+func (r *countingRouteSpy) ApplicationByID(ctx context.Context, id string) (routing.Application, error) {
+	atomic.AddInt32(&r.applicationByIDCalls, 1)
+	return r.Store.ApplicationByID(ctx, id)
+}
+
+func (r *countingRouteSpy) AIServerByID(ctx context.Context, id string) (routing.AIServer, error) {
+	atomic.AddInt32(&r.aiServerByIDCalls, 1)
+	return r.Store.AIServerByID(ctx, id)
+}
+
 // TestStartingServersByModelDoesNotScaleWithModelCount seeds manyModelsN
 // (>5) DISTINCT gateway models, each offered by its own server, with exactly
 // ONE server's ONE spec published as "starting". It asserts the row counts
@@ -263,14 +286,19 @@ func (r *countingRouteSpy) MappingByID(ctx context.Context, id string) (routing.
 //     run again).
 //   - Portal.AllowedServerIDs is called EXACTLY ONCE for the whole request
 //     (one call covering every distinct candidate server), not once per model.
-//   - Routes.RuntimeSpecByID / Routes.MappingByID are each called EXACTLY
-//     ONCE -- bounded by the number of STARTING specs (1), never by the
-//     number of models in rows (manyModelsN).
+//   - Routes.RuntimeSpecByID / Routes.MappingByID -- and, since the offering
+//     restriction (Fix round 2) was added, Routes.ApplicationByID /
+//     Routes.AIServerByID -- are each called EXACTLY ONCE, bounded by the
+//     number of STARTING specs (1), never by the number of models in rows
+//     (manyModelsN). Pinning the two offering reads matters as much as the
+//     first two: the obvious way to check "does this server offer the model"
+//     is to ask the portal for the model's server list, which is exactly the
+//     per-row full-join walk this design exists to avoid.
 //
 // If a future change reverts to a per-row Portal.ModelServers call, or adds a
-// per-row AllowedServerIDs/RuntimeSpecByID/MappingByID call, this test fails
-// on the call counts even though the produced counts would still happen to
-// be correct.
+// per-row AllowedServerIDs/RuntimeSpecByID/MappingByID/ApplicationByID/
+// AIServerByID call, this test fails on the call counts even though the
+// produced counts would still happen to be correct.
 func TestStartingServersByModelDoesNotScaleWithModelCount(t *testing.T) {
 	const manyModelsN = 6
 	ctx := context.Background()
@@ -314,7 +342,9 @@ func TestStartingServersByModelDoesNotScaleWithModelCount(t *testing.T) {
 	for i := 0; i < manyModelsN; i++ {
 		rows[i] = portal.ModelDTO{ID: fmt.Sprintf("many-model-%d", i)}
 	}
-	s.injectLoadingOnCounts(ctx, auth.Token{UserID: "usr_many"}, rows)
+	// true = the principal-facing branch, the one that pays for the
+	// AllowedServerIDs call this test counts.
+	s.injectLoadingOnCounts(ctx, auth.Token{UserID: "usr_many"}, rows, true)
 
 	for i, row := range rows {
 		want := 0
@@ -337,6 +367,12 @@ func TestStartingServersByModelDoesNotScaleWithModelCount(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&routeSpy.mappingByIDCalls); got != 1 {
 		t.Fatalf("Routes.MappingByID called %d times, want exactly 1 (bounded by the 1 starting spec, not the %d models)", got, manyModelsN)
+	}
+	if got := atomic.LoadInt32(&routeSpy.applicationByIDCalls); got != 1 {
+		t.Fatalf("Routes.ApplicationByID called %d times, want exactly 1 (the offering check is a point read per starting spec, not a join per request)", got)
+	}
+	if got := atomic.LoadInt32(&routeSpy.aiServerByIDCalls); got != 1 {
+		t.Fatalf("Routes.AIServerByID called %d times, want exactly 1 (the offering check is a point read per starting spec, not a join per request)", got)
 	}
 }
 
@@ -411,7 +447,7 @@ func TestStartingServersByModelRespectsVisibility(t *testing.T) {
 
 	s := &Server{Routes: routeStore, Portal: svc, RuntimeStatus: rtStatus}
 	rows := []portal.ModelDTO{{ID: visModel}}
-	s.injectLoadingOnCounts(ctx, auth.Token{UserID: testUser}, rows)
+	s.injectLoadingOnCounts(ctx, auth.Token{UserID: testUser}, rows, true)
 
 	if rows[0].LoadingOnCount != 1 {
 		t.Fatalf("loading_on_count = %d, want 1 (server A only -- server C is starting too but restricted to usr_other_vis, not usr_test_vis)", rows[0].LoadingOnCount)
@@ -419,8 +455,226 @@ func TestStartingServersByModelRespectsVisibility(t *testing.T) {
 
 	// Sanity: the SAME principal, if provisioned as otherUser, sees both.
 	rows2 := []portal.ModelDTO{{ID: visModel}}
-	s.injectLoadingOnCounts(ctx, auth.Token{UserID: otherUser}, rows2)
+	s.injectLoadingOnCounts(ctx, auth.Token{UserID: otherUser}, rows2, true)
 	if rows2[0].LoadingOnCount != 2 {
 		t.Fatalf("loading_on_count for the provisioned user = %d, want 2 (both A and C visible to usr_other_vis)", rows2[0].LoadingOnCount)
+	}
+}
+
+// --- Fix round 2: the count must agree with the column beside it -----------
+//
+// Two findings from the final whole-branch review, both of the same shape:
+// loading_on_count is read against its sibling counts on the SAME row
+// (offered_on_count, loaded_on), so it has to be computed under the same rules
+// they are -- otherwise the yellow "Lädt" number contradicts the "Angeboten"
+// number next to it. The tests below pin both halves.
+
+// startBothFixtureServersStarting publishes a "starting" runtime spec for BOTH
+// of newLoadingOnCountFixture's servers, so a test can take exactly ONE of them
+// out of "offering" (or out of the principal's visibility) and see whether the
+// count still attributes it.
+func startBothFixtureServersStarting(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for _, seed := range []struct{ serverID, mappingID, specID string }{
+		{mlServerA, mlMappingA, "rspec_off_a"},
+		{mlServerB, mlMappingB, "rspec_off_b"},
+	} {
+		if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+			ID: seed.specID, MappingID: seed.mappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", seed.specID, err)
+		}
+		s.RuntimeStatus.publish(seed.serverID, []RuntimeStatusDTO{
+			{SpecID: seed.specID, Model: mlAppModel, State: "starting"},
+		})
+	}
+}
+
+// TestLoadingOnCountCountsOnlyOfferingServers is the offering fix's proof.
+// startingServersByModel used to attribute EVERY "starting" spec to its
+// mapping's gateway model after only the visibility check, while
+// OfferedOnCount counts a server only when its mapping survives
+// activeMappingViews' conditions (server active + not unhealthy, application
+// active + reachable, mapping active). A child does not stop when an operator
+// disables its mapping, takes its application down, or its server goes
+// unhealthy -- so the count could attribute, and even EXCEED, servers that do
+// not offer the model: "Lädt 2" beside "Angeboten 1".
+//
+// Each case below removes server B from "offering" in one of those ways, with
+// BOTH servers publishing a starting spec. The assertions are the invariant
+// itself (loading <= offered) plus the exact expected pair, so a fix that
+// merely clamps the number would not pass.
+func TestLoadingOnCountCountsOnlyOfferingServers(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name    string
+		deOffer func(t *testing.T, s *Server)
+		wantWhy string
+	}{
+		{
+			name: "mapping disabled",
+			deOffer: func(t *testing.T, s *Server) {
+				m, err := s.Routes.MappingByID(ctx, mlMappingB)
+				if err != nil {
+					t.Fatalf("MappingByID: %v", err)
+				}
+				m.Status = routing.ServerStatusDisabled
+				if err := s.Routes.UpdateMapping(ctx, m); err != nil {
+					t.Fatalf("UpdateMapping: %v", err)
+				}
+			},
+			wantWhy: "server B's mapping is disabled, so B does not offer the model",
+		},
+		{
+			name: "application disabled",
+			deOffer: func(t *testing.T, s *Server) {
+				app, err := s.Routes.ApplicationByID(ctx, mlAppB)
+				if err != nil {
+					t.Fatalf("ApplicationByID: %v", err)
+				}
+				app.Status = routing.ServerStatusDisabled
+				if err := s.Routes.UpdateApplication(ctx, app); err != nil {
+					t.Fatalf("UpdateApplication: %v", err)
+				}
+			},
+			wantWhy: "server B's application is disabled, so B does not offer the model",
+		},
+		{
+			name: "application unreachable",
+			deOffer: func(t *testing.T, s *Server) {
+				s.AppHealth.Set(mlAppB, false, time.Now(), "probe failed")
+			},
+			wantWhy: "server B's application is failing its reachability probe, so B does not offer the model",
+		},
+		{
+			name: "server unhealthy",
+			deOffer: func(t *testing.T, s *Server) {
+				if err := s.Routes.SetServerHealth(ctx, mlServerB, routing.HealthUnhealthy); err != nil {
+					t.Fatalf("SetServerHealth: %v", err)
+				}
+			},
+			wantWhy: "server B is unhealthy, so it is not selectable and does not offer the model",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newLoadingOnCountFixture(t)
+			startBothFixtureServersStarting(t, s)
+			tc.deOffer(t, s)
+
+			byID := fetchModelsOverview(t, s, "/api/portal/models")
+			dto, ok := byID[mlModel]
+			if !ok {
+				t.Fatalf("model %q missing from overview: %#v", mlModel, byID)
+			}
+			if dto.OfferedOnCount != 1 {
+				t.Fatalf("offered_on_count = %d, want 1 (%s)", dto.OfferedOnCount, tc.wantWhy)
+			}
+			if dto.LoadingOnCount != 1 {
+				t.Fatalf("loading_on_count = %d, want 1 -- %s, so only server A may be counted", dto.LoadingOnCount, tc.wantWhy)
+			}
+			if dto.LoadingOnCount > dto.OfferedOnCount {
+				t.Fatalf("loading_on_count (%d) > offered_on_count (%d): the yellow count must never exceed the offered count it is read against", dto.LoadingOnCount, dto.OfferedOnCount)
+			}
+		})
+	}
+}
+
+// TestLoadingOnCountFilteringMatchesItsSiblingsPerBranch is the branch fix's
+// proof. injectLoadingOnCounts runs on BOTH branches of handlePortalModels,
+// but the two branches compute their OTHER counts differently:
+// Service.Models is modelsResponse(suppress=true), which builds
+// offered_on_count from visibleMappingViews (resource-group filtered), while
+// the admin ?manage=1 Service.ManageModels is modelsResponse(suppress=false),
+// reading the token-less activeMappingViews and therefore deliberately
+// UNFILTERED. Applying the AllowedServerIDs filter on both left the manage
+// view with one filtered column beside unfiltered neighbours -- an
+// under-reporting "Lädt" next to an "Angeboten" that counts everything.
+//
+// Fixture: both servers offer the model and both are starting; server B is
+// restricted to a resource group provisioned for a DIFFERENT user. The same
+// admin token must then see 1/1 on the plain listing and 2/2 on ?manage=1 --
+// the point being that loading and offered move TOGETHER on each branch.
+func TestLoadingOnCountFilteringMatchesItsSiblingsPerBranch(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := newLoadingOnCountFixture(t)
+	startBothFixtureServersStarting(t, s)
+
+	const rgID = "rgrp_ml_branch"
+	if err := s.Routes.CreateResourceGroup(ctx, routing.ResourceGroup{ID: rgID, Name: "RG restricted", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateResourceGroup: %v", err)
+	}
+	if err := s.Routes.SetResourceGroupServer(ctx, rgID, mlServerB); err != nil {
+		t.Fatalf("SetResourceGroupServer: %v", err)
+	}
+	// Provisioned for somebody else: the fixture's admin token (usr_ml) is not
+	// allowed to USE server B, and AllowedServerIDs has no admin bypass.
+	if err := s.Routes.SetResourceGroupProvision(ctx, rgID, routing.ProvisionKindUser, "usr_someone_else"); err != nil {
+		t.Fatalf("SetResourceGroupProvision: %v", err)
+	}
+
+	plain := fetchModelsOverview(t, s, "/api/portal/models")[mlModel]
+	if plain.OfferedOnCount != 1 {
+		t.Fatalf("plain offered_on_count = %d, want 1 (server B is provisioned to another user)", plain.OfferedOnCount)
+	}
+	if plain.LoadingOnCount != 1 {
+		t.Fatalf("plain loading_on_count = %d, want 1 -- the principal-facing listing filters both counts the same way", plain.LoadingOnCount)
+	}
+
+	manage := fetchModelsOverview(t, s, "/api/portal/models?manage=1")[mlModel]
+	if manage.OfferedOnCount != 2 {
+		t.Fatalf("manage offered_on_count = %d, want 2 (sanity: the admin management listing is unfiltered by design)", manage.OfferedOnCount)
+	}
+	if manage.LoadingOnCount != 2 {
+		t.Fatalf("manage loading_on_count = %d, want 2 -- on the unfiltered admin listing the loading count must not be the one filtered column", manage.LoadingOnCount)
+	}
+}
+
+// TestLoadingOnCountFollowsAnOfferedOverrideAlias covers the alias half of the
+// group/alias gap the review flagged. modelsResponse's per-token alias overlay
+// copies the target's whole listing payload onto the alias row (loaded/
+// loaded_on, offered_on_count, context size, vision, is_group) so the alias
+// row "looks exactly like its target's row, just filed under a different
+// name". The loading count belongs with them.
+//
+// Aliases exist only on the principal-facing listing, so the manage branch
+// must NOT repoint a row's count even when a rule happens to be named like a
+// real model -- asserted here with the same rule on both branch settings.
+func TestLoadingOnCountFollowsAnOfferedOverrideAlias(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := newLoadingOnCountFixture(t)
+	const specID = "rspec_ml_alias"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: mlMappingA, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(mlServerA, []RuntimeStatusDTO{{SpecID: specID, Model: mlAppModel, State: "starting"}})
+
+	token := auth.Token{UserID: "usr_ml", ModelOverrideRules: map[string]auth.ModelOverrideRule{
+		"team-fast": {To: mlModel, Offer: true},
+	}}
+	// The listing the principal gets: the alias row plus its target's row.
+	rows := []portal.ModelDTO{{ID: "team-fast"}, {ID: mlModel}}
+	s.injectLoadingOnCounts(ctx, token, rows, true)
+	if rows[0].LoadingOnCount != 1 {
+		t.Fatalf("alias row loading_on_count = %d, want 1 (the alias carries its target's row data)", rows[0].LoadingOnCount)
+	}
+	if rows[1].LoadingOnCount != 1 {
+		t.Fatalf("target row loading_on_count = %d, want 1 (the alias must not move the count off the target)", rows[1].LoadingOnCount)
+	}
+
+	// The admin management branch: no alias overlay at all, so a row named
+	// like the rule keeps its OWN (here: absent) count.
+	manageRows := []portal.ModelDTO{{ID: "team-fast"}}
+	s.injectLoadingOnCounts(ctx, token, manageRows, false)
+	if manageRows[0].LoadingOnCount != 0 {
+		t.Fatalf("manage-branch row loading_on_count = %d, want 0 (the manage listing shows real models; a token's alias rule must not repoint a row there)", manageRows[0].LoadingOnCount)
 	}
 }
