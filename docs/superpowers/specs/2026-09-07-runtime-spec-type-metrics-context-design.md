@@ -142,13 +142,24 @@ This is the concrete fix for the single-`OP_AGENT_METRICS_URL` limitation.
   agent not loading models" path. For a `server_agent` that loads models, the
   per-spec per-model scrape (§3.3) is the source; the single URL is redundant
   there.
-- **App-level `context_probe_path`** stays for **non-`server_agent`** apps
-  (gateway-side probe, unchanged). `server_agent` mappings now get their context
-  from the per-spec agent probe instead, so for a `server_agent`-type
-  application the app-level `context_probe_path` is unused: the portal
-  **disables and empties** that field on create and edit (only non-server_agent
-  applications keep it). No hard backend rejection — it is simply ignored for
-  server_agent, and the portal keeps it clear.
+- **App-level gateway-side upstream probes** stay for **non-`server_agent`**
+  apps (unchanged). For a `server_agent`-type application the gateway cannot
+  reach the loopback children and the agent's telemetry supersedes them, so
+  these app fields are **unused** and the portal **disables and empties** them
+  on create and edit:
+  - `context_probe_path` — context comes per-spec from the agent (this feature).
+  - `capacity_probe_path` — a direct upstream `/metrics`|`/slots` GET; the child
+    is loopback-unreachable, and the per-model metrics (this feature) supersede
+    it.
+  - `loaded_models_path` + `loaded_models_format` — the agent reports
+    `LoadedModels` in telemetry (and already "takes precedence"), so the
+    gateway-side poll is redundant.
+
+  Only non-server_agent applications keep these. No hard backend rejection —
+  they are ignored for server_agent and kept clear by the portal. The
+  **health-check** fields are a separate concern (server_agent liveness is
+  agent-presence); whether its HTTP health-check is also moot is **verified
+  during implementation**, not assumed here.
 
 ### 3.7 Per-model runtime state (loading / ready)
 
@@ -213,8 +224,10 @@ the resolved probe paths, so the operator sees what will be used. The
 per-mapping **context size** and **live active/queue** are surfaced in the
 runtime/mapping views (context_size already shown; add the live metrics).
 
-On the **application** editor: for a `server_agent`-type app the app-level
-`context_probe_path` field is **disabled and cleared** (§3.6).
+On the **application** editor: for a `server_agent`-type app the gateway-side
+upstream-probe fields — `context_probe_path`, `capacity_probe_path`,
+`loaded_models_path`, `loaded_models_format` — are **disabled and cleared**
+(§3.6).
 
 On the **"Modelle" → Details** view: show the per-model **runtime state**
 (`stopped`/`loading`/`ready`, §3.7) with a loading indicator, alongside the live
@@ -277,7 +290,8 @@ i18n de + en (parity compile-enforced).
    here).
 6. Frontend: Type select + path overrides + detected-type/paths display + live
    metrics display; **"Modelle" → Details** load-state indicator; the
-   `server_agent` app-editor **context_probe_path disable+clear**; i18n de/en.
+   `server_agent` app-editor **disable+clear of the gateway-side probe fields**
+   (context/capacity/loaded-models); i18n de/en.
 7. Docs: agent-runtime-manager, telemetry-usage-observability, data-model,
    api-surface, config-env, ADR.
 8. Full verification (Postgres + Sonar + version rule + frontend format:check);
