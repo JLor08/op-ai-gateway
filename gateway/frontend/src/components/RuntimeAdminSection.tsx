@@ -255,6 +255,61 @@ function runtimeParseErrorReason(code: string, t: Translation): string {
 }
 
 /**
+ * Task 6 (probe-reachability-and-model-status): one probe's chip status,
+ * visible label and tooltip, shared by both the metrics ("M") and context
+ * ("C") chips in the live-status table's "Probes" column so their
+ * state -> appearance mapping has exactly one source of truth.
+ *
+ * `""` (not reported -- a legacy agent, or a non-running child) renders
+ * nothing at all: `undefined` here, not a placeholder chip.
+ *
+ * Colour choice, given runtimeState.ts's constraint that the portal has only
+ * THREE status colours (success/watch/standby -- no red anywhere):
+ *  - "ok"          -> success (green): the endpoint was reachable and queried.
+ *  - "unreachable" -> watch (the portal's only non-green, non-neutral
+ *                     colour): a path IS configured/derived but the last
+ *                     probe failed -- the "forgot llama.cpp --metrics" case,
+ *                     and the one state this column exists to surface.
+ *  - "na" and any value this build does not recognise -> standby (neutral
+ *                     grey): "na" means this runtime type has no such
+ *                     endpoint at all (Ollama has no /metrics) and must NEVER
+ *                     look like "unreachable", or a healthy Ollama model
+ *                     looks broken. `error` is deliberately NOT used here --
+ *                     statusClassByKey collapses it onto the same grey as
+ *                     standby (components/shared/status.ts), which would make
+ *                     "unreachable" indistinguishable from "na" instead of
+ *                     standing out as the warning it is.
+ */
+function probeChipInfo(
+  probeState: string,
+  prefix: string,
+  t: Translation,
+): { status: BadgeStatus; label: string; tooltip: string } | undefined {
+  if (probeState === '') return undefined;
+  if (probeState === 'ok') {
+    return {
+      status: 'success',
+      label: `${prefix} ${t.runtimeProbeStateOk}`,
+      tooltip: t.runtimeProbeTooltipOk,
+    };
+  }
+  if (probeState === 'unreachable') {
+    return {
+      status: 'watch',
+      label: `${prefix} ${t.runtimeProbeStateUnreachable}`,
+      tooltip: t.runtimeProbeTooltipUnreachable,
+    };
+  }
+  // "na", and any future/unrecognised non-empty value: neutral, never a
+  // false warning for a probe state this build does not know.
+  return {
+    status: 'standby',
+    label: `${prefix} ${t.runtimeProbeStateNa}`,
+    tooltip: t.runtimeProbeTooltipNa,
+  };
+}
+
+/**
  * The states a restart sequence can actually complete from.
  *
  * A restart is force_stopped -> await `stopped` -> clear the override, and on
@@ -3009,6 +3064,43 @@ export function RuntimeAdminSection({
           />
         ) : (
           <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+        );
+      },
+    },
+    {
+      // Task 6: whether the agent's last per-model /metrics and context
+      // probe actually reached the server -- so an operator who forgot
+      // llama.cpp's --metrics flag sees it, instead of silently reading a 0
+      // everywhere. Same spec-id join as `live_status` above, deliberately
+      // adjacent to it: one column says "is it running", the next says
+      // "can we actually see its numbers". Two independent chips (metrics /
+      // context) because a runtime can serve one probe and not the other.
+      id: 'probes',
+      label: t.runtimeProbesColumn,
+      value: (m) => {
+        const live = statusForMapping(m);
+        return [live?.metrics_probe, live?.context_probe].filter(Boolean).join(' ');
+      },
+      sortable: false,
+      searchable: false,
+      render: (m) => {
+        const live = statusForMapping(m);
+        const metrics = probeChipInfo(live?.metrics_probe ?? '', t.runtimeProbeMetricsPrefix, t);
+        const context = probeChipInfo(live?.context_probe ?? '', t.runtimeProbeContextPrefix, t);
+        if (!metrics && !context) return null;
+        return (
+          <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', flexWrap: 'wrap' }}>
+            {metrics && (
+              <Tooltip title={metrics.tooltip}>
+                <StatusChip status={metrics.status} label={metrics.label} />
+              </Tooltip>
+            )}
+            {context && (
+              <Tooltip title={context.tooltip}>
+                <StatusChip status={context.status} label={context.label} />
+              </Tooltip>
+            )}
+          </Box>
         );
       },
     },

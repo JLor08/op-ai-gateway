@@ -229,6 +229,8 @@ function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     context_size: 0,
     active_requests: 0,
     queue_depth: 0,
+    metrics_probe: '',
+    context_probe: '',
     ...overrides,
   };
 }
@@ -2030,6 +2032,88 @@ describe('RuntimeAdminSection live status list', () => {
     // Alpha's spec is reported starting; Bravo's spec has no live status.
     expect(await screen.findByText(t.runtimeStateStarting)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeStatusUnknown)).toBeInTheDocument();
+  });
+});
+
+// Task 6 (probe-reachability-and-model-status): the agent's per-model
+// metrics/context probes are only useful if an operator who forgot
+// llama.cpp's `--metrics` flag can SEE it -- rather than silently reading a
+// `0` everywhere. `metrics_probe`/`context_probe` join into this same
+// launch-specs list by spec_id, exactly like `state` above.
+describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
+  function probeLabel(prefix: string, state: string): string {
+    return `${prefix} ${state}`;
+  }
+
+  it('renders independent metrics/context probe chips -- unreachable is the warning colour, ok is the success one', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [
+        makeStatus({ spec_id: 'spec_1', metrics_probe: 'unreachable', context_probe: 'ok' }),
+      ],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    const metricsChip = screen.getByText(
+      probeLabel(t.runtimeProbeMetricsPrefix, t.runtimeProbeStateUnreachable),
+    );
+    expect(metricsChip).toHaveAttribute('data-status', 'watch');
+
+    const contextChip = screen.getByText(
+      probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateOk),
+    );
+    expect(contextChip).toHaveAttribute('data-status', 'active');
+  });
+
+  // "na" (this runtime type has no such endpoint, e.g. Ollama has no
+  // /metrics) must NEVER look like the "unreachable" warning -- an Ollama
+  // model would otherwise look broken when it is fine.
+  it('renders `na` as the neutral chip, never the warning one', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', metrics_probe: 'na', context_probe: 'na' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    const chips = screen.getAllByText(
+      probeLabel(t.runtimeProbeMetricsPrefix, t.runtimeProbeStateNa),
+    );
+    expect(chips.length).toBeGreaterThan(0);
+    for (const chip of [
+      ...chips,
+      ...screen.getAllByText(probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateNa)),
+    ]) {
+      expect(chip).toHaveAttribute('data-status', 'standby');
+      expect(chip).not.toHaveAttribute('data-status', 'watch');
+    }
+  });
+
+  // "" means "not reported" (a legacy agent, or a non-running child) --
+  // render nothing at all, not even a neutral placeholder chip.
+  it('renders no probe chips when both probes are unreported ("")', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', metrics_probe: '', context_probe: '' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    const row = screen.getAllByRole('row').find((r) => r.textContent?.includes('Alpha'));
+    if (!row) throw new Error('expected exactly one row containing Alpha');
+    // The row's `state` chip (live_status) is the only StatusChip left; no
+    // probe chip renders for either the metrics or the context probe.
+    expect(row.querySelectorAll('[data-status]')).toHaveLength(1);
   });
 });
 
