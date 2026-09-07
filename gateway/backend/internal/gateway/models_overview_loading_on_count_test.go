@@ -306,7 +306,7 @@ func TestStartingServersByModelDoesNotScaleWithModelCount(t *testing.T) {
 	routeStore := routing.NewMemoryStore()
 
 	var startingModel string
-	var startingSpecID = "rspec_many_0"
+	startingSpecID := "rspec_many_0"
 	for i := 0; i < manyModelsN; i++ {
 		serverID := fmt.Sprintf("srv_many_%d", i)
 		appID := fmt.Sprintf("app_many_%d", i)

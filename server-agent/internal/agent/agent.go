@@ -1051,31 +1051,40 @@ type runtimeCtxEntry struct {
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
-	// Defense-in-depth SSRF guard (the portal validates these paths on write;
-	// this is the second layer): a metrics/context path is only ever appended
-	// to the loopback base, so an unsafe one -- @userinfo, //authority, a
-	// scheme, whitespace -- could re-parse the URL's Host off-loopback. Skip
-	// the probe rather than dial it.
-	if st.MetricsPath == "" {
-		rs.MetricsProbe = "na"
-	} else if !collector.SafeProbePath(st.MetricsPath) {
-		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
-		rs.MetricsProbe = "unreachable"
-	} else {
-		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-		active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
-		cancel()
-		if err != nil {
-			slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)
-			rs.MetricsProbe = "unreachable"
-		} else {
-			rs.ActiveRequests = active
-			rs.QueueDepth = queue
-			rs.MetricsProbe = "ok"
-		}
-	}
-
+	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
+}
+
+// probeRuntimeChildMetrics runs probeRuntimeChild's metrics-scrape half and
+// returns the reachability state to store on rs.MetricsProbe. It fills
+// rs.ActiveRequests/rs.QueueDepth only on a successful scrape, exactly as
+// probeRuntimeChild did inline before this was split out to match the context
+// half's shape -- the debug logging and the never-fatal behaviour are unchanged.
+//
+// Defense-in-depth SSRF guard (the portal validates these paths on write; this
+// is the second layer): a metrics path is only ever appended to the loopback
+// base, so an unsafe one -- @userinfo, //authority, a scheme, whitespace --
+// could re-parse the URL's Host off-loopback. Skip the probe rather than dial
+// it, and report it as unreachable: a path IS configured, it just cannot be
+// used.
+func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
+	if st.MetricsPath == "" {
+		return "na"
+	}
+	if !collector.SafeProbePath(st.MetricsPath) {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
+		return "unreachable"
+	}
+	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
+	active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+	cancel()
+	if err != nil {
+		slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)
+		return "unreachable"
+	}
+	rs.ActiveRequests = active
+	rs.QueueDepth = queue
+	return "ok"
 }
 
 // probeRuntimeChildContext runs probeRuntimeChild's context-probe half and
