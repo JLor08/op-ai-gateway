@@ -52,54 +52,123 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 // report "starting". This mirrors injectRowRuntimeState's own unconditional `row.State
 // = dto.State` line one section below.
 //
-// For each row, ModelServers(ctx, token, row.ID) re-resolves exactly the offering rows
-// the model-servers endpoint would show this same principal (same visibility +
-// resource-group rules Models()/ManageModels() already applied to produce the row in
-// the first place), so the count never exceeds OfferedOnCount and never leaks a server
-// this principal could not otherwise see. A synthetic model-group ID matches no real
-// mapping's GatewayModelName, so ModelServers returns an empty slice and the group's
-// LoadingOnCount is 0 -- no per-member aggregation, out of scope for this task.
+// PERFORMANCE (Task 5 review fix, "Fix round 1"): the original implementation called
+// Portal.ModelServers once per DISTINCT MODEL ROW, and ModelServers internally re-walks
+// the ENTIRE server/app/mapping join from scratch on every call (activeMappingViews:
+// AIServers + ApplicationsByServer per active server + MappingsByApplication per active
+// app, plus AllowedServerIDs and, for non-admins, ModelSettings, plus ServerOwners per
+// offering server) -- an N+1 against SQLite that multiplied the base listing's ~31
+// queries by the model count (30 models x ~30 joined rows =~ 930 extra round trips per
+// `GET /api/portal/models`). This version INVERTS the loop via startingServersByModel:
+// it walks the runtime-status registry ONCE per request (bounded by the number of
+// servers that have ever published a status frame, normally a handful, most not
+// "starting"), not once per model row, so the cost no longer scales with the number of
+// models in the response. See startingServersByModel's doc comment for the full cost
+// accounting and how the visibility guarantee ModelServers used to provide for free is
+// preserved explicitly.
 //
-// Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a ModelServers
-// error for one row, a mapping with no runtime spec, or a spec with no published
-// status all just leave that row's count at 0 -- never an error, and never a reason to
-// fail the whole list. Each distinct ServerID's status snapshot is fetched at most once
-// across the WHOLE rows loop (byServer, shared with runtimeStatusesForServer's own
-// per-request cache discipline).
+// Best-effort and nil-safe throughout: a nil RuntimeStatus, Routes or Portal, an
+// AllowedServerIDs error, a spec with no matching mapping, all just leave every row's
+// count at 0 -- never an error, and never a reason to fail the whole list.
 func (s *Server) injectLoadingOnCounts(ctx context.Context, token auth.Token, rows []portal.ModelDTO) {
 	if s.RuntimeStatus == nil || s.Routes == nil || s.Portal == nil {
 		return
 	}
-	byServer := map[string]map[string]RuntimeStatusDTO{}
+	startingByModel := s.startingServersByModel(ctx, token)
+	if len(startingByModel) == 0 {
+		return
+	}
 	for i := range rows {
-		rows[i].LoadingOnCount = s.loadingServerCount(ctx, token, byServer, rows[i].ID)
+		rows[i].LoadingOnCount = len(startingByModel[rows[i].ID])
 	}
 }
 
-// loadingServerCount returns the number of DISTINCT servers offering modelID (per
-// ModelServers, principal-scoped like every other row on this response) whose managed
-// spec's live RuntimeStatus currently reports State == "starting". byServer is the
-// injectLoadingOnCounts-shared per-server status-snapshot cache (see
-// runtimeStatusesForServer). A ModelServers error, or a row whose mapping has no
-// runtime spec or no published status, contributes nothing -- best-effort, never a
-// reason to fail the count.
-func (s *Server) loadingServerCount(ctx context.Context, token auth.Token, byServer map[string]map[string]RuntimeStatusDTO, modelID string) int {
-	serverRows, err := s.Portal.ModelServers(ctx, token, modelID)
-	if err != nil {
-		return 0
+// startingServerCandidate is one (server, spec) pair the runtime-status registry
+// currently reports as State == "starting", before the AllowedServerIDs visibility
+// filter is applied.
+type startingServerCandidate struct {
+	serverID string
+	specID   string
+}
+
+// startingServersByModel returns map[gatewayModelName]set-of-serverIDs for every
+// server currently reporting a "starting" spec for that model, restricted to servers
+// this principal is allowed to see. injectLoadingOnCounts turns each set into a plain
+// len() lookup per row.
+//
+// COST, and why it no longer scales with the model count: this takes ONE
+// statusSnapshot per server known to the registry (RuntimeStatus.serverIDs(); the
+// registry only ever holds servers that have published agent-managed-runtime
+// telemetry, pruned by runtimeStatusRegistry.Retain as servers are deleted, so this is
+// bounded by the deployment's GPU-box count, not its model count). When that pass
+// finds zero "starting" specs -- the overwhelmingly common case, since a model
+// finishes starting in seconds -- it returns immediately with NO further store calls
+// at all. Only when at least one starting spec exists does it pay: exactly ONE
+// AllowedServerIDs call for every distinct candidate server in the WHOLE request
+// (never once per model), plus one RuntimeSpecByID + one MappingByID point read
+// (primary-key lookups, not joins) per starting spec -- normally 0-2 of each, since
+// only a handful of specs are ever mid-launch at once. Contrast the old per-row
+// Portal.ModelServers call this replaces, which re-walked the full server/app/mapping
+// join once per model regardless of how many (if any) servers were starting anything.
+//
+// VISIBILITY (must not regress): the old implementation inherited its visibility
+// filtering for free by going through Portal.ModelServers, which itself calls
+// AllowedServerIDs under resource-group provisioning (Resource Groups Phase 2) --
+// see filterAllowedModelServerRows. This inverted pass bypasses that path entirely
+// (it never calls ModelServers), so it re-applies the IDENTICAL mechanism directly:
+// s.Portal.AllowedServerIDs, resolved once for the whole request instead of once per
+// model row. A server the principal is not allowed to use is dropped BEFORE it can
+// contribute to any model's count -- counting a restricted server here would leak its
+// existence to a principal who cannot otherwise see it. On an AllowedServerIDs error
+// this fails CLOSED (counts nothing) rather than falling back to "count everything",
+// mirroring filterAllowedModelServerRows's own failOpen=false choice for this exact
+// mechanism: an under-count is a display glitch, an over-count is a visibility leak.
+func (s *Server) startingServersByModel(ctx context.Context, token auth.Token) map[string]map[string]struct{} {
+	result := map[string]map[string]struct{}{}
+	var candidates []startingServerCandidate
+	serverIDSet := map[string]struct{}{}
+	for _, serverID := range s.RuntimeStatus.serverIDs() {
+		for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
+			if dto.State != "starting" {
+				continue
+			}
+			candidates = append(candidates, startingServerCandidate{serverID: serverID, specID: dto.SpecID})
+			serverIDSet[serverID] = struct{}{}
+		}
 	}
-	loading := map[string]struct{}{}
-	for _, row := range serverRows {
-		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
+	if len(candidates) == 0 {
+		return result
+	}
+
+	ids := make([]string, 0, len(serverIDSet))
+	for id := range serverIDSet {
+		ids = append(ids, id)
+	}
+	allowed, err := s.Portal.AllowedServerIDs(ctx, token, ids)
+	if err != nil {
+		return result
+	}
+
+	for _, c := range candidates {
+		if !allowed[c.serverID] {
+			continue
+		}
+		spec, ok, err := s.Routes.RuntimeSpecByID(ctx, c.specID)
 		if err != nil || !ok {
 			continue
 		}
-		statuses := s.runtimeStatusesForServer(byServer, row.ServerID)
-		if dto, ok := statuses[spec.ID]; ok && dto.State == "starting" {
-			loading[row.ServerID] = struct{}{}
+		mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+		if err != nil {
+			continue
 		}
+		set, ok := result[mapping.GatewayModelName]
+		if !ok {
+			set = map[string]struct{}{}
+			result[mapping.GatewayModelName] = set
+		}
+		set[c.serverID] = struct{}{}
 	}
-	return len(loading)
+	return result
 }
 
 // manageModelsRequested reports whether the request asked for the unsuppressed
