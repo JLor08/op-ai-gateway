@@ -551,6 +551,71 @@ describe('ApplicationSection server_agent type', () => {
   });
 });
 
+// GAP 9: buildBody's `type === 'server_agent' ? '' : value.trim()` ternary for
+// loaded_models_path/loaded_models_format and context_probe_path has
+// dedicated coverage above for the server_agent CLEARING branch (both create
+// and edit), but nothing proved the OTHER branch of that same ternary --
+// that a non-server_agent application's three probe fields are actually sent
+// as typed/stored rather than silently collapsed to '' too. These two tests
+// mirror the server_agent pair exactly (create, then edit-without-touching)
+// so an inverted or always-'' ternary fails one of them.
+describe('ApplicationSection non-agent probe fields', () => {
+  it('sends the loaded-models path/format and context-probe path as typed on create for a non-server_agent type', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('vllm');
+
+    fireEvent.change(screen.getByLabelText(t.applicationLoadedModelsPath), {
+      target: { value: '/v1/models-custom' },
+    });
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationLoadedModelsFormat }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.applicationLoadedFormatLlamaSwap }),
+    );
+    fireEvent.change(screen.getByLabelText(t.applicationContextProbePath), {
+      target: { value: '/context-custom' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].loaded_models_path).toBe('/v1/models-custom');
+    expect(created[0].loaded_models_format).toBe('llama_swap');
+    expect(created[0].context_probe_path).toBe('/context-custom');
+  });
+
+  it('preserves the loaded-models path/format and context-probe path on save when editing a non-server_agent app', async () => {
+    const { updated } = renderSection({
+      apps: [
+        makeApp({
+          id: 'app_1',
+          type: 'vllm',
+          loaded_models_path: '/v1/models-existing',
+          loaded_models_format: 'openai',
+          context_probe_path: '/context-existing',
+        }),
+      ],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+
+    const pathField = screen.getByLabelText(t.applicationLoadedModelsPath) as HTMLInputElement;
+    const contextField = screen.getByLabelText(t.applicationContextProbePath) as HTMLInputElement;
+    // Unlike the server_agent case, these fields are editable and prefilled
+    // with the stored values -- and this test deliberately leaves them
+    // untouched, so any change buildBody makes to them is its own doing.
+    expect(pathField.value).toBe('/v1/models-existing');
+    expect(pathField).not.toBeDisabled();
+    expect(contextField.value).toBe('/context-existing');
+    expect(contextField).not.toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.loaded_models_path).toBe('/v1/models-existing');
+    expect(updated[0].body.loaded_models_format).toBe('openai');
+    expect(updated[0].body.context_probe_path).toBe('/context-existing');
+  });
+});
+
 describe('ApplicationSection reachability indicator', () => {
   it('shows a reachable chip with the last-checked timestamp in a tooltip', async () => {
     renderSection({

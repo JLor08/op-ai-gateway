@@ -700,6 +700,84 @@ func TestIngestTelemetrySampleRuntimeContextWriteBackSkipsLockedMapping(t *testi
 	}
 }
 
+// countingContextWriteStore counts the context write-back's own UPDATE
+// (UpdateMappingContextProbe), so a test can assert that an UNCHANGED probed
+// context_size costs no write at all -- writeBackRuntimeContext's sibling
+// spy to countingMeasuredWriteStore above, same mechanism, different call.
+type countingContextWriteStore struct {
+	*routing.MemoryStore
+	updateCalls atomic.Int32
+}
+
+func (c *countingContextWriteStore) UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error {
+	c.updateCalls.Add(1)
+	return c.MemoryStore.UpdateMappingContextProbe(ctx, id, contextSize, at)
+}
+
+// TestIngestTelemetrySampleRuntimeContextWriteBackSkipsUnchangedValue is
+// writeBackRuntimeContext's change-detection half, mirroring
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue for its
+// VRAM sibling: telemetry arrives roughly once a second and each sample is a
+// full snapshot, so a runtime whose probed context window is simply STABLE
+// (the normal case once a model is loaded) must not drive one unconditional
+// UPDATE per second per mapping, forever. Detection compares against the
+// mapping's CURRENTLY STORED context_size (resolveRuntimeSpecMapping's
+// storedContext), not against what this same spec_id reported last sample.
+func TestIngestTelemetrySampleRuntimeContextWriteBackSkipsUnchangedValue(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_unchanged", false)
+	counting := &countingContextWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_ctx_unchanged","state":"running","context_size":8192}]}`
+
+	// First ingest: the mapping starts at ContextSize=0, so 8192 is a genuine
+	// change and must be written.
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest 1: %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingContextProbe calls after first ingest = %d, want 1 (initial write)", got)
+	}
+
+	// Second ingest, SAME context_size: must be skipped entirely.
+	req, raw = ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest 2 (unchanged): %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingContextProbe calls = %d after a SECOND sample carrying the SAME context_size, want still 1 -- an unchanged value must not be rewritten", got)
+	}
+	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_ctx_unchanged")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192 (unchanged from the first write)", mapping.ContextSize)
+	}
+
+	// A value that genuinely moved must still be written: change detection
+	// must not turn into "write once and never again".
+	changed := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_ctx_unchanged","state":"running","context_size":16384}]}`
+	req, raw = ingestReq(t, changed)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest 3 (changed): %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 2 {
+		t.Fatalf("UpdateMappingContextProbe calls = %d after a CHANGED context_size, want 2", got)
+	}
+	mapping, err = srv.Routes.MappingByID(context.Background(), "map_rspec_ctx_unchanged")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.ContextSize != 16384 {
+		t.Fatalf("ContextSize = %d, want the changed 16384", mapping.ContextSize)
+	}
+}
+
 // --- Task 12: per-server telemetry aggregate = sum across runtimes --------
 
 // TestIngestTelemetrySamplePerServerAggregateSumsRuntimes proves that when a
