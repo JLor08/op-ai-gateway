@@ -3272,3 +3272,39 @@ func TestManagerZeroMeasurementDoesNotDefeatTheGPUBudget(t *testing.T) {
 		t.Fatalf("Status()[spec-b] = state %v, pid %d -- spec-b was actually started on a GPU whose budget only fits spec-a", st.State, st.PID)
 	}
 }
+
+// TestSnapshotStatusCopiesProbeConfig covers the Task 9 gap left after
+// review: snapshotStatus copies a spec's resolved Type, MetricsPath, and
+// ContextProbePath onto the Status it returns (manager.go, "Probe config
+// (Task 9)"), and nothing exercised that those three lines actually run.
+// Manager.Status() is exactly snapshotStatus() executed on the owner's
+// command goroutine (see handleClose's sibling handler for cmdStatus), so
+// calling the pure function directly through newSnapshotOwner -- the same
+// no-goroutine, no-child-process seam TestBuildSnapshotNeverLetsA... already
+// uses for buildSnapshot -- proves the same guarantee without spawning a
+// stub child: a future refactor that silently drops the copy would fail
+// here immediately, instead of only showing up as a blank type/probe-path
+// column somewhere downstream.
+func TestSnapshotStatusCopiesProbeConfig(t *testing.T) {
+	spec := baseSpec("spec-a", "model-a")
+	spec.Type = "vllm"
+	spec.MetricsPath = "/metrics"
+	spec.ContextProbePath = "/v1/internal/context"
+
+	o, _ := newSnapshotOwner(spec, 4242, nil)
+
+	statuses := o.snapshotStatus()
+	if len(statuses) != 1 {
+		t.Fatalf("snapshotStatus() returned %d statuses, want 1", len(statuses))
+	}
+	got := statuses[0]
+	if got.Type != spec.Type {
+		t.Errorf("Status.Type = %q, want %q (spec.Type) -- snapshotStatus must copy the spec's resolved runtime kind onto Status", got.Type, spec.Type)
+	}
+	if got.MetricsPath != spec.MetricsPath {
+		t.Errorf("Status.MetricsPath = %q, want %q (spec.MetricsPath)", got.MetricsPath, spec.MetricsPath)
+	}
+	if got.ContextProbePath != spec.ContextProbePath {
+		t.Errorf("Status.ContextProbePath = %q, want %q (spec.ContextProbePath)", got.ContextProbePath, spec.ContextProbePath)
+	}
+}
