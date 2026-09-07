@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"sort"
 	"time"
@@ -26,10 +27,79 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 	// passing the flag just gets the normal suppressed list (the flag is ignored, no
 	// 403). Everything else (chat picker, inference /v1/models) keeps Models().
 	if manageModelsRequested(r) && token.HasScope("admin") {
-		writeJSON(w, http.StatusOK, s.Portal.ManageModels(r.Context(), token))
+		resp := s.Portal.ManageModels(r.Context(), token)
+		s.injectLoadingOnCounts(r.Context(), token, resp.Data)
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.Portal.Models(r.Context(), token))
+	resp := s.Portal.Models(r.Context(), token)
+	s.injectLoadingOnCounts(r.Context(), token, resp.Data)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// injectLoadingOnCounts fills each row's LoadingOnCount from the volatile runtime-status
+// registry, mirroring injectRuntimeModelState's split for ModelServerDTO: Service.Models/
+// ManageModels always leave this zero because only the gateway layer holds the
+// runtime-status registry (Service.Models has no reference to it at all -- see
+// modelsResponse in portal/service.go, which builds offeredOn/loadedOn purely from
+// routing.Store + LoadedModelReader).
+//
+// The count is registry-availability-gated ONLY, deliberately NOT gated on the
+// runtime_model_probe capability the way ActiveRequests/QueueDepth/MetricsProbe/
+// ContextProbe are in injectRowRuntimeState: State (the loading signal) is reported by
+// ANY runtime_manager agent and predates the probe feature entirely, so gating it on
+// runtime_model_probe would wrongly hide "Lädt" for older agents that legitimately
+// report "starting". This mirrors injectRowRuntimeState's own unconditional `row.State
+// = dto.State` line one section below.
+//
+// For each row, ModelServers(ctx, token, row.ID) re-resolves exactly the offering rows
+// the model-servers endpoint would show this same principal (same visibility +
+// resource-group rules Models()/ManageModels() already applied to produce the row in
+// the first place), so the count never exceeds OfferedOnCount and never leaks a server
+// this principal could not otherwise see. A synthetic model-group ID matches no real
+// mapping's GatewayModelName, so ModelServers returns an empty slice and the group's
+// LoadingOnCount is 0 -- no per-member aggregation, out of scope for this task.
+//
+// Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a ModelServers
+// error for one row, a mapping with no runtime spec, or a spec with no published
+// status all just leave that row's count at 0 -- never an error, and never a reason to
+// fail the whole list. Each distinct ServerID's status snapshot is fetched at most once
+// across the WHOLE rows loop (byServer, shared with runtimeStatusesForServer's own
+// per-request cache discipline).
+func (s *Server) injectLoadingOnCounts(ctx context.Context, token auth.Token, rows []portal.ModelDTO) {
+	if s.RuntimeStatus == nil || s.Routes == nil || s.Portal == nil {
+		return
+	}
+	byServer := map[string]map[string]RuntimeStatusDTO{}
+	for i := range rows {
+		rows[i].LoadingOnCount = s.loadingServerCount(ctx, token, byServer, rows[i].ID)
+	}
+}
+
+// loadingServerCount returns the number of DISTINCT servers offering modelID (per
+// ModelServers, principal-scoped like every other row on this response) whose managed
+// spec's live RuntimeStatus currently reports State == "starting". byServer is the
+// injectLoadingOnCounts-shared per-server status-snapshot cache (see
+// runtimeStatusesForServer). A ModelServers error, or a row whose mapping has no
+// runtime spec or no published status, contributes nothing -- best-effort, never a
+// reason to fail the count.
+func (s *Server) loadingServerCount(ctx context.Context, token auth.Token, byServer map[string]map[string]RuntimeStatusDTO, modelID string) int {
+	serverRows, err := s.Portal.ModelServers(ctx, token, modelID)
+	if err != nil {
+		return 0
+	}
+	loading := map[string]struct{}{}
+	for _, row := range serverRows {
+		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
+		if err != nil || !ok {
+			continue
+		}
+		statuses := s.runtimeStatusesForServer(byServer, row.ServerID)
+		if dto, ok := statuses[spec.ID]; ok && dto.State == "starting" {
+			loading[row.ServerID] = struct{}{}
+		}
+	}
+	return len(loading)
 }
 
 // manageModelsRequested reports whether the request asked for the unsuppressed

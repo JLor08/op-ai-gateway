@@ -961,6 +961,14 @@ type ModelDTO struct {
 	// OfferedOnCount is how many servers currently OFFER this model (an active
 	// mapping on an active + reachable application). Always ≥ the loaded count.
 	OfferedOnCount int `json:"offered_on_count"`
+	// LoadingOnCount is how many of those offering servers currently report their
+	// managed runtime spec for this model as "starting" (the Models overview's
+	// yellow "Lädt" column). Service.Models/ManageModels always leave this at its
+	// zero value: only the gateway layer holds the volatile runtime-status
+	// registry needed to resolve it, so it injects LoadingOnCount after the fact
+	// -- exactly like ModelServerDTO's Priority/State fields (see
+	// injectRuntimeModelState's doc comment in portal_model_endpoints.go).
+	LoadingOnCount int `json:"loading_on_count"`
 	// Visibility is the model's global visibility from model_settings
 	// ("shown" | "hidden" | "locked"); "shown" when no setting row exists.
 	Visibility string `json:"visibility"`
