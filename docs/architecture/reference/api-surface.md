@@ -133,7 +133,7 @@ request still passes every admission gate — are in
 
 | Path | Methods | Auth notes | Purpose |
 |---|---|---|---|
-| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller; each row also carries `loading_on_count` — servers currently offering the model whose managed spec is `starting` — gateway-injected from the volatile runtime-status registry (`?manage=1` too), registry-availability-gated only, **not** on `runtime_model_probe` (see [Agent-Managed Model Runtime §11.8](../cross-cutting/agent-runtime-manager.md#118-the-models-overviews-loading-count)) |
+| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller; each row also carries `loading_on_count` — servers that currently OFFER the model (the same conditions `offered_on_count` applies, so it never exceeds it) and whose managed spec is `starting` — gateway-injected from the volatile runtime-status registry (`?manage=1` too, where it is unfiltered like its sibling counts, while the plain listing applies the same resource-group filter its siblings do), registry-availability-gated only, **not** on `runtime_model_probe`; always `0` on a model-GROUP row (see [Agent-Managed Model Runtime §11.8](../cross-cutting/agent-runtime-manager.md#118-the-models-overviews-loading-count)) |
 | `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; for a `server_agent` mapping, also its live per-instance `state`/`active_requests`/`queue_depth`/`metrics_probe`/`context_probe` (gateway-injected from the volatile runtime-status registry, both on the plain GET and the SSE compute closure — `state` unconditionally, the other four only when the reporting agent declared `runtime_model_probe`); SSE push on load-state change |
 | `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
@@ -268,8 +268,12 @@ Conventions worth stating, because each is a judgement call a client depends on:
   special-case. `metrics_probe`/`context_probe` are each exactly one of
   `ok`/`unreachable`/`na`, or `""` when this frame never ran the probe (a
   non-running child, or an agent that predates the field) — the
-  reachability that says whether the two request-count fields and
-  `context_size` are real measurements or just unprobed zeros.
+  reachability that says whether the two request-count fields and this
+  frame's `context_size` are real measurements or just unprobed zeros. (In
+  THIS row `context_size` is the probe's own result. The same-named field on
+  the model-servers row above is a different thing — the persisted mapping
+  value — and is therefore not probe-gated; see
+  [Agent-Managed Model Runtime §11.7](../cross-cutting/agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog).)
 - **`gpus`/`measured_at` are a watermark, and they are omitted together.**
   `measured_at` is the **gateway's** arrival time for the frame that carried the
   measurement, not the agent's self-reported `reported_at`; a frame that measured

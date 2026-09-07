@@ -2827,7 +2827,10 @@ anywhere downstream. Computing them changes nothing about the probes' own
 non-fatal behaviour: a failure is still logged at `Debug` and never fails the
 collect cycle. What consumes the two states: the runtime admin's "Probes"
 column ([§11.5](#115-what-each-remaining-tab-shows)) and the Models-detail
-gate that stops showing a fabricated `0` ([§11.7](#117-live-runtime-state-on-the-models-catalog)).
+gate that stops showing a fabricated `0` for the two probe-derived numbers
+([§11.7](#117-live-runtime-state-on-the-models-catalog) — which also
+explains why the context SIZE is not gated this way, being a persisted
+mapping value rather than a probe result).
 
 The registry's `subscribe` copies the current snapshot **and** registers the
 subscriber channel under a single lock acquisition, so no publish between the two
@@ -3354,6 +3357,16 @@ make every healthy Ollama model look broken. See [Status
 colours](theming-and-i18n.md#9-status-colours-there-are-exactly-three) for
 why `watch`, not a fourth colour, is the only shade available for
 "configured but failing".
+
+Each chip carries a tooltip spelling out what its state means, and that
+tooltip is wrapped as `Tooltip > <span> > StatusChip`, never
+`Tooltip > StatusChip`. MUI's `Tooltip` works by cloning its event handlers
+(and a ref) onto its child, and the shared `StatusChip` takes only
+`{ status, label }` — it spreads nothing onto the inner `Chip` and is not
+`forwardRef` — so a tooltip attached directly to it has every prop silently
+dropped and never opens. The wrapper element is the same
+`Tooltip > span > item` shape `RowActionsMenu` uses to explain a disabled
+menu item, and it keeps the shared chip's contract unchanged.
 
 Three field semantics the form encodes rather than leaving to guesswork:
 `vram_measured_mb` is agent-owned and always ignored on write, so it renders as
@@ -4587,28 +4600,51 @@ extracted to a shared `runtimeState.ts` so the two screens cannot render the
 same state in two different colors — with a loading indicator on
 `starting`, alongside the context size and live active/queue.
 
-**A real `0` and "never measured" used to render identically, and the
-reachability signal is what tells them apart.** Because
-`metrics_probe`/`context_probe` ride the identical `runtime_model_probe`
-gate as the numbers they qualify, the frontend (`ModelServersSection.tsx`)
-uses them as the one test for whether a figure is real: **Aktiv** and
-**Warteschlange** render `—` unless `metrics_probe == "ok"`, **Kontext**
-renders `—` unless `context_probe == "ok"`, and only then is the underlying
-number shown — including a genuine `0` (truly idle), which is now
-distinguished from "unmeasured" solely by the reachability gate, never by
-the number itself. No new nullable numeric field was needed for this: the
+**A real `0` and "never measured" used to render identically, and for the
+two probe-derived numbers the reachability signal is what tells them
+apart.** `active_requests`/`queue_depth` are probe-derived: the portal
+service leaves them at `0` and only the capability-gated injection above
+ever fills them, so the number alone cannot say whether it was measured.
+`metrics_probe` rides that same gate, which is exactly what makes it the
+right test, and the frontend (`ModelServersSection.tsx`) uses it as one:
+**Aktiv** and **Warteschlange** render `—` unless `metrics_probe == "ok"`,
+and only then is the underlying number shown — including a genuine `0`
+(truly idle), distinguished from "unmeasured" by the reachability gate and
+never by the number itself. No new nullable numeric field was needed: the
 existing reachability signal already answers "is this value real", so a
-non-probing agent (the two fields empty) also correctly renders `—` rather
-than a fabricated `0`.
+non-probing agent (the field empty) also correctly renders `—` rather than
+a fabricated `0`.
+
+**The context size follows the opposite rule, because it is not
+probe-derived.** `context_size` reaches the row from the PERSISTED mapping
+field (`ContextSize: view.mapping.ContextSize` in
+`portal/service_model_servers.go`), which a benchmark run or a manual
+operator entry sets just as well as the agent's context probe writing it
+back. So **Kontext** is gated on the VALUE — the number whenever it is
+known (`> 0`), `—` otherwise — and a real context size of `0` cannot
+happen, which is what makes `> 0` exactly the "nothing is known" test and
+keeps the same "never render a meaningless `0`" intent. Gating it on
+`context_probe` instead (the branch's first attempt) hid a real, stored
+context size on every non-probing row: any non-`server_agent` model
+server, and any agent without `runtime_model_probe`. `context_probe`
+reports only the **reachability of the probe that can refresh** that
+value, which is what the runtime admin screen's "Probes" column shows; it
+says nothing about whether the stored value is real.
 
 **The former "Geladen" and "Live-Status" columns are now one "Status"
 column.** Two facts that used to sit in adjacent columns — the
 benchmark-derived `loaded` boolean and the raw runtime `state` — collapse
 into a single tri-state: **Geladen** (`state == "running"`), **Lädt**
-(`state == "starting"`), **Nicht Geladen** (otherwise). Only the chip's
-*colour* reuses the shared vocabulary — `modelStatusBadge` calls the same
-`runtimeStateBadge` the loading indicator above uses, so "Lädt" gets the
-identical `watch` treatment. The *label* is deliberately its own: a local
+(`state == "starting"` **or** `"pending_vram_unknown"`), **Nicht Geladen**
+(otherwise). The two loading states are one bucket here because they are
+one bucket in the shared vocabulary this column reuses: `runtimeStateBadge`
+maps both onto `watch` ("waiting to be loaded"), so treating only
+`starting` as loading would have let the same spec, at the same instant,
+read yellow "Lädt" on the runtime admin screen and grey "Nicht Geladen"
+here. Only the chip's *colour* reuses that vocabulary —
+`modelStatusBadge` calls the same `runtimeStateBadge` the loading indicator
+above uses, so "Lädt" gets the identical `watch` treatment. The *label* is
+deliberately its own: a local
 `modelStatusLabel` keyed on `tableModelLoaded`/`modelServerLoading`/
 `modelServerNotLoaded` ("Geladen"/"Lädt"/"Nicht geladen") — the
 model-loading wording, not `runtimeStateLabel`'s lifecycle wording
@@ -4650,21 +4686,69 @@ count by the number of models shown. `startingServersByModel` instead walks
 `RuntimeStatus.serverIDs()` once, collects every `starting` candidate
 `(server, spec)` pair, and only when that set is non-empty resolves it
 further: one `AllowedServerIDs` call for every distinct candidate server in
-the whole request (never once per model), then one `RuntimeSpecByID` plus
-one `MappingByID` point lookup per starting spec to find the owning model.
-The cost therefore scales with the number of specs currently starting —
-normally zero or a handful, fleet-wide — never with the number of models in
-the response.
+the whole request (never once per model), then a fixed handful of
+primary-key point lookups per starting spec — `RuntimeSpecByID` and
+`MappingByID` to find the owning model, `ApplicationByID` and
+`AIServerByID` for the offering check below. The cost therefore scales with
+the number of specs currently starting — normally zero or a handful,
+fleet-wide — never with the number of models in the response.
+
+**Only servers that actually OFFER the model are counted, or the yellow
+count contradicts the column beside it.** A `starting` spec is not by
+itself a reason to count its server: `offered_on_count` counts a server
+only when its mapping survives `activeMappingViews`' conditions (server
+active and not unhealthy, application active and reachable, mapping
+active), and a running child does **not** stop when an operator disables
+its mapping or takes its application down. Attributing every `starting`
+spec regardless therefore let "Lädt 2" appear beside "Angeboten 1".
+`offeringServerName` re-applies exactly those conditions per starting spec
+— via the two point reads above rather than a second full join — and keys
+the result sets by server **name**, the unit `offeredOn` counts, so the
+loading set is a literal subset of the offered set and
+`loading_on_count <= offered_on_count` holds by construction rather than by
+coincidence. Its reachability answer comes from the **same** shared
+`AppHealthRegistry` the portal service reads through its `AppHealthReader`
+(`cmd/gateway/main.go` hands one registry to both), so the two columns
+cannot disagree about an application's health.
 
 **Principal visibility is preserved explicitly, because this pass bypasses
-the path that used to provide it for free.** The old per-row call inherited
-its resource-group filtering by going through `Portal.ModelServers`, which
-itself calls `AllowedServerIDs`; the inverted pass re-applies the identical
-mechanism directly, once for the whole request, and — like
-`filterAllowedModelServerRows`'s own choice — fails **closed** on an
-`AllowedServerIDs` error (counts nothing, never falls back to counting
-every server): an under-count is a display glitch, an over-count would leak
-a restricted server's existence to a principal who cannot otherwise see it.
+the path that used to provide it for free — and it is applied per branch,
+matching the sibling counts on the same row.** The old per-row call
+inherited its resource-group filtering by going through
+`Portal.ModelServers`, which itself calls `AllowedServerIDs`; the inverted
+pass re-applies the identical mechanism directly, once for the whole
+request, and — like `filterAllowedModelServerRows`'s own choice — fails
+**closed** on an `AllowedServerIDs` error (counts nothing, never falls back
+to counting every server): an under-count is a display glitch, an
+over-count would leak a restricted server's existence to a principal who
+cannot otherwise see it. But *which* branch is asking matters, because the
+portal service computes this row's other counts differently per branch:
+the principal-facing `Service.Models` is `modelsResponse(suppress=true)`
+and builds `offered_on_count`/`loaded_on` from `visibleMappingViews` (the
+same resource-group filter), while the admin `?manage=1`
+`Service.ManageModels` is `modelsResponse(suppress=false)`, reading the
+token-less `activeMappingViews` and therefore **deliberately unfiltered**.
+So the loading count filters on the first branch and skips the filter
+entirely on the second — otherwise the admin view carried one filtered
+column beside neighbours that count everything, which is an
+under-reporting inconsistency rather than a leak (that branch is
+admin-scoped and its siblings are unfiltered by design).
+
+**Two row kinds and one of them is a known gap.** A per-token override
+**alias** row takes its target's loading count, matching the rest of the
+alias row's payload (`loaded`/`loaded_on`, `offered_on_count`, context
+size, vision, `is_group`), which `modelsResponse`'s alias overlay already
+copies from the target — an alias row is meant to look exactly like its
+target's row under a different name. Aliases exist only on the
+principal-facing listing, so the `?manage=1` branch never consults the
+rules: a row id there is always a real model name. A model **GROUP** row,
+by contrast, shows aggregated offered/loaded counts but always a loading
+count of `0`: `ModelDTO` carries only `IsGroup` and no member list, and
+re-deriving the offerable member set in the gateway layer would mean a
+second copy of `modelGroupOverlay`'s whole rule set (member order,
+`loaded_only`, per-member suppression). A group whose member is mid-launch
+therefore shows "Lädt" on that member's own row only; the limitation is
+recorded in `injectLoadingOnCounts`' doc comment.
 
 The frontend (`ModelList.tsx`) renders the count as a yellow
 (`status="watch"`) `StatusChip` in a new "Lädt" column between "Angeboten"
