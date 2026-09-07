@@ -57,13 +57,13 @@ COMPOSE_PROJECT="op-ai-gateway-sonar"
 SONAR_URL="http://127.0.0.1:9000"
 PROJECT_KEY="op-ai-gateway"
 
-# Credentials live in ONE shared location so every git worktree uses the same
-# admin password as the (globally-named, shared) SonarQube docker volume. The
-# main worktree's .sonar-local is that shared home; a linked worktree resolves
-# to it via `git worktree list` rather than its own per-worktree copy. Override
-# with SONAR_LOCAL_DIR for non-standard setups.
-_main_worktree="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
-LOCAL_DIR="${SONAR_LOCAL_DIR:-${_main_worktree:-$ROOT}/.sonar-local}"
+# .sonar-local lives in ONE shared location (the main worktree's) so every git
+# worktree uses the same credentials + exports as the globally-named, shared
+# SonarQube docker volume. The resolution is shared with branch-findings.sh via
+# local-dir.sh so the two cannot drift; override with SONAR_LOCAL_DIR.
+# shellcheck source=scripts/sonar/local-dir.sh
+. "$SCRIPT_DIR/local-dir.sh"
+LOCAL_DIR="$(sonar_local_dir "$ROOT")"
 CREDS_FILE="$LOCAL_DIR/credentials.json"
 FINDINGS_FILE="$LOCAL_DIR/findings.json"
 HOTSPOTS_FILE="$LOCAL_DIR/hotspots.json"

@@ -34,6 +34,11 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Resolve the findings-export path through the SAME shared logic sonar.sh uses
+# (the main worktree's .sonar-local), so a scan exported from one worktree is
+# read here even when this runs from a different linked worktree. See local-dir.sh.
+# shellcheck source=scripts/sonar/local-dir.sh
+. "$SCRIPT_DIR/local-dir.sh"
 BASE=""
 FINDINGS=""
 
@@ -43,7 +48,8 @@ Usage: $0 [--base <ref>] [--findings <file>] [--repo <dir>]
 
   --base <ref>       branch/ref to compare against (default: origin/main when
                      that ref exists, else main)
-  --findings <file>  Sonar issue export (default: <repo>/.sonar-local/findings.json)
+  --findings <file>  Sonar issue export (default: the main worktree's shared
+                     .sonar-local/findings.json, honoring SONAR_LOCAL_DIR)
   --repo <dir>       repository to inspect (default: this script's repository)
 EOF
 }
@@ -60,7 +66,7 @@ done
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 cd "$REPO" || { echo "error: cannot enter $REPO" >&2; exit 2; }
-[ -n "$FINDINGS" ] || FINDINGS="$REPO/.sonar-local/findings.json"
+[ -n "$FINDINGS" ] || FINDINGS="$(sonar_local_dir "$REPO")/findings.json"
 [ -f "$FINDINGS" ] || {
   echo "error: no findings export at $FINDINGS -- run 'sonar.sh findings' first" >&2
   exit 2
