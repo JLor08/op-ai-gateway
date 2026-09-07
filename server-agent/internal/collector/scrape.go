@@ -11,10 +11,15 @@ import (
 	"strings"
 )
 
-// vLLM-style metric names the scraper maps onto the active/queue counters.
+// The request-counter metric names the scraper maps onto the active/queue
+// counters, per inference-server family. A /metrics endpoint carries one family
+// or the other, never both, so Scrape auto-detects: for each counter it takes
+// whichever name is present. active = running/processing; queue = waiting/deferred.
 const (
-	promRunningMetric = "vllm:num_requests_running"
-	promWaitingMetric = "vllm:num_requests_waiting"
+	vllmRunningMetric     = "vllm:num_requests_running"    // vLLM
+	vllmWaitingMetric     = "vllm:num_requests_waiting"    // vLLM
+	llamacppRunningMetric = "llamacpp:requests_processing" // llama.cpp (llama-server --metrics)
+	llamacppWaitingMetric = "llamacpp:requests_deferred"   // llama.cpp
 )
 
 // parsePromText parses a Prometheus text-exposition body into a map summing the
@@ -65,8 +70,10 @@ func NewScraper(url string, client *http.Client) Scraper {
 	return &promScraper{url: url, client: client}
 }
 
-// Scrape fetches the /metrics body and returns the running/waiting request
-// counts (0 when the metric is absent).
+// Scrape fetches the /metrics body and returns the active/queued request counts
+// (0 when neither family's metric is present). It auto-detects the inference
+// server: for each counter it takes the vLLM name if present, else the llama.cpp
+// name.
 func (s *promScraper) Scrape(ctx context.Context) (active int, queue int, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if err != nil {
@@ -82,5 +89,20 @@ func (s *promScraper) Scrape(ctx context.Context) (active int, queue int, err er
 		return 0, 0, err
 	}
 	m := parsePromText(body)
-	return int(m[promRunningMetric]), int(m[promWaitingMetric]), nil
+	active = int(firstPresent(m, vllmRunningMetric, llamacppRunningMetric))
+	queue = int(firstPresent(m, vllmWaitingMetric, llamacppWaitingMetric))
+	return active, queue, nil
+}
+
+// firstPresent returns the value of the first metric name that is PRESENT in m
+// (0 when none are). Presence, not value, decides — a server legitimately
+// reporting 0 keeps that 0 rather than falling through to another family's
+// counter.
+func firstPresent(m map[string]float64, names ...string) float64 {
+	for _, n := range names {
+		if v, ok := m[n]; ok {
+			return v
+		}
+	}
+	return 0
 }

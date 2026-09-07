@@ -45,7 +45,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_TRANSPORT`    | `-transport`     | `transport`    | `websocket` | Telemetry transport: `websocket` (one persistent connection) or `post` (one HTTP POST per sample). See [Transport](#transport-post-vs-websocket). |
 | `OP_AGENT_INTERVAL`     | `-interval`      | `interval`     | `1s`    | Collection cadence as a Go duration (e.g. `500ms`, `5s`). Clamped up to a **250ms** floor; a non-positive value falls back to `1s`. |
 | `OP_AGENT_SYSTEM_REPORT_INTERVAL` | `-system-report-interval` | `system_report_interval` | `30m` | POST-mode re-send cadence for the static hardware inventory (self-heals a gateway restart). Floored at `1m`. Ignored under `websocket` (which re-sends on each reconnect). |
-| `OP_AGENT_METRICS_URL`  | `-metrics-url`   | `metrics_url`  | —       | Optional inference `/metrics` (Prometheus text) URL to scrape for active/queued requests. |
+| `OP_AGENT_METRICS_URL`  | `-metrics-url`   | `metrics_url`  | —       | Optional inference `/metrics` (Prometheus text) URL to scrape for active/queued requests. Metric names auto-detected: vLLM or llama.cpp. |
 | `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
@@ -588,9 +588,12 @@ collector (CPU / memory / swap / load / network via `gopsutil`) always runs.
 
 When `-metrics-url` / `OP_AGENT_METRICS_URL` is set, the agent additionally GETs
 that Prometheus-text endpoint each cycle and reports the running/queued request
-counts (`vllm:num_requests_running` → active, `vllm:num_requests_waiting` →
-queue depth). Any other exposition is ignored; a scrape failure is logged and
-skipped without stopping the loop.
+counts. The metric names are auto-detected per inference server (no format
+setting): **vLLM** (`vllm:num_requests_running` → active,
+`vllm:num_requests_waiting` → queue depth) and **llama.cpp** /
+`llama-server --metrics` (`llamacpp:requests_processing` → active,
+`llamacpp:requests_deferred` → queue depth). Any other exposition yields 0/0; a
+scrape failure is logged and skipped without stopping the loop.
 
 ## Hardware inventory
 
