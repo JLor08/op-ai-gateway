@@ -78,6 +78,11 @@ export function Login({
         </SecretReveal>
         <Field
           id="login-totp"
+          // Focus the code field the moment the 2FA step appears so the operator
+          // can type the code straight in — no click first. The step is a fresh
+          // subtree mount (the email/password branch is replaced), so autoFocus
+          // fires on mount.
+          autoFocus
           label={t.totpCodeLabel}
           value={code}
           onChange={(e) => setCode(e.target.value)}
@@ -96,6 +101,11 @@ export function Login({
         <Typography color="text.secondary">{t.loginTotpIntro}</Typography>
         <Field
           id="login-totp"
+          // Focus the code field the moment the 2FA step appears so the operator
+          // can type the code straight in — no click first. The step is a fresh
+          // subtree mount (the email/password branch is replaced), so autoFocus
+          // fires on mount.
+          autoFocus
           label={t.totpCodeLabel}
           value={code}
           onChange={(e) => setCode(e.target.value)}
