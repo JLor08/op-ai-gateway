@@ -133,8 +133,8 @@ request still passes every admission gate — are in
 
 | Path | Methods | Auth notes | Purpose |
 |---|---|---|---|
-| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller |
-| `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; for a `server_agent` mapping, also its live per-instance `state`/`active_requests`/`queue_depth` (gateway-injected from the volatile runtime-status registry, both on the plain GET and the SSE compute closure); SSE push on load-state change |
+| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller; each row also carries `loading_on_count` — servers currently offering the model whose managed spec is `starting` — gateway-injected from the volatile runtime-status registry (`?manage=1` too), registry-availability-gated only, **not** on `runtime_model_probe` (see [Agent-Managed Model Runtime §11.8](../cross-cutting/agent-runtime-manager.md#118-the-models-overviews-loading-count)) |
+| `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; for a `server_agent` mapping, also its live per-instance `state`/`active_requests`/`queue_depth`/`metrics_probe`/`context_probe` (gateway-injected from the volatile runtime-status registry, both on the plain GET and the SSE compute closure — `state` unconditionally, the other four only when the reporting agent declared `runtime_model_probe`); SSE push on load-state change |
 | `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
 | `/api/portal/model-settings/{name}` | PUT | **`admin`** | Set a model's visibility |
@@ -256,14 +256,20 @@ Conventions worth stating, because each is a judgement call a client depends on:
   server-wide list with no per-application filter, and must join rows back to
   operator-facing names itself via `spec_id → spec.mapping_id → mapping`. Row
   shape: `{spec_id, model, state, since, pid?, port?, in_flight, restarts,
-  context_size, active_requests, queue_depth, gpus?, measured_at?,
-  last_error?}` with `last_error = {message, at, exit_code, failures,
-  stderr_tail?}` and `gpus = [{index, vram_measured_mb}]`. Unlike `gpus`/
-  `measured_at` (below), `context_size`/`active_requests`/`queue_depth` are
-  **never omitted** — they are the per-child probe's result (§10 of
+  context_size, active_requests, queue_depth, metrics_probe, context_probe,
+  gpus?, measured_at?, last_error?}` with `last_error = {message, at,
+  exit_code, failures, stderr_tail?}` and `gpus = [{index,
+  vram_measured_mb}]`. Unlike `gpus`/`measured_at` (below),
+  `context_size`/`active_requests`/`queue_depth`/`metrics_probe`/
+  `context_probe` are **never omitted** — they are the per-child probe's
+  result (§10 of
   [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
-  and `0` is their honest pre-probe/unsupported value, not an absence to
-  special-case.
+  and `0`/`""` is their honest pre-probe/unsupported value, not an absence to
+  special-case. `metrics_probe`/`context_probe` are each exactly one of
+  `ok`/`unreachable`/`na`, or `""` when this frame never ran the probe (a
+  non-running child, or an agent that predates the field) — the
+  reachability that says whether the two request-count fields and
+  `context_size` are real measurements or just unprobed zeros.
 - **`gpus`/`measured_at` are a watermark, and they are omitted together.**
   `measured_at` is the **gateway's** arrival time for the frame that carried the
   measurement, not the agent's self-reported `reported_at`; a frame that measured
