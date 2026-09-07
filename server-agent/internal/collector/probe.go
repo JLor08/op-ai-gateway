@@ -82,10 +82,22 @@ func SafeProbePath(p string) bool {
 //     catch the ollama-style architecture-prefixed key).
 //
 // Missing or unparseable data returns (0, err); ProbeContext never panics.
-func ProbeContext(ctx context.Context, baseURL, specType, contextPath string) (int, error) {
+//
+// client is the HTTP client used to issue the request. The caller (agent.go's
+// probeRuntimeChild) passes its private keep-alives-disabled client -- the
+// same one used for the metrics scrape -- because a managed child's loopback
+// port is an OS-assigned, recyclable ephemeral port: a keep-alive connection
+// left open past a child's restart/exit could otherwise be transparently
+// reused against a different process later assigned that same port. A nil
+// client falls back to http.DefaultClient, for existing/incidental callers
+// that have no such concern.
+func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, contextPath string) (int, error) {
 	path := strings.TrimSpace(contextPath)
 	if path == "" {
 		return 0, fmt.Errorf("probe context: no context path configured")
+	}
+	if client == nil {
+		client = http.DefaultClient
 	}
 
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
@@ -93,7 +105,7 @@ func ProbeContext(ctx context.Context, baseURL, specType, contextPath string) (i
 	if err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}

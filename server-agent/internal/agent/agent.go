@@ -1009,11 +1009,17 @@ func (a *Agent) appliedConfigETag() string {
 
 // runtimeCtxEntry is one cached context-probe result: the PID it was
 // measured against (so a restart -- a changed PID -- forces a re-probe,
-// since a new process generation may serve a different model/config) and
-// the context size itself.
+// since a new process generation may serve a different model/config), the
+// specType and contextProbePath it was probed with (so the runtime
+// manager's config reconciliation editing a RUNNING spec's Type or
+// ContextProbePath WITHOUT restarting the process -- same PID -- also
+// forces a re-probe instead of serving a stale size probed under the old
+// config forever), and the context size itself.
 type runtimeCtxEntry struct {
-	pid  int
-	size int
+	pid              int
+	specType         string
+	contextProbePath string
+	size             int
 }
 
 // probeRuntimeChild fills rs's probe-RESULT fields (ActiveRequests,
@@ -1023,11 +1029,16 @@ type runtimeCtxEntry struct {
 // channel). client is shared across all children probed this cycle.
 //
 // Metrics are scraped every call. Context is probed at most once per child
-// lifetime: a cache hit for st.SpecID with the SAME st.PID reuses the
-// stored size; a PID mismatch (the child restarted) or cache miss re-probes.
-// A failed metrics or context probe is logged at debug and leaves the
-// corresponding field(s) at zero -- it never fails the collect cycle. A
-// context-probe FAILURE is deliberately never cached, so a transient error
+// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type, and
+// st.ContextProbePath reuses the stored size; a PID mismatch (the child
+// restarted), a Type/ContextProbePath mismatch (the runtime manager's
+// config reconciliation changed a RUNNING spec's probe config without
+// restarting the process), or a cache miss all re-probe. A failed metrics
+// or context probe is logged at debug and leaves the corresponding
+// field(s) at zero -- it never fails the collect cycle. A context-probe
+// FAILURE, and a context-probe SUCCESS that returns a non-positive size
+// (effectively "unknown" -- a JSON field present but literally 0, or
+// smaller), are both deliberately never cached, so a transient condition
 // (e.g. the child's HTTP server still warming up) is retried next cycle
 // instead of sticking at 0 forever.
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
@@ -1059,21 +1070,36 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "context", "path", st.ContextProbePath)
 		return
 	}
-	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID {
+	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
+		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath {
 		rs.ContextSize = entry.size
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, base, st.Type, st.ContextProbePath)
+	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
 		return
 	}
+	if size <= 0 {
+		// A non-positive size is effectively "unknown" (a JSON field present
+		// but literally 0, or any parse yielding <= 0) -- treat it like a
+		// failed probe: do not cache it as final, so it is retried next
+		// cycle instead of sticking at 0 forever. rs.ContextSize stays at
+		// its zero value.
+		slog.Debug("runtime context probe returned non-positive size, not caching", "spec_id", st.SpecID, "size", size)
+		return
+	}
 	if a.runtimeCtxCache == nil {
 		a.runtimeCtxCache = make(map[string]runtimeCtxEntry)
 	}
-	a.runtimeCtxCache[st.SpecID] = runtimeCtxEntry{pid: st.PID, size: size}
+	a.runtimeCtxCache[st.SpecID] = runtimeCtxEntry{
+		pid:              st.PID,
+		specType:         st.Type,
+		contextProbePath: st.ContextProbePath,
+		size:             size,
+	}
 	rs.ContextSize = size
 }
 

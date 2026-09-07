@@ -1493,6 +1493,143 @@ func TestCollectOnceRuntimeProbesMetricsAndContext(t *testing.T) {
 	}
 }
 
+// TestCollectOnceRuntimeContextCacheInvalidatesOnProbeConfigChange is FIX 3's
+// proof: the runtime manager's config reconciliation can change a RUNNING
+// spec's ContextProbePath (or Type) WITHOUT restarting the process -- same
+// PID. A cache keyed on PID alone would keep serving the size probed against
+// the OLD path forever; the cache must also invalidate on a probe-config
+// change and re-probe using the NEW path.
+func TestCollectOnceRuntimeContextCacheInvalidatesOnProbeConfigChange(t *testing.T) {
+	var v1Hits, v2Hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			atomic.AddInt32(&v1Hits, 1)
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+		case "/v2/models":
+			atomic.AddInt32(&v2Hits, 1)
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":4096}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	baseStatus := runtimectl.Status{
+		SpecID:           "rspec_3",
+		Model:            "qwen-coder",
+		State:            runtimectl.StateRunning,
+		PID:              4242, // unchanged across both cycles -- no restart.
+		Port:             portFromURL(t, srv.URL),
+		Type:             "vllm",
+		ContextProbePath: "/v1/models",
+	}
+	drv.setStatuses([]runtimectl.Status{baseStatus})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	first := poster.first()
+	if first == nil || len(first.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 1) = %+v", first)
+	}
+	if got := first.Runtimes[0].ContextSize; got != 8192 {
+		t.Fatalf("ContextSize (cycle 1) = %d, want 8192", got)
+	}
+	if hits := atomic.LoadInt32(&v1Hits); hits != 1 {
+		t.Fatalf("/v1/models hits after cycle 1 = %d, want 1", hits)
+	}
+
+	// The spec's probe config changes (operator edit; runtime manager
+	// reconciliation) WITHOUT a restart: same SpecID, same PID, new
+	// ContextProbePath.
+	changed := baseStatus
+	changed.ContextProbePath = "/v2/models"
+	drv.setStatuses([]runtimectl.Status{changed})
+
+	a.collectOnce(context.Background())
+	last := poster.last()
+	if last == nil || len(last.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 2) = %+v", last)
+	}
+	if got := last.Runtimes[0].ContextSize; got != 4096 {
+		t.Errorf("ContextSize (cycle 2) = %d, want 4096 (must re-probe the NEW path, not serve the cached old-path value)", got)
+	}
+	if hits := atomic.LoadInt32(&v2Hits); hits != 1 {
+		t.Errorf("/v2/models hits after cycle 2 = %d, want 1 (a pid-only cache key would never hit the new path)", hits)
+	}
+}
+
+// TestCollectOnceRuntimeContextZeroSizeNotCached is FIX 4's proof: a context
+// probe that succeeds but returns a non-positive size (a JSON field present
+// but literally 0) is effectively "unknown" and must NOT be cached as final
+// -- it must be retried next cycle like a failed probe, so a transient 0
+// (e.g. the child still warming up) can recover once real data is served.
+func TestCollectOnceRuntimeContextZeroSizeNotCached(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		n := atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":0}]}`))
+		} else {
+			_, _ = w.Write([]byte(`{"data":[{"id":"m1","max_model_len":8192}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_4",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              4343,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "vllm",
+			ContextProbePath: "/v1/models",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	first := poster.first()
+	if first == nil || len(first.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 1) = %+v", first)
+	}
+	if got := first.Runtimes[0].ContextSize; got != 0 {
+		t.Fatalf("ContextSize (cycle 1) = %d, want 0", got)
+	}
+	if hits := atomic.LoadInt32(&hits); hits != 1 {
+		t.Fatalf("probe hits after cycle 1 = %d, want 1", hits)
+	}
+
+	a.collectOnce(context.Background())
+	last := poster.last()
+	if last == nil || len(last.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 2) = %+v", last)
+	}
+	if got := last.Runtimes[0].ContextSize; got != 8192 {
+		t.Errorf("ContextSize (cycle 2) = %d, want 8192 (a cached 0 would never re-probe)", got)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("probe hits after cycle 2 = %d, want 2 (a 0-size result must not be cached)", got)
+	}
+}
+
 // TestCollectOnceRuntimeProbeUnreachableLeavesZero proves a StateRunning
 // child whose probe endpoints are unreachable still produces a complete,
 // error-free sample: ContextSize/ActiveRequests/QueueDepth all stay 0, and
