@@ -316,7 +316,11 @@ quality gate that a coding agent can run and act on headlessly. It is a
 **local development tool, deliberately not part of CI**: the server runs via
 `scripts/sonar/docker-compose.yml` bound to `127.0.0.1:9000` only, and its
 generated credentials live in the gitignored `.sonar-local/` (0700/0600) —
-never in the repository.
+never in the repository. The docker volumes are globally named, so they are
+shared across every git worktree on the same docker daemon; `.sonar-local/`
+therefore resolves to the **main worktree's** copy (via `git worktree list`,
+overridable with `SONAR_LOCAL_DIR`) so a linked worktree picks up the same
+admin credentials instead of hitting a stale, per-worktree copy.
 
 Lifecycle (`scripts/sonar/sonar.sh`, wrapped by make targets):
 

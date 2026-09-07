@@ -38,8 +38,11 @@
 #   purge                 docker compose down -v (drops all persisted data).
 #
 # Credentials (admin password + API token) live in the gitignored
-# .sonar-local/ directory at the repo root (dir 0700, files 0600) -- never
-# committed. The server is loopback-only (127.0.0.1:9000).
+# .sonar-local/ directory (dir 0700, files 0600) -- never committed. That
+# directory is the MAIN git worktree's, shared by every linked worktree (the
+# docker volumes are globally named, so they're shared too); override with
+# SONAR_LOCAL_DIR for non-standard setups. The server is loopback-only
+# (127.0.0.1:9000).
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -54,7 +57,13 @@ COMPOSE_PROJECT="op-ai-gateway-sonar"
 SONAR_URL="http://127.0.0.1:9000"
 PROJECT_KEY="op-ai-gateway"
 
-LOCAL_DIR="$ROOT/.sonar-local"
+# Credentials live in ONE shared location so every git worktree uses the same
+# admin password as the (globally-named, shared) SonarQube docker volume. The
+# main worktree's .sonar-local is that shared home; a linked worktree resolves
+# to it via `git worktree list` rather than its own per-worktree copy. Override
+# with SONAR_LOCAL_DIR for non-standard setups.
+_main_worktree="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+LOCAL_DIR="${SONAR_LOCAL_DIR:-${_main_worktree:-$ROOT}/.sonar-local}"
 CREDS_FILE="$LOCAL_DIR/credentials.json"
 FINDINGS_FILE="$LOCAL_DIR/findings.json"
 HOTSPOTS_FILE="$LOCAL_DIR/hotspots.json"
