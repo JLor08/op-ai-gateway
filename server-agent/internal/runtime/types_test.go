@@ -182,6 +182,32 @@ func TestParseConfigRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSpecUnmarshalsTypeAndProbePaths pins the wire tags of the three fields
+// this task adds to Spec, mirroring the gateway's AgentRuntimeSpecDTO
+// (gateway/backend/internal/portal/service_runtime.go): Type is the resolved
+// effective runtime-server kind, MetricsPath/ContextProbePath are the
+// resolved probe paths the gateway derived for that Type. The json tags
+// (type/metrics_path/context_probe_path) must match the DTO's tags
+// field-for-field, or the agent silently drops what the gateway sends.
+func TestSpecUnmarshalsTypeAndProbePaths(t *testing.T) {
+	const raw = `{"id":"rspec_1","type":"llama_cpp","metrics_path":"/metrics","context_probe_path":"/props"}`
+
+	var spec Spec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	if spec.Type != "llama_cpp" {
+		t.Errorf("spec.Type = %q, want %q", spec.Type, "llama_cpp")
+	}
+	if spec.MetricsPath != "/metrics" {
+		t.Errorf("spec.MetricsPath = %q, want %q", spec.MetricsPath, "/metrics")
+	}
+	if spec.ContextProbePath != "/props" {
+		t.Errorf("spec.ContextProbePath = %q, want %q", spec.ContextProbePath, "/props")
+	}
+}
+
 // TestParseConfigEmptyDocumentCollectionsAreNeverNil covers the
 // fully-empty document a server with no server_agent application yet
 // produces (task-7-report.md): every collection must still marshal as `[]`,

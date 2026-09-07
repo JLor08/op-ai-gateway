@@ -75,6 +75,19 @@ type Spec struct {
 	// the reported command. Never persisted by the agent; redacted in file-mode
 	// reports (report.go).
 	APIToken string `json:"api_token"`
+	// Type is the RESOLVED effective runtime-server kind for this spec
+	// (vllm/llama_cpp/tgi/ollama/custom) -- the gateway's
+	// AgentRuntimeSpecDTO.Type, which is always the explicit spec.Type when
+	// set, else the type auto-detected from Binary. Never empty on a spec the
+	// gateway actually pushes.
+	Type string `json:"type"`
+	// MetricsPath and ContextProbePath are the RESOLVED effective probe
+	// paths the gateway derived for Type -- AgentRuntimeSpecDTO's fields of
+	// the same name: the stored per-spec override when set, else Type's own
+	// default (which may itself be empty, e.g. custom or ollama's metrics
+	// path).
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // VisibleDevicesMode wire values. The agent distinguishes only "args" from
