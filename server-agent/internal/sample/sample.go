@@ -139,6 +139,8 @@ type RuntimeSample struct {
 	ContextSize    int                 `json:"context_size"`
 	ActiveRequests int                 `json:"active_requests"`
 	QueueDepth     int                 `json:"queue_depth"`
+	MetricsProbe   string              `json:"metrics_probe"`
+	ContextProbe   string              `json:"context_probe"`
 	GPUs           []RuntimeGPUSample  `json:"gpus,omitempty"`
 	LastError      *RuntimeErrorSample `json:"last_error,omitempty"`
 }

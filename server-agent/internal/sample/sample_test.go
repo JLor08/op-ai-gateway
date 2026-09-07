@@ -65,6 +65,8 @@ type wireRuntimeSample struct {
 	ContextSize    int               `json:"context_size"`
 	ActiveRequests int               `json:"active_requests"`
 	QueueDepth     int               `json:"queue_depth"`
+	MetricsProbe   string            `json:"metrics_probe"`
+	ContextProbe   string            `json:"context_probe"`
 	GPUs           []wireRuntimeGPU  `json:"gpus,omitempty"`
 	LastError      *wireRuntimeError `json:"last_error,omitempty"`
 }
@@ -446,6 +448,79 @@ func TestRuntimeSampleContextAndMetricsFieldsRoundTrip(t *testing.T) {
 		}
 		if string(v) != "0" {
 			t.Errorf("runtimes[0].%s = %s, want 0", key, v)
+		}
+	}
+}
+
+// TestRuntimeSampleProbeFieldsRoundTrip is the sample half of Task 1: MetricsProbe
+// and ContextProbe mirror the gateway ingest's exact tags (metrics_probe /
+// context_probe) and, like ContextSize/ActiveRequests/QueueDepth, are always-
+// present string fields -- NOT omitempty -- so a spec left at the zero value
+// still marshals both keys as present with value "", never omitting them.
+func TestRuntimeSampleProbeFieldsRoundTrip(t *testing.T) {
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{
+				SpecID:       "rspec_probe",
+				Model:        "qwen-coder",
+				State:        "running",
+				Since:        since,
+				MetricsProbe: "ok",
+				ContextProbe: "unreachable",
+			},
+		},
+	}
+	s.Normalize()
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got wireSample
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into wire struct: %v", err)
+	}
+	if len(got.Runtimes) != 1 {
+		t.Fatalf("runtimes len = %d, want 1", len(got.Runtimes))
+	}
+	rt := got.Runtimes[0]
+	if rt.MetricsProbe != "ok" {
+		t.Errorf("runtimes[0].metrics_probe = %q, want ok", rt.MetricsProbe)
+	}
+	if rt.ContextProbe != "unreachable" {
+		t.Errorf("runtimes[0].context_probe = %q, want unreachable", rt.ContextProbe)
+	}
+
+	// A spec left at the zero value for probe fields must still carry
+	// them PRESENT in the wire JSON (not omitempty) as empty strings --
+	// mirroring ContextSize/ActiveRequests/QueueDepth. Probe the raw JSON
+	// to verify the fields are present with value "".
+	var zero Sample
+	zero.Runtimes = []RuntimeSample{{SpecID: "rspec_zero_probe"}}
+	zero.Normalize()
+	rawZero, err := json.Marshal(&zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	var probe struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(rawZero, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 1 {
+		t.Fatalf("probe runtimes len = %d, want 1", len(probe.Runtimes))
+	}
+	for _, key := range []string{"metrics_probe", "context_probe"} {
+		v, ok := probe.Runtimes[0][key]
+		if !ok {
+			t.Errorf("runtimes[0] missing %q key; must not be omitempty", key)
+			continue
+		}
+		if string(v) != `""` {
+			t.Errorf("runtimes[0].%s = %s, want \"\"", key, v)
 		}
 	}
 }
