@@ -1703,6 +1703,19 @@ type AgentRuntimeSpecDTO struct {
 	// surfaced in the portal UI; portal.Service adds no server-side guard of its
 	// own here because it does not hold the gateway public URL.
 	APIToken string `json:"api_token"`
+	// Type is the RESOLVED effective runtime-server kind for this spec --
+	// routing.EffectiveRuntimeSpecType(spec): the explicit spec.Type when
+	// set, else the type auto-detected from Binary. Never the raw stored
+	// spec.Type, which may be "" -- the agent always receives a concrete
+	// kind it can act on directly.
+	Type string `json:"type"`
+	// MetricsPath and ContextProbePath are the RESOLVED effective probe
+	// paths for Type -- routing.DeriveProbePaths(Type, spec.MetricsPath,
+	// spec.ContextProbePath): the stored per-spec override when set, else
+	// Type's own default (which may itself be empty, e.g. custom or
+	// ollama's metrics path). Never the raw stored override alone.
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1881,6 +1894,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
 		// here -- the builder returns the empty document above when it is nil.
 		specDTO.APIToken = s.resolvePushToken(spec, *agentApp)
+		// Push the RESOLVED effective type + probe paths, not the raw stored
+		// spec.Type/MetricsPath/ContextProbePath -- the agent needs a concrete
+		// kind and concrete paths to probe, not "figure out the default
+		// yourself" (see AgentRuntimeSpecDTO.Type doc).
+		et := routing.EffectiveRuntimeSpecType(spec)
+		mp, cp := routing.DeriveProbePaths(et, spec.MetricsPath, spec.ContextProbePath)
+		specDTO.Type = string(et)
+		specDTO.MetricsPath = mp
+		specDTO.ContextProbePath = cp
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}

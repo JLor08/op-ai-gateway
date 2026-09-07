@@ -2261,6 +2261,77 @@ func TestAgentRuntimeConfigPushesDecryptedAPIToken(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeConfigPushesResolvedTypeAndProbePaths pins that the
+// agent-wire document carries the RESOLVED effective type + probe paths
+// (routing.EffectiveRuntimeSpecType / routing.DeriveProbePaths), never the
+// raw stored spec.Type/MetricsPath/ContextProbePath: an unset Type on a
+// llama-server binary resolves to "llama_cpp" with that kind's default probe
+// paths; explicit overrides ride through unchanged; and a "custom" spec with
+// no overrides pushes empty paths rather than any other kind's defaults.
+func TestAgentRuntimeConfigPushesResolvedTypeAndProbePaths(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	seedSpec := func(model, binary, specType, metricsOverride, contextOverride string) string {
+		t.Helper()
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: model, AppModelName: model})
+		if err != nil {
+			t.Fatalf("CreateMapping(%s): %v", model, err)
+		}
+		specID := "rspec_" + compactRandomHex(16)
+		spec := routing.RuntimeSpec{
+			ID:               specID,
+			MappingID:        mapping.ID,
+			Enabled:          true,
+			Binary:           binary,
+			Args:             "[]",
+			Env:              "{}",
+			Type:             specType,
+			MetricsPath:      metricsOverride,
+			ContextProbePath: contextOverride,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		if err := routeStore.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("seed spec(%s): %v", model, err)
+		}
+		return specID
+	}
+
+	// Auto-detect: Type unset, binary is llama-server -> resolves to
+	// llama_cpp's default probe paths.
+	autoID := seedSpec("m-auto", "/usr/local/bin/llama-server", "", "", "")
+	// Explicit overrides ride through unchanged regardless of type.
+	overrideID := seedSpec("m-override", "/usr/local/bin/llama-server", "vllm", "/custom-metrics", "/custom-context")
+	// custom with no overrides -> empty paths (not another kind's defaults).
+	customID := seedSpec("m-custom", "/usr/local/bin/my-server", "custom", "", "")
+
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	type resolved struct {
+		specType, metrics, context string
+	}
+	pushed := map[string]resolved{}
+	for _, s := range cfg.Specs {
+		pushed[s.ID] = resolved{s.Type, s.MetricsPath, s.ContextProbePath}
+	}
+
+	if got, want := pushed[autoID], (resolved{"llama_cpp", "/metrics", "/props"}); got != want {
+		t.Fatalf("auto-detected spec = %+v, want %+v", got, want)
+	}
+	if got, want := pushed[overrideID], (resolved{"vllm", "/custom-metrics", "/custom-context"}); got != want {
+		t.Fatalf("overridden spec = %+v, want %+v", got, want)
+	}
+	if got, want := pushed[customID], (resolved{"custom", "", ""}); got != want {
+		t.Fatalf("custom spec = %+v, want %+v", got, want)
+	}
+}
+
 // TestPutRuntimeSpecPreservesGPUArrayOrder pins that the request array order of
 // gpus is the stored + response + agent-wire order (not re-sorted by index).
 func TestPutRuntimeSpecPreservesGPUArrayOrder(t *testing.T) {
