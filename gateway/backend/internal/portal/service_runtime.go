@@ -98,6 +98,25 @@ var (
 	// that is not app/custom, or a custom source whose api_token_header fails
 	// checkHeaderName's shape check. HTTP 400.
 	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
+	// ErrRuntimeSpecTypeInvalid rejects a type that is not one of
+	// ""/vllm/llama_cpp/tgi/ollama/custom (design 2026-09-07). "" is valid --
+	// it means auto-detect from Binary (routing.EffectiveRuntimeSpecType) --
+	// so this is the same "empty is fine, everything else must be a known
+	// value" shape as validVisibleDevicesMode, not validRuntimeAPITokenMode's
+	// caller-normalizes-empty-first shape.
+	ErrRuntimeSpecTypeInvalid = errors.New("runtime_spec.type_invalid")
+	// ErrRuntimeSpecMetricsPathInvalid / ErrRuntimeSpecContextProbePathInvalid
+	// reject a metrics_path / context_probe_path override that is not a SAFE
+	// RELATIVE PATH (safeRelativeProbePath): non-empty and either not rooted at
+	// a single "/" (e.g. "@evil:9999/x", "http://evil"), protocol-relative
+	// ("//evil"), carrying a scheme ("://"), or containing whitespace/control
+	// bytes. The agent builds its probe URL by concatenating the override onto
+	// "http://127.0.0.1:PORT"; a value like "@evil:9999/x" would re-parse the
+	// port digits as userinfo and resolve Host to the ATTACKER, turning the
+	// agent's loopback probe into an outbound (SSRF) request. Rejected at the
+	// portal before it can ever reach the agent. HTTP 400.
+	ErrRuntimeSpecMetricsPathInvalid      = errors.New("runtime_spec.metrics_path_invalid")
+	ErrRuntimeSpecContextProbePathInvalid = errors.New("runtime_spec.context_probe_path_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -387,6 +406,24 @@ type RuntimeSpecDTO struct {
 	// header and the "app has no token ⇒ auth off" hint under app mode.
 	AppAPITokenSet    bool   `json:"app_api_token_set"`
 	AppAPITokenHeader string `json:"app_api_token_header"`
+	// Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
+	// "tgi" | "ollama" | "custom"); see routing.RuntimeSpec.Type. "" means
+	// auto-detect from Binary -- EffectiveType below is what that resolves to.
+	Type string `json:"type"`
+	// MetricsPath / ContextProbePath are the operator's raw overrides (""
+	// means "use the type's default"); see routing.RuntimeSpec.
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
+	// EffectiveType / ResolvedMetricsPath / ResolvedContextProbePath are
+	// READ-ONLY echoes of routing.EffectiveRuntimeSpecType +
+	// routing.DeriveProbePaths -- what the agent will actually use once Type/
+	// MetricsPath/ContextProbePath resolve (auto-detection and per-type
+	// defaults applied). The portal shows these next to the raw fields above
+	// so an operator relying on auto-detect can see the outcome without
+	// guessing.
+	EffectiveType            string `json:"effective_type"`
+	ResolvedMetricsPath      string `json:"resolved_metrics_path"`
+	ResolvedContextProbePath string `json:"resolved_context_probe_path"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -437,6 +474,13 @@ type PutRuntimeSpecRequest struct {
 	// APITokenRotate, when true under mode "random", forces regeneration on
 	// write.
 	APITokenRotate bool `json:"api_token_rotate"`
+	// Type / MetricsPath / ContextProbePath: see RuntimeSpecDTO's doc. Type
+	// is validated by validRuntimeSpecType (empty or one of the five
+	// routing.RuntimeSpecType values); MetricsPath/ContextProbePath are
+	// freeform and only trimmed -- no shape validation.
+	Type             string `json:"type"`
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -455,17 +499,29 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		return RuntimeSpecDTO{}, err
 	}
 	if !ok {
+		// Type/MetricsPath/ContextProbePath are zero (""), same as every other
+		// unconfigured field; EffectiveType/the resolved paths are still
+		// computed from that empty spec (an empty Binary detects as
+		// RuntimeSpecTypeCustom, whose defaults are empty paths) so the
+		// portal's echoes are never left stale relative to what a first save
+		// with no overrides would resolve to.
+		emptySpec := routing.RuntimeSpec{}
+		effectiveType := routing.EffectiveRuntimeSpecType(emptySpec)
+		resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, emptySpec.MetricsPath, emptySpec.ContextProbePath)
 		return RuntimeSpecDTO{
-			MappingID:            mapping.ID,
-			Args:                 []string{},
-			Env:                  map[string]string{},
-			GPUs:                 []RuntimeSpecGPUDTO{},
-			APIFlavors:           []string{},
-			VisibleDevicesMode:   string(routing.VisibleDevicesModeEnv),
-			APITokenMode:         string(routing.RuntimeAPITokenModeApp),
-			APITokenHeaderSource: string(routing.RuntimeAPITokenHeaderSourceApp),
-			AppAPITokenSet:       app.APIToken != "",
-			AppAPITokenHeader:    app.APITokenHeader,
+			MappingID:                mapping.ID,
+			Args:                     []string{},
+			Env:                      map[string]string{},
+			GPUs:                     []RuntimeSpecGPUDTO{},
+			APIFlavors:               []string{},
+			VisibleDevicesMode:       string(routing.VisibleDevicesModeEnv),
+			APITokenMode:             string(routing.RuntimeAPITokenModeApp),
+			APITokenHeaderSource:     string(routing.RuntimeAPITokenHeaderSourceApp),
+			AppAPITokenSet:           app.APIToken != "",
+			AppAPITokenHeader:        app.APITokenHeader,
+			EffectiveType:            string(effectiveType),
+			ResolvedMetricsPath:      resolvedMetrics,
+			ResolvedContextProbePath: resolvedContext,
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
@@ -571,6 +627,23 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	if err := validateRuntimeSpecAPIToken(req); err != nil {
 		return RuntimeSpecDTO{}, err
+	}
+	specType := strings.TrimSpace(req.Type)
+	if !validRuntimeSpecType(specType) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecTypeInvalid
+	}
+	metricsPath := strings.TrimSpace(req.MetricsPath)
+	contextProbePath := strings.TrimSpace(req.ContextProbePath)
+	// SSRF guard: an operator-supplied probe-path override is only ever
+	// appended to the agent's own "http://127.0.0.1:PORT" loopback base, so it
+	// MUST be a safe relative path. Reject anything that could re-anchor the
+	// URL's Host (@userinfo, //authority, a scheme) or smuggle whitespace/
+	// control bytes -- see safeRelativeProbePath and the two sentinels' docs.
+	if !safeRelativeProbePath(metricsPath) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecMetricsPathInvalid
+	}
+	if !safeRelativeProbePath(contextProbePath) {
+		return RuntimeSpecDTO{}, ErrRuntimeSpecContextProbePathInvalid
 	}
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
@@ -726,6 +799,9 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
+		Type:                        specType,
+		MetricsPath:                 metricsPath,
+		ContextProbePath:            contextProbePath,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -911,6 +987,53 @@ func validRuntimeAPITokenMode(s string) bool {
 	return false
 }
 
+// validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
+// default and every pre-feature row's stored value) or one of the five
+// routing.RuntimeSpecType values. Unlike validRuntimeAPITokenMode, empty IS
+// accepted directly here (mirrors validVisibleDevicesMode) -- callers pass
+// req.Type through untouched, they don't normalize "" to a concrete value
+// first, because "" is itself a legitimate stored/wire value (auto), not a
+// default that collapses into one of the five kinds.
+func validRuntimeSpecType(s string) bool {
+	switch routing.RuntimeSpecType(s) {
+	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
+		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama, routing.RuntimeSpecTypeCustom:
+		return true
+	}
+	return false
+}
+
+// safeRelativeProbePath reports whether p is a safe relative probe path: empty
+// (the operator left the override blank -- routing.DeriveProbePaths then
+// supplies the per-type default), or a single-"/"-rooted path carrying no
+// scheme, no protocol-relative "//" authority, and no whitespace/control
+// bytes. It is the SSRF guard on metrics_path/context_probe_path: the agent
+// concatenates the override onto "http://127.0.0.1:PORT", so a value like
+// "@evil:9999/x", "//evil", or "http://evil" would otherwise re-parse to an
+// off-loopback Host. Valid overrides such as "/metrics", "/v1/models",
+// "/props" and "/api/show" all pass. Callers pass the already-TrimSpace'd
+// value; the byte scan additionally rejects any INTERIOR whitespace/control
+// byte (e.g. "/foo bar"), which trimming does not remove.
+func safeRelativeProbePath(p string) bool {
+	if p == "" {
+		return true
+	}
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	if strings.Contains(p, "://") {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		// Reject every byte at or below ASCII space (control chars, tab, CR,
+		// NL, and space itself) and DEL.
+		if b := p[i]; b <= 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // specHasAPITokenPlaceholder reports whether the literal "${API_TOKEN}"
 // appears in any Env value or any Args element. Args is included
 // deliberately (design decision C1): some upstream binaries only accept a
@@ -1030,6 +1153,8 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 			VRAMMeasuredMB: g.VRAMMeasuredMB,
 		})
 	}
+	effectiveType := routing.EffectiveRuntimeSpecType(spec)
+	resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, spec.MetricsPath, spec.ContextProbePath)
 	return RuntimeSpecDTO{
 		Configured:                  true,
 		ID:                          spec.ID,
@@ -1060,6 +1185,12 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		APITokenHeader:              spec.APITokenHeader,
 		AppAPITokenSet:              app.APIToken != "",
 		AppAPITokenHeader:           app.APITokenHeader,
+		Type:                        spec.Type,
+		MetricsPath:                 spec.MetricsPath,
+		ContextProbePath:            spec.ContextProbePath,
+		EffectiveType:               string(effectiveType),
+		ResolvedMetricsPath:         resolvedMetrics,
+		ResolvedContextProbePath:    resolvedContext,
 	}, nil
 }
 
@@ -1626,6 +1757,19 @@ type AgentRuntimeSpecDTO struct {
 	// surfaced in the portal UI; portal.Service adds no server-side guard of its
 	// own here because it does not hold the gateway public URL.
 	APIToken string `json:"api_token"`
+	// Type is the RESOLVED effective runtime-server kind for this spec --
+	// routing.EffectiveRuntimeSpecType(spec): the explicit spec.Type when
+	// set, else the type auto-detected from Binary. Never the raw stored
+	// spec.Type, which may be "" -- the agent always receives a concrete
+	// kind it can act on directly.
+	Type string `json:"type"`
+	// MetricsPath and ContextProbePath are the RESOLVED effective probe
+	// paths for Type -- routing.DeriveProbePaths(Type, spec.MetricsPath,
+	// spec.ContextProbePath): the stored per-spec override when set, else
+	// Type's own default (which may itself be empty, e.g. custom or
+	// ollama's metrics path). Never the raw stored override alone.
+	MetricsPath      string `json:"metrics_path"`
+	ContextProbePath string `json:"context_probe_path"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -1804,6 +1948,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
 		// here -- the builder returns the empty document above when it is nil.
 		specDTO.APIToken = s.resolvePushToken(spec, *agentApp)
+		// Push the RESOLVED effective type + probe paths, not the raw stored
+		// spec.Type/MetricsPath/ContextProbePath -- the agent needs a concrete
+		// kind and concrete paths to probe, not "figure out the default
+		// yourself" (see AgentRuntimeSpecDTO.Type doc).
+		et := routing.EffectiveRuntimeSpecType(spec)
+		mp, cp := routing.DeriveProbePaths(et, spec.MetricsPath, spec.ContextProbePath)
+		specDTO.Type = string(et)
+		specDTO.MetricsPath = mp
+		specDTO.ContextProbePath = cp
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}

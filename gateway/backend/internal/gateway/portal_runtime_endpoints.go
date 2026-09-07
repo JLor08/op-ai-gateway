@@ -81,6 +81,9 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
+	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, custom (or empty for auto)"},
+	{err: portal.ErrRuntimeSpecMetricsPathInvalid, status: http.StatusBadRequest, code: "runtime_spec.metrics_path_invalid", msg: "metrics_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
+	{err: portal.ErrRuntimeSpecContextProbePathInvalid, status: http.StatusBadRequest, code: "runtime_spec.context_probe_path_invalid", msg: "context_probe_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken
 	// -- code is err.Error() verbatim, per the convention every row above
 	// already follows.

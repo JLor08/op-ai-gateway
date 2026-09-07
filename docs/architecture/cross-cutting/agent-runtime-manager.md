@@ -744,6 +744,75 @@ today. A test asserts that literally, on all four vendor values, including for a
 spec that declares GPUs (the case where the feature had something it *could*
 have emitted).
 
+### 3.4 Runtime-server kind and per-kind probe-path derivation
+
+A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` | `custom`;
+migration 75, `text not null default ''`) is what tells the gateway — and,
+through it, the agent — which conventions govern *this* child's metrics and
+context-window endpoints (design 2026-09-07). `""` (every pre-feature row) is
+not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
+(`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
+launched binary's basename, first match wins — `vllm`, then
+`llama-server`/`llama_cpp`/`llama.cpp`, then
+`text-generation-launcher`/`tgi`, then `ollama` — and falls back to `custom`
+when nothing matches. `EffectiveRuntimeSpecType(spec)` resolves the type that
+actually governs a spec: the explicit `Type` when set, else the detected one.
+
+`DeriveProbePaths(type, metricsOverride, contextOverride)` turns a resolved
+type into the two endpoints the agent probes, an operator override always
+winning **per field** over the type's own default:
+
+| Type | Metrics endpoint (default) | Context endpoint (default) | Context field |
+|---|---|---|---|
+| `vllm` | `/metrics` (Prometheus) | `/v1/models` | `data[].max_model_len` |
+| `llama_cpp` | `/metrics` (Prometheus) | `/props` | `default_generation_settings.n_ctx` (falls back to a top-level `n_ctx`) |
+| `tgi` | `/metrics` (Prometheus; `tgi_batch_current_size`=active, `tgi_queue_size`=queue) | `/info` | `max_total_tokens` |
+| `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
+| `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
+
+These upstream shapes were verified against each project's own documentation
+on 2026-09-07 (vLLM's `ModelCard.max_model_len`, llama.cpp's `tools/server`
+docs, TGI's `openapi.json` and metrics reference, Ollama's `api.md`), and the
+best-effort scan is also what `custom` and any type this portal build does not
+yet recognize fall back to — never a hard failure, since a spec's real backend
+is exactly what an operator picking `custom` is telling the gateway it cannot
+assume.
+
+**Resolution happens gateway-side, and only the resolved values cross the
+wire.** `EffectiveRuntimeSpecType` + `DeriveProbePaths` run in
+`internal/portal` when the runtime-config document is assembled; the agent
+receives concrete `type`/`metrics_path`/`context_probe_path` values in its
+`AgentRuntimeSpecDTO` — it never re-implements the detection or the per-type
+table itself. The portal's own `GET` additionally echoes **read-only**
+`effective_type`/`resolved_metrics_path`/`resolved_context_probe_path`
+alongside the raw stored `type`/`metrics_path`/`context_probe_path`, so an
+operator relying on auto-detect can see the outcome without guessing, and one
+that types a raw override still sees the exact resolved string the agent will
+use. An invalid `type` (anything outside the five values above) is refused
+before any mutation as `runtime_spec.type_invalid` (400).
+
+What the resolved paths are actually *used for* — the per-child probe cycle
+itself, and the three sample fields it fills — is [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)
+below.
+
+**This makes three of a `server_agent` application's own gateway-side probe
+fields redundant for it, and the portal treats them as such.** An ordinary
+application's `context_probe_path`/`loaded_models_path`/
+`loaded_models_format` drive the gateway's own app-level context probe and
+model-status poller against the application's single upstream (§7 of
+[Routing & Model Selection](routing-and-model-selection.md#7-model-selection-metrics));
+a `server_agent` application has no single upstream to probe that way — model
+discovery, loaded state and now context size all come from each managed
+child's own runtime spec instead. The application editor therefore
+**disables and clears** those three fields specifically for `type ===
+'server_agent'`, so a value left over from an earlier, different application
+type never lingers unread on the stored row. `capacity_probe_path` is the one
+sibling field this does **not** apply to: it stays backend-only (feeding the
+capacity benchmark, [Routing & Model Selection
+§6.1](routing-and-model-selection.md#61-cp1cp2--the-capacity-benchmark-engine))
+and was never surfaced in the application editor at all, for any application
+type.
+
 ## 4. One router port per AI server
 
 The agent listens on a single HTTP port, reads the `model` field out of each
@@ -1956,9 +2025,10 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 ([§7.2](#72-the-applied-document-acknowledgement)), `gpu_selection`
 ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)),
-`Since: "0.4.0"`, and `runtime_api_token`
+`Since: "0.4.0"`, `runtime_api_token`
 ([§3.2](#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)),
-`Since: "0.5.0"`.
+`Since: "0.5.0"`, and `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`.
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -2006,6 +2076,29 @@ sub-`0.5.0` agent gets no portal warning before the spec fails to start.
 This is recorded as a known gap, not a design decision, in
 [§13](#13-known-limitations-and-accepted-risks).
 `server-agent`'s `Version` moved `0.4.0` → `0.5.0` for this entry, MINOR per
+the same rule.
+
+`runtime_model_probe` differs from every flag above in what it actually
+gates. The agent does **not** wait for it to be declared back before
+probing: a `StateRunning` child with a live loopback port is probed every
+collect cycle ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time))
+purely as a function of `runtime_manager` being active — the agent gates
+none of its own behavior on this flag, exactly like `gpu_selection` and
+`runtime_api_token` before it. What the flag gates is entirely on the
+**gateway** side: `ingestTelemetrySample` only writes a probed context size
+back onto its mapping, and only sums `runtimes[]`'s active/queue into the
+per-server telemetry aggregate, when the *reporting sample's own*
+`capabilities` names `runtime_model_probe` — a gateway talking to an agent
+that predates the flag never trusts numbers that agent never promised to
+fill honestly (an old agent's `runtimes[]` entries carry the pre-feature
+zero for all three fields, which must not be mistaken for "measured zero").
+Unlike `gpu_selection`, nothing in the portal reads this flag back as an
+"agent too old" advisory: an older agent's managed models simply show no
+context size and no live per-model load on the Models catalog
+([§11.7](#117-live-runtime-state-on-the-models-catalog)) rather than a
+warning banner, because there is no operator action to prompt — the gap
+closes itself the next time that agent is upgraded.
+`server-agent`'s `Version` moved `0.5.0` → `0.6.0` for this entry, MINOR per
 the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
@@ -2661,6 +2754,51 @@ the runtime manager, overriding the generic model-status lister: only specs in
 state `running` count, and `starting` explicitly does not. Counting `starting` as
 loaded — to make the portal look responsive — sends real traffic to a model that
 cannot answer yet, turning a warm-up into user-visible timeouts.
+
+**Per-child probing feeds three more fields onto this same channel** —
+`ContextSize`/`ActiveRequests`/`QueueDepth` — one of the two reasons
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation) resolves a
+concrete `Type`/`MetricsPath`/`ContextProbePath` per spec. For every
+`StateRunning` child with a live loopback port, the agent's own collect loop
+(`probeRuntimeChild`, alongside the sibling host/GPU/power/temp collectors
+already running there) fills them from that child's **own** endpoints —
+never the store, never a separate poll loop — using the resolved probe
+configuration `snapshotStatus` copies from the spec onto `runtime.Status`
+(agent-internal fields, not part of the `Status`↔`RuntimeSample` wire
+mirror). Two different cadences share the one collect cycle:
+
+- **Live request metrics are scraped every cycle.** A non-empty
+  `MetricsPath` points the existing Prometheus scraper (§8.2.6 of
+  [Telemetry, Usage Analytics &
+  Observability](telemetry-usage-observability.md#826-optional-inference-server-scraping) —
+  now also recognizing TGI's `tgi_batch_current_size`/`tgi_queue_size` gauge
+  names alongside vLLM's and llama.cpp's counters) at this child's own
+  loopback port instead of a single external target.
+- **Context size is probed at most once per child lifetime.** A cache keyed
+  by `(SpecID, PID)` — the PID, not the spec id alone, so a restart (a new
+  PID) forces a re-probe, since a new process generation may serve a
+  different model or config — short-circuits every cycle after the first
+  success. A *failed* probe is never cached, so a child whose HTTP server is
+  still warming up is retried next cycle rather than sticking at `0` forever.
+
+Both probes share the agent's existing ~2 s collect timeout and are
+best-effort throughout: a failure is logged at `Debug` and leaves the
+corresponding field(s) at their zero value — it never fails the collect
+cycle, exactly like every other collector in this loop. This is a
+**separate** code path from `OP_AGENT_METRICS_URL`'s agent-wide scraper: that
+setting targets **one** external `/metrics` endpoint and feeds the sample's
+**top-level** `ActiveRequests`/`QueueDepth` — the way a *classic*,
+non-managed application still reports load. The per-child probe targets each
+managed spec's own resolved endpoint and feeds the corresponding entry in
+`runtimes[]` instead; the two write disjoint fields and coexist on one agent
+process without conflict. What the gateway does with `runtimes[]`'s numbers
+once ingested — the context write-back and the per-server aggregate, both
+gated on the `runtime_model_probe` capability — is [Telemetry, Usage
+Analytics & Observability
+§8.3.2](telemetry-usage-observability.md#832-shared-ingest-core); what the
+Models catalog and routing do with the live active/queue is
+[§11.7](#117-live-runtime-state-on-the-models-catalog) and [Routing & Model
+Selection §3](routing-and-model-selection.md#3-candidate-scoring).
 
 The registry's `subscribe` copies the current snapshot **and** registers the
 subscriber channel under a single lock acquisition, so no publish between the two
@@ -4369,6 +4507,31 @@ gateway process dies between the drain and the restore, every model on that
 server stays `force_stopped` until an operator clears it by hand**
 ([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
 
+### 11.7 Live runtime state on the Models catalog
+
+The Models catalog's server list — `GET /api/portal/model-servers` and its
+`/events` SSE sibling, the ordinary "which servers offer this model" screen
+every application type uses, **not** the `server_agent`-only runtime admin
+screen of §11.1–§11.6 — shows a `server_agent` mapping's live per-instance
+state, context size and active/queue counts too. These are
+**gateway-injected** onto the same `ModelServerDTO` rows the portal
+`Service` builds, mirroring how `Priority` is already left zero by the
+service layer and filled in by the gateway's own live-ranking pass
+(`rankModelServers`). `injectRuntimeModelState`
+(`internal/gateway/portal_model_endpoints.go`) resolves each row's mapping
+to its runtime spec (`RuntimeSpecByMapping`) and joins that spec id against
+the same volatile per-server `RuntimeStatus` snapshot [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)
+describes, filling `state`/`active_requests`/`queue_depth`; best-effort and
+nil-safe throughout — a mapping with no spec, or a spec with no published
+status yet, just leaves the row's zero value, never an error. It runs at
+**both** the plain `GET` and the SSE compute closure, so a live subscriber
+sees the same fields a fresh poll would. The frontend renders `state`
+through the identical `runtimeStateBadge`/`runtimeStateLabel` pair the
+runtime admin screen uses — extracted to a shared `runtimeState.ts` so the
+two screens cannot render the same state in two different colors — with a
+loading indicator on `starting`, alongside the context size and live
+active/queue.
+
 ## 12. The timeout budget
 
 Five bounds sit on one request to a cold managed model, and they are only
@@ -4456,8 +4619,12 @@ operator meets first:
   refresh: a file-mode agent re-reports when its file changes, but the portal
   picks that up only on a remount or navigation. Live status, which changes second
   by second, rides the SSE stream instead.
-- **The models list does not surface agent-managed runtime state** — "currently
-  loading" and "last load failed" are visible only on the runtime admin screen.
+- **The models list surfaces live state and load, but not `last_error`.**
+  [§11.7](#117-live-runtime-state-on-the-models-catalog) puts a mapping's
+  live state/context/active/queue on the Models catalog; "last load failed"
+  — `runtimes[].last_error` — is still visible only on the runtime admin
+  screen (§11.5), which is the only place that also lets an operator act on
+  it (force-start, inspect logs).
 - **Windows stop is kill-only.** Managed processes are started with
   `exec.Command` (never `CommandContext`) and, on unix, in their own process
   group so a stop signal reaches the whole tree; the platform-specific calls live
@@ -4942,4 +5109,4 @@ mechanics of the generated agent config document are in
 - [HTTP API Surface](../reference/api-surface.md) and
   [Data Model](../reference/data-model.md) — the wire contracts and the schema.
 - [Architecture Decisions](../09-architecture-decisions.md) — ADR-024 to
-  ADR-029.
+  ADR-029, and ADR-031 to ADR-036.

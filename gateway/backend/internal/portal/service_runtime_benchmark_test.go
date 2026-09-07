@@ -89,6 +89,14 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// spec, so they are never settable through PutRuntimeSpec.
 		"app_api_token_set":    true,
 		"app_api_token_header": true,
+		// effective_type/resolved_metrics_path/resolved_context_probe_path are
+		// READ-ONLY echoes (routing.EffectiveRuntimeSpecType +
+		// routing.DeriveProbePaths applied to type/metrics_path/
+		// context_probe_path below) so the portal can show what will actually
+		// be used; there is no way to set them directly, only their inputs.
+		"effective_type":              true,
+		"resolved_metrics_path":       true,
+		"resolved_context_probe_path": true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
@@ -155,6 +163,12 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APITokenSet:                 true, // read-only; must NOT appear in want below
 		APITokenHeaderSource:        string(routing.RuntimeAPITokenHeaderSourceCustom),
 		APITokenHeader:              "X-Upstream-Token",
+		Type:                        string(routing.RuntimeSpecTypeVLLM),
+		MetricsPath:                 "/metrics",
+		ContextProbePath:            "/v1/models",
+		EffectiveType:               string(routing.RuntimeSpecTypeVLLM), // read-only; must NOT appear in want below
+		ResolvedMetricsPath:         "/metrics",                          // read-only; must NOT appear in want below
+		ResolvedContextProbePath:    "/v1/models",                        // read-only; must NOT appear in want below
 	}
 	req := putRequestFromDTO(dto)
 	want := PutRuntimeSpecRequest{
@@ -181,6 +195,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APITokenMode:                dto.APITokenMode,
 		APITokenHeaderSource:        dto.APITokenHeaderSource,
 		APITokenHeader:              dto.APITokenHeader,
+		Type:                        dto.Type,
+		MetricsPath:                 dto.MetricsPath,
+		ContextProbePath:            dto.ContextProbePath,
 	}
 	if !reflect.DeepEqual(req, want) {
 		t.Fatalf("putRequestFromDTO dropped or altered a field:\n got %#v\nwant %#v", req, want)

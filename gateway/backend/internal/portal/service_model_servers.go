@@ -27,6 +27,14 @@ type ModelServerDTO struct {
 	// resolver/activity/telemetry) computes and injects it after the fact.
 	Priority int `json:"priority"`
 
+	// State is the model's live runtime lifecycle ("running"/"starting"/... or "" when
+	// no agent-managed runtime status is known); ActiveRequests/QueueDepth are its live
+	// per-model load. Like Priority, Service.ModelServers leaves these zero/empty — the
+	// gateway layer injects them from the runtime-status registry after the fact.
+	State          string `json:"state"`
+	ActiveRequests int    `json:"active_requests"`
+	QueueDepth     int    `json:"queue_depth"`
+
 	GenTokensPerSecond           float64    `json:"gen_tokens_per_second"`
 	PromptTokensPerSecond        float64    `json:"prompt_tokens_per_second"`
 	LoadTimeMS                   int        `json:"load_time_ms"`

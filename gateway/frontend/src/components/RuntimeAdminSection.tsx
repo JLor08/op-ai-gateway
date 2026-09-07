@@ -59,6 +59,7 @@ import { useResource } from './shared/useResource';
 import { ResourceFallback, resourceState } from './shared/ResourceFallback';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
+import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
@@ -213,32 +214,13 @@ function emptySpec(mappingId: string): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    type: '',
+    metrics_path: '',
+    context_probe_path: '',
+    effective_type: '',
+    resolved_metrics_path: '',
+    resolved_context_probe_path: '',
   };
-}
-
-// The nine RuntimeState wire values (server-agent/internal/runtime/types.go)
-// mapped to their labels. NOTE the deliberate name/value mismatch on
-// `pending_vram_unknown`: the enum value is the long one, the i18n key is the
-// shorter `runtimeStatePendingVram`. Neither is renamed here -- this map is
-// exactly the place where the two vocabularies meet.
-const runtimeStateLabelByValue: Record<string, MessageKey> = {
-  stopped: 'runtimeStateStopped',
-  starting: 'runtimeStateStarting',
-  running: 'runtimeStateRunning',
-  draining: 'runtimeStateDraining',
-  backoff: 'runtimeStateBackoff',
-  start_failed: 'runtimeStateStartFailed',
-  crashed: 'runtimeStateCrashed',
-  pending_vram_unknown: 'runtimeStatePendingVram',
-  not_permitted: 'runtimeStateNotPermitted',
-};
-
-// A state this portal build does not know (a newer agent) renders its raw wire
-// value rather than a misleading label -- the same forward-compat fallback
-// runtimeWarningLabelByCode above uses.
-function runtimeStateLabel(state: string, t: Translation): string {
-  const key = runtimeStateLabelByValue[state];
-  return key ? t[key] : state;
 }
 
 // The file-mode `parse_error` codes, mapped to the sentence the operator
@@ -262,7 +244,7 @@ const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
   read_failed: 'runtimeParseErrorReadFailed',
 };
 
-// Unlike runtimeStateLabel above, an unrecognised value does NOT fall back to
+// Unlike runtimeStateLabel (shared/runtimeState.ts), an unrecognised value does NOT fall back to
 // the raw wire value: the whole point of the closed set is that the operator
 // is never shown an identifier. A code this build does not know -- a newer
 // agent, the agent's `unclassified` floor, or the gateway's generic constant
@@ -270,21 +252,6 @@ const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
 function runtimeParseErrorReason(code: string, t: Translation): string {
   const key = runtimeParseErrorReasonByCode[code];
   return key ? t[key] : t.runtimeParseErrorUnknown;
-}
-
-// The portal has exactly THREE status colours: the theme defines
-// success/watch/standby pairs and nothing else (theme/ThemeRoot.tsx), and
-// statusClassByKey collapses `error`/`disabled`/`expired` onto standby
-// (components/shared/status.ts) -- there is no red anywhere in the portal, and
-// adding one is a portal-wide design change, not this screen's call. So the
-// colour can only carry the three coarse facts it genuinely has (loaded /
-// on its way / neither), and the LABEL carries the rest. `last_error` -- "the
-// last load attempt failed" -- is not a state at all and gets its own column.
-function runtimeStateBadge(state: string): BadgeStatus {
-  if (state === 'running') return 'active';
-  // Both are "waiting to be loaded", the user-visible "currently loading".
-  if (state === 'starting' || state === 'pending_vram_unknown') return 'watch';
-  return 'standby';
 }
 
 /**
@@ -504,12 +471,14 @@ function narrowReportConfig(config: unknown): ReportConfig {
 // field list: a field added to RuntimeSpec later carries through by itself
 // instead of being silently dropped here.
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
-  // api_token_set/app_api_token_set/app_api_token_header are READ-ONLY echoes
-  // (PutRuntimeSpecRequest excludes them, same as configured/id/mapping_id) --
-  // dropped here too so an override click never round-trips them back as if
-  // they were writable. api_token_mode/api_token_header_source/api_token_header
-  // DO belong in `rest`: an override must preserve them unchanged, exactly
-  // like every other field this full-document PUT carries verbatim.
+  // api_token_set/app_api_token_set/app_api_token_header and the RuntimeSpec
+  // Type block's own effective_type/resolved_metrics_path/
+  // resolved_context_probe_path are READ-ONLY echoes (PutRuntimeSpecRequest
+  // excludes all six, same as configured/id/mapping_id) -- dropped here too
+  // so an override click never round-trips them back as if they were
+  // writable. type/metrics_path/context_probe_path (the writable trio) DO
+  // belong in `rest`: an override must preserve them unchanged, exactly like
+  // every other field this full-document PUT carries verbatim.
   const {
     configured,
     id,
@@ -517,6 +486,9 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     api_token_set,
     app_api_token_set,
     app_api_token_header,
+    effective_type,
+    resolved_metrics_path,
+    resolved_context_probe_path,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -2170,6 +2142,15 @@ export function RuntimeAdminSection({
   const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
   const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
+  // RuntimeSpec Type: the explicit runtime-server kind ('' = auto-detect from
+  // `binary`) plus the two per-type probe-path overrides. Mirrors the
+  // api_token_mode trio above -- writable state here, the resolved values
+  // (effective_type/resolved_metrics_path/resolved_context_probe_path) are
+  // read straight from the loaded spec at render time (see `currentSpec`
+  // below), never copied into state, since nothing here ever writes them.
+  const [specType, setSpecType] = useState<RuntimeSpec['type']>('');
+  const [metricsPath, setMetricsPath] = useState('');
+  const [contextProbePath, setContextProbePath] = useState('');
 
   /**
    * The newest VRAM measurement this mapping has, for the per-GPU APPLY
@@ -2252,6 +2233,9 @@ export function RuntimeAdminSection({
     setApiTokenCleared(false);
     setApiTokenRotate(false);
     setGpuRows([]);
+    setSpecType('');
+    setMetricsPath('');
+    setContextProbePath('');
   }
 
   function hydrateSpecFields(spec: RuntimeSpec) {
@@ -2290,6 +2274,9 @@ export function RuntimeAdminSection({
     setSpecApiFlavors([...spec.api_flavors]);
     setSpecResponsesMode(spec.responses_mode);
     setSpecMessagesMode(spec.messages_mode);
+    setSpecType(spec.type);
+    setMetricsPath(spec.metrics_path);
+    setContextProbePath(spec.context_probe_path);
   }
 
   function openCreate() {
@@ -2580,6 +2567,9 @@ export function RuntimeAdminSection({
       api_flavors: specApiFlavors,
       responses_mode: specResponsesMode,
       messages_mode: specMessagesMode,
+      type: specType,
+      metrics_path: metricsPath.trim(),
+      context_probe_path: contextProbePath.trim(),
     };
   }
 
@@ -3632,6 +3622,69 @@ export function RuntimeAdminSection({
               onChange={(e) => setBinary(e.target.value)}
               required
               placeholder="/usr/local/bin/llama-server"
+            />
+            {/* RuntimeSpec Type: explicit backend kind ('' = auto-detect from
+                `binary` above), plus the per-type metrics/context-probe path
+                overrides. Mirrors the api_token_mode SelectField below --
+                writable state, options from i18n. The read-only echoes right
+                after it (effective_type/resolved_metrics_path/
+                resolved_context_probe_path) show what the backend actually
+                resolves these three to, straight from the loaded spec
+                (`currentSpec`) rather than form state, since nothing here
+                ever writes them -- so an operator relying on Auto still sees
+                the detected outcome without guessing. */}
+            <SelectField
+              id="runtime-spec-type"
+              label={t.runtimeSpecType}
+              value={specType}
+              onChange={(e) => setSpecType(e.target.value as RuntimeSpec['type'])}
+              sx={{ maxWidth: 340 }}
+            >
+              <option value="">{t.runtimeSpecTypeAuto}</option>
+              <option value="vllm">{t.runtimeSpecTypeVllm}</option>
+              <option value="llama_cpp">{t.runtimeSpecTypeLlamaCpp}</option>
+              <option value="tgi">{t.runtimeSpecTypeTgi}</option>
+              <option value="ollama">{t.runtimeSpecTypeOllama}</option>
+              <option value="custom">{t.runtimeSpecTypeCustom}</option>
+            </SelectField>
+            <Field
+              id="runtime-spec-metrics-path"
+              label={t.runtimeSpecMetricsPath}
+              value={metricsPath}
+              onChange={(e) => setMetricsPath(e.target.value)}
+              helperText={t.runtimeSpecMetricsPathHelp}
+            />
+            <Field
+              id="runtime-spec-context-probe-path"
+              label={t.runtimeSpecContextProbePath}
+              value={contextProbePath}
+              onChange={(e) => setContextProbePath(e.target.value)}
+              helperText={t.runtimeSpecContextProbePathHelp}
+            />
+            <Field
+              id="runtime-spec-effective-type"
+              label={t.runtimeSpecEffectiveType}
+              value={currentSpec?.effective_type ?? ''}
+              // See the vram-benchmark read-only Field above: the no-op
+              // matters because jsdom's fireEvent.change fires even on a
+              // readOnly input.
+              onChange={() => {}}
+              readOnly
+              sx={{ maxWidth: 340 }}
+            />
+            <Field
+              id="runtime-spec-resolved-metrics-path"
+              label={t.runtimeSpecResolvedMetricsPath}
+              value={currentSpec?.resolved_metrics_path ?? ''}
+              onChange={() => {}}
+              readOnly
+            />
+            <Field
+              id="runtime-spec-resolved-context-probe-path"
+              label={t.runtimeSpecResolvedContextProbePath}
+              value={currentSpec?.resolved_context_probe_path ?? ''}
+              onChange={() => {}}
+              readOnly
             />
             <Field
               id="runtime-spec-args"

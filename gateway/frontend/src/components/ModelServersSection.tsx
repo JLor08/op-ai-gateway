@@ -7,6 +7,7 @@ import { PortalApiError, type ModelOption, type ModelServerRow } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
+import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { makeVisionColumn } from './shared/visionColumn';
 import type { RowAction } from './shared/RowActionsMenu';
@@ -17,9 +18,11 @@ import { formatPortalError } from './shared/format';
 /**
  * Per-model detail sub-view: the servers offering a gateway model, each with its
  * mapping's benchmark metrics, a LIVE loaded indicator (fed by SSE), a LIVE "Prio"
- * rank (fed by a ~3s poll), and a "Laden" (load) row action gated on can_load /
- * loaded / server-idle. A full ListTable (search / filter / sort / columns), the
- * same as every other admin list.
+ * rank (fed by a ~3s poll), a LIVE runtime-state badge + active/queue counts (also
+ * SSE-fed, sharing the state vocabulary RuntimeAdminSection's "Live status" column
+ * uses), and a "Laden" (load) row action gated on can_load / loaded / server-idle.
+ * A full ListTable (search / filter / sort / columns), the same as every other
+ * admin list.
  *
  * Live: on mount it fetches the offering list, then subscribes to the per-model SSE
  * (snapshot + update frames) AND starts a ~3s poll that re-fetches the same list so
@@ -143,6 +146,47 @@ export function ModelServersSection({
         ) : (
           <StatusChip status="standby" label={t.modelServerNotLoaded} />
         ),
+    },
+    {
+      // The live per-model runtime lifecycle (SSE-fed, same as `loaded` above):
+      // "starting"/"pending_vram_unknown" is the user-visible "currently
+      // loading", distinct from the benchmark-derived `loaded` flag, which only
+      // ever flips once a load finishes. "" means no agent-managed runtime
+      // status is known for this (server, mapping) — rendered as "unknown"
+      // rather than a misleading "stopped". Reuses the SAME badge/label
+      // vocabulary as RuntimeAdminSection's "Live status" column
+      // (shared/runtimeState.ts) so the two screens never drift apart.
+      id: 'state',
+      label: t.runtimeLiveStatus,
+      value: (r) => (r.state ? runtimeStateLabel(r.state, t) : t.runtimeStatusUnknown),
+      filter: 'enum',
+      searchable: false,
+      render: (r) =>
+        r.state ? (
+          <StatusChip status={runtimeStateBadge(r.state)} label={runtimeStateLabel(r.state, t)} />
+        ) : (
+          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+        ),
+    },
+    {
+      // Live per-model load (SSE-fed): how many requests are in flight on this
+      // (server, mapping) right now. 0 is a real, meaningful value (idle) —
+      // unlike the benchmark metrics below, it is never rendered as "-".
+      id: 'active',
+      label: t.modelServerColActive,
+      numeric: true,
+      value: (r) => String(r.active_requests),
+      render: (r) => String(r.active_requests),
+    },
+    {
+      // Live per-model load (SSE-fed): how many requests are waiting for
+      // admission on this (server, mapping) right now. Same "0 is real" rule
+      // as `active` above.
+      id: 'queue',
+      label: t.modelServerColQueue,
+      numeric: true,
+      value: (r) => String(r.queue_depth),
+      render: (r) => String(r.queue_depth),
     },
     {
       id: 'genTps',

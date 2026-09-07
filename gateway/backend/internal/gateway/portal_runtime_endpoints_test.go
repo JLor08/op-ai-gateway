@@ -142,6 +142,23 @@ func TestHandlePortalMappingRuntimeSpecPutBadFlavorReturns400(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400 pins the WIRE
+// contract of portal.ErrRuntimeSpecTypeInvalid, mirroring
+// TestHandlePortalMappingRuntimeSpecPutBadFlavorReturns400 above.
+func TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","type":"bogus"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.type_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.type_invalid", code)
+	}
+}
+
 func TestHandlePortalMappingRuntimeSpecPutBadVisibleDevicesModeReturns400(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)

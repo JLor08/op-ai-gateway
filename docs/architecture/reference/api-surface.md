@@ -134,7 +134,7 @@ request still passes every admission gate — are in
 | Path | Methods | Auth notes | Purpose |
 |---|---|---|---|
 | `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller |
-| `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; SSE push on load-state change |
+| `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; for a `server_agent` mapping, also its live per-instance `state`/`active_requests`/`queue_depth` (gateway-injected from the volatile runtime-status registry, both on the plain GET and the SSE compute closure); SSE push on load-state change |
 | `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
 | `/api/portal/model-settings/{name}` | PUT | **`admin`** | Set a model's visibility |
@@ -256,8 +256,14 @@ Conventions worth stating, because each is a judgement call a client depends on:
   server-wide list with no per-application filter, and must join rows back to
   operator-facing names itself via `spec_id → spec.mapping_id → mapping`. Row
   shape: `{spec_id, model, state, since, pid?, port?, in_flight, restarts,
-  gpus?, measured_at?, last_error?}` with `last_error = {message, at, exit_code,
-  failures, stderr_tail?}` and `gpus = [{index, vram_measured_mb}]`.
+  context_size, active_requests, queue_depth, gpus?, measured_at?,
+  last_error?}` with `last_error = {message, at, exit_code, failures,
+  stderr_tail?}` and `gpus = [{index, vram_measured_mb}]`. Unlike `gpus`/
+  `measured_at` (below), `context_size`/`active_requests`/`queue_depth` are
+  **never omitted** — they are the per-child probe's result (§10 of
+  [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
+  and `0` is their honest pre-probe/unsupported value, not an absence to
+  special-case.
 - **`gpus`/`measured_at` are a watermark, and they are omitted together.**
   `measured_at` is the **gateway's** arrival time for the frame that carried the
   measurement, not the agent's self-reported `reported_at`; a frame that measured
@@ -298,7 +304,7 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
@@ -370,6 +376,22 @@ this endpoint; the two mode rules (`visible_devices_mode_invalid`,
 instead degrades an unknown or empty `visible_devices_mode` to `env` rather
 than refusing it. See
 [agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement).
+
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `type` (`""` | `"vllm"` |
+`"llama_cpp"` | `"tgi"` | `"ollama"` | `"custom"`, empty = auto-detect from
+`binary`) and the operator's own raw `metrics_path`/`context_probe_path`
+overrides (empty = use the resolved type's own default). The **GET**
+response additionally echoes three **read-only** fields —
+`effective_type`, `resolved_metrics_path`, `resolved_context_probe_path` —
+the outcome of `routing.EffectiveRuntimeSpecType` +
+`routing.DeriveProbePaths` against the stored `type`/overrides, so a client
+relying on auto-detect can render what the agent will actually use without
+recomputing the per-type table itself; these three are never accepted on the
+PUT. `runtime_spec.type_invalid` (400) rejects a `type` that is neither empty
+(auto-detect) nor one of the five named kinds above, checked before any
+mutation like every other spec validation rule. See [Agent-Managed Model
+Runtime
+§3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
 
 `RuntimeSpecDTO` additionally carries the runtime-spec **API token** fields —
 see [agent-runtime-manager.md](../cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)
@@ -597,7 +619,13 @@ independent implementations must agree on:
   `work_dir`, `gpus[{index, vram_mb}]`, `listen_port`, `health_path`,
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
   `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
-  `visible_devices_mode`, `admin_state`;
+  `visible_devices_mode`, `admin_state`, `type`, `metrics_path`,
+  `context_probe_path` — the last three always **resolved, concrete**
+  values (`routing.EffectiveRuntimeSpecType` + `routing.DeriveProbePaths`
+  already applied gateway-side), never the raw stored `""` an
+  auto-detecting/default-using spec has on file, so the agent never
+  re-implements the per-type table itself ([Agent-Managed Model Runtime
+  §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation));
 - **`coresident` entries are SPEC ids, never mapping ids** — the mistake that
   would type-check and silently break admission;
 - **`etag` is a deterministic digest over the document's own content** —

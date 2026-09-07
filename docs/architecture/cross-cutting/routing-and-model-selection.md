@@ -339,12 +339,19 @@ still serve. Order matters — later filters see only what survived earlier ones
 | 3 | Capacity cap (CP3) | keep candidates whose server is below its *effective cap* = `MaxConcurrency − reservedSessions(server)`; unknown `MaxConcurrency` (0) never caps | on empty **and** an admission controller is wired → queue (§6) instead of falling open; otherwise fail-open (warn) |
 | 4 | Swap-protection | drop a **not-already-loaded** candidate whose server is actively serving (a request in flight, or completed within `swap_protect_window_seconds`) — loading it now would evict a resident model | on empty, or no viable survivor, fail-open (warn) |
 | 5 | Prefer-loaded (dominant, not a filter) | if any survivor already has the requested model resident, that partition is preferred over the rest — but only if it yields a Score-viable pick | fails open to the full pool otherwise |
-| 6 | `argmaxByScore` | pick the highest `Score()` (below) among what remains | `ok=false` → `ErrNoHealthyHost` |
+| 6 | Prefer-starting (dominant, not a filter) | below prefer-loaded: if any survivor's requested model is currently `starting` (loading) on its server, per the live per-model runtime state, that partition is preferred over cold-starting a stopped one — again only if it yields a Score-viable pick | fails open to the full pool otherwise |
+| 7 | `argmaxByScore` | pick the highest `Score()` (below) among what remains | `ok=false` → `ErrNoHealthyHost` |
 
-Filters 3–5 are all gated on optional collaborators (`ServerActivityChecker`,
-`LoadedModelChecker`) being wired; with none wired, resolution is exactly the
-filter-1 → filter-6 path (the pre-capacity, pre-swap-protection behavior),
-which is the intentional no-op invariant these features were added under.
+Filters 3–6 are all gated on optional collaborators (`ServerActivityChecker`,
+`LoadedModelChecker`, `RuntimeModelStateChecker`) being wired; with none
+wired, resolution is exactly the filter-1 → filter-7 path (the pre-capacity,
+pre-swap-protection behavior), which is the intentional no-op invariant these
+features were added under. Filter 6 can never fire ahead of filter 5: a
+`StateRunning` instance is always in the loaded set already (the agent's
+`loaded_models` list is `StateRunning`-only, [Agent-Managed Model Runtime
+§10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
+so "running beats starting" holds structurally, not by ordering discipline
+alone.
 
 ### 3.1 The score function
 
@@ -364,6 +371,22 @@ The viability gate runs **before** the tiebreak: a candidate whose live
 health/load penalties already sank it to ≤0 is excluded outright, so a fast
 benchmark score can never rescue a degraded server. `validTelemetry` also
 rejects negative counters or an out-of-range/`NaN`/`Inf` error rate outright.
+
+**`activeRequests`/`queueDepth` are per-server telemetry by default, but a
+live per-model figure overrides them when one exists.**
+`mergeRuntimeModelMetrics` (`resolver.go`) asks the optional
+`RuntimeModelStateChecker` for *this candidate's own* live active/queue —
+sourced from the volatile runtime-status registry a `server_agent`'s
+per-child probe feeds, keyed by upstream model name rather than server id —
+and, when it answers, overlays those two counters onto the server telemetry
+before `Score()` runs; a candidate with no such data (a legacy agent, or a
+model with no managed spec) keeps the plain per-server figures unchanged, the
+same nil-checker no-op every optional collaborator in this chapter follows.
+This runs at **both** `argmaxByScore` call sites — ordinary resolution and
+`ScoreModelServers` (below) — so a busy model on an otherwise idle
+multi-model server is scored by its OWN load, not diluted by its
+server-mates' idle counters. See [Agent-Managed Model Runtime
+§11.7](agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog).
 
 `metricTiebreak` (capped at `genThroughputBonusCap(50) +
 promptThroughputBonusCap(20) + mtpBonus(30) = 100`, well under the 200-point
@@ -650,7 +673,19 @@ gated by `metrics_locked` (a manually-pinned mapping never auto-overwrites):
 |---|---|---|---|
 | **Benchmark run** | `"benchmark"` | cold-minus-warm load time, generation/prompt tok/s (`measureMapping` / `measureSpeedTarget`) | manual or scheduled (below) |
 | **Opportunistic EWMA** | `"opportunistic"` | gen/prompt tok/s, blended (α=0.2) from every successful **real** inference on an app with `OpportunisticMetricsEnabled` | every live request, no explicit run |
-| **Context probe** | (context-size fields only) | usable context window, via the app's `context_probe_path` (e.g. llama.cpp `/props`) | during a benchmark's warm pass, or standalone (`startContextProbe`) |
+| **Context probe** | `"probe"` (context-size fields only — throughput/vision/etc. are untouched) | usable context window: via the application's `context_probe_path` (e.g. llama.cpp `/props`), **or**, for a `server_agent` mapping, the agent's per-child probe against the mapping's runtime spec's own resolved `context_probe_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | during a benchmark's warm pass, standalone (`startContextProbe`), or — the agent path — every telemetry cycle the agent reports a changed value |
+
+Both context-probe triggers land through the **same** store method
+(`UpdateMappingContextProbe`), which is why they share one `metrics_source`
+value — there is no separate provenance for "the agent measured this" versus
+"the application-level probe measured this", and no `"agent"` value exists.
+A `server_agent` mapping's **live** `active_requests`/`queue_depth` are
+deliberately **absent from this table entirely**: unlike every metric above,
+they are never written to a mapping row at all, so they carry no
+`metrics_source` and are never subject to `metrics_locked` — they are read
+live from the volatile runtime-status registry instead (§3.1 above,
+[Telemetry, Usage Analytics &
+Observability](telemetry-usage-observability.md#832-shared-ingest-core)).
 
 **Benchmark trigger modes:**
 
@@ -760,3 +795,7 @@ See [Configuration](configuration.md) for the full variable list.
   the `ServerTelemetry` this chapter scores against, and how it is produced.
 - [Persistence](persistence.md) — the `Store` interface and its SQLite/
   PostgreSQL/memory implementations.
+- [Agent-Managed Model Runtime](agent-runtime-manager.md) — `RuntimeSpec.Type`
+  and per-kind probe-path derivation (§3.4), the volatile runtime-status
+  registry the live per-model metrics and prefer-starting preference read
+  (§10), and the Models catalog's own live-state injection (§11.7).

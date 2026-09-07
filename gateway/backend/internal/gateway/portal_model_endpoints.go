@@ -68,6 +68,68 @@ func (s *Server) rankModelServers(ctx context.Context, model string) map[string]
 	return ranks
 }
 
+// injectRuntimeModelState fills each row's live State/ActiveRequests/QueueDepth from the
+// volatile runtime-status registry, mirroring how rankModelServers' caller injects
+// Priority: Service.ModelServers always leaves these zero/empty because only the
+// gateway layer holds the registry + routing store needed to resolve them.
+//
+// Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a mapping with no
+// runtime spec, or a spec with no published status all just leave the row's zero value —
+// never an error, and never a reason to fail the whole list. Each distinct ServerID's
+// status snapshot is fetched at most once (statusSnapshot copies its whole per-server
+// slice), then indexed by spec id so every row in that server is a cheap map lookup.
+func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.ModelServerDTO) {
+	if s.RuntimeStatus == nil || s.Routes == nil {
+		return
+	}
+	byServer := map[string]map[string]RuntimeStatusDTO{}
+	for i := range rows {
+		statuses := s.runtimeStatusesForServer(byServer, rows[i].ServerID)
+		s.injectRowRuntimeState(ctx, &rows[i], statuses)
+	}
+}
+
+// runtimeStatusesForServer returns serverID's runtime-status snapshot indexed by spec id,
+// building it from s.RuntimeStatus.statusSnapshot on first use and caching the result in
+// byServer so each distinct server's snapshot (a copy of its whole per-server slice) is
+// fetched at most once across the whole rows loop.
+func (s *Server) runtimeStatusesForServer(byServer map[string]map[string]RuntimeStatusDTO, serverID string) map[string]RuntimeStatusDTO {
+	if m, ok := byServer[serverID]; ok {
+		return m
+	}
+	m := make(map[string]RuntimeStatusDTO)
+	for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
+		m[dto.SpecID] = dto
+	}
+	byServer[serverID] = m
+	return m
+}
+
+// injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth from statuses (row's
+// owning server's runtime-status snapshot indexed by spec id), resolving row's runtime spec
+// to find the right entry. Best-effort and nil-safe: a mapping with no runtime spec, or a
+// spec with no published status, just leaves the row's zero value.
+func (s *Server) injectRowRuntimeState(ctx context.Context, row *portal.ModelServerDTO, statuses map[string]RuntimeStatusDTO) {
+	spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
+	if err != nil || !ok {
+		return // best-effort: no spec for this mapping, or lookup failed — leave zero
+	}
+	dto, ok := statuses[spec.ID]
+	if !ok {
+		return
+	}
+	// State (the loading indicator) is valid for any runtime_manager agent, so it is
+	// injected unconditionally. Active/queue, however, are only real when the reporting
+	// agent declared runtime_model_probe: for a non-probing agent they default to a
+	// fabricated 0, so gate their injection on the flag and otherwise leave the row's
+	// counts at their zero value (same root cause as the routing metricsOK gate).
+	row.State = dto.State
+	if s.AgentFeatures.Has(row.ServerID, runtimeModelProbeFeature) {
+		row.ActiveRequests = dto.ActiveRequests
+		row.QueueDepth = dto.QueueDepth
+	}
+}
+
 // handlePortalModelServers lists the servers that offer a gateway model (?name=<model>) with the
 // mapping's benchmark metrics + live loaded-state + a can_load flag. gateway:use, global (mirrors
 // handlePortalModels). The model name is a query param because a gateway model name may contain '/'.
@@ -89,6 +151,7 @@ func (s *Server) handlePortalModelServers(w http.ResponseWriter, r *http.Request
 	for i := range rows {
 		rows[i].Priority = ranks[rows[i].MappingID]
 	}
+	s.injectRuntimeModelState(r.Context(), rows)
 	writeJSON(w, http.StatusOK, map[string]any{"data": rows})
 }
 
@@ -127,6 +190,7 @@ func (s *Server) handlePortalModelServersEvents(w http.ResponseWriter, r *http.R
 		for i := range rows {
 			rows[i].Priority = ranks[rows[i].MappingID]
 		}
+		s.injectRuntimeModelState(r.Context(), rows)
 		return rows
 	}
 	// Subscribe BEFORE the snapshot, not after. The registry's channel is

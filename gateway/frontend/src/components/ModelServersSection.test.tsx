@@ -32,6 +32,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-a',
       loaded: true,
       can_load: true,
+      state: 'running',
+      active_requests: 5,
+      queue_depth: 3,
       gen_tokens_per_second: 42.5,
       prompt_tokens_per_second: 210,
       load_time_ms: 1200,
@@ -51,6 +54,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-b',
       loaded: false,
       can_load: false,
+      state: '',
+      active_requests: 0,
+      queue_depth: 0,
       gen_tokens_per_second: 11.1,
       prompt_tokens_per_second: 90,
       load_time_ms: 800,
@@ -70,6 +76,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-c',
       loaded: false,
       can_load: true,
+      state: 'starting',
+      active_requests: 0,
+      queue_depth: 3,
       gen_tokens_per_second: 33.3,
       prompt_tokens_per_second: 150,
       load_time_ms: 950,
@@ -326,5 +335,65 @@ describe('ModelServersSection', () => {
     expect(within(rowFor('GPU-Box-C')).getByText(t.tableModelVision)).toBeInTheDocument();
     expect(within(rowFor('GPU-Box-A')).getByText('–')).toBeInTheDocument();
     expect(within(rowFor('GPU-Box-B')).getByText('–')).toBeInTheDocument();
+  });
+
+  it("shows a loading indicator for a 'starting' row and the matching badge for the other live states", async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // rowC is 'starting' → the same "currently loading" badge/label
+    // RuntimeAdminSection's Live-status column renders for that state (shared
+    // via components/shared/runtimeState.ts). Also assert the chip's
+    // data-status KEY (StatusChip.tsx's documented
+    // getByText(label).toHaveAttribute('data-status', key) pattern, mirrored
+    // from RuntimeAdminSection.test.tsx) so a dropped runtimeStateBadge(r.state)
+    // call — which would flatten every chip to one fixed grey key — fails here,
+    // not just a missing label.
+    expect(within(rowFor('GPU-Box-C')).getByText(t.runtimeStateStarting)).toHaveAttribute(
+      'data-status',
+      'watch',
+    );
+    // rowA is 'running' → the active badge.
+    expect(within(rowFor('GPU-Box-A')).getByText(t.runtimeStateRunning)).toHaveAttribute(
+      'data-status',
+      'active',
+    );
+    // rowB has no runtime status ('') → the neutral "unknown" badge, not a
+    // misleading "stopped".
+    expect(within(rowFor('GPU-Box-B')).getByText(t.runtimeStatusUnknown)).toHaveAttribute(
+      'data-status',
+      'standby',
+    );
+  });
+
+  it('shows the live active/queue counts and the context size', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-A');
+
+    // Pin each value to its OWN column by cell position rather than asserting
+    // getByText independently for each — a swap of the active/queue column
+    // `render` functions would still leave both numbers present somewhere in
+    // the row. Indices follow the default-visible `columns` order declared in
+    // ModelServersSection.tsx (defaultHidden columns excluded): 0 prio,
+    // 1 server, 2 loaded, 3 state, 4 active, 5 queue, 6 genTps, 7 promptTps,
+    // 8 loadTime, 9 context.
+    const cells = within(rowFor('GPU-Box-A')).getAllByRole('cell');
+    // active_requests=5, queue_depth=3, context_size=32768 (makeRows' rowA).
+    expect(cells[4]).toHaveTextContent('5');
+    expect(cells[5]).toHaveTextContent('3');
+    expect(cells[9]).toHaveTextContent('32768');
+  });
+
+  it('renders 0 active/queue as the real value, not a placeholder dash', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-B');
+
+    // rowB: active_requests=0, queue_depth=0 — a genuinely idle server, distinct
+    // from the "-" placeholder the benchmark-metric columns use for "unknown".
+    const rowB = within(rowFor('GPU-Box-B'));
+    expect(rowB.getAllByText('0')).toHaveLength(2);
   });
 });

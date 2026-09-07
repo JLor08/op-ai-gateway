@@ -250,6 +250,12 @@ function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    type: '',
+    metrics_path: '',
+    context_probe_path: '',
+    effective_type: '',
+    resolved_metrics_path: '',
+    resolved_context_probe_path: '',
     ...overrides,
   };
 }

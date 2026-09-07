@@ -95,6 +95,62 @@ func TestScoreModelServersRanksAndFlagsCapacity(t *testing.T) {
 	}
 }
 
+// ScoreModelServers must merge live per-model metrics (from a RuntimeModelStateChecker)
+// onto per-server telemetry before scoring, exactly as argmaxByScore does -- otherwise the
+// live per-model view shown for a model (used by the UI) would silently fall back to
+// whole-server load instead of this model's own. srv_a's per-server telemetry has 0 active
+// requests / 0 queue depth (so on telemetry alone it would score 1430 and beat srv_b's 1130
+// on priority, as in TestScoreModelServersRanksAndFlagsCapacity); the runtime-status
+// registry reports srv_a's MODEL as heavily loaded (active=20, queue=10) -- metrics that
+// DIFFER from its per-server telemetry -- which must be merged in and drop its score to
+// 730, flipping the ranking to srv_b.
+func TestScoreModelServersUsesPerModelMetrics(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	store := seededScoreServersStore(t, now)
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	resolver.SetRuntimeModelStateChecker(&fakeRuntimeState{byServer: map[string]fakeRuntimeStateEntry{
+		"srv_a": {state: "running", active: 20, queue: 10},
+		"srv_b": {state: "running", active: 0, queue: 0},
+	}})
+
+	scores, err := resolver.ScoreModelServers(context.Background(), "m1", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers returned error: %v", err)
+	}
+
+	var a, b CandidateScore
+	var foundA, foundB bool
+	for _, cs := range scores {
+		switch cs.MappingID {
+		case "map_a":
+			a, foundA = cs, true
+		case "map_b":
+			b, foundB = cs, true
+		}
+	}
+	if !foundA || !foundB {
+		t.Fatalf("expected both map_a and map_b in scores, got %+v", scores)
+	}
+
+	const wantA = 1000 + 20*20 + 50 - 20*25 - 10*20 - 100*0.2 // 730: per-model active=20/queue=10 merged in
+	const wantB = 1000 + 5*20 + 50 - 100*0.2                  // 1130: per-model metrics idle, telemetry unchanged
+	if a.Score != wantA {
+		t.Fatalf("a.Score = %v, want %v (per-model active=20/queue=10 must be merged into srv_a's score, not just its per-server telemetry's 0/0)", a.Score, wantA)
+	}
+	if b.Score != wantB {
+		t.Fatalf("b.Score = %v, want %v", b.Score, wantB)
+	}
+	if !a.Available || !b.Available {
+		t.Fatalf("expected both available (under cap, viable): a=%v b=%v", a.Available, b.Available)
+	}
+	// Without the per-model merge, srv_a would score 1430 on telemetry alone (priority
+	// beats srv_b's 1130, as in TestScoreModelServersRanksAndFlagsCapacity) -- the merge
+	// must flip the ranking.
+	if b.Score <= a.Score {
+		t.Fatalf("b.Score (%v) not > a.Score (%v): per-model metrics must flip the ranking that per-server telemetry alone would set", b.Score, a.Score)
+	}
+}
+
 func TestScoreModelServersUnknownModelReturnsEmpty(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	store := seededScoreServersStore(t, now)

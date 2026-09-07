@@ -507,7 +507,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-74-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-75-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -563,7 +563,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-74-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-75-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -643,4 +643,94 @@ so the operator's TLS posture is depended on, not verified.
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [§13](cross-cutting/agent-runtime-manager.md#13-known-limitations-and-accepted-risks),
 [Data Model §4](reference/data-model.md#runtime-spec-api-token),
+[API Surface](reference/api-surface.md#agent-managed-model-runtime).
+
+## ADR-036 — Runtime probing reuses the per-runtime channel; `Type` drives derivation; only context is durable
+**Context:** giving a `server_agent` mapping's own context window and live
+request load — one process among several a single agent manages — needed a
+carrier, a way to decide WHICH endpoints to probe per backend, and a
+persistence answer for two numbers with very different lifetimes: context
+size barely changes, active/queue changes every second. **Decision:**
+four choices, taken together. (1) **Reuse the existing per-runtime
+`RuntimeSample` channel** ([Telemetry
+§8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core))
+rather than a new array or endpoint: `ContextSize`/`ActiveRequests`/
+`QueueDepth` ride the same `runtimes[]` entries that already report
+`state`/`pid`/`port`/`restarts`/`gpus`, so every existing contract on that
+channel — full-snapshot replace, the absent-vs-empty rule, ingest ordering —
+applies unchanged with zero new wire surface. (2) **A new explicit
+`RuntimeSpec.Type`** (migration 75; `''` = auto-detect from `Binary`'s
+basename, else `custom`) is the single foundation both the metrics endpoint
+and the context endpoint derive from (`DeriveProbePaths`), instead of
+teaching the agent per-binary heuristics of its own; resolution happens
+**gateway-side** (`EffectiveRuntimeSpecType` + `DeriveProbePaths` in
+`internal/portal`) and only the RESOLVED, concrete paths are pushed to the
+agent — it never re-derives anything, it is handed exactly where to `GET`.
+An operator's own `metrics_path`/`context_probe_path` override always wins
+over the per-type default for its own field. (3) **Persist only the stable
+figure.** Context size is written onto the mapping through the
+**pre-existing** `UpdateMappingContextProbe` (provenance `"probe"` — the
+same value and the same method the application-level context probe already
+used, change-detected, respecting `metrics_locked`), while live
+active/queue stays strictly **volatile**, in the in-RAM `RuntimeStatus`
+registry that already never touches the database
+([§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+Routing and the Models catalog read it live — a new routing-owned
+`RuntimeModelStateChecker` adapter for scoring, and `injectRuntimeModelState`
+on the portal DTO for the catalog
+([§11.7](cross-cutting/agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog))
+— never through a per-mapping active/queue column. (4) **No new lifecycle
+state.** A loading instance is surfaced with the existing `StateStarting`
+value, and routing gains one new, strictly subordinate preference: prefer an
+already-`StateStarting` instance of the requested model over cold-starting a
+stopped one, below the dominant already-loaded (`StateRunning`) partition
+([Routing & Model Selection
+§3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring)).
+**Consequence:** the sample's wire shape grew by exactly three additive,
+non-`omitempty` ints, so an agent that never probes anything (or that predates
+this feature) is byte-identical to before on every OTHER field, and a
+consumer sees explicit zeros rather than an absent key to reason about.
+Because live load is never written to disk, a gateway restart or a stale
+agent shows no per-model active/queue for that mapping (routing falls back to
+per-server telemetry) rather than serving a plausible-looking but stale
+number — the same posture this feature's own VRAM measurements already take.
+Because `Type` drives both probe paths from one field, fixing the type alone
+(rather than hand-entering two endpoints) is normally enough, and the portal
+always shows the resolved outcome next to the raw override so an auto-detect
+result is never a guess. The new `runtime_model_probe` capability flag is
+declared unconditionally by any agent that probes at all — the agent gates
+none of its own behavior on it — and exists purely so the GATEWAY can tell a
+sample that genuinely probed its children from one whose zeros mean "this
+agent never fills this field": `ingestTelemetrySample` only writes the
+context-probe write-back and only sums `runtimes[]` into the per-server
+active/queue aggregate (replacing, never adding to, the legacy top-level
+scrape — see below) when the reporting sample's own capabilities name it.
+**Rejected:** a durable per-mapping active/queue column written every
+telemetry cycle (live load is not a fact worth a row history, and it is
+already served by the channel built for exactly that); a second top-level
+array for per-model probe results mirroring the agent-wide scraper's own
+fields (`runtimes[]` already is a per-model channel keyed by `spec_id`, and a
+second array reporting the same specs invites the two to disagree about
+which child is running); and a new lifecycle state for "loading" distinct
+from `StateStarting` (routing's own loaded-model list already treats
+`StateStarting` as not-yet-servable, so a second name for the same fact would
+need every existing consumer taught about it for no new information). Left
+deliberately unresolved by this decision, and not a regression it caused:
+`OP_AGENT_METRICS_URL`'s agent-wide, single-external-endpoint scrape
+(auto-detecting vLLM/llama.cpp counter names) is the pre-existing case for a
+*classic*, non-managed application; it feeds the sample's **top-level**
+`ActiveRequests`/`QueueDepth`, a disjoint field from anything `runtimes[]`
+carries, so the two mechanisms coexist on one agent process without
+conflict — see [Telemetry, Usage Analytics &
+Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-optional-inference-server-scraping).
+→ [Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
+[§11.7](cross-cutting/agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog),
+[Routing & Model Selection
+§3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
+[Telemetry, Usage Analytics & Observability
+§8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
+[Data Model §4](reference/data-model.md#4-migration-history-75-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).

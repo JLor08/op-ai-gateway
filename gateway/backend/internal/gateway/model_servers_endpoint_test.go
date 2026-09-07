@@ -390,3 +390,181 @@ func TestModelServersEndpointEventsSnapshotThenUpdate(t *testing.T) {
 		t.Fatalf("update data = %+v, want one loaded row", upd.Data)
 	}
 }
+
+// TestModelServersEndpointInjectsLiveRuntimeState: a mapping backed by a runtime spec with a
+// published RuntimeStatus surfaces that live State/ActiveRequests/QueueDepth on its
+// ModelServerDTO row -- proving injectRuntimeModelState is wired into
+// handlePortalModelServers, joining on RuntimeSpecByMapping(mapping) -> spec.ID ->
+// statusSnapshot(serverID), exactly like the existing Priority injection it sits beside.
+func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+	})
+	// The agent declares runtime_model_probe, so the per-model active/queue are
+	// real and get injected alongside State.
+	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if len(out.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(out.Data), out.Data)
+	}
+	row := out.Data[0]
+	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
+		t.Fatalf("row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+}
+
+// A server whose agent has NOT declared runtime_model_probe still gets its lifecycle
+// State injected (the loading indicator is valid for any runtime_manager agent), but its
+// active/queue -- a fabricated 0 for a non-probing agent -- must be left at zero rather
+// than injected. Same root cause as the routing metricsOK gate.
+func TestModelServersEndpointInjectsStateButNotMetricsWithoutProbeFeature(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_noflag"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+	})
+	// Deliberately do NOT declare runtime_model_probe for msServerID.
+
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if len(out.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(out.Data), out.Data)
+	}
+	row := out.Data[0]
+	if row.State != "starting" {
+		t.Fatalf("row.State = %q, want starting (State must inject even without the probe feature)", row.State)
+	}
+	if row.ActiveRequests != 0 || row.QueueDepth != 0 {
+		t.Fatalf("row metrics = (active=%d, queue=%d), want (0, 0) -- non-probing agent's active/queue must NOT be injected", row.ActiveRequests, row.QueueDepth)
+	}
+}
+
+// TestModelServersEndpointLeavesRuntimeStateZeroWithNoStatus: a mapping with no runtime spec
+// (and, separately, a server that has never published a RuntimeStatus) leaves the DTO's live
+// fields at their zero value -- best-effort, never a panic or an error response.
+func TestModelServersEndpointLeavesRuntimeStateZeroWithNoStatus(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	// Deliberately: no UpsertRuntimeSpec for msMappingID, no publish on s.RuntimeStatus.
+
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if len(out.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(out.Data), out.Data)
+	}
+	row := out.Data[0]
+	if row.State != "" || row.ActiveRequests != 0 || row.QueueDepth != 0 {
+		t.Fatalf("row live state = (state=%q, active=%d, queue=%d), want zero value with no runtime spec/status", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+}
+
+// TestModelServersEndpointEventsInjectsLiveRuntimeState: the SSE endpoint's `snapshot` frame
+// carries the same live State/ActiveRequests/QueueDepth injection as the plain GET handler --
+// proving injectRuntimeModelState is wired into the SSE compute() closure too, not just the GET
+// handler it sits beside (handlePortalModelServers). Mirrors
+// TestModelServersEndpointInjectsLiveRuntimeState's seeding/publish and
+// TestModelServersEndpointEventsSnapshotThenUpdate's SSE harness.
+func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_evt"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+	})
+	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/portal/model-servers/events?name="+url.QueryEscape(msModel), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reader := bufio.NewReader(resp.Body)
+
+	event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+	if event != "snapshot" {
+		t.Fatalf("first event = %q, want snapshot", event)
+	}
+	var snap struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(data), &snap); err != nil {
+		t.Fatalf("unmarshal snapshot: %v (%s)", err, data)
+	}
+	if len(snap.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(snap.Data), snap.Data)
+	}
+	row := snap.Data[0]
+	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
+		t.Fatalf("snapshot row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+}

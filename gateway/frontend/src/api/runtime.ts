@@ -97,6 +97,25 @@ export interface RuntimeSpec {
   api_flavors: string[];
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;
+  // Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
+  // "tgi" | "ollama" | "custom"); "" means auto-detect from `binary` --
+  // `effective_type` below is what that resolves to. Mirrors the Go
+  // RuntimeSpecDTO.Type / routing.RuntimeSpec.Type.
+  type: '' | 'vllm' | 'llama_cpp' | 'tgi' | 'ollama' | 'custom';
+  // metrics_path / context_probe_path are the operator's raw overrides ("" =
+  // use the type's default); see `resolved_metrics_path` /
+  // `resolved_context_probe_path` below for what they actually resolve to.
+  metrics_path: string;
+  context_probe_path: string;
+  // effective_type / resolved_metrics_path / resolved_context_probe_path are
+  // READ-ONLY echoes of the backend's auto-detection + per-type defaulting
+  // (routing.EffectiveRuntimeSpecType / routing.DeriveProbePaths): what the
+  // agent will actually use once type/metrics_path/context_probe_path
+  // resolve. Shown next to the raw fields above so an operator relying on
+  // auto-detect can see the outcome without guessing.
+  effective_type: string;
+  resolved_metrics_path: string;
+  resolved_context_probe_path: string;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim
@@ -118,6 +137,9 @@ export type PutRuntimeSpecRequest = Omit<
   | 'api_token_set'
   | 'app_api_token_set'
   | 'app_api_token_header'
+  | 'effective_type'
+  | 'resolved_metrics_path'
+  | 'resolved_context_probe_path'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
@@ -183,6 +205,9 @@ export interface RuntimeStatus {
   port?: number;
   in_flight: number;
   restarts: number;
+  context_size: number;
+  active_requests: number;
+  queue_depth: number;
   gpus?: RuntimeGPUStatus[];
   measured_at?: string;
   last_error?: RuntimeError;

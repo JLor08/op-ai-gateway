@@ -161,6 +161,12 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    type: '',
+    metrics_path: '',
+    context_probe_path: '',
+    effective_type: '',
+    resolved_metrics_path: '',
+    resolved_context_probe_path: '',
     ...overrides,
   };
 }
@@ -220,6 +226,9 @@ function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     since: '2026-07-16T12:00:00Z',
     in_flight: 0,
     restarts: 0,
+    context_size: 0,
+    active_requests: 0,
+    queue_depth: 0,
     ...overrides,
   };
 }
@@ -1832,6 +1841,9 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,
+    type: spec.type,
+    metrics_path: spec.metrics_path,
+    context_probe_path: spec.context_probe_path,
   };
 }
 
@@ -5920,6 +5932,93 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
     // No mapping exists yet, so there is nothing to read a history for.
     expect(fakeApi.mappingBenchmarks).not.toHaveBeenCalled();
+  });
+});
+
+// RuntimeSpec Type: the explicit backend-kind select (default '' / Auto),
+// the two per-type path overrides (metrics_path/context_probe_path), and the
+// read-only resolved echoes (effective_type/resolved_metrics_path/
+// resolved_context_probe_path) that show what the backend actually resolves
+// these to -- including in Auto mode. Mirrors the API-token mode block below.
+describe('RuntimeAdminSection RuntimeSpec Type + probe-path overrides', () => {
+  it('defaults the Type select to Auto and renders the override + resolved-echo fields on create', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    const typeCombo = screen.getByRole('combobox', { name: t.runtimeSpecType });
+    expect(typeCombo).toHaveTextContent(t.runtimeSpecTypeAuto);
+
+    expect((screen.getByLabelText(t.runtimeSpecMetricsPath) as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText(t.runtimeSpecContextProbePath) as HTMLInputElement).value).toBe(
+      '',
+    );
+
+    // No spec loaded yet on create, so the resolved echoes read blank -- but
+    // they are still rendered, read-only.
+    const effectiveField = screen.getByLabelText(t.runtimeSpecEffectiveType) as HTMLInputElement;
+    expect(effectiveField).toHaveAttribute('readonly');
+    expect(effectiveField.value).toBe('');
+    expect(
+      (screen.getByLabelText(t.runtimeSpecResolvedMetricsPath) as HTMLInputElement).value,
+    ).toBe('');
+    expect(
+      (screen.getByLabelText(t.runtimeSpecResolvedContextProbePath) as HTMLInputElement).value,
+    ).toBe('');
+  });
+
+  it('shows the resolved echoes from the loaded spec on edit', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          effective_type: 'llama_cpp',
+          resolved_metrics_path: '/metrics',
+          resolved_context_probe_path: '/props',
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+
+    expect((screen.getByLabelText(t.runtimeSpecEffectiveType) as HTMLInputElement).value).toBe(
+      'llama_cpp',
+    );
+    expect(
+      (screen.getByLabelText(t.runtimeSpecResolvedMetricsPath) as HTMLInputElement).value,
+    ).toBe('/metrics');
+    expect(
+      (screen.getByLabelText(t.runtimeSpecResolvedContextProbePath) as HTMLInputElement).value,
+    ).toBe('/props');
+  });
+
+  it('selecting a type and typing path overrides carries all three into the spec PUT body', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+
+    const typeCombo = screen.getByRole('combobox', { name: t.runtimeSpecType });
+    fireEvent.mouseDown(typeCombo);
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMetricsPath), {
+      target: { value: '/custom-metrics' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecContextProbePath), {
+      target: { value: '/custom-props' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('llama_cpp');
+    expect(putSpecs[0].body.metrics_path).toBe('/custom-metrics');
+    expect(putSpecs[0].body.context_probe_path).toBe('/custom-props');
   });
 });
 

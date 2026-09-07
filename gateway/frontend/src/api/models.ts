@@ -334,6 +334,14 @@ export type ModelServerRow = {
   mapping_id: string;
   loaded: boolean;
   can_load: boolean;
+  // Live runtime lifecycle ("running"/"starting"/... or "" when no agent-managed
+  // runtime status is known); active_requests/queue_depth are its live per-model
+  // load. Mirrors the backend's ModelServerDTO (service_model_servers.go) — like
+  // priority below, Service.ModelServers leaves these zero/empty and the gateway
+  // layer injects them from the runtime-status registry after the fact.
+  state: string;
+  active_requests: number;
+  queue_depth: number;
   gen_tokens_per_second: number;
   prompt_tokens_per_second: number;
   load_time_ms: number;

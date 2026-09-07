@@ -16,6 +16,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 	"time"
 )
@@ -157,16 +158,19 @@ type agentRuntimeError struct {
 // agent, so there is no ambiguity about which mapping/model this entry
 // describes even when the agent has not (yet) resolved Model.
 type agentRuntimeSample struct {
-	SpecID    string                  `json:"spec_id"`
-	Model     string                  `json:"model"`
-	State     string                  `json:"state"`
-	Since     time.Time               `json:"since"`
-	PID       int                     `json:"pid,omitempty"`
-	Port      int                     `json:"port,omitempty"`
-	InFlight  int                     `json:"in_flight"`
-	Restarts  int                     `json:"restarts"`
-	GPUs      []agentRuntimeGPUSample `json:"gpus,omitempty"`
-	LastError *agentRuntimeError      `json:"last_error,omitempty"`
+	SpecID         string                  `json:"spec_id"`
+	Model          string                  `json:"model"`
+	State          string                  `json:"state"`
+	Since          time.Time               `json:"since"`
+	PID            int                     `json:"pid,omitempty"`
+	Port           int                     `json:"port,omitempty"`
+	InFlight       int                     `json:"in_flight"`
+	Restarts       int                     `json:"restarts"`
+	ContextSize    int                     `json:"context_size"`
+	ActiveRequests int                     `json:"active_requests"`
+	QueueDepth     int                     `json:"queue_depth"`
+	GPUs           []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError      *agentRuntimeError      `json:"last_error,omitempty"`
 }
 
 // maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
@@ -183,6 +187,19 @@ type agentRuntimeSample struct {
 // derivation changed, every acknowledgement in the fleet would be silently
 // discarded -- degrading to the fallback with nothing to point at.
 const maxAppliedConfigETag = 256
+
+// runtimeModelProbeFeature is the agent-DECLARED capability name (server-agent
+// Task 11, server-agent/internal/agent/features.go) meaning: this agent probes
+// each managed child model server for its context window and per-child
+// active/queue counts, and reports them per runtime entry rather than (only)
+// via the legacy agent-wide scrape. It is NOT one of this gateway's OWN
+// advertised features (gatewayAgentFeatures, agent_features.go) -- unlike
+// those, this is a capability an agent declares and the gateway merely
+// consumes, checked via s.AgentFeatures.Has, the same way runtime_api_token
+// (a different agent-declared capability) is handled elsewhere in this
+// package. Gates both Piece 1 (writeBackRuntimeContext) and Piece 2 (the
+// per-server active/queue aggregate) below.
+const runtimeModelProbeFeature = "runtime_model_probe"
 
 // clampAppliedConfigETag trims and bounds one reported applied-config ETag.
 func clampAppliedConfigETag(s string) string {
@@ -224,14 +241,17 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 	out := make([]RuntimeStatusDTO, 0, len(samples))
 	for _, rt := range samples {
 		dto := RuntimeStatusDTO{
-			SpecID:   rt.SpecID,
-			Model:    rt.Model,
-			State:    rt.State,
-			Since:    rt.Since,
-			PID:      rt.PID,
-			Port:     rt.Port,
-			InFlight: rt.InFlight,
-			Restarts: rt.Restarts,
+			SpecID:         rt.SpecID,
+			Model:          rt.Model,
+			State:          rt.State,
+			Since:          rt.Since,
+			PID:            rt.PID,
+			Port:           rt.Port,
+			InFlight:       rt.InFlight,
+			Restarts:       rt.Restarts,
+			ContextSize:    rt.ContextSize,
+			ActiveRequests: rt.ActiveRequests,
+			QueueDepth:     rt.QueueDepth,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.
@@ -258,6 +278,29 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 		out = append(out, dto)
 	}
 	return out
+}
+
+// sumRuntimeActiveQueue sums active_requests and queue_depth across every
+// runtime entry in a sample, for the per-server ServerTelemetry aggregate a
+// multi-model server-agent needs (Task 12, Piece 2): a server-agent that
+// reports per-runtime metrics may not also run the legacy agent-wide scrape,
+// so the accurate per-server routing figure is the sum across its managed
+// processes rather than the (possibly absent/stale) top-level fields.
+func sumRuntimeActiveQueue(runtimes []agentRuntimeSample) (active, queue int) {
+	for _, rt := range runtimes {
+		// A count can never legitimately be negative. Clamp each per-runtime
+		// value to >= 0 before summing rather than rejecting the sample: an
+		// unclamped negative here would push the sum negative, and that
+		// negative aggregate REPLACES the (already validated) top-level
+		// telemetry.ActiveRequests/QueueDepth at the call site below, which
+		// would poison this server's routing scorer input (validTelemetry
+		// treats a negative counter as invalid, excluding the server from ALL
+		// routing) -- rejecting instead would break the best-effort
+		// runtimes[] discipline this file otherwise holds throughout.
+		active += max(rt.ActiveRequests, 0)
+		queue += max(rt.QueueDepth, 0)
+	}
+	return active, queue
 }
 
 // maxRuntimeSamplesPerSample bounds how many entries of a telemetry sample's
@@ -470,6 +513,135 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 		out[g.GPUIndex] = g.VRAMMeasuredMB
 	}
 	return out
+}
+
+// resolveRuntimeSpecMapping reports whether specID's owning mapping may have
+// its probed context_size written back for THIS sample, reached from server
+// serverID -- the context write-back's sibling to resolveRuntimeSpecWritable
+// above, resolving the SAME ownership chain (RuntimeSpecByID -> MappingByID
+// -> ApplicationByID -> application.ServerID) for the SAME reason: spec_id is
+// an agent-supplied body field with no other verification anywhere in this
+// path, and an agent authenticated for server A must never be able to name a
+// spec_id belonging to server B and overwrite B's mapping metrics.
+//
+// Deliberately NOT resolveRuntimeSpecWritable itself: that method's third
+// gate is VRAMLocked, which governs vram_estimate_mb/vram_measured_mb, not
+// context_size -- the wrong lock for this call. The gate that matters here is
+// mapping.MetricsLocked (operator-pinned mapping metrics, the same flag
+// UpdateMappingContextProbe's own SQL already enforces): checking it here
+// too, before ever calling that method, skips a write the store would only
+// silently no-op, and lets the change-detection below compare against a
+// context value the operator actually intends to keep.
+//
+// On success returns the mapping id and its CURRENTLY STORED context_size
+// (for the caller's change-detection), true. Any failure to resolve -- a
+// lookup error, a spec/mapping/application that no longer exists, a
+// cross-server mismatch, or a locked mapping -- returns ("", 0, false); a
+// cross-server mismatch is logged at Warn (not Debug), matching
+// resolveRuntimeSpecWritable's audit-trail discipline for the same reason: an
+// agent naming another server's resources is a signal worth keeping, not a
+// merely stale id.
+func (s *Server) resolveRuntimeSpecMapping(ctx context.Context, serverID, specID string) (mappingID string, storedContext int, ok bool) {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime context write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return "", 0, false
+	}
+	if !ok {
+		// The spec has since been deleted (or never existed); nothing to
+		// write the probed context back to. Not an error.
+		return "", 0, false
+	}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		slog.Debug("runtime context write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return "", 0, false
+	}
+	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		slog.Debug("runtime context write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return "", 0, false
+	}
+	if app.ServerID != serverID {
+		slog.Warn("context write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return "", 0, false
+	}
+	if mapping.MetricsLocked {
+		// The operator pinned this mapping's metrics; UpdateMappingContextProbe
+		// would no-op anyway -- skip the pointless write (and the store round
+		// trip it would cost).
+		return "", 0, false
+	}
+	return mapping.ID, mapping.ContextSize, true
+}
+
+// writeBackRuntimeContext writes each sample runtime's probed context window
+// back onto its owning mapping's context_size (Task 12, Option B: persist
+// only the STABLE context size onto the mapping -- no per-mapping active/queue
+// storage, no migration, no new store method; UpdateMappingContextProbe
+// already exists and already sets context_size + metrics_source="probe" +
+// metrics_updated_at, no-oping on a locked or missing mapping).
+//
+// Mirrors writeBackRuntimeVRAM's discipline throughout: runtimes is length-capped
+// at maxRuntimeSamplesPerSample before any store call; resolution
+// (resolveRuntimeSpecMapping) is memoized per DISTINCT spec_id, so a sample
+// repeating the same spec_id -- a full snapshot arrives roughly once a second --
+// never re-resolves it; and AN UNCHANGED VALUE IS NOT REWRITTEN, comparing
+// against the mapping's CURRENTLY STORED context_size (read once per distinct
+// writable spec_id, memoized alongside the resolution) rather than against
+// whatever this same spec_id reported last sample -- the same reasoning
+// writeBackRuntimeVRAM documents at length: without it, a model whose context
+// window is simply stable (the normal case) would drive one unconditional
+// UPDATE per second per mapping, forever.
+//
+// Best-effort throughout, matching the "a report is evidence, not a
+// transaction" ingest discipline this whole file follows: nothing here is
+// ever returned as an error -- this must NEVER reject the telemetry sample it
+// rode in on. Called only when the reporting agent declares
+// runtimeModelProbeFeature for THIS sample (see the call site in
+// ingestTelemetrySample), and only AFTER every store write in
+// ingestTelemetrySample has succeeded, mirroring writeBackRuntimeVRAM's own
+// placement.
+func (s *Server) writeBackRuntimeContext(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	now := time.Now().UTC()
+	type resolution struct {
+		mappingID     string
+		storedContext int
+		ok            bool
+	}
+	resolved := make(map[string]resolution, len(runtimes))
+	for _, rt := range runtimes {
+		specID := strings.TrimSpace(rt.SpecID)
+		if specID == "" || rt.ContextSize <= 0 {
+			continue
+		}
+		r, seen := resolved[specID]
+		if !seen {
+			mappingID, storedContext, ok := s.resolveRuntimeSpecMapping(ctx, serverID, specID)
+			r = resolution{mappingID: mappingID, storedContext: storedContext, ok: ok}
+			resolved[specID] = r
+		}
+		if !r.ok {
+			continue
+		}
+		if r.storedContext == rt.ContextSize {
+			continue // already on file, no write amplification
+		}
+		if err := s.Routes.UpdateMappingContextProbe(ctx, r.mappingID, rt.ContextSize, now); err != nil {
+			slog.Debug("runtime context write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
+			continue
+		}
+		// Keep the memo truthful for the rest of THIS sample: a malformed
+		// payload naming the same spec_id twice must not write twice.
+		r.storedContext = rt.ContextSize
+		resolved[specID] = r
+	}
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's
@@ -695,9 +867,25 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	req.ServerID = serverID
 	slog.Debug("agent telemetry received", "server_id", serverID, "gpus", len(req.GPUs), "has_host", req.Host != nil)
 	now := time.Now().UTC()
+	// Parsed once and reused below at the AgentFeatures.Set call site (this
+	// sample's declared capability set) and here for the per-server metric
+	// aggregate -- see runtimeModelProbeFeature's doc for why this
+	// agent-declared capability is checked via membership rather than
+	// advertised in gatewayAgentFeatures.
+	caps := parseAgentCapabilities(req.Capabilities)
 	telemetry, err := telemetryFromRequest(req, raw, now)
 	if err != nil {
 		return &invalidPayloadError{cause: err}
+	}
+	// A multi-model server-agent reporting per-runtime metrics may not also
+	// run the legacy agent-wide OP_AGENT_METRICS_URL scrape, so the top-level
+	// active_requests/queue_depth this sample carries can be absent or stale.
+	// When the agent declares runtime_model_probe, the accurate per-server
+	// figure is the SUM across its runtimes -- this REPLACES (never adds to)
+	// the top-level fields, since adding would double-count an agent that
+	// still runs both.
+	if slices.Contains(caps, runtimeModelProbeFeature) && len(req.Runtimes) > 0 {
+		telemetry.ActiveRequests, telemetry.QueueDepth = sumRuntimeActiveQueue(req.Runtimes)
 	}
 	// Build the rich sample up front so a bad rich section rejects atomically.
 	sample, err := telemetrySampleFromRequest(req, now)
@@ -763,8 +951,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// failed to persist would claim freshness the gateway does not have.
 	// Tolerant: a malformed capabilities blob yields an empty feature set
 	// (PushRuntimeConfig then correctly withholds delivery) rather than
-	// rejecting the whole sample -- see parseAgentCapabilities.
-	s.AgentFeatures.Set(serverID, parseAgentCapabilities(req.Capabilities))
+	// rejecting the whole sample -- see parseAgentCapabilities. Reuses caps
+	// (parsed once, above) rather than re-parsing req.Capabilities.
+	s.AgentFeatures.Set(serverID, caps)
 	// Record WHICH runtime-config document this agent says it has APPLIED, and
 	// do it BEFORE the status publish two lines below. That ordering is a
 	// contract, not tidiness: the VRAM benchmark's isolation wait is woken by
@@ -787,6 +976,21 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// launch spec (skipped for a VRAMLocked spec) -- see writeBackRuntimeVRAM.
 	// Never rejects the sample; a failure here is logged and dropped.
 	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
+	// Best-effort write-back of each managed process's probed context window
+	// onto its owning mapping (Task 12, Option B) -- see writeBackRuntimeContext.
+	// Gated on THIS sample's own parsed caps (reused from above), NOT on a
+	// re-read of the shared mutable AgentFeatures registry: during a rolling
+	// agent upgrade, two overlapping in-flight samples for the same server
+	// could otherwise clobber each other's Set(caps) between this gate and
+	// the write-back it guards, letting one sample's write-back run under
+	// the OTHER sample's capabilities. Checking caps directly is race-free --
+	// it reflects exactly what THIS sample declared. An agent that has never
+	// declared runtime_model_probe must never have its mappings' context_size
+	// touched from this path. Never rejects the sample; a failure here is
+	// logged and dropped.
+	if slices.Contains(caps, runtimeModelProbeFeature) {
+		s.writeBackRuntimeContext(ctx, serverID, req.Runtimes)
+	}
 	s.maybeFireReactivation(ctx, server)
 	return nil
 }

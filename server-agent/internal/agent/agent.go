@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
@@ -26,6 +27,7 @@ import (
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,7 +99,18 @@ import (
 // agent can tell that a runtime-spec API token will not actually be honored
 // (or masked) rather than let the operator discover it from a leaked
 // credential.
-const Version = "0.5.0"
+//
+// 0.5.0 -> 0.6.0 is the single bump for the runtime-spec-type-metrics-context
+// branch: the agent now probes each managed child model server for its
+// context size (once) and live request metrics (per telemetry cycle) and
+// reports them in the per-runtime telemetry sample
+// (sample.RuntimeSample.ContextSize/ActiveRequests/QueueDepth). The agent
+// gates none of this on the flag -- it always probes what it can reach --
+// but agent.Features declares "runtime_model_probe" anyway, MINOR, so a
+// gateway/portal talking to an older agent can tell that a runtime panel
+// will stay blank rather than let the operator mistake missing data for a
+// broken model server.
+const Version = "0.6.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -462,6 +475,15 @@ type Agent struct {
 	// no driver, or the driver does not implement it -- in which case the
 	// sample simply carries no runtime_config_applied_etag.
 	runtimeConfigAck runtimeConfigAcknowledger
+
+	// runtimeCtxCache caches each running child's probed context size
+	// (Task 9), keyed by SpecID -- see runtimeCtxEntry and
+	// probeRuntimeChild. collectOnce is the only method that touches this
+	// map, and it runs exclusively from the single Run goroutine (Run's
+	// three call sites, agent.go ~639/672/700), so no mutex is needed here.
+	// Left nil until the first running child with a context probe path is
+	// seen; probeRuntimeChild lazy-inits it.
+	runtimeCtxCache map[string]runtimeCtxEntry
 
 	// --- T3, live managed-process log streaming -------------------------
 	//
@@ -985,6 +1007,102 @@ func (a *Agent) appliedConfigETag() string {
 	return a.runtimeConfigAck.AppliedConfigETag()
 }
 
+// runtimeCtxEntry is one cached context-probe result: the PID it was
+// measured against (so a restart -- a changed PID -- forces a re-probe,
+// since a new process generation may serve a different model/config), the
+// specType and contextProbePath it was probed with (so the runtime
+// manager's config reconciliation editing a RUNNING spec's Type or
+// ContextProbePath WITHOUT restarting the process -- same PID -- also
+// forces a re-probe instead of serving a stale size probed under the old
+// config forever), and the context size itself.
+type runtimeCtxEntry struct {
+	pid              int
+	specType         string
+	contextProbePath string
+	size             int
+}
+
+// probeRuntimeChild fills rs's probe-RESULT fields (ActiveRequests,
+// QueueDepth, ContextSize) for one StateRunning child with a live port
+// (Task 9, design spec §7/§9: context size once per child lifetime + live
+// request metrics every cycle, on the existing per-runtime telemetry
+// channel). client is shared across all children probed this cycle.
+//
+// Metrics are scraped every call. Context is probed at most once per child
+// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type, and
+// st.ContextProbePath reuses the stored size; a PID mismatch (the child
+// restarted), a Type/ContextProbePath mismatch (the runtime manager's
+// config reconciliation changed a RUNNING spec's probe config without
+// restarting the process), or a cache miss all re-probe. A failed metrics
+// or context probe is logged at debug and leaves the corresponding
+// field(s) at zero -- it never fails the collect cycle. A context-probe
+// FAILURE, and a context-probe SUCCESS that returns a non-positive size
+// (effectively "unknown" -- a JSON field present but literally 0, or
+// smaller), are both deliberately never cached, so a transient condition
+// (e.g. the child's HTTP server still warming up) is retried next cycle
+// instead of sticking at 0 forever.
+func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
+	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
+
+	// Defense-in-depth SSRF guard (the portal validates these paths on write;
+	// this is the second layer): a metrics/context path is only ever appended
+	// to the loopback base, so an unsafe one -- @userinfo, //authority, a
+	// scheme, whitespace -- could re-parse the URL's Host off-loopback. Skip
+	// the probe rather than dial it.
+	if st.MetricsPath != "" && collector.SafeProbePath(st.MetricsPath) {
+		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
+		active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+		cancel()
+		if err != nil {
+			slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)
+		} else {
+			rs.ActiveRequests = active
+			rs.QueueDepth = queue
+		}
+	} else if st.MetricsPath != "" {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
+	}
+
+	if st.ContextProbePath == "" {
+		return
+	}
+	if !collector.SafeProbePath(st.ContextProbePath) {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "context", "path", st.ContextProbePath)
+		return
+	}
+	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
+		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath {
+		rs.ContextSize = entry.size
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
+	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath)
+	cancel()
+	if err != nil {
+		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
+		return
+	}
+	if size <= 0 {
+		// A non-positive size is effectively "unknown" (a JSON field present
+		// but literally 0, or any parse yielding <= 0) -- treat it like a
+		// failed probe: do not cache it as final, so it is retried next
+		// cycle instead of sticking at 0 forever. rs.ContextSize stays at
+		// its zero value.
+		slog.Debug("runtime context probe returned non-positive size, not caching", "spec_id", st.SpecID, "size", size)
+		return
+	}
+	if a.runtimeCtxCache == nil {
+		a.runtimeCtxCache = make(map[string]runtimeCtxEntry)
+	}
+	a.runtimeCtxCache[st.SpecID] = runtimeCtxEntry{
+		pid:              st.PID,
+		specType:         st.Type,
+		contextProbePath: st.ContextProbePath,
+		size:             size,
+	}
+	rs.ContextSize = size
+}
+
 // collectOnce builds one sample from the host, GPU, and scrape collectors and
 // pushes it. Each collector failure is logged and skipped so a partial sample
 // still ships; a push failure is logged but not returned (the loop keeps going).
@@ -1111,6 +1229,14 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		var loaded []string
 		if len(statuses) > 0 {
 			runtimes := make([]sample.RuntimeSample, 0, len(statuses))
+			// M5-pattern private transport, keep-alives disabled (mirrors
+			// manager.go's pollHealth client): these loopback ports are
+			// OS-assigned and recyclable, so a keep-alive connection left
+			// open past a child's restart could otherwise be reused against
+			// a completely different process later assigned the same port.
+			// One client for every child probed this cycle -- cheap to
+			// build, and each probe already carries its own short timeout.
+			probeClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			for _, st := range statuses {
 				rs := sample.RuntimeSample{
 					SpecID:   st.SpecID,
@@ -1141,6 +1267,15 @@ func (a *Agent) collectOnce(ctx context.Context) {
 						Failures:   st.LastError.Failures,
 						StderrTail: st.LastError.StderrTail,
 					}
+				}
+				// Task 9: fill ContextSize/ActiveRequests/QueueDepth from
+				// this child's own /metrics and context endpoints. Only a
+				// running child with a live port has anything to probe --
+				// StateStarting/backoff/crashed/etc. have no healthy
+				// endpoint yet, so they correctly stay at the zero value
+				// collectOnce would otherwise never touch.
+				if st.State == runtimectl.StateRunning && st.Port > 0 {
+					a.probeRuntimeChild(ctx, probeClient, st, &rs)
 				}
 				runtimes = append(runtimes, rs)
 				// Routing must never see a cold/loading model as usable

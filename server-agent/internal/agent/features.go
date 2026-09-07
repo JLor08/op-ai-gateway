@@ -119,6 +119,26 @@ var Features = []Feature{
 	// 0.5.0 has not shipped -- the binary that first carries this name is the
 	// same 0.5.0 that first carries ${API_TOKEN} resolution and masking.
 	{Name: "runtime_api_token", Since: "0.5.0"},
+	// runtime_model_probe: this agent probes each managed child model server
+	// for its context size (once, at process start) and live request metrics
+	// (once per telemetry cycle) and reports them in the per-runtime
+	// telemetry sample (sample.RuntimeSample.ContextSize/ActiveRequests/
+	// QueueDepth).
+	//
+	// Like runtime_logs, runtime_config_ack, gpu_selection, and
+	// runtime_api_token, it is declared for the GATEWAY/PORTAL's benefit
+	// rather than the agent's -- the agent gates nothing of its own behavior
+	// on it, it always probes what it can reach -- so the portal can tell
+	// the operator whether the connected agent actually reports context size
+	// and live metrics, rather than showing a runtime panel that silently
+	// stays blank on an older agent that predates this probing.
+	//
+	// Since is 0.6.0, this branch's single bump (see agent.go's Version
+	// block): the rule is one bump per SHIPPED CHANGE, never per commit, and
+	// 0.6.0 has not shipped -- the binary that first carries this name is
+	// the same 0.6.0 that first carries the context-size and live-metrics
+	// probing.
+	{Name: "runtime_model_probe", Since: "0.6.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

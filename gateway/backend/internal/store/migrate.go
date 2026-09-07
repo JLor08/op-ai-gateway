@@ -105,6 +105,7 @@ var migrations = []migration{
 	{version: 72, name: "application_endpoint_modes", up: migration72Up},
 	{version: 73, name: "runtime_spec_gpu_position_and_visible_devices_mode", up: migration73Up},
 	{version: 74, name: "runtime_spec_api_token", up: migration74Up},
+	{version: 75, name: "runtime_spec_type_probe", up: migration75Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3256,6 +3257,26 @@ func migration74Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
 		"api_token_header text not null default ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migration75Up adds the runtime-spec type/metrics-path/context-probe-path
+// columns (design 2026-09-07), additive + append-only like migration74Up.
+// Type defaults to "" (auto-detect from the binary), preserving today's
+// behaviour for every pre-feature row.
+func migration75Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"type text not null default ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"metrics_path text not null default ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
+		"context_probe_path text not null default ''"); err != nil {
 		return err
 	}
 	return nil

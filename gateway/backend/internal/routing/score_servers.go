@@ -46,6 +46,7 @@ func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time
 				inflight, _ := r.activity.ServerActivity(candidate.Server.ID)
 				k = inflight
 			}
+			telemetry, ok = r.mergeRuntimeModelMetrics(candidate, telemetry, ok, now)
 			route := scoringRoute(candidate, telemetry, ok, k, model)
 			score, viable := Score(route, model, now)
 			available := viable
