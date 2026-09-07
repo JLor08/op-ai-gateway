@@ -461,3 +461,61 @@ func TestModelServersEndpointLeavesRuntimeStateZeroWithNoStatus(t *testing.T) {
 		t.Fatalf("row live state = (state=%q, active=%d, queue=%d), want zero value with no runtime spec/status", row.State, row.ActiveRequests, row.QueueDepth)
 	}
 }
+
+// TestModelServersEndpointEventsInjectsLiveRuntimeState: the SSE endpoint's `snapshot` frame
+// carries the same live State/ActiveRequests/QueueDepth injection as the plain GET handler --
+// proving injectRuntimeModelState is wired into the SSE compute() closure too, not just the GET
+// handler it sits beside (handlePortalModelServers). Mirrors
+// TestModelServersEndpointInjectsLiveRuntimeState's seeding/publish and
+// TestModelServersEndpointEventsSnapshotThenUpdate's SSE harness.
+func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_evt"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+	})
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/portal/model-servers/events?name="+url.QueryEscape(msModel), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reader := bufio.NewReader(resp.Body)
+
+	event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+	if event != "snapshot" {
+		t.Fatalf("first event = %q, want snapshot", event)
+	}
+	var snap struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(data), &snap); err != nil {
+		t.Fatalf("unmarshal snapshot: %v (%s)", err, data)
+	}
+	if len(snap.Data) != 1 {
+		t.Fatalf("len(data) = %d, want 1 (%+v)", len(snap.Data), snap.Data)
+	}
+	row := snap.Data[0]
+	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
+		t.Fatalf("snapshot row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+}
