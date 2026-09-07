@@ -6,8 +6,10 @@ Status: approved in brainstorming (user: "passt"). Date: 2026-09-07.
 
 When the **server-agent loads models** (per-mapping runtime specs → the agent's
 router → a child model server per spec, loopback-only), give the gateway a
-per-model **context size** and per-model **live metrics** (active/queued
-requests). The enabler is a new **`RuntimeSpec.Type`** (`vllm` | `llama_cpp` |
+per-model **context size**, per-model **live metrics** (active/queued
+requests), and per-model **runtime state** (loading / ready — visible in the
+portal and usable by routing). The enabler is a new **`RuntimeSpec.Type`**
+(`vllm` | `llama_cpp` |
 `tgi` | `ollama` | `custom`) from which the per-type probe endpoints and the
 metric/field extraction are derived, with per-spec overrides.
 
@@ -142,7 +144,36 @@ This is the concrete fix for the single-`OP_AGENT_METRICS_URL` limitation.
   there.
 - **App-level `context_probe_path`** stays for **non-`server_agent`** apps
   (gateway-side probe, unchanged). `server_agent` mappings now get their context
-  from the per-spec agent probe instead.
+  from the per-spec agent probe instead, so for a `server_agent`-type
+  application the app-level `context_probe_path` is unused: the portal
+  **disables and empties** that field on create and edit (only non-server_agent
+  applications keep it). No hard backend rejection — it is simply ignored for
+  server_agent, and the portal keeps it clear.
+
+### 3.7 Per-model runtime state (loading / ready)
+
+The agent owns each child's lifecycle and already health-checks it, so it knows,
+per model, whether the child is **not running**, **running-but-not-yet-healthy**
+(loading its weights), or **healthy/serving**. Report that as a per-model
+`state`:
+
+- `stopped` — no child running for this spec.
+- `loading` — child launched, health check not yet passing (weights loading).
+- `ready` — child healthy and serving.
+
+It travels in the same per-model `Sample.models` entry (§4). Downstream:
+
+- **Portal — "Modelle" → Details:** show the state (a loading indicator while
+  `loading`), so an operator can *see* a model coming up without issuing a
+  request. This is the proactive visibility that does not exist today (the
+  gateway currently only learns "starting" reactively, from a cold-load `503
+  ErrUpstreamStarting` on an actual request).
+- **Routing signal:** the gateway knows the per-mapping state, so a `loading`
+  model is "soon available." Conservative first use (exact scoring/admission in
+  the plan): the router **prefers waiting for an already-`loading` instance over
+  triggering a second cold-start** of the same model, and can surface
+  "loading, ~ready soon" instead of a blunt failure. It complements — does not
+  replace — the existing cold-load 503 retry path.
 
 ## 4. Data model, wire, and sample
 
@@ -160,8 +191,9 @@ This is the concrete fix for the single-`OP_AGENT_METRICS_URL` limitation.
 - **Agent wire `runtime.Spec`** gains `Type`, `MetricsPath`, `ContextProbePath`
   (json `type` / `metrics_path` / `context_probe_path`).
 - **Telemetry `Sample`** gains a per-model array (json `models`), each entry:
-  `model`, `context_size`, `active_requests`, `queue_depth`. Nil/empty is a
-  valid empty array (mirrors `LoadedModels`).
+  `model`, `state` (`stopped`|`loading`|`ready`, §3.7), `context_size`,
+  `active_requests`, `queue_depth`. Nil/empty is a valid empty array (mirrors
+  `LoadedModels`).
 
 ## 5. Capability negotiation + version
 
@@ -179,8 +211,16 @@ optional overrides for a known type) the `metrics_path` / `context_probe_path`
 fields. Read-only display of the **detected** effective type when `Auto`, and of
 the resolved probe paths, so the operator sees what will be used. The
 per-mapping **context size** and **live active/queue** are surfaced in the
-runtime/mapping views (context_size already shown; add the live metrics). i18n
-de + en (parity compile-enforced).
+runtime/mapping views (context_size already shown; add the live metrics).
+
+On the **application** editor: for a `server_agent`-type app the app-level
+`context_probe_path` field is **disabled and cleared** (§3.6).
+
+On the **"Modelle" → Details** view: show the per-model **runtime state**
+(`stopped`/`loading`/`ready`, §3.7) with a loading indicator, alongside the live
+metrics and context size.
+
+i18n de + en (parity compile-enforced).
 
 ## 7. Open implementation decisions (resolved in the plan)
 
@@ -226,12 +266,18 @@ de + en (parity compile-enforced).
    push; per-mapping context + metrics ingest → routing + DTOs.
 3. Agent (`server-agent`): wire `Spec` fields; per-child context probe (once,
    cached) + per-child metrics scrape (per cycle) via the extended `collector`;
+   per-model runtime **state** (stopped/loading/ready) from process + health;
    per-model `Sample.models`; capability flag + Version; verify tgi/ollama
    endpoints against source.
-4. Gateway ingest: decode `Sample.models` → per-mapping context + metrics.
-5. Scoring: per-model active/queue as the source; per-server aggregation derived.
+4. Gateway ingest: decode `Sample.models` → per-mapping context + metrics + load
+   state.
+5. Scoring/routing: per-model active/queue as the source (per-server aggregation
+   derived); `loading` state as a "soon-available" signal (prefer an
+   already-loading instance over a second cold-start; exact integration decided
+   here).
 6. Frontend: Type select + path overrides + detected-type/paths display + live
-   metrics display; i18n de/en.
+   metrics display; **"Modelle" → Details** load-state indicator; the
+   `server_agent` app-editor **context_probe_path disable+clear**; i18n de/en.
 7. Docs: agent-runtime-manager, telemetry-usage-observability, data-model,
    api-surface, config-env, ADR.
 8. Full verification (Postgres + Sonar + version rule + frontend format:check);
