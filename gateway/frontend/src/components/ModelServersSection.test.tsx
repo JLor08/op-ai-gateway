@@ -32,6 +32,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-a',
       loaded: true,
       can_load: true,
+      state: 'running',
+      active_requests: 5,
+      queue_depth: 3,
       gen_tokens_per_second: 42.5,
       prompt_tokens_per_second: 210,
       load_time_ms: 1200,
@@ -51,6 +54,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-b',
       loaded: false,
       can_load: false,
+      state: '',
+      active_requests: 0,
+      queue_depth: 0,
       gen_tokens_per_second: 11.1,
       prompt_tokens_per_second: 90,
       load_time_ms: 800,
@@ -70,6 +76,9 @@ function makeRows(): ModelServerRow[] {
       mapping_id: 'map-c',
       loaded: false,
       can_load: true,
+      state: 'starting',
+      active_requests: 0,
+      queue_depth: 3,
       gen_tokens_per_second: 33.3,
       prompt_tokens_per_second: 150,
       load_time_ms: 950,
@@ -326,5 +335,44 @@ describe('ModelServersSection', () => {
     expect(within(rowFor('GPU-Box-C')).getByText(t.tableModelVision)).toBeInTheDocument();
     expect(within(rowFor('GPU-Box-A')).getByText('–')).toBeInTheDocument();
     expect(within(rowFor('GPU-Box-B')).getByText('–')).toBeInTheDocument();
+  });
+
+  it("shows a loading indicator for a 'starting' row and the matching badge for the other live states", async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // rowC is 'starting' → the same "currently loading" badge/label
+    // RuntimeAdminSection's Live-status column renders for that state (shared
+    // via components/shared/runtimeState.ts).
+    expect(within(rowFor('GPU-Box-C')).getByText(t.runtimeStateStarting)).toBeInTheDocument();
+    // rowA is 'running' → the active badge.
+    expect(within(rowFor('GPU-Box-A')).getByText(t.runtimeStateRunning)).toBeInTheDocument();
+    // rowB has no runtime status ('') → the neutral "unknown" badge, not a
+    // misleading "stopped".
+    expect(within(rowFor('GPU-Box-B')).getByText(t.runtimeStatusUnknown)).toBeInTheDocument();
+  });
+
+  it('shows the live active/queue counts and the context size', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-A');
+
+    const rowA = within(rowFor('GPU-Box-A'));
+    // active_requests=5, queue_depth=3, context_size=32768 (makeRows' rowA).
+    expect(rowA.getByText('5')).toBeInTheDocument();
+    expect(rowA.getByText('3')).toBeInTheDocument();
+    expect(rowA.getByText('32768')).toBeInTheDocument();
+  });
+
+  it('renders 0 active/queue as the real value, not a placeholder dash', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-B');
+
+    // rowB: active_requests=0, queue_depth=0 — a genuinely idle server, distinct
+    // from the "-" placeholder the benchmark-metric columns use for "unknown".
+    const rowB = within(rowFor('GPU-Box-B'));
+    expect(rowB.getAllByText('0')).toHaveLength(2);
   });
 });
