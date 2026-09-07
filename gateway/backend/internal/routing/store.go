@@ -1296,6 +1296,19 @@ type RuntimeSpec struct {
 	// APITokenHeader is the custom transmission header (source=="custom" only);
 	// empty ⇒ Authorization: Bearer.
 	APITokenHeader string
+	// Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
+	// "tgi" | "ollama" | "custom"); "" (default, every pre-feature row)
+	// auto-detects from Binary. Selects which per-kind metrics/context-probe
+	// conventions the agent applies.
+	Type string
+	// MetricsPath is the path on the child's listen port serving its metrics
+	// endpoint (e.g. a Prometheus-style /metrics for vllm); "" = none/the
+	// default for Type.
+	MetricsPath string
+	// ContextProbePath is the path on the child's listen port the agent
+	// probes to discover the model's actual context window; "" = none/the
+	// default for Type.
+	ContextProbePath string
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of the
 	// API-variant capability + the two coding-agent endpoint modes (design
 	// 2026-09-03). For a server_agent mapping the RESOLVED spec is the sole
