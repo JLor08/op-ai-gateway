@@ -68,6 +68,43 @@ func (s *Server) rankModelServers(ctx context.Context, model string) map[string]
 	return ranks
 }
 
+// injectRuntimeModelState fills each row's live State/ActiveRequests/QueueDepth from the
+// volatile runtime-status registry, mirroring how rankModelServers' caller injects
+// Priority: Service.ModelServers always leaves these zero/empty because only the
+// gateway layer holds the registry + routing store needed to resolve them.
+//
+// Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a mapping with no
+// runtime spec, or a spec with no published status all just leave the row's zero value —
+// never an error, and never a reason to fail the whole list. Each distinct ServerID's
+// status snapshot is fetched at most once (statusSnapshot copies its whole per-server
+// slice), then indexed by spec id so every row in that server is a cheap map lookup.
+func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.ModelServerDTO) {
+	if s.RuntimeStatus == nil || s.Routes == nil {
+		return
+	}
+	byServer := map[string]map[string]RuntimeStatusDTO{}
+	for i := range rows {
+		serverID := rows[i].ServerID
+		m, ok := byServer[serverID]
+		if !ok {
+			m = make(map[string]RuntimeStatusDTO)
+			for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
+				m[dto.SpecID] = dto
+			}
+			byServer[serverID] = m
+		}
+		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, rows[i].MappingID)
+		if err != nil || !ok {
+			continue // best-effort: no spec for this mapping, or lookup failed — leave zero
+		}
+		if dto, ok := m[spec.ID]; ok {
+			rows[i].State = dto.State
+			rows[i].ActiveRequests = dto.ActiveRequests
+			rows[i].QueueDepth = dto.QueueDepth
+		}
+	}
+}
+
 // handlePortalModelServers lists the servers that offer a gateway model (?name=<model>) with the
 // mapping's benchmark metrics + live loaded-state + a can_load flag. gateway:use, global (mirrors
 // handlePortalModels). The model name is a query param because a gateway model name may contain '/'.
@@ -89,6 +126,7 @@ func (s *Server) handlePortalModelServers(w http.ResponseWriter, r *http.Request
 	for i := range rows {
 		rows[i].Priority = ranks[rows[i].MappingID]
 	}
+	s.injectRuntimeModelState(r.Context(), rows)
 	writeJSON(w, http.StatusOK, map[string]any{"data": rows})
 }
 
@@ -127,6 +165,7 @@ func (s *Server) handlePortalModelServersEvents(w http.ResponseWriter, r *http.R
 		for i := range rows {
 			rows[i].Priority = ranks[rows[i].MappingID]
 		}
+		s.injectRuntimeModelState(r.Context(), rows)
 		return rows
 	}
 	// Subscribe BEFORE the snapshot, not after. The registry's channel is
