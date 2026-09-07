@@ -99,7 +99,18 @@ import (
 // agent can tell that a runtime-spec API token will not actually be honored
 // (or masked) rather than let the operator discover it from a leaked
 // credential.
-const Version = "0.5.0"
+//
+// 0.5.0 -> 0.6.0 is the single bump for the runtime-spec-type-metrics-context
+// branch: the agent now probes each managed child model server for its
+// context size (once) and live request metrics (per telemetry cycle) and
+// reports them in the per-runtime telemetry sample
+// (sample.RuntimeSample.ContextSize/ActiveRequests/QueueDepth). The agent
+// gates none of this on the flag -- it always probes what it can reach --
+// but agent.Features declares "runtime_model_probe" anyway, MINOR, so a
+// gateway/portal talking to an older agent can tell that a runtime panel
+// will stay blank rather than let the operator mistake missing data for a
+// broken model server.
+const Version = "0.6.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

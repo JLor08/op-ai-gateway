@@ -212,3 +212,30 @@ func TestRuntimeAPITokenFeatureIsDeclared(t *testing.T) {
 	}
 	t.Fatalf("Features does not declare %q; the gateway/portal cannot know a runtime-spec API token will be honored by this agent: %+v", name, Features)
 }
+
+// TestRuntimeModelProbeFeatureIsDeclared pins the runtime-model-probe
+// feature's exact wire NAME and the version it ships in, and pins the
+// accompanying MINOR bump to agent.Version itself. The gateway/portal check
+// this literal string before trusting that the connected agent probes each
+// managed child model server for its context size and live request metrics
+// and reports them in the per-runtime telemetry sample
+// (sample.RuntimeSample.ContextSize/ActiveRequests/QueueDepth); a rename
+// here would break that negotiation silently. Same
+// two-sides-of-one-contract reasoning as TestRuntimeConfigAckFeatureIsDeclared,
+// TestGPUSelectionFeatureIsDeclared, and TestRuntimeAPITokenFeatureIsDeclared.
+func TestRuntimeModelProbeFeatureIsDeclared(t *testing.T) {
+	const name = "runtime_model_probe"
+	if Version != "0.6.0" {
+		t.Fatalf("Version = %q, want 0.6.0 (this branch's single bump, accompanying the %q feature)", Version, name)
+	}
+	for _, f := range Features {
+		if f.Name != name {
+			continue
+		}
+		if f.Since != "0.6.0" {
+			t.Fatalf("feature %q Since = %q, want 0.6.0 (the branch's single bump)", name, f.Since)
+		}
+		return
+	}
+	t.Fatalf("Features does not declare %q; the gateway/portal cannot know this agent probes managed model servers for context size and live request metrics: %+v", name, Features)
+}
