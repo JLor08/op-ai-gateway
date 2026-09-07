@@ -14,9 +14,9 @@ const t = messages.de;
 afterEach(() => cleanup());
 
 const models: ModelOption[] = [
-  { id: 'm1', display_name: 'm1', flavors: ['openai'] },
-  { id: 'm2', display_name: 'm2', flavors: ['openai'] },
-  { id: 'fast', display_name: 'Fast', flavors: [], is_group: true },
+  { id: 'm1', display_name: 'm1', flavors: ['openai'], loading_on_count: 0 },
+  { id: 'm2', display_name: 'm2', flavors: ['openai'], loading_on_count: 0 },
+  { id: 'fast', display_name: 'Fast', flavors: [], loading_on_count: 0, is_group: true },
 ];
 
 function makeGroup(overrides: Partial<PortalModelGroup> = {}): PortalModelGroup {

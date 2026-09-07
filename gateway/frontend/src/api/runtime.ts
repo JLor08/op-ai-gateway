@@ -211,6 +211,19 @@ export interface RuntimeStatus {
   gpus?: RuntimeGPUStatus[];
   measured_at?: string;
   last_error?: RuntimeError;
+  // Whether the agent's last per-model probe of its `/metrics` and context
+  // (e.g. llama.cpp `/props`) endpoints actually reached the server, mirroring
+  // the Go RuntimeStatusDTO's own closed set:
+  //  - "ok"          the endpoint is configured/derived AND was reachable.
+  //  - "unreachable" a path IS configured/derived but the last probe failed --
+  //                  e.g. the operator forgot llama.cpp's `--metrics` flag.
+  //                  THIS is the warning state; never confuse it with "na".
+  //  - "na"          this runtime type has no such endpoint at all (Ollama has
+  //                  no /metrics) -- neutral, NOT a warning.
+  //  - ""            not reported (a legacy agent, or a non-running child) --
+  //                  render nothing.
+  metrics_probe: string;
+  context_probe: string;
 }
 
 // One unit of a managed model process's output on the live log stream

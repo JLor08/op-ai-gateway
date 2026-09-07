@@ -263,7 +263,13 @@ evidence is not stamped on a failed write:
   reports it as an explicit `0` rather than omitting the key; see
   [Agent-Managed Model Runtime
   §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
-  for when each is filled), `gpus[]` of `{index, vram_measured_mb}` (omitted when
+  for when each is filled), `metrics_probe`/`context_probe` (each a `string`,
+  exactly one of `ok`/`unreachable`/`na`, or `""` when not reported — the
+  reachability of the endpoint each numeric field above came from, so a
+  forgotten `--metrics` flag or a genuinely unsupported endpoint is no longer
+  indistinguishable from a real, measured `0`; see [Agent-Managed Model
+  Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
+  for the exact rules), `gpus[]` of `{index, vram_measured_mb}` (omitted when
   nothing was measured this cycle, and explicitly sorted by index because it is
   built from a Go map), and `last_error` of `{message, at, exit_code, failures,
   stderr_tail}`. When a runtime driver is active it **also overrides

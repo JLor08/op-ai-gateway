@@ -392,8 +392,8 @@ func TestModelServersEndpointEventsSnapshotThenUpdate(t *testing.T) {
 }
 
 // TestModelServersEndpointInjectsLiveRuntimeState: a mapping backed by a runtime spec with a
-// published RuntimeStatus surfaces that live State/ActiveRequests/QueueDepth on its
-// ModelServerDTO row -- proving injectRuntimeModelState is wired into
+// published RuntimeStatus surfaces that live State/ActiveRequests/QueueDepth/MetricsProbe/
+// ContextProbe on its ModelServerDTO row -- proving injectRuntimeModelState is wired into
 // handlePortalModelServers, joining on RuntimeSpecByMapping(mapping) -> spec.ID ->
 // statusSnapshot(serverID), exactly like the existing Priority injection it sits beside.
 func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
@@ -408,10 +408,10 @@ func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
-		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7, MetricsProbe: "ok", ContextProbe: "unreachable"},
 	})
-	// The agent declares runtime_model_probe, so the per-model active/queue are
-	// real and get injected alongside State.
+	// The agent declares runtime_model_probe, so the per-model active/queue and the
+	// probe reachability states are real and get injected alongside State.
 	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
@@ -434,12 +434,16 @@ func TestModelServersEndpointInjectsLiveRuntimeState(t *testing.T) {
 	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
 		t.Fatalf("row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
 	}
+	if row.MetricsProbe != "ok" || row.ContextProbe != "unreachable" {
+		t.Fatalf("row probe state = (metrics_probe=%q, context_probe=%q), want (ok, unreachable)", row.MetricsProbe, row.ContextProbe)
+	}
 }
 
 // A server whose agent has NOT declared runtime_model_probe still gets its lifecycle
 // State injected (the loading indicator is valid for any runtime_manager agent), but its
-// active/queue -- a fabricated 0 for a non-probing agent -- must be left at zero rather
-// than injected. Same root cause as the routing metricsOK gate.
+// active/queue -- a fabricated 0 for a non-probing agent -- and its probe reachability
+// states must be left at zero rather than injected. Same root cause as the routing
+// metricsOK gate.
 func TestModelServersEndpointInjectsStateButNotMetricsWithoutProbeFeature(t *testing.T) {
 	s, _ := newModelServersEndpointFixture(t)
 	ctx := context.Background()
@@ -452,7 +456,7 @@ func TestModelServersEndpointInjectsStateButNotMetricsWithoutProbeFeature(t *tes
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
-		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7, MetricsProbe: "ok", ContextProbe: "unreachable"},
 	})
 	// Deliberately do NOT declare runtime_model_probe for msServerID.
 
@@ -478,6 +482,9 @@ func TestModelServersEndpointInjectsStateButNotMetricsWithoutProbeFeature(t *tes
 	}
 	if row.ActiveRequests != 0 || row.QueueDepth != 0 {
 		t.Fatalf("row metrics = (active=%d, queue=%d), want (0, 0) -- non-probing agent's active/queue must NOT be injected", row.ActiveRequests, row.QueueDepth)
+	}
+	if row.MetricsProbe != "" || row.ContextProbe != "" {
+		t.Fatalf("row probe state = (metrics_probe=%q, context_probe=%q), want (\"\", \"\") -- non-probing agent's probe states must NOT be injected", row.MetricsProbe, row.ContextProbe)
 	}
 }
 
@@ -511,9 +518,9 @@ func TestModelServersEndpointLeavesRuntimeStateZeroWithNoStatus(t *testing.T) {
 }
 
 // TestModelServersEndpointEventsInjectsLiveRuntimeState: the SSE endpoint's `snapshot` frame
-// carries the same live State/ActiveRequests/QueueDepth injection as the plain GET handler --
-// proving injectRuntimeModelState is wired into the SSE compute() closure too, not just the GET
-// handler it sits beside (handlePortalModelServers). Mirrors
+// carries the same live State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe injection as
+// the plain GET handler -- proving injectRuntimeModelState is wired into the SSE compute()
+// closure too, not just the GET handler it sits beside (handlePortalModelServers). Mirrors
 // TestModelServersEndpointInjectsLiveRuntimeState's seeding/publish and
 // TestModelServersEndpointEventsSnapshotThenUpdate's SSE harness.
 func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
@@ -528,7 +535,7 @@ func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
-		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7},
+		{SpecID: specID, Model: msAppModel, State: "starting", ActiveRequests: 3, QueueDepth: 7, MetricsProbe: "ok", ContextProbe: "unreachable"},
 	})
 	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
 
@@ -566,5 +573,8 @@ func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
 	row := snap.Data[0]
 	if row.State != "starting" || row.ActiveRequests != 3 || row.QueueDepth != 7 {
 		t.Fatalf("snapshot row live state = (state=%q, active=%d, queue=%d), want (starting, 3, 7)", row.State, row.ActiveRequests, row.QueueDepth)
+	}
+	if row.MetricsProbe != "ok" || row.ContextProbe != "unreachable" {
+		t.Fatalf("snapshot row probe state = (metrics_probe=%q, context_probe=%q), want (ok, unreachable)", row.MetricsProbe, row.ContextProbe)
 	}
 }

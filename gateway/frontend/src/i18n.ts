@@ -61,6 +61,7 @@ const de = {
   tableApis: 'Verfügbar über',
   tableModelLoaded: 'Geladen',
   tableModelOffered: 'Angeboten',
+  tableModelLoading: 'Lädt',
   tableModelVision: 'Vision',
   tableScope: 'Scope',
   tableRequest: 'Request',
@@ -562,6 +563,23 @@ const de = {
   runtimeGpuDriftExpected: 'Erwartet',
   runtimeGpuDriftCurrent: 'Aktuell',
   runtimeLiveStatus: 'Live-Status',
+  // Task 6 (probe-reachability-and-model-status): whether the agent's last
+  // per-model /metrics and context probe actually reached the server -- so an
+  // operator who forgot llama.cpp's --metrics flag sees it instead of
+  // silently reading a 0 everywhere. "na" (this runtime type has no such
+  // endpoint, e.g. Ollama has no /metrics) is deliberately worded and coloured
+  // apart from "unreachable" (a path IS configured but the last probe
+  // failed) -- conflating them would make a healthy Ollama model look broken.
+  runtimeProbesColumn: 'Sondierungen',
+  runtimeProbeMetricsPrefix: 'M',
+  runtimeProbeContextPrefix: 'C',
+  runtimeProbeStateOk: 'Erreichbar',
+  runtimeProbeStateUnreachable: 'Nicht erreichbar',
+  runtimeProbeStateNa: 'Nicht zutreffend',
+  runtimeProbeTooltipOk: 'Der Endpunkt ist erreichbar und wird abgefragt.',
+  runtimeProbeTooltipUnreachable:
+    'Dieser Endpunkt ist aktuell nicht erreichbar. Prüfen Sie die Serverargumente bzw. den konfigurierten Endpunkt (z. B. --metrics bei llama.cpp).',
+  runtimeProbeTooltipNa: 'Dieser Runtime-Typ bietet diesen Endpunkt nicht.',
   runtimeStateStopped: 'Gestoppt',
   runtimeStateStarting: 'Startet…',
   runtimeStateRunning: 'Läuft',
@@ -1068,10 +1086,17 @@ const de = {
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Modell',
+  // Task 7 (probe-reachability-and-model-status): the merged tri-state column
+  // label, replacing the old separate "Geladen" + "Live-Status" columns.
+  modelServerColStatus: 'Status',
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   groupServersIntro: 'Modelle und Server, die diese Gruppe bedienen kann (Live-Priorität).',
   modelServerNotLoaded: 'Nicht geladen',
+  // The merged Status column's "currently loading" state (runtime state
+  // "starting"), distinct from modelServerLoadDisabledBusy's "Lädt…" (a row
+  // action's disabled-tooltip hint, not a column value).
+  modelServerLoading: 'Lädt',
   modelServerSource: 'Quelle',
   modelServerUpdated: 'Aktualisiert',
   modelServerLoad: 'Laden',
@@ -2266,6 +2291,7 @@ const en: PortalMessages = {
   tableApis: 'Available via',
   tableModelLoaded: 'Loaded',
   tableModelOffered: 'Offered',
+  tableModelLoading: 'Loading',
   tableModelVision: 'Vision',
   tableScope: 'Scope',
   tableRequest: 'Request',
@@ -2754,6 +2780,23 @@ const en: PortalMessages = {
   runtimeGpuDriftExpected: 'Expected',
   runtimeGpuDriftCurrent: 'Now',
   runtimeLiveStatus: 'Live status',
+  // Task 6 (probe-reachability-and-model-status): whether the agent's last
+  // per-model /metrics and context probe actually reached the server -- so an
+  // operator who forgot llama.cpp's --metrics flag sees it instead of
+  // silently reading a 0 everywhere. "na" (this runtime type has no such
+  // endpoint, e.g. Ollama has no /metrics) is deliberately worded and coloured
+  // apart from "unreachable" (a path IS configured but the last probe
+  // failed) -- conflating them would make a healthy Ollama model look broken.
+  runtimeProbesColumn: 'Probes',
+  runtimeProbeMetricsPrefix: 'M',
+  runtimeProbeContextPrefix: 'C',
+  runtimeProbeStateOk: 'Reachable',
+  runtimeProbeStateUnreachable: 'Unreachable',
+  runtimeProbeStateNa: 'Not applicable',
+  runtimeProbeTooltipOk: 'The endpoint is reachable and being queried.',
+  runtimeProbeTooltipUnreachable:
+    "This endpoint is currently not reachable. Check the server's arguments or configured endpoint (e.g. llama.cpp's --metrics).",
+  runtimeProbeTooltipNa: 'This runtime type has no such endpoint.',
   runtimeStateStopped: 'Stopped',
   runtimeStateStarting: 'Starting…',
   runtimeStateRunning: 'Running',
@@ -3234,10 +3277,12 @@ const en: PortalMessages = {
   modelServerColServer: 'Server',
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Model',
+  modelServerColStatus: 'Status',
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   groupServersIntro: 'Models and servers this group can serve (live priority).',
   modelServerNotLoaded: 'Not loaded',
+  modelServerLoading: 'Loading',
   modelServerSource: 'Source',
   modelServerUpdated: 'Updated',
   modelServerLoad: 'Load',

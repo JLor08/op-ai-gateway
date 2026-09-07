@@ -23,7 +23,13 @@ const t = messages.de;
 // predate the vision-capability gate) keep exercising attach + send unchanged;
 // the "Chat: vision gating" describe block below covers the non-capable path.
 const models: ModelOption[] = [
-  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], vision: true },
+  {
+    id: 'gpt-oss-20b',
+    display_name: 'gpt-oss-20b',
+    flavors: ['openai'],
+    loading_on_count: 0,
+    vision: true,
+  },
 ];
 
 // The store now subscribes to a server run over EventSource; this fake records
@@ -496,6 +502,7 @@ describe('Chat: loaded-state of the selected model', () => {
         id: 'gpt-oss-20b',
         display_name: 'gpt-oss-20b',
         flavors: ['openai'],
+        loading_on_count: 0,
         loaded: true,
         loaded_on: ['GPU-1'],
       },
@@ -518,11 +525,29 @@ describe('Chat: loaded-state of the selected model', () => {
 
 describe('Chat: image attachment gated on model vision capability', () => {
   const nonVisionModels: ModelOption[] = [
-    { id: 'text-only', display_name: 'text-only', flavors: ['openai'], vision: false },
+    {
+      id: 'text-only',
+      display_name: 'text-only',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: false,
+    },
   ];
   const mixedModels: ModelOption[] = [
-    { id: 'vision-model', display_name: 'vision-model', flavors: ['openai'], vision: true },
-    { id: 'text-model', display_name: 'text-model', flavors: ['openai'], vision: false },
+    {
+      id: 'vision-model',
+      display_name: 'vision-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    },
+    {
+      id: 'text-model',
+      display_name: 'text-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: false,
+    },
   ];
 
   it('disables the attach button when the selected model is not vision-capable', async () => {
@@ -607,8 +632,13 @@ describe('Chat: server override picker (Task 6)', () => {
   // -- so picking either keeps modelAvailable true; only the DROPDOWN's option
   // set narrows once a server override is picked.
   const twoModelCatalog: ModelOption[] = [
-    { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'] },
-    { id: 'server-only-model', display_name: 'server-only-model', flavors: ['openai'] },
+    { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+    {
+      id: 'server-only-model',
+      display_name: 'server-only-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+    },
   ];
 
   it("filters the model dropdown to the picked server's offered models and starts a run with both fields set", async () => {

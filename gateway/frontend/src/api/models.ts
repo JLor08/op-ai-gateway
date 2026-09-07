@@ -316,6 +316,9 @@ export type ModelOption = {
   // Count of reachable applications that currently OFFER this model (a real model
   // via its active mappings, or a group via its offerable members). 0 = unknown.
   offered_on_count?: number;
+  // Count of servers offering this model whose managed spec currently reports the
+  // "starting" lifecycle state (i.e. the model is mid-load on that server).
+  loading_on_count: number;
   // The model's global visibility (default "shown"). Only meaningful for a real
   // model; a group row (is_group) has no visibility control.
   visibility?: ModelVisibility;
@@ -342,6 +345,22 @@ export type ModelServerRow = {
   state: string;
   active_requests: number;
   queue_depth: number;
+  // Whether the agent's last per-model probe of its metrics/context endpoints
+  // actually reached the server -- mirrors RuntimeStatusDTO's own closed set
+  // (api/runtime.ts): "ok" (reachable) / "unreachable" (configured but the
+  // last probe failed) / "na" (this runtime type has no such endpoint) / ""
+  // (not reported -- legacy/non-probing agent).
+  //
+  // `metrics_probe` QUALIFIES its numbers: active_requests/queue_depth are
+  // probe-derived (0 unless a probing agent filled them), so only "ok" means
+  // they are real and every other value renders those columns as "—".
+  // `context_probe` does NOT qualify context_size: that value is a persisted
+  // mapping field (benchmark, manual entry, or a probe write), so it is shown
+  // whenever it is known (> 0) and this field reports only the reachability of
+  // the probe that can refresh it -- surfaced in the runtime admin screen's
+  // "Probes" column.
+  metrics_probe: string;
+  context_probe: string;
   gen_tokens_per_second: number;
   prompt_tokens_per_second: number;
   load_time_ms: number;

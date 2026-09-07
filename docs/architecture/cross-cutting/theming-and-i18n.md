@@ -211,6 +211,20 @@ the naming trap that a state → label table invites: the wire value is
 table must key on the **full enum value** — a table keyed on `pending_vram`
 compiles, passes type checks, and shows a raw wire string to operators.
 
+Two more surfaces reuse the identical three-class mapping rather than
+inventing a fourth colour: the runtime admin's per-probe "Probes" chips map
+`ok → active/success`, `unreachable → watch`, `na → standby` — `watch` is
+deliberately the only shade available for "configured but currently
+failing", so it must never be reused for "not configured at all" (`na`), or
+a healthy Ollama model with no `/metrics` endpoint would look broken; and
+the Models overview's "Lädt" count chip is a plain `watch` badge, the same
+colour `starting` already carries everywhere else. See [Agent-Managed Model
+Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
+and [§11.5](agent-runtime-manager.md#115-what-each-remaining-tab-shows) for
+the probe states, and
+[§11.8](agent-runtime-manager.md#118-the-models-overviews-loading-count)
+for the count.
+
 Two portal behaviours on that screen are **advisory by design and must never
 block a write**: the co-residency matrix's per-cell VRAM tooltip (the agent's own
 arithmetic is the veto, so the portal must not pre-empt it) and the GPU

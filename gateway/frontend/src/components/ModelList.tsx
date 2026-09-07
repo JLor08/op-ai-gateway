@@ -136,6 +136,18 @@ export function ModelList({
         ),
     },
     {
+      id: 'loading',
+      label: t.tableModelLoading,
+      numeric: true,
+      value: (m) => String(m.loading_on_count ?? 0),
+      render: (m) =>
+        (m.loading_on_count ?? 0) > 0 ? (
+          <StatusChip status="watch" label={String(m.loading_on_count)} />
+        ) : (
+          '-'
+        ),
+    },
+    {
       id: 'loaded',
       label: t.tableModelLoaded,
       numeric: true,

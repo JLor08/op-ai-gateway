@@ -13,9 +13,10 @@ const t = messages.de;
 
 afterEach(() => cleanup());
 
-// vision: true on both so the vision column's own dash never collides with the
-// dash under test in the loaded/offered columns below (each row keeps exactly
-// one "-" — its own).
+// vision: true on both, and a non-zero loading_on_count on both, so neither
+// the vision nor the (new) loading column's own dash collides with the dash
+// under test in the loaded/offered columns below (each row keeps exactly one
+// "-" — its own).
 const models: ModelOption[] = [
   {
     id: 'qwen-coder',
@@ -24,9 +25,17 @@ const models: ModelOption[] = [
     loaded: true,
     loaded_on: ['GPU-Box'],
     offered_on_count: 3,
+    loading_on_count: 4,
     vision: true,
   },
-  { id: 'llama3', display_name: 'llama3', flavors: ['openai'], offered_on_count: 2, vision: true },
+  {
+    id: 'llama3',
+    display_name: 'llama3',
+    flavors: ['openai'],
+    offered_on_count: 2,
+    loading_on_count: 5,
+    vision: true,
+  },
 ];
 
 // ModelList now calls useToast (for optimistic visibility errors), so every render
@@ -74,6 +83,7 @@ describe('ModelList vision column', () => {
         flavors: ['openai'],
         vision: true,
         offered_on_count: 1,
+        loading_on_count: 0,
         loaded: true,
         loaded_on: ['srv-a'],
       },
@@ -83,6 +93,7 @@ describe('ModelList vision column', () => {
         flavors: ['openai'],
         vision: false,
         offered_on_count: 1,
+        loading_on_count: 0,
         loaded: true,
         loaded_on: ['srv-a'],
       },
@@ -142,17 +153,19 @@ describe('ModelList offered column', () => {
         display_name: 'with-offered',
         flavors: ['openai'],
         offered_on_count: 3,
+        loading_on_count: 1,
         vision: true,
       },
-      // No offered_on_count → the offered cell shows "-". It IS loaded (count 1) and
-      // vision-capable, so neither of those cells is a dash, leaving exactly one
-      // "-" in the row (offered).
+      // No offered_on_count → the offered cell shows "-". It IS loaded (count 1),
+      // has a non-zero loading_on_count, and is vision-capable, so none of those
+      // other cells is a dash, leaving exactly one "-" in the row (offered).
       {
         id: 'no-offered',
         display_name: 'no-offered',
         flavors: ['openai'],
         loaded: true,
         loaded_on: ['srv-a'],
+        loading_on_count: 2,
         vision: true,
       },
     ];
@@ -163,6 +176,76 @@ describe('ModelList offered column', () => {
 
     const noneRow = screen.getAllByText('no-offered')[0].closest('tr')!;
     expect(within(noneRow).getByText('-')).toBeInTheDocument();
+  });
+});
+
+describe('ModelList loading column', () => {
+  it('renders a Loading column header BETWEEN Offered and Loaded', () => {
+    renderList({ t, models });
+    expect(screen.getByText(t.tableModelLoading)).toBeInTheDocument();
+    // Column order must read Angeboten, Lädt, Geladen: pin it via the ordered
+    // header list so a mis-ordered insertion cannot pass.
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+    const offeredIdx = headers.findIndex((txt) => txt.includes(t.tableModelOffered));
+    const loadingIdx = headers.findIndex((txt) => txt.includes(t.tableModelLoading));
+    const loadedIdx = headers.findIndex((txt) => txt.includes(t.tableModelLoaded));
+    expect(offeredIdx).toBeGreaterThanOrEqual(0);
+    expect(loadingIdx).toBeGreaterThanOrEqual(0);
+    expect(loadedIdx).toBeGreaterThanOrEqual(0);
+    expect(offeredIdx).toBeLessThan(loadingIdx);
+    expect(loadingIdx).toBeLessThan(loadedIdx);
+  });
+
+  it('shows a yellow (watch) chip with the loading count, pinned to the cell between offered and loaded', () => {
+    const local: ModelOption[] = [
+      {
+        id: 'loading-model',
+        display_name: 'loading-model',
+        flavors: ['openai'],
+        offered_on_count: 3,
+        loading_on_count: 2,
+        loaded_on: ['srv-a'],
+        vision: true,
+      },
+    ];
+    renderList({ t, models: local });
+
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+    const loadingColIdx = headers.findIndex((txt) => txt.includes(t.tableModelLoading));
+    expect(loadingColIdx).toBeGreaterThanOrEqual(0);
+
+    const row = screen.getAllByText('loading-model')[0].closest('tr')!;
+    const cells = within(row).getAllByRole('cell');
+    const loadingCell = cells[loadingColIdx];
+
+    const chipLabel = within(loadingCell).getByText('2');
+    expect(chipLabel).toHaveAttribute('data-status', 'watch');
+  });
+
+  it('shows no chip in the loading cell when loading_on_count is 0', () => {
+    const local: ModelOption[] = [
+      {
+        id: 'not-loading',
+        display_name: 'not-loading',
+        flavors: ['openai'],
+        offered_on_count: 3,
+        loading_on_count: 0,
+        loaded_on: ['srv-a'],
+        vision: true,
+      },
+    ];
+    renderList({ t, models: local });
+
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+    const loadingColIdx = headers.findIndex((txt) => txt.includes(t.tableModelLoading));
+    expect(loadingColIdx).toBeGreaterThanOrEqual(0);
+
+    const row = screen.getAllByText('not-loading')[0].closest('tr')!;
+    const cells = within(row).getAllByRole('cell');
+    const loadingCell = cells[loadingColIdx];
+
+    expect(within(loadingCell).getByText('-')).toBeInTheDocument();
+    expect(within(loadingCell).queryByText('0')).toBeNull();
   });
 });
 
@@ -204,7 +287,13 @@ describe('ModelList details sub-view', () => {
 
   it('opens the GROUP-detail view (not the per-model one) for a group row', async () => {
     const withGroup: ModelOption[] = [
-      { id: 'fast-group', display_name: 'fast-group', flavors: [], is_group: true },
+      {
+        id: 'fast-group',
+        display_name: 'fast-group',
+        flavors: [],
+        loading_on_count: 0,
+        is_group: true,
+      },
       ...models,
     ];
     const modelServers = vi.fn(async () => []);
@@ -272,7 +361,13 @@ describe('ModelList visibility', () => {
     // hidden model appears with an editable select pre-selected to Hidden and can
     // be reverted back to Shown.
     const hiddenModels: ModelOption[] = [
-      { id: 'trapped', display_name: 'trapped', flavors: ['openai'], visibility: 'hidden' },
+      {
+        id: 'trapped',
+        display_name: 'trapped',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        visibility: 'hidden',
+      },
     ];
     const setModelVisibility = vi.fn(async () => ({ ok: true }));
     const onModelsChanged = vi.fn();
@@ -298,10 +393,11 @@ describe('ModelList visibility', () => {
         id: 'fast',
         display_name: 'fast',
         flavors: ['openai'],
+        loading_on_count: 0,
         is_group: true,
         visibility: 'hidden',
       },
-      { id: 'llama3', display_name: 'llama3', flavors: ['openai'] },
+      { id: 'llama3', display_name: 'llama3', flavors: ['openai'], loading_on_count: 0 },
     ];
     const setModelVisibility = vi.fn(async () => ({ ok: true }));
     const onModelsChanged = vi.fn();
@@ -331,6 +427,7 @@ describe('ModelList visibility', () => {
         id: 'fast',
         display_name: 'fast',
         flavors: ['openai'],
+        loading_on_count: 0,
         is_group: true,
         visibility: 'locked',
       },
@@ -348,10 +445,11 @@ describe('ModelList visibility', () => {
         id: 'fast-group',
         display_name: 'fast-group',
         flavors: ['openai'],
+        loading_on_count: 0,
         is_group: true,
         visibility: 'shown',
       },
-      { id: 'llama3', display_name: 'llama3', flavors: ['openai'] },
+      { id: 'llama3', display_name: 'llama3', flavors: ['openai'], loading_on_count: 0 },
     ];
     renderList({ t, models });
     // The dedicated Typ column header is present.

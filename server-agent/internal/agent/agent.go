@@ -1026,61 +1026,95 @@ type runtimeCtxEntry struct {
 // QueueDepth, ContextSize) for one StateRunning child with a live port
 // (Task 9, design spec §7/§9: context size once per child lifetime + live
 // request metrics every cycle, on the existing per-runtime telemetry
-// channel). client is shared across all children probed this cycle.
+// channel), plus (Task 2) rs.MetricsProbe/rs.ContextProbe: each is exactly
+// one of "ok" (probe succeeded), "unreachable" (a path was configured but
+// the SSRF guard rejected it, the probe errored, or -- context only -- the
+// probe returned a non-positive size), or "na" (no path was configured for
+// this child at all). These make a forgotten runtime flag (e.g. llama.cpp
+// started without --metrics) visible instead of silently reading as an
+// idle 0. client is shared across all children probed this cycle.
 //
 // Metrics are scraped every call. Context is probed at most once per child
 // lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type, and
-// st.ContextProbePath reuses the stored size; a PID mismatch (the child
-// restarted), a Type/ContextProbePath mismatch (the runtime manager's
-// config reconciliation changed a RUNNING spec's probe config without
-// restarting the process), or a cache miss all re-probe. A failed metrics
-// or context probe is logged at debug and leaves the corresponding
-// field(s) at zero -- it never fails the collect cycle. A context-probe
-// FAILURE, and a context-probe SUCCESS that returns a non-positive size
-// (effectively "unknown" -- a JSON field present but literally 0, or
-// smaller), are both deliberately never cached, so a transient condition
-// (e.g. the child's HTTP server still warming up) is retried next cycle
-// instead of sticking at 0 forever.
+// st.ContextProbePath reuses the stored size (and reports "ok" -- a cached
+// size means a prior probe on this exact generation already succeeded); a
+// PID mismatch (the child restarted), a Type/ContextProbePath mismatch (the
+// runtime manager's config reconciliation changed a RUNNING spec's probe
+// config without restarting the process), or a cache miss all re-probe. A
+// failed metrics or context probe is logged at debug and leaves the
+// corresponding numeric field(s) at zero -- it never fails the collect
+// cycle. A context-probe FAILURE, and a context-probe SUCCESS that returns
+// a non-positive size (effectively "unknown" -- a JSON field present but
+// literally 0, or smaller), are both deliberately never cached, so a
+// transient condition (e.g. the child's HTTP server still warming up) is
+// retried next cycle instead of sticking at 0 forever.
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
-	// Defense-in-depth SSRF guard (the portal validates these paths on write;
-	// this is the second layer): a metrics/context path is only ever appended
-	// to the loopback base, so an unsafe one -- @userinfo, //authority, a
-	// scheme, whitespace -- could re-parse the URL's Host off-loopback. Skip
-	// the probe rather than dial it.
-	if st.MetricsPath != "" && collector.SafeProbePath(st.MetricsPath) {
-		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-		active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
-		cancel()
-		if err != nil {
-			slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)
-		} else {
-			rs.ActiveRequests = active
-			rs.QueueDepth = queue
-		}
-	} else if st.MetricsPath != "" {
-		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
-	}
+	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
+	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
+}
 
+// probeRuntimeChildMetrics runs probeRuntimeChild's metrics-scrape half and
+// returns the reachability state to store on rs.MetricsProbe. It fills
+// rs.ActiveRequests/rs.QueueDepth only on a successful scrape, exactly as
+// probeRuntimeChild did inline before this was split out to match the context
+// half's shape -- the debug logging and the never-fatal behaviour are unchanged.
+//
+// Defense-in-depth SSRF guard (the portal validates these paths on write; this
+// is the second layer): a metrics path is only ever appended to the loopback
+// base, so an unsafe one -- @userinfo, //authority, a scheme, whitespace --
+// could re-parse the URL's Host off-loopback. Skip the probe rather than dial
+// it, and report it as unreachable: a path IS configured, it just cannot be
+// used.
+func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
+	if st.MetricsPath == "" {
+		return "na"
+	}
+	if !collector.SafeProbePath(st.MetricsPath) {
+		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "metrics", "path", st.MetricsPath)
+		return "unreachable"
+	}
+	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
+	active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+	cancel()
+	if err != nil {
+		slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)
+		return "unreachable"
+	}
+	rs.ActiveRequests = active
+	rs.QueueDepth = queue
+	return "ok"
+}
+
+// probeRuntimeChildContext runs probeRuntimeChild's context-probe half and
+// returns the reachability state to store on rs.ContextProbe. It also fills
+// rs.ContextSize on a cache hit or a successful (size>0) probe, exactly as
+// probeRuntimeChild did inline before this was split out for readability --
+// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path
+// change), the deliberate non-caching of a probe error or a non-positive
+// size, and the debug logging are all unchanged.
+func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.ContextProbePath == "" {
-		return
+		return "na"
 	}
 	if !collector.SafeProbePath(st.ContextProbePath) {
 		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "context", "path", st.ContextProbePath)
-		return
+		return "unreachable"
 	}
 	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
 		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath {
+		// A cached size means a prior probe on this exact (pid, type, path)
+		// generation already succeeded.
 		rs.ContextSize = entry.size
-		return
+		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
 	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
-		return
+		return "unreachable"
 	}
 	if size <= 0 {
 		// A non-positive size is effectively "unknown" (a JSON field present
@@ -1089,7 +1123,7 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 		// cycle instead of sticking at 0 forever. rs.ContextSize stays at
 		// its zero value.
 		slog.Debug("runtime context probe returned non-positive size, not caching", "spec_id", st.SpecID, "size", size)
-		return
+		return "unreachable"
 	}
 	if a.runtimeCtxCache == nil {
 		a.runtimeCtxCache = make(map[string]runtimeCtxEntry)
@@ -1101,6 +1135,7 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 		size:             size,
 	}
 	rs.ContextSize = size
+	return "ok"
 }
 
 // collectOnce builds one sample from the host, GPU, and scrape collectors and

@@ -2800,6 +2800,38 @@ Models catalog and routing do with the live active/queue is
 [§11.7](#117-live-runtime-state-on-the-models-catalog) and [Routing & Model
 Selection §3](routing-and-model-selection.md#3-candidate-scoring).
 
+**Each probe also reports its own reachability, closing a blind spot the
+numeric fields alone cannot.** A forgotten `--metrics` flag (or any other
+misconfigured endpoint) used to fail silently — the scrape errored, the field
+stayed at its zero value, and nothing told the operator the number was fake
+rather than genuinely idle. `probeRuntimeChild` sets `MetricsProbe` and
+`ContextProbe` on the same `RuntimeSample` entry alongside the numeric
+fields, each exactly one of:
+
+- **`na`** — no path is configured for this child at all (`MetricsPath`/
+  `ContextProbePath` resolved empty, e.g. Ollama has no Prometheus-style
+  `/metrics`). Not an error: the runtime type simply has no such endpoint.
+- **`unreachable`** — a path IS configured but the attempt produced no value:
+  connection refused (the forgotten-flag case), a non-2xx response, a parse
+  failure, an unsafe path the SSRF guard refused to dial, or — context only —
+  a probe that succeeded but returned a non-positive size.
+- **`ok`** — the probe succeeded. For context, a cache hit also counts as
+  `ok`: a cached size means a prior probe on this exact process generation
+  already succeeded, so it is still an honest "reachable", never a fabricated
+  one.
+
+Both fields are set only when the numeric fields are — a `StateRunning`
+child with a live port — so a non-running child, or an agent that predates
+this feature, leaves them at `""` and no reachability indicator appears
+anywhere downstream. Computing them changes nothing about the probes' own
+non-fatal behaviour: a failure is still logged at `Debug` and never fails the
+collect cycle. What consumes the two states: the runtime admin's "Probes"
+column ([§11.5](#115-what-each-remaining-tab-shows)) and the Models-detail
+gate that stops showing a fabricated `0` for the two probe-derived numbers
+([§11.7](#117-live-runtime-state-on-the-models-catalog) — which also
+explains why the context SIZE is not gated this way, being a persisted
+mapping value rather than a probe result).
+
 The registry's `subscribe` copies the current snapshot **and** registers the
 subscriber channel under a single lock acquisition, so no publish between the two
 can be lost (the `serverPerfRegistry` discipline). Delivery is non-blocking: a
@@ -3304,6 +3336,37 @@ different words"* — which asserts the **column headers on both tabs**, in both
 directions. The tab-strip assertions that scope `getByRole('tab', …)` because the
 label now matches twice are **not** coverage for it: they read the tab's label,
 which the relabel did not touch, and they pass either way.
+
+**Immediately beside `live_status` sits a second, independent signal:
+"Probes".** One column answers "is the process running"; the next answers
+"can we actually see its numbers" — a `server_agent` process can be
+`running` and still have its metrics or context endpoint silently
+misconfigured, which is exactly the blind spot
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time) closes.
+The column renders two independent chips, **M** (metrics) and **C**
+(context), joined to the row by the same `spec_id` the live-status column
+uses; a probe reported `""` (no running child, or a pre-feature agent)
+renders no chip at all rather than a placeholder, and a row with neither
+chip renders nothing in this column. Colour follows the portal's three-class
+status model exactly — `ok` → the success/green chip, `unreachable` → the
+`watch` chip (the portal's only non-green, non-neutral colour), `na` → the
+neutral `standby` chip — and `na` is deliberately never rendered as a
+warning: an `na` metrics probe means this runtime type genuinely has no
+`/metrics` endpoint (Ollama), and colouring that like `unreachable` would
+make every healthy Ollama model look broken. See [Status
+colours](theming-and-i18n.md#9-status-colours-there-are-exactly-three) for
+why `watch`, not a fourth colour, is the only shade available for
+"configured but failing".
+
+Each chip carries a tooltip spelling out what its state means, and that
+tooltip is wrapped as `Tooltip > <span> > StatusChip`, never
+`Tooltip > StatusChip`. MUI's `Tooltip` works by cloning its event handlers
+(and a ref) onto its child, and the shared `StatusChip` takes only
+`{ status, label }` — it spreads nothing onto the inner `Chip` and is not
+`forwardRef` — so a tooltip attached directly to it has every prop silently
+dropped and never opens. The wrapper element is the same
+`Tooltip > span > item` shape `RowActionsMenu` uses to explain a disabled
+menu item, and it keeps the shared chip's contract unchanged.
 
 Three field semantics the form encodes rather than leaving to guesswork:
 `vram_measured_mb` is agent-owned and always ignored on write, so it renders as
@@ -4521,16 +4584,176 @@ service layer and filled in by the gateway's own live-ranking pass
 (`internal/gateway/portal_model_endpoints.go`) resolves each row's mapping
 to its runtime spec (`RuntimeSpecByMapping`) and joins that spec id against
 the same volatile per-server `RuntimeStatus` snapshot [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)
-describes, filling `state`/`active_requests`/`queue_depth`; best-effort and
-nil-safe throughout — a mapping with no spec, or a spec with no published
-status yet, just leaves the row's zero value, never an error. It runs at
-**both** the plain `GET` and the SSE compute closure, so a live subscriber
-sees the same fields a fresh poll would. The frontend renders `state`
-through the identical `runtimeStateBadge`/`runtimeStateLabel` pair the
-runtime admin screen uses — extracted to a shared `runtimeState.ts` so the
-two screens cannot render the same state in two different colors — with a
-loading indicator on `starting`, alongside the context size and live
-active/queue.
+describes, filling `state`/`active_requests`/`queue_depth`/`metrics_probe`/
+`context_probe`; best-effort and nil-safe throughout — a mapping with no
+spec, or a spec with no published status yet, just leaves the row's zero
+value, never an error. It runs at **both** the plain `GET` and the SSE
+compute closure, so a live subscriber sees the same fields a fresh poll
+would. `state` is injected **unconditionally** — it is valid for any
+`runtime_manager` agent — while `active_requests`/`queue_depth`/
+`metrics_probe`/`context_probe` are injected only when the reporting agent
+declared `runtime_model_probe`; for a non-probing agent they stay at their
+zero value rather than the fabricated `0` a probe-only field would
+otherwise imply. The frontend renders `state` through the identical
+`runtimeStateBadge`/`runtimeStateLabel` pair the runtime admin screen uses —
+extracted to a shared `runtimeState.ts` so the two screens cannot render the
+same state in two different colors — with a loading indicator on
+`starting`, alongside the context size and live active/queue.
+
+**A real `0` and "never measured" used to render identically, and for the
+two probe-derived numbers the reachability signal is what tells them
+apart.** `active_requests`/`queue_depth` are probe-derived: the portal
+service leaves them at `0` and only the capability-gated injection above
+ever fills them, so the number alone cannot say whether it was measured.
+`metrics_probe` rides that same gate, which is exactly what makes it the
+right test, and the frontend (`ModelServersSection.tsx`) uses it as one:
+**Aktiv** and **Warteschlange** render `—` unless `metrics_probe == "ok"`,
+and only then is the underlying number shown — including a genuine `0`
+(truly idle), distinguished from "unmeasured" by the reachability gate and
+never by the number itself. No new nullable numeric field was needed: the
+existing reachability signal already answers "is this value real", so a
+non-probing agent (the field empty) also correctly renders `—` rather than
+a fabricated `0`.
+
+**The context size follows the opposite rule, because it is not
+probe-derived.** `context_size` reaches the row from the PERSISTED mapping
+field (`ContextSize: view.mapping.ContextSize` in
+`portal/service_model_servers.go`), which a benchmark run or a manual
+operator entry sets just as well as the agent's context probe writing it
+back. So **Kontext** is gated on the VALUE — the number whenever it is
+known (`> 0`), `—` otherwise — and a real context size of `0` cannot
+happen, which is what makes `> 0` exactly the "nothing is known" test and
+keeps the same "never render a meaningless `0`" intent. Gating it on
+`context_probe` instead (the branch's first attempt) hid a real, stored
+context size on every non-probing row: any non-`server_agent` model
+server, and any agent without `runtime_model_probe`. `context_probe`
+reports only the **reachability of the probe that can refresh** that
+value, which is what the runtime admin screen's "Probes" column shows; it
+says nothing about whether the stored value is real.
+
+**The former "Geladen" and "Live-Status" columns are now one "Status"
+column.** Two facts that used to sit in adjacent columns — the
+benchmark-derived `loaded` boolean and the raw runtime `state` — collapse
+into a single tri-state: **Geladen** (`state == "running"`), **Lädt**
+(`state == "starting"` **or** `"pending_vram_unknown"`), **Nicht Geladen**
+(otherwise). The two loading states are one bucket here because they are
+one bucket in the shared vocabulary this column reuses: `runtimeStateBadge`
+maps both onto `watch` ("waiting to be loaded"), so treating only
+`starting` as loading would have let the same spec, at the same instant,
+read yellow "Lädt" on the runtime admin screen and grey "Nicht Geladen"
+here. Only the chip's *colour* reuses that vocabulary —
+`modelStatusBadge` calls the same `runtimeStateBadge` the loading indicator
+above uses, so "Lädt" gets the identical `watch` treatment. The *label* is
+deliberately its own: a local
+`modelStatusLabel` keyed on `tableModelLoaded`/`modelServerLoading`/
+`modelServerNotLoaded` ("Geladen"/"Lädt"/"Nicht geladen") — the
+model-loading wording, not `runtimeStateLabel`'s lifecycle wording
+("Startet…" for the same `starting` state); `runtimeStateLabel` is not
+imported in this file. A row with no runtime state at all — a model server that is not
+a `server_agent` mapping, where `state` is always `""` — falls back to the
+pre-existing `loaded` boolean instead: **Geladen** if loaded, else **Nicht
+Geladen**, so the merge changes nothing for the majority of model servers
+that never had a runtime state to show.
+
+### 11.8 The Models overview's loading count
+
+One more figure is gateway-injected the same way, onto a different screen
+and a different DTO: the Models **overview** (`GET /api/portal/models`, the
+all-models list — distinct from the per-model server list §11.7 covers)
+shows `loading_on_count`, the number of servers currently offering a model
+whose managed spec is `starting`. `ModelDTO.LoadingOnCount`
+(`internal/portal/service.go`) is left at zero by `portal.Service` for the
+identical structural reason `Priority` and every field in §11.7 are — the
+portal service has no reference to the volatile runtime-status registry —
+and is filled in afterwards by `handlePortalModels`
+(`internal/gateway/portal_model_endpoints.go`), on both the plain listing
+and the `?manage=1` admin branch.
+
+**This is the one runtime-derived field in this whole feature that is
+deliberately *not* gated on `runtime_model_probe`.** The count is driven by
+lifecycle `State`, which — like `state` in §11.7 — any `runtime_manager`
+agent reports, probing or not, and predates the probe feature entirely;
+gating it on `runtime_model_probe` would wrongly hide "Lädt" for every older
+agent that is legitimately mid-launch. The only gate is registry
+availability itself: a nil `RuntimeStatus`/`Routes`/`Portal` leaves every
+row at its zero count.
+
+**The computation is one registry-driven pass, not one query per model.**
+An earlier version called the per-model server list once per model row,
+and that list re-walks the entire server/application/mapping join from
+scratch on every call — an N+1 that multiplied the base listing's query
+count by the number of models shown. `startingServersByModel` instead walks
+`RuntimeStatus.serverIDs()` once, collects every `starting` candidate
+`(server, spec)` pair, and only when that set is non-empty resolves it
+further: one `AllowedServerIDs` call for every distinct candidate server in
+the whole request (never once per model), then a fixed handful of
+primary-key point lookups per starting spec — `RuntimeSpecByID` and
+`MappingByID` to find the owning model, `ApplicationByID` and
+`AIServerByID` for the offering check below. The cost therefore scales with
+the number of specs currently starting — normally zero or a handful,
+fleet-wide — never with the number of models in the response.
+
+**Only servers that actually OFFER the model are counted, or the yellow
+count contradicts the column beside it.** A `starting` spec is not by
+itself a reason to count its server: `offered_on_count` counts a server
+only when its mapping survives `activeMappingViews`' conditions (server
+active and not unhealthy, application active and reachable, mapping
+active), and a running child does **not** stop when an operator disables
+its mapping or takes its application down. Attributing every `starting`
+spec regardless therefore let "Lädt 2" appear beside "Angeboten 1".
+`offeringServerName` re-applies exactly those conditions per starting spec
+— via the two point reads above rather than a second full join — and keys
+the result sets by server **name**, the unit `offeredOn` counts, so the
+loading set is a literal subset of the offered set and
+`loading_on_count <= offered_on_count` holds by construction rather than by
+coincidence. Its reachability answer comes from the **same** shared
+`AppHealthRegistry` the portal service reads through its `AppHealthReader`
+(`cmd/gateway/main.go` hands one registry to both), so the two columns
+cannot disagree about an application's health.
+
+**Principal visibility is preserved explicitly, because this pass bypasses
+the path that used to provide it for free — and it is applied per branch,
+matching the sibling counts on the same row.** The old per-row call
+inherited its resource-group filtering by going through
+`Portal.ModelServers`, which itself calls `AllowedServerIDs`; the inverted
+pass re-applies the identical mechanism directly, once for the whole
+request, and — like `filterAllowedModelServerRows`'s own choice — fails
+**closed** on an `AllowedServerIDs` error (counts nothing, never falls back
+to counting every server): an under-count is a display glitch, an
+over-count would leak a restricted server's existence to a principal who
+cannot otherwise see it. But *which* branch is asking matters, because the
+portal service computes this row's other counts differently per branch:
+the principal-facing `Service.Models` is `modelsResponse(suppress=true)`
+and builds `offered_on_count`/`loaded_on` from `visibleMappingViews` (the
+same resource-group filter), while the admin `?manage=1`
+`Service.ManageModels` is `modelsResponse(suppress=false)`, reading the
+token-less `activeMappingViews` and therefore **deliberately unfiltered**.
+So the loading count filters on the first branch and skips the filter
+entirely on the second — otherwise the admin view carried one filtered
+column beside neighbours that count everything, which is an
+under-reporting inconsistency rather than a leak (that branch is
+admin-scoped and its siblings are unfiltered by design).
+
+**Two row kinds and one of them is a known gap.** A per-token override
+**alias** row takes its target's loading count, matching the rest of the
+alias row's payload (`loaded`/`loaded_on`, `offered_on_count`, context
+size, vision, `is_group`), which `modelsResponse`'s alias overlay already
+copies from the target — an alias row is meant to look exactly like its
+target's row under a different name. Aliases exist only on the
+principal-facing listing, so the `?manage=1` branch never consults the
+rules: a row id there is always a real model name. A model **GROUP** row,
+by contrast, shows aggregated offered/loaded counts but always a loading
+count of `0`: `ModelDTO` carries only `IsGroup` and no member list, and
+re-deriving the offerable member set in the gateway layer would mean a
+second copy of `modelGroupOverlay`'s whole rule set (member order,
+`loaded_only`, per-member suppression). A group whose member is mid-launch
+therefore shows "Lädt" on that member's own row only; the limitation is
+recorded in `injectLoadingOnCounts`' doc comment.
+
+The frontend (`ModelList.tsx`) renders the count as a yellow
+(`status="watch"`) `StatusChip` in a new "Lädt" column between "Angeboten"
+and "Geladen", shown only when the count is greater than zero — the same
+convention its neighbouring count columns already use.
 
 ## 12. The timeout budget
 
@@ -4625,6 +4848,11 @@ operator meets first:
   — `runtimes[].last_error` — is still visible only on the runtime admin
   screen (§11.5), which is the only place that also lets an operator act on
   it (force-start, inspect logs).
+- **Only reachability and the three probed numbers are surfaced today, not
+  the richer telemetry the same endpoints already carry.** Live tokens/sec,
+  prefix/KV-cache stats, and modality auto-detection (llama.cpp's
+  `modalities`, Ollama's `capabilities`) are deliberately out of scope for
+  this feature and tracked separately in issue #49.
 - **Windows stop is kill-only.** Managed processes are started with
   `exec.Command` (never `CommandContext`) and, on unix, in their own process
   group so a stop signal reaches the whole tree; the platform-specific calls live

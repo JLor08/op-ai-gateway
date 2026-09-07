@@ -54,6 +54,8 @@ type RuntimeStatusDTO struct {
 	ContextSize    int       `json:"context_size"`
 	ActiveRequests int       `json:"active_requests"`
 	QueueDepth     int       `json:"queue_depth"`
+	MetricsProbe   string    `json:"metrics_probe"`
+	ContextProbe   string    `json:"context_probe"`
 	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
 	// GATEWAY's own arrival time for the frame that carried it -- never the
 	// agent's self-reported reported_at, which is a claim rather than an
@@ -362,6 +364,26 @@ func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusD
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]RuntimeStatusDTO(nil), r.statuses[serverID]...)
+}
+
+// serverIDs returns every server id that has a published runtime-status
+// snapshot, in no particular order. Bounded to the deployment's GPU-box
+// count (servers running agent-managed models), pruned by Retain below as
+// servers are deleted -- so this is cheap to call once per request and,
+// unlike an offering-servers-per-model walk, its size never depends on how
+// many gateway models exist. Nil/empty for a nil registry or before any
+// server has ever published a status frame.
+func (r *runtimeStatusRegistry) serverIDs() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.statuses))
+	for id := range r.statuses {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // subscribe atomically returns serverID's current runtime-status snapshot

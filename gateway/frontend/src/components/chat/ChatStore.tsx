@@ -250,7 +250,10 @@ export function ChatStoreProvider({
     // selected while unreachable; otherwise just the real models. An empty
     // selection injects nothing (the field is intentionally clearable/searchable).
     if (savedMissing)
-      return [...chatModels, { id: model, display_name: model, flavors: ['openai'] }];
+      return [
+        ...chatModels,
+        { id: model, display_name: model, flavors: ['openai'], loading_on_count: 0 },
+      ];
     return chatModels;
   }, [chatModels, model]);
 
