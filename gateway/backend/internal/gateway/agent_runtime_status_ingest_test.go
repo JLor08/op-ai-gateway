@@ -757,3 +757,35 @@ func TestIngestTelemetrySamplePerServerAggregateUsesTopLevelWithoutCapability(t 
 		t.Fatalf("QueueDepth = %d, want the top-level 4 (no runtime_model_probe capability declared)", telemetry.QueueDepth)
 	}
 }
+
+// TestIngestTelemetrySamplePerServerAggregateClampsNegativeRuntimeValue proves
+// sumRuntimeActiveQueue clamps a per-runtime negative active_requests to 0
+// before summing, rather than letting it flow into the persisted per-server
+// ServerTelemetry aggregate. telemetryFromRequest already rejects a negative
+// TOP-LEVEL active_requests/queue_depth (agent_ingest.go ~1410), but a
+// negative value nested inside one runtimes[] entry bypassed that guard: left
+// unclamped, it would persist a negative aggregate that the routing scorer's
+// validTelemetry treats as invalid, silently excluding this server from ALL
+// routing for every model until a later clean sample. The runtimes[] array
+// is best-effort enrichment throughout this file (see writeBackRuntimeVRAM's
+// "a report is evidence, not a transaction" discipline), so the fix clamps
+// rather than rejects: ingest must still succeed.
+func TestIngestTelemetrySamplePerServerAggregateClampsNegativeRuntimeValue(t *testing.T) {
+	srv := NewTestServer()
+	body := `{"host":{"cpu_util_pct":1},"active_requests":99,"queue_depth":99,` +
+		`"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rt_a","state":"running","active_requests":-999,"queue_depth":0},` +
+		`{"spec_id":"rt_b","state":"running","active_requests":3,"queue_depth":0}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest must succeed (best-effort runtimes[] enrichment, not a transaction) even with a negative per-runtime active_requests: %v", err)
+	}
+
+	telemetry, ok, err := srv.Routes.TelemetryByServer(context.Background(), "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("TelemetryByServer: ok=%v err=%v", ok, err)
+	}
+	if telemetry.ActiveRequests != 3 {
+		t.Fatalf("ActiveRequests = %d, want 3 (the negative rt_a entry clamped to 0, not summed as -999)", telemetry.ActiveRequests)
+	}
+}

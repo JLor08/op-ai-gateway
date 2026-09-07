@@ -288,8 +288,17 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 // processes rather than the (possibly absent/stale) top-level fields.
 func sumRuntimeActiveQueue(runtimes []agentRuntimeSample) (active, queue int) {
 	for _, rt := range runtimes {
-		active += rt.ActiveRequests
-		queue += rt.QueueDepth
+		// A count can never legitimately be negative. Clamp each per-runtime
+		// value to >= 0 before summing rather than rejecting the sample: an
+		// unclamped negative here would push the sum negative, and that
+		// negative aggregate REPLACES the (already validated) top-level
+		// telemetry.ActiveRequests/QueueDepth at the call site below, which
+		// would poison this server's routing scorer input (validTelemetry
+		// treats a negative counter as invalid, excluding the server from ALL
+		// routing) -- rejecting instead would break the best-effort
+		// runtimes[] discipline this file otherwise holds throughout.
+		active += max(rt.ActiveRequests, 0)
+		queue += max(rt.QueueDepth, 0)
 	}
 	return active, queue
 }
@@ -969,12 +978,17 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
 	// Best-effort write-back of each managed process's probed context window
 	// onto its owning mapping (Task 12, Option B) -- see writeBackRuntimeContext.
-	// Gated on THIS sample's declared capabilities (s.AgentFeatures.Has reflects
-	// the Set call just above): an agent that has never declared
-	// runtime_model_probe must never have its mappings' context_size touched
-	// from this path. Never rejects the sample; a failure here is logged and
-	// dropped.
-	if s.AgentFeatures.Has(serverID, runtimeModelProbeFeature) {
+	// Gated on THIS sample's own parsed caps (reused from above), NOT on a
+	// re-read of the shared mutable AgentFeatures registry: during a rolling
+	// agent upgrade, two overlapping in-flight samples for the same server
+	// could otherwise clobber each other's Set(caps) between this gate and
+	// the write-back it guards, letting one sample's write-back run under
+	// the OTHER sample's capabilities. Checking caps directly is race-free --
+	// it reflects exactly what THIS sample declared. An agent that has never
+	// declared runtime_model_probe must never have its mappings' context_size
+	// touched from this path. Never rejects the sample; a failure here is
+	// logged and dropped.
+	if slices.Contains(caps, runtimeModelProbeFeature) {
 		s.writeBackRuntimeContext(ctx, serverID, req.Runtimes)
 	}
 	s.maybeFireReactivation(ctx, server)
