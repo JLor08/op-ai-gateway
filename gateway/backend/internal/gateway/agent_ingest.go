@@ -169,6 +169,8 @@ type agentRuntimeSample struct {
 	ContextSize    int                     `json:"context_size"`
 	ActiveRequests int                     `json:"active_requests"`
 	QueueDepth     int                     `json:"queue_depth"`
+	MetricsProbe   string                  `json:"metrics_probe"`
+	ContextProbe   string                  `json:"context_probe"`
 	GPUs           []agentRuntimeGPUSample `json:"gpus,omitempty"`
 	LastError      *agentRuntimeError      `json:"last_error,omitempty"`
 }
@@ -252,6 +254,8 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			ContextSize:    rt.ContextSize,
 			ActiveRequests: rt.ActiveRequests,
 			QueueDepth:     rt.QueueDepth,
+			MetricsProbe:   rt.MetricsProbe,
+			ContextProbe:   rt.ContextProbe,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.

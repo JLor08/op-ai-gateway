@@ -867,3 +867,32 @@ func TestIngestTelemetrySamplePerServerAggregateClampsNegativeRuntimeValue(t *te
 		t.Fatalf("ActiveRequests = %d, want 3 (the negative rt_a entry clamped to 0, not summed as -999)", telemetry.ActiveRequests)
 	}
 }
+
+// --- Task 3: Probe reachability status fields ---
+
+// TestIngestTelemetrySampleRuntimeProbeReachability proves that a runtime
+// sample carrying metrics_probe and context_probe reachability status fields
+// correctly populates the RuntimeStatusDTO with those exact values.
+func TestIngestTelemetrySampleRuntimeProbeReachability(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_probes", false)
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_probes","model":"qwen-coder","state":"running","since":"2026-08-20T10:00:00Z","pid":4242,"port":9001,"in_flight":2,"restarts":1,"context_size":8192,"active_requests":3,"queue_depth":5,"metrics_probe":"ok","context_probe":"unreachable"}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %#v, want one entry", snap)
+	}
+	got := snap[0]
+	if got.MetricsProbe != "ok" {
+		t.Fatalf("MetricsProbe = %q, want %q", got.MetricsProbe, "ok")
+	}
+	if got.ContextProbe != "unreachable" {
+		t.Fatalf("ContextProbe = %q, want %q", got.ContextProbe, "unreachable")
+	}
+}

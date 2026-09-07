@@ -54,6 +54,8 @@ type RuntimeStatusDTO struct {
 	ContextSize    int       `json:"context_size"`
 	ActiveRequests int       `json:"active_requests"`
 	QueueDepth     int       `json:"queue_depth"`
+	MetricsProbe   string    `json:"metrics_probe"`
+	ContextProbe   string    `json:"context_probe"`
 	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
 	// GATEWAY's own arrival time for the frame that carried it -- never the
 	// agent's self-reported reported_at, which is a claim rather than an
