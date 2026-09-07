@@ -344,13 +344,27 @@ describe('ModelServersSection', () => {
 
     // rowC is 'starting' → the same "currently loading" badge/label
     // RuntimeAdminSection's Live-status column renders for that state (shared
-    // via components/shared/runtimeState.ts).
-    expect(within(rowFor('GPU-Box-C')).getByText(t.runtimeStateStarting)).toBeInTheDocument();
+    // via components/shared/runtimeState.ts). Also assert the chip's
+    // data-status KEY (StatusChip.tsx's documented
+    // getByText(label).toHaveAttribute('data-status', key) pattern, mirrored
+    // from RuntimeAdminSection.test.tsx) so a dropped runtimeStateBadge(r.state)
+    // call — which would flatten every chip to one fixed grey key — fails here,
+    // not just a missing label.
+    expect(within(rowFor('GPU-Box-C')).getByText(t.runtimeStateStarting)).toHaveAttribute(
+      'data-status',
+      'watch',
+    );
     // rowA is 'running' → the active badge.
-    expect(within(rowFor('GPU-Box-A')).getByText(t.runtimeStateRunning)).toBeInTheDocument();
+    expect(within(rowFor('GPU-Box-A')).getByText(t.runtimeStateRunning)).toHaveAttribute(
+      'data-status',
+      'active',
+    );
     // rowB has no runtime status ('') → the neutral "unknown" badge, not a
     // misleading "stopped".
-    expect(within(rowFor('GPU-Box-B')).getByText(t.runtimeStatusUnknown)).toBeInTheDocument();
+    expect(within(rowFor('GPU-Box-B')).getByText(t.runtimeStatusUnknown)).toHaveAttribute(
+      'data-status',
+      'standby',
+    );
   });
 
   it('shows the live active/queue counts and the context size', async () => {
@@ -358,11 +372,18 @@ describe('ModelServersSection', () => {
     renderSection(api);
     await screen.findByText('GPU-Box-A');
 
-    const rowA = within(rowFor('GPU-Box-A'));
+    // Pin each value to its OWN column by cell position rather than asserting
+    // getByText independently for each — a swap of the active/queue column
+    // `render` functions would still leave both numbers present somewhere in
+    // the row. Indices follow the default-visible `columns` order declared in
+    // ModelServersSection.tsx (defaultHidden columns excluded): 0 prio,
+    // 1 server, 2 loaded, 3 state, 4 active, 5 queue, 6 genTps, 7 promptTps,
+    // 8 loadTime, 9 context.
+    const cells = within(rowFor('GPU-Box-A')).getAllByRole('cell');
     // active_requests=5, queue_depth=3, context_size=32768 (makeRows' rowA).
-    expect(rowA.getByText('5')).toBeInTheDocument();
-    expect(rowA.getByText('3')).toBeInTheDocument();
-    expect(rowA.getByText('32768')).toBeInTheDocument();
+    expect(cells[4]).toHaveTextContent('5');
+    expect(cells[5]).toHaveTextContent('3');
+    expect(cells[9]).toHaveTextContent('32768');
   });
 
   it('renders 0 active/queue as the real value, not a placeholder dash', async () => {
