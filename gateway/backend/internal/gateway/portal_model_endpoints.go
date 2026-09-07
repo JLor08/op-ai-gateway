@@ -200,6 +200,43 @@ type startingServerCandidate struct {
 // see injectLoadingOnCounts.
 func (s *Server) startingServersByModel(ctx context.Context, token auth.Token, filterVisibility bool) map[string]map[string]struct{} {
 	result := map[string]map[string]struct{}{}
+	candidates, candidateServerIDs := s.startingCandidates()
+	if len(candidates) == 0 {
+		return result
+	}
+
+	allowed := map[string]bool{}
+	if filterVisibility {
+		var err error
+		allowed, err = s.Portal.AllowedServerIDs(ctx, token, candidateServerIDs)
+		if err != nil {
+			return result
+		}
+	}
+
+	for _, c := range candidates {
+		if filterVisibility && !allowed[c.serverID] {
+			continue
+		}
+		modelName, serverName, ok := s.startingCandidateOffering(ctx, c)
+		if !ok {
+			continue
+		}
+		set, exists := result[modelName]
+		if !exists {
+			set = map[string]struct{}{}
+			result[modelName] = set
+		}
+		set[serverName] = struct{}{}
+	}
+	return result
+}
+
+// startingCandidates walks the runtime-status registry once and returns every
+// (server, spec) pair currently reporting State == "starting", plus the DISTINCT server
+// ids among them -- the exact argument for startingServersByModel's single
+// AllowedServerIDs call. No store access at all: this reads only the in-memory registry.
+func (s *Server) startingCandidates() ([]startingServerCandidate, []string) {
 	var candidates []startingServerCandidate
 	serverIDSet := map[string]struct{}{}
 	for _, serverID := range s.RuntimeStatus.serverIDs() {
@@ -211,47 +248,32 @@ func (s *Server) startingServersByModel(ctx context.Context, token auth.Token, f
 			serverIDSet[serverID] = struct{}{}
 		}
 	}
-	if len(candidates) == 0 {
-		return result
+	ids := make([]string, 0, len(serverIDSet))
+	for id := range serverIDSet {
+		ids = append(ids, id)
 	}
+	return candidates, ids
+}
 
-	allowed := map[string]bool{}
-	if filterVisibility {
-		ids := make([]string, 0, len(serverIDSet))
-		for id := range serverIDSet {
-			ids = append(ids, id)
-		}
-		var err error
-		allowed, err = s.Portal.AllowedServerIDs(ctx, token, ids)
-		if err != nil {
-			return result
-		}
+// startingCandidateOffering resolves one starting candidate to the (gateway model name,
+// server name) it should be counted under, or ok == false when it must not be counted
+// at all: an unresolvable spec or mapping, or a server that does not actually OFFER the
+// mapping (offeringServerName). Every step is a primary-key point read -- see
+// startingServersByModel's COST note.
+func (s *Server) startingCandidateOffering(ctx context.Context, c startingServerCandidate) (string, string, bool) {
+	spec, found, err := s.Routes.RuntimeSpecByID(ctx, c.specID)
+	if err != nil || !found {
+		return "", "", false
 	}
-
-	for _, c := range candidates {
-		if filterVisibility && !allowed[c.serverID] {
-			continue
-		}
-		spec, ok, err := s.Routes.RuntimeSpecByID(ctx, c.specID)
-		if err != nil || !ok {
-			continue
-		}
-		mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
-		if err != nil {
-			continue
-		}
-		serverName, offering := s.offeringServerName(ctx, c.serverID, mapping)
-		if !offering {
-			continue
-		}
-		set, ok := result[mapping.GatewayModelName]
-		if !ok {
-			set = map[string]struct{}{}
-			result[mapping.GatewayModelName] = set
-		}
-		set[serverName] = struct{}{}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		return "", "", false
 	}
-	return result
+	serverName, offering := s.offeringServerName(ctx, c.serverID, mapping)
+	if !offering {
+		return "", "", false
+	}
+	return mapping.GatewayModelName, serverName, true
 }
 
 // offeringServerName reports whether serverID currently OFFERS mapping -- the exact
