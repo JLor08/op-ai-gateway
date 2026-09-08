@@ -71,6 +71,12 @@ function makeActive(overrides: Partial<ActiveRequest> = {}): ActiveRequest {
     provider_model: 'upstream-live-model',
     stream: true,
     started_at: '2026-07-16T12:00:00.000Z',
+    // Required by the DTO (Task 5); defaults mean "not measured" so existing
+    // assertions in this suite are unaffected unless a test overrides them.
+    output_tokens: 0,
+    tokens_per_second: 0,
+    tokens_per_second_source: '',
+    ttft_ms: 0,
     ...overrides,
   };
 }
