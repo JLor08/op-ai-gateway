@@ -56,6 +56,17 @@ type RuntimeStatusDTO struct {
 	QueueDepth     int       `json:"queue_depth"`
 	MetricsProbe   string    `json:"metrics_probe"`
 	ContextProbe   string    `json:"context_probe"`
+	// LiveProgressSupport mirrors agentRuntimeSample.LiveProgressSupport
+	// field-for-field: "" (undetermined), "supported", or "unsupported" for
+	// this child's build's live-progress request parameters (issue #51 /
+	// timings-capability-detection). The runtime-admin surface already
+	// displays this frame's other probe states (MetricsProbe/ContextProbe)
+	// alongside the live process; carrying this one too keeps the registry's
+	// published shape coherent with what it already exposes, even though no
+	// current consumer reads it yet -- the durable verdict lives on the
+	// mapping (routing.ModelMapping.LiveProgressSupport, written by
+	// writeBackRuntimeLiveProgress in agent_ingest.go).
+	LiveProgressSupport string `json:"live_progress_support"`
 	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
 	// GATEWAY's own arrival time for the frame that carried it -- never the
 	// agent's self-reported reported_at, which is a claim rather than an

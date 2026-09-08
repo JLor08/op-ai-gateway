@@ -896,3 +896,258 @@ func TestIngestTelemetrySampleRuntimeProbeReachability(t *testing.T) {
 		t.Fatalf("ContextProbe = %q, want %q", got.ContextProbe, "unreachable")
 	}
 }
+
+// --- Task 5: per-mapping live-progress-support capability write-back ------
+
+// countingLiveProgressWriteStore counts the live-progress write-back's own
+// UPDATE (UpdateMappingLiveProgressSupport), so a test can assert exactly how
+// many times it fired -- writeBackRuntimeLiveProgress's sibling spy to
+// countingContextWriteStore/countingMeasuredWriteStore above, same mechanism,
+// different call.
+type countingLiveProgressWriteStore struct {
+	*routing.MemoryStore
+	updateCalls atomic.Int32
+}
+
+func (c *countingLiveProgressWriteStore) UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error {
+	c.updateCalls.Add(1)
+	return c.MemoryStore.UpdateMappingLiveProgressSupport(ctx, id, support, at)
+}
+
+// liveProgressBody builds a minimal runtime_model_probe-declaring telemetry
+// body naming specID with the given live_progress_support verdict (omitted
+// entirely from the JSON when support is ""). It carries no gpus and no
+// context_size: that isolates the live-progress write-back's own resolution
+// from writeBackRuntimeVRAM's and writeBackRuntimeContext's, both of which
+// `continue` before ever resolving a spec when their own preconditions (GPUs
+// present / context_size > 0) are absent -- letting a memoization test count
+// RuntimeSpecByID calls attributable to this path alone.
+func liveProgressBody(specID, support string) string {
+	field := ""
+	if support != "" {
+		field = `,"live_progress_support":"` + support + `"`
+	}
+	return `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"` + specID + `","state":"running"` + field + `}]}`
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves a
+// "supported" sample is written to the mapping's live_progress_support
+// column, and that an IDENTICAL second sample costs no further write. This is
+// writeBackRuntimeContext's F2 fix applied to a capability rather than a
+// metric -- and it matters MORE here: a build capability is stable by
+// nature, so the SAME child build reports the SAME verdict every single
+// second for its whole life. Without change detection this would drive one
+// UPDATE per second per mapping, forever, for a value that can never change
+// short of an operator swapping the upstream binary.
+func TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_once", false)
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	body := liveProgressBody("rspec_lp_once", "supported")
+	for i := 0; i < 2; i++ {
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d across two samples carrying the SAME verdict, want exactly 1", got)
+	}
+	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_lp_once")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q", mapping.LiveProgressSupport, "supported")
+	}
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample proves a
+// sample whose live_progress_support is "" -- an older agent that predates
+// the field, or a child whose build this agent has not yet reached a stable
+// verdict for -- never writes: unknown must never overwrite a stored
+// verdict. The mapping is seeded to ALREADY hold "supported" via the Task 1
+// writer directly (not through the code path under test), so this assertion
+// cannot pass merely because both sides happen to be empty.
+func TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_empty", false)
+	ctx := context.Background()
+	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_lp_empty", "supported", time.Now().UTC()); err != nil {
+		t.Fatalf("seed UpdateMappingLiveProgressSupport: %v", err)
+	}
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	body := liveProgressBody("rspec_lp_empty", "")
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf(`UpdateMappingLiveProgressSupport calls = %d for an empty ("") sample, want 0 -- unknown must never overwrite a stored verdict`, got)
+	}
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_empty")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", mapping.LiveProgressSupport, "supported")
+	}
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping proves
+// the deliberate difference from writeBackRuntimeContext: UNLIKE the
+// context-size write-back, a metrics_locked mapping's live-progress
+// capability IS still updated. A capability is a property of the upstream
+// build, not a metric an operator pins numbers against -- see
+// resolveRuntimeSpecLiveProgress's doc comment for the full rationale. The
+// mapping's manually pinned context_size/metrics_source must remain
+// untouched: only the orthogonal capability write is unlocked.
+func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_locked", false)
+	ctx := context.Background()
+
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_locked")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	mapping.MetricsLocked = true
+	mapping.ContextSize = 4096
+	mapping.MetricsSource = "manual"
+	if err := srv.Routes.UpdateMapping(ctx, mapping); err != nil {
+		t.Fatalf("UpdateMapping: %v", err)
+	}
+
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	body := liveProgressBody("rspec_lp_locked", "supported")
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want exactly 1 -- a locked mapping's capability must still be updated", got)
+	}
+	got, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_locked")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q even though the mapping is metrics_locked", got.LiveProgressSupport, "supported")
+	}
+	if got.ContextSize != 4096 || got.MetricsSource != "manual" {
+		t.Fatalf("mapping = %#v, want the manually pinned context_size/metrics_source left untouched", got)
+	}
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackWritesOnChange proves change
+// detection is not "write once and never again": a verdict that genuinely
+// moves (e.g. an operator swaps the upstream binary for one with a different
+// build) must still be written.
+func TestIngestTelemetrySampleLiveProgressWriteBackWritesOnChange(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_change", false)
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+	ctx := context.Background()
+
+	req, raw := ingestReq(t, liveProgressBody("rspec_lp_change", "unsupported"))
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest 1: %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls after first ingest = %d, want 1", got)
+	}
+
+	req, raw = ingestReq(t, liveProgressBody("rspec_lp_change", "supported"))
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest 2 (changed): %v", err)
+	}
+	if got := counting.updateCalls.Load(); got != 2 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d after a CHANGED verdict (unsupported -> supported), want 2", got)
+	}
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_change")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want the changed %q", mapping.LiveProgressSupport, "supported")
+	}
+}
+
+// manyLiveProgressSamples builds n agentRuntimeSample entries all naming
+// specID with the given live_progress_support verdict and no gpus/
+// context_size -- isolating the live-progress write-back's own resolution
+// from writeBackRuntimeVRAM's and writeBackRuntimeContext's, both of which
+// `continue` before ever resolving a spec when their own preconditions (GPUs
+// present / context_size > 0) are absent.
+func manyLiveProgressSamples(n int, specID, support string) []agentRuntimeSample {
+	out := make([]agentRuntimeSample, n)
+	for i := range out {
+		out[i] = agentRuntimeSample{SpecID: specID, State: "running", LiveProgressSupport: support}
+	}
+	return out
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackMemoizesRepeatedSpecID proves
+// a snapshot repeating one spec_id many times resolves it exactly once:
+// telemetry arrives roughly once per second as a FULL SNAPSHOT, so a sample
+// naming the same spec_id many times over must not re-run the ownership
+// resolution chain (RuntimeSpecByID + MappingByID + ApplicationByID) once per
+// occurrence. A call-count spy on RuntimeSpecByID is the honest way to prove
+// this: both a memoized and an un-memoized loop reach the same final stored
+// value, so only the call count distinguishes them.
+func TestIngestTelemetrySampleLiveProgressWriteBackMemoizesRepeatedSpecID(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_memo", false)
+	counting := &countingRuntimeSpecStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	req := agentTelemetryRequest{
+		Host:         &agentHostReport{CPUUtilPct: 1},
+		Capabilities: json.RawMessage(`{"features":["runtime_model_probe"]}`),
+		Runtimes:     manyLiveProgressSamples(10, "rspec_lp_memo", "supported"),
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.runtimeSpecByIDCalls.Load(); got != 1 {
+		t.Fatalf("RuntimeSpecByID calls = %d, want exactly 1 (one spec_id repeated 10x in one snapshot must resolve once)", got)
+	}
+}
+
+// TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO proves a runtime
+// sample's live_progress_support reaches the volatile RuntimeStatusDTO the
+// portal's live SSE stream serves, mirroring
+// TestIngestTelemetrySampleRuntimeProbeReachability for MetricsProbe/
+// ContextProbe. Unlike the store write-back, DTO publishing is unconditional
+// -- it is not gated on the runtime_model_probe capability.
+func TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_dto", false)
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_lp_dto","state":"running","live_progress_support":"unsupported"}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %#v, want one entry", snap)
+	}
+	if snap[0].LiveProgressSupport != "unsupported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q", snap[0].LiveProgressSupport, "unsupported")
+	}
+}
