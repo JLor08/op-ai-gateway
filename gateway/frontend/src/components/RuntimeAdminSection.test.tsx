@@ -1867,6 +1867,27 @@ function inRowWith(text: string) {
   return within(rows[0]);
 }
 
+// cellForColumn resolves a row's cell by its COLUMN HEADER rather than a
+// hard-coded index -- the same precedent as ModelServersSection.test.tsx's
+// helper of the same name. Needed for #57: the mapping table's `gpus` column
+// already falls back to the shared "—" em-dash when a spec has no GPUs (the
+// default `makeSpec()` shape), and the probes column now falls back to the
+// SAME glyph when both probes are unreported. A positional or page-wide
+// `getByText('—')` assertion could not tell those two cells apart -- it would
+// happily pass against the neighbouring `gpus` cell even if the probes column
+// were reverted to rendering nothing at all.
+function cellForColumn(rowText: string, columnLabel: string): HTMLElement {
+  const rows = screen.getAllByRole('row').filter((r) => r.textContent?.includes(rowText));
+  if (rows.length !== 1) {
+    throw new Error(`expected exactly one table row containing ${rowText}, found ${rows.length}`);
+  }
+  const row = rows[0];
+  const headers = within(row.closest('table')!).getAllByRole('columnheader');
+  const index = headers.findIndex((h) => h.textContent?.trim() === columnLabel);
+  if (index < 0) throw new Error(`no column header labelled ${columnLabel}`);
+  return within(row).getAllByRole('cell')[index];
+}
+
 describe('RuntimeAdminSection live status list', () => {
   it('renders one row per reported process with its state, since, pid, port, in-flight and restarts', async () => {
     const { stream } = renderSection({
@@ -2096,12 +2117,20 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
     }
   });
 
-  // "" means "not reported" (a legacy agent, or a non-running child) --
-  // render nothing at all, not even a neutral placeholder chip.
-  it('renders no probe chips when both probes are unreported ("")', async () => {
+  // "" means "not reported" (a legacy agent, or a non-running child) -- no
+  // chip renders for either probe individually, but #57 decided the CELL
+  // itself must still say "present, nothing to report": the shared em-dash,
+  // not a blank cell indistinguishable from a column that does not exist.
+  it('renders the shared em-dash, not a blank cell, when both probes are unreported ("")', async () => {
     const { stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
       specsByMappingId: {
+        // Deliberately the DEFAULT `makeSpec()` shape, i.e. `gpus: []` --
+        // which makes the neighbouring `gpus` column ALSO fall back to the
+        // shared "—" em-dash (`formatGpus`). An unscoped `getByText('—')`
+        // would happily match that cell even if the probes column were
+        // reverted to rendering `null`; only a column-scoped query can tell
+        // the two apart.
         map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
       },
       statusRows: [makeStatus({ spec_id: 'spec_1', metrics_probe: '', context_probe: '' })],
@@ -2114,6 +2143,9 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
     // The row's `state` chip (live_status) is the only StatusChip left; no
     // probe chip renders for either the metrics or the context probe.
     expect(row.querySelectorAll('[data-status]')).toHaveLength(1);
+    const probesCell = cellForColumn('Alpha', t.runtimeProbesColumn);
+    expect(probesCell).toHaveTextContent('—');
+    expect(probesCell.querySelectorAll('[data-status]')).toHaveLength(0);
   });
 
   // FIX 5 of the final whole-branch review: these tooltips were DEAD. MUI's
@@ -2161,6 +2193,100 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
       screen.getByText(probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateOk)),
     );
     expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeProbeTooltipOk);
+  });
+});
+
+// #57: task 6 (above) shipped the probe chips into the launch-specs table's
+// `columns` -- the MAPPING table, by the letter of #50's own design spec ("add
+// one compact Probes column to the mapping live-status table"). The operator
+// who went looking for probe reachability was on the Live-Status tab
+// (`statusColumns`, storageKey="op.runtimeStatus") and found nothing there: a
+// different table, answering "what is actually RUNNING" rather than "what is
+// CONFIGURED". These are the same three cases as the describe block above,
+// replayed against the Live-Status tab, so a regression that drops (or never
+// restores) the Live-Status column fails HERE even while the mapping table's
+// own copy stays green.
+describe('RuntimeAdminSection probe-reachability column on Live-Status (#57)', () => {
+  function probeLabel(prefix: string, state: string): string {
+    return `${prefix} ${state}`;
+  }
+
+  it('renders independent metrics/context probe chips on the Live-Status row -- unreachable is the warning colour, ok is the success one', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          spec_id: 'spec_1',
+          model: 'Alpha',
+          metrics_probe: 'unreachable',
+          context_probe: 'ok',
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('Alpha');
+
+    const cell = cellForColumn('Alpha', t.runtimeProbesColumn);
+    const metricsChip = within(cell).getByText(
+      probeLabel(t.runtimeProbeMetricsPrefix, t.runtimeProbeStateUnreachable),
+    );
+    expect(metricsChip).toHaveAttribute('data-status', 'watch');
+
+    const contextChip = within(cell).getByText(
+      probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateOk),
+    );
+    expect(contextChip).toHaveAttribute('data-status', 'active');
+  });
+
+  // "na" (this runtime type has no such endpoint, e.g. Ollama has no
+  // /metrics) must NEVER look like the "unreachable" warning on this table
+  // either -- an Ollama model would otherwise look broken when it is fine.
+  it('renders `na` as the neutral chip on the Live-Status row, never the warning one', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({ spec_id: 'spec_1', model: 'Alpha', metrics_probe: 'na', context_probe: 'na' }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('Alpha');
+
+    const cell = cellForColumn('Alpha', t.runtimeProbesColumn);
+    for (const prefix of [t.runtimeProbeMetricsPrefix, t.runtimeProbeContextPrefix]) {
+      const chip = within(cell).getByText(probeLabel(prefix, t.runtimeProbeStateNa));
+      expect(chip).toHaveAttribute('data-status', 'standby');
+      expect(chip).not.toHaveAttribute('data-status', 'watch');
+    }
+  });
+
+  // Both "" (not reported -- a legacy agent, a non-running child, or no spec
+  // status has arrived yet): the shared em-dash, not a blank cell
+  // indistinguishable from a column that does not exist -- the whole reason
+  // #57 happened. `since` is seeded non-empty so its OWN "–" (en dash, a
+  // visually similar but distinct character) fallback cannot be in play, and
+  // the column-scoped query means the `pid`/`port` columns' own "–" fallbacks
+  // (also seeded away here) could not satisfy the assertion either way.
+  it('renders the shared em-dash, not a blank cell, when both probes are unreported ("") on Live-Status', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          spec_id: 'spec_1',
+          model: 'Alpha',
+          metrics_probe: '',
+          context_probe: '',
+          since: '2026-07-16T12:00:00Z',
+          pid: 4242,
+          port: 8099,
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('Alpha');
+
+    const cell = cellForColumn('Alpha', t.runtimeProbesColumn);
+    expect(cell).toHaveTextContent('—');
+    expect(cell.querySelectorAll('[data-status]')).toHaveLength(0);
   });
 });
 
