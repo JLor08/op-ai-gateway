@@ -20,6 +20,13 @@ import (
 type ModelInfo struct {
 	Name        string
 	ContextSize int
+	// LiveProgressSupport is the upstream build's verdict on the live-progress
+	// request parameters (#51), as detected by detectLiveProgressSupport: ""
+	// (never determined -- the body wasn't a llama.cpp /props document at all),
+	// "supported", or "unsupported". "" must never overwrite an already-stored
+	// verdict -- see UpdateMappingLiveProgressSupport and the context-probe pass
+	// in cmd/gateway/app_health.go.
+	LiveProgressSupport string
 }
 
 // ModelInfoProber GETs target.Endpoint+probePath and parses model info (currently
@@ -87,7 +94,63 @@ func parseModelInfo(body []byte) []ModelInfo {
 	if nctx == 0 {
 		nctx = intFromAny(obj["n_ctx"])
 	}
-	return []ModelInfo{{Name: name, ContextSize: nctx}}
+	return []ModelInfo{{Name: name, ContextSize: nctx, LiveProgressSupport: detectLiveProgressSupport(body)}}
+}
+
+// detectLiveProgressSupport is the live-progress-capability detector (#51): it
+// decides whether the upstream build tolerates the live-progress request
+// parameters (tokens/sec, TTFT) WITHOUT ever sending a request that risks a
+// 400 to find out.
+//
+// The signal is the presence of the key "timings_per_token" inside
+// default_generation_settings.params in a llama.cpp /props response. That
+// object is a serialization of the COMPILED request-schema field list, so the
+// key's presence asserts "this build's completion schema has that field" --
+// not merely "this looks like llama.cpp". Presence is ALL that is checked:
+// the value is always false (the handler default-constructs the params
+// struct), so it carries no information and must never be read.
+//
+// Returns:
+//   - "supported"    default_generation_settings.params is present AND
+//     contains the key.
+//   - "unsupported"  default_generation_settings.params is present but does
+//     NOT contain the key -- a real verdict about a real build (an older
+//     llama.cpp).
+//   - ""             anything else: unparseable bytes, or a body that simply
+//     isn't that document -- a vLLM /v1/models body, an Ollama /api/show
+//     body, a TGI /info body, .... This is UNKNOWN, not a verdict, and the
+//     caller must never let it overwrite an already-stored verdict.
+//
+// Do NOT simplify the "" case to "no key -> unsupported": a vLLM
+// application's context probe fetches /v1/models, not /props, and
+// timings_per_token is a llama.cpp request-schema field that vLLM's context
+// probe was never asking about. Under that simplification every vLLM
+// application would be marked unsupported and then silently dropped from the
+// live-progress figure by the decision rule -- even though vLLM's own
+// equivalent parameter still works.
+//
+// A sibling copy of this EXACT rule lives in the server-agent module: the two
+// are separate Go modules and cannot share code, mirroring the "DUPLICATED
+// locally on purpose" precedent at memory_probe.go:111. Whoever changes this
+// rule must change that copy identically, or the two halves of this feature
+// will drift.
+func detectLiveProgressSupport(body []byte) string {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return ""
+	}
+	dgs, ok := obj["default_generation_settings"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	params, ok := dgs["params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if _, present := params["timings_per_token"]; present {
+		return "supported"
+	}
+	return "unsupported"
 }
 
 // ExpandModelPath substitutes the {model} placeholder in a probe path with the upstream model
@@ -122,6 +185,28 @@ func PickModelContextSize(infos []ModelInfo, model string) int {
 		}
 		if first == 0 {
 			first = info.ContextSize
+		}
+	}
+	return first
+}
+
+// PickModelLiveProgressSupport returns the live-progress-support verdict for a
+// per-model probe of the given model: an info whose Name matches
+// (case-sensitive) wins; otherwise the first info with a non-empty verdict (a
+// per-model /props probe returns one model, so this is that model's value).
+// Returns "" (unknown) when nothing usable is present -- callers must never
+// let that overwrite an already-stored verdict. Mirrors PickModelContextSize.
+func PickModelLiveProgressSupport(infos []ModelInfo, model string) string {
+	first := ""
+	for _, info := range infos {
+		if info.LiveProgressSupport == "" {
+			continue
+		}
+		if info.Name == model {
+			return info.LiveProgressSupport
+		}
+		if first == "" {
+			first = info.LiveProgressSupport
 		}
 	}
 	return first

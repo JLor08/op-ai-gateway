@@ -38,6 +38,11 @@ type healthStore interface {
 	SetServerHealth(ctx context.Context, serverID, health string) error
 	MappingsByApplication(ctx context.Context, applicationID string) ([]routing.ModelMapping, error)
 	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
+	// UpdateMappingLiveProgressSupport records the live-progress-support verdict
+	// (#51) detected alongside the context probe. UNLIKE UpdateMappingContextProbe
+	// it carries no metrics_locked guard -- see its doc comment on the store
+	// interface (routing.MappingStore) for why.
+	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
 }
 
@@ -559,6 +564,17 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	// the store's metrics_locked guard makes a manual pin win atomically.
 	// Skipped entirely for an off-mesh server under netbird_only so this pass
 	// never dials it.
+	//
+	// Riding the SAME probe response (#51): each ModelInfo also carries a
+	// LiveProgressSupport verdict (see provider.detectLiveProgressSupport) --
+	// "" when the body isn't a llama.cpp /props document at all (a vLLM
+	// /v1/models body, an Ollama /api/show body, ...), "supported"/
+	// "unsupported" when it is. Unlike context_size this is a CAPABILITY, not a
+	// metric, so its write (UpdateMappingLiveProgressSupport) carries no
+	// metrics_locked guard and is independent of the context-size outcome; an
+	// unknown ("") verdict never calls the writer, and an unchanged verdict is
+	// skipped so this pass does not issue an UPDATE per application per cadence
+	// tick forever.
 	if r.prober != nil && !offMesh {
 		ctxProber, hasCtxProber := r.prober.(provider.ModelInfoProber)
 		for i := range active {
@@ -628,10 +644,22 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 							continue
 						}
 						ctxSize := provider.PickModelContextSize(infos, mp.AppModelName)
-						if ctxSize <= 0 || ctxSize > maxProbedContextSize || ctxSize == mp.ContextSize {
-							continue
+						if ctxSize > 0 && ctxSize <= maxProbedContextSize && ctxSize != mp.ContextSize {
+							_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, ctxSize, r.now())
 						}
-						_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, ctxSize, r.now())
+						// Additive live-progress-support write (#51), independent of the
+						// context-size outcome above: an unknown ("") verdict never calls
+						// the writer -- unknown must never overwrite a stored verdict -- and
+						// an unchanged verdict is skipped too, so this ~30s-cadence pass does
+						// not issue an UPDATE per application per tick forever (the same
+						// reasoning writeBackRuntimeContext documents at length in
+						// internal/gateway/agent_ingest.go). UpdateMappingLiveProgressSupport
+						// itself carries no metrics_locked guard (a build capability, not a
+						// metric an operator pins numbers against), so this call is
+						// deliberately NOT gated on mp.MetricsLocked either.
+						if support := provider.PickModelLiveProgressSupport(infos, mp.AppModelName); support != "" && support != mp.LiveProgressSupport {
+							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, support, r.now())
+						}
 					}
 					return
 				}
@@ -658,16 +686,35 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 				}
 				for _, info := range infos {
 					// Ignore unknown (0) or absurd values; the store guards metrics_locked.
-					if info.ContextSize <= 0 || info.ContextSize > maxProbedContextSize {
+					if info.ContextSize > 0 && info.ContextSize <= maxProbedContextSize {
+						for _, mp := range mappings {
+							// Skip a locked mapping client-side too (avoids a wasted DB
+							// round-trip every cadence for a locked-divergent row); the
+							// store's atomic metrics_locked = 0 guard stays the source of
+							// truth. Skip an unchanged value so provenance does not churn.
+							if mp.AppModelName == info.Name && !mp.MetricsLocked && mp.ContextSize != info.ContextSize {
+								_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, info.ContextSize, r.now())
+							}
+						}
+					}
+					// Additive live-progress-support write (#51), independent of the
+					// context-size outcome above (and, unlike it, NOT gated on
+					// mp.MetricsLocked -- UpdateMappingLiveProgressSupport records a build
+					// capability, not a metric an operator pins numbers against, so it
+					// carries no metrics_locked guard; see its doc comment). An unknown
+					// ("") verdict never calls the writer -- unknown must never overwrite a
+					// stored verdict, which is what keeps a vLLM /v1/models response (no
+					// default_generation_settings.params at all) from ever being read as
+					// "unsupported". An unchanged verdict is skipped too, so this
+					// ~30s-cadence pass does not issue an UPDATE per application per tick
+					// forever (the same reasoning writeBackRuntimeContext documents at
+					// length in internal/gateway/agent_ingest.go).
+					if info.LiveProgressSupport == "" {
 						continue
 					}
 					for _, mp := range mappings {
-						// Skip a locked mapping client-side too (avoids a wasted DB
-						// round-trip every cadence for a locked-divergent row); the
-						// store's atomic metrics_locked = 0 guard stays the source of
-						// truth. Skip an unchanged value so provenance does not churn.
-						if mp.AppModelName == info.Name && !mp.MetricsLocked && mp.ContextSize != info.ContextSize {
-							_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, info.ContextSize, r.now())
+						if mp.AppModelName == info.Name && mp.LiveProgressSupport != info.LiveProgressSupport {
+							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, info.LiveProgressSupport, r.now())
 						}
 					}
 				}

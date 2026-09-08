@@ -28,12 +28,13 @@ type fakeHealthStore struct {
 	apps     map[string][]routing.Application
 	settings map[string]string
 
-	mu              sync.Mutex
-	health          map[string]string
-	mappings        map[string][]routing.ModelMapping  // keyed by application id
-	ctxProbeSets    int                                // count of UpdateMappingContextProbe calls
-	availSamplesLog []routing.ServerAvailabilitySample // append-ordered availability samples
-	failInsert      bool                               // when true, InsertServerAvailabilitySample errors
+	mu               sync.Mutex
+	health           map[string]string
+	mappings         map[string][]routing.ModelMapping  // keyed by application id
+	ctxProbeSets     int                                // count of UpdateMappingContextProbe calls
+	liveProgressSets int                                // count of UpdateMappingLiveProgressSupport calls
+	availSamplesLog  []routing.ServerAvailabilitySample // append-ordered availability samples
+	failInsert       bool                               // when true, InsertServerAvailabilitySample errors
 }
 
 func (f *fakeHealthStore) AIServers(context.Context) ([]routing.AIServer, error) {
@@ -89,6 +90,38 @@ func (f *fakeHealthStore) ctxProbeSetCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.ctxProbeSets
+}
+
+// UpdateMappingLiveProgressSupport mirrors the store contract (#51): it stamps
+// live_progress_support + live_progress_checked_at UNCONDITIONALLY -- UNLIKE
+// UpdateMappingContextProbe above it carries NO metrics_locked guard, mirroring
+// SQLiteStore.UpdateMappingLiveProgressSupport (a build capability, not a
+// metric an operator pins numbers against).
+func (f *fakeHealthStore) UpdateMappingLiveProgressSupport(_ context.Context, id, support string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.liveProgressSets++
+	for appID, list := range f.mappings {
+		for i := range list {
+			if list[i].ID != id {
+				continue
+			}
+			list[i].LiveProgressSupport = support
+			t := at
+			list[i].LiveProgressCheckedAt = &t
+			f.mappings[appID] = list
+			return nil
+		}
+	}
+	return nil
+}
+
+// liveProgressSetCount returns how many times UpdateMappingLiveProgressSupport
+// was called (a call-count spy for the no-rewrite property).
+func (f *fakeHealthStore) liveProgressSetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.liveProgressSets
 }
 
 // InsertServerAvailabilitySample records an availability sample so the sampling
@@ -661,6 +694,188 @@ func TestRunAppHealthOnceContextProbeNoTemplateUsesSingleProbeNameMatch(t *testi
 	gotB, _ := st.mappingOf("m2")
 	if gotB.ContextSize != 0 {
 		t.Fatalf("m-b ContextSize = %d, want 0 (reported name did not match)", gotB.ContextSize)
+	}
+}
+
+// TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCycle
+// is the no-rewrite property test (#51): a llama.cpp /props body carrying
+// "supported" must be persisted on the first cycle, and a second,
+// otherwise-identical cycle (a fresh cadence state, standing in for the next
+// ~30s tick) must NOT reissue the write, since the stored verdict already
+// matches. Without this comparison the pass would issue an UPDATE per
+// application per cadence tick forever -- the same reasoning
+// writeBackRuntimeContext documents at length in
+// internal/gateway/agent_ingest.go. Uses a call-count spy
+// (liveProgressSetCount), mirroring the repo's existing ctxProbeSetCount spy.
+func TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCycle(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "up", ContextSize: 131072, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
+
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q", got.LiveProgressSupport, "supported")
+	}
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times after the first cycle, want 1", n)
+	}
+
+	// A second cycle with a fresh cadence state (as if the next tick's interval
+	// had elapsed) reports the SAME verdict -- it must not be rewritten.
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
+	}
+}
+
+// TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists proves the
+// global "unknown never overwrites" rule at the pass level: when the probe's
+// parsed ModelInfo carries LiveProgressSupport == "" -- exactly what a vLLM
+// /v1/models body, an Ollama /api/show body, or any other non-llama.cpp-/props
+// shape parses to (see detectLiveProgressSupport in
+// internal/provider/model_info.go) -- the pass must never call the writer at
+// all. This is the guard that keeps a live vLLM application from being
+// silently marked unsupported and dropped from the live-progress figure by
+// Task 3's decision rule.
+//
+// The mapping starts with an ALREADY-STORED "supported" verdict (as if a
+// previous, correctly-shaped /props probe had determined it): this is what
+// makes the assertion meaningful. If the pass instead compared only "changed
+// vs. unchanged" without a dedicated empty-string guard, an unknown result
+// ("" != "supported") would look like a "changed" value and would overwrite
+// the good verdict with unknown -- exactly the regression this test exists to
+// catch. The context-size write is independent and must still land, proving
+// the two writes were not accidentally coupled together.
+func TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up",
+			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+		}},
+	}
+	prober := newFakeProber()
+	// Stands in for a vLLM /v1/models response: ProbeModelInfo reports a context
+	// size but LiveProgressSupport is unknown ("") -- the schema field it is
+	// about does not exist for this upstream's probed endpoint at all.
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "up", ContextSize: 4096}}
+	reg := gateway.NewAppHealthRegistry(nil)
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 0 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an unknown verdict, want 0", n)
+	}
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (unknown must never overwrite an already-stored verdict)", got.LiveProgressSupport, "supported")
+	}
+	if got.ContextSize != 4096 {
+		t.Fatalf("ContextSize = %d, want 4096 (context-size probing must be unaffected by the live-progress guard)", got.ContextSize)
+	}
+}
+
+// TestRunAppHealthOnceLiveProgressSupportPersistsChangedVerdict proves a
+// changed verdict IS persisted (the complement of the no-rewrite test above):
+// the mapping starts at "supported" and the upstream now reports
+// "unsupported" (e.g. after a downgrade to an older llama.cpp build).
+func TestRunAppHealthOnceLiveProgressSupportPersistsChangedVerdict(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up",
+			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+		}},
+	}
+	prober := newFakeProber()
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "up", ContextSize: 4096, LiveProgressSupport: "unsupported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "unsupported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (a changed verdict must be persisted)", got.LiveProgressSupport, "unsupported")
+	}
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1", n)
+	}
+}
+
+// TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock proves
+// UpdateMappingLiveProgressSupport is deliberately NOT gated on
+// mp.MetricsLocked, unlike UpdateMappingContextProbe: a capability is not a
+// metric an operator pins numbers against (see the store method's doc
+// comment), so an operator locking a mapping's throughput/context-size
+// figures must not also silently suppress a real, freshly-detected build
+// capability.
+func TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up",
+			Status: routing.ServerStatusActive, ContextSize: 4096, MetricsLocked: true, MetricsSource: "manual",
+		}},
+	}
+	prober := newFakeProber()
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "up", ContextSize: 131072, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	got, _ := st.mappingOf("m1")
+	// ContextSize respects the lock (existing, untouched behavior)...
+	if got.ContextSize != 4096 {
+		t.Fatalf("locked ContextSize = %d, want 4096 (probe must not overwrite a lock)", got.ContextSize)
+	}
+	// ...but LiveProgressSupport is written regardless.
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (must be written even when metrics are locked)", got.LiveProgressSupport, "supported")
+	}
+}
+
+// TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport proves
+// the per-model {model}-template branch (the second write site,
+// app_health.go's `if strings.Contains(app.ContextProbePath, "{model}")`
+// block) also persists the live-progress verdict, not just the single-probe
+// branch exercised by the tests above.
+func TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxTemplateApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"m-a"})
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (per-model probe must persist the verdict too)", got.LiveProgressSupport, "supported")
+	}
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1", n)
 	}
 }
 

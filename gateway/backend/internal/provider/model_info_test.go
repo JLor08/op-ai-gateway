@@ -28,6 +28,16 @@ func TestParseModelInfoProps(t *testing.T) {
 		{"dgs not an object -> falls through", `{"model":"m","default_generation_settings":"nope"}`, []ModelInfo{{Name: "m", ContextSize: 0}}},
 		{"negative n_ctx -> 0", `{"model":"m","default_generation_settings":{"n_ctx":-5}}`, []ModelInfo{{Name: "m", ContextSize: 0}}},
 		{"top-level array -> empty", `[1,2,3]`, nil},
+		{
+			"parseModelInfo plumbs the live-progress verdict onto the returned entry (supported)",
+			`{"model":"m","default_generation_settings":{"n_ctx":100,"params":{"timings_per_token":false}}}`,
+			[]ModelInfo{{Name: "m", ContextSize: 100, LiveProgressSupport: "supported"}},
+		},
+		{
+			"parseModelInfo plumbs the live-progress verdict onto the returned entry (unsupported)",
+			`{"model":"m","default_generation_settings":{"n_ctx":100,"params":{"n_predict":-1}}}`,
+			[]ModelInfo{{Name: "m", ContextSize: 100, LiveProgressSupport: "unsupported"}},
+		},
 	}
 	for _, tc := range cases {
 		got := parseModelInfo([]byte(tc.body))
@@ -39,6 +49,98 @@ func TestParseModelInfoProps(t *testing.T) {
 				t.Fatalf("%s: got %+v, want %+v", tc.name, got[i], tc.want[i])
 			}
 		}
+	}
+}
+
+// TestParseModelInfoLiveProgressSupport is the decision-rule test for #51: it
+// pins detectLiveProgressSupport's exact supported/unsupported/unknown
+// boundary, which is the single most important behavior in this feature.
+//
+// The case named "vLLM ... must NEVER be read as unsupported" is the
+// load-bearing one. A vLLM application's context probe fetches /v1/models,
+// not /props -- an entirely different schema that was never asked about
+// timings_per_token. The naive simplification ("answered without the key ->
+// unsupported") would mark every such body unsupported, and Task 3's decision
+// rule would then silently stop sending the live-progress parameters to a
+// live, working vLLM application. If this case ever starts asserting
+// "unsupported", that regression has landed -- do not "fix" this test to
+// match; fix detectLiveProgressSupport instead.
+func TestParseModelInfoLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"llama.cpp /props WITH the key -> supported (never inspect the value, which is always false)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false,"n_predict":-1}}}`,
+			"supported",
+		},
+		{
+			"llama.cpp /props WITHOUT the key -> unsupported, a real verdict (an older build)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"unsupported",
+		},
+		{
+			"a vLLM /v1/models body must NEVER be read as unsupported -- it is a different schema, not an older llama.cpp",
+			`{"object":"list","data":[{"id":"facebook/opt-125m","object":"model","owned_by":"vllm","max_model_len":2048}]}`,
+			"",
+		},
+		{
+			"an Ollama /api/show body -> unknown, not unsupported",
+			`{"model_info":{"general.architecture":"llama"},"parameters":"num_ctx 4096","template":"{{ .Prompt }}"}`,
+			"",
+		},
+		{
+			"a /props-shaped body with default_generation_settings but no params object at all -> unknown",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096}}`,
+			"",
+		},
+		{
+			"unparseable bytes -> unknown",
+			`not json`,
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectLiveProgressSupport([]byte(tc.body)); got != tc.want {
+				t.Fatalf("detectLiveProgressSupport(%s) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPickModelLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name  string
+		infos []ModelInfo
+		model string
+		want  string
+	}{
+		{
+			"name-match wins even when a different info precedes",
+			[]ModelInfo{{Name: "other", LiveProgressSupport: "unsupported"}, {Name: "m", LiveProgressSupport: "supported"}},
+			"m", "supported",
+		},
+		{
+			"first-non-empty fallback when no name matches (a per-model probe reporting a divergent name)",
+			[]ModelInfo{{Name: "some-basename", LiveProgressSupport: "supported"}},
+			"m", "supported",
+		},
+		{
+			"skips unknown entries",
+			[]ModelInfo{{Name: "m", LiveProgressSupport: ""}, {Name: "x", LiveProgressSupport: "unsupported"}},
+			"m", "unsupported",
+		},
+		{"empty -> unknown", nil, "m", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PickModelLiveProgressSupport(tc.infos, tc.model); got != tc.want {
+				t.Fatalf("PickModelLiveProgressSupport(%+v, %q) = %q, want %q", tc.infos, tc.model, got, tc.want)
+			}
+		})
 	}
 }
 
