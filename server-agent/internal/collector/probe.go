@@ -97,7 +97,7 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 		return 0, fmt.Errorf("probe context: no context path configured")
 	}
 
-	body, err := fetchProbeBody(ctx, client, baseURL, path)
+	body, _, err := fetchProbeBody(ctx, client, baseURL, path)
 	if err != nil {
 		return 0, fmt.Errorf("probe context: %w", err)
 	}
@@ -120,7 +120,15 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 // ProbeContext's long-standing contract), and return the raw response body
 // on a 2xx status. It never interprets the bytes -- each caller applies its
 // own parse/evidence rule to the same body.
-func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, error) {
+//
+// The returned status is the HTTP status code actually received, or 0 if no
+// response was ever received at all (a transport-level failure: connection
+// refused, timeout, DNS failure, ...). ProbeContext ignores it -- its error
+// handling and caching policy are unchanged by this. ProbeLiveProgressSupport
+// uses it to tell a transient failure (status 0, or some other non-404
+// non-2xx status) from a conclusive 404 when deciding whether an
+// undetermined verdict is safe to cache.
+func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -128,18 +136,19 @@ func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path stri
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("probe: upstream status %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("probe: upstream status %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return body, resp.StatusCode, err
 }
 
 // LiveProgressProbePath is the fixed path GETted for the live-progress-
@@ -155,9 +164,9 @@ const LiveProgressProbePath = "/props"
 
 // ProbeLiveProgressSupport GETs baseURL+LiveProgressProbePath and returns
 // the live-progress-capability verdict for whatever answered: "supported",
-// "unsupported", or "" (unknown -- the fetch failed, or the body is not a
-// llama.cpp /props document at all). It reuses fetchProbeBody, the exact
-// GET-and-read-body step ProbeContext uses, then hands the raw bytes to
+// "unsupported", or "" (unknown -- the body is not a llama.cpp /props
+// document at all). It reuses fetchProbeBody, the exact GET-and-read-body
+// step ProbeContext uses, then hands the raw bytes to
 // detectLiveProgressSupport for the actual evidence rule.
 //
 // This is a SIBLING of ProbeContext, not a case folded into it:
@@ -167,15 +176,46 @@ const LiveProgressProbePath = "/props"
 // capability that has nothing to do with context-size extraction. Keeping
 // this a separate function is the deliberate shape choice.
 //
-// A fetch failure is swallowed to "" rather than returned as an error: this
-// probe is advisory (see detectLiveProgressSupport's doc comment) and must
-// never fail or delay a collect cycle.
-func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) string {
-	body, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
+// The second return, stable, tells the caller whether this outcome
+// (including a "" one) is safe to cache and stop asking about, or must be
+// retried next cycle. This is a resource-usage fix: without it, a
+// non-llama.cpp child would have its /props endpoint hit every single
+// collect cycle for its entire lifetime, because "" was never cached at all.
+// The split is about WHY no verdict could be determined, not about the
+// verdict's value:
+//
+//   - stable == true: the endpoint answered CONCLUSIVELY. Either a real
+//     /props document (verdict "supported"/"unsupported", exactly as
+//     before), or a 404 (this route does not exist on this build), or any
+//     other syntactically well-formed body that simply isn't that document
+//     (a vLLM/Ollama/TGI body, say). None of that can change while this
+//     process keeps running: the binary behind it does not change.
+//   - stable == false: no conclusive answer was possible -- the fetch never
+//     got an HTTP response at all (connection refused, timeout, ...), the
+//     response was some other non-404 non-2xx status, or the body was
+//     syntactically invalid/truncated JSON. Any of these can describe a
+//     child that is merely still warming up, so the caller must NOT cache
+//     "" here.
+//
+// A caller that collapses this into one branch either reintroduces the
+// permanent per-cycle /props traffic (by never caching) or permanently
+// misses a verdict for a slow-starting child (by caching everything).
+func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) (verdict string, stable bool) {
+	body, status, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
 	if err != nil {
-		return ""
+		// No conclusive body in hand. A 404 is the one status that
+		// conclusively answers "this route does not exist here"; every
+		// other failure (status 0 -- no response at all -- or some other
+		// non-2xx status) might still resolve differently once the child
+		// finishes starting up.
+		return "", status == http.StatusNotFound
 	}
-	return detectLiveProgressSupport(body)
+	if !json.Valid(body) {
+		// Syntactically invalid/truncated JSON reads as a child still
+		// mid-response, not a conclusive answer -- do not cache it.
+		return "", false
+	}
+	return detectLiveProgressSupport(body), true
 }
 
 // detectLiveProgressSupport is the agent-side half of the live-progress-

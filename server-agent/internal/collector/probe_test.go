@@ -273,39 +273,88 @@ func TestDetectLiveProgressSupport(t *testing.T) {
 // with NO specType parameter at all -- unlike ProbeContext, it never
 // dispatches on the effective runtime type. A "custom"-typed child (the
 // type routing.DeriveProbePaths gives no context path to at all) still gets
-// probed here, and a body carrying the key still reports "supported".
+// probed here, and a body carrying the key still reports "supported". A real
+// verdict must also report stable == true: it is safe for the caller to
+// cache and never ask again for this pid.
 func TestProbeLiveProgressSupport_Supported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`)
 
-	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
 	if got != "supported" {
-		t.Errorf("ProbeLiveProgressSupport = %q, want %q", got, "supported")
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "supported")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a real verdict is always cacheable)")
 	}
 }
 
 // TestProbeLiveProgressSupport_Unsupported covers a real /props document
-// from an older llama.cpp build that never added the field.
+// from an older llama.cpp build that never added the field. Also stable:
+// this is a real, unchanging verdict about this pid's build.
 func TestProbeLiveProgressSupport_Unsupported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`)
 
-	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
 	if got != "unsupported" {
-		t.Errorf("ProbeLiveProgressSupport = %q, want %q", got, "unsupported")
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "unsupported")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a real verdict is always cacheable)")
 	}
 }
 
-// TestProbeLiveProgressSupport_Unreachable proves a failed fetch (a non-2xx
-// status) is swallowed to "" rather than propagated as an error or having
-// its body inspected -- this probe is advisory and must never fail a
-// collect cycle. The response body here is deliberately a WOULD-BE
-// "supported" /props document: if ProbeLiveProgressSupport ever stopped
-// checking the status code (fetchProbeBody's 2xx check is what this test
-// pins), this exact body would parse as "supported" instead of "" --
-// without that body shape, a broken implementation that ignored the status
-// entirely could still coincidentally return "" (an empty/error body also
-// parses to ""), which would let this test pass without actually covering
-// the status check.
-func TestProbeLiveProgressSupport_Unreachable(t *testing.T) {
+// TestProbeLiveProgressSupport_NotFound is the STABLE undetermined case: a
+// 404 conclusively says this route does not exist on this build, and that
+// cannot change while the process behind it keeps running. verdict stays ""
+// (never fabricate "unsupported" from a 404 -- an absent route is not the
+// same claim as "a real /props document without the field"), but stable
+// must be true so the caller stops asking.
+func TestProbeLiveProgressSupport_NotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer ts.Close()
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a 404", got, "")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a 404 is conclusive: cache it and stop asking)")
+	}
+}
+
+// TestProbeLiveProgressSupport_OtherShape mirrors the gateway side's vLLM
+// case at the HTTP-probe level (not just the parse-rule level covered by
+// TestDetectLiveProgressSupport above): a vLLM-shaped body served back for
+// this fixed "/props" GET must read as unknown, never "unsupported" -- but,
+// being a well-formed body, it IS a conclusive (stable) answer: this pid is
+// simply not a llama.cpp build.
+func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
+	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-/props shape", got, "")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a well-formed non-/props body is a conclusive answer)")
+	}
+}
+
+// TestProbeLiveProgressSupport_TransientStatus proves a non-404 non-2xx
+// status (a 503 here -- the upstream answered, but with a status that says
+// nothing conclusive about whether it's ever going to be a llama.cpp /props
+// document) is swallowed to verdict "" AND reported as stable == false, so
+// the caller retries instead of caching a possibly-temporary state. The
+// response body here is deliberately a WOULD-BE "supported" /props document:
+// if ProbeLiveProgressSupport ever stopped checking the status code
+// (fetchProbeBody's 2xx check is what this test pins), this exact body would
+// parse as "supported" instead of "" -- without that body shape, a broken
+// implementation that ignored the status entirely could still coincidentally
+// return "" (an empty/error body also parses to ""), which would let this
+// test pass without actually covering the status check.
+func TestProbeLiveProgressSupport_TransientStatus(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -313,22 +362,48 @@ func TestProbeLiveProgressSupport_Unreachable(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
 	if got != "" {
-		t.Errorf("ProbeLiveProgressSupport = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (a 503 is not conclusive -- the child may still be starting up)")
 	}
 }
 
-// TestProbeLiveProgressSupport_OtherShape mirrors the gateway side's vLLM
-// case at the HTTP-probe level (not just the parse-rule level covered by
-// TestDetectLiveProgressSupport above): a vLLM-shaped body served back for
-// this fixed "/props" GET must read as unknown, never "unsupported".
-func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
-	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
+// TestProbeLiveProgressSupport_ConnectionRefused is the TRANSIENT case named
+// explicitly in the resource-usage fix: no HTTP response was ever received
+// at all, which is exactly the "child may still be warming up" scenario that
+// must be retried next cycle, never cached.
+func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	addr := ts.URL
+	ts.Close() // closed: nothing is listening on addr anymore
 
-	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	got, stable := ProbeLiveProgressSupport(context.Background(), http.DefaultClient, addr)
 	if got != "" {
-		t.Errorf("ProbeLiveProgressSupport = %q, want %q (unknown) for a non-/props shape", got, "")
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a refused connection", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (a refused connection is transient -- retry, do not cache)")
+	}
+}
+
+// TestProbeLiveProgressSupport_UnparseableBody is the TRANSIENT
+// syntactically-invalid-JSON case: a truncated or garbled body reads the
+// same as "still mid-response", not a conclusive answer, so it must not be
+// cached either.
+func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":`) // truncated mid-object
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for unparseable JSON", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (invalid/truncated JSON is transient -- retry, do not cache)")
 	}
 }
 

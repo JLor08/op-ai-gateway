@@ -1037,18 +1037,28 @@ type runtimeCtxEntry struct {
 // runtimeCapabilityEntry is one cached live-progress-capability probe
 // result: the PID it was measured against (mirroring runtimeCtxEntry -- a
 // restart, a changed PID, forces a re-probe, since a new process generation
-// may run a different build) and the verdict itself ("supported" or
-// "unsupported"; see collector.ProbeLiveProgressSupport). There is no
+// may run a different build) and the verdict itself: "supported",
+// "unsupported", or -- deliberately -- "" (see below). There is no
 // specType/path pair to invalidate on, unlike runtimeCtxEntry: this probe
 // always targets the same fixed collector.LiveProgressProbePath regardless
 // of st.Type, so a config-only edit that changes Type or ContextProbePath
 // (without a restart) has no bearing on this cache's validity.
 //
+// verdict == "" is a valid, cached entry here, not a zero-value placeholder:
+// it means the probe got a CONCLUSIVE non-answer for this pid (a 404, or a
+// well-formed body that simply isn't a llama.cpp /props document) --
+// collector.ProbeLiveProgressSupport's stable == true case. Caching it stops
+// probeRuntimeChildLiveProgress from re-asking a question this pid's binary
+// can never answer differently, without ever fabricating a "supported" or
+// "unsupported" value it did not actually observe. A merely-absent map entry
+// (no key for st.SpecID, or a stale pid) is the "never determined, and
+// nothing yet says the answer is stable" case, and is NOT the same as a
+// present entry whose verdict happens to be "".
+//
 // This cache exists SEPARATELY from runtimeCtxCache on purpose (step 2 of
 // task 4): a context-probe cache hit is proof only that the CONTEXT probe
 // succeeded on this PID generation, never that the capability verdict was
-// ever established. Only "supported"/"unsupported" verdicts are cached here
-// -- see probeRuntimeChildLiveProgress.
+// ever established -- see probeRuntimeChildLiveProgress.
 type runtimeCapabilityEntry struct {
 	pid     int
 	verdict string
@@ -1188,24 +1198,58 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // SSRF guard to apply here (unlike MetricsPath/ContextProbePath, this path
 // is a package constant, never operator/config-supplied).
 //
-// A determined verdict ("supported" or "unsupported") is cached forever for
-// this PID generation in runtimeCapabilityCache -- a cache kept DELIBERATELY
-// separate from runtimeCtxCache, so a cached context size can never stand in
-// for a capability verdict that was never established. "" (unknown -- the
-// fetch failed, or the body isn't a llama.cpp /props document) is never
-// cached, so a transient condition is retried next cycle instead of
-// sticking at unknown forever -- mirroring probeRuntimeChildContext's
-// non-caching of a failed/non-positive probe.
+// Caching policy -- STABLE vs TRANSIENT, not "determined" vs "undetermined":
+//
+// A naive cache keyed only on whether a verdict was determined ("supported"/
+// "unsupported" cache, "" never caches) means every non-llama.cpp child
+// (vLLM/TGI/Ollama) re-GETs /props once per collect cycle, forever, for a
+// question whose answer cannot change while that pid lives -- a permanent
+// per-cycle cost, not a one-time one. The fix caches on WHY no verdict came
+// back, using collector.ProbeLiveProgressSupport's stable return:
+//
+//   - STABLE (a real "supported"/"unsupported" verdict, OR a "" that is
+//     conclusive -- a 404, or a well-formed body that simply isn't a
+//     llama.cpp /props document): that fact cannot change while st.PID's
+//     process keeps running, because the binary behind it does not change.
+//     Cache it -- verdict included, even when it is "" -- in
+//     runtimeCapabilityCache, keyed and invalidated exactly like
+//     runtimeCtxCache (a changed st.PID re-arms the question), so this pid's
+//     /props endpoint is asked at most once, not once per cycle.
+//   - TRANSIENT (a connection refused, a timeout, or an unparseable/
+//     truncated body): the child may still be warming up, so the SAME
+//     silence must not be cached -- retry next cycle, exactly as
+//     probeRuntimeChildContext already retries its own failed or
+//     non-positive probe rather than sticking at a wrong answer forever.
+//
+// Do NOT collapse this into "cache every non-empty verdict, retry every
+// empty one": that reintroduces the permanent per-cycle /props traffic this
+// policy exists to remove. Do NOT collapse it into "cache every verdict
+// including every empty one": that would permanently misdiagnose a
+// slow-starting child as having no live-progress capability. The two
+// failure reasons are why a stable "" is cached (via runtimeCapabilityCache
+// holding verdict == "") while runtimeCtxCache's cached-size path never
+// stores a failure at all -- the two caches answer different questions and
+// must not be merged: a cached context size is proof only that the CONTEXT
+// probe succeeded on this PID generation, never that the capability verdict
+// was ever established (this is also why this cache is kept separate from
+// runtimeCtxCache; a lookup here never consults it, and vice versa).
+//
+// This never overwrites an already-cached value with a fabricated one:
+// rs.LiveProgressSupport is only ever set to a verdict collector.
+// ProbeLiveProgressSupport (or a prior cache write) actually produced, and
+// an uncached probe leaves it at its zero value ("").
 func (a *Agent) probeRuntimeChildLiveProgress(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
 	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID {
 		rs.LiveProgressSupport = entry.verdict
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	verdict := collector.ProbeLiveProgressSupport(cctx, client, base)
+	verdict, stable := collector.ProbeLiveProgressSupport(cctx, client, base)
 	cancel()
-	if verdict == "" {
-		slog.Debug("runtime live-progress capability probe undetermined", "spec_id", st.SpecID)
+	if !stable {
+		// Transient: no conclusive answer yet. Do not cache; retry next
+		// cycle. rs.LiveProgressSupport stays at its zero value ("").
+		slog.Debug("runtime live-progress capability probe undetermined, will retry", "spec_id", st.SpecID)
 		return
 	}
 	if a.runtimeCapabilityCache == nil {
