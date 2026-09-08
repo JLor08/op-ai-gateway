@@ -6,6 +6,7 @@ import type { ActiveRequest } from '../api';
 import type { Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
+import { formatMetric } from './shared/format';
 import type { ActivityScope } from './ActivityToolbar';
 
 // Elapsed since a request started: "Xs" under a minute, otherwise "m:ss".
@@ -15,6 +16,37 @@ function formatElapsed(ms: number): string {
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+// A MEASURED rate must never be indistinguishable from a measured zero — that is
+// this feature's whole thesis. formatMetric(value, 1) guards only falsy values, so
+// a real but tiny rate (vLLM reports completion_tokens: 1 on the first content
+// chunk; if generation then stalls, a poll yields 1/25s = 0.04) renders "0.0" with
+// a tooltip claiming it was computed from a token the server reported.
+//
+// The sub-resolution case therefore gets a closed form rather than more decimals:
+// a second decimal would only MOVE the threshold (1 token over 250s is 0.004,
+// which renders "0.00" just the same) and would break the column's single-scale
+// reading that formatMetric's fixed decimals exist to give. "<0.1" is correct for
+// every positive value below the column's resolution, whatever it is.
+//
+// Kept local to this column: formatMetric's contract is shared, and ListTable's
+// `numeric` columns parse its output back as a number, so the sort accessor below
+// still uses formatMetric unchanged — "<0.1" is a rendering, not a value.
+function formatLiveTps(value: number): string {
+  const text = formatMetric(value, 1);
+  return value > 0 && Number(text) === 0 ? '<0.1' : text;
+}
+
+// The provenance belongs in the tooltip, never baked into the number: an
+// upstream-reported rate and a gateway-computed one are different measurements of
+// the same thing and must not be silently mixed.
+function liveTpsTitle(t: Translation, a: ActiveRequest): string {
+  if (a.tokens_per_second_source === 'upstream') return t.activityLiveTpsUpstream;
+  if (a.tokens_per_second_source === 'gateway') {
+    return t.activityLiveTpsGateway.replace('{n}', String(a.output_tokens));
+  }
+  return t.activityLiveTpsNone;
 }
 
 export type ActiveRequestsPanelProps = {
@@ -140,6 +172,27 @@ export function ActiveRequestsPanel({
       filter: 'enum',
       searchable: false,
       render: (a) => (a.stream ? '✓' : '–'),
+    },
+    {
+      id: 'live_tps',
+      label: t.activityColLiveTokenSpeed,
+      // The SORT accessor stays on formatMetric: it renders the shared "never
+      // measured" em-dash for 0 and keeps the cell sortable as a number (ListTable
+      // sinks a non-numeric cell in BOTH sort directions, so '—' never ranks as
+      // zero, while a measured sub-0.1 rate correctly sorts at ~0). The DISPLAY
+      // goes through formatLiveTps, so such a rate cannot read as a zero.
+      value: (a) => formatMetric(a.tokens_per_second, 1),
+      searchable: false,
+      numeric: true,
+      render: (a) => <span title={liveTpsTitle(t, a)}>{formatLiveTps(a.tokens_per_second)}</span>,
+    },
+    {
+      id: 'ttft',
+      label: t.activityColTTFT,
+      value: (a) => (a.ttft_ms > 0 ? String(a.ttft_ms) : ''),
+      searchable: false,
+      numeric: true,
+      render: (a) => (a.ttft_ms > 0 ? `${a.ttft_ms} ms` : '—'),
     },
     {
       id: 'elapsed',

@@ -22,13 +22,19 @@ const maxToolArgumentsBytes = 1 << 20 // 1 MiB
 
 type OpenAICompatibleClient struct {
 	http *http.Client
+	// liveProgress memoizes the upstreams that REJECTED the two advisory
+	// live-progress request parameters -- negative verdicts only, see
+	// liveProgressMemo (live_progress.go). Held per client rather than as a package
+	// global so its lifetime is the client's: one process-wide client in
+	// production, an isolated one per test.
+	liveProgress *liveProgressMemo
 }
 
 func NewOpenAICompatibleClient(httpClient *http.Client) *OpenAICompatibleClient {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &OpenAICompatibleClient{http: httpClient}
+	return &OpenAICompatibleClient{http: httpClient, liveProgress: newLiveProgressMemo()}
 }
 
 func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Target, req inference.Request) (Response, error) {
@@ -372,7 +378,19 @@ func (c *OpenAICompatibleClient) ProxyNative(ctx context.Context, target routing
 
 var _ StreamingClient = (*OpenAICompatibleClient)(nil)
 
-func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit StreamEmit) error {
+// streamRequestBody builds the Chat Completions STREAMING body. withLiveProgress
+// adds the two advisory live-progress parameters (see live_progress.go); without
+// it the body is exactly what this client sent before that feature existed.
+//
+// Note that dropping them puts `stream_options` back to exactly
+// `{"include_usage": true}` rather than removing the key: include_usage is what
+// makes the terminal usage chunk arrive at all, and every completed-request
+// figure (tokens, cost, the recorded rate) depends on it. Losing an advisory
+// mid-stream number must not cost the authoritative final one.
+//
+// Deliberately a pure function of its arguments, so CompleteStream's retry
+// rebuilds the body from scratch instead of mutating the first attempt's map.
+func streamRequestBody(target routing.Target, req inference.Request, withLiveProgress bool) ([]byte, error) {
 	body := map[string]any{
 		"model":          providerModel(target, req),
 		"stream":         true,
@@ -381,46 +399,117 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	openAIToolFields(body, req)
 	openAISamplingFields(body, req)
+	if withLiveProgress {
+		// Ask for an EXACT running output-token count mid-stream. llama.cpp then
+		// attaches its timings object (predicted_n + predicted_per_second) to every
+		// partial; vLLM puts its running completion_tokens on every chunk.
+		// continuous_usage_stats is inert without include_usage, which is set above
+		// and must stay set. See live_progress.go for why this is only a hint.
+		body["timings_per_token"] = true
+		body["stream_options"] = map[string]any{
+			"include_usage":          true,
+			"continuous_usage_stats": true,
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("%w: encode request", ErrInvalidResponse)
+		return nil, fmt.Errorf("%w: encode request", ErrInvalidResponse)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(raw))
-	if err != nil {
-		return fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
-	}
-	httpReq.Header.Set(contentTypeHeader, jsonContentType)
-	applyUpstreamAuth(ctx, httpReq)
-	sink := CaptureSinkFrom(ctx)
-	sink.RecordRequest(httpReq.Header, raw)
-	httpResp, err := c.http.Do(httpReq)
-	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTimeout
+	return raw, nil
+}
+
+// schemaRejectionStatus reports whether status is one an upstream uses to refuse a
+// body it could not accept: 400 Bad Request or 422 Unprocessable Entity, and
+// nothing else. 503 is excluded ON PURPOSE -- unavailableStatus maps it to
+// ErrUpstreamStarting, which the load runner consumes as "still warming up", and
+// re-issuing the request would both destroy that signal and hit an upstream that
+// is not ready. Every other status keeps its existing meaning too.
+func schemaRejectionStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+// CompleteStream streams a chat completion, translating the upstream's SSE into
+// this codebase's StreamEvents.
+//
+// The two live-progress parameters are ADVISORY: no live figure may fail, delay or
+// alter a request. So a schema rejection is made a NON-EVENT rather than predicted
+// -- the allow-list in live_progress.go is only a performance hint -- and an
+// upstream that refuses them is re-asked once without them. The retry is invisible
+// to the client because all three of its guards must hold:
+//
+//  1. the parameters were actually sent (liveProgress). A request that never
+//     carried them is never retried, so an ordinary 400 keeps its meaning.
+//  2. the failure is of the schema-rejection class: a 400/422 status
+//     (schemaRejectionStatus) or an in-stream error frame. Never 503, never any
+//     other status.
+//  3. nothing has been emitted yet -- an explicit boolean set on the first
+//     SUCCESSFUL emit, so the invariant is CHECKED rather than inferred from where
+//     the code happens to sit.
+//
+// With (3) holding, the already-sent 200 + text/event-stream headers stop being a
+// liability: there is no failure to report to the client, so the second attempt
+// just proceeds, minus one advisory number, and the portal renders the "never
+// measured" em-dash it already has for that case.
+//
+// Payload capture across a retry: CaptureSink.RecordRequest ASSIGNS, so the
+// captured request body is the one that actually ran. WriteResponse appends, but a
+// rejected attempt never reaches it -- the status check precedes both
+// RecordResponseHeaders and the response tee -- so only the rarer in-stream-error
+// retry leaves the failed attempt's frames ahead of the served ones, which is a
+// faithful record of what the gateway did.
+func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit StreamEmit) error {
+	// Guard (1): on the allow-list AND not already known to reject the parameters.
+	// An empty memo means "send them" (live_progress.go).
+	liveProgress := wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)
+	// Guard (3): flipped by the wrapper below on the first emit that RETURNED nil,
+	// i.e. the first event the client may already have seen.
+	emitted := false
+	tracked := func(ev inference.StreamEvent) error {
+		if err := emit(ev); err != nil {
+			return err
 		}
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		emitted = true
+		return nil
+	}
+	schemaRejected, err := c.completeStreamAttempt(ctx, target, req, liveProgress, tracked)
+	if err == nil || !liveProgress || emitted || !schemaRejected {
+		return err
+	}
+	// Deliberately NOT a loop: exactly one retry, bounded by construction rather
+	// than by remembering to clear a flag. The second attempt carries none of the
+	// advisory parameters, so whatever it reports is the upstream's real answer and
+	// belongs to the client unchanged.
+	c.liveProgress.recordRejection(target.RouteID)
+	_, err = c.completeStreamAttempt(ctx, target, req, false, tracked)
+	return err
+}
+
+// completeStreamAttempt performs ONE upstream streaming request and translates its
+// SSE into emit calls. Its first result reports whether the attempt failed the way
+// an upstream that cannot accept the live-progress parameters fails -- a 400/422
+// status, or an in-stream error frame. It is advice, not a verdict: CompleteStream
+// acts on it only under its own three guards, so it can never affect a request
+// that did not carry the parameters or that has already emitted.
+func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, target routing.Target, req inference.Request, liveProgress bool, emit StreamEmit) (bool, error) {
+	raw, err := streamRequestBody(target, req, liveProgress)
+	if err != nil {
+		return false, err
+	}
+	httpResp, retryable, err := c.startStreamRequest(ctx, target, raw)
+	if err != nil {
+		return retryable, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return unavailableStatus(httpResp.StatusCode)
-	}
-	sink.RecordResponseHeaders(httpResp.Header)
 
-	var usage *inference.Usage
-	// The last non-empty finish_reason seen across chunks (it arrives on the final
-	// content chunk). Forwarded on the terminal Completed event so the Anthropic
-	// edge can map it to a stop_reason.
-	var finishReason string
 	// Tool calls arrive incrementally across deltas (id/name in the first chunk,
 	// arguments in fragments), keyed by index. Accumulate, then emit one
 	// StreamEventToolCall per assembled call at the end (before Completed).
-	toolAcc := map[int]*inference.ToolCall{}
-	var toolOrder []int
+	st := &streamChunkState{toolAcc: map[int]*inference.ToolCall{}}
 	// Tee the raw upstream SSE into the capture sink (bounded) as the scanner reads
 	// it, so the translated upstream response is captured byte-for-byte. When not
 	// capturing, ResponseWriter() is nil and the body is read directly.
 	var streamReader io.Reader = httpResp.Body
-	if rw := sink.ResponseWriter(); rw != nil {
+	if rw := CaptureSinkFrom(ctx).ResponseWriter(); rw != nil {
 		streamReader = io.TeeReader(httpResp.Body, rw)
 	}
 	scanner := bufio.NewScanner(streamReader)
@@ -434,107 +523,264 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 		if data == "[DONE]" {
 			break
 		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content          string `json:"content"`
-					ReasoningContent string `json:"reasoning_content"`
-					Reasoning        string `json:"reasoning"`
-					ToolCalls        []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens        int `json:"prompt_tokens"`
-				CompletionTokens    int `json:"completion_tokens"`
-				TotalTokens         int `json:"total_tokens"`
-				PromptTokensDetails struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"prompt_tokens_details"`
-			} `json:"usage"`
-			Timings *struct {
-				PromptPerSecond    float64 `json:"prompt_per_second"`
-				PredictedPerSecond float64 `json:"predicted_per_second"`
-			} `json:"timings"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-		if chunk.Error != nil {
-			return fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
-		}
-		if chunk.Usage != nil {
-			total := chunk.Usage.TotalTokens
-			if total == 0 {
-				total = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
-			}
-			usage = &inference.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-				TotalTokens:  total,
-				CachedTokens: chunk.Usage.PromptTokensDetails.CachedTokens,
-			}
-			if chunk.Timings != nil {
-				usage.PromptPerSecond = chunk.Timings.PromptPerSecond
-				usage.TokensPerSecond = chunk.Timings.PredictedPerSecond
-			}
-		}
-		if len(chunk.Choices) > 0 {
-			if fr := chunk.Choices[0].FinishReason; fr != "" {
-				finishReason = fr
-			}
-			d := chunk.Choices[0].Delta
-			reasoning := d.ReasoningContent
-			if reasoning == "" {
-				reasoning = d.Reasoning
-			}
-			if d.Content != "" || reasoning != "" {
-				if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: d.Content, Reasoning: reasoning}); err != nil {
-					return err
-				}
-			}
-			for _, tc := range d.ToolCalls {
-				acc, ok := toolAcc[tc.Index]
-				if !ok {
-					acc = &inference.ToolCall{}
-					toolAcc[tc.Index] = acc
-					toolOrder = append(toolOrder, tc.Index)
-				}
-				if tc.ID != "" {
-					acc.ID = tc.ID
-				}
-				if tc.Function.Name != "" {
-					acc.Name = tc.Function.Name
-				}
-				// Bound accumulated arguments so a misbehaving upstream can't grow
-				// memory without limit; real function arguments are far below this.
-				if len(acc.Arguments) < maxToolArgumentsBytes {
-					acc.Arguments += tc.Function.Arguments
-				}
-			}
+		retryable, err := applyStreamChunk(data, st, emit)
+		if err != nil {
+			return retryable, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTimeout
+			return false, ErrTimeout
 		}
-		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
+		return false, fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
 	}
-	// Emit each fully-assembled tool call before the terminal Completed event.
-	for _, idx := range toolOrder {
-		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: toolAcc[idx]}); err != nil {
+	if err := emitToolCalls(st, emit); err != nil {
+		return false, err
+	}
+	return false, emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: st.usage, FinishReason: st.finishReason})
+}
+
+// startStreamRequest builds and sends completeStreamAttempt's upstream HTTP
+// request, recording the request (and, on a 2xx status, the response headers)
+// with the context's capture sink. This is completeStreamAttempt's original
+// inline request-building/sending code, extracted verbatim.
+//
+// Its second result mirrors completeStreamAttempt's own retry signal: true
+// when the response status is in the schema-rejection class
+// (schemaRejectionStatus). A non-nil *http.Response is returned only on a 2xx
+// status, and only then -- the caller owns closing its Body, exactly as
+// completeStreamAttempt's own `defer httpResp.Body.Close()` did before this
+// was split out: on every other path (a request/transport error, or a
+// non-2xx status), that defer would never have been reached, and here the
+// response body is closed inline instead, at the same point (this function
+// returning) before completeStreamAttempt ever sees it.
+func (c *OpenAICompatibleClient) startStreamRequest(ctx context.Context, target routing.Target, raw []byte) (*http.Response, bool, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(raw))
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+	}
+	httpReq.Header.Set(contentTypeHeader, jsonContentType)
+	applyUpstreamAuth(ctx, httpReq)
+	sink := CaptureSinkFrom(ctx)
+	sink.RecordRequest(httpReq.Header, raw)
+	httpResp, err := c.http.Do(httpReq)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, false, ErrTimeout
+		}
+		return nil, false, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		httpResp.Body.Close()
+		return nil, schemaRejectionStatus(httpResp.StatusCode), unavailableStatus(httpResp.StatusCode)
+	}
+	sink.RecordResponseHeaders(httpResp.Header)
+	return httpResp, false, nil
+}
+
+// emitToolCalls emits each of st's fully-assembled tool calls, in the order
+// their index first appeared, before the terminal Completed event.
+func emitToolCalls(st *streamChunkState, emit StreamEmit) error {
+	for _, idx := range st.toolOrder {
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: st.toolAcc[idx]}); err != nil {
 			return err
 		}
 	}
-	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: finishReason})
+	return nil
+}
+
+// streamChunkState accumulates completeStreamAttempt's per-chunk results
+// across one scan of the upstream SSE body: the last usage frame seen, the
+// last non-empty finish_reason (it arrives on the final content chunk, and is
+// forwarded on the terminal Completed event so the Anthropic edge can map it
+// to a stop_reason), and the incrementally assembled tool calls.
+type streamChunkState struct {
+	usage        *inference.Usage
+	finishReason string
+	toolAcc      map[int]*inference.ToolCall
+	toolOrder    []int
+}
+
+// streamChunk is one decoded OpenAI-compatible chat-completions SSE chunk.
+// Named (rather than declared inline in applyStreamChunk, as it originally
+// was) purely so applyStreamChunk's helpers below can share the type -- same
+// fields, same JSON tags, same zero values as the original inline struct.
+type streamChunk struct {
+	Choices []streamChunkChoice `json:"choices"`
+	Usage   *streamChunkUsage   `json:"usage"`
+	Timings *streamChunkTimings `json:"timings"`
+	Error   *streamChunkError   `json:"error"`
+}
+
+type streamChunkChoice struct {
+	Delta        streamChunkDelta `json:"delta"`
+	FinishReason string           `json:"finish_reason"`
+}
+
+type streamChunkDelta struct {
+	Content          string                `json:"content"`
+	ReasoningContent string                `json:"reasoning_content"`
+	Reasoning        string                `json:"reasoning"`
+	ToolCalls        []streamChunkToolCall `json:"tool_calls"`
+}
+
+type streamChunkToolCall struct {
+	Index    int                     `json:"index"`
+	ID       string                  `json:"id"`
+	Function streamChunkToolFunction `json:"function"`
+}
+
+type streamChunkToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type streamChunkUsage struct {
+	PromptTokens        int                         `json:"prompt_tokens"`
+	CompletionTokens    int                         `json:"completion_tokens"`
+	TotalTokens         int                         `json:"total_tokens"`
+	PromptTokensDetails streamChunkUsageCacheDetail `json:"prompt_tokens_details"`
+}
+
+type streamChunkUsageCacheDetail struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+type streamChunkTimings struct {
+	PromptPerSecond    float64 `json:"prompt_per_second"`
+	PredictedPerSecond float64 `json:"predicted_per_second"`
+	PredictedN         int     `json:"predicted_n"`
+}
+
+type streamChunkError struct {
+	Message string `json:"message"`
+}
+
+// applyStreamChunk decodes one SSE `data:` line's JSON payload and applies it
+// to st, emitting any resulting stream events: decode -> compute progress ->
+// terminal usage -> emit deltas -> accumulate tool calls (mergeChunkUsage,
+// chunkProgress and applyChunkChoice below). This is completeStreamAttempt's
+// per-chunk body, extracted verbatim; the scanner loop, its guards, and the
+// retry decision all stay in completeStreamAttempt.
+//
+// Its first result mirrors completeStreamAttempt's own: true when this chunk
+// carried an in-stream error frame (the schema-rejection class -- see
+// CompleteStream's doc comment, guard 2). A non-nil error (whether from that
+// frame or from a failed emit) must be returned by the caller immediately,
+// exactly as the original inline code did; a nil error means "continue
+// scanning", regardless of the decode outcome.
+func applyStreamChunk(data string, st *streamChunkState, emit StreamEmit) (bool, error) {
+	var chunk streamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return false, nil
+	}
+	if chunk.Error != nil {
+		// An in-stream error frame. Reported as retryable too: guard (3) means the
+		// client has seen nothing yet, and some OpenAI-compatible proxies (LiteLLM,
+		// OpenRouter -- reachable behind a llama_swap `peer`) surface a rejected body
+		// as an error EVENT after a 200 rather than as a 400 status.
+		return true, fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
+	}
+	mergeChunkUsage(st, chunk)
+	progress := chunkProgress(chunk)
+	if len(chunk.Choices) > 0 {
+		if err := applyChunkChoice(chunk.Choices[0], progress, st, emit); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// mergeChunkUsage applies one decoded chunk's usage/timings fields (if
+// present) onto st.usage. Each chunk that carries a usage object OVERWRITES
+// st.usage wholesale (not a running merge like mergePassthroughUsage) --
+// exactly what the original inline code did, since the OpenAI-compatible
+// stream's usage object is already cumulative per chunk.
+func mergeChunkUsage(st *streamChunkState, chunk streamChunk) {
+	if chunk.Usage != nil {
+		total := chunk.Usage.TotalTokens
+		if total == 0 {
+			total = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
+		}
+		st.usage = &inference.Usage{
+			InputTokens:  chunk.Usage.PromptTokens,
+			OutputTokens: chunk.Usage.CompletionTokens,
+			TotalTokens:  total,
+			CachedTokens: chunk.Usage.PromptTokensDetails.CachedTokens,
+		}
+		if chunk.Timings != nil {
+			st.usage.PromptPerSecond = chunk.Timings.PromptPerSecond
+			st.usage.TokensPerSecond = chunk.Timings.PredictedPerSecond
+		}
+	}
+}
+
+// chunkProgress computes the running, upstream-reported progress for one
+// chunk. Computed OUTSIDE the usage branch on purpose: llama.cpp attaches
+// timings to partial chunks that carry no usage object, which is why this
+// used to be dropped. Never derived here -- a chunk that reports no exact
+// count produces no progress at all.
+func chunkProgress(chunk streamChunk) *inference.StreamProgress {
+	switch {
+	case chunk.Timings != nil && (chunk.Timings.PredictedN > 0 || chunk.Timings.PredictedPerSecond > 0):
+		return &inference.StreamProgress{
+			OutputTokens:    chunk.Timings.PredictedN,
+			TokensPerSecond: chunk.Timings.PredictedPerSecond,
+		}
+	case chunk.Usage != nil && chunk.Usage.CompletionTokens > 0:
+		// vLLM's continuous usage: an exact running count, no rate.
+		return &inference.StreamProgress{OutputTokens: chunk.Usage.CompletionTokens}
+	}
+	return nil
+}
+
+// applyChunkChoice handles chunk.Choices[0] for the (single-choice) streaming
+// case: records the finish_reason, emits a text/reasoning delta event (if
+// either is present, tagged with progress), and accumulates any tool-call
+// fragments.
+func applyChunkChoice(choice streamChunkChoice, progress *inference.StreamProgress, st *streamChunkState, emit StreamEmit) error {
+	if fr := choice.FinishReason; fr != "" {
+		st.finishReason = fr
+	}
+	d := choice.Delta
+	reasoning := d.ReasoningContent
+	if reasoning == "" {
+		reasoning = d.Reasoning
+	}
+	if d.Content != "" || reasoning != "" {
+		if err := emit(inference.StreamEvent{
+			Type:      inference.StreamEventTextDelta,
+			Text:      d.Content,
+			Reasoning: reasoning,
+			Progress:  progress,
+		}); err != nil {
+			return err
+		}
+	}
+	for _, tc := range d.ToolCalls {
+		accumulateToolCall(st, tc)
+	}
+	return nil
+}
+
+// accumulateToolCall folds one tool-call delta fragment (id/name in the first
+// chunk, arguments in fragments) into st, keyed by index.
+func accumulateToolCall(st *streamChunkState, tc streamChunkToolCall) {
+	acc, ok := st.toolAcc[tc.Index]
+	if !ok {
+		acc = &inference.ToolCall{}
+		st.toolAcc[tc.Index] = acc
+		st.toolOrder = append(st.toolOrder, tc.Index)
+	}
+	if tc.ID != "" {
+		acc.ID = tc.ID
+	}
+	if tc.Function.Name != "" {
+		acc.Name = tc.Function.Name
+	}
+	// Bound accumulated arguments so a misbehaving upstream can't grow memory
+	// without limit; real function arguments are far below this.
+	if len(acc.Arguments) < maxToolArgumentsBytes {
+		acc.Arguments += tc.Function.Arguments
+	}
 }

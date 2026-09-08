@@ -91,6 +91,22 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 | `/api/portal/benchmarks/active` | GET | Currently running benchmark jobs, visibility-filtered like server ownership |
 | `/api/portal/dashboard` | GET | Aggregated dashboard payload |
 
+#### Live per-request progress (`/api/portal/usage/active`)
+
+Each in-flight row carries four additional fields, live counters resolved at
+read time from the request's own in-memory progress
+(`activeRequestDTO`/`liveProgressDTO`, `active_requests.go`/`request_progress.go`
+— see [Telemetry, Usage Analytics & Observability
+§8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)
+for the provenance rule and why some paths never populate them):
+
+| Field | Shape | "Not measured" value | Meaning |
+|---|---|---|---|
+| `output_tokens` | int | `0` | The upstream's own cumulative generated-token count; never a gateway guess. |
+| `tokens_per_second` | float | `0` | The live throughput; present only alongside a non-empty `tokens_per_second_source`. |
+| `tokens_per_second_source` | string | `""` | How the rate was obtained: `upstream` (the inference server reported it), `gateway` (computed here from the upstream's exact token count), or `""` (not measured). Always present, never omitted. |
+| `ttft_ms` | int | `0` | Milliseconds from request start to the first content delta. |
+
 #### Token model settings
 
 User tokens and service tokens carry the same per-token model-settings **fields**,

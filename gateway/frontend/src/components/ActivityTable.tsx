@@ -24,6 +24,7 @@ import ViewColumnIcon from '@mui/icons-material/ViewColumn';
 import { Eye, Lock } from 'lucide-react';
 import type { UsageEvent } from '../api';
 import { formatCost, type CurrencyUnit } from '../currency';
+import { formatMetric } from './shared/format';
 import type { Translation } from './shared/types';
 import { IconAction } from './shared/IconAction';
 import { StatusChip } from './shared/StatusChip';
@@ -89,9 +90,9 @@ function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
     case 'output_tokens':
       return row.output_tokens;
     case 'prompt_per_second':
-      return row.prompt_per_second.toFixed(1);
+      return formatMetric(row.prompt_per_second, 1);
     case 'tokens_per_second':
-      return row.tokens_per_second.toFixed(1);
+      return formatMetric(row.tokens_per_second, 1);
     case 'req_path':
       return row.req_path;
     case 'content_type':

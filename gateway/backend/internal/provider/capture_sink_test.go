@@ -129,3 +129,48 @@ func TestCaptureSinkResponseCap(t *testing.T) {
 		t.Fatalf("bounded response = %q, want abcd", got)
 	}
 }
+
+// TestCaptureSinkRecordsTheRetriedRequestBody pins the capture property the
+// live-progress retry rests on: RecordRequest ASSIGNS (it does not append), so
+// after a retried attempt the captured request body is the one that ACTUALLY ran
+// -- without the two advisory parameters -- not the rejected first attempt's. A
+// capture that showed the rejected body would send an operator debugging a
+// request off after a body the upstream never served.
+func TestCaptureSinkRecordsTheRetriedRequestBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), "timings_per_token") {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	client := NewOpenAICompatibleClient(upstream.Client())
+	sink := NewCaptureSink(1 << 20)
+	ctx := WithCaptureSink(context.Background(), sink)
+	target := routing.Target{Endpoint: upstream.URL, Provider: routing.ProviderVLLM, RouteID: "map_live", ProviderModel: "up", Timeout: 5 * time.Second}
+
+	if err := client.CompleteStream(ctx, target, streamTestRequest(), func(inference.StreamEvent) error { return nil }); err != nil {
+		t.Fatalf("CompleteStream returned %v", err)
+	}
+	body := string(sink.RequestBody())
+	if strings.Contains(body, "timings_per_token") {
+		t.Fatalf("captured request body still carries the rejected parameters: %s", body)
+	}
+	if !strings.Contains(body, `"include_usage":true`) {
+		t.Fatalf("captured request body lost include_usage: %s", body)
+	}
+	// One body, not two concatenated ones.
+	if n := strings.Count(body, `"stream":true`); n != 1 {
+		t.Fatalf("captured request body contains %d bodies, want exactly 1: %s", n, body)
+	}
+	// The captured response is the served stream; the rejected attempt never
+	// reached the response tee (the status check precedes it).
+	if resp := string(sink.ResponseBody()); !strings.Contains(resp, "[DONE]") {
+		t.Fatalf("captured response = %q, want the served stream", resp)
+	}
+}

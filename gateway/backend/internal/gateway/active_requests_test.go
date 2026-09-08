@@ -279,6 +279,86 @@ func TestPortalUsageActiveIncludesUserName(t *testing.T) {
 	}
 }
 
+// TestPortalUsageActiveLiveProgressFields asserts the four live-progress fields
+// on the wire: a row with an upstream-reported rate resolves all four keys to
+// their measured values, and a row with no Progress at all still serialises
+// "tokens_per_second_source":"" -- the key present, not omitted, so "not
+// measured" is explicit rather than a missing field the frontend must special-case.
+func TestPortalUsageActiveLiveProgressFields(t *testing.T) {
+	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin"})
+	started := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	measured := &requestProgress{}
+	measured.firstTokenUnixNano.Store(started.Add(500 * time.Millisecond).UnixNano())
+	measured.outputTokens.Store(40)
+	measured.upstreamTPSMilli.Store(21500)
+
+	srv.Active.Add(ActiveRequest{ID: "measured", UserID: "usr_dev", StartedAt: started, Progress: measured})
+	srv.Active.Add(ActiveRequest{ID: "unmeasured", UserID: "usr_dev", StartedAt: started})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/usage/active?scope=all", nil)
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+	}
+	byID := map[string]map[string]any{}
+	for _, row := range body.Data {
+		byID[row["id"].(string)] = row
+	}
+
+	measuredRow, ok := byID["measured"]
+	if !ok {
+		t.Fatalf("measured row missing from response: %s", rec.Body.String())
+	}
+	for _, key := range []string{"output_tokens", "tokens_per_second", "tokens_per_second_source", "ttft_ms"} {
+		if _, present := measuredRow[key]; !present {
+			t.Fatalf("measured row missing key %q: %#v", key, measuredRow)
+		}
+	}
+	if got := measuredRow["output_tokens"]; got != float64(40) {
+		t.Fatalf("output_tokens = %v, want 40", got)
+	}
+	if got := measuredRow["tokens_per_second"]; got != 21.5 {
+		t.Fatalf("tokens_per_second = %v, want 21.5", got)
+	}
+	if got := measuredRow["tokens_per_second_source"]; got != "upstream" {
+		t.Fatalf("tokens_per_second_source = %v, want %q", got, "upstream")
+	}
+	if got := measuredRow["ttft_ms"]; got != float64(500) {
+		t.Fatalf("ttft_ms = %v, want 500", got)
+	}
+
+	unmeasuredRow, ok := byID["unmeasured"]
+	if !ok {
+		t.Fatalf("unmeasured row missing from response: %s", rec.Body.String())
+	}
+	source, present := unmeasuredRow["tokens_per_second_source"]
+	if !present {
+		t.Fatal("unmeasured row: tokens_per_second_source key absent from JSON, want an explicit \"\"")
+	}
+	if source != "" {
+		t.Fatalf("unmeasured row tokens_per_second_source = %v, want empty string", source)
+	}
+	if got := unmeasuredRow["output_tokens"]; got != float64(0) {
+		t.Fatalf("unmeasured output_tokens = %v, want 0", got)
+	}
+	if got := unmeasuredRow["tokens_per_second"]; got != float64(0) {
+		t.Fatalf("unmeasured tokens_per_second = %v, want 0", got)
+	}
+	if got := unmeasuredRow["ttft_ms"]; got != float64(0) {
+		t.Fatalf("unmeasured ttft_ms = %v, want 0", got)
+	}
+}
+
 func TestPortalUsageActiveEmptyReturnsArray(t *testing.T) {
 	srv := NewTestServer()
 	req := httptest.NewRequest(http.MethodGet, "/api/portal/usage/active", nil)

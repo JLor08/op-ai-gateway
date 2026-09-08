@@ -334,23 +334,30 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 
 	// Copy the upstream body to the client, flushing each chunk (so SSE frames
 	// reach the client live), and re-arming the idle watchdog + write deadline on
-	// activity. respBuf tees a bounded copy (~1 MB) that feeds BOTH usage parsing
-	// (always) and capture (only when enabled — buildCaptureInput drops it
-	// otherwise). A response larger than the cap may lose a trailing usage frame;
-	// token accounting for passthrough is explicitly best-effort.
+	// activity. respBuf tees a bounded copy (~1 MB) for CAPTURE ONLY (only used when
+	// enabled — buildCaptureInput drops it otherwise); it has its own budget and its
+	// own purpose. Usage/timings are scanned incrementally by scanner as chunks pass
+	// (independently of that cap), so a response larger than it still yields its
+	// real — and, for the terminal frame, its FINAL — token count. See
+	// usageScanner's doc comment (passthrough_usage_scan.go) for why the two must
+	// not share a budget.
 	var respBuf bytes.Buffer
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes}
+	scanner := newUsageScanner(pfReq.APIFlavor, s.captureMaxBytes)
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner}
 	copyErr := copier.run(resp.Body)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, pfReq, serverName, idledOut.Load(), copyErr, start)
 
-	usg := parsePassthroughUsage(pfReq.APIFlavor, respBuf.Bytes())
+	usg := scanner.usage()
 	s.recordUsage(start, token, req, target, provider.Response{Usage: usg}, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), respBuf.Bytes(), resp.StatusCode, pfReq.APIFlavor))
 }
 
 // nativeCopier bundles everything proxyNative's body-copy needs: the client
 // writer (+ flusher/write-deadline controller), the idle watchdog to re-arm on
-// activity, and the bounded tee buffer feeding usage parsing/capture.
+// activity, the bounded tee buffer feeding capture, and the usage scanner fed
+// independently of that buffer's cap (see usageScanner). scanner is nil-safe: a
+// nativeCopier built without one — several tests here do, when they only care
+// about the copy mechanics — simply skips usage scanning.
 type nativeCopier struct {
 	w        http.ResponseWriter
 	rc       *http.ResponseController
@@ -359,13 +366,18 @@ type nativeCopier struct {
 	idle     time.Duration
 	respBuf  *bytes.Buffer
 	capBytes int
+	scanner  *usageScanner
 }
 
 // run streams the upstream body to the client chunk by chunk and returns the
 // terminal copy error (nil on a clean EOF). Extracted from proxyNative —
 // behavior-identical: same read/write order, same error precedence (a write
-// error terminates before the read error is inspected).
+// error terminates before the read error is inspected). The deferred
+// scanner.finish call runs exactly once no matter how run() returns, so the
+// final frame — which, for a buffered non-streaming response, normally never
+// gets its own trailing newline — is still scanned; see usageScanner.finish.
 func (c *nativeCopier) run(body io.Reader) error {
+	defer func() { c.scanner.finish(time.Now()) }()
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := body.Read(buf)
@@ -384,8 +396,11 @@ func (c *nativeCopier) run(body io.Reader) error {
 }
 
 // writeChunk forwards one upstream chunk: re-arm the idle watchdog + write
-// deadline (streams only), write, flush (so SSE frames reach the client
-// live), and tee into the bounded respBuf.
+// deadline (streams only), write, flush (so SSE frames reach the client live),
+// feed the usage scanner, and tee into the bounded respBuf. The scanner is fed
+// BEFORE the capture-cap check so usage/timings accounting never depends on the
+// capture budget — that check bounds respBuf only, a separate, capture-only
+// buffer with its own purpose (see usageScanner).
 func (c *nativeCopier) writeChunk(chunk []byte) error {
 	if c.watchdog != nil {
 		c.watchdog.Reset(c.idle)
@@ -397,6 +412,7 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 	if c.flusher != nil {
 		c.flusher.Flush()
 	}
+	c.scanner.feed(chunk, time.Now())
 	if c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}
@@ -469,73 +485,146 @@ func rewriteModelField(raw []byte, providerModel string) []byte {
 	return out
 }
 
-// parsePassthroughUsage best-effort extracts token counts from a proxied upstream
-// response (stream or buffered) so the Activity view still shows tokens. It never
-// fails: absent fields yield zero. Responses uses input_tokens/output_tokens on
-// response.usage (or top-level for the buffered body); Anthropic uses
-// message.usage (message_start) + top-level usage (message_delta).
+// parsePassthroughUsage best-effort extracts token counts (and, for the
+// Responses shape, llama.cpp's own reported rate) from a proxied upstream
+// response (stream or buffered) so the Activity view still shows tokens. It
+// never fails: absent fields yield zero. Responses uses input_tokens/
+// output_tokens on response.usage (or top-level for the buffered body), plus
+// prompt_per_second/predicted_per_second from a sibling `timings` object
+// llama.cpp attaches to the terminal response.completed frame — mirroring the
+// Chat Completions shape (openai_compatible.go:97-100), where the SAME server
+// bolts `timings` onto whatever JSON envelope it is already emitting, so the
+// same top-level placement is assumed here. Anthropic uses message.usage
+// (message_start) + top-level usage (message_delta) and carries no timings on
+// any frame at all — see usageScanner.usage for its gateway-derived fallback.
+//
+// This single-shot form is a thin wrapper over mergePassthroughUsage plus the
+// TotalTokens default, for a caller with the FULL body already in hand (the
+// tests below). The native-passthrough response path itself no longer calls
+// this directly — see usageScanner, which needs the merge step WITHOUT the
+// default baked in, since it merges fragment by fragment as chunks arrive.
 func parsePassthroughUsage(apiFlavor string, body []byte) inference.Usage {
 	var u inference.Usage
-	take := func(dst *int, v int) {
-		if v > *dst {
-			*dst = v
-		}
-	}
+	mergePassthroughUsage(&u, apiFlavor, body)
+	finalizeTotalTokens(&u)
+	return u
+}
+
+// mergePassthroughUsage scans body's usage/timings payload(s) for apiFlavor and
+// merges each field into dst via a running MAX (never a sum, never a plain
+// overwrite) — safe to call more than once, and safe to call with overlapping
+// or repeated data, which is exactly what usageScanner (passthrough_usage_scan.go)
+// does across a stream's chunks.
+//
+// It deliberately does NOT apply parsePassthroughUsage's "TotalTokens defaults
+// to Input+Output" fallback. Anthropic in particular splits input tokens
+// (message_start) from the final output tokens (message_delta) across
+// DIFFERENT frames/fragments; defaulting per-fragment would let an early
+// fragment's partial total (e.g. input-only, output not seen yet) get stuck as
+// the running max instead of the true final sum once the later fragment's
+// output tokens arrive. Callers finalize exactly once, after every fragment has
+// been merged — see finalizeTotalTokens.
+func mergePassthroughUsage(dst *inference.Usage, apiFlavor string, body []byte) {
 	for _, payload := range jsonPayloads(body) {
 		switch apiFlavor {
 		case "openai_responses":
-			var m struct {
-				Usage    *responsesUsage `json:"usage"`
-				Response *struct {
-					Usage *responsesUsage `json:"usage"`
-				} `json:"response"`
-			}
-			if json.Unmarshal(payload, &m) != nil {
-				continue
-			}
-			for _, uu := range []*responsesUsage{m.Usage, nested(m.Response)} {
-				if uu == nil {
-					continue
-				}
-				take(&u.InputTokens, uu.InputTokens)
-				take(&u.OutputTokens, uu.OutputTokens)
-				take(&u.TotalTokens, uu.TotalTokens)
-				// Responses input_tokens ALREADY includes the cached subset (OpenAI
-				// semantics), so only the cached count is lifted out — InputTokens is
-				// left untouched (matches the translate/chat path).
-				take(&u.CachedTokens, uu.InputTokensDetails.CachedTokens)
-			}
+			mergeResponsesUsage(dst, payload)
 		case "anthropic_messages":
-			var m struct {
-				Usage   *anthropicUsage `json:"usage"`
-				Message *struct {
-					Usage *anthropicUsage `json:"usage"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(payload, &m) != nil {
-				continue
-			}
-			for _, uu := range []*anthropicUsage{m.Usage, nestedAnthropic(m.Message)} {
-				if uu == nil {
-					continue
-				}
-				// Anthropic reports input_tokens EXCLUDING the prompt-cache tokens
-				// (cache reads + creations are separate buckets). The canonical
-				// inference.Usage uses OpenAI semantics where InputTokens INCLUDES the
-				// cached subset (see compat.AnthropicInputTokens, the inverse), so the
-				// cache buckets are folded back in — keeping the value consistent with
-				// the translate path for the same prompt.
-				take(&u.InputTokens, uu.InputTokens+uu.CacheReadInputTokens+uu.CacheCreationInputTokens)
-				take(&u.OutputTokens, uu.OutputTokens)
-				take(&u.CachedTokens, uu.CacheReadInputTokens)
-				take(&u.CacheWriteTokens, uu.CacheCreationInputTokens)
-			}
+			mergeAnthropicUsage(dst, payload)
 		}
 	}
+}
+
+// mergeResponsesUsage is mergePassthroughUsage's "openai_responses" case,
+// split out per-flavor: it applies one payload's usage/timings fields (if any)
+// into dst via the same running-MAX merge.
+func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
+	var m struct {
+		Usage    *responsesUsage `json:"usage"`
+		Response *struct {
+			Usage *responsesUsage `json:"usage"`
+		} `json:"response"`
+		Timings *struct {
+			PromptPerSecond    float64 `json:"prompt_per_second"`
+			PredictedPerSecond float64 `json:"predicted_per_second"`
+		} `json:"timings"`
+	}
+	if json.Unmarshal(payload, &m) != nil {
+		return
+	}
+	for _, uu := range []*responsesUsage{m.Usage, nested(m.Response)} {
+		if uu == nil {
+			continue
+		}
+		takeMax(&dst.InputTokens, uu.InputTokens)
+		takeMax(&dst.OutputTokens, uu.OutputTokens)
+		takeMax(&dst.TotalTokens, uu.TotalTokens)
+		// Responses input_tokens ALREADY includes the cached subset (OpenAI
+		// semantics), so only the cached count is lifted out — InputTokens is
+		// left untouched (matches the translate/chat path).
+		takeMax(&dst.CachedTokens, uu.InputTokensDetails.CachedTokens)
+	}
+	if m.Timings != nil {
+		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
+		takeMaxF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
+	}
+}
+
+// mergeAnthropicUsage is mergePassthroughUsage's "anthropic_messages" case,
+// split out per-flavor: it applies one payload's usage fields (if any) into
+// dst via the same running-MAX merge.
+func mergeAnthropicUsage(dst *inference.Usage, payload []byte) {
+	var m struct {
+		Usage   *anthropicUsage `json:"usage"`
+		Message *struct {
+			Usage *anthropicUsage `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(payload, &m) != nil {
+		return
+	}
+	for _, uu := range []*anthropicUsage{m.Usage, nestedAnthropic(m.Message)} {
+		if uu == nil {
+			continue
+		}
+		// Anthropic reports input_tokens EXCLUDING the prompt-cache tokens
+		// (cache reads + creations are separate buckets). The canonical
+		// inference.Usage uses OpenAI semantics where InputTokens INCLUDES the
+		// cached subset (see compat.AnthropicInputTokens, the inverse), so the
+		// cache buckets are folded back in — keeping the value consistent with
+		// the translate path for the same prompt.
+		takeMax(&dst.InputTokens, uu.InputTokens+uu.CacheReadInputTokens+uu.CacheCreationInputTokens)
+		takeMax(&dst.OutputTokens, uu.OutputTokens)
+		takeMax(&dst.CachedTokens, uu.CacheReadInputTokens)
+		takeMax(&dst.CacheWriteTokens, uu.CacheCreationInputTokens)
+	}
+}
+
+// takeMax and takeMaxF implement mergePassthroughUsage's running-MAX merge
+// (never a sum, never a plain overwrite) for int and float64 fields
+// respectively. Neither closes over anything, so they are plain functions
+// shared by mergeResponsesUsage and mergeAnthropicUsage rather than per-call
+// closures.
+func takeMax(d *int, v int) {
+	if v > *d {
+		*d = v
+	}
+}
+
+func takeMaxF(d *float64, v float64) {
+	if v > *d {
+		*d = v
+	}
+}
+
+// finalizeTotalTokens fills TotalTokens from Input+Output when the upstream
+// reported no explicit total. Applied exactly ONCE, after every usage fragment
+// for a response has been merged — see mergePassthroughUsage's doc comment for
+// why this cannot happen per-fragment without corrupting an incremental scan.
+func finalizeTotalTokens(u *inference.Usage) {
 	if u.TotalTokens == 0 {
 		u.TotalTokens = u.InputTokens + u.OutputTokens
 	}
-	return u
 }
 
 type responsesUsage struct {

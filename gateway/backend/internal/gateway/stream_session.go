@@ -65,6 +65,12 @@ type streamSession struct {
 	respBuf     bytes.Buffer
 	capBytes    int
 	captureSink *provider.CaptureSink
+
+	// progress is this request's live counter, shared by pointer with the
+	// ActiveRequest registered in beginStream (same allocation) so the registry's
+	// DTO builder sees values as this goroutine writes them. Always non-nil: this
+	// is the one streaming path that has something to count.
+	progress *requestProgress
 }
 
 // beginStream resolves the routing target, verifies the provider supports
@@ -108,7 +114,11 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	// Register ONLY on the real streaming path (after the flusher check). The early
 	// resolve-error and no-streamer branches above return before this and are
 	// intentionally not tracked as active (they still record to the completed list).
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start})
+	// progress is allocated here (the only Add site with anything to count) and the
+	// same pointer is threaded into the streamSession below, so both the registry's
+	// copy and this goroutine's writes share one live counter.
+	progress := &requestProgress{}
+	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start, Progress: progress})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -126,7 +136,7 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 		s: s, w: w, r: r, token: token, req: req, raw: raw, id: id, start: start,
 		capturing: capturing, target: target, streamer: streamer, flusher: flusher,
 		providerReq: providerReq, ctx: ctx, cancel: cancel, rc: http.NewResponseController(w),
-		idle: idle, capBytes: s.captureMaxBytes,
+		idle: idle, capBytes: s.captureMaxBytes, progress: progress,
 	}
 	if idle > 0 {
 		ss.watchdog = time.AfterFunc(idle, func() { ss.idledOut.Store(true); cancel() })
@@ -185,6 +195,12 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 	return ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, func(ev inference.StreamEvent) error {
 		if ss.watchdog != nil {
 			ss.watchdog.Reset(ss.idle)
+		}
+		// One hook for all three translate flavors: this wrapper is what
+		// chat-completions, Responses and Anthropic translate all stream through.
+		// Only a delta that actually carried content counts as "first token".
+		if ev.Type == inference.StreamEventTextDelta && (ev.Text != "" || ev.Reasoning != "") {
+			ss.progress.observeDelta(time.Now(), ev.Progress)
 		}
 		return handler(ev)
 	})

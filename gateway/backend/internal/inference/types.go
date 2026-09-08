@@ -186,12 +186,26 @@ const (
 	StreamEventError     StreamEventType = "error"
 )
 
+// StreamProgress is a running, UPSTREAM-REPORTED measurement of a stream in
+// flight. It is advisory and is attached only to intermediate events whose chunk
+// actually carried an exact count -- it is never derived, never estimated, and
+// never a substitute for the terminal Usage on StreamEventCompleted.
+type StreamProgress struct {
+	// OutputTokens is the upstream's own cumulative generated-token count
+	// (llama.cpp `timings.predicted_n`, vLLM's continuous `completion_tokens`).
+	OutputTokens int
+	// TokensPerSecond is the upstream's own rate. 0 when the upstream reports a
+	// count but no rate (vLLM); the consumer then derives a rate from the count.
+	TokensPerSecond float64
+}
+
 type StreamEvent struct {
 	Type         StreamEventType `json:"type"`
 	Text         string          `json:"text,omitempty"`
 	Reasoning    string          `json:"reasoning,omitempty"`
 	ToolCall     *ToolCall       `json:"tool_call,omitempty"`
 	Usage        *Usage          `json:"usage,omitempty"`
+	Progress     *StreamProgress `json:"progress,omitempty"`
 	FinishReason string          `json:"finish_reason,omitempty"`
 	Error        *Error          `json:"error,omitempty"`
 }

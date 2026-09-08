@@ -151,6 +151,15 @@ export type ActiveRequest = {
   agent_id?: string;
   stream: boolean;
   started_at: string;
+  // Live per-request progress. `output_tokens` is the upstream's own cumulative
+  // count (0 = none reported). `tokens_per_second` is 0 when not measured, and
+  // `tokens_per_second_source` says how it was obtained: 'upstream' (reported by
+  // the inference server), 'gateway' (computed here from the upstream's exact
+  // count), or '' (not measured). `ttft_ms` is 0 when not measured.
+  output_tokens: number;
+  tokens_per_second: number;
+  tokens_per_second_source: string;
+  ttft_ms: number;
 };
 
 export type CaptureDetail = {

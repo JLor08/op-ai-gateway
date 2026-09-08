@@ -22,6 +22,14 @@ import { formatPortalError } from './shared/format';
 import type { TsBucket, TsWindow } from './activityColumns';
 
 const SSE_THROTTLE_MS = 1000;
+// The running-connections list is otherwise refetched only on the payload-free
+// start/end SSE pokes, so during ONE long stream the live tokens/s and TTFT cells
+// would freeze for the whole request -- exactly the case they exist for. Polling
+// only while something is running keeps an idle gateway at zero cost, and the
+// start poke re-arms it. 2s rather than the repo's usual 3s because the elapsed
+// column in the same row ticks every second, and a 3s data poll makes the
+// throughput cell visibly lag its neighbour.
+const ACTIVE_POLL_MS = 2000;
 
 export type UseActivityDataArgs = {
   api: Pick<
@@ -212,6 +220,20 @@ export function useActivityData({
   newestRef.current = newest;
   const queryRef = useRef(query);
   queryRef.current = query;
+
+  // Poll the running-connections list while it is non-empty (see ACTIVE_POLL_MS
+  // above for why). Reads the query from queryRef instead of the `query` param
+  // directly so this effect never tears down and rebuilds the interval on a
+  // filter keystroke -- only a change in `active.length` (something starts or
+  // finishes) or `loadActive` itself does that.
+  useEffect(() => {
+    if (active.length === 0) return;
+    const id = window.setInterval(() => {
+      const q = queryRef.current;
+      void loadActive(q.scope ?? 'own', q.user_id, q.token_id);
+    }, ACTIVE_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [active.length, loadActive]);
 
   // SSE-driven refetch: stats always (window-wide, page-independent); list only
   // when the newest view is showing. Failures are transient -> no toast.
