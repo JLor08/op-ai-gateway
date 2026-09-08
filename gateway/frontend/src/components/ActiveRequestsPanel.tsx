@@ -6,6 +6,7 @@ import type { ActiveRequest } from '../api';
 import type { Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
+import { formatMetric } from './shared/format';
 import type { ActivityScope } from './ActivityToolbar';
 
 // Elapsed since a request started: "Xs" under a minute, otherwise "m:ss".
@@ -15,6 +16,17 @@ function formatElapsed(ms: number): string {
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+// The provenance belongs in the tooltip, never baked into the number: an
+// upstream-reported rate and a gateway-computed one are different measurements of
+// the same thing and must not be silently mixed.
+function liveTpsTitle(t: Translation, a: ActiveRequest): string {
+  if (a.tokens_per_second_source === 'upstream') return t.activityLiveTpsUpstream;
+  if (a.tokens_per_second_source === 'gateway') {
+    return t.activityLiveTpsGateway.replace('{n}', String(a.output_tokens));
+  }
+  return t.activityLiveTpsNone;
 }
 
 export type ActiveRequestsPanelProps = {
@@ -140,6 +152,25 @@ export function ActiveRequestsPanel({
       filter: 'enum',
       searchable: false,
       render: (a) => (a.stream ? '✓' : '–'),
+    },
+    {
+      id: 'live_tps',
+      label: t.activityColLiveTokenSpeed,
+      // formatMetric renders the shared "never measured" em-dash for 0 and keeps
+      // the cell sortable as a number; ListTable sinks a non-numeric cell in BOTH
+      // sort directions, so '—' never ranks as zero.
+      value: (a) => formatMetric(a.tokens_per_second, 1),
+      searchable: false,
+      numeric: true,
+      render: (a) => <span title={liveTpsTitle(t, a)}>{formatMetric(a.tokens_per_second, 1)}</span>,
+    },
+    {
+      id: 'ttft',
+      label: t.activityColTTFT,
+      value: (a) => (a.ttft_ms > 0 ? String(a.ttft_ms) : ''),
+      searchable: false,
+      numeric: true,
+      render: (a) => (a.ttft_ms > 0 ? `${a.ttft_ms} ms` : '—'),
     },
     {
       id: 'elapsed',

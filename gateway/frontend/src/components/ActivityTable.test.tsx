@@ -391,4 +391,29 @@ describe('ActivityTable', () => {
       ).toBeInTheDocument();
     });
   });
+
+  describe('tokens_per_second / prompt_per_second (never-measured convention)', () => {
+    const speedColumns = ACTIVITY_COLUMNS.filter(
+      (c) => c.defaultVisible || c.id === 'prompt_per_second' || c.id === 'tokens_per_second',
+    );
+
+    it('renders an em dash, not 0.0, for a never-measured completed row', () => {
+      renderTable({
+        columns: speedColumns,
+        rows: [makeRow({ prompt_per_second: 0, tokens_per_second: 0 })],
+      });
+      // Both columns render the shared em-dash; there are two such cells.
+      expect(screen.getAllByRole('cell', { name: '—' })).toHaveLength(2);
+      expect(screen.queryByRole('cell', { name: '0.0' })).not.toBeInTheDocument();
+    });
+
+    it('renders the measured rate with one decimal, like its sibling energy/cost cells', () => {
+      renderTable({
+        columns: speedColumns,
+        rows: [makeRow({ prompt_per_second: 12.5, tokens_per_second: 40 })],
+      });
+      expect(screen.getByRole('cell', { name: '12.5' })).toBeInTheDocument();
+      expect(screen.getByRole('cell', { name: '40.0' })).toBeInTheDocument();
+    });
+  });
 });
