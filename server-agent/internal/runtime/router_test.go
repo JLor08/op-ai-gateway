@@ -1390,6 +1390,41 @@ func TestRouterUpstreamPropsColdModelNeverStarts(t *testing.T) {
 	}
 }
 
+// TestRouterUpstreamPropsStartingWithLivePortStaysNotRunning: the guard is
+// `st.State == StateRunning && st.Port != 0`, not a port check alone --
+// snapshotStatus fills Port for every state where a process exists,
+// StateStarting included, so a starting child with a live port must still
+// answer runtime.model_not_running with ZERO hits on the child. Dropping the
+// State half of the guard would forward straight to the live child and pass
+// every other test in this file (their non-running fixtures all carry Port
+// 0), which is exactly the coverage gap this test closes.
+func TestRouterUpstreamPropsStartingWithLivePortStaysNotRunning(t *testing.T) {
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateStarting, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/m/props", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrorCode(t, rec); code != "runtime.model_not_running" {
+		t.Fatalf("code = %q, want runtime.model_not_running", code)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 -- a starting child with a live port must never be forwarded to", got)
+	}
+	if n := m.ensures.Load(); n != 0 {
+		t.Fatalf("EnsureRunning called %d times, want 0", n)
+	}
+}
+
 // TestRouterUpstreamPropsUnknownModelAndNilManager: both answer the existing
 // runtime.model_not_managed, and so does an empty model segment.
 func TestRouterUpstreamPropsUnknownModelAndNilManager(t *testing.T) {

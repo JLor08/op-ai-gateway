@@ -4,7 +4,7 @@
 // This file is the router port (design doc §6.1): the single HTTP port the
 // gateway talks to for a server_agent application, which routes every
 // inference request to the right managed model process, starting it first
-// if necessary. Three route classes:
+// if necessary. Four route classes:
 //
 //   - GET /health, GET /v1/health -- always 200 while the router is up.
 //     "Reachability means the router accepts, not that a model is warm" --
@@ -409,7 +409,7 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 		found = true
 		if st.State == StateRunning && st.Port != 0 {
 			port = st.Port
-			break // first running entry wins (byUpstream dispatch collapses duplicates the same way)
+			break // prefer a running entry among duplicate upstream_model specs; byUpstream's own collapse is an arbitrary map-order winner, but a probe must read a live child
 		}
 	}
 	if !found {
@@ -461,7 +461,8 @@ type modelStreamPeek struct {
 }
 
 // serveProxy is the model-routed reverse proxy: every request that is not
-// one of the three fixed control paths above. It buffers the body (bounded),
+// one of the four fixed GET-only routes above -- health, running, models,
+// and the /upstream/{model}/props probe. It buffers the body (bounded),
 // extracts model/stream, and hands off to the plain or streaming path.
 func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
