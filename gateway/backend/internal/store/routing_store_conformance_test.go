@@ -367,6 +367,178 @@ func TestRoutingStoreOpportunisticMetricsEWMA(t *testing.T) {
 	})
 }
 
+// --- Live-progress capability verdict (#51) ---------------------------------
+
+// TestUpdateMappingLiveProgressSupportIgnoresMetricsLock is the load-bearing
+// test for the deliberate deviation in UpdateMappingLiveProgressSupport: UNLIKE
+// every other targeted mapping writer (UpdateMappingContextProbe,
+// UpdateMappingVisionCapable, UpdateMappingBenchmarkMetrics,
+// UpdateMappingOpportunisticMetrics, UpdateMappingCapacityMetrics,
+// UpdateMappingEnergyEWMA -- six for six), this one must NOT be blocked by
+// MetricsLocked, and must NOT restamp MetricsSource / MetricsUpdatedAt. It
+// writes a mapping that is LOCKED, with a known MetricsSource, a known
+// MetricsUpdatedAt and a known GenTokensPerSecond, and asserts the verdict
+// lands while all four metrics fields stay exactly as seeded. If a future
+// change "fixes" this writer to look like its six siblings (adds the
+// `MetricsLocked` guard back, or starts stamping the metrics provenance
+// columns), this test must fail on both backends.
+func TestUpdateMappingLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+
+		mapping := routing.ModelMapping{
+			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateMapping(ctx, mapping); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		// Lock the mapping with a known throughput + provenance, exactly as an
+		// operator pinning numbers they answer for would (via UpdateMapping).
+		metricsAt := now.Add(time.Hour)
+		const seededThroughput = 42.5
+		mapping.GenTokensPerSecond = seededThroughput
+		mapping.MetricsLocked = true
+		mapping.MetricsSource = "benchmark"
+		mapping.MetricsUpdatedAt = &metricsAt
+		mapping.UpdatedAt = now.Add(2 * time.Hour)
+		if err := s.UpdateMapping(ctx, mapping); err != nil {
+			t.Fatalf("lock mapping: %v", err)
+		}
+
+		// Write the live-progress verdict on the LOCKED mapping.
+		verdictAt := now.Add(3 * time.Hour)
+		if err := s.UpdateMappingLiveProgressSupport(ctx, "m1", "supported", verdictAt); err != nil {
+			t.Fatalf("update mapping live progress support: %v", err)
+		}
+
+		got, err := s.MappingByID(ctx, "m1")
+		if err != nil {
+			t.Fatalf("mapping by id: %v", err)
+		}
+
+		// The verdict landed -- the lock did NOT block it.
+		if got.LiveProgressSupport != "supported" {
+			t.Fatalf("LiveProgressSupport = %q, want %q (MetricsLocked must not block this writer)", got.LiveProgressSupport, "supported")
+		}
+		if got.LiveProgressCheckedAt == nil || !got.LiveProgressCheckedAt.Equal(verdictAt) {
+			t.Fatalf("LiveProgressCheckedAt = %v, want %v", got.LiveProgressCheckedAt, verdictAt)
+		}
+
+		// All four metrics fields are untouched.
+		if got.MetricsSource != "benchmark" {
+			t.Fatalf("MetricsSource = %q, want %q (must be untouched by a capability write)", got.MetricsSource, "benchmark")
+		}
+		if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(metricsAt) {
+			t.Fatalf("MetricsUpdatedAt = %v, want %v (must be untouched by a capability write)", got.MetricsUpdatedAt, metricsAt)
+		}
+		if got.GenTokensPerSecond != seededThroughput {
+			t.Fatalf("GenTokensPerSecond = %v, want %v (must be untouched by a capability write)", got.GenTokensPerSecond, seededThroughput)
+		}
+		if !got.MetricsLocked {
+			t.Fatalf("MetricsLocked = %v, want true (must be untouched by a capability write)", got.MetricsLocked)
+		}
+	})
+}
+
+// TestUpdateMappingLiveProgressSupportRoundTrip proves the three accepted
+// verdict values round-trip through both backends, that a freshly created
+// mapping defaults to "" (never determined), and that a write against a
+// missing mapping id is a benign no-op, mirroring every sibling mapping
+// writer's missing-id convention.
+func TestUpdateMappingLiveProgressSupportRoundTrip(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		mapping := routing.ModelMapping{
+			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateMapping(ctx, mapping); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		// Default on a freshly created mapping: "" (never determined), no
+		// checked-at timestamp.
+		got, err := s.MappingByID(ctx, "m1")
+		if err != nil {
+			t.Fatalf("mapping by id: %v", err)
+		}
+		if got.LiveProgressSupport != "" {
+			t.Fatalf("LiveProgressSupport = %q, want \"\" (default)", got.LiveProgressSupport)
+		}
+		if got.LiveProgressCheckedAt != nil {
+			t.Fatalf("LiveProgressCheckedAt = %v, want nil (default)", got.LiveProgressCheckedAt)
+		}
+
+		// The three accepted values round-trip.
+		for i, tc := range []struct {
+			support string
+		}{
+			{"supported"},
+			{"unsupported"},
+			{""},
+		} {
+			at := now.Add(time.Duration(i+1) * time.Hour)
+			if err := s.UpdateMappingLiveProgressSupport(ctx, "m1", tc.support, at); err != nil {
+				t.Fatalf("update mapping live progress support (%q): %v", tc.support, err)
+			}
+			got, err := s.MappingByID(ctx, "m1")
+			if err != nil {
+				t.Fatalf("mapping by id (%q): %v", tc.support, err)
+			}
+			if got.LiveProgressSupport != tc.support {
+				t.Fatalf("LiveProgressSupport = %q, want %q", got.LiveProgressSupport, tc.support)
+			}
+			if got.LiveProgressCheckedAt == nil || !got.LiveProgressCheckedAt.Equal(at) {
+				t.Fatalf("LiveProgressCheckedAt = %v, want %v", got.LiveProgressCheckedAt, at)
+			}
+		}
+
+		// A write against a MISSING mapping id is a benign no-op (no error),
+		// mirroring every sibling mapping writer's missing-id convention.
+		if err := s.UpdateMappingLiveProgressSupport(ctx, "does-not-exist", "supported", now); err != nil {
+			t.Fatalf("update mapping live progress support (missing) = %v, want nil (benign no-op)", err)
+		}
+	})
+}
+
 // --- Sample reduction: availability + telemetry -----------------------------
 
 // TestRoutingStoreAvailabilitySampleReduction exercises

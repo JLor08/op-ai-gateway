@@ -615,6 +615,15 @@ type ModelMapping struct {
 	MetricsLocked         bool       // metrics are manually pinned (do not auto-overwrite)
 	MetricsUpdatedAt      *time.Time // when the metrics were last set; nil = never
 	MetricsSource         string     // provenance of the metrics (e.g. "manual"); '' = unknown
+	// LiveProgressSupport records whether this mapping's upstream tolerates the
+	// live-progress request parameters (#51): "" = never determined,
+	// "supported", "unsupported". It is a CAPABILITY of the upstream build, not
+	// a metric, so it deliberately sits outside the MetricsLocked group above --
+	// see UpdateMappingLiveProgressSupport for why.
+	LiveProgressSupport string
+	// LiveProgressCheckedAt is when that verdict was last determined. Operator
+	// diagnostics and the portal tooltip ONLY -- no decision logic reads it.
+	LiveProgressCheckedAt *time.Time
 	// Per-mapping concurrency-capacity metrics (later phases populate them).
 	// 0 = unknown everywhere.
 	MaxConcurrency               int     // max concurrent requests the model can serve; 0 = unknown
@@ -970,7 +979,10 @@ type ApplicationStore interface {
 // MappingStore is CRUD for model mappings (gateway model name -> app model
 // name) plus the family of targeted, metrics_locked-respecting metric
 // updates (context probe, vision, benchmark, opportunistic EWMA, capacity,
-// energy EWMA) and the routing-candidate lookup (ActiveMappingsForModel).
+// energy EWMA), the routing-candidate lookup (ActiveMappingsForModel), and
+// UpdateMappingLiveProgressSupport -- the one targeted writer here that is
+// NOT metrics_locked-respecting, because it records a capability rather than
+// a metric (see its doc comment).
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
@@ -1008,6 +1020,13 @@ type MappingStore interface {
 	// the energy reconciler to calibrate a mapping's coefficient from measured
 	// results (Tier 1 in the attribution engine).
 	UpdateMappingEnergyEWMA(ctx context.Context, id string, sampleWhPerToken, alpha float64, at time.Time) error
+	// UpdateMappingLiveProgressSupport records whether this mapping's upstream
+	// tolerates the live-progress request parameters (#51). UNLIKE every writer
+	// above, it carries NO metrics_locked guard and does not touch
+	// MetricsSource / MetricsUpdatedAt: a build capability is not a metric an
+	// operator pins numbers against -- see the SQLiteStore implementation for
+	// the full rationale.
+	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
 	MappingByID(ctx context.Context, id string) (ModelMapping, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	MappingsByServer(ctx context.Context, serverID string) ([]ModelMapping, error)

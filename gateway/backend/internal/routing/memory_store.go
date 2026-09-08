@@ -1018,6 +1018,28 @@ func (m *MemoryStore) UpdateMappingContextProbe(_ context.Context, id string, co
 	return nil
 }
 
+// UpdateMappingLiveProgressSupport records whether this mapping's upstream
+// tolerates the live-progress request parameters (#51).
+//
+// UNLIKE every other automated writer above, this one has NO MetricsLocked
+// guard and does not touch MetricsSource / MetricsUpdatedAt: mirrors
+// SQLiteStore.UpdateMappingLiveProgressSupport, see its doc comment for why
+// (a build capability is not a metric an operator pins numbers against). A
+// missing mapping is a benign no-op.
+func (m *MemoryStore) UpdateMappingLiveProgressSupport(_ context.Context, id, support string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[id]
+	if !ok {
+		return nil
+	}
+	mapping.LiveProgressSupport = support
+	t := at
+	mapping.LiveProgressCheckedAt = &t
+	m.mappings[id] = mapping
+	return nil
+}
+
 // UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
 // from a vision-capability check, only while it is unlocked. A missing or
 // locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
