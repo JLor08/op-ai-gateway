@@ -1091,6 +1091,29 @@ const de = {
   modelServerColStatus: 'Status',
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
+  // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
+  // verdict, beside the Kontext column -- see ModelServersSection.tsx's
+  // liveProgressChipInfo for why this is not probe-gated, and why "" renders
+  // the shared "—" placeholder instead of nothing (an override of the design
+  // spec: an indistinguishable "no such column" vs "nothing determined yet"
+  // already cost a real support report on a sibling table's silent `null`).
+  modelServerColLiveProgress: 'Live-Fortschritt',
+  modelServerLiveProgressSupported: 'Unterstützt',
+  // The NEUTRAL badge label, deliberately not phrased as a warning: an older
+  // llama.cpp build that lacks this request parameter is not broken.
+  modelServerLiveProgressUnsupported: 'Nicht unterstützt',
+  // The enum-filter's label for "" (never determined) -- distinct from the
+  // "—" the cell itself renders, which is a placeholder glyph, not filterable
+  // text.
+  modelServerLiveProgressUnknown: 'Nicht ermittelt',
+  modelServerLiveProgressTooltipSupported:
+    'Dieser Server unterstützt die Live-Fortschritts-Parameter der Anfrage; der Live-Fortschritt lässt sich verfolgen.',
+  modelServerLiveProgressTooltipUnsupported:
+    'Dieser Build unterstützt die Live-Fortschritts-Parameter der Anfrage nicht — sein Anfrage-Schema kennt dieses Feld nicht, daher ist der Live-Wert nicht verfügbar.',
+  // Appended to the tooltip above when a checked-at timestamp is known.
+  // Diagnostic text only -- see live_progress_checked_at's own doc-comment
+  // (api/models.ts): no rendering decision may branch on this value.
+  modelServerLiveProgressCheckedAt: (when: string) => `Geprüft am ${when}.`,
   groupServersIntro: 'Modelle und Server, die diese Gruppe bedienen kann (Live-Priorität).',
   modelServerNotLoaded: 'Nicht geladen',
   // The merged Status column's "currently loading" state (runtime state
@@ -3286,6 +3309,15 @@ const en: PortalMessages = {
   modelServerColStatus: 'Status',
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
+  modelServerColLiveProgress: 'Live progress',
+  modelServerLiveProgressSupported: 'Supported',
+  modelServerLiveProgressUnsupported: 'Not supported',
+  modelServerLiveProgressUnknown: 'Not determined',
+  modelServerLiveProgressTooltipSupported:
+    "This server supports the request's live-progress parameters; live progress can be tracked.",
+  modelServerLiveProgressTooltipUnsupported:
+    "This build does not support the request's live-progress parameters — its request schema has no such field, so the live figure is unavailable.",
+  modelServerLiveProgressCheckedAt: (when: string) => `Checked at ${when}.`,
   groupServersIntro: 'Models and servers this group can serve (live priority).',
   modelServerNotLoaded: 'Not loaded',
   modelServerLoading: 'Loading',

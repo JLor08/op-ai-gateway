@@ -52,6 +52,12 @@ function makeRows(): ModelServerRow[] {
       is_mtp: false,
       metrics_source: 'benchmark',
       metrics_updated_at: '2026-08-01T10:00:00Z',
+      // Task 6 (timings-capability-detection): rowA/rowB/rowC each seed a
+      // DIFFERENT verdict (supported/unsupported/never-determined) — one
+      // fixture per possible value — so a test asserting on one verdict
+      // cannot coincidentally pass off another row's value.
+      live_progress_support: 'supported',
+      live_progress_checked_at: '2026-08-01T08:00:00Z',
       priority: 1,
     },
     {
@@ -76,6 +82,8 @@ function makeRows(): ModelServerRow[] {
       is_mtp: false,
       metrics_source: 'manual',
       metrics_updated_at: null,
+      live_progress_support: 'unsupported',
+      live_progress_checked_at: '2026-08-01T07:00:00Z',
       priority: 3,
     },
     {
@@ -100,6 +108,11 @@ function makeRows(): ModelServerRow[] {
       is_mtp: true,
       metrics_source: 'benchmark',
       metrics_updated_at: '2026-08-01T09:00:00Z',
+      // Never determined: the checked-at timestamp is also absent, matching
+      // what the backend actually produces for "" (see ModelMapping.
+      // LiveProgressCheckedAt's doc-comment — nil until a verdict exists).
+      live_progress_support: '',
+      live_progress_checked_at: null,
       priority: 2,
     },
   ];
@@ -578,4 +591,77 @@ describe('ModelServersSection', () => {
       expect(cells[4]).toHaveTextContent('—');
     },
   );
+
+  // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
+  // verdict, beside the Kontext column. makeRows() seeds a DIFFERENT verdict
+  // per row (rowA "supported", rowB "unsupported", rowC "" never-determined)
+  // specifically so this test's assertions cannot pass by coincidence off the
+  // wrong row's fixture value.
+  it('renders the live-progress verdict as a badge BY KEY, and the shared em-dash when never determined', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    // rowA: "supported" -> the positive badge. Asserted by KEY (data-status),
+    // never colour: this portal has no red, and shared/status.ts collapses
+    // several distinct statuses onto the same visual appearance, so a colour
+    // assertion here would go stale silently.
+    expect(
+      within(rowFor('GPU-Box-A')).getByText(t.modelServerLiveProgressSupported),
+    ).toHaveAttribute('data-status', 'active');
+
+    // rowB: "unsupported" -> the NEUTRAL badge (standby), deliberately NOT the
+    // attention/"watch" badge every other explicit-state column on this
+    // screen reaches for: an older llama.cpp build that lacks this request
+    // parameter is not broken, it simply lacks a nicety, and flagging it
+    // would put a warning on every such server.
+    expect(
+      within(rowFor('GPU-Box-B')).getByText(t.modelServerLiveProgressUnsupported),
+    ).toHaveAttribute('data-status', 'standby');
+
+    // rowC: "" (never determined) -> the design spec calls for rendering
+    // NOTHING here; that is deliberately overridden to the shared "—"
+    // placeholder instead (column index 9: 0 prio … 8 context, see the
+    // comment on the "shows the live active/queue counts" test above), so the
+    // column reads as "present, nothing determined yet" rather than as a
+    // column that doesn't exist. No badge/chip is rendered for it either.
+    const cellsC = within(rowFor('GPU-Box-C')).getAllByRole('cell');
+    expect(cellsC[9]).toHaveTextContent('—');
+    expect(
+      within(rowFor('GPU-Box-C')).queryByText(t.modelServerLiveProgressSupported),
+    ).not.toBeInTheDocument();
+    expect(
+      within(rowFor('GPU-Box-C')).queryByText(t.modelServerLiveProgressUnsupported),
+    ).not.toBeInTheDocument();
+  });
+
+  it('opens the "supported" live-progress tooltip on hover, naming the verdict and the checked-at time', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    fireEvent.mouseOver(screen.getByText(t.modelServerLiveProgressSupported));
+    const tooltip = await screen.findByRole('tooltip');
+    expect(tooltip).toHaveTextContent(t.modelServerLiveProgressTooltipSupported);
+    // rowA's live_progress_checked_at is '2026-08-01T08:00:00Z'.
+    expect(tooltip).toHaveTextContent(
+      t.modelServerLiveProgressCheckedAt(new Date('2026-08-01T08:00:00Z').toLocaleString()),
+    );
+  });
+
+  it('opens the "unsupported" live-progress tooltip on hover, naming the reason and the checked-at time', async () => {
+    const { api } = makeApi();
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    fireEvent.mouseOver(screen.getByText(t.modelServerLiveProgressUnsupported));
+    const tooltip = await screen.findByRole('tooltip');
+    // Names the reason: the live figure is unavailable because this build's
+    // request schema has no such field.
+    expect(tooltip).toHaveTextContent(t.modelServerLiveProgressTooltipUnsupported);
+    // rowB's live_progress_checked_at is '2026-08-01T07:00:00Z'.
+    expect(tooltip).toHaveTextContent(
+      t.modelServerLiveProgressCheckedAt(new Date('2026-08-01T07:00:00Z').toLocaleString()),
+    );
+  });
 });

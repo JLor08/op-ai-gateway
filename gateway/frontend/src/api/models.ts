@@ -374,6 +374,18 @@ export type ModelServerRow = {
   vision_capable?: boolean;
   metrics_source: string;
   metrics_updated_at?: string | null;
+  // live_progress_support is the mapping's PERSISTED verdict on whether this
+  // upstream tolerates the live-progress two-parameter request (#51):
+  // "supported" / "unsupported" / "" (never determined). Mirrors the
+  // backend's ModelServerDTO (service_model_servers.go) -- like context_size,
+  // and UNLIKE metrics_probe/context_probe/state above, this is read straight
+  // off the persisted mapping field, so it is always present (required, no
+  // `?`) rather than left "" for a gateway-injection pass to fill; a fixture
+  // that omits it is simply wrong, not "not yet reported".
+  live_progress_support: string;
+  // When that verdict was last determined; undefined/null when never
+  // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
+  live_progress_checked_at?: string | null;
   // Live 1-based rank among this model's offering servers (0 = unknown/unranked).
   priority: number;
 };

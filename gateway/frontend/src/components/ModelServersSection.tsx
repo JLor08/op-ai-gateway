@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState } from 'react';
+import { Tooltip } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import { PortalApiError, type ModelOption, type ModelServerRow } from '../api';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
@@ -89,6 +90,68 @@ function modelStatusLabel(key: ModelStatusKey, t: Translation): string {
 // mapping field, not a probe result -- see that column's own comment.
 function probeOk(probeState: string): boolean {
   return probeState === 'ok';
+}
+
+// `live_progress_support` is the mapping's PERSISTED verdict on whether this
+// upstream tolerates the live-progress two-parameter request (#51):
+// "supported" / "unsupported" / "" (never determined). Deliberately NOT
+// gated on a probe field, for exactly the reason the Kontext column's own
+// comment above gives: the portal service fills it once from the PERSISTED
+// mapping field (`LiveProgressSupport: view.mapping.LiveProgressSupport`,
+// service_model_servers.go), which a background detector writes directly to
+// the mapping (routing.Store.UpdateMappingLiveProgressSupport) -- there is
+// no gateway-injection seam to gate this on, unlike metrics_probe/
+// context_probe/state/active_requests/queue_depth above. Gating this cell on
+// a probe field would repeat the exact bug the Kontext column's fix already
+// closed: hiding a real, persisted verdict on every row a probe fixture
+// doesn't happen to reach.
+//
+// The design spec calls for rendering NOTHING when this is "". That is
+// DELIBERATELY OVERRIDDEN here: this codebase already has a convention for
+// "the field exists, nothing has been measured/determined yet" -- the shared
+// "—" placeholder the active/queue/context columns above use -- and an
+// indistinguishable "column doesn't exist" vs "nothing determined yet" has
+// already cost a real support report on a sibling table's silent `null`. So
+// "" renders "—" here too (see the render callback below), not an empty
+// cell.
+function liveProgressChipInfo(
+  support: string,
+  t: Translation,
+): { status: BadgeStatus; label: string; tooltip: string } | undefined {
+  if (support === 'supported') {
+    return {
+      status: 'success',
+      label: t.modelServerLiveProgressSupported,
+      tooltip: t.modelServerLiveProgressTooltipSupported,
+    };
+  }
+  if (support === 'unsupported') {
+    // The NEUTRAL badge, deliberately NOT the attention/"watch" one: an older
+    // llama.cpp build that lacks this request parameter is not broken, it
+    // simply lacks a nicety. Flagging it as attention-worthy would put a
+    // warning on every such server -- the same mistake as showing a bare 0
+    // that actually means "not measured".
+    return {
+      status: 'standby',
+      label: t.modelServerLiveProgressUnsupported,
+      tooltip: t.modelServerLiveProgressTooltipUnsupported,
+    };
+  }
+  return undefined;
+}
+
+// live_progress_checked_at exists ONLY for this tooltip and for operator
+// diagnostics (mirrors ModelMapping.LiveProgressCheckedAt's own doc-comment)
+// -- it is folded into the tooltip string here, not read by any rendering
+// decision (the badge/colour choice above depends solely on
+// live_progress_support).
+function liveProgressTooltip(
+  info: { tooltip: string },
+  checkedAt: string | null | undefined,
+  t: Translation,
+): string {
+  if (!checkedAt) return info.tooltip;
+  return `${info.tooltip} ${t.modelServerLiveProgressCheckedAt(new Date(checkedAt).toLocaleString())}`;
 }
 
 export function ModelServersSection({
@@ -272,6 +335,32 @@ export function ModelServersSection({
       numeric: true,
       value: (r) => String(r.context_size),
       render: (r) => (r.context_size > 0 ? String(r.context_size) : '—'),
+    },
+    {
+      // See liveProgressChipInfo above for why this is read straight off the
+      // row's persisted field, not gated on any probe column.
+      id: 'liveProgress',
+      label: t.modelServerColLiveProgress,
+      value: (r) => r.live_progress_support,
+      filter: 'enum',
+      searchable: false,
+      enumLabel: (v) =>
+        v === 'supported'
+          ? t.modelServerLiveProgressSupported
+          : v === 'unsupported'
+            ? t.modelServerLiveProgressUnsupported
+            : t.modelServerLiveProgressUnknown,
+      render: (r) => {
+        const info = liveProgressChipInfo(r.live_progress_support, t);
+        if (!info) return '—';
+        return (
+          <Tooltip title={liveProgressTooltip(info, r.live_progress_checked_at, t)}>
+            <span>
+              <StatusChip status={info.status} label={info.label} />
+            </span>
+          </Tooltip>
+        );
+      },
     },
     {
       id: 'maxConc',
