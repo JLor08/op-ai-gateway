@@ -893,6 +893,81 @@ func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
 	}
 }
 
+// --- Final-review F2: the live-progress decision inputs on the benchmark path ---
+//
+// benchmarkTargetReq builds the Target for FIVE streaming callers (measureMapping,
+// measureMappingCapacity, the vision measurement, the load runner, the model warmer)
+// and set neither live-progress field, so provider.wantsLiveProgress saw an
+// undetermined verdict and no spec shape on every one of those streams. Two
+// consequences, both bad in opposite directions: a mapping already DETECTED as
+// "unsupported" still received the parameters (and RouteID is "" here, which the
+// rejection memo deliberately never memoizes, so the wasted 400-plus-retry repeats
+// on every stream of every run, forever), while a server_agent child whose spec
+// resolves to a tolerant shape STOPPED receiving them, where #51's provider-keyed
+// allow-list sent them.
+
+// TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs pins both fields at the
+// builder. The verdict is seeded "unsupported" and the spec type resolves to
+// "llama_cpp" -- both non-empty and distinct, so neither assertion can pass off a
+// zero value.
+func TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs(t *testing.T) {
+	tgt := benchServerAgentTarget()
+	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.spec.Type = string(routing.RuntimeSpecTypeLlamaCpp)
+
+	target, _ := benchmarkTargetReq(tgt)
+	if target.LiveProgressSupport != "unsupported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q -- a detected verdict must reach the benchmark stream, or every one of them pays a 400 plus a retry, forever", target.LiveProgressSupport, "unsupported")
+	}
+	if target.LiveProgressSpecType != "llama_cpp" {
+		t.Fatalf("LiveProgressSpecType = %q, want %q (routing.EffectiveRuntimeSpecType of the resolved spec)", target.LiveProgressSpecType, "llama_cpp")
+	}
+}
+
+// TestBenchmarkTargetReqLiveProgressSpecTypeOnlyForServerAgent mirrors
+// routing.Resolver.targetFrom's rule exactly: LiveProgressSpecType is filled ONLY
+// for a server_agent app. For any other type the spec is zero-valued, and
+// EffectiveRuntimeSpecType would resolve a zero spec to "custom" -- a claim about a
+// managed child that does not exist. wantsLiveProgress never reads the field for a
+// non-server_agent target, so the wrong value would be inert today and a trap
+// tomorrow. The verdict, by contrast, is a property of the MAPPING and is carried
+// for every app type.
+func TestBenchmarkTargetReqLiveProgressSpecTypeOnlyForServerAgent(t *testing.T) {
+	tgt := benchTestTarget() // ProviderMock, zero spec
+	tgt.mapping.LiveProgressSupport = "supported"
+
+	target, _ := benchmarkTargetReq(tgt)
+	if target.LiveProgressSpecType != "" {
+		t.Fatalf("LiveProgressSpecType = %q, want %q for a non-server_agent app (targetFrom fills it only for server_agent)", target.LiveProgressSpecType, "")
+	}
+	if target.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q -- the mapping's verdict is carried for every app type", target.LiveProgressSupport, "supported")
+	}
+}
+
+// TestMeasureMappingStreamCarriesLiveProgressVerdict proves the fields survive the
+// FULL path (benchmarkTargetReq -> streamOnce -> CompleteStream) and reach the
+// provider that actually decides, not just the struct the builder returned --
+// mirroring TestMeasureMappingStreamsWithSpecToken's shape below. All five callers
+// share this one builder, so this covers the capacity/vision/load/warm streams too.
+func TestMeasureMappingStreamCarriesLiveProgressVerdict(t *testing.T) {
+	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 42}}
+	srv := &Server{Provider: fake}
+	tgt := benchServerAgentTarget()
+	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.spec.Type = string(routing.RuntimeSpecTypeVLLM)
+
+	if _, err := srv.measureMapping(context.Background(), tgt); err != nil {
+		t.Fatalf("measureMapping err = %v", err)
+	}
+	if fake.lastTarget.LiveProgressSupport != "unsupported" {
+		t.Fatalf("streamed LiveProgressSupport = %q, want %q", fake.lastTarget.LiveProgressSupport, "unsupported")
+	}
+	if fake.lastTarget.LiveProgressSpecType != "vllm" {
+		t.Fatalf("streamed LiveProgressSpecType = %q, want %q", fake.lastTarget.LiveProgressSpecType, "vllm")
+	}
+}
+
 // TestMeasureMappingStreamsWithSpecToken exercises the FULL measureMapping path
 // (benchmarkTargetReq -> streamOnce -> CompleteStream) end to end, asserting the fake
 // provider actually received the spec's token on the wire -- not just that
