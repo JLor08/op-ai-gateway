@@ -620,7 +620,7 @@ calls emits no text delta at all (the provider's stream loop forwards a text
 event only when the delta carries non-empty content or reasoning; tool-call
 argument fragments accumulate silently and surface only once the stream ends),
 so counting deltas would undercount such a turn by close to 100%; speculative
-decoding lands several tokens per delta, undercounting by 50-75%; and the Go
+decoding lands several tokens per delta, which undercounts by an amount dependent on the upstream model; and the Go
 backend has no tokenizer to count correctly by any other means. When no exact
 count has been seen, the row shows the same shared "never measured" em dash
 (`formatMetric`, `shared/format.ts`) the rest of Activity uses for a metric
