@@ -2031,7 +2031,7 @@ func TestCollectOnceRuntimeProbeStatesContextCacheHitOK(t *testing.T) {
 // recovery proof: a "custom"-typed child -- the effective type
 // routing.DeriveProbePaths gives NO context path at all, so ContextProbe
 // stays "na" and nothing is ever fetched for context -- still gets its
-// live-progress capability determined, because probeRuntimeChildLiveProgress
+// live-progress capability determined, because probeRuntimeChildProps
 // GETs collector.LiveProgressProbePath ("/props") unconditionally, never
 // gated on Type or ContextProbePath. Without this, a llama.cpp build
 // launched without an explicit Type would never be probed for this
@@ -2083,6 +2083,138 @@ func TestCollectOnceRuntimeLiveProgressCustomTypeSupported(t *testing.T) {
 	}
 	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 		t.Errorf("/props hits = %d, want 1 (the capability probe must GET /props for a custom-typed child)", hits)
+	}
+}
+
+// TestCollectOnceRuntimeCapabilitiesCachedAcrossCycles proves the widened
+// cache carries capabilities too, exactly as it already does for
+// LiveProgressSupport (TestCollectOnceRuntimeLiveProgressApiKeyRefusalCachedAcrossCycles
+// and siblings): a determined verdict set from one /props document is
+// fetched once and reused across every later collect cycle for the same
+// pid, so a second cycle re-probes nothing -- and the sample still reports
+// the capability verdicts from the cached entry.
+func TestCollectOnceRuntimeCapabilitiesCachedAcrossCycles(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":false}},
+		                        "modalities":{"vision":true,"video":false,"audio":false},
+		                        "chat_template_caps":{"supports_tools":true}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_caps_cached",
+			Model:  "vision-model",
+			State:  runtimectl.StateRunning,
+			PID:    6020,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "custom",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	want := &sample.Capabilities{Vision: "yes", Video: "no", Audio: "no", Tools: "yes"}
+	const cycles = 3
+	for cycle := 1; cycle <= cycles; cycle++ {
+		a.collectOnce(context.Background())
+		got := poster.last()
+		if got == nil || len(got.Runtimes) != 1 {
+			t.Fatalf("cycle %d: Runtimes = %+v", cycle, got)
+		}
+		rs := got.Runtimes[0]
+		if rs.LiveProgressSupport != "supported" {
+			t.Errorf("cycle %d: LiveProgressSupport = %q, want %q", cycle, rs.LiveProgressSupport, "supported")
+		}
+		if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+			t.Errorf("cycle %d: Capabilities = %+v, want %+v", cycle, rs.Capabilities, want)
+		}
+		if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+			t.Fatalf("cycle %d: /props hits = %d, want 1 (a determined verdict set -- capabilities included -- must be cached across cycles)", cycle, hits)
+		}
+	}
+}
+
+// TestCollectOnceRuntimeCapabilitiesPidChangeRearms proves a PID change
+// re-arms the question for capabilities exactly as it does for the
+// live-progress verdict (TestCollectOnceRuntimeLiveProgressPidChangeRearmsStableUnknown):
+// a restarted child under a new pid is re-probed -- the hit counter grows --
+// and the sample after the restart carries the freshly-probed capabilities,
+// not a stale copy read through the old pid's cache entry.
+func TestCollectOnceRuntimeCapabilitiesPidChangeRearms(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":false}},
+		                        "modalities":{"vision":true,"video":false,"audio":false},
+		                        "chat_template_caps":{"supports_tools":true}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	pid := 6021
+	setStatuses := func() {
+		drv.setStatuses([]runtimectl.Status{
+			{
+				SpecID: "rspec_caps_pid_rearm",
+				State:  runtimectl.StateRunning,
+				PID:    pid,
+				Port:   portFromURL(t, srv.URL),
+				Type:   "custom",
+			},
+		})
+	}
+	setStatuses()
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	want := &sample.Capabilities{Vision: "yes", Video: "no", Audio: "no", Tools: "yes"}
+
+	a.collectOnce(context.Background())
+	a.collectOnce(context.Background())
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Fatalf("/props hits before restart = %d, want 1 (cached across cycles for the same pid)", hits)
+	}
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	if rs := got.Runtimes[0]; rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Fatalf("Capabilities before restart = %+v, want %+v", rs.Capabilities, want)
+	}
+
+	// The child restarts: same SpecID, a new pid.
+	pid = 6022
+	setStatuses()
+	a.collectOnce(context.Background())
+	if hits := atomic.LoadInt32(&propsHits); hits != 2 {
+		t.Errorf("/props hits after restart = %d, want 2 (a changed pid must re-arm the question for capabilities too)", hits)
+	}
+	got = poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	if rs := got.Runtimes[0]; rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities after restart = %+v, want %+v", rs.Capabilities, want)
 	}
 }
 
@@ -2189,7 +2321,7 @@ func TestCollectOnceRuntimeLiveProgressUnreachable(t *testing.T) {
 // TestProbeRuntimeChildLiveProgressIgnoresContextCache is step 2's direct
 // proof: a runtimeCtxCache hit (a prior context probe on this exact PID
 // generation already succeeded) must NOT be read as evidence that the
-// live-progress capability was ever determined. probeRuntimeChildLiveProgress
+// live-progress capability was ever determined. probeRuntimeChildProps
 // keeps its own cache (runtimeCapabilityCache), so it must still issue the
 // live /props GET here and return the verdict that fetch actually produces
 // -- not skip the probe, and not fabricate a verdict from the unrelated
@@ -2233,7 +2365,7 @@ func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
 
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 	var rs sample.RuntimeSample
-	a.probeRuntimeChildLiveProgress(context.Background(), srv.Client(), base, st, &rs)
+	a.probeRuntimeChildProps(context.Background(), srv.Client(), base, st, &rs)
 
 	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 		t.Fatalf("/props hits = %d, want 1 (a context-cache hit must not skip the capability probe)", hits)
@@ -2245,7 +2377,7 @@ func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
 	// A second call now hits the CAPABILITY cache this probe itself just
 	// populated -- no second GET.
 	var rs2 sample.RuntimeSample
-	a.probeRuntimeChildLiveProgress(context.Background(), srv.Client(), base, st, &rs2)
+	a.probeRuntimeChildProps(context.Background(), srv.Client(), base, st, &rs2)
 	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 		t.Errorf("/props hits after 2nd call = %d, want 1 (a determined verdict must be cached)", hits)
 	}
@@ -2258,7 +2390,7 @@ func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
 // task 4 report "Concerns" item 2): caching the STABLE half of an
 // undetermined ("") verdict -- a 404, or a well-formed non-/props body --
 // while still retrying the TRANSIENT half (a connection refused, a timeout,
-// an unparseable body) every cycle. See probeRuntimeChildLiveProgress's
+// an unparseable body) every cycle. See probeRuntimeChildProps's
 // "Caching policy" doc comment for the full distinction.
 
 // TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles is required
@@ -2450,7 +2582,7 @@ func TestProbeRuntimeChildLiveProgressConnectionRefusedRetries(t *testing.T) {
 	const cycles = 3
 	for cycle := 1; cycle <= cycles; cycle++ {
 		var rs sample.RuntimeSample
-		a.probeRuntimeChildLiveProgress(context.Background(), client, base, st, &rs)
+		a.probeRuntimeChildProps(context.Background(), client, base, st, &rs)
 		if rs.LiveProgressSupport != "" {
 			t.Errorf("cycle %d: LiveProgressSupport = %q, want %q (unknown)", cycle, rs.LiveProgressSupport, "")
 		}

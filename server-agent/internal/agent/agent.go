@@ -494,16 +494,19 @@ type Agent struct {
 	// seen; probeRuntimeChild lazy-inits it.
 	runtimeCtxCache map[string]runtimeCtxEntry
 
-	// runtimeCapabilityCache caches each running child's probed live-
-	// progress-capability verdict (task 4 of #51), keyed by SpecID -- see
-	// runtimeCapabilityEntry and probeRuntimeChildLiveProgress. Deliberately
-	// a SEPARATE cache from runtimeCtxCache above, not a field added to
-	// runtimeCtxEntry: the context probe and the capability probe succeed
-	// and fail independently, so a context-probe cache hit must never be
-	// read as proof the capability was ever determined. Same
-	// single-goroutine access pattern as runtimeCtxCache -- no mutex needed.
-	// Left nil until the first running child is seen;
-	// probeRuntimeChildLiveProgress lazy-inits it.
+	// runtimeCapabilityCache caches every /props-derived verdict for a
+	// running child's current pid generation, keyed by SpecID -- see
+	// runtimeCapabilityEntry and probeRuntimeChildProps. It started as just
+	// the live-progress-capability verdict (task 4 of #51) and was widened
+	// (#49-2) to the full collector.PropsVerdicts (live-progress plus the
+	// llama.cpp capability verdicts) once both began riding the same single
+	// /props fetch. Deliberately a SEPARATE cache from runtimeCtxCache
+	// above, not a field added to runtimeCtxEntry: the context probe and the
+	// capability probe succeed and fail independently, so a context-probe
+	// cache hit must never be read as proof the capability was ever
+	// determined. Same single-goroutine access pattern as runtimeCtxCache --
+	// no mutex needed. Left nil until the first running child is seen;
+	// probeRuntimeChildProps lazy-inits it.
 	runtimeCapabilityCache map[string]runtimeCapabilityEntry
 
 	// --- T3, live managed-process log streaming -------------------------
@@ -1043,34 +1046,36 @@ type runtimeCtxEntry struct {
 	size             int
 }
 
-// runtimeCapabilityEntry is one cached live-progress-capability probe
-// result: the PID it was measured against (mirroring runtimeCtxEntry -- a
-// restart, a changed PID, forces a re-probe, since a new process generation
-// may run a different build) and the verdict itself: "supported",
-// "unsupported", or -- deliberately -- "" (see below). There is no
-// specType/path pair to invalidate on, unlike runtimeCtxEntry: this probe
-// always targets the same fixed collector.LiveProgressProbePath regardless
-// of st.Type, so a config-only edit that changes Type or ContextProbePath
-// (without a restart) has no bearing on this cache's validity.
+// runtimeCapabilityEntry is one cached /props probe result: the PID it was
+// measured against (mirroring runtimeCtxEntry -- a restart, a changed PID,
+// forces a re-probe, since a new process generation may run a different
+// build) and the verdict set itself: collector.PropsVerdicts, carrying both
+// the live-progress verdict ("supported", "unsupported", or -- deliberately
+// -- "", see below) and, since #49-2, the llama.cpp capability verdicts
+// derived from that same document. There is no specType/path pair to
+// invalidate on, unlike runtimeCtxEntry: this probe always targets the same
+// fixed collector.LiveProgressProbePath regardless of st.Type, so a
+// config-only edit that changes Type or ContextProbePath (without a restart)
+// has no bearing on this cache's validity.
 //
-// verdict == "" is a valid, cached entry here, not a zero-value placeholder:
-// it means the probe got a CONCLUSIVE non-answer for this pid (a 404, or a
-// well-formed body that simply isn't a llama.cpp /props document) --
-// collector.ProbeLiveProgressSupport's stable == true case. Caching it stops
-// probeRuntimeChildLiveProgress from re-asking a question this pid's binary
-// can never answer differently, without ever fabricating a "supported" or
-// "unsupported" value it did not actually observe. A merely-absent map entry
-// (no key for st.SpecID, or a stale pid) is the "never determined, and
-// nothing yet says the answer is stable" case, and is NOT the same as a
-// present entry whose verdict happens to be "".
+// verdicts == (collector.PropsVerdicts{}) is a valid, cached entry here, not
+// a zero-value placeholder: it means the probe got a CONCLUSIVE non-answer
+// for this pid (a 404, or a well-formed body that simply isn't a llama.cpp
+// /props document) -- collector.ProbePropsVerdicts's stable == true case.
+// Caching it stops probeRuntimeChildProps from re-asking a question this
+// pid's binary can never answer differently, without ever fabricating a
+// verdict it did not actually observe. A merely-absent map entry (no key for
+// st.SpecID, or a stale pid) is the "never determined, and nothing yet says
+// the answer is stable" case, and is NOT the same as a present entry holding
+// the zero value.
 //
 // This cache exists SEPARATELY from runtimeCtxCache on purpose (step 2 of
 // task 4): a context-probe cache hit is proof only that the CONTEXT probe
 // succeeded on this PID generation, never that the capability verdict was
-// ever established -- see probeRuntimeChildLiveProgress.
+// ever established -- see probeRuntimeChildProps.
 type runtimeCapabilityEntry struct {
-	pid     int
-	verdict string
+	pid      int
+	verdicts collector.PropsVerdicts
 }
 
 // probeRuntimeChild fills rs's probe-RESULT fields (ActiveRequests,
@@ -1104,7 +1109,7 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 
 	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
-	a.probeRuntimeChildLiveProgress(ctx, client, base, st, rs)
+	a.probeRuntimeChildProps(ctx, client, base, st, rs)
 }
 
 // probeRuntimeChildMetrics runs probeRuntimeChild's metrics-scrape half and
@@ -1190,12 +1195,19 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 	return "ok"
 }
 
-// probeRuntimeChildLiveProgress fills rs.LiveProgressSupport with the
-// live-progress-capability verdict for st -- task 4's agent-side half of
-// issue #51 (the gateway's half is detectLiveProgressSupport in
+// probeRuntimeChildProps fills rs.LiveProgressSupport and rs.Capabilities
+// with every verdict one /props document yields for st: the live-progress-
+// capability verdict, task 4's agent-side half of issue #51 (the gateway's
+// half is detectLiveProgressSupport in
 // gateway/backend/internal/provider/model_info.go; collector.
 // detectLiveProgressSupport is a DELIBERATE duplicate of that exact rule --
-// see its doc comment -- and the two must never drift).
+// see its doc comment -- and the two must never drift), and, since #49-2,
+// the llama.cpp capability verdict set (collector.detectCapabilities, the
+// same duplication precedent against gateway/backend's own copy). Both
+// verdict kinds ride the SAME single /props fetch
+// (collector.ProbePropsVerdicts) -- the whole point of widening the probe
+// was that a llama_cpp child is never asked for /props a second time just to
+// answer a second question.
 //
 // Unlike probeRuntimeChildContext, this ALWAYS GETs
 // collector.LiveProgressProbePath ("/props"), regardless of st.Type or
@@ -1203,7 +1215,7 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // "custom"-typed spec no context path at all, so without this unconditional
 // probe a custom-typed llama.cpp child -- exactly the case a type-based
 // rule refuses -- would never be probed for this capability. One extra
-// loopback GET per child lifetime once a verdict is cached; there is no
+// loopback GET per child lifetime once a verdict set is cached; there is no
 // SSRF guard to apply here (unlike MetricsPath/ContextProbePath, this path
 // is a package constant, never operator/config-supplied).
 //
@@ -1214,16 +1226,17 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // (vLLM/TGI/Ollama) re-GETs /props once per collect cycle, forever, for a
 // question whose answer cannot change while that pid lives -- a permanent
 // per-cycle cost, not a one-time one. The fix caches on WHY no verdict came
-// back, using collector.ProbeLiveProgressSupport's stable return:
+// back, using collector.ProbePropsVerdicts's stable return:
 //
-//   - STABLE (a real "supported"/"unsupported" verdict, OR a "" that is
+//   - STABLE (a real "supported"/"unsupported" verdict and/or real
+//     capability verdicts, OR a zero-value collector.PropsVerdicts{} that is
 //     conclusive -- a 404, or a well-formed body that simply isn't a
 //     llama.cpp /props document): that fact cannot change while st.PID's
 //     process keeps running, because the binary behind it does not change.
-//     Cache it -- verdict included, even when it is "" -- in
-//     runtimeCapabilityCache, keyed and invalidated exactly like
-//     runtimeCtxCache (a changed st.PID re-arms the question), so this pid's
-//     /props endpoint is asked at most once, not once per cycle.
+//     Cache it -- zero value included -- in runtimeCapabilityCache, keyed
+//     and invalidated exactly like runtimeCtxCache (a changed st.PID
+//     re-arms the question), so this pid's /props endpoint is asked at most
+//     once, not once per cycle.
 //   - TRANSIENT (a connection refused, a timeout, or an unparseable/
 //     truncated body): the child may still be warming up, so the SAME
 //     silence must not be cached -- retry next cycle, exactly as
@@ -1235,25 +1248,28 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // policy exists to remove. Do NOT collapse it into "cache every verdict
 // including every empty one": that would permanently misdiagnose a
 // slow-starting child as having no live-progress capability. The two
-// failure reasons are why a stable "" is cached (via runtimeCapabilityCache
-// holding verdict == "") while runtimeCtxCache's cached-size path never
-// stores a failure at all -- the two caches answer different questions and
-// must not be merged: a cached context size is proof only that the CONTEXT
-// probe succeeded on this PID generation, never that the capability verdict
-// was ever established (this is also why this cache is kept separate from
-// runtimeCtxCache; a lookup here never consults it, and vice versa).
+// failure reasons are why a stable zero-value collector.PropsVerdicts{} is
+// cached (via runtimeCapabilityCache) while runtimeCtxCache's cached-size
+// path never stores a failure at all -- the two caches answer different
+// questions and must not be merged: a cached context size is proof only
+// that the CONTEXT probe succeeded on this PID generation, never that the
+// capability verdict was ever established (this is also why this cache is
+// kept separate from runtimeCtxCache; a lookup here never consults it, and
+// vice versa).
 //
 // This never overwrites an already-cached value with a fabricated one:
-// rs.LiveProgressSupport is only ever set to a verdict collector.
-// ProbeLiveProgressSupport (or a prior cache write) actually produced, and
-// an uncached probe leaves it at its zero value ("").
-func (a *Agent) probeRuntimeChildLiveProgress(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
+// rs.LiveProgressSupport and rs.Capabilities are only ever set from a
+// verdict set collector.ProbePropsVerdicts (or a prior cache write) actually
+// produced, and an uncached probe leaves rs.LiveProgressSupport at its zero
+// value ("") and rs.Capabilities at its zero value (nil).
+func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
 	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID {
-		rs.LiveProgressSupport = entry.verdict
+		rs.LiveProgressSupport = entry.verdicts.LiveProgress
+		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	verdict, stable := collector.ProbeLiveProgressSupport(cctx, client, base)
+	verdicts, stable := collector.ProbePropsVerdicts(cctx, client, base)
 	cancel()
 	if !stable {
 		// Transient: no conclusive answer yet. Do not cache; retry next
@@ -1264,8 +1280,26 @@ func (a *Agent) probeRuntimeChildLiveProgress(ctx context.Context, client *http.
 	if a.runtimeCapabilityCache == nil {
 		a.runtimeCapabilityCache = make(map[string]runtimeCapabilityEntry)
 	}
-	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{pid: st.PID, verdict: verdict}
-	rs.LiveProgressSupport = verdict
+	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{pid: st.PID, verdicts: verdicts}
+	rs.LiveProgressSupport = verdicts.LiveProgress
+	rs.Capabilities = capabilitiesSample(verdicts.Caps)
+}
+
+// capabilitiesSample converts one probe's collector.Capabilities into
+// RuntimeSample.Capabilities' wire pointer type. Always returns a non-nil
+// pointer, even when every field is "" (nothing determined): that all-empty
+// struct is the "detection ran, found nothing" wire value, distinct from the
+// nil probeRuntimeChildProps leaves in place for an uncached, undetermined
+// probe -- see sample.RuntimeSample.Capabilities' own doc comment for why
+// that distinction is load-bearing.
+func capabilitiesSample(c collector.Capabilities) *sample.Capabilities {
+	return &sample.Capabilities{
+		Vision: c.Vision,
+		Video:  c.Video,
+		Audio:  c.Audio,
+		Tools:  c.Tools,
+		Extra:  c.Extra,
+	}
 }
 
 // collectOnce builds one sample from the host, GPU, and scrape collectors and

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -397,7 +398,8 @@ func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
 func TestProbeLiveProgressSupport_Supported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "supported" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "supported")
 	}
@@ -412,7 +414,8 @@ func TestProbeLiveProgressSupport_Supported(t *testing.T) {
 func TestProbeLiveProgressSupport_Unsupported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "unsupported" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "unsupported")
 	}
@@ -433,7 +436,8 @@ func TestProbeLiveProgressSupport_NotFound(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a 404", got, "")
 	}
@@ -483,7 +487,8 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+			verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+			got := verdicts.LiveProgress
 			if got != "" {
 				t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a %d", got, "", tc.status)
 			}
@@ -491,6 +496,67 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 				t.Errorf("ProbeLiveProgressSupport stable = %v, want %v -- %s", stable, tc.wantStable, tc.why)
 			}
 		})
+	}
+}
+
+// TestProbePropsVerdictsFetchesOnce is the entire point of widening the
+// probe (#49-2): one GET yields every verdict, so a llama_cpp child is not
+// asked for /props twice (once for live progress, once for capabilities) --
+// the hit counter is the assertion that matters.
+func TestProbePropsVerdictsFetchesOnce(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != LiveProgressProbePath {
+			t.Errorf("probed %q, want %q", r.URL.Path, LiveProgressProbePath)
+		}
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":false}},
+		                        "modalities":{"vision":true,"video":false,"audio":false},
+		                        "chat_template_caps":{"supports_tools":true}}`))
+	}))
+	defer srv.Close()
+
+	v, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+	if !stable {
+		t.Fatal("a parsed /props document must be stable")
+	}
+	if v.LiveProgress != "supported" {
+		t.Fatalf("LiveProgress = %q, want supported", v.LiveProgress)
+	}
+	if v.Caps.Vision != "yes" || v.Caps.Video != "no" || v.Caps.Tools != "yes" {
+		t.Fatalf("Caps = %+v", v.Caps)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("/props hits = %d, want exactly 1", got)
+	}
+}
+
+// TestProbePropsVerdictsKeepsTheConclusiveSet pins the conclusive/transient
+// contract as a regression anchor, restated here on the widened function:
+// ProbePropsVerdicts must keep ProbeLiveProgressSupport's exact conclusive
+// set ({404, 401, 403, 405}), transient/retry rule (status 0 and every other
+// non-2xx, notably 5xx), and stable-empty caching -- only the return payload
+// widened.
+func TestProbePropsVerdictsKeepsTheConclusiveSet(t *testing.T) {
+	for _, status := range []int{404, 401, 403, 405} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		v, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+		srv.Close()
+		if !stable {
+			t.Fatalf("status %d must be conclusive", status)
+		}
+		// reflect.DeepEqual, not ==: Capabilities carries an []string.
+		if v.LiveProgress != "" || !reflect.DeepEqual(v.Caps, Capabilities{}) {
+			t.Fatalf("status %d yielded verdicts: %+v", status, v)
+		}
+	}
+	for _, status := range []int{500, 503} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		_, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+		srv.Close()
+		if stable {
+			t.Fatalf("status %d must be transient", status)
+		}
 	}
 }
 
@@ -503,7 +569,8 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
 	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-/props shape", got, "")
 	}
@@ -532,7 +599,8 @@ func TestProbeLiveProgressSupport_TransientStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
 	}
@@ -552,7 +620,8 @@ func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
 	addr := ts.URL
 	ts.Close() // closed: nothing is listening on addr anymore
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), http.DefaultClient, addr)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), http.DefaultClient, addr)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a refused connection", got, "")
 	}
@@ -568,7 +637,8 @@ func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
 func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":`) // truncated mid-object
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for unparseable JSON", got, "")
 	}
