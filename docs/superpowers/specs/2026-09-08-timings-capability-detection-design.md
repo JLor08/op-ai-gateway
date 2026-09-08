@@ -76,9 +76,28 @@ key's presence asserts "this build's completion schema has that field" — not m
 `GET /props` is ungated on every llama.cpp build (unlike `/metrics`, which needs
 `--metrics`), and it costs no inference, no tokens and no GPU time.
 
-Absence, a failed fetch, a non-llama.cpp body, or a body we cannot parse all mean
-**unsupported**, not unknown — a body that answered and did not contain the key is
-evidence. Only "we never got to ask" is unknown.
+**What counts as evidence, precisely — this is narrower than it first looks, and
+getting it wrong breaks vLLM.** The key is a *llama.cpp* request-schema field. vLLM's
+half of #51 is `stream_options.continuous_usage_stats`, a different question, and
+vLLM's context probe fetches `/v1/models` (`DeriveProbePaths`), not `/props`. So a
+rule of "the body answered and lacked the key ⇒ unsupported" would mark every vLLM
+application unsupported from its `/v1/models` response and stop sending to it —
+silently removing a live number that works today.
+
+Therefore:
+
+- **`supported`** — the body is a llama.cpp `/props` document (it has
+  `default_generation_settings.params`) **and** that object contains the key.
+- **`unsupported`** — the body *is* that document and the key is absent. This is a
+  real verdict about a real build: an older llama.cpp without the field.
+- **unknown, and the persisted value is left untouched** — everything else: the fetch
+  failed, or the body is some other shape (vLLM's `/v1/models`, TGI's `/info`,
+  Ollama's `/api/show`). We never got to ask the question.
+
+So the persisted tri-state means "does this upstream tolerate the live-progress
+parameters", and this detector is one *source* of evidence for it — one that only
+ever speaks for llama.cpp. Where it is silent, §1's shape rule carries the decision,
+which is exactly what keeps vLLM working.
 
 > Verify every field against llama.cpp **source**, never `tools/server/README.md`:
 > that README documents a pre-refactor `/props` shape and has already produced one
@@ -117,7 +136,44 @@ and keeps overwriting. Persistence exists only so that a gateway restart does no
 start from nothing — which is what makes "silent until detected" cost nothing after
 the first successful probe ever, rather than after every restart.
 
-## 4. The gateway half — non-agent applications
+## 4. Showing it in the portal
+
+The persisted verdict must be visible, the way `context_size` is — an operator who
+sees no live number should be able to tell whether the gateway decided against
+asking, and why.
+
+Because the value is **persisted on the mapping**, the portal service reads it
+directly from `view.mapping`, exactly as it already does for
+`ContextSize: view.mapping.ContextSize` (`internal/portal/service_model_servers.go:147`).
+No gateway-injection seam is needed — unlike the volatile probe fields, which the
+gateway layer has to fill after the fact because the portal service cannot reach the
+runtime-status registry.
+
+`ModelServerDTO` gains the tri-state as a plain string, snake_case, **not**
+`omitempty`, so "not determined" is an explicit `""` on the wire rather than a
+missing key — the same choice #50 made for `metrics_probe` and #51 for
+`tokens_per_second_source`.
+
+The column goes in the model-detail table (`ModelServersSection.tsx`), beside the
+Kontext column, and — like Kontext — carries a comment saying it is a persisted
+value rather than a probe-derived one, because that distinction has already caused
+one bug on that surface. Rendering follows #50's chip vocabulary:
+
+- **`supported`** → the positive badge.
+- **`unsupported`** → the **neutral** badge, deliberately not the attention badge. An
+  older llama.cpp build is not broken; it simply lacks a nicety. Marking it as
+  attention-worthy would put a warning on every such server, which is the same
+  mistake as showing a `0` that means "not measured".
+- **`""`** → nothing rendered, per the "not reported ⇒ no indicator" convention.
+
+Refer to badges by key, never by colour — the theme can change, and a hue written
+into prose or a doc goes stale.
+
+A tooltip states what the verdict means and, for `unsupported`, that the live figure
+is unavailable because this build's request schema has no such field. i18n keys in
+both `de` and `en`.
+
+## 5. The gateway half — non-agent applications
 
 `/props` is **already fetched today** for exactly the two ambiguous non-agent types:
 a `llama_cpp` application defaults `context_probe_path` to `/props`, and a
@@ -142,7 +198,7 @@ An application whose operator blanked `context_probe_path` is never probed, so i
 stays unknown — and §1's shape rule is what keeps a plain `llama_cpp` application
 working there. That is the case the rule exists for.
 
-## 5. The agent half — agent-managed children
+## 6. The agent half — agent-managed children
 
 This signal is **unreachable from the gateway** for an agent-managed child: the
 agent's router answers 404 to any request whose JSON body names no managed model, so
@@ -178,7 +234,7 @@ Then:
   exactly like the context size. Without it, the agent half only confirms what the
   effective type already guessed.
 
-## 6. The decision point
+## 7. The decision point
 
 `Target` gains one field carrying the persisted tri-state. It costs **no extra
 lookup**: `Resolver.targetFrom` (`internal/routing/resolver.go`) already receives the
@@ -197,7 +253,7 @@ provider type, and its effective spec type — with the memo consulted as it is 
 Its doc comment must be rewritten: after this change the allow-list is no longer even
 a fallback for *sending*, it is the "shape implies a tolerant upstream" clause of §1.
 
-## 7. Error handling and edge cases
+## 8. Error handling and edge cases
 
 - Everything stays advisory. A failed probe, an unparseable body, a missing column
   value and an older agent are all ordinary states, never errors, never logged as
@@ -218,7 +274,7 @@ a fallback for *sending*, it is the "shape implies a tolerant upstream" clause o
 - The value is per mapping; deleting and recreating a mapping resets it to unknown,
   which is correct.
 
-## 8. Testing
+## 9. Testing
 
 - The decision rule as a table over every combination of persisted state × provider
   type × effective spec type, including the pre-feature `""` spec type resolving from
@@ -236,10 +292,10 @@ a fallback for *sending*, it is the "shape implies a tolerant upstream" clause o
 - An older agent that never populates the field leaves the persisted value alone
   rather than overwriting it with unknown.
 - A cached context size does not imply a capability verdict (the separate-hit-tracking
-  property from §5).
+  property from §6).
 - Every new test must fail if its production change is reverted.
 
-## 9. Also in scope
+## 10. Also in scope
 
 #51's final re-review found this and it was outside that wave's scope: the
 gateway-derived rate in `liveProgressDTO` got a 50 ms floor on its generation window,
@@ -249,7 +305,7 @@ after the first content frame could record an implausibly high rate — and that
 feeds the mapping's opportunistic throughput EWMA, which is a routing input. Add the
 same floor.
 
-## 10. Out of scope
+## 11. Out of scope
 
 - An operator-triggered capability benchmark that settles the question for any
   upstream, including ones with no `/props` at all (the shape `vision_capable` uses).
