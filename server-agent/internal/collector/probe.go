@@ -96,27 +96,10 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 	if path == "" {
 		return 0, fmt.Errorf("probe context: no context path configured")
 	}
-	if client == nil {
-		client = http.DefaultClient
-	}
 
-	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, _, err := fetchProbeBody(ctx, client, baseURL, path)
 	if err != nil {
-		return 0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("probe context: upstream status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("probe context: %w", err)
 	}
 
 	var v any
@@ -129,6 +112,205 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 		return 0, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
 	}
 	return n, nil
+}
+
+// fetchProbeBody is the common GET-and-read-body step shared by ProbeContext
+// and ProbeLiveProgressSupport: build baseURL+path, issue the request
+// through client (falling back to http.DefaultClient for a nil one, matching
+// ProbeContext's long-standing contract), and return the raw response body
+// on a 2xx status. It never interprets the bytes -- each caller applies its
+// own parse/evidence rule to the same body.
+//
+// The returned status is the HTTP status code actually received, or 0 if no
+// response was ever received at all (a transport-level failure: connection
+// refused, timeout, DNS failure, ...). ProbeContext ignores it -- its error
+// handling and caching policy are unchanged by this. ProbeLiveProgressSupport
+// uses it to tell a transient failure (status 0, or a non-2xx status that
+// says nothing final -- a 5xx above all) from a CONCLUSIVE refusal (404,
+// 401, 403, 405) when deciding whether an undetermined verdict is safe to
+// cache; see its own comment for why exactly those four are conclusive.
+func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, fmt.Errorf("probe: upstream status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return body, resp.StatusCode, err
+}
+
+// LiveProgressProbePath is the fixed path GETted for the live-progress-
+// capability verdict (issue #51, task 4). Unlike contextPath above, this
+// path is NOT type-derived and NOT overridable: routing.DeriveProbePaths
+// gives a "custom"-typed spec no context path at all, so a custom-typed
+// child (DetectRuntimeSpecType's fallback, or an explicit operator choice)
+// would otherwise never be probed here -- exactly the case this detector
+// exists to recover. The agent's probeRuntimeChildLiveProgress (agent.go)
+// GETs this path unconditionally for every StateRunning child with a live
+// port, regardless of st.Type or st.ContextProbePath.
+const LiveProgressProbePath = "/props"
+
+// ProbeLiveProgressSupport GETs baseURL+LiveProgressProbePath and returns
+// the live-progress-capability verdict for whatever answered: "supported",
+// "unsupported", or "" (unknown -- the body is not a llama.cpp /props
+// document at all). It reuses fetchProbeBody, the exact GET-and-read-body
+// step ProbeContext uses, then hands the raw bytes to
+// detectLiveProgressSupport for the actual evidence rule.
+//
+// This is a SIBLING of ProbeContext, not a case folded into it:
+// ProbeContext is hard-typed to (int, error) and every extractor beneath it
+// (extractContext and friends) returns (int, bool) -- a tri-state verdict
+// cannot ride that chain, and widening it would touch every extractor for a
+// capability that has nothing to do with context-size extraction. Keeping
+// this a separate function is the deliberate shape choice.
+//
+// The second return, stable, tells the caller whether this outcome
+// (including a "" one) is safe to cache and stop asking about, or must be
+// retried next cycle. This is a resource-usage fix: without it, a
+// non-llama.cpp child would have its /props endpoint hit every single
+// collect cycle for its entire lifetime, because "" was never cached at all.
+// The split is about WHY no verdict could be determined, not about the
+// verdict's value:
+//
+//   - stable == true: the endpoint answered CONCLUSIVELY. Either a real
+//     /props document (verdict "supported"/"unsupported", exactly as
+//     before), or a status that settles the question for this pid -- 404
+//     (no such route on this build), 401/403 (the route is behind an api
+//     key this probe cannot supply), 405 (not for GET) -- or any other
+//     syntactically well-formed body that simply isn't that document (a
+//     vLLM/Ollama/TGI body, say). None of that can change while this
+//     process keeps running: the binary behind it, and the credential it
+//     was launched with, do not change.
+//   - stable == false: no conclusive answer was possible -- the fetch never
+//     got an HTTP response at all (connection refused, timeout, ...), the
+//     response was some OTHER non-2xx status (a 5xx above all), or the body
+//     was syntactically invalid/truncated JSON. Any of these can describe a
+//     child that is merely still warming up, so the caller must NOT cache
+//     "" here.
+//
+// A caller that collapses this into one branch either reintroduces the
+// permanent per-cycle /props traffic (by never caching) or permanently
+// misses a verdict for a slow-starting child (by caching everything).
+func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) (verdict string, stable bool) {
+	body, status, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
+	if err != nil {
+		// No conclusive body in hand -- but SOME statuses are still a
+		// conclusive answer to "will this endpoint ever hand me a /props
+		// document?", and those must be cached or the caller re-GETs
+		// /props on every collect cycle (1 s default, 250 ms floor) for
+		// the child's entire lifetime.
+		//
+		// Conclusive, because none of them can change while THIS pid
+		// keeps running -- they are properties of the binary's routing
+		// table and of the credential it was started with, both fixed at
+		// exec time:
+		//   - 404: this build has no such route.
+		//   - 401/403: the route exists but demands a credential this
+		//     probe does not have and cannot obtain. `llama-server
+		//     --api-key ${API_TOKEN}` is a first-class supported spec
+		//     shape, and llama.cpp marks only /health and /v1/health as
+		//     public -- /props is behind the key. The agent's probe
+		//     cannot authenticate (runtime.Status carries no token), so
+		//     asking again buys nothing; the verdict stays undetermined
+		//     and the decision falls back to the shape clause. Lifting
+		//     that limitation is issue #58.
+		//   - 405: the route exists but not for GET, which is the same
+		//     kind of fixed, build-level fact as a 404.
+		//
+		// NOT conclusive: status 0 (no HTTP response at all -- connection
+		// refused, timeout) and every other non-2xx, notably 5xx. Those
+		// all describe a child that may merely still be starting up, so
+		// they must be retried rather than cached.
+		stable := status == http.StatusNotFound ||
+			status == http.StatusUnauthorized ||
+			status == http.StatusForbidden ||
+			status == http.StatusMethodNotAllowed
+		return "", stable
+	}
+	if !json.Valid(body) {
+		// Syntactically invalid/truncated JSON reads as a child still
+		// mid-response, not a conclusive answer -- do not cache it.
+		return "", false
+	}
+	return detectLiveProgressSupport(body), true
+}
+
+// detectLiveProgressSupport is the agent-side half of the live-progress-
+// capability detector (issue #51): it decides whether the upstream build
+// tolerates the live-progress request parameters (tokens/sec, TTFT) WITHOUT
+// ever sending a request that risks a 400 to find out.
+//
+// The signal is the presence of the key "timings_per_token" inside
+// default_generation_settings.params in a llama.cpp /props response. That
+// object is a serialization of the COMPILED request-schema field list, so
+// the key's presence asserts "this build's completion schema has that
+// field" -- not merely "this looks like llama.cpp". Presence is ALL that is
+// checked: the value is always false (the handler default-constructs the
+// params struct), so it carries no information and must never be read.
+//
+// Returns:
+//   - "supported"    default_generation_settings.params is present AND
+//     contains the key.
+//   - "unsupported"  default_generation_settings.params is present but does
+//     NOT contain the key -- a real verdict about a real build (an older
+//     llama.cpp).
+//   - ""             anything else: unparseable bytes, or a body that
+//     simply isn't that document -- a vLLM /v1/models body, an Ollama
+//     /api/show body, a TGI /info body, .... This is UNKNOWN, not a
+//     verdict, and callers must never let it overwrite an already-cached
+//     verdict. A llama.cpp ROUTER-mode body ("role": "router", issue #55)
+//     lands here too, even though it is /props-shaped: it describes the
+//     router's own build, not the one serving this model.
+//
+// This is a DUPLICATE, on purpose, of detectLiveProgressSupport in
+// gateway/backend/internal/provider/model_info.go -- the two are separate Go
+// modules (gateway/backend and server-agent) and cannot share code,
+// mirroring the "DUPLICATED locally on purpose" precedent at
+// gateway/backend/internal/provider/memory_probe.go:111. Whoever changes
+// this rule must change that copy identically, or the two halves of this
+// feature will drift. A reviewer finding them divergent is a real finding;
+// finding them duplicated is expected.
+func detectLiveProgressSupport(body []byte) string {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return ""
+	}
+	// llama.cpp's ROUTER mode answers /props with a DUMMY document carrying
+	// "role": "router" -- the ROUTER's own compiled schema, not that of the
+	// server actually serving this model (issue #55). It is no evidence about
+	// this model's upstream in either direction, so it yields UNDETERMINED.
+	// Reading it as evidence would be worse than reading nothing: a wrong
+	// "supported" is absorbed by the streaming retry, while a wrong
+	// "unsupported" is PERMANENT and self-reinforcing, because every later
+	// probe returns the same dummy and the no-rewrite guard then keeps it.
+	if role, ok := obj["role"].(string); ok && role == "router" {
+		return ""
+	}
+	dgs, ok := obj["default_generation_settings"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	params, ok := dgs["params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if _, present := params["timings_per_token"]; present {
+		return "supported"
+	}
+	return "unsupported"
 }
 
 // extractContext dispatches to the per-specType extraction rule.

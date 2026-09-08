@@ -189,8 +189,9 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			live_progress_support, live_progress_checked_at,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		mapping.ID,
 		mapping.ApplicationID,
 		mapping.GatewayModelName,
@@ -209,6 +210,8 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
+		mapping.LiveProgressSupport,
+		mapping.LiveProgressCheckedAt,
 		mapping.CreatedAt,
 		mapping.UpdatedAt,
 	)
@@ -232,6 +235,7 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 			load_time_ms = ?, context_size = ?, is_mtp = ?, vision_capable = ?, energy_wh_per_token = ?, metrics_locked = ?,
 			metrics_updated_at = ?, metrics_source = ?,
 			max_concurrency = ?, recommended_concurrency = ?, gen_tokens_per_second_at_capacity = ?,
+			live_progress_support = ?, live_progress_checked_at = ?,
 			updated_at = ?
 		where id = ?`,
 		mapping.ApplicationID,
@@ -251,6 +255,8 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
+		mapping.LiveProgressSupport,
+		mapping.LiveProgressCheckedAt,
 		mapping.UpdatedAt,
 		mapping.ID,
 	)
@@ -282,6 +288,33 @@ func (s *SQLiteStore) UpdateMappingContextProbe(ctx context.Context, id string, 
 		return fmt.Errorf("update mapping context probe: %w", err)
 	}
 	return nil // 0 rows affected (missing or locked) is a benign no-op
+}
+
+// UpdateMappingLiveProgressSupport records whether this mapping's upstream
+// tolerates the live-progress request parameters (#51).
+//
+// UNLIKE every other automated writer on this table, this one carries NO
+// `and metrics_locked = 0` guard and does not touch metrics_source /
+// metrics_updated_at. That is deliberate: metrics_locked exists so an operator
+// can pin NUMBERS THEY ANSWER FOR -- throughput, context size -- against
+// automation. A build capability is not such a number: pinning it could only
+// ever produce a wrong answer, and unlike a pinned throughput a wrong
+// capability has an operational consequence -- the live figure silently stays
+// off, with no visible reason, until someone thinks to unlock a mapping's
+// metrics. And because it is a capability rather than a metric, writing it must
+// not restamp the metrics provenance columns; doing so would misattribute this
+// mapping's throughput figures to a capability probe.
+func (s *SQLiteStore) UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error {
+	_, err := s.exec(ctx, `
+		update model_mappings
+		set live_progress_support = ?, live_progress_checked_at = ?
+		where id = ?`,
+		support, at, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update mapping live progress support: %w", err)
+	}
+	return nil // 0 rows affected (missing mapping) is a benign no-op
 }
 
 // UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
@@ -427,6 +460,7 @@ func (s *SQLiteStore) MappingByID(ctx context.Context, id string) (routing.Model
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			live_progress_support, live_progress_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where id = ?`, id)
@@ -439,6 +473,7 @@ func (s *SQLiteStore) MappingsByApplication(ctx context.Context, applicationID s
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			live_progress_support, live_progress_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where application_id = ?
@@ -456,6 +491,7 @@ func (s *SQLiteStore) MappingsByServer(ctx context.Context, serverID string) ([]
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
 			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
+			m.live_progress_support, m.live_progress_checked_at,
 			m.created_at, m.updated_at
 		from model_mappings m
 		join applications a on a.id = m.application_id
@@ -486,6 +522,7 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
 			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
+			m.live_progress_support, m.live_progress_checked_at,
 			m.created_at, m.updated_at
 		from model_mappings m
 		join applications a on a.id = m.application_id
@@ -526,6 +563,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		mapVisionCapable     int64
 		mapLocked            int64
 		mapUpdatedNil        sql.NullTime
+		mapLiveProgressAtNil sql.NullTime
 	)
 	err := row.Scan(
 		&c.Server.ID, &c.Server.Name, &c.Server.Domain, &c.Server.ServerPathSuffix, &c.Server.Provider, &c.Server.Endpoint,
@@ -546,6 +584,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.GenTokensPerSecond, &c.Mapping.PromptTokensPerSecond, &c.Mapping.LoadTimeMS, &c.Mapping.ContextSize,
 		&mapIsMTP, &mapVisionCapable, &c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
 		&c.Mapping.MaxConcurrency, &c.Mapping.RecommendedConcurrency, &c.Mapping.GenTokensPerSecondAtCapacity,
+		&c.Mapping.LiveProgressSupport, &mapLiveProgressAtNil,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
 	)
 	if err != nil {
@@ -561,6 +600,10 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	if mapUpdatedNil.Valid {
 		t := mapUpdatedNil.Time
 		c.Mapping.MetricsUpdatedAt = &t
+	}
+	if mapLiveProgressAtNil.Valid {
+		t := mapLiveProgressAtNil.Time
+		c.Mapping.LiveProgressCheckedAt = &t
 	}
 	if lastSeen.Valid {
 		t := lastSeen.Time
@@ -668,6 +711,7 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	var mapping routing.ModelMapping
 	var isMTP, visionCapable, locked int64
 	var updatedNil sql.NullTime
+	var liveProgressAtNil sql.NullTime
 	err := row.Scan(
 		&mapping.ID,
 		&mapping.ApplicationID,
@@ -687,6 +731,8 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.MaxConcurrency,
 		&mapping.RecommendedConcurrency,
 		&mapping.GenTokensPerSecondAtCapacity,
+		&mapping.LiveProgressSupport,
+		&liveProgressAtNil,
 		&mapping.CreatedAt,
 		&mapping.UpdatedAt,
 	)
@@ -702,6 +748,10 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	if updatedNil.Valid {
 		t := updatedNil.Time
 		mapping.MetricsUpdatedAt = &t
+	}
+	if liveProgressAtNil.Valid {
+		t := liveProgressAtNil.Time
+		mapping.LiveProgressCheckedAt = &t
 	}
 	return mapping, nil
 }

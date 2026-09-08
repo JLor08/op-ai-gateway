@@ -173,6 +173,16 @@ func (s *usageScanner) scan(payload []byte, at time.Time) {
 // count" discipline the rest of the feature applies, aimed at *which* count is
 // authoritative.
 //
+// It also floors the generation window itself at minGatewayRateWindow (see
+// request_progress.go), for the same reason that constant exists there: a
+// window measured microseconds after the first content frame divides an exact
+// count by ~0 and yields an implausible rate. On the live column that would be
+// a one-poll display glitch that self-corrects; here it is worse, because
+// usage() feeds UpdateMappingOpportunisticMetrics's gen_tokens_per_second
+// EWMA -- a ROUTING input the scorer and a model group's MinTokensPerSecond
+// gate read -- so an implausible sample would not self-correct, it would be
+// permanently blended into a number that steers request routing.
+//
 // The Responses shape deliberately does NOT get this fallback: llama.cpp
 // attaches no timings to the Anthropic shape at all, which is the only reason
 // Anthropic needs a derived rate here. An absent Responses `timings` object is
@@ -185,8 +195,8 @@ func (s *usageScanner) usage() inference.Usage {
 	finalizeTotalTokens(&u)
 	if s.apiFlavor == "anthropic_messages" && u.TokensPerSecond == 0 && u.OutputTokens > 0 &&
 		s.haveFirstContent && s.haveTerminalUsage {
-		if genSecs := s.lastAt.Sub(s.firstContentAt).Seconds(); genSecs > 0 {
-			u.TokensPerSecond = float64(u.OutputTokens) / genSecs
+		if window := s.lastAt.Sub(s.firstContentAt); window >= minGatewayRateWindow {
+			u.TokensPerSecond = float64(u.OutputTokens) / window.Seconds()
 		}
 	}
 	return u

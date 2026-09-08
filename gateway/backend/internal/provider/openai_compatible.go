@@ -433,7 +433,8 @@ func schemaRejectionStatus(status int) bool {
 //
 // The two live-progress parameters are ADVISORY: no live figure may fail, delay or
 // alter a request. So a schema rejection is made a NON-EVENT rather than predicted
-// -- the allow-list in live_progress.go is only a performance hint -- and an
+// -- the shape clause of live_progress.go's three-layer rule is only a
+// performance hint -- and an
 // upstream that refuses them is re-asked once without them. The retry is invisible
 // to the client because all three of its guards must hold:
 //
@@ -458,8 +459,9 @@ func schemaRejectionStatus(status int) bool {
 // retry leaves the failed attempt's frames ahead of the served ones, which is a
 // faithful record of what the gateway did.
 func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit StreamEmit) error {
-	// Guard (1): on the allow-list AND not already known to reject the parameters.
-	// An empty memo means "send them" (live_progress.go).
+	// Guard (1): wantsLiveProgress's three-layer rule says yes (a persisted
+	// verdict, else the shape clause) AND this route is not already known to
+	// reject the parameters. An empty memo means "send them" (live_progress.go).
 	liveProgress := wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)
 	// Guard (3): flipped by the wrapper below on the first emit that RETURNED nil,
 	// i.e. the first event the client may already have seen.

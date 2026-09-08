@@ -5,9 +5,11 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"strings"
 	"testing"
 	"time"
 )
@@ -192,5 +194,84 @@ func TestModelServersHiddenLockedSuppression(t *testing.T) {
 	}
 	if len(rowsLockedAdmin) != 1 {
 		t.Fatalf("ModelServers(admin, locked-model) = %+v, want 1 row (admin bypass, unfiltered)", rowsLockedAdmin)
+	}
+}
+
+// TestModelServersLiveProgressSupportPersisted: LiveProgressSupport/
+// LiveProgressCheckedAt are read straight off the PERSISTED mapping field (via
+// routing.Store.UpdateMappingLiveProgressSupport), exactly like ContextSize --
+// NOT left zero/empty for a gateway-layer injection pass the way
+// State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe are. One row per
+// verdict, including the "never determined" default (no write at all), so a
+// dropped fill in ModelServers (leaving the DTO field at its Go zero value)
+// cannot coincidentally satisfy this: the seeded "" row must ALSO carry a nil
+// CheckedAt, which only holds if the fill genuinely reads the mapping rather
+// than defaulting.
+func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
+	seedOffering(t, routeStore, now, "srv-supported", "app-supported", "map-supported", "shared", "up-supported", 0)
+	seedOffering(t, routeStore, now, "srv-unsupported", "app-unsupported", "map-unsupported", "shared", "up-unsupported", 0)
+	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
+
+	checkedAt := now.Add(-time.Hour)
+	if err := routeStore.UpdateMappingLiveProgressSupport(context.Background(), "map-supported", "supported", checkedAt); err != nil {
+		t.Fatalf("UpdateMappingLiveProgressSupport(supported): %v", err)
+	}
+	if err := routeStore.UpdateMappingLiveProgressSupport(context.Background(), "map-unsupported", "unsupported", checkedAt); err != nil {
+		t.Fatalf("UpdateMappingLiveProgressSupport(unsupported): %v", err)
+	}
+	// map-unknown gets no call at all: "never determined" is the mapping's
+	// untouched zero value, not a call with an empty string.
+
+	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
+	if err != nil {
+		t.Fatalf("ModelServers: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("len(rows) = %d, want 3 (%+v)", len(rows), rows)
+	}
+	byServer := map[string]ModelServerDTO{}
+	for _, r := range rows {
+		byServer[r.ServerID] = r
+	}
+
+	supported := byServer["srv-supported"]
+	if supported.LiveProgressSupport != "supported" {
+		t.Fatalf("supported row LiveProgressSupport = %q, want \"supported\"", supported.LiveProgressSupport)
+	}
+	if supported.LiveProgressCheckedAt == nil || !supported.LiveProgressCheckedAt.Equal(checkedAt) {
+		t.Fatalf("supported row LiveProgressCheckedAt = %v, want %v", supported.LiveProgressCheckedAt, checkedAt)
+	}
+
+	unsupported := byServer["srv-unsupported"]
+	if unsupported.LiveProgressSupport != "unsupported" {
+		t.Fatalf("unsupported row LiveProgressSupport = %q, want \"unsupported\"", unsupported.LiveProgressSupport)
+	}
+	if unsupported.LiveProgressCheckedAt == nil || !unsupported.LiveProgressCheckedAt.Equal(checkedAt) {
+		t.Fatalf("unsupported row LiveProgressCheckedAt = %v, want %v", unsupported.LiveProgressCheckedAt, checkedAt)
+	}
+
+	unknown := byServer["srv-unknown"]
+	if unknown.LiveProgressSupport != "" {
+		t.Fatalf("never-determined row LiveProgressSupport = %q, want \"\"", unknown.LiveProgressSupport)
+	}
+	if unknown.LiveProgressCheckedAt != nil {
+		t.Fatalf("never-determined row LiveProgressCheckedAt = %v, want nil", unknown.LiveProgressCheckedAt)
+	}
+
+	// The wire encoding of "never determined" must carry the key with an
+	// explicit "" value, not omit it (no `omitempty` on live_progress_support) --
+	// a missing key is indistinguishable from a client that doesn't know the
+	// field yet, which is exactly the ambiguity this feature exists to remove.
+	blob, err := json.Marshal(unknown)
+	if err != nil {
+		t.Fatalf("json.Marshal(unknown): %v", err)
+	}
+	if !strings.Contains(string(blob), `"live_progress_support":""`) {
+		t.Fatalf("wire JSON = %s, want an explicit \"live_progress_support\":\"\"", blob)
+	}
+	if strings.Contains(string(blob), `"live_progress_checked_at"`) {
+		t.Fatalf("wire JSON = %s, want live_progress_checked_at OMITTED when nil", blob)
 	}
 }

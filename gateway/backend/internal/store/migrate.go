@@ -106,6 +106,7 @@ var migrations = []migration{
 	{version: 73, name: "runtime_spec_gpu_position_and_visible_devices_mode", up: migration73Up},
 	{version: 74, name: "runtime_spec_api_token", up: migration74Up},
 	{version: 75, name: "runtime_spec_type_probe", up: migration75Up},
+	{version: 76, name: "model_mappings_live_progress_support", up: migration76Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3277,6 +3278,30 @@ func migration75Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs",
 		"context_probe_path text not null default ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migration76Up adds model_mappings.live_progress_support +
+// live_progress_checked_at (live-progress capability detection, #51).
+// live_progress_support defaults to "" (never determined), the same
+// zero-value-means-unknown convention as vision_capable (migration32Up).
+// live_progress_checked_at is nullable (dl.timestampType, no default),
+// mirroring migration9Up's metrics_updated_at. Append-only like
+// migration75Up.
+//
+// These two columns are deliberately NOT part of the metrics_locked group
+// this table otherwise guards every automated writer with: see
+// SQLiteStore.UpdateMappingLiveProgressSupport for why -- a build capability
+// is not a metric an operator pins numbers against.
+func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "model_mappings",
+		"live_progress_support text not null default ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "model_mappings",
+		"live_progress_checked_at "+dl.timestampType()); err != nil {
 		return err
 	}
 	return nil

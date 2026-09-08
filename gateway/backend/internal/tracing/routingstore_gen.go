@@ -1252,6 +1252,18 @@ func (_d *RoutingStoreWithTracing) UpdateMappingEnergyEWMA(ctx context.Context, 
 	return _d.Store.UpdateMappingEnergyEWMA(ctx, id, sampleWhPerToken, alpha, at)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateMappingLiveProgressSupport(ctx context.Context, id string, support string, at time.Time) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateMappingLiveProgressSupport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateMappingLiveProgressSupport(ctx, id, support, at)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateMappingOpportunisticMetrics(ctx context.Context, id string, genSample float64, promptSample float64, alpha float64, at time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateMappingOpportunisticMetrics")
 	defer span.End()

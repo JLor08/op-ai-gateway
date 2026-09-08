@@ -28,6 +28,16 @@ func TestParseModelInfoProps(t *testing.T) {
 		{"dgs not an object -> falls through", `{"model":"m","default_generation_settings":"nope"}`, []ModelInfo{{Name: "m", ContextSize: 0}}},
 		{"negative n_ctx -> 0", `{"model":"m","default_generation_settings":{"n_ctx":-5}}`, []ModelInfo{{Name: "m", ContextSize: 0}}},
 		{"top-level array -> empty", `[1,2,3]`, nil},
+		{
+			"parseModelInfo plumbs the live-progress verdict onto the returned entry (supported)",
+			`{"model":"m","default_generation_settings":{"n_ctx":100,"params":{"timings_per_token":false}}}`,
+			[]ModelInfo{{Name: "m", ContextSize: 100, LiveProgressSupport: "supported"}},
+		},
+		{
+			"parseModelInfo plumbs the live-progress verdict onto the returned entry (unsupported)",
+			`{"model":"m","default_generation_settings":{"n_ctx":100,"params":{"n_predict":-1}}}`,
+			[]ModelInfo{{Name: "m", ContextSize: 100, LiveProgressSupport: "unsupported"}},
+		},
 	}
 	for _, tc := range cases {
 		got := parseModelInfo([]byte(tc.body))
@@ -39,6 +49,170 @@ func TestParseModelInfoProps(t *testing.T) {
 				t.Fatalf("%s: got %+v, want %+v", tc.name, got[i], tc.want[i])
 			}
 		}
+	}
+}
+
+// TestParseModelInfoNamelessBodyStillCarriesTheVerdict is final-review F5: a
+// /props document that carries the capability evidence but NO model/model_path
+// used to be dropped whole (parseModelInfo returned nil the moment no name was
+// found), so a real verdict was discarded even though the evidence rule needs
+// no name at all -- a capability belongs to the server BUILD, a context size to
+// a MODEL. The agent-side half never had this coupling; it hands the raw body
+// straight to the detector.
+//
+// The nameless entry must carry NO context size even though this body reports
+// an n_ctx of 4096: an unnamed size cannot be attributed, and letting it through
+// would weaken exactly the name matching that context attribution needs. Both
+// facts are asserted numerically/exactly rather than through a "non-empty"
+// check, and the two Pick* consumers are exercised on the same slice so the
+// split is proven where it is actually read.
+func TestParseModelInfoNamelessBodyStillCarriesTheVerdict(t *testing.T) {
+	const nameless = `{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`
+
+	got := parseModelInfo([]byte(nameless))
+	if len(got) != 1 {
+		t.Fatalf("parseModelInfo returned %d entries, want exactly 1 -- a nameless body still proves the build's capability", len(got))
+	}
+	if got[0].LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q", got[0].LiveProgressSupport, "supported")
+	}
+	if got[0].Name != "" {
+		t.Fatalf("Name = %q, want %q (the body carries no model/model_path)", got[0].Name, "")
+	}
+	if got[0].ContextSize != 0 {
+		t.Fatalf("ContextSize = %d, want 0 -- an unnamed context size must never be reported, or it lands on whatever model was probed", got[0].ContextSize)
+	}
+
+	// The consumers: the verdict reaches a per-model pick through the
+	// first-non-empty fallback, while the context pick still finds nothing.
+	if v := PickModelLiveProgressSupport(got, "some-model"); v != "supported" {
+		t.Fatalf("PickModelLiveProgressSupport = %q, want %q", v, "supported")
+	}
+	if n := PickModelContextSize(got, "some-model"); n != 0 {
+		t.Fatalf("PickModelContextSize = %d, want 0", n)
+	}
+
+	// No name AND no verdict is still nil: this widening reports a nameless
+	// entry only when there is something to report.
+	if got := parseModelInfo([]byte(`{"default_generation_settings":{"n_ctx":4096}}`)); got != nil {
+		t.Fatalf("parseModelInfo(no name, no verdict) = %+v, want nil", got)
+	}
+}
+
+// TestParseModelInfoLiveProgressSupport is the decision-rule test for #51: it
+// pins detectLiveProgressSupport's exact supported/unsupported/unknown
+// boundary, which is the single most important behavior in this feature.
+//
+// The case named "vLLM ... must NEVER be read as unsupported" is the
+// load-bearing one. A vLLM application's context probe fetches /v1/models,
+// not /props -- an entirely different schema that was never asked about
+// timings_per_token. The naive simplification ("answered without the key ->
+// unsupported") would mark every such body unsupported, and Task 3's decision
+// rule would then silently stop sending the live-progress parameters to a
+// live, working vLLM application. If this case ever starts asserting
+// "unsupported", that regression has landed -- do not "fix" this test to
+// match; fix detectLiveProgressSupport instead.
+func TestParseModelInfoLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"llama.cpp /props WITH the key -> supported (never inspect the value, which is always false)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false,"n_predict":-1}}}`,
+			"supported",
+		},
+		{
+			"llama.cpp /props WITHOUT the key -> unsupported, a real verdict (an older build)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"unsupported",
+		},
+		{
+			"a vLLM /v1/models body must NEVER be read as unsupported -- it is a different schema, not an older llama.cpp",
+			`{"object":"list","data":[{"id":"facebook/opt-125m","object":"model","owned_by":"vllm","max_model_len":2048}]}`,
+			"",
+		},
+		{
+			"an Ollama /api/show body -> unknown, not unsupported",
+			`{"model_info":{"general.architecture":"llama"},"parameters":"num_ctx 4096","template":"{{ .Prompt }}"}`,
+			"",
+		},
+		{
+			"a /props-shaped body with default_generation_settings but no params object at all -> unknown",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096}}`,
+			"",
+		},
+		{
+			"unparseable bytes -> unknown",
+			`not json`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy /props (issue #55) -> unknown, NEVER a verdict: it is the router's own build, not the one serving this model",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy that WOULD have read as supported is also unknown -- the role gate precedes the params rule",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"",
+		},
+		{
+			"default_generation_settings present but NOT an object -> unknown (the type assertion fails)",
+			`{"model":"m","default_generation_settings":"unexpected"}`,
+			"",
+		},
+		{
+			"params present but null -> unknown, never unsupported (a null is not an empty params object)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":null}}`,
+			"",
+		},
+		{
+			"no model name at all, but the params object IS present -> a real verdict: the evidence rule needs no model name",
+			`{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"supported",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectLiveProgressSupport([]byte(tc.body)); got != tc.want {
+				t.Fatalf("detectLiveProgressSupport(%s) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPickModelLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name  string
+		infos []ModelInfo
+		model string
+		want  string
+	}{
+		{
+			"name-match wins even when a different info precedes",
+			[]ModelInfo{{Name: "other", LiveProgressSupport: "unsupported"}, {Name: "m", LiveProgressSupport: "supported"}},
+			"m", "supported",
+		},
+		{
+			"first-non-empty fallback when no name matches (a per-model probe reporting a divergent name)",
+			[]ModelInfo{{Name: "some-basename", LiveProgressSupport: "supported"}},
+			"m", "supported",
+		},
+		{
+			"skips unknown entries",
+			[]ModelInfo{{Name: "m", LiveProgressSupport: ""}, {Name: "x", LiveProgressSupport: "unsupported"}},
+			"m", "unsupported",
+		},
+		{"empty -> unknown", nil, "m", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PickModelLiveProgressSupport(tc.infos, tc.model); got != tc.want {
+				t.Fatalf("PickModelLiveProgressSupport(%+v, %q) = %q, want %q", tc.infos, tc.model, got, tc.want)
+			}
+		})
 	}
 }
 

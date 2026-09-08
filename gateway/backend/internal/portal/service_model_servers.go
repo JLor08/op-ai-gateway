@@ -53,6 +53,24 @@ type ModelServerDTO struct {
 	VisionCapable                bool       `json:"vision_capable"`
 	MetricsSource                string     `json:"metrics_source"`
 	MetricsUpdatedAt             *time.Time `json:"metrics_updated_at,omitempty"`
+
+	// LiveProgressSupport is the mapping's PERSISTED verdict on whether this
+	// upstream tolerates the live-progress two-parameter request (#51):
+	// "supported" / "unsupported" / "" (never determined) -- routing.
+	// ModelMapping.LiveProgressSupport, read straight off view.mapping exactly
+	// like ContextSize above. Unlike State/ActiveRequests/QueueDepth/
+	// MetricsProbe/ContextProbe (which Service.ModelServers leaves zero/empty
+	// for the gateway layer to inject from the runtime-status registry), this
+	// value is written directly to the mapping by the background detectors
+	// (routing.Store.UpdateMappingLiveProgressSupport), so it needs no
+	// gateway-injection seam -- Service.ModelServers fills it itself. No
+	// `omitempty`: "never determined" must be an explicit "" on the wire, not a
+	// missing key -- same rule the wire encoding of State already follows.
+	LiveProgressSupport string `json:"live_progress_support"`
+	// LiveProgressCheckedAt is when that verdict was last determined; nil when
+	// never determined. Diagnostic/tooltip only, mirroring ModelMapping.
+	// LiveProgressCheckedAt's own doc-comment -- no decision logic may read it.
+	LiveProgressCheckedAt *time.Time `json:"live_progress_checked_at,omitempty"`
 }
 
 // GroupModelServerDTO is one (model, server) a model group can serve, with the live
@@ -152,6 +170,8 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 			VisionCapable:                view.mapping.VisionCapable,
 			MetricsSource:                view.mapping.MetricsSource,
 			MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
+			LiveProgressSupport:          view.mapping.LiveProgressSupport,
+			LiveProgressCheckedAt:        view.mapping.LiveProgressCheckedAt,
 		})
 	}
 	rows, err = s.filterAllowedModelServerRows(ctx, principal, rows)

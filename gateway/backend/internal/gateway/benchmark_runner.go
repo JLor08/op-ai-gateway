@@ -112,9 +112,20 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 	if gotFirst {
 		ttft = firstAt.Sub(start)
 	}
+	// Floor the generation window at minGatewayRateWindow (request_progress.go), the
+	// same guard passthrough_usage_scan.go's Anthropic fallback uses, and for the
+	// same reason: a warm pass whose whole completion arrives microseconds after the
+	// first token divides an exact output-token count by a window of ~0 and yields an
+	// implausible rate. It is WORSE here than on either sibling site: measureMapping's
+	// result flows straight into UpdateMappingBenchmarkMetrics (below), which HARD
+	// OVERWRITES mapping.GenTokensPerSecond -- not the EWMA blend
+	// UpdateMappingOpportunisticMetrics applies to a live sample. There is no damping
+	// at all, so one implausible benchmark sample would replace the routing value the
+	// scorer and a model group's MinTokensPerSecond gate read outright, with nothing
+	// to average it back out.
 	if usage.TokensPerSecond == 0 && usage.OutputTokens > 0 && gotFirst {
-		if genSecs := end.Sub(firstAt).Seconds(); genSecs > 0 {
-			usage.TokensPerSecond = float64(usage.OutputTokens) / genSecs
+		if window := end.Sub(firstAt); window >= minGatewayRateWindow {
+			usage.TokensPerSecond = float64(usage.OutputTokens) / window.Seconds()
 		}
 	}
 	return ttft, usage, nil
@@ -145,6 +156,15 @@ func (s *Server) benchmarkSpecFor(ctx context.Context, app routing.Application, 
 // and capacity (measureMappingCapacity) paths so both hit an identical target/request.
 func benchmarkTargetReq(tgt benchmarkTarget) (routing.Target, inference.Request) {
 	apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
+	// LiveProgressSpecType mirrors routing.Resolver.targetFrom exactly: the
+	// resolved shape of the launch spec, and ONLY for a server_agent app --
+	// for anything else the field stays "" (wantsLiveProgress never reads it
+	// there, and a "custom" filled in from a zero spec would be a claim about
+	// a child that does not exist).
+	liveProgressSpecType := ""
+	if tgt.app.Type == routing.ProviderServerAgent {
+		liveProgressSpecType = string(routing.EffectiveRuntimeSpecType(tgt.spec))
+	}
 	target := routing.Target{
 		Provider:       tgt.app.Type,
 		Endpoint:       routing.ApplicationEndpoint(tgt.server, tgt.app),
@@ -153,6 +173,28 @@ func benchmarkTargetReq(tgt benchmarkTarget) (routing.Target, inference.Request)
 		Timeout:        time.Duration(tgt.app.TimeoutMS) * time.Millisecond,
 		APIToken:       apiToken,
 		APITokenHeader: apiTokenHeader,
+		// The live-progress decision inputs, for the same reason the live
+		// request path carries them (provider.wantsLiveProgress's three-layer
+		// rule) -- and they matter MORE here than on a live request. RouteID
+		// is deliberately "" on this path, and an empty RouteID is never
+		// memoized, so the rejection memo can NEVER suppress a repeat: a
+		// mapping already detected as "unsupported" would otherwise pay a 400
+		// plus a retry on every single one of these streams, forever. A
+		// capacity run is 4 levels x 16 concurrent = 64 streams per run.
+		// Setting them also restores the parameters for a server_agent child
+		// whose resolved spec type genuinely implies a tolerant upstream,
+		// which #51's provider-keyed allow-list sent and the three-layer rule
+		// otherwise dropped on this path.
+		//
+		// The measured throughput figure is unaffected either way:
+		// streamOnce reads usage only from the single StreamEventCompleted
+		// event, which carries the LAST usage-bearing chunk's cumulative
+		// numbers (the terminal one), and falls back to its own wall-clock
+		// floor when that reports no rate. These parameters only ADD
+		// mid-stream chunks, which streamOnce ignores entirely (they reach
+		// StreamProgress on delta events, not Usage).
+		LiveProgressSupport:  tgt.mapping.LiveProgressSupport,
+		LiveProgressSpecType: liveProgressSpecType,
 	}
 	p := benchmarkPrompts[0]
 	req := inference.Request{

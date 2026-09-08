@@ -204,6 +204,286 @@ func TestProbeContext_NilClientFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestDetectLiveProgressSupport is the decision-rule test for #51's
+// agent-side detector: it pins detectLiveProgressSupport's exact
+// supported/unsupported/unknown boundary. These cases are DELIBERATELY the
+// same as gateway/backend/internal/provider/model_info_test.go's
+// TestParseModelInfoLiveProgressSupport table, byte-for-byte where the shape
+// overlaps -- the two detectLiveProgressSupport copies (one per Go module)
+// must decide identically on identical input, and this shared table is what
+// makes a silent drift between them show up as a failing test on EITHER
+// side instead of going unnoticed.
+//
+// The vLLM and Ollama cases are the load-bearing ones: a vLLM app's context
+// probe fetches /v1/models, an entirely different schema that was never
+// asked about timings_per_token, so it must read as unknown ("") and NEVER
+// as "unsupported" -- the naive simplification ("answered without the key
+// -> unsupported") would silently drop live-progress support for every
+// working vLLM/Ollama upstream. If either of those two cases starts
+// asserting "unsupported", that regression has landed; fix
+// detectLiveProgressSupport, not this test.
+func TestDetectLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"llama.cpp /props WITH the key -> supported (never inspect the value, which is always false)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false,"n_predict":-1}}}`,
+			"supported",
+		},
+		{
+			"llama.cpp /props WITHOUT the key -> unsupported, a real verdict (an older build)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"unsupported",
+		},
+		{
+			"a vLLM /v1/models body must NEVER be read as unsupported -- it is a different schema, not an older llama.cpp",
+			`{"object":"list","data":[{"id":"facebook/opt-125m","object":"model","owned_by":"vllm","max_model_len":2048}]}`,
+			"",
+		},
+		{
+			"an Ollama /api/show body -> unknown, not unsupported",
+			`{"model_info":{"general.architecture":"llama"},"parameters":"num_ctx 4096","template":"{{ .Prompt }}"}`,
+			"",
+		},
+		{
+			"a /props-shaped body with default_generation_settings but no params object at all -> unknown",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096}}`,
+			"",
+		},
+		{
+			"unparseable bytes -> unknown",
+			`not json`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy /props (issue #55) -> unknown, NEVER a verdict: it is the router's own build, not the one serving this model",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy that WOULD have read as supported is also unknown -- the role gate precedes the params rule",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"",
+		},
+		{
+			"default_generation_settings present but NOT an object -> unknown (the type assertion fails)",
+			`{"model":"m","default_generation_settings":"unexpected"}`,
+			"",
+		},
+		{
+			"params present but null -> unknown, never unsupported (a null is not an empty params object)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":null}}`,
+			"",
+		},
+		{
+			"no model name at all, but the params object IS present -> a real verdict: the evidence rule needs no model name",
+			`{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"supported",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectLiveProgressSupport([]byte(tc.body)); got != tc.want {
+				t.Fatalf("detectLiveProgressSupport(%s) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this
+// probe GETs collector.LiveProgressProbePath ("/props") unconditionally,
+// with NO specType parameter at all -- unlike ProbeContext, it never
+// dispatches on the effective runtime type. A "custom"-typed child (the
+// type routing.DeriveProbePaths gives no context path to at all) still gets
+// probed here, and a body carrying the key still reports "supported". A real
+// verdict must also report stable == true: it is safe for the caller to
+// cache and never ask again for this pid.
+func TestProbeLiveProgressSupport_Supported(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`)
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "supported" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "supported")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a real verdict is always cacheable)")
+	}
+}
+
+// TestProbeLiveProgressSupport_Unsupported covers a real /props document
+// from an older llama.cpp build that never added the field. Also stable:
+// this is a real, unchanging verdict about this pid's build.
+func TestProbeLiveProgressSupport_Unsupported(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`)
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "unsupported" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "unsupported")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a real verdict is always cacheable)")
+	}
+}
+
+// TestProbeLiveProgressSupport_NotFound is the STABLE undetermined case: a
+// 404 conclusively says this route does not exist on this build, and that
+// cannot change while the process behind it keeps running. verdict stays ""
+// (never fabricate "unsupported" from a 404 -- an absent route is not the
+// same claim as "a real /props document without the field"), but stable
+// must be true so the caller stops asking.
+func TestProbeLiveProgressSupport_NotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer ts.Close()
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a 404", got, "")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a 404 is conclusive: cache it and stop asking)")
+	}
+}
+
+// TestProbeLiveProgressSupport_ConclusiveRefusals pins the OTHER conclusive
+// statuses beside the 404 above (final-review finding F1). 401/403 is the
+// supported `llama-server --api-key ${API_TOKEN}` shape: llama.cpp marks only
+// /health and /v1/health as public, so /props answers 401/403 for a probe
+// with no credential -- and the agent's probe HAS no credential
+// (runtime.Status carries no token, issue #58). 405 is the same class of
+// fixed, build-level fact as a 404: the route exists, but not for GET.
+//
+// None of the three can change while this pid lives, so all three MUST be
+// stable: treating them as transient re-GETs /props on every collect cycle
+// (1 s default, 250 ms floor) for the child's entire lifetime, plus one
+// slog.Debug line per attempt, forever. A 5xx stays transient -- it is
+// exactly the "child still warming up" case -- and is included here as the
+// control that proves the classifier still distinguishes the two.
+//
+// The verdict must stay "" in every row either way: a refusal is never
+// evidence about the build's request schema, only about its routing table.
+func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
+	cases := []struct {
+		status     int
+		wantStable bool
+		why        string
+	}{
+		{http.StatusUnauthorized, true, "401: /props is behind an api key this probe cannot supply -- fixed at exec time"},
+		{http.StatusForbidden, true, "403: same as 401, a credential decision fixed at exec time"},
+		{http.StatusMethodNotAllowed, true, "405: the route is not GETtable on this build -- as fixed as a 404"},
+		{http.StatusInternalServerError, false, "500: says nothing conclusive -- the child may still be starting up"},
+		{http.StatusServiceUnavailable, false, "503: same -- must be retried, never cached"},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				// A would-be "supported" document: if the status check were
+				// ever dropped, this body would parse to "supported" and the
+				// verdict assertion below would catch it.
+				_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+			}))
+			defer ts.Close()
+
+			got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+			if got != "" {
+				t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a %d", got, "", tc.status)
+			}
+			if stable != tc.wantStable {
+				t.Errorf("ProbeLiveProgressSupport stable = %v, want %v -- %s", stable, tc.wantStable, tc.why)
+			}
+		})
+	}
+}
+
+// TestProbeLiveProgressSupport_OtherShape mirrors the gateway side's vLLM
+// case at the HTTP-probe level (not just the parse-rule level covered by
+// TestDetectLiveProgressSupport above): a vLLM-shaped body served back for
+// this fixed "/props" GET must read as unknown, never "unsupported" -- but,
+// being a well-formed body, it IS a conclusive (stable) answer: this pid is
+// simply not a llama.cpp build.
+func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
+	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-/props shape", got, "")
+	}
+	if !stable {
+		t.Errorf("ProbeLiveProgressSupport stable = false, want true (a well-formed non-/props body is a conclusive answer)")
+	}
+}
+
+// TestProbeLiveProgressSupport_TransientStatus proves a non-404 non-2xx
+// status (a 503 here -- the upstream answered, but with a status that says
+// nothing conclusive about whether it's ever going to be a llama.cpp /props
+// document) is swallowed to verdict "" AND reported as stable == false, so
+// the caller retries instead of caching a possibly-temporary state. The
+// response body here is deliberately a WOULD-BE "supported" /props document:
+// if ProbeLiveProgressSupport ever stopped checking the status code
+// (fetchProbeBody's 2xx check is what this test pins), this exact body would
+// parse as "supported" instead of "" -- without that body shape, a broken
+// implementation that ignored the status entirely could still coincidentally
+// return "" (an empty/error body also parses to ""), which would let this
+// test pass without actually covering the status check.
+func TestProbeLiveProgressSupport_TransientStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+	}))
+	defer ts.Close()
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (a 503 is not conclusive -- the child may still be starting up)")
+	}
+}
+
+// TestProbeLiveProgressSupport_ConnectionRefused is the TRANSIENT case named
+// explicitly in the resource-usage fix: no HTTP response was ever received
+// at all, which is exactly the "child may still be warming up" scenario that
+// must be retried next cycle, never cached.
+func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	addr := ts.URL
+	ts.Close() // closed: nothing is listening on addr anymore
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), http.DefaultClient, addr)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a refused connection", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (a refused connection is transient -- retry, do not cache)")
+	}
+}
+
+// TestProbeLiveProgressSupport_UnparseableBody is the TRANSIENT
+// syntactically-invalid-JSON case: a truncated or garbled body reads the
+// same as "still mid-response", not a conclusive answer, so it must not be
+// cached either.
+func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":`) // truncated mid-object
+
+	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for unparseable JSON", got, "")
+	}
+	if stable {
+		t.Errorf("ProbeLiveProgressSupport stable = true, want false (invalid/truncated JSON is transient -- retry, do not cache)")
+	}
+}
+
 // TestSafeProbePath is the agent's defense-in-depth SSRF guard: only an empty
 // or single-"/"-rooted relative path with no scheme/authority/whitespace is
 // safe to append to the loopback base. The attack vectors (@userinfo, //

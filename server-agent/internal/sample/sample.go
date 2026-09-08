@@ -128,21 +128,30 @@ type RuntimeErrorSample struct {
 // nil, not an empty array, when nothing was measured this cycle -- e.g. no
 // measurer installed, or the spec is not yet running).
 type RuntimeSample struct {
-	SpecID         string              `json:"spec_id"`
-	Model          string              `json:"model"`
-	State          string              `json:"state"`
-	Since          time.Time           `json:"since"`
-	PID            int                 `json:"pid,omitempty"`
-	Port           int                 `json:"port,omitempty"`
-	InFlight       int                 `json:"in_flight"`
-	Restarts       int                 `json:"restarts"`
-	ContextSize    int                 `json:"context_size"`
-	ActiveRequests int                 `json:"active_requests"`
-	QueueDepth     int                 `json:"queue_depth"`
-	MetricsProbe   string              `json:"metrics_probe"`
-	ContextProbe   string              `json:"context_probe"`
-	GPUs           []RuntimeGPUSample  `json:"gpus,omitempty"`
-	LastError      *RuntimeErrorSample `json:"last_error,omitempty"`
+	SpecID         string    `json:"spec_id"`
+	Model          string    `json:"model"`
+	State          string    `json:"state"`
+	Since          time.Time `json:"since"`
+	PID            int       `json:"pid,omitempty"`
+	Port           int       `json:"port,omitempty"`
+	InFlight       int       `json:"in_flight"`
+	Restarts       int       `json:"restarts"`
+	ContextSize    int       `json:"context_size"`
+	ActiveRequests int       `json:"active_requests"`
+	QueueDepth     int       `json:"queue_depth"`
+	MetricsProbe   string    `json:"metrics_probe"`
+	ContextProbe   string    `json:"context_probe"`
+	// LiveProgressSupport is the live-progress-capability verdict (issue #51,
+	// task 4): "supported", "unsupported", or "" (unknown -- not yet
+	// determined, or the child's /props endpoint never yielded a llama.cpp
+	// /props document). Filled by the agent's probeRuntimeChildLiveProgress
+	// (internal/agent), independently of ContextProbe/ContextSize above -- a
+	// successful context probe never implies this was determined, and vice
+	// versa. Additive and byte-neutral: an older agent simply never
+	// populates it, and "" already means unknown to every consumer.
+	LiveProgressSupport string              `json:"live_progress_support"`
+	GPUs                []RuntimeGPUSample  `json:"gpus,omitempty"`
+	LastError           *RuntimeErrorSample `json:"last_error,omitempty"`
 }
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring

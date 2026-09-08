@@ -887,7 +887,11 @@ func TestCompleteStreamDoesNotRetryWhenTheParametersWereNotSent(t *testing.T) {
 // 400 does not: some OpenAI-compatible proxies (LiteLLM, OpenRouter -- reachable
 // behind a llama_swap `peer`) answer 200 and then report the refused body as an
 // SSE error EVENT. Nothing has been emitted at that point, so the same retry
-// applies.
+// applies. The target carries an observed "supported" verdict: a llama_swap
+// application's TYPE alone never implies a tolerant upstream (wantsLiveProgress's
+// shape clause deliberately excludes it — its child can be anything), so only a
+// prior positive detection lets this peer receive the parameters at all; the
+// retry mechanics under test are otherwise unrelated to that verdict.
 func TestCompleteStreamRetriesOnInStreamErrorBeforeFirstToken(t *testing.T) {
 	up := &liveProgressUpstream{}
 	server := up.serve(func(w http.ResponseWriter, _ int, body []byte) {
@@ -904,7 +908,7 @@ func TestCompleteStreamRetriesOnInStreamErrorBeforeFirstToken(t *testing.T) {
 	client := NewOpenAICompatibleClient(server.Client())
 	var text string
 	err := client.CompleteStream(context.Background(),
-		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaSwap, RouteID: "map_peer", ProviderModel: "m", Timeout: 5 * time.Second},
+		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaSwap, RouteID: "map_peer", ProviderModel: "m", Timeout: 5 * time.Second, LiveProgressSupport: "supported"},
 		streamTestRequest(),
 		func(ev inference.StreamEvent) error { text += ev.Text; return nil })
 	if err != nil {
@@ -951,8 +955,12 @@ func TestCompleteStreamDoesNotRetryAfterTheFirstEmit(t *testing.T) {
 // TestCompleteStreamMemoizesTheRejectionPerMapping proves the negative-only memo
 // does its job: a genuinely incompatible upstream costs ONE wasted round trip for
 // the mapping, not one per request. The second request skips the parameters
-// outright; a different mapping is unaffected (no positive verdict is cached
-// either way, so an empty memo still means "send them").
+// outright; a different mapping is unaffected (the memo entry is per-RouteID).
+// The target carries an observed "supported" verdict standing in for a wrong
+// positive prediction (a server_agent app's Provider alone never implies a
+// tolerant upstream; only its resolved spec type or a verdict like this one
+// does) — CompleteStream's in-process rejection memo is what corrects it after
+// the very first request, without ever touching the persisted verdict.
 func TestCompleteStreamMemoizesTheRejectionPerMapping(t *testing.T) {
 	up := &liveProgressUpstream{}
 	server := up.serve(func(w http.ResponseWriter, _ int, body []byte) {
@@ -966,7 +974,7 @@ func TestCompleteStreamMemoizesTheRejectionPerMapping(t *testing.T) {
 	defer server.Close()
 
 	client := NewOpenAICompatibleClient(server.Client())
-	target := routing.Target{Endpoint: server.URL, Provider: routing.ProviderServerAgent, RouteID: "map_custom", ProviderModel: "m", Timeout: 5 * time.Second}
+	target := routing.Target{Endpoint: server.URL, Provider: routing.ProviderServerAgent, RouteID: "map_custom", ProviderModel: "m", Timeout: 5 * time.Second, LiveProgressSupport: "supported"}
 	for i := range 3 {
 		if err := client.CompleteStream(context.Background(), target, streamTestRequest(), func(inference.StreamEvent) error { return nil }); err != nil {
 			t.Fatalf("CompleteStream #%d returned %v", i+1, err)

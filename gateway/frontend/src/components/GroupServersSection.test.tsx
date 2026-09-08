@@ -49,6 +49,11 @@ function makeRows(): GroupModelServerRow[] {
       is_mtp: false,
       metrics_source: 'benchmark',
       metrics_updated_at: '2026-08-01T10:00:00Z',
+      // Task 6 (timings-capability-detection): ModelServerRow gained this
+      // required (persisted, not probe-gated) field; GroupServersSection
+      // itself has no column for it, so '' (never determined) is a fine
+      // minimal default for this fixture.
+      live_progress_support: '',
       priority: 1,
     },
     {
@@ -74,6 +79,7 @@ function makeRows(): GroupModelServerRow[] {
       is_mtp: false,
       metrics_source: 'manual',
       metrics_updated_at: null,
+      live_progress_support: '',
       priority: 2,
     },
   ];

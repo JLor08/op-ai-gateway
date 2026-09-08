@@ -158,21 +158,31 @@ type agentRuntimeError struct {
 // agent, so there is no ambiguity about which mapping/model this entry
 // describes even when the agent has not (yet) resolved Model.
 type agentRuntimeSample struct {
-	SpecID         string                  `json:"spec_id"`
-	Model          string                  `json:"model"`
-	State          string                  `json:"state"`
-	Since          time.Time               `json:"since"`
-	PID            int                     `json:"pid,omitempty"`
-	Port           int                     `json:"port,omitempty"`
-	InFlight       int                     `json:"in_flight"`
-	Restarts       int                     `json:"restarts"`
-	ContextSize    int                     `json:"context_size"`
-	ActiveRequests int                     `json:"active_requests"`
-	QueueDepth     int                     `json:"queue_depth"`
-	MetricsProbe   string                  `json:"metrics_probe"`
-	ContextProbe   string                  `json:"context_probe"`
-	GPUs           []agentRuntimeGPUSample `json:"gpus,omitempty"`
-	LastError      *agentRuntimeError      `json:"last_error,omitempty"`
+	SpecID         string    `json:"spec_id"`
+	Model          string    `json:"model"`
+	State          string    `json:"state"`
+	Since          time.Time `json:"since"`
+	PID            int       `json:"pid,omitempty"`
+	Port           int       `json:"port,omitempty"`
+	InFlight       int       `json:"in_flight"`
+	Restarts       int       `json:"restarts"`
+	ContextSize    int       `json:"context_size"`
+	ActiveRequests int       `json:"active_requests"`
+	QueueDepth     int       `json:"queue_depth"`
+	MetricsProbe   string    `json:"metrics_probe"`
+	ContextProbe   string    `json:"context_probe"`
+	// LiveProgressSupport is this child's build's verdict on the live-progress
+	// request parameters (issue #51 / timings-capability-detection Task 4):
+	// "" (never determined -- an older agent that predates this field, or a
+	// probe that has not yet reached a stable answer), "supported", or
+	// "unsupported". Produced by the SAME probeRuntimeChild pass that fills
+	// ContextSize/ContextProbe above (server-agent's
+	// probeRuntimeChildLiveProgress), so it is additive and byte-neutral for
+	// an older agent: the field is simply absent, decoding to "". See
+	// writeBackRuntimeLiveProgress for the gateway-side write-back.
+	LiveProgressSupport string                  `json:"live_progress_support"`
+	GPUs                []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError           *agentRuntimeError      `json:"last_error,omitempty"`
 }
 
 // maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
@@ -243,19 +253,20 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 	out := make([]RuntimeStatusDTO, 0, len(samples))
 	for _, rt := range samples {
 		dto := RuntimeStatusDTO{
-			SpecID:         rt.SpecID,
-			Model:          rt.Model,
-			State:          rt.State,
-			Since:          rt.Since,
-			PID:            rt.PID,
-			Port:           rt.Port,
-			InFlight:       rt.InFlight,
-			Restarts:       rt.Restarts,
-			ContextSize:    rt.ContextSize,
-			ActiveRequests: rt.ActiveRequests,
-			QueueDepth:     rt.QueueDepth,
-			MetricsProbe:   rt.MetricsProbe,
-			ContextProbe:   rt.ContextProbe,
+			SpecID:              rt.SpecID,
+			Model:               rt.Model,
+			State:               rt.State,
+			Since:               rt.Since,
+			PID:                 rt.PID,
+			Port:                rt.Port,
+			InFlight:            rt.InFlight,
+			Restarts:            rt.Restarts,
+			ContextSize:         rt.ContextSize,
+			ActiveRequests:      rt.ActiveRequests,
+			QueueDepth:          rt.QueueDepth,
+			MetricsProbe:        rt.MetricsProbe,
+			ContextProbe:        rt.ContextProbe,
+			LiveProgressSupport: rt.LiveProgressSupport,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.
@@ -648,6 +659,158 @@ func (s *Server) writeBackRuntimeContext(ctx context.Context, serverID string, r
 	}
 }
 
+// resolveRuntimeSpecLiveProgress reports whether specID's owning mapping may
+// have its live-progress-support CAPABILITY written back for THIS sample,
+// reached from server serverID -- the capability write-back's sibling to
+// resolveRuntimeSpecMapping above, resolving the SAME ownership chain
+// (RuntimeSpecByID -> MappingByID -> ApplicationByID -> application.ServerID)
+// for the SAME reason: spec_id is an agent-supplied body field with no other
+// verification anywhere in this path, and an agent authenticated for server A
+// must never be able to name a spec_id belonging to server B and overwrite
+// B's mapping capability verdict.
+//
+// Deliberately does NOT check mapping.MetricsLocked, unlike
+// resolveRuntimeSpecMapping. UpdateMappingLiveProgressSupport (Task 1) itself
+// carries no metrics_locked guard in its SQL -- see that method's doc comment
+// -- because a build capability is not a metric an operator pins numbers
+// against: an operator who locks a mapping's throughput/context figures is
+// answering for THOSE NUMBERS, not vouching for what the upstream binary's
+// request schema accepts. Adding an in-Go pre-check here would silently
+// re-impose the exact guard the writer's own design deliberately omits, and
+// would leave a locked mapping's live-progress capability permanently
+// undiscoverable -- the same reasoning app_health.go's own
+// UpdateMappingLiveProgressSupport call sites already document for the
+// HTTP-probe path; this is its per-runtime-sample sibling.
+//
+// On success returns the mapping id and its CURRENTLY STORED
+// LiveProgressSupport verdict (for the caller's change-detection), true. Any
+// failure to resolve -- a lookup error, a spec/mapping/application that no
+// longer exists, or a cross-server mismatch -- returns ("", "", false); a
+// cross-server mismatch is logged at Warn (not Debug), matching
+// resolveRuntimeSpecMapping's audit-trail discipline for the same reason: an
+// agent naming another server's resources is a signal worth keeping, not a
+// merely stale id.
+func (s *Server) resolveRuntimeSpecLiveProgress(ctx context.Context, serverID, specID string) (mappingID string, storedSupport string, ok bool) {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime capability write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return "", "", false
+	}
+	if !ok {
+		// The spec has since been deleted (or never existed); nothing to
+		// write the reported capability back to. Not an error.
+		return "", "", false
+	}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		slog.Debug("runtime capability write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return "", "", false
+	}
+	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		slog.Debug("runtime capability write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return "", "", false
+	}
+	if app.ServerID != serverID {
+		slog.Warn("capability write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return "", "", false
+	}
+	return mapping.ID, mapping.LiveProgressSupport, true
+}
+
+// writeBackRuntimeLiveProgress writes each sample runtime's live-progress-
+// support verdict back onto its owning mapping's live_progress_support column
+// (timings-capability-detection Task 5, the gateway-side half of issue #51's
+// agent-reported detection: Task 4 made server-agent report, per managed
+// child, whether that child's build tolerates the live-progress request
+// parameters, in sample.RuntimeSample.LiveProgressSupport).
+//
+// Mirrors writeBackRuntimeContext's discipline throughout: runtimes is
+// length-capped at maxRuntimeSamplesPerSample before any store call;
+// resolution (resolveRuntimeSpecLiveProgress) is memoized per DISTINCT
+// spec_id, so a sample repeating the same spec_id -- a full snapshot arrives
+// roughly once a second -- never re-resolves it; and AN UNCHANGED VALUE IS
+// NOT REWRITTEN, comparing against the mapping's CURRENTLY STORED
+// LiveProgressSupport (read once per distinct writable spec_id, memoized
+// alongside the resolution) rather than against whatever this same spec_id
+// reported last sample. That comparison matters MORE here than for context:
+// a build capability is stable by nature -- the SAME child build reports the
+// SAME verdict every single second for its whole life -- so without it every
+// telemetry sample from every managed process would drive one unconditional
+// UPDATE per second per mapping, forever, for a value that can never change
+// short of an operator swapping the upstream binary.
+//
+// Two deliberate differences from writeBackRuntimeContext, each earning its
+// own call site above:
+//
+//  1. NO metrics_locked check, in either direction: resolveRuntimeSpecLiveProgress
+//     performs none of the in-Go pre-check resolveRuntimeSpecMapping does at
+//     its own call site, and UpdateMappingLiveProgressSupport's SQL carries
+//     no such guard either. A locked mapping's capability still gets
+//     updated -- this is the design's central decision (see
+//     resolveRuntimeSpecLiveProgress's doc), not an oversight to fix later.
+//  2. An empty ("") sample SKIPS THE WRITE ENTIRELY: an older agent that
+//     predates this field, or a child whose build this agent has not yet
+//     reached a stable verdict for, reports "" -- and unknown must never
+//     overwrite a stored verdict. This is never a "clear", only ever a
+//     "nothing to say yet".
+//
+// Best-effort throughout, matching the "a report is evidence, not a
+// transaction" ingest discipline this whole file follows: nothing here is
+// ever returned as an error -- this must NEVER reject the telemetry sample it
+// rode in on. Called only AFTER every store write in ingestTelemetrySample
+// has succeeded, mirroring writeBackRuntimeContext's own placement, and only
+// when the reporting agent declares runtimeModelProbeFeature for THIS
+// sample -- the verdict rides on the exact same per-runtime probe pass
+// (server-agent's probeRuntimeChild) that produces ContextSize, so it shares
+// that pass's trust boundary: an agent that has never declared
+// runtime_model_probe must never have a mapping's stored capability touched
+// from this path either.
+func (s *Server) writeBackRuntimeLiveProgress(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	now := time.Now().UTC()
+	type resolution struct {
+		mappingID     string
+		storedSupport string
+		ok            bool
+	}
+	resolved := make(map[string]resolution, len(runtimes))
+	for _, rt := range runtimes {
+		specID := strings.TrimSpace(rt.SpecID)
+		support := strings.TrimSpace(rt.LiveProgressSupport)
+		if specID == "" || support == "" {
+			// An unknown/undetermined verdict must never overwrite a stored
+			// one -- see the doc above. Not a "clear"; simply nothing to say.
+			continue
+		}
+		r, seen := resolved[specID]
+		if !seen {
+			mappingID, storedSupport, ok := s.resolveRuntimeSpecLiveProgress(ctx, serverID, specID)
+			r = resolution{mappingID: mappingID, storedSupport: storedSupport, ok: ok}
+			resolved[specID] = r
+		}
+		if !r.ok {
+			continue
+		}
+		if r.storedSupport == support {
+			continue // already on file, no write amplification
+		}
+		if err := s.Routes.UpdateMappingLiveProgressSupport(ctx, r.mappingID, support, now); err != nil {
+			slog.Debug("runtime capability write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
+			continue
+		}
+		// Keep the memo truthful for the rest of THIS sample: a malformed
+		// payload naming the same spec_id twice must not write twice.
+		r.storedSupport = support
+		resolved[specID] = r
+	}
+}
+
 // ProxyRouteSample is the gateway-side mirror of the agent's
 // sample.ProxyRouteSample wire type — no certificate material and no upstream
 // address, just the listen port, whether TLS is currently active on it, and
@@ -994,6 +1157,18 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// logged and dropped.
 	if slices.Contains(caps, runtimeModelProbeFeature) {
 		s.writeBackRuntimeContext(ctx, serverID, req.Runtimes)
+		// Best-effort write-back of each managed process's reported
+		// live-progress-support CAPABILITY verdict onto its owning mapping
+		// (timings-capability-detection Task 5) -- see
+		// writeBackRuntimeLiveProgress. Same gate as writeBackRuntimeContext
+		// immediately above and for the same reason: the verdict rides on the
+		// SAME per-runtime probe pass that produces context_size, so it
+		// shares that pass's trust boundary. UNLIKE the context write-back,
+		// this one is NOT metrics_locked-gated -- see
+		// writeBackRuntimeLiveProgress's doc for why a capability is not a
+		// metric. Never rejects the sample; a failure here is logged and
+		// dropped.
+		s.writeBackRuntimeLiveProgress(ctx, serverID, req.Runtimes)
 	}
 	s.maybeFireReactivation(ctx, server)
 	return nil
