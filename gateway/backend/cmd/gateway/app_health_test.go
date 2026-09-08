@@ -738,6 +738,180 @@ func TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCyc
 	}
 }
 
+// fakeAgentBundle satisfies agentRegistryBundle for feature-gate tests:
+// ReportingWithin/Retain are inert, HasFeature answers from a static map.
+type fakeAgentBundle struct{ features map[string][]string }
+
+func (f fakeAgentBundle) ReportingWithin(string, time.Duration) bool { return false }
+func (f fakeAgentBundle) Retain(map[string]struct{})                 {}
+func (f fakeAgentBundle) HasFeature(serverID, feature string) bool {
+	for _, name := range f.features[serverID] {
+		if name == feature {
+			return true
+		}
+	}
+	return false
+}
+
+// presenceBundle adapts a bare *gateway.AgentPresenceRegistry -- the shape
+// every pre-existing `agents:` field below already constructs, predating
+// HasFeature -- to the (now three-method) agentRegistryBundle:
+// ReportingWithin/Retain promote unchanged from the embedded registry, and
+// HasFeature is unconditionally false, the same fail-closed default a
+// production agentRegistries with no agentFeatures registry wired already
+// returns (see agentRegistries.HasFeature above).
+type presenceBundle struct{ *gateway.AgentPresenceRegistry }
+
+func (presenceBundle) HasFeature(string, string) bool { return false }
+
+// serverAgentApp builds an active server_agent-typed app with an empty
+// ContextProbePath, so the implicit-default-gate tests below start from the
+// exact shape the gate is meant to recognize.
+func serverAgentApp(id, serverID string, port int) routing.Application {
+	app := activeApp(id, serverID, port)
+	app.Type = routing.ProviderServerAgent
+	return app
+}
+
+// TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping
+// proves the issue #58 implicit default: a server_agent application with no
+// operator-set ContextProbePath, whose agent declared
+// runtimeUpstreamPropsFeature, gets probed at serverAgentPropsProbePath
+// (/upstream/{model}/props) per loaded mapping -- exactly like an explicit
+// {model}-template ContextProbePath would. A second, otherwise-identical
+// cycle must not re-issue the live-progress write (the same no-rewrite
+// property TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAn-
+// IdenticalCycle proves for the explicit-path case above).
+func TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping(t *testing.T) {
+	shrinkRetryGap(t)
+	app := serverAgentApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/up/props"] = []provider.ModelInfo{{Name: "up", LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"up"}) // "up" is loaded
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !prober.probedPath("/upstream/up/props") {
+		t.Fatalf("expected the server_agent implicit default path /upstream/up/props to be probed")
+	}
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times after the first cycle, want 1", n)
+	}
+
+	// A second cycle with a fresh cadence state (as if the next tick's interval
+	// had elapsed) reports the SAME verdict -- it must not be rewritten.
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
+	}
+}
+
+// TestRunAppHealthOnceServerAgentWithoutFeatureNeverProbes proves the
+// fail-closed half of the gate: a server_agent application with an empty
+// ContextProbePath gets NO implicit probe at all -- neither when the agent
+// bundle has positive evidence the server did NOT declare the feature (an
+// empty features map) nor when there is no bundle at all (nil, the shape
+// every test above this one in the file already passes). Without this gate
+// an agent lacking the runtime router's /upstream/{model}/props route would
+// be probed anyway and answer 404 runtime.model_not_managed forever.
+func TestRunAppHealthOnceServerAgentWithoutFeatureNeverProbes(t *testing.T) {
+	cases := []struct {
+		name   string
+		agents agentRegistryBundle
+	}{
+		{"feature not declared", fakeAgentBundle{features: map[string][]string{}}},
+		{"nil bundle", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkRetryGap(t)
+			app := serverAgentApp("a1", "s1", 8001)
+			st := newHealthTestStore(app)
+			st.mappings = map[string][]routing.ModelMapping{
+				"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+			}
+			prober := newFakeProber()
+			prober.modelInfoByPath["/upstream/up/props"] = []provider.ModelInfo{{Name: "up", LiveProgressSupport: "supported"}}
+			reg := gateway.NewAppHealthRegistry(nil)
+			loaded := gateway.NewLoadedModelRegistry()
+			loaded.SetGatewayProbe("a1", []string{"up"})
+
+			(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: tc.agents, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+			if n := prober.ctxProbeCallCount(); n != 0 {
+				t.Fatalf("ProbeModelInfo called %d times without the declared feature, want 0", n)
+			}
+			if n := st.liveProgressSetCount(); n != 0 {
+				t.Fatalf("UpdateMappingLiveProgressSupport called %d times without the declared feature, want 0", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceServerAgentOperatorPathWins proves an operator-set
+// ContextProbePath always wins over the implicit server_agent default, even
+// when the agent declared the feature: the operator's path is probed, and
+// the implicit default path is never touched.
+func TestRunAppHealthOnceServerAgentOperatorPathWins(t *testing.T) {
+	shrinkRetryGap(t)
+	app := serverAgentApp("a1", "s1", 8001)
+	app.ContextProbePath = "/custom/{model}/info"
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/custom/up/info"] = []provider.ModelInfo{{Name: "up", LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"up"})
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !prober.probedPath("/custom/up/info") {
+		t.Fatalf("expected the operator-set path /custom/up/info to be probed")
+	}
+	if prober.probedPath("/upstream/up/props") {
+		t.Fatalf("the operator-set ContextProbePath must win -- the implicit default must never be probed")
+	}
+}
+
+// TestRunAppHealthOnceNonServerAgentNeverGetsImplicitPath proves the implicit
+// default is type-gated, not feature-only: a llama_swap-typed app with an
+// empty ContextProbePath gets no implicit probe even when the feature is
+// (nonsensically) declared for its server.
+func TestRunAppHealthOnceNonServerAgentNeverGetsImplicitPath(t *testing.T) {
+	shrinkRetryGap(t)
+	app := activeApp("a1", "s1", 8001)
+	app.Type = routing.ProviderLlamaSwap
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/up/props"] = []provider.ModelInfo{{Name: "up", LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"up"})
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := prober.ctxProbeCallCount(); n != 0 {
+		t.Fatalf("ProbeModelInfo called %d times for a non-server_agent app with an empty ContextProbePath, want 0 (the implicit path is type-gated, not feature-only)", n)
+	}
+}
+
 // TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists proves the
 // global "unknown never overwrites" rule at the pass level: when the probe's
 // parsed ModelInfo carries LiveProgressSupport == "" -- exactly what a vLLM
@@ -1451,7 +1625,7 @@ func TestRunAppHealthOnceWritesAvailabilitySample(t *testing.T) {
 	lastAvail := map[string]availWriteState{}
 
 	// 1) First cycle: healthy + agent reporting -> exactly one sample capturing it.
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	samples := st.availSamples()
 	if len(samples) != 1 {
 		t.Fatalf("availability samples after the first cycle = %d, want 1", len(samples))
@@ -1461,14 +1635,14 @@ func TestRunAppHealthOnceWritesAvailabilitySample(t *testing.T) {
 	}
 
 	// 2) Second cycle, same clock + unchanged state -> no new sample (not due, no change).
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 1 {
 		t.Fatalf("availability samples after an unchanged cycle = %d, want 1 (deduped)", n)
 	}
 
 	// 3) Advance past the heartbeat with the same state -> one periodic heartbeat sample.
 	current = base.Add(200 * time.Millisecond)
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 2 {
 		t.Fatalf("availability samples after the heartbeat = %d, want 2", n)
 	}
@@ -1478,7 +1652,7 @@ func TestRunAppHealthOnceWritesAvailabilitySample(t *testing.T) {
 	// registry so Reporting("s1") flips to false without waiting out the window.
 	presence.Retain(map[string]struct{}{})
 	current = base.Add(210 * time.Millisecond) // < heartbeat since the 200ms write
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	samples = st.availSamples()
 	if len(samples) != 3 {
 		t.Fatalf("availability samples after the presence transition = %d, want 3", len(samples))
@@ -1511,7 +1685,7 @@ func TestRunAppHealthOnceWritesNetbirdConnectedTransition(t *testing.T) {
 	lastAvail := map[string]availWriteState{}
 
 	// 1) First cycle: peer connected -> one sample capturing NetbirdConnected=true.
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	samples := st.availSamples()
 	if len(samples) != 1 {
 		t.Fatalf("availability samples after the first cycle = %d, want 1", len(samples))
@@ -1523,7 +1697,7 @@ func TestRunAppHealthOnceWritesNetbirdConnectedTransition(t *testing.T) {
 	// 2) Peer disconnects (state transition), SAME clock + SAME health/agent -> a new
 	// sample purely because the NetBird dimension changed.
 	st.servers[0].NetbirdConnected = false
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	samples = st.availSamples()
 	if len(samples) != 2 {
 		t.Fatalf("availability samples after the NetBird transition = %d, want 2", len(samples))
@@ -1555,7 +1729,7 @@ func TestRunAppHealthOnceAvailabilitySampleBestEffortRetry(t *testing.T) {
 	// 1) Insert fails: the loop attempts the write but records nothing AND must not
 	// advance lastAvail (so the state is still "unseen" for the next cycle).
 	st.setFailInsert(true)
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 0 {
 		t.Fatalf("availability samples after a failed insert = %d, want 0 (nothing recorded)", n)
 	}
@@ -1567,7 +1741,7 @@ func TestRunAppHealthOnceAvailabilitySampleBestEffortRetry(t *testing.T) {
 	// not advance lastAvail, the state is still unseen -> a sample IS written (the
 	// failed write was retried, not deduped away).
 	st.setFailInsert(false)
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 1 {
 		t.Fatalf("availability samples after the retry = %d, want 1 (failed write retried, not deduped)", n)
 	}
@@ -1596,7 +1770,7 @@ func TestRunAppHealthOnceAvailabilityHeartbeatInclusiveBoundary(t *testing.T) {
 	lastAvail := map[string]availWriteState{}
 
 	// 1) First cycle writes the initial sample (lastAvail.at == base).
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 1 {
 		t.Fatalf("availability samples after the first cycle = %d, want 1", n)
 	}
@@ -1604,7 +1778,7 @@ func TestRunAppHealthOnceAvailabilityHeartbeatInclusiveBoundary(t *testing.T) {
 	// 2) Advance EXACTLY availabilityHeartbeat since the last write, state unchanged
 	// -> the heartbeat is due at the inclusive boundary (tNow.Sub(prev.at) == hb).
 	current = base.Add(availabilityHeartbeat)
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presence, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{presence}, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(context.Background(), &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 	if n := len(st.availSamples()); n != 2 {
 		t.Fatalf("availability samples at the exact heartbeat boundary = %d, want 2 (>= is inclusive)", n)
 	}
@@ -1659,7 +1833,7 @@ func TestRunAppHealthOnceAvailabilityUsesEffectivePerServerAgentWindow(t *testin
 	}
 	syncer1 := newFakeModelSyncer()
 	syncer1.agentPresenceDefault = 3600
-	(&appHealthRunner{store: st1, prober: newFakeProber(), syncer: syncer1, registry: gateway.NewAppHealthRegistry(nil), loaded: nil, agents: presence1, groups: nil, settings: st1, probeTimeout: time.Second, cipher: nil, now: func() time.Time { return fixed1 }}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+	(&appHealthRunner{store: st1, prober: newFakeProber(), syncer: syncer1, registry: gateway.NewAppHealthRegistry(nil), loaded: nil, agents: presenceBundle{presence1}, groups: nil, settings: st1, probeTimeout: time.Second, cipher: nil, now: func() time.Time { return fixed1 }}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 	if s := st1.availSamples(); len(s) != 1 {
 		t.Fatalf("s1 availability samples = %d, want 1", len(s))
 	} else if s[0].AgentReporting {
@@ -1682,7 +1856,7 @@ func TestRunAppHealthOnceAvailabilityUsesEffectivePerServerAgentWindow(t *testin
 	}
 	syncer2 := newFakeModelSyncer()
 	syncer2.agentPresenceDefault = 2
-	(&appHealthRunner{store: st2, prober: newFakeProber(), syncer: syncer2, registry: gateway.NewAppHealthRegistry(nil), loaded: nil, agents: presence2, groups: nil, settings: st2, probeTimeout: time.Second, cipher: nil, now: func() time.Time { return fixed2 }}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+	(&appHealthRunner{store: st2, prober: newFakeProber(), syncer: syncer2, registry: gateway.NewAppHealthRegistry(nil), loaded: nil, agents: presenceBundle{presence2}, groups: nil, settings: st2, probeTimeout: time.Second, cipher: nil, now: func() time.Time { return fixed2 }}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 	if s := st2.availSamples(); len(s) != 1 {
 		t.Fatalf("s2 availability samples = %d, want 1", len(s))
 	} else if s[0].AgentReporting {

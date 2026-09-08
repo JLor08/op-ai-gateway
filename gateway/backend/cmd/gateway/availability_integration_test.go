@@ -80,7 +80,7 @@ func TestRunAppHealthOnceAgentPresencePropagatesToAvailabilitySample(t *testing.
 	lastAvail := map[string]availWriteState{}
 
 	// Run one cycle passing the SAME agentPresence instance and the real store.
-	(&appHealthRunner{store: mem, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: agentPresence, groups: nil, settings: settings, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(ctx, &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
+	(&appHealthRunner{store: mem, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: presenceBundle{agentPresence}, groups: nil, settings: settings, probeTimeout: time.Second, cipher: nil, now: clock}).runOnce(ctx, &cycleState{lastProbed: lastProbed, lastAvail: lastAvail})
 
 	from := base.Add(-time.Hour)
 	to := base.Add(time.Hour)
