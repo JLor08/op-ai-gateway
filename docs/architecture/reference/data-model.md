@@ -37,7 +37,7 @@ not route-based).
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
-| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics. |
+| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics, and the persisted live-progress-capability verdict (migration 76) — a capability, not a metric, so it is not covered by `metrics_locked`. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -214,7 +214,7 @@ service, or project that produced it.
 | `store.Project` | `internal/store/models.go` | A cross-user usage-attribution grouping, optionally coupled to a user-group. |
 | `routing.AIServer` | `internal/routing/store.go` | A serving host: NetBird linkage, energy config, admin-group/certificate/HTTPS-switch overrides. |
 | `routing.Application` | `internal/routing/store.go` | An upstream API surface on a server: scoring inputs, health-check config, probes, sealed upstream token. |
-| `routing.ModelMapping` | `internal/routing/store.go` | A gateway-model ↔ app-model binding with performance and capacity metrics. |
+| `routing.ModelMapping` | `internal/routing/store.go` | A gateway-model ↔ app-model binding with performance and capacity metrics, plus the persisted live-progress-capability verdict. |
 | `routing.ModelGroup` / `GroupMember` / `ModelSetting` | `internal/routing/store.go` | Priority-failover synthetic models, their ordered members, and per-model visibility. |
 | `routing.Service` / `ServiceDelegate` | `internal/routing/store.go` | A service account and its delegated managers. |
 | `routing.ResourceGroup` / `ResourceGroupProvision` | `internal/routing/store.go` | A server-management container and its polymorphic provisioning targets. |
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (75 migrations)
+## 4. Migration history (76 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -423,6 +423,12 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 75 | `runtime_spec_type_probe` | Three additive columns on `agent_runtime_specs`, all `text not null default ''` (design 2026-09-07). `type` — the explicit runtime-server kind (`""`\|`vllm`\|`llama_cpp`\|`tgi`\|`ollama`\|`custom`); `''` is not "unset", it is **auto-detect from `binary_path`'s basename** (`routing.DetectRuntimeSpecType`), which is exactly what every pre-feature row already resolves to — the `''` default preserves today's behaviour for the whole existing fleet with no backfill needed. `metrics_path`/`context_probe_path` — the operator's own raw overrides for the two probe endpoints `type` would otherwise default (`routing.DeriveProbePaths`); `''` means "use the resolved type's own default", which may itself be empty (e.g. `ollama` has no metrics endpoint, `custom` has neither). See [Agent-Managed Model Runtime §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation) and [ADR-036](../09-architecture-decisions.md#adr-036--runtime-probing-reuses-the-per-runtime-channel-type-drives-derivation-only-context-is-durable). |
 
+### Live-progress capability detection
+
+| # | Migration | Purpose |
+|---|---|---|
+| 76 | `model_mappings_live_progress_support` | Two additive columns on `model_mappings` (timings-capability-detection, issue #51 follow-up). `live_progress_support text not null default ''` — the persisted verdict on whether this mapping's upstream tolerates the live-progress streaming parameters: `''` (never determined, the same zero-value-means-unknown convention migration 32's `vision_capable` already uses), `supported`, or `unsupported`. `live_progress_checked_at` (nullable, `dl.timestampType()`, no default) — when that verdict was last determined, mirroring migration 9's `metrics_updated_at`; append-only like migration 75. **Neither column is part of the `metrics_locked` group this table otherwise guards every automated writer with** — see the field semantics below for why a capability is deliberately not covered by it. |
+
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
 
@@ -504,6 +510,19 @@ plausible-looking validation rule would break the normal case:
   `''` | `force_running` | `force_stopped`. `vram_locked` lives on the **spec**
   rather than per GPU, because an operator thinks "pin this model's numbers", not
   "pin GPU 2" (mirroring `metrics_locked`).
+- **`model_mappings.live_progress_support`/`live_progress_checked_at` are
+  deliberately NOT covered by `metrics_locked`, unlike every other automated
+  writer on this table.** `metrics_locked` exists so an operator can pin a
+  NUMBER they are answering for (throughput, context size); the live-progress
+  verdict is a capability of the upstream *build*, not a number an operator
+  vouches for, so pinning it could only ever produce a wrong answer — and
+  unlike a pinned throughput figure, a wrong capability has a silent cost: the
+  live figure stays off, with no visible reason, until someone thinks to
+  unlock the mapping. Writing it also does not restamp `metrics_source`/
+  `metrics_updated_at`, so it never misattributes this mapping's throughput
+  provenance to a capability probe. `live_progress_checked_at` is operator
+  diagnostics and the portal tooltip only — no decision logic anywhere reads
+  it.
 - **VRAM ownership is split and must stay split.**
   `agent_runtime_spec_gpus.vram_estimate_mb` is operator-owned (written by the
   portal) and `vram_measured_mb` is agent-owned (written only by the telemetry

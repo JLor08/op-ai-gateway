@@ -2765,7 +2765,7 @@ already running there) fills them from that child's **own** endpoints —
 never the store, never a separate poll loop — using the resolved probe
 configuration `snapshotStatus` copies from the spec onto `runtime.Status`
 (agent-internal fields, not part of the `Status`↔`RuntimeSample` wire
-mirror). Two different cadences share the one collect cycle:
+mirror). Three different cadences share the one collect cycle:
 
 - **Live request metrics are scraped every cycle.** A non-empty
   `MetricsPath` points the existing Prometheus scraper (§8.2.6 of
@@ -2780,8 +2780,48 @@ mirror). Two different cadences share the one collect cycle:
   different model or config — short-circuits every cycle after the first
   success. A *failed* probe is never cached, so a child whose HTTP server is
   still warming up is retried next cycle rather than sticking at `0` forever.
+- **A fourth field, `LiveProgressSupport`, is probed the same way but on its
+  own fixed path and its own caching rule** (`probeRuntimeChildLiveProgress`,
+  timings-capability-detection Task 4; the decision this feeds is [Telemetry,
+  Usage Analytics &
+  Observability §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+  Unlike `ContextProbePath` above, this probe is **not** derived from `Type`
+  and does not depend on it at all: it always GETs the fixed path `/props`
+  (`collector.LiveProgressProbePath`), regardless of `st.Type` or whether
+  `st.ContextProbePath` is even set. That is deliberate — `DeriveProbePaths`
+  gives a `custom`-typed spec no context path at all
+  ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), so a
+  *type-based* rule would never probe a `custom`-typed llama.cpp child for
+  this capability, which is exactly the case this unconditional probe exists
+  to recover: one extra loopback GET per child lifetime once a verdict is
+  cached, on a path that is a package constant rather than
+  operator/config-supplied, so there is no SSRF surface to guard here the way
+  `MetricsPath`/`ContextProbePath` need one.
 
-Both probes share the agent's existing ~2 s collect timeout and are
+  The caching rule distinguishes **why** no verdict came back, not merely
+  whether one did. A cache keyed by `(SpecID, PID)`, like the context cache,
+  stores a verdict — `"supported"`, `"unsupported"`, **or** a deliberate `""`
+  — only once the probe's answer is *stable*: a real `/props` document, a 404
+  (this route does not exist on this build), or any other well-formed body
+  that simply is not that document. None of those can change while this pid's
+  process keeps running. A *transient* failure — connection refused, a
+  timeout, or unparseable/truncated JSON — is never cached, exactly like a
+  failed context probe, because it might describe a child still warming up
+  rather than a conclusive answer. Collapsing this into "cache every
+  non-empty verdict, retry every empty one" would re-probe `/props` on every
+  single collect cycle, forever, for any non-llama.cpp child — a permanent
+  per-cycle cost for a question whose answer cannot change; collapsing it the
+  other way ("cache every verdict, empty included") would permanently
+  misdiagnose a slow-starting child as incapable. This cache is kept
+  deliberately **separate** from the context cache — a cached context size is
+  proof only that the context probe succeeded on this pid generation, never
+  that the capability verdict was ever established — so a lookup in one never
+  consults the other. The evidence rule this probe applies to the fetched
+  body — and why it is a byte-for-byte duplicate of the gateway's own copy —
+  is [Telemetry, Usage Analytics & Observability
+  §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
+
+Every probe shares the agent's existing ~2 s collect timeout and is
 best-effort throughout: a failure is logged at `Debug` and leaves the
 corresponding field(s) at their zero value — it never fails the collect
 cycle, exactly like every other collector in this loop. This is a
@@ -2825,7 +2865,12 @@ child with a live port — so a non-running child, or an agent that predates
 this feature, leaves them at `""` and no reachability indicator appears
 anywhere downstream. Computing them changes nothing about the probes' own
 non-fatal behaviour: a failure is still logged at `Debug` and never fails the
-collect cycle. What consumes the two states: the runtime admin's "Probes"
+collect cycle. `LiveProgressSupport` gets **no** third `MetricsProbe`/
+`ContextProbe`-style reachability field of its own: its tri-state value
+already carries that information, since `""` covers both "not yet
+determined" and "never probed" identically, and no consumer needs to
+distinguish them the way a fabricated `0` needed distinguishing from a real
+one. What consumes the two states: the runtime admin's "Probes"
 column ([§11.5](#115-what-each-remaining-tab-shows)) and the Models-detail
 gate that stops showing a fabricated `0` for the two probe-derived numbers
 ([§11.7](#117-live-runtime-state-on-the-models-catalog) — which also
@@ -4630,6 +4675,40 @@ server, and any agent without `runtime_model_probe`. `context_probe`
 reports only the **reachability of the probe that can refresh** that
 value, which is what the runtime admin screen's "Probes" column shows; it
 says nothing about whether the stored value is real.
+
+**The live-progress-support column follows the SAME persisted-value rule as
+context size, for the same reason, and it is deliberately NOT gated on a
+probe field either.** `live_progress_support` also reaches the row straight
+from the persisted mapping field
+(`LiveProgressSupport: view.mapping.LiveProgressSupport` in
+`portal/service_model_servers.go`) — written by a background detector
+(§8.4.3 of [Telemetry, Usage Analytics &
+Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
+not gateway-injected the way `state`/`active_requests`/`queue_depth`/
+`metrics_probe`/`context_probe` are — so there is no gateway-injection seam
+to gate this cell on, and gating it on a probe field would repeat the exact
+bug the context-size fix above already closed: hiding a real, persisted
+verdict on every row a probe fixture doesn't happen to reach.
+
+The frontend (`ModelServersSection.tsx`) renders the mapping's three possible
+values as three distinct states, keyed by badge KEY rather than colour:
+`"supported"` gets the `success` badge; `"unsupported"` gets the **neutral**
+`standby` badge, deliberately **not** the attention-drawing `watch` badge
+`modelStatusBadge` uses for a loading/starting state above — an older
+llama.cpp build that lacks this one request parameter is not broken, it
+simply lacks a nicety, and flagging it as attention-worthy would put a
+warning on every such server; and `""` (never determined) renders the shared
+`—` placeholder the active/queue/context columns on this same row already
+use, rather than an empty cell. That last choice is a deliberate departure
+from the original design spec, which called for rendering nothing: an empty
+cell is indistinguishable from a column that does not exist, and that exact
+ambiguity already cost a real support report once, on a sibling
+table (issue #57, where the Probes column's `null` for both states read as
+"the feature is missing" rather than "nothing determined yet"). `—` says
+"present, nothing determined yet" instead, matching the convention this same
+row already applies to a metric that was simply never measured.
+`live_progress_checked_at` feeds only the cell's tooltip — never the badge or
+label choice, which depend solely on `live_progress_support`.
 
 **The former "Geladen" and "Live-Status" columns are now one "Status"
 column.** Two facts that used to sit in adjacent columns — the

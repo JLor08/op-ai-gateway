@@ -637,9 +637,14 @@ from an absent field) and exactly one of three values:
 - `gateway` — computed here, output tokens over elapsed seconds since the
   first content delta, and only ever over the upstream's own exact count
   (vLLM reports an exact running `completion_tokens` but no rate of its own).
-  The window has a floor of 50 ms: a poll landing microseconds after the first
+  The window has a floor of 50 ms (`minGatewayRateWindow`,
+  `request_progress.go`): a poll landing microseconds after the first
   delta would divide an exact count by ~0 and render an absurd figure for one
-  poll, and the row simply keeps the em dash it was already showing.
+  poll, and the row simply keeps the em dash it was already showing. The same
+  constant now floors two more sites that divide an exact output-token count
+  by a wall-clock window: the native-passthrough Anthropic fallback below, and
+  the benchmark runner, whose copy of this guard matters more than either —
+  see "a recorded rate is a routing input" further down.
 - `""` (empty) — not measured.
 
 Because a *measured* value must never be mistakable for a measured zero, the
@@ -648,28 +653,132 @@ one-decimal resolution instead of `0.0` (a real 1-token/25s sample). That is a
 rendering local to this column, not a change to the shared `formatMetric`
 contract, whose fixed decimals other columns parse back as numbers to sort.
 
-**The allow-list is a performance hint, not a correctness gate.** Getting an
-exact mid-stream count at all needs two extra parameters on the
-*gateway-built* streaming request body: `timings_per_token` and
-`stream_options.continuous_usage_stats` (`openai_compatible.go`'s
-`CompleteStream`). They are added only when the resolved target's provider is
-in `liveProgressUpstreams` (`live_progress.go`) — today llama.cpp, llama-swap,
-vLLM, and server_agent, and LiteLLM deliberately not, since it forwards
-unrecognized body keys straight to its own upstream (OpenAI/Azure), which
-answer 400 "Unrecognized request argument supplied". But that list only
-decides who is *asked*; it is not what keeps an incompatible upstream safe.
+**Whether the two parameters are sent is a three-layer rule, ordered by the
+quality of the evidence: observation beats prediction, prediction beats
+guessing.** Getting an exact mid-stream count at all needs two extra
+parameters on the *gateway-built* streaming request body: `timings_per_token`
+and `stream_options.continuous_usage_stats` (`openai_compatible.go`'s
+`CompleteStream`). `wantsLiveProgress` (`live_progress.go`) decides, per
+request, in this order:
 
-It cannot be, because an application **type does not imply the upstream's
-request schema**. `server_agent` is not an inference server at all: what
-serves is whatever `RuntimeSpec.Type` says (`"" | vllm | llama_cpp | tgi |
-ollama | custom`), where `custom` means nobody knows and `""` — auto-detect —
-is the value on every row that predates the runtime manager, and the agent's
-router forwards the request body byte-for-byte. `llama_swap` is a proxy: each
-model resolves either to a free-text `cmd` (any OpenAI-compatible server) or
-to a `peer` at an arbitrary base URL with an injected bearer token —
-llama-swap's own configuration example points at OpenRouter — so a
+1. the mapping's PERSISTED verdict (`routing.ModelMapping.LiveProgressSupport`,
+   below) is `"unsupported"` — never send. This is either an observed upstream
+   rejection or a verdict copied from one; no shape guess outranks it.
+2. the persisted verdict is `"supported"` — always send, for the same reason
+   in reverse.
+3. the verdict has never been determined (`""`) — fall back to
+   `liveProgressUpstreams`, the SHAPE clause: send only when the target's
+   application type genuinely implies a tolerant upstream. That map is keyed
+   on exactly two values today, `llama_cpp` and `vllm` — not the literal
+   string `llama_swap`, and not the literal string `server_agent` either; see
+   below for why. LiteLLM is deliberately not on it either, since it forwards
+   unrecognized body keys straight to its own upstream (OpenAI/Azure), which
+   answer 400 "Unrecognized request argument supplied".
+
+The shape clause (layer 3) is a performance hint, never a correctness gate on
+its own — layers 1 and 2 exist precisely because it cannot be one, and it
+decides only who is *asked*, never what keeps an incompatible upstream safe.
+
+It cannot be a correctness gate on its own, because an application **type
+does not imply the upstream's request schema**. `server_agent` is not an
+inference server at all: what actually serves is whatever
+`routing.EffectiveRuntimeSpecType` resolves the child's launch spec to (`"" |
+vllm | llama_cpp | tgi | ollama | custom`, auto-detected from the launched
+binary's basename when the spec leaves `Type` at its pre-feature default
+`""`). So the shape clause tests a `server_agent` target against *that*
+resolved value (`Target.LiveProgressSpecType`, filled by `targetFrom` at no
+extra store cost), never against `Target.Provider` — which for a
+`server_agent` mapping is always the literal string `"server_agent"` and says
+nothing about the child actually running behind it. `llama_swap` is a proxy,
+kept off the shape clause entirely rather than merely excluded from a bigger
+list: each model resolves either to a free-text `cmd` (any OpenAI-compatible
+server) or to a `peer` at an arbitrary base URL with an injected bearer
+token — llama-swap's own configuration example points at OpenRouter — so a
 `llama_swap` model can terminate at `api.openai.com`, which is exactly the
-case LiteLLM is excluded for.
+case LiteLLM is excluded for; its type says nothing about what actually
+answers, so shape alone must never opt it in (a per-mapping `"supported"`
+verdict still can, same as any other type).
+
+**The persisted verdict (layers 1–2) comes from parsing the one document that
+can actually prove either answer, never from guessing at a value.** A
+background pass — the gateway's own context-probe pass
+(`cmd/gateway/app_health.go`, riding the SAME response its context-size probe
+already fetches) for an ordinary application, or the server-agent's own probe
+of its managed children (below) for a `server_agent` one — parses a llama.cpp
+`/props` response's `default_generation_settings.params` object
+(`detectLiveProgressSupport`, `internal/provider/model_info.go`). The key
+`timings_per_token` present there means `"supported"`; the `params` object
+present but lacking that key means `"unsupported"` — a real verdict about a
+real, older llama.cpp build. Only the key's PRESENCE is read; its value is
+always `false` (the handler default-constructs the params struct before ever
+setting it) and carries no information.
+
+Any other shape — or a fetch that fails outright — leaves the verdict
+UNDETERMINED (`""`), and an undetermined verdict must never overwrite an
+already-stored one. This is the trap the naive reading ("no key in the
+response ⇒ unsupported") would fall into: a vLLM application's own context
+probe fetches `/v1/models`, not `/props`, and `timings_per_token` is a
+llama.cpp request-schema field vLLM's probe was never asking about. Under
+that simplification every vLLM application would be marked `"unsupported"`
+and then silently dropped from the live-progress figure by
+`wantsLiveProgress` — even though vLLM's own equivalent parameter still
+works and the shape clause already sends it the parameters today. So a TGI
+`/info` body, an Ollama `/api/show` body, and a vLLM `/v1/models` body all
+leave the stored verdict exactly as it was, indistinguishable from a probe
+that never got a response at all.
+
+The verdict is persisted on the mapping (`model_mappings.live_progress_support`
++ `live_progress_checked_at`, migration 76 — see [Data Model
+§4](../reference/data-model.md#4-migration-history-76-migrations)) and it sits
+deliberately OUTSIDE the `metrics_locked` group that guards every other
+automated writer on that table. `metrics_locked` lets an operator pin a
+NUMBER they are answering for — throughput, context size; a capability is not
+that kind of number. Pinning it could only ever produce a WRONG answer, and
+unlike a pinned throughput figure a wrong capability has a silent operational
+cost: the live figure stays off, with no visible reason, until someone thinks
+to unlock the mapping. `UpdateMappingLiveProgressSupport` is therefore the
+first writer on `model_mappings` with no `metrics_locked` guard, and it also
+does not restamp `metrics_source`/`metrics_updated_at` — writing it must not
+misattribute this mapping's throughput provenance to a capability probe.
+`live_progress_checked_at` itself is operator diagnostics and the portal
+tooltip only ([API Surface](../reference/api-surface.md#models-servers-applications-mappings));
+no decision logic anywhere reads it.
+
+**Two detectors, one rule, deliberately duplicated.** The evidence rule above
+is implemented twice — once in the gateway (`internal/provider/model_info.go`),
+once in the server-agent module
+(`server-agent/internal/collector/probe.go`) — because the two are separate
+Go modules sharing no code, the same constraint `memory_probe.go:111`'s
+"line-parse is DUPLICATED locally on purpose" comment already documents for
+an unrelated feature. Both copies carry a comment pointing at the other, so a
+change to one is a deliberate prompt to change the other identically; a
+reviewer finding them diverge is a real finding, finding them duplicated is
+expected.
+
+The agent's copy exists at all because the gateway **cannot** reach a managed
+`server_agent` child's `/props` itself: the agent's router 404s
+`runtime.model_not_managed` for any request whose JSON body doesn't name a
+managed model (`server-agent/internal/runtime/router.go`'s `serveProxy`), and
+a bare `/props` GET carries no such body. So the agent probes each of its own
+children directly over loopback instead — the mechanics are [Agent-Managed
+Model Runtime's per-child probing
+section](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time) —
+and reports the verdict back on the telemetry channel, where
+`writeBackRuntimeLiveProgress` (`internal/gateway/agent_ingest.go`) writes it
+onto the mapping under the same `runtime_model_probe` capability gate as the
+context write-back, and — like every writer here — deliberately **without**
+a `mapping.MetricsLocked` check: the capability write-back's own doc comment
+states this is the design's central decision, not an oversight.
+
+**An unchanged verdict is never rewritten, on either write path.** Both the
+gateway's own context-probe pass and the ingest write-back above compare the
+freshly-observed verdict against the mapping's CURRENTLY STORED one before
+calling `UpdateMappingLiveProgressSupport`, and skip the call when they
+already agree. A capability is stable by nature — the same upstream build
+reports the same verdict every single time it is asked — so without that
+comparison either pass would drive one unconditional `UPDATE` per mapping per
+probe cycle, forever, for a value that can only change if an operator swaps
+the upstream binary underneath the mapping.
 
 **Correctness comes from a retry.** No live figure may fail, delay or alter a
 request, so a schema rejection is made a *non-event* rather than predicted: an
@@ -721,7 +830,11 @@ also reads llama.cpp's `timings` object off the Responses shape, and — for the
 Anthropic shape, which carries no timings on any frame — `usageScanner`
 derives a rate from the exact output-token count over the generation window
 (first content frame → last observed byte), mirroring the benchmark runner's
-own arithmetic.
+own arithmetic — literally the same `minGatewayRateWindow` floor, not merely
+a similar one: a window under 50 ms is suppressed rather than divided into,
+for the same reason the live-progress cell above suppresses one (a warm pass
+whose whole completion arrives microseconds after the first byte would divide
+an exact count by ~0 and yield an implausible rate).
 
 That derived rate requires an **authoritative terminal usage frame**
 (`isTerminalUsageFrame`, defined per flavor beside the content-frame
@@ -744,7 +857,23 @@ scorer and by a group's `MinTokensPerSecond` gate (§ routing). Before this
 change `Usage.TokensPerSecond` was always 0 on the passthrough path, so that
 feedback never fired for Codex/Claude-Code traffic; now that passthrough
 reports a rate, it can contribute — which is why the rate it reports must come
-from an exact, authoritative count and never from a placeholder.
+from an exact, authoritative count and never from a placeholder. The window
+floor above matters here for the same reason: an implausible passthrough
+sample would blend into that EWMA and stay there until enough real samples
+diluted it back out.
+
+**The benchmark runner's own copy of this floor (`benchmark_runner.go`'s
+`streamOnce`) matters MORE than either of the two above, because its result
+is never blended.** `measureMapping` feeds `streamOnce`'s output straight into
+`UpdateMappingBenchmarkMetrics`, which **hard-overwrites**
+`mapping.GenTokensPerSecond` — not the EWMA blend
+`UpdateMappingOpportunisticMetrics` applies to a live sample. A single
+implausible benchmark sample (the same "completion arrives microseconds after
+the first token" condition the other two sites suppress) would therefore
+replace the routing value the scorer and a model group's `MinTokensPerSecond`
+gate read outright, with nothing left to average it back out — worse than a
+one-poll display glitch (the live cell) or one contribution among many to an
+EWMA (the passthrough path), both of which self-correct on their own.
 
 That scanning was deliberately moved off the response-capture
 tee buffer (bounded at `captureMaxBytes`, ~1 MiB) onto its own incremental scan
