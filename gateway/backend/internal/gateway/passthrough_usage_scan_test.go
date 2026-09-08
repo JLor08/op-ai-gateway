@@ -4,8 +4,13 @@
 package gateway
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/provider"
+	"op-ai-gateway/internal/routing"
 	"strings"
 	"testing"
 	"time"
@@ -121,6 +126,49 @@ func TestPassthroughAnthropicFallbackNeedsAContentFrame(t *testing.T) {
 	if got := s.usage().TokensPerSecond; got != 0 {
 		t.Fatalf("TokensPerSecond = %v, want 0 (no content frame was ever observed)", got)
 	}
+}
+
+// TestPassthroughAnthropicFallbackFloorsTheGenerationWindow pins #51's
+// final-review finding: an authoritative message_delta that arrives a hair
+// after the first content frame must not produce an implausible rate. Both
+// cases have the SAME 40-token count and only differ in the generation
+// window's width, straddling minGatewayRateWindow (50ms) on either side --
+// this is deliberate: a fixture that only exercised one side could pass with
+// the floor deleted entirely, whereas pinning both the suppressed 49ms case
+// AND the honored, exactly-computed 51ms case cannot.
+func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	messageStart := []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n")
+	contentDelta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
+	messageDelta := []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n")
+
+	t.Run("just under the floor is suppressed", func(t *testing.T) {
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+		s.feed(messageStart, base)
+		s.feed(contentDelta, base) // first content frame at t+0
+		s.feed(messageDelta, base.Add(49*time.Millisecond))
+
+		u := s.usage()
+		if u.TokensPerSecond != 0 {
+			t.Fatalf("TokensPerSecond = %v, want 0 (49ms generation window is below the 50ms floor)", u.TokensPerSecond)
+		}
+		if u.OutputTokens != 40 {
+			t.Fatalf("OutputTokens = %d, want 40 (the count itself is unaffected by the rate floor)", u.OutputTokens)
+		}
+	})
+
+	t.Run("just over the floor is honored exactly", func(t *testing.T) {
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+		s.feed(messageStart, base)
+		s.feed(contentDelta, base) // first content frame at t+0
+		s.feed(messageDelta, base.Add(51*time.Millisecond))
+
+		u := s.usage()
+		want := 40.0 / 0.051
+		if u.TokensPerSecond != want {
+			t.Fatalf("TokensPerSecond = %v, want %v (40 tokens over the 51ms generation window)", u.TokensPerSecond, want)
+		}
+	})
 }
 
 // TestUsageScannerCarryBoundDropsOnPathologicalLine pins the bounded-carry
@@ -294,21 +342,83 @@ func TestPassthroughRecordsResponsesUpstreamRateOnTheUsageEvent(t *testing.T) {
 	}
 }
 
+// pacedProxyBody serves a native-passthrough response body across multiple
+// Reads, each held back by gap, so a test can force REAL elapsed wall-clock
+// time between two SSE frames rather than two back-to-back time.Now() calls a
+// few nanoseconds apart (which an ordinary in-process httptest round trip
+// would otherwise produce). Modeled on server_stream_timeout_test.go's
+// trickleReader.
+type pacedProxyBody struct {
+	pieces []string
+	gap    time.Duration
+}
+
+func (r *pacedProxyBody) Read(p []byte) (int, error) {
+	if len(r.pieces) == 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(r.gap)
+	n := copy(p, r.pieces[0])
+	r.pieces[0] = r.pieces[0][n:]
+	if r.pieces[0] == "" {
+		r.pieces = r.pieces[1:]
+	}
+	return n, nil
+}
+
+// pacedNativeProxyProvider is recordingProxyProvider's ProxyNative, minus the
+// call-recording fields this package's tests don't need, with its body served
+// through pacedProxyBody instead of a single strings.Reader -- so the caller
+// controls how much real wall-clock time separates one SSE frame from the
+// next.
+type pacedNativeProxyProvider struct {
+	pieces []string
+	gap    time.Duration
+}
+
+func (pacedNativeProxyProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (pacedNativeProxyProvider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{}})
+}
+
+func (p pacedNativeProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+	return &provider.ProxyResponse{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(&pacedProxyBody{pieces: append([]string(nil), p.pieces...), gap: p.gap}),
+	}, nil
+}
+
 // TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent is the same claim for
 // the Anthropic flavor, which carries no timings on any frame and therefore
-// depends on usageScanner's derived rate. The exact value is not assertable end to
-// end (the generation window is however long this in-process copy takes), so the
-// assertion is the one that actually changed: a POSITIVE recorded rate where the
-// pre-branch value was always exactly 0.
+// depends on usageScanner's derived rate. The exact value is not assertable end
+// to end, so the assertion is the one that actually changed: a POSITIVE
+// recorded rate where the pre-branch value was always exactly 0.
+//
+// The body is deliberately PACED (content_block_delta, then a real 80ms
+// sleep, then message_delta) rather than served in one shot: an ordinary
+// in-process httptest round trip copies the whole canned body in a single
+// Read, so the scanner's first-content and last-activity timestamps would
+// otherwise be two time.Now() calls a few nanoseconds apart -- exactly the
+// implausible-window case Task 7's floor (minGatewayRateWindow, mirrored from
+// request_progress.go) now suppresses. Without the real gap this test would
+// assert on the very bug that floor exists to prevent.
 func TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent(t *testing.T) {
-	body := "event: message_start\n" +
-		`data: {"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":1}}}` + "\n\n" +
-		"event: content_block_delta\n" +
-		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
-		"event: message_delta\n" +
-		`data: {"type":"message_delta","usage":{"output_tokens":40}}` + "\n\n" +
-		"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
-	prov := &recordingProxyProvider{respBody: body}
+	prov := pacedNativeProxyProvider{
+		pieces: []string{
+			"event: message_start\n" +
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":1}}}` + "\n\n" +
+				"event: content_block_delta\n" +
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n",
+			"event: message_delta\n" +
+				`data: {"type":"message_delta","usage":{"output_tokens":40}}` + "\n\n" +
+				"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n",
+		},
+		gap: 80 * time.Millisecond,
+	}
 	srv := newNativeProxyTestServer(prov, false, true)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
