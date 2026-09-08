@@ -344,12 +344,16 @@ export function ModelServersSection({
       value: (r) => r.live_progress_support,
       filter: 'enum',
       searchable: false,
+      // Two branches only: ListTable's enumOptions drops '' from the derived
+      // option list, so a "never determined" row is never an option and no
+      // third label is reachable from here. (Whether the column SHOULD offer a
+      // "never determined" filter is a product question, not a rendering one.)
+      // The '' rows are still rendered -- as the shared "—" placeholder, by
+      // the `render` below -- they are just not filterable by that value.
       enumLabel: (v) =>
         v === 'supported'
           ? t.modelServerLiveProgressSupported
-          : v === 'unsupported'
-            ? t.modelServerLiveProgressUnsupported
-            : t.modelServerLiveProgressUnknown,
+          : t.modelServerLiveProgressUnsupported,
       render: (r) => {
         const info = liveProgressChipInfo(r.live_progress_support, t);
         if (!info) return '—';

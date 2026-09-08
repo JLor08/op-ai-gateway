@@ -1102,10 +1102,6 @@ const de = {
   // The NEUTRAL badge label, deliberately not phrased as a warning: an older
   // llama.cpp build that lacks this request parameter is not broken.
   modelServerLiveProgressUnsupported: 'Nicht unterstützt',
-  // The enum-filter's label for "" (never determined) -- distinct from the
-  // "—" the cell itself renders, which is a placeholder glyph, not filterable
-  // text.
-  modelServerLiveProgressUnknown: 'Nicht ermittelt',
   modelServerLiveProgressTooltipSupported:
     'Dieser Server unterstützt die Live-Fortschritts-Parameter der Anfrage; der Live-Fortschritt lässt sich verfolgen.',
   modelServerLiveProgressTooltipUnsupported:
@@ -3312,7 +3308,6 @@ const en: PortalMessages = {
   modelServerColLiveProgress: 'Live progress',
   modelServerLiveProgressSupported: 'Supported',
   modelServerLiveProgressUnsupported: 'Not supported',
-  modelServerLiveProgressUnknown: 'Not determined',
   modelServerLiveProgressTooltipSupported:
     "This server supports the request's live-progress parameters; live progress can be tracked.",
   modelServerLiveProgressTooltipUnsupported:

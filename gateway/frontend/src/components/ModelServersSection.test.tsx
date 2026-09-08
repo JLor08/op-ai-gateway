@@ -155,6 +155,20 @@ function rowFor(serverName: string): HTMLElement {
   return screen.getByText(serverName).closest('tr')!;
 }
 
+// cellForColumn resolves a row's cell by its COLUMN HEADER rather than by a
+// hard-coded index. Several columns on this table render the identical "—"
+// placeholder for their own not-measured case, so an index-based assertion
+// silently survives a column being inserted ahead of the one under test — it
+// just asserts on the neighbour. The header row is the same table's, so the
+// index it yields is the visible-column index the body rows use.
+function cellForColumn(serverName: string, columnLabel: string): HTMLElement {
+  const row = rowFor(serverName);
+  const headers = within(row.closest('table')!).getAllByRole('columnheader');
+  const index = headers.findIndex((h) => h.textContent?.trim() === columnLabel);
+  if (index < 0) throw new Error(`no column header labelled ${columnLabel}`);
+  return within(row).getAllByRole('cell')[index];
+}
+
 // The single "Laden" action lives in the kebab (⋮) row menu (maxInlineActions=0)
 // so a disabled item can surface its reason. Open a row's menu, close it again.
 function openMenu(serverName: string) {
@@ -621,12 +635,16 @@ describe('ModelServersSection', () => {
 
     // rowC: "" (never determined) -> the design spec calls for rendering
     // NOTHING here; that is deliberately overridden to the shared "—"
-    // placeholder instead (column index 9: 0 prio … 8 context, see the
-    // comment on the "shows the live active/queue counts" test above), so the
-    // column reads as "present, nothing determined yet" rather than as a
-    // column that doesn't exist. No badge/chip is rendered for it either.
-    const cellsC = within(rowFor('GPU-Box-C')).getAllByRole('cell');
-    expect(cellsC[9]).toHaveTextContent('—');
+    // placeholder instead, so the column reads as "present, nothing
+    // determined yet" rather than as a column that doesn't exist. No
+    // badge/chip is rendered for it either.
+    //
+    // Scoped to this column BY HEADER, not by index: the immediately
+    // preceding Kontext column renders the identical glyph for its own
+    // not-measured case, so an index-based query would stay green while
+    // asserting on the wrong cell if a column were ever inserted ahead of
+    // this one.
+    expect(cellForColumn('GPU-Box-C', t.modelServerColLiveProgress)).toHaveTextContent('—');
     expect(
       within(rowFor('GPU-Box-C')).queryByText(t.modelServerLiveProgressSupported),
     ).not.toBeInTheDocument();
