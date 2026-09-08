@@ -112,9 +112,20 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 	if gotFirst {
 		ttft = firstAt.Sub(start)
 	}
+	// Floor the generation window at minGatewayRateWindow (request_progress.go), the
+	// same guard passthrough_usage_scan.go's Anthropic fallback uses, and for the
+	// same reason: a warm pass whose whole completion arrives microseconds after the
+	// first token divides an exact output-token count by a window of ~0 and yields an
+	// implausible rate. It is WORSE here than on either sibling site: measureMapping's
+	// result flows straight into UpdateMappingBenchmarkMetrics (below), which HARD
+	// OVERWRITES mapping.GenTokensPerSecond -- not the EWMA blend
+	// UpdateMappingOpportunisticMetrics applies to a live sample. There is no damping
+	// at all, so one implausible benchmark sample would replace the routing value the
+	// scorer and a model group's MinTokensPerSecond gate read outright, with nothing
+	// to average it back out.
 	if usage.TokensPerSecond == 0 && usage.OutputTokens > 0 && gotFirst {
-		if genSecs := end.Sub(firstAt).Seconds(); genSecs > 0 {
-			usage.TokensPerSecond = float64(usage.OutputTokens) / genSecs
+		if window := end.Sub(firstAt); window >= minGatewayRateWindow {
+			usage.TokensPerSecond = float64(usage.OutputTokens) / window.Seconds()
 		}
 	}
 	return ttft, usage, nil

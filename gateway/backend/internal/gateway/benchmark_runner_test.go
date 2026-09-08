@@ -23,7 +23,13 @@ import (
 type benchFakeProvider struct {
 	calls        int
 	firstDelayMS int // sleep before the first delta on call #1 (simulates a cold load)
-	usage        inference.Usage
+	// genDelayMS sleeps AFTER the first delta and BEFORE Completed, on every call. This
+	// is the generation window streamOnce's wall-clock fallback (benchmark_runner.go)
+	// measures firstAt-to-end over, so it is what a test controls to land on either
+	// side of minGatewayRateWindow -- see
+	// TestBenchmarkMeasureMappingFloorsTheGenerationWindow.
+	genDelayMS int
+	usage      inference.Usage
 	// lastTarget records the routing.Target passed to the most recent CompleteStream
 	// call, so a test can assert what APIToken/APITokenHeader the benchmark runner
 	// attached (I3: the benchmark Target builders must resolve through
@@ -44,6 +50,9 @@ func (f *benchFakeProvider) CompleteStream(_ context.Context, target routing.Tar
 	}
 	if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: "ok"}); err != nil {
 		return err
+	}
+	if f.genDelayMS > 0 {
+		time.Sleep(time.Duration(f.genDelayMS) * time.Millisecond)
 	}
 	u := f.usage
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &u})
@@ -95,7 +104,15 @@ func TestBenchmarkMeasureMappingLoadTimeFromColdWarm(t *testing.T) {
 }
 
 func TestBenchmarkMeasureMappingDerivesRateWhenUpstreamSilent(t *testing.T) {
-	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 10}} // TokensPerSecond: 0
+	// genDelayMS clears minGatewayRateWindow (50ms) with comfortable margin against
+	// scheduling jitter -- this test's job is proving the wall-clock fallback wiring
+	// (streamOnce -> measureMapping -> res.GenTokensPerSecond), not the floor itself.
+	// The floor's threshold behavior is pinned exclusively by
+	// TestBenchmarkMeasureMappingFloorsTheGenerationWindow below. Before Task 7's
+	// second-instance fix this test's fixture had NO delay at all: the in-process
+	// first-delta-to-Completed gap was sub-millisecond, which the floor now
+	// (correctly) suppresses -- this is what turned it red after that fix landed.
+	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 10}, genDelayMS: 80} // TokensPerSecond: 0
 	srv := &Server{Provider: fake}
 	res, err := srv.measureMapping(context.Background(), benchTestTarget())
 	if err != nil {
@@ -104,6 +121,59 @@ func TestBenchmarkMeasureMappingDerivesRateWhenUpstreamSilent(t *testing.T) {
 	if res.GenTokensPerSecond <= 0 {
 		t.Fatalf("GenTokensPerSecond = %v, want > 0 (wall-clock fallback)", res.GenTokensPerSecond)
 	}
+}
+
+// TestBenchmarkMeasureMappingFloorsTheGenerationWindow pins the review finding on
+// Task 7 (benchmark_runner.go's streamOnce carried the identical unguarded
+// genSecs > 0 pattern passthrough_usage_scan.go's Anthropic fallback already had a
+// floor for): a warm pass whose whole completion arrives a hair after the first
+// token must not produce an implausible rate that then HARD-OVERWRITES
+// mapping.GenTokensPerSecond via UpdateMappingBenchmarkMetrics -- worse than the
+// EWMA-blended passthrough case, because there is no damping at all.
+//
+// streamOnce times itself with real time.Now() calls (no injectable clock), so
+// unlike the deterministic-timestamp sibling test
+// (TestPassthroughAnthropicFallbackFloorsTheGenerationWindow, which feeds exact
+// synthetic timestamps and can assert an exact rate on both sides of the floor),
+// this test drives the boundary with a real time.Sleep and cannot assert bit-exact
+// equality on the "honored" side -- actual elapsed wall-clock time is never exactly
+// the sleep duration. It still pins both sides of minGatewayRateWindow (50ms) with
+// margin against scheduling jitter: comfortably under (suppressed, asserted == 0,
+// which IS exact and deterministic) and comfortably over (honored, asserted > 0 and
+// within a generous upper bound that a mis-scaled floor constant could not
+// accidentally satisfy). Reverting the floor (restoring the old
+// `genSecs := ...Seconds(); genSecs > 0` guard) fails the "under" subtest, because
+// the old code has no minimum and would compute a (large, implausible) rate for
+// even a 10ms window.
+func TestBenchmarkMeasureMappingFloorsTheGenerationWindow(t *testing.T) {
+	t.Run("well under the floor is suppressed", func(t *testing.T) {
+		fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 10}, genDelayMS: 10}
+		srv := &Server{Provider: fake}
+		res, err := srv.measureMapping(context.Background(), benchTestTarget())
+		if err != nil {
+			t.Fatalf("measureMapping err = %v", err)
+		}
+		if res.GenTokensPerSecond != 0 {
+			t.Fatalf("GenTokensPerSecond = %v, want 0 (10ms generation window is well below the 50ms floor)", res.GenTokensPerSecond)
+		}
+	})
+
+	t.Run("well over the floor is honored", func(t *testing.T) {
+		fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 10}, genDelayMS: 200}
+		srv := &Server{Provider: fake}
+		res, err := srv.measureMapping(context.Background(), benchTestTarget())
+		if err != nil {
+			t.Fatalf("measureMapping err = %v", err)
+		}
+		// Window is ~200ms (plus negligible scheduling overhead), so the rate sits near
+		// 10/0.2 = 50. A generous [10, 100] band tolerates real scheduling jitter while
+		// still rejecting a floor that was raised so high (e.g. into the seconds range)
+		// that 200ms would still be suppressed, or a rate computed over the wrong
+		// (whole-request) window.
+		if res.GenTokensPerSecond <= 10 || res.GenTokensPerSecond > 100 {
+			t.Fatalf("GenTokensPerSecond = %v, want in (10, 100] (~10 output tokens over a ~200ms window)", res.GenTokensPerSecond)
+		}
+	})
 }
 
 func TestBenchmarkMeasureMappingNoStreaming(t *testing.T) {
