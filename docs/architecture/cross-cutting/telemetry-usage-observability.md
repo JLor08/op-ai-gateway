@@ -713,6 +713,30 @@ real, older llama.cpp build. Only the key's PRESENCE is read; its value is
 always `false` (the handler default-constructs the params struct before ever
 setting it) and carries no information.
 
+**A model NAME is not part of that evidence.** The verdict is a property of the
+server BUILD; a context size is a property of a MODEL. So the gateway's parse
+reports the verdict even for a `/props` body carrying no `model`/`model_path` at
+all (a nameless `ModelInfo`, `parseModelInfo`) — dropping the whole entry there,
+as it once did, discarded a real verdict for a real llama.cpp build. Such a
+nameless entry deliberately carries NO context size: an unattributable size must
+not be handed to whatever model happened to be probed, so the name matching the
+context write needs stays exactly as strict as it was. The per-model
+(`{model}`-template) pass attributes the verdict directly, because it GETted
+that mapping's own expanded path; the single-probe pass attributes a NAMELESS
+verdict to every mapping of the application — one application has one endpoint,
+hence one build — while a NAMED one still reaches only the name-matched mapping.
+
+Two shapes are refused as evidence even though they look right. `"role":
+"router"` marks llama.cpp's **router-mode** dummy `/props` (issue #55): that
+document is the *router's* own compiled schema, not that of the server serving
+this model, so it yields `""` in both detector copies regardless of what its
+`params` object contains. A wrong `"supported"` from it would be absorbed by the
+retry below, but a wrong `"unsupported"` would be permanent and
+self-reinforcing — every later probe returns the same dummy, and the no-rewrite
+rule then keeps it. And a `default_generation_settings` that is not an object,
+or a `params` that is `null`, is not an empty params object: both are `""`, never
+`"unsupported"`.
+
 Any other shape — or a fetch that fails outright — leaves the verdict
 UNDETERMINED (`""`), and an undetermined verdict must never overwrite an
 already-stored one. This is the trap the naive reading ("no key in the

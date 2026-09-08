@@ -787,6 +787,89 @@ func TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists(t *testing.T) {
 	}
 }
 
+// TestRunAppHealthOnceSingleProbeNamelessVerdictReachesEveryMapping is the
+// attribution half of final-review F5, on the single-probe (non-{model})
+// branch. A /props body that carries the capability evidence but no
+// model/model_path now parses to a NAMELESS ModelInfo (see
+// TestParseModelInfoNamelessBodyStillCarriesTheVerdict); with the old strict
+// name equality that verdict could match nothing -- an AppModelName is never
+// "" in practice -- so it was determined and then thrown away.
+//
+// A single-probe application has exactly ONE endpoint
+// (routing.ApplicationEndpoint), so every mapping it owns is served by that
+// same build and the unattributable verdict is genuinely theirs. Both mappings
+// must therefore be written: the count is asserted numerically at 2, so a
+// silent one-mapping-only regression is caught, and the context size (0 here,
+// deliberately absent from a nameless entry) must stay untouched.
+func TestRunAppHealthOnceSingleProbeNamelessVerdictReachesEveryMapping(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {
+			{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a", Status: routing.ServerStatusActive},
+			{ID: "m2", ApplicationID: "a1", GatewayModelName: "g-b", AppModelName: "m-b", Status: routing.ServerStatusActive},
+		},
+	}
+	prober := newFakeProber()
+	// What parseModelInfo yields for a /props body with the params object but
+	// no model/model_path: a verdict, no name, no context size.
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 2 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 2 -- a nameless verdict belongs to every mapping of this one-endpoint application", n)
+	}
+	for _, id := range []string{"m1", "m2"} {
+		got, _ := st.mappingOf(id)
+		if got.LiveProgressSupport != "supported" {
+			t.Fatalf("%s LiveProgressSupport = %q, want %q", id, got.LiveProgressSupport, "supported")
+		}
+		if got.ContextSize != 0 {
+			t.Fatalf("%s ContextSize = %d, want 0 (a nameless entry reports no size, so nothing may be attributed)", id, got.ContextSize)
+		}
+	}
+}
+
+// TestRunAppHealthOnceSingleProbeNamedVerdictStaysNameMatched is the guard on
+// the other side of that widening: when the probe DOES report a model name,
+// the strict name equality must survive untouched. Resolving F5 by simply
+// asking provider.PickModelLiveProgressSupport per mapping (whose fallback
+// takes the first non-empty verdict) would have widened the NAMED case too --
+// attributing one model's verdict to every sibling mapping, which for a
+// literal-path llama_swap application is a claim about a different upstream
+// entirely. Asserted as a numeric count of 1 plus the untouched sibling.
+func TestRunAppHealthOnceSingleProbeNamedVerdictStaysNameMatched(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxProbeApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {
+			{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a", Status: routing.ServerStatusActive},
+			{ID: "m2", ApplicationID: "a1", GatewayModelName: "g-b", AppModelName: "m-b", Status: routing.ServerStatusActive},
+		},
+	}
+	prober := newFakeProber()
+	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1 -- a NAMED verdict must still reach only the name-matched mapping", n)
+	}
+	gotA, _ := st.mappingOf("m1")
+	if gotA.LiveProgressSupport != "supported" {
+		t.Fatalf("m-a LiveProgressSupport = %q, want %q (name-matched)", gotA.LiveProgressSupport, "supported")
+	}
+	gotB, _ := st.mappingOf("m2")
+	if gotB.LiveProgressSupport != "" {
+		t.Fatalf("m-b LiveProgressSupport = %q, want %q (the reported name did not match)", gotB.LiveProgressSupport, "")
+	}
+}
+
 // TestRunAppHealthOnceLiveProgressSupportPersistsChangedVerdict proves a
 // changed verdict IS persisted (the complement of the no-rewrite test above):
 // the mapping starts at "supported" and the upstream now reports

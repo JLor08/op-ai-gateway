@@ -52,6 +52,53 @@ func TestParseModelInfoProps(t *testing.T) {
 	}
 }
 
+// TestParseModelInfoNamelessBodyStillCarriesTheVerdict is final-review F5: a
+// /props document that carries the capability evidence but NO model/model_path
+// used to be dropped whole (parseModelInfo returned nil the moment no name was
+// found), so a real verdict was discarded even though the evidence rule needs
+// no name at all -- a capability belongs to the server BUILD, a context size to
+// a MODEL. The agent-side half never had this coupling; it hands the raw body
+// straight to the detector.
+//
+// The nameless entry must carry NO context size even though this body reports
+// an n_ctx of 4096: an unnamed size cannot be attributed, and letting it through
+// would weaken exactly the name matching that context attribution needs. Both
+// facts are asserted numerically/exactly rather than through a "non-empty"
+// check, and the two Pick* consumers are exercised on the same slice so the
+// split is proven where it is actually read.
+func TestParseModelInfoNamelessBodyStillCarriesTheVerdict(t *testing.T) {
+	const nameless = `{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`
+
+	got := parseModelInfo([]byte(nameless))
+	if len(got) != 1 {
+		t.Fatalf("parseModelInfo returned %d entries, want exactly 1 -- a nameless body still proves the build's capability", len(got))
+	}
+	if got[0].LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q", got[0].LiveProgressSupport, "supported")
+	}
+	if got[0].Name != "" {
+		t.Fatalf("Name = %q, want %q (the body carries no model/model_path)", got[0].Name, "")
+	}
+	if got[0].ContextSize != 0 {
+		t.Fatalf("ContextSize = %d, want 0 -- an unnamed context size must never be reported, or it lands on whatever model was probed", got[0].ContextSize)
+	}
+
+	// The consumers: the verdict reaches a per-model pick through the
+	// first-non-empty fallback, while the context pick still finds nothing.
+	if v := PickModelLiveProgressSupport(got, "some-model"); v != "supported" {
+		t.Fatalf("PickModelLiveProgressSupport = %q, want %q", v, "supported")
+	}
+	if n := PickModelContextSize(got, "some-model"); n != 0 {
+		t.Fatalf("PickModelContextSize = %d, want 0", n)
+	}
+
+	// No name AND no verdict is still nil: this widening reports a nameless
+	// entry only when there is something to report.
+	if got := parseModelInfo([]byte(`{"default_generation_settings":{"n_ctx":4096}}`)); got != nil {
+		t.Fatalf("parseModelInfo(no name, no verdict) = %+v, want nil", got)
+	}
+}
+
 // TestParseModelInfoLiveProgressSupport is the decision-rule test for #51: it
 // pins detectLiveProgressSupport's exact supported/unsupported/unknown
 // boundary, which is the single most important behavior in this feature.
@@ -100,6 +147,31 @@ func TestParseModelInfoLiveProgressSupport(t *testing.T) {
 			"unparseable bytes -> unknown",
 			`not json`,
 			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy /props (issue #55) -> unknown, NEVER a verdict: it is the router's own build, not the one serving this model",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy that WOULD have read as supported is also unknown -- the role gate precedes the params rule",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"",
+		},
+		{
+			"default_generation_settings present but NOT an object -> unknown (the type assertion fails)",
+			`{"model":"m","default_generation_settings":"unexpected"}`,
+			"",
+		},
+		{
+			"params present but null -> unknown, never unsupported (a null is not an empty params object)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":null}}`,
+			"",
+		},
+		{
+			"no model name at all, but the params object IS present -> a real verdict: the evidence rule needs no model name",
+			`{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"supported",
 		},
 	}
 	for _, tc := range cases {

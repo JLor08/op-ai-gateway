@@ -571,10 +571,12 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	// /v1/models body, an Ollama /api/show body, ...), "supported"/
 	// "unsupported" when it is. Unlike context_size this is a CAPABILITY, not a
 	// metric, so its write (UpdateMappingLiveProgressSupport) carries no
-	// metrics_locked guard and is independent of the context-size outcome; an
-	// unknown ("") verdict never calls the writer, and an unchanged verdict is
-	// skipped so this pass does not issue an UPDATE per application per cadence
-	// tick forever.
+	// metrics_locked guard and is independent of the context-size outcome -- and
+	// independent of the reported model NAME too, where a nameless /props body
+	// leaves nothing to match on (a capability belongs to the server build, a
+	// context size to a model); an unknown ("") verdict never calls the writer,
+	// and an unchanged verdict is skipped so this pass does not issue an UPDATE
+	// per application per cadence tick forever.
 	if r.prober != nil && !offMesh {
 		ctxProber, hasCtxProber := r.prober.(provider.ModelInfoProber)
 		for i := range active {
@@ -660,7 +662,13 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 							_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, ctxSize, r.now())
 						}
 						// Additive live-progress-support write (#51), independent of the
-						// context-size outcome above: an unknown ("") verdict never calls
+						// context-size outcome above -- and, since PickModelLiveProgress-
+						// Support falls back to the first non-empty verdict when no
+						// reported name matches, independent of the model NAME as well:
+						// this path attributed the probe DIRECTLY (it GETted this
+						// mapping's own expanded path), so a /props body carrying the
+						// capability evidence but no model/model_path still yields this
+						// mapping's verdict. An unknown ("") verdict never calls
 						// the writer -- unknown must never overwrite a stored verdict -- and
 						// an unchanged verdict is skipped too, so this ~30s-cadence pass does
 						// not issue an UPDATE per application per tick forever (the same
@@ -721,11 +729,25 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 					// ~30s-cadence pass does not issue an UPDATE per application per tick
 					// forever (the same reasoning writeBackRuntimeContext documents at
 					// length in internal/gateway/agent_ingest.go).
+					//
+					// Independent of the context SIZE, and -- for a NAMELESS info --
+					// of the reported model NAME too. parseModelInfo reports a nameless
+					// entry when a /props body carries the capability evidence but no
+					// model/model_path (the verdict needs no name: it is a property of
+					// the server build, not of a model). A single-probe application has
+					// exactly ONE endpoint, so every mapping it owns is served by that
+					// same build and an unattributable verdict is genuinely theirs.
+					// A NAMED info keeps the strict name equality it always had -- this
+					// widening applies only to the case whose alternative is dropping a
+					// real verdict on the floor.
 					if info.LiveProgressSupport == "" {
 						continue
 					}
 					for _, mp := range mappings {
-						if mp.AppModelName == info.Name && mp.LiveProgressSupport != info.LiveProgressSupport {
+						if info.Name != "" && mp.AppModelName != info.Name {
+							continue
+						}
+						if mp.LiveProgressSupport != info.LiveProgressSupport {
 							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, info.LiveProgressSupport, r.now())
 						}
 					}

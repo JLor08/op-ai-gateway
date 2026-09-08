@@ -271,7 +271,9 @@ func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL 
 //     simply isn't that document -- a vLLM /v1/models body, an Ollama
 //     /api/show body, a TGI /info body, .... This is UNKNOWN, not a
 //     verdict, and callers must never let it overwrite an already-cached
-//     verdict.
+//     verdict. A llama.cpp ROUTER-mode body ("role": "router", issue #55)
+//     lands here too, even though it is /props-shaped: it describes the
+//     router's own build, not the one serving this model.
 //
 // This is a DUPLICATE, on purpose, of detectLiveProgressSupport in
 // gateway/backend/internal/provider/model_info.go -- the two are separate Go
@@ -284,6 +286,17 @@ func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL 
 func detectLiveProgressSupport(body []byte) string {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return ""
+	}
+	// llama.cpp's ROUTER mode answers /props with a DUMMY document carrying
+	// "role": "router" -- the ROUTER's own compiled schema, not that of the
+	// server actually serving this model (issue #55). It is no evidence about
+	// this model's upstream in either direction, so it yields UNDETERMINED.
+	// Reading it as evidence would be worse than reading nothing: a wrong
+	// "supported" is absorbed by the streaming retry, while a wrong
+	// "unsupported" is PERMANENT and self-reinforcing, because every later
+	// probe returns the same dummy and the no-rewrite guard then keeps it.
+	if role, ok := obj["role"].(string); ok && role == "router" {
 		return ""
 	}
 	dgs, ok := obj["default_generation_settings"].(map[string]any)

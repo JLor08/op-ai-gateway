@@ -258,6 +258,31 @@ func TestDetectLiveProgressSupport(t *testing.T) {
 			`not json`,
 			"",
 		},
+		{
+			"a llama.cpp ROUTER-mode dummy /props (issue #55) -> unknown, NEVER a verdict: it is the router's own build, not the one serving this model",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"",
+		},
+		{
+			"a llama.cpp ROUTER-mode dummy that WOULD have read as supported is also unknown -- the role gate precedes the params rule",
+			`{"role":"router","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"",
+		},
+		{
+			"default_generation_settings present but NOT an object -> unknown (the type assertion fails)",
+			`{"model":"m","default_generation_settings":"unexpected"}`,
+			"",
+		},
+		{
+			"params present but null -> unknown, never unsupported (a null is not an empty params object)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":null}}`,
+			"",
+		},
+		{
+			"no model name at all, but the params object IS present -> a real verdict: the evidence rule needs no model name",
+			`{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`,
+			"supported",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

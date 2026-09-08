@@ -72,7 +72,28 @@ func fetchModelInfo(ctx context.Context, httpClient *http.Client, target routing
 
 // parseModelInfo reads the llama.cpp /props shape: the loaded model's name (from
 // "model", or basename of "model_path") + n_ctx (default_generation_settings.n_ctx,
-// else top-level n_ctx). Returns one entry when a model name is present, else nil.
+// else top-level n_ctx) + the live-progress-capability verdict
+// (detectLiveProgressSupport).
+//
+// A model NAME is required for the context size but NOT for the verdict, and the
+// two are reported independently:
+//
+//   - name present: one entry carrying the name, the size, and the verdict --
+//     the ordinary case, unchanged.
+//   - name absent, verdict determinable: one NAMELESS entry carrying ONLY the
+//     verdict. Returning nil here (as this did) silently discarded a real
+//     verdict, because the evidence rule needs no name at all: the verdict is a
+//     property of the server BUILD, while a context size is a property of a
+//     MODEL. The agent-side half never had this coupling -- it hands the raw
+//     body straight to the detector.
+//   - neither: nil, exactly as before.
+//
+// The nameless entry deliberately carries NO context size, even when the body
+// reports an n_ctx. An unnamed size cannot be attributed: PickModelContextSize's
+// first-positive fallback would hand it to whatever model was probed, and the
+// single-probe pass's name equality would hand it to any mapping whose
+// AppModelName is empty. The name matching that context attribution needs stays
+// exactly as strict as it was.
 func parseModelInfo(body []byte) []ModelInfo {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
@@ -84,8 +105,12 @@ func parseModelInfo(body []byte) []ModelInfo {
 	} else if s, ok := obj["model_path"].(string); ok && strings.TrimSpace(s) != "" {
 		name = path.Base(strings.TrimSpace(s))
 	}
+	support := detectLiveProgressSupport(body)
 	if name == "" {
-		return nil
+		if support == "" {
+			return nil
+		}
+		return []ModelInfo{{LiveProgressSupport: support}}
 	}
 	nctx := 0
 	if dgs, ok := obj["default_generation_settings"].(map[string]any); ok {
@@ -94,7 +119,7 @@ func parseModelInfo(body []byte) []ModelInfo {
 	if nctx == 0 {
 		nctx = intFromAny(obj["n_ctx"])
 	}
-	return []ModelInfo{{Name: name, ContextSize: nctx, LiveProgressSupport: detectLiveProgressSupport(body)}}
+	return []ModelInfo{{Name: name, ContextSize: nctx, LiveProgressSupport: support}}
 }
 
 // detectLiveProgressSupport is the live-progress-capability detector (#51): it
@@ -119,7 +144,10 @@ func parseModelInfo(body []byte) []ModelInfo {
 //   - ""             anything else: unparseable bytes, or a body that simply
 //     isn't that document -- a vLLM /v1/models body, an Ollama /api/show
 //     body, a TGI /info body, .... This is UNKNOWN, not a verdict, and the
-//     caller must never let it overwrite an already-stored verdict.
+//     caller must never let it overwrite an already-stored verdict. A
+//     llama.cpp ROUTER-mode body ("role": "router", issue #55) lands here
+//     too, even though it is /props-shaped: it describes the router's own
+//     build, not the one serving this model.
 //
 // Do NOT simplify the "" case to "no key -> unsupported": a vLLM
 // application's context probe fetches /v1/models, not /props, and
@@ -137,6 +165,17 @@ func parseModelInfo(body []byte) []ModelInfo {
 func detectLiveProgressSupport(body []byte) string {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return ""
+	}
+	// llama.cpp's ROUTER mode answers /props with a DUMMY document carrying
+	// "role": "router" -- the ROUTER's own compiled schema, not that of the
+	// server actually serving this model (issue #55). It is no evidence about
+	// this model's upstream in either direction, so it yields UNDETERMINED.
+	// Reading it as evidence would be worse than reading nothing: a wrong
+	// "supported" is absorbed by the streaming retry, while a wrong
+	// "unsupported" is PERMANENT and self-reinforcing, because every later
+	// probe returns the same dummy and the no-rewrite guard then keeps it.
+	if role, ok := obj["role"].(string); ok && role == "router" {
 		return ""
 	}
 	dgs, ok := obj["default_generation_settings"].(map[string]any)
