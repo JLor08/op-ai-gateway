@@ -624,6 +624,48 @@ type ModelMapping struct {
 	// LiveProgressCheckedAt is when that verdict was last determined. Operator
 	// diagnostics and the portal tooltip ONLY -- no decision logic reads it.
 	LiveProgressCheckedAt *time.Time
+	// CapVision/CapVideo/CapAudio/CapTools are the auto-detected capability
+	// verdicts (#49 sub-project 2), each "" (never determined) | "yes" | "no".
+	// Three states, not a bool, for the reason vision_capable's own history
+	// shows: a bool conflates "not probed" with "no", and the models list
+	// AND-aggregates it fail-closed, so one unprobed mapping silently disables
+	// a whole model's image attachment. "" must never overwrite a stored
+	// verdict -- see UpdateMappingCapabilities.
+	//
+	// Deliberately OUTSIDE the metrics_locked group, like
+	// LiveProgressSupport above and for the same reason: a capability is not
+	// a number an operator answers for. The one exception is the vision SYNC
+	// onto VisionCapable, which goes through the lock-guarded
+	// UpdateMappingVisionCapable on purpose (see the write-back callers).
+	//
+	// CapVideo carries an upstream subtlety worth knowing before acting on
+	// it: llama.cpp's modalities.video is true when the BINARY was built with
+	// video support AND the model has a vision encoder -- it is not a claim
+	// that the model understands video.
+	//
+	// CapTools is "the chat template natively supports tool calls", NOT "tool
+	// calls work": llama.cpp with --jinja (its default) accepts tools for
+	// every model through a generic handler.
+	CapVision string
+	CapVideo  string
+	CapAudio  string
+	CapTools  string
+	// CapExtra is a JSON array of capability names the upstream reported that
+	// have no column here ("thinking", "insert", "embedding", ...). Stored
+	// verbatim rather than mapped onto an enum because the vocabulary is
+	// open-ended upstream (Ollama passes manifest-declared capabilities
+	// through unchanged), so an enum would silently drop future values. ""
+	// when nothing extra was reported.
+	CapExtra string
+	// CapabilitiesSource is which probe produced the current verdicts:
+	// "llama_cpp_props" | "ollama_show" | "". Per-capability-group
+	// provenance, deliberately NOT the mapping-wide MetricsSource, which one
+	// writer would otherwise stamp over another's.
+	CapabilitiesSource string
+	// CapabilitiesCheckedAt is when the verdicts were last determined; nil
+	// when never. Diagnostics and the portal tooltip ONLY -- no decision
+	// logic may read it (the LiveProgressCheckedAt rule).
+	CapabilitiesCheckedAt *time.Time
 	// Per-mapping concurrency-capacity metrics (later phases populate them).
 	// 0 = unknown everywhere.
 	MaxConcurrency               int     // max concurrent requests the model can serve; 0 = unknown
@@ -976,13 +1018,26 @@ type ApplicationStore interface {
 	DeleteApplication(ctx context.Context, id string) error
 }
 
+// CapabilityVerdicts is one probe's capability answer set. Every verdict is
+// "" (this probe determined nothing about it) | "yes" | "no"; "" fields are
+// NOT written, so a partial answer (an older llama.cpp with modalities but no
+// chat_template_caps) cannot clear what another probe established.
+type CapabilityVerdicts struct {
+	Vision string
+	Video  string
+	Audio  string
+	Tools  string
+	Extra  []string
+	Source string
+}
+
 // MappingStore is CRUD for model mappings (gateway model name -> app model
 // name) plus the family of targeted, metrics_locked-respecting metric
 // updates (context probe, vision, benchmark, opportunistic EWMA, capacity,
 // energy EWMA), the routing-candidate lookup (ActiveMappingsForModel), and
-// UpdateMappingLiveProgressSupport -- the one targeted writer here that is
-// NOT metrics_locked-respecting, because it records a capability rather than
-// a metric (see its doc comment).
+// UpdateMappingLiveProgressSupport / UpdateMappingCapabilities -- the two
+// targeted writers here that are NOT metrics_locked-respecting, because they
+// record a capability rather than a metric (see their doc comments).
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
@@ -1027,6 +1082,13 @@ type MappingStore interface {
 	// operator pins numbers against -- see the SQLiteStore implementation for
 	// the full rationale.
 	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
+	// UpdateMappingCapabilities records the auto-detected capability verdicts
+	// (#49-2). Writes only the non-empty verdicts, stamps
+	// capabilities_source/capabilities_checked_at, and -- like
+	// UpdateMappingLiveProgressSupport and unlike every metric writer on this
+	// table -- carries NO metrics_locked guard and never touches
+	// metrics_source/metrics_updated_at.
+	UpdateMappingCapabilities(ctx context.Context, id string, caps CapabilityVerdicts, at time.Time) error
 	MappingByID(ctx context.Context, id string) (ModelMapping, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	MappingsByServer(ctx context.Context, serverID string) ([]ModelMapping, error)

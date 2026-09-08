@@ -107,6 +107,7 @@ var migrations = []migration{
 	{version: 74, name: "runtime_spec_api_token", up: migration74Up},
 	{version: 75, name: "runtime_spec_type_probe", up: migration75Up},
 	{version: 76, name: "model_mappings_live_progress_support", up: migration76Up},
+	{version: 77, name: "model_mappings_capabilities", up: migration77Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3305,4 +3306,30 @@ func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		return err
 	}
 	return nil
+}
+
+// migration77Up adds the auto-detected capability columns (#49 sub-project
+// 2): cap_vision/cap_video/cap_audio/cap_tools (each "" | "yes" | "no",
+// zero-value-means-unknown like live_progress_support in migration76Up),
+// cap_extra (a JSON array of capability names with no column of their own),
+// capabilities_source (which probe produced them), and the nullable
+// capabilities_checked_at. Append-only, no backfill.
+//
+// Like migration76Up's columns and for the same reason, these are NOT part of
+// the metrics_locked group: see SQLiteStore.UpdateMappingCapabilities.
+func migration77Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"cap_vision text not null default ''",
+		"cap_video text not null default ''",
+		"cap_audio text not null default ''",
+		"cap_tools text not null default ''",
+		"cap_extra text not null default ''",
+		"capabilities_source text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "model_mappings", col); err != nil {
+			return err
+		}
+	}
+	return addColumnIfMissing(ctx, tx, dl, "model_mappings",
+		"capabilities_checked_at "+dl.timestampType())
 }

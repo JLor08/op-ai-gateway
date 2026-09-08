@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/storeerr"
 	"sort"
@@ -1036,6 +1037,54 @@ func (m *MemoryStore) UpdateMappingLiveProgressSupport(_ context.Context, id, su
 	mapping.LiveProgressSupport = support
 	t := at
 	mapping.LiveProgressCheckedAt = &t
+	m.mappings[id] = mapping
+	return nil
+}
+
+// UpdateMappingCapabilities records auto-detected capability verdicts (#49-2),
+// mirroring SQLiteStore.UpdateMappingCapabilities: only non-empty verdicts are
+// written (so a partial probe answer cannot clear a previously stored one),
+// there is NO MetricsLocked guard, and MetricsSource/MetricsUpdatedAt are left
+// untouched. A missing mapping, or a caps value with nothing determined, is a
+// benign no-op that does not stamp CapabilitiesSource/CapabilitiesCheckedAt.
+func (m *MemoryStore) UpdateMappingCapabilities(_ context.Context, id string, caps CapabilityVerdicts, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[id]
+	if !ok {
+		return nil
+	}
+	wrote := false
+	if caps.Vision != "" {
+		mapping.CapVision = caps.Vision
+		wrote = true
+	}
+	if caps.Video != "" {
+		mapping.CapVideo = caps.Video
+		wrote = true
+	}
+	if caps.Audio != "" {
+		mapping.CapAudio = caps.Audio
+		wrote = true
+	}
+	if caps.Tools != "" {
+		mapping.CapTools = caps.Tools
+		wrote = true
+	}
+	if len(caps.Extra) > 0 {
+		encoded, err := json.Marshal(caps.Extra)
+		if err != nil {
+			return fmt.Errorf("update mapping capabilities: encode extra: %w", err)
+		}
+		mapping.CapExtra = string(encoded)
+		wrote = true
+	}
+	if !wrote {
+		return nil // nothing determined: not an error, and not a write
+	}
+	mapping.CapabilitiesSource = caps.Source
+	t := at
+	mapping.CapabilitiesCheckedAt = &t
 	m.mappings[id] = mapping
 	return nil
 }
