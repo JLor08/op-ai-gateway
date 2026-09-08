@@ -2120,10 +2120,21 @@ closes itself the next time that agent is upgraded.
 `server-agent`'s `Version` moved `0.5.0` → `0.6.0` for this entry, MINOR per
 the same rule.
 
-`runtime_upstream_props` breaks the pattern every flag above shares: it is
-the one entry in this registry the **gateway** genuinely gates real behavior
-on, fail-closed, rather than declaring it purely for the portal's benefit
-the way `gpu_selection`, `runtime_api_token` and `runtime_model_probe` do.
+`runtime_upstream_props` is not the only entry in this registry the
+**gateway** gates real behavior on, fail-closed. `runtime_manager` itself
+does: `PushRuntimeConfig` returns early unless the agent has declared it
+([§9](#9-keeping-the-agent-current-the-notification-rule)). So does
+`runtime_config_ack`, which decides which standard of proof a VRAM-isolation
+wait may apply ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+And so does `runtime_model_probe` — not just the ingest write gate above, but
+also withholding probe-derived numbers from the portal model catalog and the
+runtime-model state checker for an agent that has not declared it.
+`gpu_selection` and `runtime_api_token` are the true portal-informational
+flags here: declared for operator visibility, with no gateway behavior
+riding on either. What actually sets `runtime_upstream_props` apart is
+narrower than "the gateway gates on it" — the gateway-side fail-closed gate
+is this flag's ENTIRE REASON FOR EXISTING, not a secondary effect layered
+onto a flag that would otherwise serve some other purpose.
 The agent's router serves `GET /upstream/{model}/props` ([§4.1](#41-control-routes))
 — the GET-only, allowlisted passthrough to a running managed child's
 `/props` (issue #58;

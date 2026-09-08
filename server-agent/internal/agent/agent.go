@@ -115,10 +115,10 @@ import (
 // (issue #58): the runtime router now serves GET /upstream/{model}/props,
 // the GET-only allowlisted passthrough the gateway probes an
 // api-key-protected child's live-progress capability through.
-// agent.Features declares "runtime_upstream_props", MINOR -- and unlike
-// the earlier portal-informational flags, the gateway genuinely gates on
-// this one (fail-closed), so deploying this agent is what turns the
-// gateway-side probing on.
+// agent.Features declares "runtime_upstream_props", MINOR -- a flag whose
+// entire reason for existing is the gateway's fail-closed gate on this
+// probing (the PushRuntimeConfig precedent), so deploying this agent is
+// what turns the gateway-side probing on.
 const Version = "0.7.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
