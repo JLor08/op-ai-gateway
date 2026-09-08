@@ -1446,16 +1446,40 @@ func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 
 // TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch: the M9 contract --
 // the new case is isGet-guarded, so a POST at the same path lands in
-// serveProxy and gets the body-dispatch 404, NOT the allowlist refusal.
+// serveProxy's body-dispatch path, NOT serveUpstreamProps. A body-less POST
+// can't tell the two apart (serveProxy's own empty-model 404 and
+// serveUpstreamProps' allowlist refusal are indistinguishable against an
+// empty-statuses fake), so this drives a named model through a RUNNING
+// status entry: a POST with body {"model":"m"} must reach servePlainProxy
+// and call EnsureRunning (asserted via the fake's counter) -- something
+// serveUpstreamProps never does -- and must NEVER reach the running child
+// directly (asserted via the child's own hit counter), which is what would
+// happen if the isGet guard were missing and the request fell into
+// serveUpstreamProps instead.
 func TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch(t *testing.T) {
-	rt := newRouter(&statusManager{})
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateRunning, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
 	rec := httptest.NewRecorder()
-	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/upstream/m/props", strings.NewReader(`{}`)))
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/upstream/m/props", strings.NewReader(`{"model":"m"}`)))
+
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
+		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
 	}
 	if code := decodeErrorCode(t, rec); code != "runtime.model_not_managed" {
-		t.Fatalf("code = %q, want runtime.model_not_managed (serveProxy's empty-model answer -- proof of fall-through)", code)
+		t.Fatalf("code = %q, want runtime.model_not_managed (statusManager.EnsureRunning's own sentinel -- proof of fall-through)", code)
+	}
+	if n := m.ensures.Load(); n != 1 {
+		t.Fatalf("EnsureRunning called %d times, want 1 -- the POST must drive servePlainProxy's EnsureRunning call, which serveUpstreamProps never makes", n)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 -- a POST must never reach the running child directly through serveUpstreamProps", got)
 	}
 }
 
@@ -1475,4 +1499,67 @@ func TestRouterUpstreamPropsUpstreamGoneOnDialFailure(t *testing.T) {
 	if code := decodeErrorCode(t, rec); code != "runtime.upstream_gone" {
 		t.Fatalf("code = %q, want runtime.upstream_gone", code)
 	}
+}
+
+// TestRouterUpstreamPropsRunningEntryWinsAmongDuplicates: router.go's
+// duplicate-Model scan must skip a non-running entry in favor of a later
+// running one, and among two RUNNING duplicates the FIRST one must win
+// outright -- a binding requirement with its own comment ("first running
+// entry wins") but, before this test, zero coverage. Each sub-case points
+// at a real httptest child with its own hit counter, so "which child
+// answered" is directly observable rather than inferred from the response.
+func TestRouterUpstreamPropsRunningEntryWinsAmongDuplicates(t *testing.T) {
+	t.Run("running entry preferred over an earlier stopped one", func(t *testing.T) {
+		var hits atomic.Int32
+		child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer child.Close()
+		m := &statusManager{statuses: []Status{
+			{SpecID: "s1", Model: "m", State: StateStopped, Port: 0},
+			{SpecID: "s2", Model: "m", State: StateRunning, Port: childPort(t, child.URL)},
+		}}
+		rt := newRouter(m)
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/m/props", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+		}
+		if got := hits.Load(); got != 1 {
+			t.Fatalf("child hits = %d, want 1 -- the running entry must win over the earlier stopped one", got)
+		}
+	})
+
+	t.Run("first running entry wins over a second running entry", func(t *testing.T) {
+		var hitsFirst, hitsSecond atomic.Int32
+		first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hitsFirst.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer first.Close()
+		second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hitsSecond.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer second.Close()
+		m := &statusManager{statuses: []Status{
+			{SpecID: "s1", Model: "m", State: StateRunning, Port: childPort(t, first.URL)},
+			{SpecID: "s2", Model: "m", State: StateRunning, Port: childPort(t, second.URL)},
+		}}
+		rt := newRouter(m)
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/m/props", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+		}
+		if got := hitsFirst.Load(); got != 1 {
+			t.Fatalf("first child hits = %d, want 1", got)
+		}
+		if got := hitsSecond.Load(); got != 0 {
+			t.Fatalf("second child hits = %d, want 0 -- the first running entry must win outright, never the second", got)
+		}
+	})
 }
