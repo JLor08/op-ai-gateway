@@ -22,13 +22,19 @@ const maxToolArgumentsBytes = 1 << 20 // 1 MiB
 
 type OpenAICompatibleClient struct {
 	http *http.Client
+	// liveProgress memoizes the upstreams that REJECTED the two advisory
+	// live-progress request parameters -- negative verdicts only, see
+	// liveProgressMemo (live_progress.go). Held per client rather than as a package
+	// global so its lifetime is the client's: one process-wide client in
+	// production, an isolated one per test.
+	liveProgress *liveProgressMemo
 }
 
 func NewOpenAICompatibleClient(httpClient *http.Client) *OpenAICompatibleClient {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &OpenAICompatibleClient{http: httpClient}
+	return &OpenAICompatibleClient{http: httpClient, liveProgress: newLiveProgressMemo()}
 }
 
 func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Target, req inference.Request) (Response, error) {
@@ -372,7 +378,19 @@ func (c *OpenAICompatibleClient) ProxyNative(ctx context.Context, target routing
 
 var _ StreamingClient = (*OpenAICompatibleClient)(nil)
 
-func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit StreamEmit) error {
+// streamRequestBody builds the Chat Completions STREAMING body. withLiveProgress
+// adds the two advisory live-progress parameters (see live_progress.go); without
+// it the body is exactly what this client sent before that feature existed.
+//
+// Note that dropping them puts `stream_options` back to exactly
+// `{"include_usage": true}` rather than removing the key: include_usage is what
+// makes the terminal usage chunk arrive at all, and every completed-request
+// figure (tokens, cost, the recorded rate) depends on it. Losing an advisory
+// mid-stream number must not cost the authoritative final one.
+//
+// Deliberately a pure function of its arguments, so CompleteStream's retry
+// rebuilds the body from scratch instead of mutating the first attempt's map.
+func streamRequestBody(target routing.Target, req inference.Request, withLiveProgress bool) ([]byte, error) {
 	body := map[string]any{
 		"model":          providerModel(target, req),
 		"stream":         true,
@@ -381,12 +399,12 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	openAIToolFields(body, req)
 	openAISamplingFields(body, req)
-	if wantsLiveProgress(target) {
+	if withLiveProgress {
 		// Ask for an EXACT running output-token count mid-stream. llama.cpp then
 		// attaches its timings object (predicted_n + predicted_per_second) to every
 		// partial; vLLM puts its running completion_tokens on every chunk.
 		// continuous_usage_stats is inert without include_usage, which is set above
-		// and must stay set. See live_progress.go for why this is gated.
+		// and must stay set. See live_progress.go for why this is only a hint.
 		body["timings_per_token"] = true
 		body["stream_options"] = map[string]any{
 			"include_usage":          true,
@@ -395,11 +413,91 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("%w: encode request", ErrInvalidResponse)
+		return nil, fmt.Errorf("%w: encode request", ErrInvalidResponse)
+	}
+	return raw, nil
+}
+
+// schemaRejectionStatus reports whether status is one an upstream uses to refuse a
+// body it could not accept: 400 Bad Request or 422 Unprocessable Entity, and
+// nothing else. 503 is excluded ON PURPOSE -- unavailableStatus maps it to
+// ErrUpstreamStarting, which the load runner consumes as "still warming up", and
+// re-issuing the request would both destroy that signal and hit an upstream that
+// is not ready. Every other status keeps its existing meaning too.
+func schemaRejectionStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+// CompleteStream streams a chat completion, translating the upstream's SSE into
+// this codebase's StreamEvents.
+//
+// The two live-progress parameters are ADVISORY: no live figure may fail, delay or
+// alter a request. So a schema rejection is made a NON-EVENT rather than predicted
+// -- the allow-list in live_progress.go is only a performance hint -- and an
+// upstream that refuses them is re-asked once without them. The retry is invisible
+// to the client because all three of its guards must hold:
+//
+//  1. the parameters were actually sent (liveProgress). A request that never
+//     carried them is never retried, so an ordinary 400 keeps its meaning.
+//  2. the failure is of the schema-rejection class: a 400/422 status
+//     (schemaRejectionStatus) or an in-stream error frame. Never 503, never any
+//     other status.
+//  3. nothing has been emitted yet -- an explicit boolean set on the first
+//     SUCCESSFUL emit, so the invariant is CHECKED rather than inferred from where
+//     the code happens to sit.
+//
+// With (3) holding, the already-sent 200 + text/event-stream headers stop being a
+// liability: there is no failure to report to the client, so the second attempt
+// just proceeds, minus one advisory number, and the portal renders the "never
+// measured" em-dash it already has for that case.
+//
+// Payload capture across a retry: CaptureSink.RecordRequest ASSIGNS, so the
+// captured request body is the one that actually ran. WriteResponse appends, but a
+// rejected attempt never reaches it -- the status check precedes both
+// RecordResponseHeaders and the response tee -- so only the rarer in-stream-error
+// retry leaves the failed attempt's frames ahead of the served ones, which is a
+// faithful record of what the gateway did.
+func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit StreamEmit) error {
+	// Guard (1): on the allow-list AND not already known to reject the parameters.
+	// An empty memo means "send them" (live_progress.go).
+	liveProgress := wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)
+	// Guard (3): flipped by the wrapper below on the first emit that RETURNED nil,
+	// i.e. the first event the client may already have seen.
+	emitted := false
+	tracked := func(ev inference.StreamEvent) error {
+		if err := emit(ev); err != nil {
+			return err
+		}
+		emitted = true
+		return nil
+	}
+	schemaRejected, err := c.completeStreamAttempt(ctx, target, req, liveProgress, tracked)
+	if err == nil || !liveProgress || emitted || !schemaRejected {
+		return err
+	}
+	// Deliberately NOT a loop: exactly one retry, bounded by construction rather
+	// than by remembering to clear a flag. The second attempt carries none of the
+	// advisory parameters, so whatever it reports is the upstream's real answer and
+	// belongs to the client unchanged.
+	c.liveProgress.recordRejection(target.RouteID)
+	_, err = c.completeStreamAttempt(ctx, target, req, false, tracked)
+	return err
+}
+
+// completeStreamAttempt performs ONE upstream streaming request and translates its
+// SSE into emit calls. Its first result reports whether the attempt failed the way
+// an upstream that cannot accept the live-progress parameters fails -- a 400/422
+// status, or an in-stream error frame. It is advice, not a verdict: CompleteStream
+// acts on it only under its own three guards, so it can never affect a request
+// that did not carry the parameters or that has already emitted.
+func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, target routing.Target, req inference.Request, liveProgress bool, emit StreamEmit) (bool, error) {
+	raw, err := streamRequestBody(target, req, liveProgress)
+	if err != nil {
+		return false, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+		return false, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
 	httpReq.Header.Set(contentTypeHeader, jsonContentType)
 	applyUpstreamAuth(ctx, httpReq)
@@ -408,13 +506,13 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	httpResp, err := c.http.Do(httpReq)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTimeout
+			return false, ErrTimeout
 		}
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return false, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return unavailableStatus(httpResp.StatusCode)
+		return schemaRejectionStatus(httpResp.StatusCode), unavailableStatus(httpResp.StatusCode)
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 
@@ -484,7 +582,11 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 			continue
 		}
 		if chunk.Error != nil {
-			return fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
+			// An in-stream error frame. Reported as retryable too: guard (3) means the
+			// client has seen nothing yet, and some OpenAI-compatible proxies (LiteLLM,
+			// OpenRouter -- reachable behind a llama_swap `peer`) surface a rejected body
+			// as an error EVENT after a 200 rather than as a 400 status.
+			return true, fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
 		}
 		if chunk.Usage != nil {
 			total := chunk.Usage.TotalTokens
@@ -533,7 +635,7 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 					Reasoning: reasoning,
 					Progress:  progress,
 				}); err != nil {
-					return err
+					return false, err
 				}
 			}
 			for _, tc := range d.ToolCalls {
@@ -559,15 +661,15 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTimeout
+			return false, ErrTimeout
 		}
-		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
+		return false, fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
 	}
 	// Emit each fully-assembled tool call before the terminal Completed event.
 	for _, idx := range toolOrder {
 		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: toolAcc[idx]}); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: finishReason})
+	return false, emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: finishReason})
 }

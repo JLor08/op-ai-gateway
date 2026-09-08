@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,7 +14,9 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -727,4 +730,277 @@ func TestOpenAISamplingForwardsReasoningEffort(t *testing.T) {
 	if _, ok := body2["reasoning_effort"]; ok {
 		t.Fatalf("reasoning_effort must be omitted when unset: %v", body2)
 	}
+}
+
+// liveProgressUpstream is a test upstream for the live-progress retry: it records
+// every request body it receives and answers each one from the supplied handler,
+// so a test can assert both what was sent and how many round trips happened.
+type liveProgressUpstream struct {
+	mu     sync.Mutex
+	bodies [][]byte
+}
+
+func (u *liveProgressUpstream) serve(reply func(w http.ResponseWriter, attempt int, body []byte)) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		u.mu.Lock()
+		u.bodies = append(u.bodies, raw)
+		attempt := len(u.bodies)
+		u.mu.Unlock()
+		reply(w, attempt, raw)
+	}))
+}
+
+func (u *liveProgressUpstream) recorded() [][]byte {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([][]byte(nil), u.bodies...)
+}
+
+// hasLiveProgressParams reports whether a recorded request body carries the two
+// live-progress parameters, and (for the negative case) that stream_options was
+// restored to EXACTLY {"include_usage": true} rather than dropped -- include_usage
+// is what makes the terminal usage chunk arrive at all.
+func hasLiveProgressParams(t *testing.T, raw []byte) bool {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal recorded body: %v", err)
+	}
+	opts, ok := body["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Fatalf("stream_options = %#v, want include_usage true in every body", body["stream_options"])
+	}
+	_, timings := body["timings_per_token"]
+	if timings != (opts["continuous_usage_stats"] == true) {
+		t.Fatalf("the two live-progress parameters must move together, got %#v", body)
+	}
+	if !timings && len(opts) != 1 {
+		t.Fatalf("stream_options = %#v, want exactly {include_usage: true} without live progress", opts)
+	}
+	return timings
+}
+
+// TestCompleteStreamRetriesWithoutLiveProgressParamsOnSchemaRejection is the
+// heart of the fix: an upstream that refuses the two advisory parameters with a
+// 400 must not cost the request. The rejection is known BEFORE the first emit, so
+// re-issuing the same request without them is invisible to the client -- the
+// stream proceeds, minus one advisory number.
+func TestCompleteStreamRetriesWithoutLiveProgressParamsOnSchemaRejection(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			up := &liveProgressUpstream{}
+			server := up.serve(func(w http.ResponseWriter, _ int, body []byte) {
+				if bytes.Contains(body, []byte("timings_per_token")) {
+					w.WriteHeader(status)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+				_, _ = io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			})
+			defer server.Close()
+
+			client := NewOpenAICompatibleClient(server.Client())
+			var text string
+			var usage *inference.Usage
+			err := client.CompleteStream(context.Background(),
+				routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaCPP, RouteID: "map_live", ProviderModel: "m", Timeout: 5 * time.Second},
+				streamTestRequest(),
+				func(ev inference.StreamEvent) error {
+					text += ev.Text
+					if ev.Usage != nil {
+						usage = ev.Usage
+					}
+					return nil
+				})
+			if err != nil {
+				t.Fatalf("CompleteStream returned %v, want nil (a rejection of an advisory parameter must be a non-event)", err)
+			}
+			if text != "hi" {
+				t.Fatalf("emitted text = %q, want %q", text, "hi")
+			}
+			if usage == nil || usage.OutputTokens != 2 {
+				t.Fatalf("terminal usage = %+v, want completion_tokens 2 (include_usage must survive the retry)", usage)
+			}
+			bodies := up.recorded()
+			if len(bodies) != 2 {
+				t.Fatalf("upstream requests = %d, want 2 (one with the parameters, one without)", len(bodies))
+			}
+			if !hasLiveProgressParams(t, bodies[0]) {
+				t.Fatal("first attempt did not carry the live-progress parameters")
+			}
+			if hasLiveProgressParams(t, bodies[1]) {
+				t.Fatal("retry still carried the live-progress parameters")
+			}
+		})
+	}
+}
+
+// TestCompleteStreamDoesNotRetryOn503 pins guard (2)'s exclusion: 503 means
+// ErrUpstreamStarting, which the load runner consumes as "still warming up".
+// Retrying it would both destroy that signal and hammer an upstream that is not
+// ready, so a 503 must stay exactly one round trip and exactly that error.
+func TestCompleteStreamDoesNotRetryOn503(t *testing.T) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, _ []byte) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	defer server.Close()
+
+	client := NewOpenAICompatibleClient(server.Client())
+	err := client.CompleteStream(context.Background(),
+		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaCPP, RouteID: "map_live", ProviderModel: "m", Timeout: 5 * time.Second},
+		streamTestRequest(), func(inference.StreamEvent) error { return nil })
+	if !errors.Is(err, ErrUpstreamStarting) {
+		t.Fatalf("err = %v, want ErrUpstreamStarting", err)
+	}
+	if n := len(up.recorded()); n != 1 {
+		t.Fatalf("upstream requests = %d, want 1 (503 is not a schema rejection)", n)
+	}
+}
+
+// TestCompleteStreamDoesNotRetryWhenTheParametersWereNotSent pins guard (1): a
+// request that never carried the parameters has nothing to retry WITHOUT, so an
+// ordinary 400 keeps its meaning and costs one round trip.
+func TestCompleteStreamDoesNotRetryWhenTheParametersWereNotSent(t *testing.T) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, _ []byte) {
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	defer server.Close()
+
+	client := NewOpenAICompatibleClient(server.Client())
+	err := client.CompleteStream(context.Background(),
+		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLiteLLM, RouteID: "map_litellm", ProviderModel: "m", Timeout: 5 * time.Second},
+		streamTestRequest(), func(inference.StreamEvent) error { return nil })
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if n := len(up.recorded()); n != 1 {
+		t.Fatalf("upstream requests = %d, want 1 (nothing to retry without)", n)
+	}
+}
+
+// TestCompleteStreamRetriesOnInStreamErrorBeforeFirstToken covers the case a
+// 400 does not: some OpenAI-compatible proxies (LiteLLM, OpenRouter -- reachable
+// behind a llama_swap `peer`) answer 200 and then report the refused body as an
+// SSE error EVENT. Nothing has been emitted at that point, so the same retry
+// applies.
+func TestCompleteStreamRetriesOnInStreamErrorBeforeFirstToken(t *testing.T) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, body []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if bytes.Contains(body, []byte("timings_per_token")) {
+			_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"Unrecognized request argument supplied: timings_per_token\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	defer server.Close()
+
+	client := NewOpenAICompatibleClient(server.Client())
+	var text string
+	err := client.CompleteStream(context.Background(),
+		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaSwap, RouteID: "map_peer", ProviderModel: "m", Timeout: 5 * time.Second},
+		streamTestRequest(),
+		func(ev inference.StreamEvent) error { text += ev.Text; return nil })
+	if err != nil {
+		t.Fatalf("CompleteStream returned %v, want nil", err)
+	}
+	if text != "ok" {
+		t.Fatalf("emitted text = %q, want %q", text, "ok")
+	}
+	if n := len(up.recorded()); n != 2 {
+		t.Fatalf("upstream requests = %d, want 2", n)
+	}
+}
+
+// TestCompleteStreamDoesNotRetryAfterTheFirstEmit pins guard (3), the invariant
+// that makes the retry invisible. Here the error frame arrives AFTER a text delta
+// the client has already seen, so re-issuing the request would duplicate served
+// content: the error must be surfaced instead, in one round trip.
+func TestCompleteStreamDoesNotRetryAfterTheFirstEmit(t *testing.T) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, _ []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"boom\"}}\n\n")
+	})
+	defer server.Close()
+
+	client := NewOpenAICompatibleClient(server.Client())
+	var text string
+	err := client.CompleteStream(context.Background(),
+		routing.Target{Endpoint: server.URL, Provider: routing.ProviderLlamaCPP, RouteID: "map_live", ProviderModel: "m", Timeout: 5 * time.Second},
+		streamTestRequest(),
+		func(ev inference.StreamEvent) error { text += ev.Text; return nil })
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable (an error after the first emit must be reported, not retried)", err)
+	}
+	if text != "Hel" {
+		t.Fatalf("emitted text = %q, want %q", text, "Hel")
+	}
+	if n := len(up.recorded()); n != 1 {
+		t.Fatalf("upstream requests = %d, want 1 (no retry once the client has seen a token)", n)
+	}
+}
+
+// TestCompleteStreamMemoizesTheRejectionPerMapping proves the negative-only memo
+// does its job: a genuinely incompatible upstream costs ONE wasted round trip for
+// the mapping, not one per request. The second request skips the parameters
+// outright; a different mapping is unaffected (no positive verdict is cached
+// either way, so an empty memo still means "send them").
+func TestCompleteStreamMemoizesTheRejectionPerMapping(t *testing.T) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, body []byte) {
+		if bytes.Contains(body, []byte("timings_per_token")) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	defer server.Close()
+
+	client := NewOpenAICompatibleClient(server.Client())
+	target := routing.Target{Endpoint: server.URL, Provider: routing.ProviderServerAgent, RouteID: "map_custom", ProviderModel: "m", Timeout: 5 * time.Second}
+	for i := range 3 {
+		if err := client.CompleteStream(context.Background(), target, streamTestRequest(), func(inference.StreamEvent) error { return nil }); err != nil {
+			t.Fatalf("CompleteStream #%d returned %v", i+1, err)
+		}
+	}
+	bodies := up.recorded()
+	// Request 1: rejected attempt + retry. Requests 2 and 3: one attempt each,
+	// already without the parameters.
+	if len(bodies) != 4 {
+		t.Fatalf("upstream requests = %d, want 4 (2 for the first call, 1 each afterwards)", len(bodies))
+	}
+	if !hasLiveProgressParams(t, bodies[0]) {
+		t.Fatal("first attempt did not carry the parameters")
+	}
+	for i, raw := range bodies[1:] {
+		if hasLiveProgressParams(t, raw) {
+			t.Fatalf("request %d carried the parameters again after the rejection was memoized", i+2)
+		}
+	}
+
+	// A different mapping is not covered by that memo entry.
+	other := target
+	other.RouteID = "map_other"
+	if err := client.CompleteStream(context.Background(), other, streamTestRequest(), func(inference.StreamEvent) error { return nil }); err != nil {
+		t.Fatalf("CompleteStream for the other mapping returned %v", err)
+	}
+	bodies = up.recorded()
+	if !hasLiveProgressParams(t, bodies[4]) {
+		t.Fatal("a different mapping did not get the parameters (the memo must be per mapping)")
+	}
+}
+
+// streamTestRequest is the minimal one-message request the live-progress retry
+// tests above stream.
+func streamTestRequest() inference.Request {
+	return inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}
 }
