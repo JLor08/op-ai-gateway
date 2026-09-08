@@ -362,6 +362,10 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
 }
 
+// upstreamPropsSuffix is the one child endpoint the /upstream passthrough
+// allowlists -- both the inbound suffix match and the outbound path.
+const upstreamPropsSuffix = "/props"
+
 // serveUpstreamProps handles GET /upstream/{model}/props (issue #58): the
 // llama-swap-style upstream passthrough, restricted to a GET of exactly
 // /props on a RUNNING child. The gateway probes an api-key-protected child's
@@ -387,14 +391,14 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 //     running right now" are different diagnoses.
 func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/upstream/")
-	if !strings.HasSuffix(rest, "/props") {
+	if !strings.HasSuffix(rest, upstreamPropsSuffix) {
 		writeError(w, http.StatusNotFound, "runtime.upstream_endpoint_not_allowed",
 			"only /props may be requested through /upstream/{model}")
 		return
 	}
-	model := strings.TrimSuffix(rest, "/props")
+	model := strings.TrimSuffix(rest, upstreamPropsSuffix)
 	if model == "" || rt.m == nil {
-		writeError(w, http.StatusNotFound, "runtime.model_not_managed",
+		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
 		return
 	}
@@ -413,7 +417,7 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "runtime.model_not_managed",
+		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
 		return
 	}
@@ -422,13 +426,13 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 			"model is managed but not running; this probe never starts a child")
 		return
 	}
-	target := "http://127.0.0.1:" + strconv.Itoa(port) + "/props"
+	target := "http://127.0.0.1:" + strconv.Itoa(port) + upstreamPropsSuffix
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "runtime.upstream_gone", err.Error())
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
 		return
 	}
 	req.Header = r.Header.Clone()
@@ -444,7 +448,7 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 		// The Status snapshot can race an idle drain: the child was running
 		// a moment ago and the port is dead now. Same code the proxy paths
 		// use for "something went wrong reaching an admitted child".
-		writeError(w, http.StatusBadGateway, "runtime.upstream_gone", err.Error())
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
 		return
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-side close, best-effort
@@ -480,7 +484,7 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 
 	var peek modelStreamPeek
 	if err := json.Unmarshal(body, &peek); err != nil || peek.Model == "" {
-		writeError(w, http.StatusNotFound, "runtime.model_not_managed", "request body does not name a managed model")
+		writeError(w, http.StatusNotFound, codeModelNotManaged, "request body does not name a managed model")
 		return
 	}
 
@@ -974,6 +978,13 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
+// Stable wire codes duplicated-by-string often enough that they live as
+// constants; the full code table is sentinelCode below and design doc par.4.3.
+const (
+	codeModelNotManaged = "runtime.model_not_managed"
+	codeUpstreamGone    = "runtime.upstream_gone"
+)
+
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
 // and HTTP status. Any error that is not one of the five named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
@@ -984,7 +995,7 @@ type errorBody struct {
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
-		return "runtime.model_not_managed", http.StatusNotFound
+		return codeModelNotManaged, http.StatusNotFound
 	case errors.Is(err, ErrStartFailed):
 		return "runtime.start_failed", http.StatusBadGateway
 	case errors.Is(err, ErrStartTimeout):
@@ -994,7 +1005,7 @@ func sentinelCode(err error) (code string, status int) {
 	case errors.Is(err, ErrNotPermitted):
 		return "runtime.not_permitted", http.StatusBadGateway
 	default:
-		return "runtime.upstream_gone", http.StatusBadGateway
+		return codeUpstreamGone, http.StatusBadGateway
 	}
 }
 
