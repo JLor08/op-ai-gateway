@@ -1126,6 +1126,123 @@ func TestIngestTelemetrySampleLiveProgressWriteBackMemoizesRepeatedSpecID(t *tes
 	}
 }
 
+// TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec is the
+// capability write-back's own cross-tenant guard, the third sibling of
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec and
+// TestIngestTelemetrySampleRuntimeContextWriteBackRejectsCrossServerSpec:
+// spec_id is an agent-supplied body field with no other verification anywhere
+// on this path, and the only thing binding a sample to a server is the
+// token-derived serverID. An agent authenticated for one server must not be
+// able to overwrite another server's mapping verdict by naming its spec_id.
+// Until this test, deleting resolveRuntimeSpecLiveProgress's ownership check
+// passed the whole suite.
+//
+// The sample carries TWO runtimes: the foreign spec plus a control spec the
+// reporting server does own. That makes the assertions unfalsifiable by
+// accident -- the write count must be exactly 1 (the control's), so removing
+// the ownership check turns it into 2, and the foreign mapping is seeded with
+// a DISTINGUISHABLE stored verdict ("unsupported") that the forged sample
+// would flip to "supported". The Warn is asserted too, matching the VRAM
+// sibling's audit-trail discipline: an agent naming another server's
+// resources is a signal worth keeping.
+func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant-lp"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	// rspec_cross_lp belongs to otherServerID; rspec_own_lp to the reporting one.
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_lp", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_own_lp", false)
+	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_cross_lp", "unsupported", now); err != nil {
+		t.Fatalf("seed the foreign mapping's stored verdict: %v", err)
+	}
+
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},"runtimes":[` +
+		`{"spec_id":"rspec_cross_lp","state":"running","live_progress_support":"supported"},` +
+		`{"spec_id":"rspec_own_lp","state":"running","live_progress_support":"supported"}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
+	}
+
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want exactly 1 (only the control spec this server owns)", got)
+	}
+	foreign, err := srv.Routes.MappingByID(ctx, "map_rspec_cross_lp")
+	if err != nil {
+		t.Fatalf("MappingByID (foreign): %v", err)
+	}
+	if foreign.LiveProgressSupport != "unsupported" {
+		t.Fatalf("foreign LiveProgressSupport = %q, want the untouched %q -- an agent for one server must not overwrite another server's mapping verdict via spec_id", foreign.LiveProgressSupport, "unsupported")
+	}
+	own, err := srv.Routes.MappingByID(ctx, "map_rspec_own_lp")
+	if err != nil {
+		t.Fatalf("MappingByID (own): %v", err)
+	}
+	if own.LiveProgressSupport != "supported" {
+		t.Fatalf("own LiveProgressSupport = %q, want %q -- the ownership check must not become a blanket rejection", own.LiveProgressSupport, "supported")
+	}
+	if !findLogRecord(buf.Snapshot(), "WARN", "spec belongs to a different server") {
+		t.Fatal("a cross-server naming attempt must log a Warn, not a Debug -- an agent naming another server's resources is an audit signal, not a merely stale id")
+	}
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability pins the
+// runtime_model_probe gate on this write-back, mirroring
+// TestIngestTelemetrySampleRuntimeContextWriteBackGuardedByCapability for its
+// context sibling. The verdict rides on the exact same per-runtime probe pass
+// (server-agent's probeRuntimeChild) that produces context_size, so it shares
+// that pass's trust boundary: an agent that has never declared
+// runtime_model_probe must never have a mapping's stored capability touched
+// from this path. That ruling had nothing protecting it -- the gate could be
+// deleted with the suite still green.
+//
+// The mapping is seeded with a stored "unsupported" that the ungated write
+// would flip to "supported", and the writer's call count is asserted at zero,
+// so neither assertion can pass off an empty-equals-empty coincidence.
+func TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_nocap", false)
+	ctx := context.Background()
+	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_lp_nocap", "unsupported", time.Now().UTC()); err != nil {
+		t.Fatalf("seed stored verdict: %v", err)
+	}
+	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	// No "capabilities" object at all -- an agent that never declared
+	// runtime_model_probe, exactly like an older agent build.
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_lp_nocap","state":"running","live_progress_support":"supported"}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want 0 (the agent did not declare runtime_model_probe)", got)
+	}
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_nocap")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if mapping.LiveProgressSupport != "unsupported" {
+		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", mapping.LiveProgressSupport, "unsupported")
+	}
+}
+
 // TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO proves a runtime
 // sample's live_progress_support reaches the volatile RuntimeStatusDTO the
 // portal's live SSE stream serves, mirroring
