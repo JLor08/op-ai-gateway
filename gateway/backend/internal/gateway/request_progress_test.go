@@ -209,6 +209,12 @@ func TestLiveProgressDTO(t *testing.T) {
 	noCount := &requestProgress{}
 	noCount.firstTokenUnixNano.Store(first.UnixNano())
 
+	// Clock skew: firstTokenUnixNano is recorded before StartedAt. The negative
+	// TTFT must be clamped to 0.
+	earlyFirst := start.Add(-100 * time.Millisecond)
+	beforeStart := &requestProgress{}
+	beforeStart.firstTokenUnixNano.Store(earlyFirst.UnixNano())
+
 	cases := []struct {
 		name       string
 		p          *requestProgress
@@ -220,6 +226,7 @@ func TestLiveProgressDTO(t *testing.T) {
 		{"upstream reported", upstream, 40, 21.5, "upstream", 500},
 		{"gateway derived", gateway, 50, 25, "gateway", 500},
 		{"no exact count", noCount, 0, 0, "", 500},
+		{"first token before start (clock skew)", beforeStart, 0, 0, "", 0},
 		{"no progress at all", nil, 0, 0, "", 0},
 	}
 	for _, tc := range cases {
