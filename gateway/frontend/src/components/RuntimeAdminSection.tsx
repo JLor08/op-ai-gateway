@@ -3087,7 +3087,10 @@ export function RuntimeAdminSection({
         const live = statusForMapping(m);
         const metrics = probeChipInfo(live?.metrics_probe ?? '', t.runtimeProbeMetricsPrefix, t);
         const context = probeChipInfo(live?.context_probe ?? '', t.runtimeProbeContextPrefix, t);
-        if (!metrics && !context) return null;
+        // Both absent (no live status joined at all, or both probes are ""):
+        // the shared "not measured" em-dash (#51), not `null` -- issue #57 is
+        // exactly an empty cell here reading as a column that does not exist.
+        if (!metrics && !context) return '—';
         // Tooltip + <span> wrapper, NOT Tooltip + StatusChip directly: MUI's
         // Tooltip works by cloning its event handlers (and a ref) onto its
         // child, and the shared StatusChip destructures only { status, label }
@@ -3314,6 +3317,54 @@ export function RuntimeAdminSection({
           )}
         </Box>
       ),
+    },
+    {
+      // Task 6 (#50) shipped this column into the MAPPING table's own
+      // `columns` above, by the letter of its own design spec ("add one
+      // compact Probes column to the mapping live-status table"). The
+      // operator who went looking for it typed "Live-Status" and meant THIS
+      // tab -- see #57. A Live-Status row IS a RuntimeStatus, so unlike the
+      // mapping variant's `statusForMapping` spec-id join, this one reads
+      // `row.metrics_probe`/`row.context_probe` directly. Positioned right
+      // after `state`, mirroring the mapping table's `probes` column sitting
+      // right after its own `live_status`: one column says "is it running",
+      // the next says "can we actually see its numbers".
+      id: 'probes',
+      label: t.runtimeProbesColumn,
+      value: (row) => [row.metrics_probe, row.context_probe].filter(Boolean).join(' '),
+      sortable: false,
+      searchable: false,
+      render: (row) => {
+        const metrics = probeChipInfo(row.metrics_probe, t.runtimeProbeMetricsPrefix, t);
+        const context = probeChipInfo(row.context_probe, t.runtimeProbeContextPrefix, t);
+        // Both "" (a legacy agent, no spec status has arrived yet, or the
+        // child is not running): the shared "not measured" em-dash (#51), not
+        // `null` -- see the identical comment on the mapping table's `probes`
+        // column above.
+        if (!metrics && !context) return '—';
+        // Tooltip + <span> wrapper, NOT Tooltip + StatusChip directly: see
+        // the mapping table's `probes` column above for why the wrapper is
+        // load-bearing (MUI's Tooltip clones handlers onto its child; the
+        // shared StatusChip is not forwardRef).
+        return (
+          <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', flexWrap: 'wrap' }}>
+            {metrics && (
+              <Tooltip title={metrics.tooltip}>
+                <span>
+                  <StatusChip status={metrics.status} label={metrics.label} />
+                </span>
+              </Tooltip>
+            )}
+            {context && (
+              <Tooltip title={context.tooltip}>
+                <span>
+                  <StatusChip status={context.status} label={context.label} />
+                </span>
+              </Tooltip>
+            )}
+          </Box>
+        );
+      },
     },
     {
       id: 'since',
