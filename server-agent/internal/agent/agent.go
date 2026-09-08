@@ -110,7 +110,16 @@ import (
 // gateway/portal talking to an older agent can tell that a runtime panel
 // will stay blank rather than let the operator mistake missing data for a
 // broken model server.
-const Version = "0.6.0"
+//
+// 0.6.0 -> 0.7.0 is the single bump for the router-upstream-props branch
+// (issue #58): the runtime router now serves GET /upstream/{model}/props,
+// the GET-only allowlisted passthrough the gateway probes an
+// api-key-protected child's live-progress capability through.
+// agent.Features declares "runtime_upstream_props", MINOR -- and unlike
+// the earlier portal-informational flags, the gateway genuinely gates on
+// this one (fail-closed), so deploying this agent is what turns the
+// gateway-side probing on.
+const Version = "0.7.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
