@@ -403,7 +403,9 @@ func TestDetectCapabilities(t *testing.T) {
 // the sibling module's side too (the detectLiveProgressSupport precedent).
 func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
 	body := []byte(`{"role":"router","modalities":{"vision":true}}`)
-	if got := detectCapabilities(body); got != (Capabilities{}) {
+	// reflect.DeepEqual, not ==: Capabilities carries an []string, so the
+	// struct is not comparable.
+	if got := detectCapabilities(body); !reflect.DeepEqual(got, Capabilities{}) {
 		t.Fatalf("router dummy yielded %+v", got)
 	}
 	if got := detectLiveProgressSupport(body); got != "" {
@@ -591,7 +593,8 @@ func TestProbePropsVerdictsKeepsTheConclusiveSet(t *testing.T) {
 		if !stable {
 			t.Fatalf("status %d must be conclusive", status)
 		}
-		if v.LiveProgress != "" || v.Caps != (Capabilities{}) {
+		// reflect.DeepEqual, not ==: Capabilities carries an []string.
+		if v.LiveProgress != "" || !reflect.DeepEqual(v.Caps, Capabilities{}) {
 			t.Fatalf("status %d yielded verdicts: %+v", status, v)
 		}
 	}
