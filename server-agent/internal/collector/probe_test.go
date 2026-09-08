@@ -204,6 +204,134 @@ func TestProbeContext_NilClientFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestDetectLiveProgressSupport is the decision-rule test for #51's
+// agent-side detector: it pins detectLiveProgressSupport's exact
+// supported/unsupported/unknown boundary. These cases are DELIBERATELY the
+// same as gateway/backend/internal/provider/model_info_test.go's
+// TestParseModelInfoLiveProgressSupport table, byte-for-byte where the shape
+// overlaps -- the two detectLiveProgressSupport copies (one per Go module)
+// must decide identically on identical input, and this shared table is what
+// makes a silent drift between them show up as a failing test on EITHER
+// side instead of going unnoticed.
+//
+// The vLLM and Ollama cases are the load-bearing ones: a vLLM app's context
+// probe fetches /v1/models, an entirely different schema that was never
+// asked about timings_per_token, so it must read as unknown ("") and NEVER
+// as "unsupported" -- the naive simplification ("answered without the key
+// -> unsupported") would silently drop live-progress support for every
+// working vLLM/Ollama upstream. If either of those two cases starts
+// asserting "unsupported", that regression has landed; fix
+// detectLiveProgressSupport, not this test.
+func TestDetectLiveProgressSupport(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"llama.cpp /props WITH the key -> supported (never inspect the value, which is always false)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false,"n_predict":-1}}}`,
+			"supported",
+		},
+		{
+			"llama.cpp /props WITHOUT the key -> unsupported, a real verdict (an older build)",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096,"params":{"n_predict":-1}}}`,
+			"unsupported",
+		},
+		{
+			"a vLLM /v1/models body must NEVER be read as unsupported -- it is a different schema, not an older llama.cpp",
+			`{"object":"list","data":[{"id":"facebook/opt-125m","object":"model","owned_by":"vllm","max_model_len":2048}]}`,
+			"",
+		},
+		{
+			"an Ollama /api/show body -> unknown, not unsupported",
+			`{"model_info":{"general.architecture":"llama"},"parameters":"num_ctx 4096","template":"{{ .Prompt }}"}`,
+			"",
+		},
+		{
+			"a /props-shaped body with default_generation_settings but no params object at all -> unknown",
+			`{"model":"m","default_generation_settings":{"n_ctx":4096}}`,
+			"",
+		},
+		{
+			"unparseable bytes -> unknown",
+			`not json`,
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectLiveProgressSupport([]byte(tc.body)); got != tc.want {
+				t.Fatalf("detectLiveProgressSupport(%s) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this
+// probe GETs collector.LiveProgressProbePath ("/props") unconditionally,
+// with NO specType parameter at all -- unlike ProbeContext, it never
+// dispatches on the effective runtime type. A "custom"-typed child (the
+// type routing.DeriveProbePaths gives no context path to at all) still gets
+// probed here, and a body carrying the key still reports "supported".
+func TestProbeLiveProgressSupport_Supported(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`)
+
+	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "supported" {
+		t.Errorf("ProbeLiveProgressSupport = %q, want %q", got, "supported")
+	}
+}
+
+// TestProbeLiveProgressSupport_Unsupported covers a real /props document
+// from an older llama.cpp build that never added the field.
+func TestProbeLiveProgressSupport_Unsupported(t *testing.T) {
+	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`)
+
+	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "unsupported" {
+		t.Errorf("ProbeLiveProgressSupport = %q, want %q", got, "unsupported")
+	}
+}
+
+// TestProbeLiveProgressSupport_Unreachable proves a failed fetch (a non-2xx
+// status) is swallowed to "" rather than propagated as an error or having
+// its body inspected -- this probe is advisory and must never fail a
+// collect cycle. The response body here is deliberately a WOULD-BE
+// "supported" /props document: if ProbeLiveProgressSupport ever stopped
+// checking the status code (fetchProbeBody's 2xx check is what this test
+// pins), this exact body would parse as "supported" instead of "" --
+// without that body shape, a broken implementation that ignored the status
+// entirely could still coincidentally return "" (an empty/error body also
+// parses to ""), which would let this test pass without actually covering
+// the status check.
+func TestProbeLiveProgressSupport_Unreachable(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+	}))
+	defer ts.Close()
+
+	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
+	}
+}
+
+// TestProbeLiveProgressSupport_OtherShape mirrors the gateway side's vLLM
+// case at the HTTP-probe level (not just the parse-rule level covered by
+// TestDetectLiveProgressSupport above): a vLLM-shaped body served back for
+// this fixed "/props" GET must read as unknown, never "unsupported".
+func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
+	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
+
+	got := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	if got != "" {
+		t.Errorf("ProbeLiveProgressSupport = %q, want %q (unknown) for a non-/props shape", got, "")
+	}
+}
+
 // TestSafeProbePath is the agent's defense-in-depth SSRF guard: only an empty
 // or single-"/"-rooted relative path with no scheme/authority/whitespace is
 // safe to append to the loopback base. The attack vectors (@userinfo, //

@@ -2026,3 +2026,230 @@ func TestCollectOnceRuntimeProbeStatesContextCacheHitOK(t *testing.T) {
 		t.Errorf("ContextSize (cycle 2, cache hit) = %d, want 8192", got)
 	}
 }
+
+// TestCollectOnceRuntimeLiveProgressCustomTypeSupported is task 4's core
+// recovery proof: a "custom"-typed child -- the effective type
+// routing.DeriveProbePaths gives NO context path at all, so ContextProbe
+// stays "na" and nothing is ever fetched for context -- still gets its
+// live-progress capability determined, because probeRuntimeChildLiveProgress
+// GETs collector.LiveProgressProbePath ("/props") unconditionally, never
+// gated on Type or ContextProbePath. Without this, a llama.cpp build
+// launched without an explicit Type would never be probed for this
+// capability at all.
+func TestCollectOnceRuntimeLiveProgressCustomTypeSupported(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_custom_supported",
+			Model:  "mystery-model",
+			State:  runtimectl.StateRunning,
+			PID:    6001,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "custom",
+			// No MetricsPath/ContextProbePath -- routing.DeriveProbePaths
+			// gives a "custom" spec neither, exactly mirroring the real
+			// wire shape the gateway would send for it.
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.ContextProbe != "na" {
+		t.Errorf("ContextProbe = %q, want %q (a custom spec has no context path)", rs.ContextProbe, "na")
+	}
+	if rs.LiveProgressSupport != "supported" {
+		t.Errorf("LiveProgressSupport = %q, want %q (the custom-type recovery case)", rs.LiveProgressSupport, "supported")
+	}
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Errorf("/props hits = %d, want 1 (the capability probe must GET /props for a custom-typed child)", hits)
+	}
+}
+
+// TestCollectOnceRuntimeLiveProgressUnsupported covers a real, determined
+// "unsupported" verdict: a llama.cpp /props document whose
+// default_generation_settings.params object is present but lacks
+// timings_per_token (an older build).
+func TestCollectOnceRuntimeLiveProgressUnsupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_unsupported",
+			Model:            "old-llama",
+			State:            runtimectl.StateRunning,
+			PID:              6002,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "llama_cpp",
+			ContextProbePath: "/props",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	if rs.ContextProbe != "ok" || rs.ContextSize != 8192 {
+		t.Errorf("ContextProbe/ContextSize = %q/%d, want %q/8192", rs.ContextProbe, rs.ContextSize, "ok")
+	}
+	if rs.LiveProgressSupport != "unsupported" {
+		t.Errorf("LiveProgressSupport = %q, want %q", rs.LiveProgressSupport, "unsupported")
+	}
+}
+
+// TestCollectOnceRuntimeLiveProgressUnreachable proves a failed /props probe
+// reports LiveProgressSupport as "" (unknown), never an error, and never
+// anything that blocks the sample. The server answers every request with a
+// non-2xx status but a WOULD-BE "supported" body, and the test counts
+// /props hits: this pins that the probe actually ran and its status check
+// (not merely a refused connection, which a zero-value field would satisfy
+// even if the whole capability probe were deleted -- see
+// TestProbeLiveProgressSupport_Unreachable's identical concern) is what
+// produces "".
+func TestCollectOnceRuntimeLiveProgressUnreachable(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_capability_unreachable",
+			Model:  "qwen-coder",
+			State:  runtimectl.StateRunning,
+			PID:    6003,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "custom",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Fatalf("/props hits = %d, want 1 (the probe must actually run for this test to cover its failure path)", hits)
+	}
+	if rs := got.Runtimes[0]; rs.LiveProgressSupport != "" {
+		t.Errorf("LiveProgressSupport = %q, want %q (unknown) for a non-2xx /props response, even one carrying a well-formed supported body", rs.LiveProgressSupport, "")
+	}
+}
+
+// TestProbeRuntimeChildLiveProgressIgnoresContextCache is step 2's direct
+// proof: a runtimeCtxCache hit (a prior context probe on this exact PID
+// generation already succeeded) must NOT be read as evidence that the
+// live-progress capability was ever determined. probeRuntimeChildLiveProgress
+// keeps its own cache (runtimeCapabilityCache), so it must still issue the
+// live /props GET here and return the verdict that fetch actually produces
+// -- not skip the probe, and not fabricate a verdict from the unrelated
+// context cache entry.
+//
+// If the two caches were ever merged (e.g. a context-cache hit short-
+// circuiting the capability probe), this test would fail two ways at once:
+// the fake server's hit count would stay 0 (the GET never happened), and
+// rs.LiveProgressSupport would stay "" instead of the "supported" the live
+// response actually carries.
+func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":4096,"params":{"timings_per_token":false}}}`))
+	}))
+	defer srv.Close()
+
+	st := runtimectl.Status{
+		SpecID:           "rspec_ctx_cache_only",
+		State:            runtimectl.StateRunning,
+		PID:              6004,
+		Port:             portFromURL(t, srv.URL),
+		Type:             "llama_cpp",
+		ContextProbePath: "/props",
+	}
+
+	a := &Agent{
+		// A context probe on this EXACT (pid, type, path) generation
+		// already succeeded and is cached -- runtimeCapabilityCache is left
+		// nil: the capability was never determined.
+		runtimeCtxCache: map[string]runtimeCtxEntry{
+			st.SpecID: {pid: st.PID, specType: st.Type, contextProbePath: st.ContextProbePath, size: 4096},
+		},
+	}
+
+	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
+	var rs sample.RuntimeSample
+	a.probeRuntimeChildLiveProgress(context.Background(), srv.Client(), base, st, &rs)
+
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Fatalf("/props hits = %d, want 1 (a context-cache hit must not skip the capability probe)", hits)
+	}
+	if rs.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (the freshly-probed verdict, not a value implied by the context cache)", rs.LiveProgressSupport, "supported")
+	}
+
+	// A second call now hits the CAPABILITY cache this probe itself just
+	// populated -- no second GET.
+	var rs2 sample.RuntimeSample
+	a.probeRuntimeChildLiveProgress(context.Background(), srv.Client(), base, st, &rs2)
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Errorf("/props hits after 2nd call = %d, want 1 (a determined verdict must be cached)", hits)
+	}
+	if rs2.LiveProgressSupport != "supported" {
+		t.Errorf("LiveProgressSupport (cache hit) = %q, want %q", rs2.LiveProgressSupport, "supported")
+	}
+}

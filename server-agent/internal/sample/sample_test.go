@@ -54,21 +54,25 @@ type wireRuntimeError struct {
 }
 
 type wireRuntimeSample struct {
-	SpecID         string            `json:"spec_id"`
-	Model          string            `json:"model"`
-	State          string            `json:"state"`
-	Since          time.Time         `json:"since"`
-	PID            int               `json:"pid,omitempty"`
-	Port           int               `json:"port,omitempty"`
-	InFlight       int               `json:"in_flight"`
-	Restarts       int               `json:"restarts"`
-	ContextSize    int               `json:"context_size"`
-	ActiveRequests int               `json:"active_requests"`
-	QueueDepth     int               `json:"queue_depth"`
-	MetricsProbe   string            `json:"metrics_probe"`
-	ContextProbe   string            `json:"context_probe"`
-	GPUs           []wireRuntimeGPU  `json:"gpus,omitempty"`
-	LastError      *wireRuntimeError `json:"last_error,omitempty"`
+	SpecID         string    `json:"spec_id"`
+	Model          string    `json:"model"`
+	State          string    `json:"state"`
+	Since          time.Time `json:"since"`
+	PID            int       `json:"pid,omitempty"`
+	Port           int       `json:"port,omitempty"`
+	InFlight       int       `json:"in_flight"`
+	Restarts       int       `json:"restarts"`
+	ContextSize    int       `json:"context_size"`
+	ActiveRequests int       `json:"active_requests"`
+	QueueDepth     int       `json:"queue_depth"`
+	MetricsProbe   string    `json:"metrics_probe"`
+	ContextProbe   string    `json:"context_probe"`
+	// LiveProgressSupport mirrors the gateway's agentRuntimeSample tag
+	// (task 5's ingest side); additive beside the two probe-state fields
+	// above (task 4).
+	LiveProgressSupport string            `json:"live_progress_support"`
+	GPUs                []wireRuntimeGPU  `json:"gpus,omitempty"`
+	LastError           *wireRuntimeError `json:"last_error,omitempty"`
 }
 
 type wireProxyRoute struct {
@@ -522,6 +526,71 @@ func TestRuntimeSampleProbeFieldsRoundTrip(t *testing.T) {
 		if string(v) != `""` {
 			t.Errorf("runtimes[0].%s = %s, want \"\"", key, v)
 		}
+	}
+}
+
+// TestRuntimeSampleLiveProgressSupportRoundTrip is the sample half of task 4
+// (#51): LiveProgressSupport mirrors the gateway ingest's exact tag
+// (live_progress_support) beside MetricsProbe/ContextProbe, and -- like
+// them -- is an always-present string field, NOT omitempty, so an
+// undetermined verdict marshals as the key present with value "" (which
+// IS the documented "unknown" state) rather than being dropped from the
+// wire entirely.
+func TestRuntimeSampleLiveProgressSupportRoundTrip(t *testing.T) {
+	since := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{
+				SpecID:              "rspec_capability",
+				Model:               "qwen-coder",
+				State:               "running",
+				Since:               since,
+				LiveProgressSupport: "supported",
+			},
+		},
+	}
+	s.Normalize()
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got wireSample
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into wire struct: %v", err)
+	}
+	if len(got.Runtimes) != 1 {
+		t.Fatalf("runtimes len = %d, want 1", len(got.Runtimes))
+	}
+	if rt := got.Runtimes[0]; rt.LiveProgressSupport != "supported" {
+		t.Errorf("runtimes[0].live_progress_support = %q, want supported", rt.LiveProgressSupport)
+	}
+
+	// A spec left at the zero value (undetermined) must still carry the key
+	// PRESENT in the wire JSON -- not omitempty -- as an empty string.
+	var zero Sample
+	zero.Runtimes = []RuntimeSample{{SpecID: "rspec_capability_zero"}}
+	zero.Normalize()
+	rawZero, err := json.Marshal(&zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	var probe struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(rawZero, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 1 {
+		t.Fatalf("probe runtimes len = %d, want 1", len(probe.Runtimes))
+	}
+	v, ok := probe.Runtimes[0]["live_progress_support"]
+	if !ok {
+		t.Fatalf("runtimes[0] missing \"live_progress_support\" key; must not be omitempty")
+	}
+	if string(v) != `""` {
+		t.Errorf("runtimes[0].live_progress_support = %s, want \"\"", v)
 	}
 }
 

@@ -96,27 +96,10 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 	if path == "" {
 		return 0, fmt.Errorf("probe context: no context path configured")
 	}
-	if client == nil {
-		client = http.DefaultClient
-	}
 
-	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, err := fetchProbeBody(ctx, client, baseURL, path)
 	if err != nil {
-		return 0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("probe context: upstream status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("probe context: %w", err)
 	}
 
 	var v any
@@ -129,6 +112,122 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 		return 0, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
 	}
 	return n, nil
+}
+
+// fetchProbeBody is the common GET-and-read-body step shared by ProbeContext
+// and ProbeLiveProgressSupport: build baseURL+path, issue the request
+// through client (falling back to http.DefaultClient for a nil one, matching
+// ProbeContext's long-standing contract), and return the raw response body
+// on a 2xx status. It never interprets the bytes -- each caller applies its
+// own parse/evidence rule to the same body.
+func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("probe: upstream status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+// LiveProgressProbePath is the fixed path GETted for the live-progress-
+// capability verdict (issue #51, task 4). Unlike contextPath above, this
+// path is NOT type-derived and NOT overridable: routing.DeriveProbePaths
+// gives a "custom"-typed spec no context path at all, so a custom-typed
+// child (DetectRuntimeSpecType's fallback, or an explicit operator choice)
+// would otherwise never be probed here -- exactly the case this detector
+// exists to recover. The agent's probeRuntimeChildLiveProgress (agent.go)
+// GETs this path unconditionally for every StateRunning child with a live
+// port, regardless of st.Type or st.ContextProbePath.
+const LiveProgressProbePath = "/props"
+
+// ProbeLiveProgressSupport GETs baseURL+LiveProgressProbePath and returns
+// the live-progress-capability verdict for whatever answered: "supported",
+// "unsupported", or "" (unknown -- the fetch failed, or the body is not a
+// llama.cpp /props document at all). It reuses fetchProbeBody, the exact
+// GET-and-read-body step ProbeContext uses, then hands the raw bytes to
+// detectLiveProgressSupport for the actual evidence rule.
+//
+// This is a SIBLING of ProbeContext, not a case folded into it:
+// ProbeContext is hard-typed to (int, error) and every extractor beneath it
+// (extractContext and friends) returns (int, bool) -- a tri-state verdict
+// cannot ride that chain, and widening it would touch every extractor for a
+// capability that has nothing to do with context-size extraction. Keeping
+// this a separate function is the deliberate shape choice.
+//
+// A fetch failure is swallowed to "" rather than returned as an error: this
+// probe is advisory (see detectLiveProgressSupport's doc comment) and must
+// never fail or delay a collect cycle.
+func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) string {
+	body, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
+	if err != nil {
+		return ""
+	}
+	return detectLiveProgressSupport(body)
+}
+
+// detectLiveProgressSupport is the agent-side half of the live-progress-
+// capability detector (issue #51): it decides whether the upstream build
+// tolerates the live-progress request parameters (tokens/sec, TTFT) WITHOUT
+// ever sending a request that risks a 400 to find out.
+//
+// The signal is the presence of the key "timings_per_token" inside
+// default_generation_settings.params in a llama.cpp /props response. That
+// object is a serialization of the COMPILED request-schema field list, so
+// the key's presence asserts "this build's completion schema has that
+// field" -- not merely "this looks like llama.cpp". Presence is ALL that is
+// checked: the value is always false (the handler default-constructs the
+// params struct), so it carries no information and must never be read.
+//
+// Returns:
+//   - "supported"    default_generation_settings.params is present AND
+//     contains the key.
+//   - "unsupported"  default_generation_settings.params is present but does
+//     NOT contain the key -- a real verdict about a real build (an older
+//     llama.cpp).
+//   - ""             anything else: unparseable bytes, or a body that
+//     simply isn't that document -- a vLLM /v1/models body, an Ollama
+//     /api/show body, a TGI /info body, .... This is UNKNOWN, not a
+//     verdict, and callers must never let it overwrite an already-cached
+//     verdict.
+//
+// This is a DUPLICATE, on purpose, of detectLiveProgressSupport in
+// gateway/backend/internal/provider/model_info.go -- the two are separate Go
+// modules (gateway/backend and server-agent) and cannot share code,
+// mirroring the "DUPLICATED locally on purpose" precedent at
+// gateway/backend/internal/provider/memory_probe.go:111. Whoever changes
+// this rule must change that copy identically, or the two halves of this
+// feature will drift. A reviewer finding them divergent is a real finding;
+// finding them duplicated is expected.
+func detectLiveProgressSupport(body []byte) string {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return ""
+	}
+	dgs, ok := obj["default_generation_settings"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	params, ok := dgs["params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if _, present := params["timings_per_token"]; present {
+		return "supported"
+	}
+	return "unsupported"
 }
 
 // extractContext dispatches to the per-specType extraction rule.
