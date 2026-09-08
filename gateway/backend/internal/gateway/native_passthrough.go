@@ -525,74 +525,95 @@ func parsePassthroughUsage(apiFlavor string, body []byte) inference.Usage {
 // output tokens arrive. Callers finalize exactly once, after every fragment has
 // been merged — see finalizeTotalTokens.
 func mergePassthroughUsage(dst *inference.Usage, apiFlavor string, body []byte) {
-	take := func(d *int, v int) {
-		if v > *d {
-			*d = v
-		}
-	}
-	takeF := func(d *float64, v float64) {
-		if v > *d {
-			*d = v
-		}
-	}
 	for _, payload := range jsonPayloads(body) {
 		switch apiFlavor {
 		case "openai_responses":
-			var m struct {
-				Usage    *responsesUsage `json:"usage"`
-				Response *struct {
-					Usage *responsesUsage `json:"usage"`
-				} `json:"response"`
-				Timings *struct {
-					PromptPerSecond    float64 `json:"prompt_per_second"`
-					PredictedPerSecond float64 `json:"predicted_per_second"`
-				} `json:"timings"`
-			}
-			if json.Unmarshal(payload, &m) != nil {
-				continue
-			}
-			for _, uu := range []*responsesUsage{m.Usage, nested(m.Response)} {
-				if uu == nil {
-					continue
-				}
-				take(&dst.InputTokens, uu.InputTokens)
-				take(&dst.OutputTokens, uu.OutputTokens)
-				take(&dst.TotalTokens, uu.TotalTokens)
-				// Responses input_tokens ALREADY includes the cached subset (OpenAI
-				// semantics), so only the cached count is lifted out — InputTokens is
-				// left untouched (matches the translate/chat path).
-				take(&dst.CachedTokens, uu.InputTokensDetails.CachedTokens)
-			}
-			if m.Timings != nil {
-				takeF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
-				takeF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
-			}
+			mergeResponsesUsage(dst, payload)
 		case "anthropic_messages":
-			var m struct {
-				Usage   *anthropicUsage `json:"usage"`
-				Message *struct {
-					Usage *anthropicUsage `json:"usage"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(payload, &m) != nil {
-				continue
-			}
-			for _, uu := range []*anthropicUsage{m.Usage, nestedAnthropic(m.Message)} {
-				if uu == nil {
-					continue
-				}
-				// Anthropic reports input_tokens EXCLUDING the prompt-cache tokens
-				// (cache reads + creations are separate buckets). The canonical
-				// inference.Usage uses OpenAI semantics where InputTokens INCLUDES the
-				// cached subset (see compat.AnthropicInputTokens, the inverse), so the
-				// cache buckets are folded back in — keeping the value consistent with
-				// the translate path for the same prompt.
-				take(&dst.InputTokens, uu.InputTokens+uu.CacheReadInputTokens+uu.CacheCreationInputTokens)
-				take(&dst.OutputTokens, uu.OutputTokens)
-				take(&dst.CachedTokens, uu.CacheReadInputTokens)
-				take(&dst.CacheWriteTokens, uu.CacheCreationInputTokens)
-			}
+			mergeAnthropicUsage(dst, payload)
 		}
+	}
+}
+
+// mergeResponsesUsage is mergePassthroughUsage's "openai_responses" case,
+// split out per-flavor: it applies one payload's usage/timings fields (if any)
+// into dst via the same running-MAX merge.
+func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
+	var m struct {
+		Usage    *responsesUsage `json:"usage"`
+		Response *struct {
+			Usage *responsesUsage `json:"usage"`
+		} `json:"response"`
+		Timings *struct {
+			PromptPerSecond    float64 `json:"prompt_per_second"`
+			PredictedPerSecond float64 `json:"predicted_per_second"`
+		} `json:"timings"`
+	}
+	if json.Unmarshal(payload, &m) != nil {
+		return
+	}
+	for _, uu := range []*responsesUsage{m.Usage, nested(m.Response)} {
+		if uu == nil {
+			continue
+		}
+		takeMax(&dst.InputTokens, uu.InputTokens)
+		takeMax(&dst.OutputTokens, uu.OutputTokens)
+		takeMax(&dst.TotalTokens, uu.TotalTokens)
+		// Responses input_tokens ALREADY includes the cached subset (OpenAI
+		// semantics), so only the cached count is lifted out — InputTokens is
+		// left untouched (matches the translate/chat path).
+		takeMax(&dst.CachedTokens, uu.InputTokensDetails.CachedTokens)
+	}
+	if m.Timings != nil {
+		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
+		takeMaxF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
+	}
+}
+
+// mergeAnthropicUsage is mergePassthroughUsage's "anthropic_messages" case,
+// split out per-flavor: it applies one payload's usage fields (if any) into
+// dst via the same running-MAX merge.
+func mergeAnthropicUsage(dst *inference.Usage, payload []byte) {
+	var m struct {
+		Usage   *anthropicUsage `json:"usage"`
+		Message *struct {
+			Usage *anthropicUsage `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(payload, &m) != nil {
+		return
+	}
+	for _, uu := range []*anthropicUsage{m.Usage, nestedAnthropic(m.Message)} {
+		if uu == nil {
+			continue
+		}
+		// Anthropic reports input_tokens EXCLUDING the prompt-cache tokens
+		// (cache reads + creations are separate buckets). The canonical
+		// inference.Usage uses OpenAI semantics where InputTokens INCLUDES the
+		// cached subset (see compat.AnthropicInputTokens, the inverse), so the
+		// cache buckets are folded back in — keeping the value consistent with
+		// the translate path for the same prompt.
+		takeMax(&dst.InputTokens, uu.InputTokens+uu.CacheReadInputTokens+uu.CacheCreationInputTokens)
+		takeMax(&dst.OutputTokens, uu.OutputTokens)
+		takeMax(&dst.CachedTokens, uu.CacheReadInputTokens)
+		takeMax(&dst.CacheWriteTokens, uu.CacheCreationInputTokens)
+	}
+}
+
+// takeMax and takeMaxF implement mergePassthroughUsage's running-MAX merge
+// (never a sum, never a plain overwrite) for int and float64 fields
+// respectively. Neither closes over anything, so they are plain functions
+// shared by mergeResponsesUsage and mergeAnthropicUsage rather than per-call
+// closures.
+func takeMax(d *int, v int) {
+	if v > *d {
+		*d = v
+	}
+}
+
+func takeMaxF(d *float64, v float64) {
+	if v > *d {
+		*d = v
 	}
 }
 
