@@ -144,8 +144,9 @@ type liveProgressMemo struct {
 	now        func() time.Time
 }
 
-// newLiveProgressMemo returns an empty memo -- i.e. "send the parameters to
-// everything the allow-list permits".
+// newLiveProgressMemo returns an empty memo -- i.e. "nothing has been observed
+// rejecting the parameters, so send them wherever wantsLiveProgress's
+// three-layer rule says to".
 func newLiveProgressMemo() *liveProgressMemo {
 	return &liveProgressMemo{
 		rejectedAt: make(map[string]time.Time),
