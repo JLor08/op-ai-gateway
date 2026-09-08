@@ -879,6 +879,128 @@ func TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport(t *test
 	}
 }
 
+// TestRunAppHealthOnceContextProbeTemplateLockedMappingPersistsCapabilityNotContextSize
+// closes a gap the Task 2 implementer correctly surfaced but was told not to
+// fix: the {model}-template branch's per-mapping skip used to read
+// `mp.Status != routing.ServerStatusActive || mp.MetricsLocked ||
+// mp.AppModelName == ""`, which skipped a LOCKED mapping before it was ever
+// probed -- so its live-progress capability could never be learned at all,
+// even though UpdateMappingLiveProgressSupport itself carries no lock guard
+// (a capability is a property of the upstream build, not a number an
+// operator answers for). This is llama-swap's default {model} shape, so the
+// hole was not theoretical.
+//
+// The mapping starts with a distinguishable pre-existing state on BOTH
+// fields under test -- ContextSize 4096 (the probe reports a different
+// 8192) and LiveProgressSupport "" (the probe reports "supported") -- so
+// neither assertion can pass by an accidental "both sides already equal"
+// coincidence; each requires the fix to actually run the probe and the
+// store's own guard to actually block the context-size write.
+func TestRunAppHealthOnceContextProbeTemplateLockedMappingPersistsCapabilityNotContextSize(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxTemplateApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
+			Status: routing.ServerStatusActive, MetricsLocked: true, MetricsSource: "manual",
+			ContextSize: 4096,
+		}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"m-a"})
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !prober.probedPath("/upstream/m-a/props") {
+		t.Fatalf("a locked mapping must still be probed -- its capability cannot be learned without asking")
+	}
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want %q (a locked mapping's capability must still be persisted)", got.LiveProgressSupport, "supported")
+	}
+	// The pre-existing behavior must be unchanged: the store's own
+	// `and metrics_locked = 0` guard (SQLiteStore.UpdateMappingContextProbe;
+	// mirrored by MemoryStore and by fakeHealthStore.UpdateMappingContextProbe
+	// above) refuses the context-size write for a locked row regardless of
+	// whether the probe now runs.
+	if got.ContextSize != 4096 {
+		t.Fatalf("locked ContextSize = %d, want 4096 (context-size probing must stay refused for a locked mapping)", got.ContextSize)
+	}
+	if got.MetricsSource != "manual" {
+		t.Fatalf("locked MetricsSource = %q, want %q (unchanged)", got.MetricsSource, "manual")
+	}
+}
+
+// TestRunAppHealthOnceContextProbeTemplateSkipsNonActiveAndEmptyModelName
+// proves the {model}-template branch's other two skip terms survive the
+// mp.MetricsLocked removal above: a non-active mapping and one with an empty
+// upstream model name must still never be probed at all. m-a is a control
+// mapping that IS probed, proving the branch runs at all rather than
+// short-circuiting for some unrelated reason.
+//
+// m-b is seeded into the loaded set precisely so the non-active assertion is
+// not vacuous: dropping the `mp.Status != routing.ServerStatusActive` term
+// alone (verified by revert-testing) makes this test fail, because m-b would
+// then actually reach ProbeModelInfo.
+//
+// The empty-AppModelName case cannot be independently forced the same way:
+// gateway.LoadedModelRegistry.normalizeModelSet unconditionally drops ""
+// from any seeded loaded set (see internal/gateway/loaded_models.go), so an
+// empty AppModelName can never be a member of loadedSet regardless of the
+// explicit `mp.AppModelName == ""` term -- the loadedSet membership check a
+// few lines below already backstops it. Revert-testing confirmed this:
+// removing the explicit term alone does NOT make this test fail. The
+// assertion below still documents and verifies the required, observable
+// behavior (no probe, no write for an empty upstream model name); the
+// explicit term itself is intentional defense-in-depth against a future
+// change to the loaded-set gating, not something this test path can
+// independently falsify.
+func TestRunAppHealthOnceContextProbeTemplateSkipsNonActiveAndEmptyModelName(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxTemplateApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {
+			{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a", Status: routing.ServerStatusActive},
+			{ID: "m2", ApplicationID: "a1", GatewayModelName: "g-b", AppModelName: "m-b", Status: routing.ServerStatusDisabled},
+			{ID: "m3", ApplicationID: "a1", GatewayModelName: "g-c", AppModelName: "", Status: routing.ServerStatusActive},
+		},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	prober.modelInfoByPath["/upstream/m-b/props"] = []provider.ModelInfo{{Name: "m-b", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"m-a", "m-b"}) // seeding "" here would be a no-op: normalizeModelSet drops it
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !prober.probedPath("/upstream/m-a/props") {
+		t.Fatalf("control mapping m-a must be probed")
+	}
+	if prober.probedPath("/upstream/m-b/props") {
+		t.Fatalf("a non-active (disabled) mapping must NEVER be probed")
+	}
+	if prober.probedPath("/upstream//props") {
+		t.Fatalf("a mapping with an empty upstream model name must NEVER be probed")
+	}
+	if n := prober.ctxProbeCallCount(); n != 1 {
+		t.Fatalf("ProbeModelInfo called %d times, want 1 (only the active, named, loaded mapping)", n)
+	}
+	gotB, _ := st.mappingOf("m2")
+	if gotB.LiveProgressSupport != "" {
+		t.Fatalf("m-b LiveProgressSupport = %q, want %q (non-active mapping must not be probed nor written)", gotB.LiveProgressSupport, "")
+	}
+	gotC, _ := st.mappingOf("m3")
+	if gotC.LiveProgressSupport != "" {
+		t.Fatalf("m-c LiveProgressSupport = %q, want %q (empty upstream model name must not be probed nor written)", gotC.LiveProgressSupport, "")
+	}
+}
+
 func TestRunAppHealthOncePartialDegraded(t *testing.T) {
 	shrinkRetryGap(t)
 	st := newHealthTestStore(activeApp("a1", "s1", 8001), activeApp("a2", "s1", 8002))

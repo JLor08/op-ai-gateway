@@ -624,7 +624,19 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						return
 					}
 					for _, mp := range mappings {
-						if mp.Status != routing.ServerStatusActive || mp.MetricsLocked || mp.AppModelName == "" {
+						// Deliberately NOT also skipping mp.MetricsLocked here (#51 follow-up):
+						// a locked mapping's live-progress CAPABILITY still needs probing --
+						// UpdateMappingLiveProgressSupport below carries no lock guard, because a
+						// capability is a property of the upstream build, not a number an
+						// operator answers for (see its doc comment). Skipping the probe here
+						// would silently keep that capability undetectable forever for any
+						// locked mapping on this llama-swap-shaped {model} path. The cost: a
+						// locked mapping is now probed (one GET per cadence tick per loaded
+						// model) where it previously was not; the context-size write below is
+						// unaffected because UpdateMappingContextProbe's own SQL/store guard
+						// (`and metrics_locked = 0`) refuses a locked row regardless of whether
+						// the probe runs.
+						if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 							continue
 						}
 						if _, ok := loadedSet[mp.AppModelName]; !ok {
