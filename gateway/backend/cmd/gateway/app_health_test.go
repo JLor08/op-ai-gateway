@@ -4,9 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/config"
 	"op-ai-gateway/internal/gateway"
@@ -14,9 +19,12 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +43,11 @@ type fakeHealthStore struct {
 	liveProgressSets int                                // count of UpdateMappingLiveProgressSupport calls
 	availSamplesLog  []routing.ServerAvailabilitySample // append-ordered availability samples
 	failInsert       bool                               // when true, InsertServerAvailabilitySample errors
+	// runtimeSpecs backs RuntimeSpecsByApplication (issue #58 per-mapping
+	// upstream credentials); specsErr, when set, makes the call fail instead
+	// (exercising the fallback-to-app-token degrade path).
+	runtimeSpecs []routing.RuntimeSpec
+	specsErr     bool
 }
 
 func (f *fakeHealthStore) AIServers(context.Context) ([]routing.AIServer, error) {
@@ -185,6 +198,18 @@ func (f *fakeHealthStore) healthOf(serverID string) string {
 	return f.health[serverID]
 }
 
+// RuntimeSpecsByApplication returns the seeded runtimeSpecs (ignoring appID --
+// every test using this fake seeds a single application), or specsErr when set
+// (the read-failure degrade-to-app-token test).
+func (f *fakeHealthStore) RuntimeSpecsByApplication(_ context.Context, _ string) ([]routing.RuntimeSpec, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.specsErr {
+		return nil, fmt.Errorf("runtime specs: boom")
+	}
+	return append([]routing.RuntimeSpec(nil), f.runtimeSpecs...), nil
+}
+
 // fakeProber returns nil for reachable endpoints and an error for endpoints
 // marked down; it counts calls per endpoint so the retry path is observable.
 type fakeProber struct {
@@ -204,6 +229,11 @@ type fakeProber struct {
 	// modelInfoPaths records every probe path ProbeModelInfo was called with.
 	modelInfoByPath map[string][]provider.ModelInfo
 	modelInfoPaths  []string
+	// modelInfoErrValue maps a probe PATH to an error ProbeModelInfo returns
+	// verbatim (nil infos) -- unlike modelInfoErr (keyed by endpoint, always a
+	// generic error), this lets a test inject a SPECIFIC error (e.g. a wrapped
+	// provider.ErrAuthRejected) for one {model}-expanded path.
+	modelInfoErrValue map[string]error
 }
 
 var (
@@ -217,7 +247,8 @@ func newFakeProber() *fakeProber {
 		calls: map[string]int{}, down: map[string]bool{},
 		loaded: map[string][]string{}, loadedErr: map[string]bool{},
 		modelInfo: map[string][]provider.ModelInfo{}, modelInfoErr: map[string]bool{},
-		modelInfoByPath: map[string][]provider.ModelInfo{},
+		modelInfoByPath:   map[string][]provider.ModelInfo{},
+		modelInfoErrValue: map[string]error{},
 	}
 }
 
@@ -229,6 +260,9 @@ func (f *fakeProber) ProbeModelInfo(_ context.Context, target routing.Target, pr
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.modelInfoPaths = append(f.modelInfoPaths, probePath)
+	if err, ok := f.modelInfoErrValue[probePath]; ok {
+		return nil, err
+	}
 	if f.modelInfoErr[target.Endpoint] {
 		return nil, fmt.Errorf("model-info probe failed: %s", target.Endpoint)
 	}
@@ -883,6 +917,200 @@ func TestRunAppHealthOnceServerAgentOperatorPathWins(t *testing.T) {
 	}
 	if prober.probedPath("/upstream/up/props") {
 		t.Fatalf("the operator-set ContextProbePath must win -- the implicit default must never be probed")
+	}
+}
+
+// TestRunAppHealthOnceServerAgentProbeCarriesSpecToken is the wire-level
+// credential test (issue #58): the per-mapping context carried into the
+// {model} branch's ProbeModelInfo calls is unexported, so this proves it on
+// the WIRE instead, using a REAL provider client (the same OpenAI-compatible
+// constructor providerClients wires for server_agent) against an httptest
+// server standing in for the agent's runtime router. Mapping A resolves to
+// the default Authorization: Bearer header; mapping B's spec sets a custom
+// transmission header (X-Api-Key) and must carry NO Authorization header at
+// all. Both differ from the APPLICATION's own token, so a regression that
+// falls back to the app-level credential is caught on the wire, not just in
+// an unobservable context value.
+func TestRunAppHealthOnceServerAgentProbeCarriesSpecToken(t *testing.T) {
+	shrinkRetryGap(t)
+
+	type seenAuth struct{ authorization, apiKey string }
+	var mu sync.Mutex
+	seen := map[string]seenAuth{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.URL.Path] = seenAuth{authorization: r.Header.Get("Authorization"), apiKey: r.Header.Get("X-Api-Key")}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":true}}}`))
+	}))
+	defer upstream.Close()
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	app := serverAgentApp("a1", "s1", port)
+	// A token the pass must NEVER send once a per-mapping spec exists --
+	// its presence on the wire would mean the fallback-to-app-token path
+	// fired instead of SpecUpstreamAuth.
+	app.APIToken = "plain:app-tok-must-not-be-used"
+	st := &fakeHealthStore{
+		servers: []routing.AIServer{{ID: "s1", Domain: u.Hostname(), Provider: routing.ProviderServerAgent, Status: routing.ServerStatusActive}},
+		apps:    map[string][]routing.Application{"s1": {app}},
+	}
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {
+			{ID: "mpA", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "a", Status: routing.ServerStatusActive},
+			{ID: "mpB", ApplicationID: "a1", GatewayModelName: "g-b", AppModelName: "b", Status: routing.ServerStatusActive},
+		},
+	}
+	st.runtimeSpecs = []routing.RuntimeSpec{
+		{MappingID: "mpA", APITokenMode: "set", APIToken: "plain:tok-a"},
+		{MappingID: "mpB", APITokenMode: "set", APIToken: "plain:tok-b", APITokenHeaderSource: "custom", APITokenHeader: "X-Api-Key"},
+	}
+
+	prober := providerClients(0, false, nil) // real Multiplexer -> OpenAICompatibleClient for server_agent
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"a", "b"})
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	mu.Lock()
+	a, b := seen["/upstream/a/props"], seen["/upstream/b/props"]
+	mu.Unlock()
+
+	if a.authorization != "Bearer tok-a" {
+		t.Fatalf("mapping A Authorization = %q, want %q", a.authorization, "Bearer tok-a")
+	}
+	if a.apiKey != "" {
+		t.Fatalf("mapping A X-Api-Key = %q, want empty", a.apiKey)
+	}
+	if b.apiKey != "tok-b" {
+		t.Fatalf("mapping B X-Api-Key = %q, want %q", b.apiKey, "tok-b")
+	}
+	if b.authorization != "" {
+		t.Fatalf("mapping B Authorization = %q, want empty (custom header source, no Authorization sent)", b.authorization)
+	}
+	if n := st.liveProgressSetCount(); n != 2 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 2", n)
+	}
+}
+
+// TestRunAppHealthOnceServerAgentAuthRejectedLogsAndNeverWrites proves the
+// misconfigured-token signal (issue #58): once the retry ALSO fails with
+// provider.ErrAuthRejected (wrapped, as a real client's 401/403 classification
+// would produce), the pass logs the distinct "check the runtime spec's API
+// token" message instead of the generic probe-failed noise, and persists
+// nothing.
+func TestRunAppHealthOnceServerAgentAuthRejectedLogsAndNeverWrites(t *testing.T) {
+	shrinkRetryGap(t)
+	app := serverAgentApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoErrValue["/upstream/up/props"] = fmt.Errorf("wrapped: %w", provider.ErrAuthRejected)
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"up"})
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 0 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times on a rejected probe, want 0", n)
+	}
+	if !strings.Contains(buf.String(), "check the runtime spec's API token") {
+		t.Fatalf("log output = %q, want it to contain the misconfigured-token signal", buf.String())
+	}
+}
+
+// TestRunAppHealthOnceServerAgentSpecReadFailureFallsBackToAppToken proves the
+// degrade path (issue #58): when RuntimeSpecsByApplication fails, the {model}
+// pass still probes (a store hiccup must not blackhole the probe) and every
+// mapping falls back to the APPLICATION's own token -- SpecUpstreamAuth's
+// documented behavior for a zero-value spec, reached here via the empty map
+// the read failure leaves behind.
+func TestRunAppHealthOnceServerAgentSpecReadFailureFallsBackToAppToken(t *testing.T) {
+	shrinkRetryGap(t)
+
+	var mu sync.Mutex
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotAuth = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":true}}}`))
+	}))
+	defer upstream.Close()
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	app := serverAgentApp("a1", "s1", port)
+	app.APIToken = "plain:app-tok"
+	st := &fakeHealthStore{
+		servers: []routing.AIServer{{ID: "s1", Domain: u.Hostname(), Provider: routing.ProviderServerAgent, Status: routing.ServerStatusActive}},
+		apps:    map[string][]routing.Application{"s1": {app}},
+	}
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-up", AppModelName: "up", Status: routing.ServerStatusActive}},
+	}
+	st.specsErr = true
+
+	prober := providerClients(0, false, nil)
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"up"})
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+
+	// The read failure itself must be logged (distinct from the misconfigured-
+	// token signal test 2 checks): this is what makes the assertion below
+	// meaningful against a REVERT to the pre-#58 pass, which never calls
+	// RuntimeSpecsByApplication at all and so never logs this line either --
+	// the Authorization header alone would coincidentally match in both states
+	// (an app-token-only pass and a spec-read-failure fallback both send the
+	// app token), so the log line is the only observable that actually
+	// distinguishes "read attempted and degraded" from "never attempted".
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
+	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !strings.Contains(buf.String(), "runtime specs for app a1 failed") {
+		t.Fatalf("log output = %q, want it to record the spec read failure", buf.String())
+	}
+	mu.Lock()
+	auth := gotAuth
+	mu.Unlock()
+	if auth != "Bearer app-tok" {
+		t.Fatalf("Authorization = %q, want %q (a spec read failure must fall back to the app token)", auth, "Bearer app-tok")
+	}
+	if n := st.liveProgressSetCount(); n != 1 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1 (the probe must still proceed on a spec read failure)", n)
 	}
 }
 
