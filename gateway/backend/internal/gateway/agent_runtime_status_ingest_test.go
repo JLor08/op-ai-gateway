@@ -1644,4 +1644,83 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 			t.Fatalf("UpdateMappingVisionCapable calls = %d, want 0 -- the bool is already true, an unchanged value must not be rewritten", got)
 		}
 	})
+
+	t.Run("already consistent: zero writes to both", func(t *testing.T) {
+		// The genuine steady state: cap_vision is ALREADY "yes" (unlike the
+		// "unchanged bool" sub-case above, where cap_vision started empty),
+		// vision_capable is ALREADY true, and the probe keeps reporting "yes".
+		// Nothing differs anywhere, so neither writer should fire at all --
+		// this is what pins that the convergence fix below does not turn a
+		// quiet steady state into perpetual write amplification.
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_vision_steady", false)
+		if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_vision_steady", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
+			t.Fatalf("seed CapVision=yes: %v", err)
+		}
+		if err := srv.Routes.UpdateMappingVisionCapable(ctx, "map_rspec_vision_steady", true, time.Now().UTC()); err != nil {
+			t.Fatalf("seed VisionCapable=true: %v", err)
+		}
+		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+		srv.Routes = counting
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_steady", `{"vision":"yes"}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.capabilitiesCalls.Load(); got != 0 {
+			t.Fatalf("UpdateMappingCapabilities calls = %d, want 0 -- cap_vision is already \"yes\", nothing changed", got)
+		}
+		if got := counting.visionCalls.Load(); got != 0 {
+			t.Fatalf("UpdateMappingVisionCapable calls = %d, want 0 -- vision_capable is already true, a steady state must not write amplify", got)
+		}
+	})
+}
+
+// TestIngestVisionSyncRepairsADesyncedBool proves the vision sync converges
+// vision_capable even when the tri-state cap_vision verdict does NOT change
+// this sample -- the fix for the defect flagged in Task 4's review: driving
+// the sync from caps.Vision (non-empty only on a tri-state CHANGE) meant a
+// bool desynced by another writer (the vision benchmark, through the same
+// UpdateMappingVisionCapable) could never be repaired once cap_vision itself
+// stopped moving. Seeds the exact desynced state -- cap_vision "yes" already
+// on file, vision_capable left at its false zero value -- then ingests a
+// sample reporting vision "yes" again, so cap_vision is UNCHANGED and the
+// capabilities write itself is correctly skipped (compare-to-stored), while
+// the sync must still run off the reported verdict and flip the bool.
+func TestIngestVisionSyncRepairsADesyncedBool(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	seedRuntimeIngestSpec(t, srv, "rspec_vision_desync", false)
+	if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_vision_desync", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
+		t.Fatalf("seed CapVision=yes: %v", err)
+	}
+	// VisionCapable is left at its false zero value -- the desync: cap_vision
+	// says "yes" but vision_capable still says false, exactly as if a vision
+	// benchmark run had independently pinned false (e.g. from a transient
+	// upstream failure) after the probe had already recorded "yes".
+
+	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_vision_desync", `{"vision":"yes"}`))
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if got := counting.capabilitiesCalls.Load(); got != 0 {
+		t.Fatalf("UpdateMappingCapabilities calls = %d, want 0 -- cap_vision is unchanged (\"yes\" -> \"yes\"), so the capabilities write must stay skipped", got)
+	}
+	if got := counting.visionCalls.Load(); got != 1 {
+		t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1 -- the sync must run off the REPORTED verdict even though the tri-state did not change, to repair the desync", got)
+	}
+	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_desync")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if !mapping.VisionCapable {
+		t.Fatal("VisionCapable = false, want true -- the desynced bool must converge to match the still-current cap_vision verdict")
+	}
+	if mapping.CapVision != "yes" {
+		t.Fatalf("CapVision = %q, want the untouched %q", mapping.CapVision, "yes")
+	}
 }

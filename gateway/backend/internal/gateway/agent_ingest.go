@@ -919,6 +919,16 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 //     the models list and the portal chat's image gate already read, and an
 //     operator who locked a mapping's metrics has pinned exactly that kind of
 //     consumer-visible answer. "" syncs nothing -- unknown is not a clear.
+//     Because vision_capable is a derived surface, this function is not its
+//     only writer: the vision benchmark moves the same bool through the same
+//     locked writer on its own schedule (see benchmark_runner.go's
+//     UpdateMappingVisionCapable call) and can desync it from cap_vision --
+//     including pinning a wrong, definitive false from a transient upstream
+//     failure. So the sync below is driven by THIS sample's reported verdict,
+//     not by whether cap_vision itself changed, and it runs even when every
+//     tri-state verdict is already on file: a steady, unchanged probe result
+//     must still be able to converge a bool another writer moved out from
+//     under it, not only the one sample that first changes cap_vision.
 func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
 	if s.Routes == nil {
 		return
@@ -991,6 +1001,27 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 				caps.Extra = extra
 			}
 		}
+
+		// Vision sync: driven by `vision`, THIS sample's reported verdict --
+		// not by caps.Vision, which is non-empty only when the tri-state
+		// itself changed. Deliberately runs before the no-write-amplification
+		// `continue` below, and before the capabilities write it guards: see
+		// the doc above for why vision_capable needs to converge on every
+		// definitive sample, not just the one that changes cap_vision. ""
+		// still syncs nothing, and the compare against r.storedVisionCapable
+		// still guarantees an already-correct bool is never rewritten.
+		if vision != "" {
+			want := vision == "yes"
+			if want != r.storedVisionCapable {
+				if err := s.Routes.UpdateMappingVisionCapable(ctx, r.mappingID, want, now); err != nil {
+					slog.Debug("vision-capable sync failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
+				} else {
+					r.storedVisionCapable = want
+					resolved[specID] = r
+				}
+			}
+		}
+
 		if caps.Vision == "" && caps.Video == "" && caps.Audio == "" && caps.Tools == "" && len(caps.Extra) == 0 {
 			continue // every verdict already on file -- no write amplification
 		}
@@ -1018,19 +1049,6 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 			}
 		}
 		resolved[specID] = r
-
-		// Vision sync: see the doc above for why this one respects the lock.
-		if caps.Vision != "" {
-			want := caps.Vision == "yes"
-			if want != r.storedVisionCapable {
-				if err := s.Routes.UpdateMappingVisionCapable(ctx, r.mappingID, want, now); err != nil {
-					slog.Debug("vision-capable sync failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
-				} else {
-					r.storedVisionCapable = want
-					resolved[specID] = r
-				}
-			}
-		}
 	}
 }
 
