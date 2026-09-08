@@ -30,12 +30,29 @@ var (
 // crash). Build the wrapped error with unavailableStatus so 503 gets this tag.
 var ErrUpstreamStarting = fmt.Errorf("%w (upstream starting)", ErrUnavailable)
 
-// unavailableStatus wraps a non-2xx upstream status as ErrUnavailable, tagging a
-// 503 additionally as ErrUpstreamStarting (a retryable "still loading" signal).
+// ErrAuthRejected is the subset of ErrUnavailable meaning the upstream
+// REFUSED the request's credential: 401 (Unauthorized) or 403 (Forbidden).
+// It unwraps to ErrUnavailable, so every existing errors.Is(err,
+// ErrUnavailable) check is unaffected -- the same wrapping contract as
+// ErrUpstreamStarting above. The app-health probe pass uses it to tell
+// "the runtime spec's API token is wrong or missing" (an operator
+// misconfiguration worth a distinct log line, issue #58) apart from "the
+// upstream is down" -- string-matching the status out of the error text
+// would be fragile. Build the wrapped error with unavailableStatus so
+// 401/403 get this tag.
+var ErrAuthRejected = fmt.Errorf("%w (upstream rejected the credential)", ErrUnavailable)
+
+// unavailableStatus wraps a non-2xx upstream status as ErrUnavailable,
+// tagging a 503 additionally as ErrUpstreamStarting (a retryable "still
+// loading" signal) and a 401/403 as ErrAuthRejected (a credential the
+// upstream refused).
 func unavailableStatus(status int) error {
 	base := ErrUnavailable
-	if status == http.StatusServiceUnavailable {
+	switch status {
+	case http.StatusServiceUnavailable:
 		base = ErrUpstreamStarting
+	case http.StatusUnauthorized, http.StatusForbidden:
+		base = ErrAuthRejected
 	}
 	return fmt.Errorf("%w: upstream status %d", base, status)
 }
