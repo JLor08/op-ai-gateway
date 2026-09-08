@@ -2044,8 +2044,10 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)),
 `Since: "0.4.0"`, `runtime_api_token`
 ([§3.2](#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)),
-`Since: "0.5.0"`, and `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
-[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`.
+`Since: "0.5.0"`, `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`, and
+`runtime_upstream_props` ([§4.1](#41-control-routes),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`.
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -2117,6 +2119,28 @@ warning banner, because there is no operator action to prompt — the gap
 closes itself the next time that agent is upgraded.
 `server-agent`'s `Version` moved `0.5.0` → `0.6.0` for this entry, MINOR per
 the same rule.
+
+`runtime_upstream_props` breaks the pattern every flag above shares: it is
+the one entry in this registry the **gateway** genuinely gates real behavior
+on, fail-closed, rather than declaring it purely for the portal's benefit
+the way `gpu_selection`, `runtime_api_token` and `runtime_model_probe` do.
+The agent's router serves `GET /upstream/{model}/props` ([§4.1](#41-control-routes))
+— the GET-only, allowlisted passthrough to a running managed child's
+`/props` (issue #58;
+[ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token))
+— and the gateway's app-health `{model}` probe pass
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)) only
+sends a probe down that path at an agent whose *reported* capabilities name
+`runtime_upstream_props`: an agent that predates the route has no
+`/upstream/{model}/props` control route to answer with, so the bodiless GET
+falls through to model routing (§4.2), which sees no JSON body naming a
+managed model and answers `404 runtime.model_not_managed` (§4.3) — not once,
+but for every such probe, forever, since nothing about that response ever
+changes. The gate is therefore not an optimization but
+the difference between a probe that can eventually succeed and one that
+never will, exactly the reasoning `PushRuntimeConfig`'s own feature gate
+already established. `server-agent`'s `Version` moved `0.6.0` → `0.7.0` for
+this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
