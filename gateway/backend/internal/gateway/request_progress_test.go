@@ -189,3 +189,44 @@ func TestActiveRegistryProgressConcurrentReadWrite(t *testing.T) {
 	}
 	<-readerDone
 }
+
+func TestLiveProgressDTO(t *testing.T) {
+	start := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	first := start.Add(500 * time.Millisecond)
+	now := first.Add(2 * time.Second)
+
+	upstream := &requestProgress{}
+	upstream.firstTokenUnixNano.Store(first.UnixNano())
+	upstream.outputTokens.Store(40)
+	upstream.upstreamTPSMilli.Store(21500)
+
+	gateway := &requestProgress{}
+	gateway.firstTokenUnixNano.Store(first.UnixNano())
+	gateway.outputTokens.Store(50) // 50 tokens over 2s -> 25.0
+
+	// An exact count was never reported: no rate may be invented, however much
+	// time has passed.
+	noCount := &requestProgress{}
+	noCount.firstTokenUnixNano.Store(first.UnixNano())
+
+	cases := []struct {
+		name       string
+		p          *requestProgress
+		wantTokens int
+		wantTPS    float64
+		wantSource string
+		wantTTFT   int64
+	}{
+		{"upstream reported", upstream, 40, 21.5, "upstream", 500},
+		{"gateway derived", gateway, 50, 25, "gateway", 500},
+		{"no exact count", noCount, 0, 0, "", 500},
+		{"no progress at all", nil, 0, 0, "", 0},
+	}
+	for _, tc := range cases {
+		row := ActiveRequest{StartedAt: start, Progress: tc.p}
+		tokens, tps, source, ttft := liveProgressDTO(row, now)
+		if tokens != tc.wantTokens || tps != tc.wantTPS || source != tc.wantSource || ttft != tc.wantTTFT {
+			t.Fatalf("%s: got (%d, %v, %q, %d)", tc.name, tokens, tps, source, ttft)
+		}
+	}
+}

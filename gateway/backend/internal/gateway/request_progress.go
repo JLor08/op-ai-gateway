@@ -53,3 +53,33 @@ func (p *requestProgress) observeDelta(at time.Time, prog *inference.StreamProgr
 		p.upstreamTPSMilli.Store(int64(prog.TokensPerSecond * 1000))
 	}
 }
+
+// liveProgressDTO resolves one in-flight request's counters into its wire values.
+// Nil-safe throughout: a request with no progress struct resolves to "not
+// measured" -- an explicit "" source rather than a fabricated zero.
+//
+// The provenance rule is structural, not merely documented: a gateway-derived rate
+// is only ever computed over an EXACT upstream count, so there is no code path in
+// which a guessed number becomes a displayed rate.
+func liveProgressDTO(row ActiveRequest, now time.Time) (outputTokens int, tps float64, source string, ttftMS int64) {
+	p := row.Progress
+	if p == nil {
+		return 0, 0, "", 0
+	}
+	outputTokens = int(p.outputTokens.Load())
+	first := p.firstTokenUnixNano.Load()
+	if first == 0 {
+		return outputTokens, 0, "", 0
+	}
+	firstAt := time.Unix(0, first)
+	if ttftMS = firstAt.Sub(row.StartedAt).Milliseconds(); ttftMS < 0 {
+		ttftMS = 0
+	}
+	if milli := p.upstreamTPSMilli.Load(); milli > 0 {
+		return outputTokens, float64(milli) / 1000, "upstream", ttftMS
+	}
+	if secs := now.Sub(firstAt).Seconds(); outputTokens > 0 && secs > 0 {
+		return outputTokens, float64(outputTokens) / secs, "gateway", ttftMS
+	}
+	return outputTokens, 0, "", ttftMS
+}

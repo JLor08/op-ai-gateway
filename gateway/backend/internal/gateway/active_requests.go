@@ -197,6 +197,18 @@ type activeRequestDTO struct {
 	AgentID        string `json:"agent_id"`
 	Stream         bool   `json:"stream"`
 	StartedAt      string `json:"started_at"`
+	// Live per-request progress. output_tokens is the upstream's own cumulative
+	// count (0 = none reported); tokens_per_second is 0 when not measured; and
+	// tokens_per_second_source says how the rate was obtained -- "upstream"
+	// (reported by the inference server), "gateway" (computed here from the
+	// upstream's exact count), or "" (not measured). Plain string, deliberately
+	// NOT omitempty, so "not measured" is explicit on the wire.
+	OutputTokens          int     `json:"output_tokens"`
+	TokensPerSecond       float64 `json:"tokens_per_second"`
+	TokensPerSecondSource string  `json:"tokens_per_second_source"`
+	// TTFTMs is the time from request start to the first content delta. 0 = not
+	// measured.
+	TTFTMs int64 `json:"ttft_ms"`
 }
 
 // handlePortalUsageActive returns the in-flight requests visible to the caller.
@@ -259,28 +271,43 @@ func (s *Server) handlePortalUsageActive(w http.ResponseWriter, r *http.Request)
 		names = s.Portal.DisplayNames(r.Context(), ids)
 	}
 
+	// One clock reading for the whole response so every row's live progress is
+	// mutually consistent (a row read a moment earlier or later than its
+	// neighbours would show a skewed gateway-derived rate). Reuse the registry's
+	// own now() hook, like its other methods, so tests can fix the clock; a bare
+	// *Server built in a test may have a nil registry, hence the guard.
+	now := time.Now().UTC()
+	if s.Active != nil {
+		now = s.Active.now()
+	}
+
 	dtos := make([]activeRequestDTO, 0, len(filtered))
 	for _, row := range filtered {
+		outputTokens, tps, tpsSource, ttftMS := liveProgressDTO(row, now)
 		dtos = append(dtos, activeRequestDTO{
-			ID:             row.ID,
-			UserID:         row.UserID,
-			UserName:       names[row.UserID],
-			TokenID:        row.TokenID,
-			TokenName:      row.TokenName,
-			ServiceID:      row.ServiceID,
-			ServiceName:    row.ServiceName,
-			ServerName:     row.ServerName,
-			Model:          row.Model,
-			RequestedModel: row.RequestedModel,
-			APIFlavor:      row.APIFlavor,
-			ReqPath:        row.ReqPath,
-			ProviderPath:   row.ProviderPath,
-			ProviderModel:  row.ProviderModel,
-			SessionID:      row.SessionID,
-			SessionSource:  row.SessionSource,
-			AgentID:        row.AgentID,
-			Stream:         row.Stream,
-			StartedAt:      row.StartedAt.UTC().Format(time.RFC3339),
+			ID:                    row.ID,
+			UserID:                row.UserID,
+			UserName:              names[row.UserID],
+			TokenID:               row.TokenID,
+			TokenName:             row.TokenName,
+			ServiceID:             row.ServiceID,
+			ServiceName:           row.ServiceName,
+			ServerName:            row.ServerName,
+			Model:                 row.Model,
+			RequestedModel:        row.RequestedModel,
+			APIFlavor:             row.APIFlavor,
+			ReqPath:               row.ReqPath,
+			ProviderPath:          row.ProviderPath,
+			ProviderModel:         row.ProviderModel,
+			SessionID:             row.SessionID,
+			SessionSource:         row.SessionSource,
+			AgentID:               row.AgentID,
+			Stream:                row.Stream,
+			OutputTokens:          outputTokens,
+			TokensPerSecond:       tps,
+			TokensPerSecondSource: tpsSource,
+			TTFTMs:                ttftMS,
+			StartedAt:             row.StartedAt.UTC().Format(time.RFC3339),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": dtos})
