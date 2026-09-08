@@ -509,7 +509,12 @@ sets it on the wire `Spec.api_token` field, which is what `${API_TOKEN}`
 substitutes agent-side. Same token on both sides because the gateway is the
 one party that holds it; no router change was needed on either the gateway or
 the agent, because the agent's router already forwards the inbound
-`Authorization` header verbatim to the selected child.
+`Authorization` header verbatim to the selected child. That same verbatim
+forwarding now carries a second purpose (issue #58): the gateway's
+`GET /upstream/{model}/props` capability probe
+([§4.1](#41-control-routes), [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time))
+rides it too, which is why an api-key'd child's live-progress verdict is
+recoverable without the agent attaching anything of its own.
 
 **Sealed at rest, decrypted only at the moment of use, fail-closed on
 decrypt.** `set` and `random` values are sealed with the same capture cipher
@@ -829,7 +834,7 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Four fixed GET-only paths; any other method on those exact paths falls through
+Five fixed GET-only routes; any other method on those exact paths falls through
 to model routing.
 
 | Route | Answers | Blocks during a load? |
@@ -837,6 +842,7 @@ to model routing.
 | `GET /health`, `GET /v1/health` | `200 {"status":"ok"}` as soon as the listener is bound, with nothing loaded. Never touches the process manager. | Never |
 | `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only** specs in state `running`. | Never |
 | `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones. | Never |
+| `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -848,6 +854,15 @@ must not read a 200 as evidence that any model process exists.
 `LoadedModelsFormat: "llama_swap"` detection works unchanged — and it is a
 second, independent source of loaded-state truth beside telemetry, not
 redundant with it.
+
+**`/upstream/{model}/props` is the router's first path-parameter dispatch —
+a new contract BESIDE §4.2's byte-for-byte body dispatch, not a change to
+it.** A `GET` on the path whose suffix is anything other than `/props` is
+refused outright (`runtime.upstream_endpoint_not_allowed`, §4.3): the
+allowlist is exactly one path, never a generic reverse proxy. A non-`GET` on
+the same path falls through to the ordinary model-routed proxy, same as any
+other method on the four routes above (the existing M9 rule) — there is no
+separate method check inside this handler.
 
 ### 4.2 Model routing
 
@@ -888,11 +903,13 @@ request-id concept.
 | Code | Status | Meaning |
 |---|---|---|
 | `runtime.model_not_managed` | 404 | No active launch spec for this model. |
+| `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props` (§4.1) never starts a child, so a cold match gets this instead of a boot. |
 | `runtime.start_failed` | 502 | The process exited or never became healthy. |
 | `runtime.start_timeout` | 504 | `startup_timeout_seconds` elapsed — kept distinct from `start_failed` because it is a different diagnosis. |
 | `runtime.admission_blocked` | 503 | No slot freed within the wait window. |
 | `runtime.not_permitted` | 502 | Agent-local policy refused the binary, the directory or a placeholder — a configuration error, explicitly **not** transient. |
 | `runtime.request_too_large` | 413 | Body over the router's limit. |
+| `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props` — the passthrough allowlist (§4.1) is exactly one path. |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
 
 Collapsing or renaming any of these destroys the distinction between a
@@ -2027,8 +2044,10 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)),
 `Since: "0.4.0"`, `runtime_api_token`
 ([§3.2](#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)),
-`Since: "0.5.0"`, and `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
-[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`.
+`Since: "0.5.0"`, `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`, and
+`runtime_upstream_props` ([§4.1](#41-control-routes),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`.
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -2100,6 +2119,39 @@ warning banner, because there is no operator action to prompt — the gap
 closes itself the next time that agent is upgraded.
 `server-agent`'s `Version` moved `0.5.0` → `0.6.0` for this entry, MINOR per
 the same rule.
+
+`runtime_upstream_props` is not the only entry in this registry the
+**gateway** gates real behavior on, fail-closed. `runtime_manager` itself
+does: `PushRuntimeConfig` returns early unless the agent has declared it
+([§9](#9-keeping-the-agent-current-the-notification-rule)). So does
+`runtime_config_ack`, which decides which standard of proof a VRAM-isolation
+wait may apply ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+And so does `runtime_model_probe` — not just the ingest write gate above, but
+also withholding probe-derived numbers from the portal model catalog and the
+runtime-model state checker for an agent that has not declared it.
+`gpu_selection` and `runtime_api_token` are the true portal-informational
+flags here: declared for operator visibility, with no gateway behavior
+riding on either. What actually sets `runtime_upstream_props` apart is
+narrower than "the gateway gates on it" — the gateway-side fail-closed gate
+is this flag's ENTIRE REASON FOR EXISTING, not a secondary effect layered
+onto a flag that would otherwise serve some other purpose.
+The agent's router serves `GET /upstream/{model}/props` ([§4.1](#41-control-routes))
+— the GET-only, allowlisted passthrough to a running managed child's
+`/props` (issue #58;
+[ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token))
+— and the gateway's app-health `{model}` probe pass
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)) only
+sends a probe down that path at an agent whose *reported* capabilities name
+`runtime_upstream_props`: an agent that predates the route has no
+`/upstream/{model}/props` control route to answer with, so the bodiless GET
+falls through to model routing (§4.2), which sees no JSON body naming a
+managed model and answers `404 runtime.model_not_managed` (§4.3) — not once,
+but for every such probe, forever, since nothing about that response ever
+changes. The gate is therefore not an optimization but
+the difference between a probe that can eventually succeed and one that
+never will, exactly the reasoning `PushRuntimeConfig`'s own feature gate
+already established. `server-agent`'s `Version` moved `0.6.0` → `0.7.0` for
+this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -2711,8 +2763,12 @@ than an agent fault:
 
 - Creating (or retyping) a `server_agent` application appeared to do nothing:
   the agent stayed unaware for up to a minute, its router did not bind, and —
-  because the app-health probe does not special-case `server_agent` — the fresh
-  application read *unhealthy* for that whole minute.
+  because the app-health probe otherwise does not special-case `server_agent`
+  for this liveness question (its one exception, added later, is the implicit
+  `{model}` `/props` probe path and its per-mapping credential — §4.1, §10
+  below; issue #58 — gated on the agent-declared `runtime_upstream_props` and
+  unrelated to whether the router has bound at all) — the fresh application
+  read *unhealthy* for that whole minute.
 - Renaming a mapping's `gateway_model_name` left inference under the **new** name
   404-ing at the agent's router while the old name still routed.
 - `runtime_max_processes` reached the agent only on the poll.
@@ -2828,24 +2884,48 @@ mirror). Three different cadences share the one collect cycle:
   is [Telemetry, Usage Analytics & Observability
   §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
 
-  **Known gap: an api-key-protected child's verdict cannot be determined
-  today (issue #58).** `${API_TOKEN}` substitution in a spec's args is a
-  first-class feature ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)),
-  so `llama-server --api-key ${API_TOKEN}` is an expected, supported launch —
-  and llama.cpp marks only `/health` and `/v1/health` as public endpoints, so
-  `/props` sits behind that key. This probe cannot authenticate: it is handed
-  a loopback base URL and a `runtime.Status`, and `Status` carries no token at
-  all. Such a child therefore answers `401`/`403`, which is cached as a
-  conclusive non-verdict (above), and its `live_progress_support` stays `""`
-  forever. The consequence is concrete and not hidden: the per-request
-  decision falls through to its shape clause, which for a `custom`-typed spec
-  opts out — so a `custom`-typed llama.cpp child behind an api key does **not**
-  get the live-progress parameters, where the earlier provider-keyed allow-list
-  DID send them: it listed the bare application type `server_agent`, which
-  opted in every managed child regardless of what actually served. An operator can
-  work around it today by setting the spec's `Type` to `llama_cpp` explicitly
-  (the shape clause then opts in) or by dropping the api key on a loopback-only
-  child. Threading the spec's sealed token through to this probe is issue #58.
+  **An api-key-protected child's verdict is recovered at the gateway edge,
+  not by teaching this probe a credential (issue #58, closed).**
+  `${API_TOKEN}` substitution in a spec's args is a first-class feature
+  ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), so
+  `llama-server --api-key ${API_TOKEN}` is an expected, supported launch — and
+  llama.cpp marks only `/health` and `/v1/health` as public endpoints, so
+  `/props` sits behind that key. This loopback probe still cannot
+  authenticate — it is handed a loopback base URL and a `runtime.Status`, and
+  `Status` carries no token at all — and that stays true by design, not as an
+  oversight left open: `runtime.Status` is copied into every reported and
+  logged place this feature touches, so keeping it token-free is what keeps a
+  spec's credential out of all of them. Threading the sealed token into this
+  probe instead was the originally sketched remedy, and it was rejected on
+  exactly that basis. Such a child therefore still answers `401`/`403` here,
+  still cached as a conclusive non-verdict (above), and this probe's own
+  `live_progress_support` write for it still stays `""` forever — unchanged,
+  and it remains the fast path for every *unprotected* child, and the only
+  source of truth at all for an agent that predates the passthrough below.
+
+  The gap instead closes on the **gateway** side, at the edge that already
+  attaches a credential for ordinary inference: the gateway's app-health pass
+  probes the same child through the router's `GET /upstream/{model}/props`
+  passthrough ([§4.1](#41-control-routes); issue #58), resolving and attaching
+  that mapping's own `routing.SpecUpstreamAuth` credential per mapping — the
+  same per-mapping resolution [§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)
+  describes for inference. The premise this rests on is that the **router**
+  injects no credential of its own and forwards `Authorization` verbatim, not
+  that the agent holds no token at all — it does, from the runtime-config push
+  that carries `${API_TOKEN}`'s resolved value. A mismatch between how the
+  agent comments on that value and how it actually persists it is tracked
+  separately as issue #61 — narrower, and not a reason this design needed to
+  route a credential through `Status`. Once the gateway's probe
+  establishes a real verdict this way, the persisted layers (1–2 of
+  [Telemetry, Usage Analytics & Observability
+  §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests))
+  take over for that mapping and the shape-clause fallback described above
+  never has to answer for it again. Both writers — this loopback probe's
+  telemetry write-back and the gateway's own probe — apply the identical
+  evidence rule and converge through the same compare-to-stored discipline, so
+  which one's write lands first for a given mapping is never a contract. An
+  operator can still work around a `custom`-typed spec's shape-clause opt-out
+  the same way as before, by setting `Type` to `llama_cpp` explicitly.
 
 Every probe shares the agent's existing ~2 s collect timeout and is
 best-effort throughout: a failure is logged at `Debug` and leaves the

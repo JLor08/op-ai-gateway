@@ -29,6 +29,24 @@ var (
 	appHealthProbeConcurrency = 8
 )
 
+// runtimeUpstreamPropsFeature is the agent-DECLARED capability naming the
+// runtime router's GET /upstream/{model}/props passthrough (issue #58). The
+// {model} probe pass below only sends such probes at an agent with positive
+// evidence the route exists -- fail-closed, the PushRuntimeConfig precedent
+// -- because an older agent answers 404 runtime.model_not_managed for every
+// such probe, forever, and silent no-op traffic each cadence tick is
+// exactly what a capability gate exists to prevent.
+const runtimeUpstreamPropsFeature = "runtime_upstream_props"
+
+// serverAgentPropsProbePath is the implicit {model}-template probe path for
+// a server_agent application whose operator left app.ContextProbePath
+// empty: the agent's router forwards it to the RUNNING child's /props with
+// the request's credential intact, so the pass recovers the live-progress
+// verdict of an api-key-protected child (issue #58) -- the case the agent's
+// own token-less loopback probe conclusively cannot determine. An
+// operator-set ContextProbePath always wins over this default.
+const serverAgentPropsProbePath = "/upstream/{model}/props"
+
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
 // and *routing.MemoryStore both satisfy it.
 type healthStore interface {
@@ -44,6 +62,13 @@ type healthStore interface {
 	// interface (routing.MappingStore) for why.
 	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
+	// RuntimeSpecsByApplication lists the runtime specs joined to the app's
+	// mappings (RuntimeSpec.MappingID keys back to the mapping). The {model}
+	// pass uses it to build PER-MAPPING upstream credentials for a
+	// server_agent application (routing.SpecUpstreamAuth -- the resolver and
+	// benchmark-runner precedent) instead of the app-level token: each
+	// mapping's child can carry its own api key (issue #58).
+	RuntimeSpecsByApplication(ctx context.Context, appID string) ([]routing.RuntimeSpec, error)
 }
 
 // availabilityHeartbeat: the health loop writes an availability sample at least
@@ -105,6 +130,11 @@ type modelSyncer interface {
 type agentRegistryBundle interface {
 	ReportingWithin(serverID string, window time.Duration) bool
 	Retain(live map[string]struct{})
+	// HasFeature reports whether serverID's agent declared feature in its
+	// last telemetry sample. false is the fail-closed default (nil registry,
+	// never-reported server) -- the same contract as
+	// agentFeaturesRegistry.Has, which backs it in production.
+	HasFeature(serverID, feature string) bool
 }
 
 // agentRegistries is the production bundle: it delegates the presence read and fans
@@ -142,11 +172,19 @@ type agentRegistries struct {
 	// check in Retain below is what makes the zero value safe.
 	agentFeatures interface {
 		Retain(live map[string]struct{})
+		Has(serverID, feature string) bool
 	}
 }
 
 func (a agentRegistries) ReportingWithin(serverID string, window time.Duration) bool {
 	return a.presence.ReportingWithin(serverID, window)
+}
+
+func (a agentRegistries) HasFeature(serverID, feature string) bool {
+	if a.agentFeatures == nil {
+		return false // nil interface field: same fail-closed default as the registry itself
+	}
+	return a.agentFeatures.Has(serverID, feature)
 }
 
 func (a agentRegistries) Retain(live map[string]struct{}) {
@@ -181,6 +219,15 @@ func retainAgents(agents agentRegistryBundle, live map[string]struct{}) {
 		return
 	}
 	agents.Retain(live)
+}
+
+// hasAgentFeature is the nil-guarded accessor mirroring reportingWithin: a
+// nil bundle (tests that pass no registries) means no evidence, so false.
+func hasAgentFeature(agents agentRegistryBundle, serverID, feature string) bool {
+	if agents == nil {
+		return false
+	}
+	return agents.HasFeature(serverID, feature)
 }
 
 // appHealthRunner holds the FIXED collaborators for one app-health loop
@@ -581,7 +628,17 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		ctxProber, hasCtxProber := r.prober.(provider.ModelInfoProber)
 		for i := range active {
 			app := active[i]
-			if !hasCtxProber || strings.TrimSpace(app.ContextProbePath) == "" {
+			probePath := strings.TrimSpace(app.ContextProbePath)
+			if probePath == "" && app.Type == routing.ProviderServerAgent &&
+				hasAgentFeature(r.agents, server.ID, runtimeUpstreamPropsFeature) {
+				// server_agent implicit default (issue #58): probe the router's
+				// GET-only /props passthrough per loaded mapping. Fail-closed on
+				// the agent's declared capability -- an agent without the route
+				// would 404 every probe -- and an operator-set ContextProbePath
+				// above always wins.
+				probePath = serverAgentPropsProbePath
+			}
+			if !hasCtxProber || probePath == "" {
 				continue
 			}
 			key := "ctx:" + app.ID
@@ -596,7 +653,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 			state.lastProbed[key] = cfg.tNow
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(app routing.Application) {
+			go func(app routing.Application, probePath string) {
 				defer wg.Done()
 				defer func() { <-sem }()
 				target := routing.Target{
@@ -608,7 +665,26 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 				token, _ := capture.OpenSecret(r.cipher, app.APIToken)
 				pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
 
-				if strings.Contains(app.ContextProbePath, "{model}") {
+				// For a server_agent application the credential is per MAPPING
+				// (issue #58): each mapping's spec can carry its own upstream
+				// token, and the router forwards whatever header we attach
+				// verbatim to the child. Loaded once per app; a read error
+				// degrades to the empty map -- every lookup then yields the
+				// zero-value spec, whose SpecUpstreamAuth answer is the
+				// documented app-token fallback, i.e. exactly the pre-#58
+				// behavior of this pass.
+				specByMapping := map[string]routing.RuntimeSpec{}
+				if app.Type == routing.ProviderServerAgent {
+					specs, serr := r.store.RuntimeSpecsByApplication(ctx, app.ID)
+					if serr != nil {
+						log.Printf("app health: runtime specs for app %s failed: %v (probing with the app token)", app.ID, serr)
+					}
+					for _, sp := range specs {
+						specByMapping[sp.MappingID] = sp
+					}
+				}
+
+				if strings.Contains(probePath, "{model}") {
 					// Per-model endpoint: substitute {model} with each genuinely-loaded
 					// model's upstream name and attribute the returned context size
 					// DIRECTLY to that mapping — sidestepping the reported-name match the
@@ -644,17 +720,37 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						if _, ok := loadedSet[mp.AppModelName]; !ok {
 							continue // only probe genuinely-loaded models
 						}
-						probePath := provider.ExpandModelPath(app.ContextProbePath, mp.AppModelName)
-						infos, perr := ctxProber.ProbeModelInfo(pctx, target, probePath)
+						// Per-mapping credential (issue #58): SpecUpstreamAuth
+						// resolves mode off/set/random/app against this mapping's
+						// spec (zero-value spec => app token, the resolver's exact
+						// fallback); the token is SEALED, so OpenSecret it exactly
+						// like the app token above (fail-open).
+						mctx := pctx
+						if app.Type == routing.ProviderServerAgent {
+							specToken, header := routing.SpecUpstreamAuth(specByMapping[mp.ID], app)
+							specTok, _ := capture.OpenSecret(r.cipher, specToken)
+							mctx = provider.WithUpstreamAuth(ctx, header, specTok)
+						}
+						expanded := provider.ExpandModelPath(probePath, mp.AppModelName)
+						infos, perr := ctxProber.ProbeModelInfo(mctx, target, expanded)
 						if perr != nil {
 							select {
 							case <-ctx.Done():
 								return
 							case <-time.After(appHealthRetryGap):
 							}
-							infos, perr = ctxProber.ProbeModelInfo(pctx, target, probePath)
+							infos, perr = ctxProber.ProbeModelInfo(mctx, target, expanded)
 						}
 						if perr != nil {
+							if errors.Is(perr, provider.ErrAuthRejected) {
+								// On this path a 401/403 is a MISCONFIGURED token,
+								// not "cannot determine": the gateway holds the
+								// credential, and an unauthenticated child ignores
+								// extra tokens. Repeats each failing cycle by
+								// design -- it is the operator signal, and it
+								// stops when the token is fixed (issue #58).
+								log.Printf("app health: model info probe for app %s model %q rejected by the upstream (401/403): check the runtime spec's API token", app.ID, mp.AppModelName)
+							}
 							continue
 						}
 						ctxSize := provider.PickModelContextSize(infos, mp.AppModelName)
@@ -684,7 +780,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 					return
 				}
 
-				infos, err := ctxProber.ProbeModelInfo(pctx, target, app.ContextProbePath)
+				infos, err := ctxProber.ProbeModelInfo(pctx, target, probePath)
 				if err != nil {
 					// Retry once after a short gap before giving up, mirroring the
 					// health + loaded probes' anti-flap behaviour.
@@ -693,7 +789,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						return
 					case <-time.After(appHealthRetryGap):
 					}
-					infos, err = ctxProber.ProbeModelInfo(pctx, target, app.ContextProbePath)
+					infos, err = ctxProber.ProbeModelInfo(pctx, target, probePath)
 				}
 				if err != nil || len(infos) == 0 {
 					// A failed/empty probe leaves the stored context_size as-is (unlike
@@ -752,7 +848,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						}
 					}
 				}
-			}(app)
+			}(app, probePath)
 		}
 	}
 	wg.Wait()

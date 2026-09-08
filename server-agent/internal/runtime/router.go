@@ -4,7 +4,7 @@
 // This file is the router port (design doc §6.1): the single HTTP port the
 // gateway talks to for a server_agent application, which routes every
 // inference request to the right managed model process, starting it first
-// if necessary. Three route classes:
+// if necessary. Four route classes:
 //
 //   - GET /health, GET /v1/health -- always 200 while the router is up.
 //     "Reachability means the router accepts, not that a model is warm" --
@@ -17,6 +17,13 @@
 //     straight off Manager's already-non-blocking Status()/LoadedModels()
 //     (Task 14's serialized owner answers these on its own command channel,
 //     interleaved with -- never behind -- a pending admission/start).
+//   - GET /upstream/{model}/props -- the GET-only, allowlisted passthrough
+//     to a RUNNING managed child's /props (issue #58): model from the PATH
+//     (prefix/suffix decomposition, so ids containing "/" work), resolved
+//     via Status() only -- NEVER EnsureRunning, a probe must not start or
+//     keep alive a child -- and relayed byte-verbatim so the gateway's
+//     evidence rule reads the child's own document. The allowlist is
+//     exactly /props; widening it is #49-2/#55 business.
 //   - everything else -- the model-routed reverse proxy.
 //
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
@@ -90,6 +97,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -273,8 +282,8 @@ func newRouter(m managerPort) *router {
 }
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// M9: the brief specifies GET for all three control paths; a
-	// different method on one of these exact paths falls through to the
+	// M9: the brief specifies GET for the control paths; a different
+	// method on one of these exact paths falls through to the
 	// model-routed proxy instead (the ordinary "everything else" case),
 	// rather than getting the always-200 treatment regardless of method.
 	isGet := r.Method == http.MethodGet
@@ -285,6 +294,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveRunning(w, r)
 	case isGet && r.URL.Path == "/v1/models":
 		rt.serveModels(w, r)
+	case isGet && strings.HasPrefix(r.URL.Path, "/upstream/"):
+		rt.serveUpstreamProps(w, r)
 	default:
 		rt.serveProxy(w, r)
 	}
@@ -351,6 +362,99 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
 }
 
+// upstreamPropsSuffix is the one child endpoint the /upstream passthrough
+// allowlists -- both the inbound suffix match and the outbound path.
+const upstreamPropsSuffix = "/props"
+
+// serveUpstreamProps handles GET /upstream/{model}/props (issue #58): the
+// llama-swap-style upstream passthrough, restricted to a GET of exactly
+// /props on a RUNNING child. The gateway probes an api-key-protected child's
+// live-progress capability through it, attaching the spec's token -- which
+// this handler, like the proxy paths, forwards verbatim (Authorization and
+// custom token headers are not hop-by-hop).
+//
+// Deliberate properties, each one a guardrail from the issue:
+//   - Status() only, never EnsureRunning: llama-swap's own /upstream route
+//     boots a cold model on contact -- a probe that starts children is a
+//     hazard, not a feature. No inFlight/lastUsed touch either, so the
+//     probe never keeps an idle child alive.
+//   - Prefix/suffix decomposition, not segment matching: upstream model ids
+//     are only TrimSpace-validated and may contain "/" (HF-style
+//     "org/model"); everything between "/upstream/" and the trailing
+//     "/props" is the model. provider.ExpandModelPath on the gateway side
+//     keeps "/" literal, so the two ends agree.
+//   - The outbound path is EXACTLY /props -- never the inbound path -- and
+//     the response is relayed unmodified: the evidence rule's
+//     "role":"router" gate must see the child's own document.
+//   - Managed-but-cold gets its own sentinel (runtime.model_not_running):
+//     §4.3's error codes are never collapsed, and "no spec" vs "not
+//     running right now" are different diagnoses.
+func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/upstream/")
+	if !strings.HasSuffix(rest, upstreamPropsSuffix) {
+		writeError(w, http.StatusNotFound, "runtime.upstream_endpoint_not_allowed",
+			"only /props may be requested through /upstream/{model}")
+		return
+	}
+	model := strings.TrimSuffix(rest, upstreamPropsSuffix)
+	if model == "" || rt.m == nil {
+		writeError(w, http.StatusNotFound, codeModelNotManaged,
+			"no active launch spec for this model")
+		return
+	}
+	var (
+		port  int
+		found bool
+	)
+	for _, st := range rt.m.Status() {
+		if st.Model != model {
+			continue
+		}
+		found = true
+		if st.State == StateRunning && st.Port != 0 {
+			port = st.Port
+			break // prefer a running entry among duplicate upstream_model specs; byUpstream's own collapse is an arbitrary map-order winner, but a probe must read a live child
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, codeModelNotManaged,
+			"no active launch spec for this model")
+		return
+	}
+	if port == 0 {
+		writeError(w, http.StatusNotFound, "runtime.model_not_running",
+			"model is managed but not running; this probe never starts a child")
+		return
+	}
+	target := "http://127.0.0.1:" + strconv.Itoa(port) + upstreamPropsSuffix
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
+		return
+	}
+	req.Header = r.Header.Clone()
+	for _, h := range hopByHopHeaders {
+		req.Header.Del(h)
+	}
+	// Same I2 reasoning as buildUpstreamRequest: never forward the caller's
+	// Accept-Encoding, so the Transport negotiates and transparently
+	// decompresses on our behalf and the relayed bytes are the decoded body.
+	req.Header.Del("Accept-Encoding")
+	resp, err := rt.transport.RoundTrip(req)
+	if err != nil {
+		// The Status snapshot can race an idle drain: the child was running
+		// a moment ago and the port is dead now. Same code the proxy paths
+		// use for "something went wrong reaching an admitted child".
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // read-side close, best-effort
+	forwardUpstreamResponse(w, nil, resp)
+}
+
 // modelStreamPeek is the minimal shape the router reads out of a proxied
 // request body: just enough to route it and decide whether to heartbeat.
 // Every other field of the real request (OpenAI/Anthropic-shaped or
@@ -361,7 +465,8 @@ type modelStreamPeek struct {
 }
 
 // serveProxy is the model-routed reverse proxy: every request that is not
-// one of the three fixed control paths above. It buffers the body (bounded),
+// one of the four fixed GET-only routes above -- health, running, models,
+// and the /upstream/{model}/props probe. It buffers the body (bounded),
 // extracts model/stream, and hands off to the plain or streaming path.
 func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
@@ -379,7 +484,7 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 
 	var peek modelStreamPeek
 	if err := json.Unmarshal(body, &peek); err != nil || peek.Model == "" {
-		writeError(w, http.StatusNotFound, "runtime.model_not_managed", "request body does not name a managed model")
+		writeError(w, http.StatusNotFound, codeModelNotManaged, "request body does not name a managed model")
 		return
 	}
 
@@ -873,6 +978,13 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
+// Stable wire codes duplicated-by-string often enough that they live as
+// constants; the full code table is sentinelCode below and design doc par.4.3.
+const (
+	codeModelNotManaged = "runtime.model_not_managed"
+	codeUpstreamGone    = "runtime.upstream_gone"
+)
+
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
 // and HTTP status. Any error that is not one of the five named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
@@ -883,7 +995,7 @@ type errorBody struct {
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
-		return "runtime.model_not_managed", http.StatusNotFound
+		return codeModelNotManaged, http.StatusNotFound
 	case errors.Is(err, ErrStartFailed):
 		return "runtime.start_failed", http.StatusBadGateway
 	case errors.Is(err, ErrStartTimeout):
@@ -893,7 +1005,7 @@ func sentinelCode(err error) (code string, status int) {
 	case errors.Is(err, ErrNotPermitted):
 		return "runtime.not_permitted", http.StatusBadGateway
 	default:
-		return "runtime.upstream_gone", http.StatusBadGateway
+		return codeUpstreamGone, http.StatusBadGateway
 	}
 }
 

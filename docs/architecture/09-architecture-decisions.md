@@ -734,3 +734,55 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
 [Data Model §4](reference/data-model.md#4-migration-history-76-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
+
+## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
+**Context:** #52 left an api-key-protected child's `timings_per_token`
+verdict undeterminable — the loopback probe carries no credential, and
+`401`/`403` are cached as conclusive refusals, not transient failures — a
+regression specifically for a `custom`-typed protected child, whose shape
+clause opts out with no persisted verdict to override it. The originally
+sketched remedy, threading the spec's sealed token into the agent-local
+probe, was rejected on two grounds: `runtime.Status` is copied into every
+reported and logged place this feature touches, so a credential riding it
+would leak into all of them; and the "the agent holds no token" premise that
+motivated probing the child directly turned out false anyway — the
+runtime-config push already carries the resolved `${API_TOKEN}` value
+agent-side (a mismatch between how the agent comments on that value and how
+it actually persists it is tracked separately as issue #61, and does not
+change this decision's reasoning). The accurate invariant was never about
+what the agent holds; it is
+that the **router** injects no credential of its own and forwards
+`Authorization` verbatim, exactly as it already does for ordinary inference.
+**Decision:** mirror llama-swap's `/upstream/{model}/…` shape, with the
+guardrails llama-swap itself lacks — GET-only, an allowlist of exactly
+`/props`, `Status()`-only resolution that never starts or keeps alive a
+child, and the model decomposed from the path by prefix/suffix rather than
+segment matching (an upstream id may itself contain `/`)
+([Agent-Managed Model Runtime §4.1](cross-cutting/agent-runtime-manager.md#41-control-routes)) —
+and let the gateway's `{model}` app-health pass probe through it instead of
+over loopback, attaching that mapping's own `routing.SpecUpstreamAuth`
+credential, fail-closed-gated on the agent-declared `runtime_upstream_props`
+capability so an older agent is never sent a probe its router would just
+404 forever
+([§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation)).
+**Consequence:** `live_progress_support` now has two converging writers — the
+agent's own loopback probe over telemetry, and the gateway's probe through
+the router — that apply the identical evidence rule and the same
+compare-to-stored discipline, so which one's write lands first for a given
+mapping is never a contract; the loopback probe stays the fast, generally
+available path for every unprotected child and the only path for an agent
+that predates this feature, while the router passthrough is what resolves a
+protected one. A `401`/`403` on this path is no longer an unresolvable dead
+end but a typed, logged operator misconfiguration
+(`provider.ErrAuthRejected`, surfaced as "check the runtime spec's API
+token"). Widening the allowlist beyond `/props` — `/slots` for #49-2,
+router-mode passthrough for #55 — is deliberately left to those issues; this
+decision adds exactly the one route #58 needed.
+→ [Agent-Managed Model Runtime
+§4.1](cross-cutting/agent-runtime-manager.md#41-control-routes),
+[§4.3](cross-cutting/agent-runtime-manager.md#43-stable-error-codes),
+[§3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
+[§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
+[Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
+[API Surface](reference/api-surface.md#53-the-agents-own-router-port-not-a-gateway-endpoint).

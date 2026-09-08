@@ -139,6 +139,21 @@ var Features = []Feature{
 	// the same 0.6.0 that first carries the context-size and live-metrics
 	// probing.
 	{Name: "runtime_model_probe", Since: "0.6.0"},
+	// runtime_upstream_props: this agent's runtime router serves
+	// GET /upstream/{model}/props -- the GET-only, allowlisted passthrough to
+	// a RUNNING managed child's /props (issue #58; it never starts a child,
+	// and the allowlist is exactly /props). Unlike most entries above, the
+	// GATEWAY gates real behavior on this flag, fail-closed (the
+	// PushRuntimeConfig precedent): its app-health {model} probe pass only
+	// sends /upstream/{model}/props probes at an agent with positive
+	// evidence the route exists -- an older agent would answer 404
+	// runtime.model_not_managed for every such probe, forever.
+	//
+	// Since is 0.7.0, this branch's single bump (see agent.go's Version
+	// block): the rule is one bump per SHIPPED CHANGE, never per commit, and
+	// the binary that first carries this name is the same 0.7.0 that first
+	// carries the route.
+	{Name: "runtime_upstream_props", Since: "0.7.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

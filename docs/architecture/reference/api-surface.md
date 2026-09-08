@@ -737,23 +737,27 @@ server file-mode on a failed ingest.
 ### 5.3 The agent's own router port (not a gateway endpoint)
 
 For completeness, since the gateway's `server_agent` provider talks to it: the
-agent's managed-runtime router serves **exactly four GET control paths** —
-`/health`, `/v1/health`, `/running`, `/v1/models` — and routes everything else
-on a `model` field in a JSON request body.
+agent's managed-runtime router serves **five fixed GET-only control routes** —
+`/health`, `/v1/health`, `/running`, `/v1/models`, `/upstream/{model}/props` —
+and routes everything else on a `model` field in a JSON request body.
 
 | Path | Answers |
 |---|---|
 | `GET /health`, `GET /v1/health` | `200 {"status":"ok"}` unconditionally, without touching the process manager |
 | `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only running** specs |
 | `GET /v1/models` | OpenAI's shape, `{"object":"list","data":[{"id":"<upstream>","object":"model"}]}` — **every managed** spec, cold ones included |
+| `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` decomposed from the path by prefix/suffix (an upstream id may itself contain `/`), resolved via `Status()` **only** — it never starts or keeps alive a child. Only `/props` may follow `{model}`; headers minus the hop-by-hop set forward verbatim, and the response is relayed unmodified. |
 
 Any other method on those exact paths falls through to model routing. A request
 with no body, a non-JSON body, or a body naming no managed model gets
 `404 runtime.model_not_managed` — **including a WebSocket handshake, which is a
 bodiless GET**; there is no `/ws` and no upgrade path, and a child that answers
 `101` anyway has its response refused. A body over 32 MiB gets
-`413 runtime.request_too_large`. Responses are never buffered. Full error-code
-table and the reasoning: [Agent-Managed Model
+`413 runtime.request_too_large`. `/upstream/{model}/props` adds two more stable
+codes of its own: `404 runtime.model_not_running` for a managed-but-cold match
+(this route never boots one), and `404 runtime.upstream_endpoint_not_allowed`
+for any suffix other than `/props`. Responses are never buffered. Full
+error-code table and the reasoning: [Agent-Managed Model
 Runtime](../cross-cutting/agent-runtime-manager.md).
 
 ## 6. Health & SPA

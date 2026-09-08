@@ -214,8 +214,7 @@ func TestRuntimeAPITokenFeatureIsDeclared(t *testing.T) {
 }
 
 // TestRuntimeModelProbeFeatureIsDeclared pins the runtime-model-probe
-// feature's exact wire NAME and the version it ships in, and pins the
-// accompanying MINOR bump to agent.Version itself. The gateway/portal check
+// feature's exact wire NAME and the version it ships in. The gateway/portal check
 // this literal string before trusting that the connected agent probes each
 // managed child model server for its context size and live request metrics
 // and reports them in the per-runtime telemetry sample
@@ -225,17 +224,36 @@ func TestRuntimeAPITokenFeatureIsDeclared(t *testing.T) {
 // TestGPUSelectionFeatureIsDeclared, and TestRuntimeAPITokenFeatureIsDeclared.
 func TestRuntimeModelProbeFeatureIsDeclared(t *testing.T) {
 	const name = "runtime_model_probe"
-	if Version != "0.6.0" {
-		t.Fatalf("Version = %q, want 0.6.0 (this branch's single bump, accompanying the %q feature)", Version, name)
-	}
 	for _, f := range Features {
 		if f.Name != name {
 			continue
 		}
 		if f.Since != "0.6.0" {
-			t.Fatalf("feature %q Since = %q, want 0.6.0 (the branch's single bump)", name, f.Since)
+			t.Fatalf("feature %q Since = %q, want 0.6.0 (the feature's shipped version)", name, f.Since)
 		}
 		return
 	}
 	t.Fatalf("Features does not declare %q; the gateway/portal cannot know this agent probes managed model servers for context size and live request metrics: %+v", name, Features)
+}
+
+// TestFeaturesDeclareRuntimeUpstreamProps pins the #58 capability: the
+// gateway's app-health pass fail-closed-gates its /upstream/{model}/props
+// probing on this exact name, so a rename here silently turns that probing
+// off for every agent.
+func TestFeaturesDeclareRuntimeUpstreamProps(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_upstream_props" {
+			found = true
+			if f.Since != "0.7.0" {
+				t.Fatalf("runtime_upstream_props Since = %q, want 0.7.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_upstream_props")
+	}
+	if Version != "0.7.0" {
+		t.Fatalf("Version = %q, want 0.7.0 (one bump per shipped change; 0.6.0 has shipped)", Version)
+	}
 }
