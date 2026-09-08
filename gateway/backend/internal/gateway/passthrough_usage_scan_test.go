@@ -331,3 +331,49 @@ func TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent(t *testing.T) {
 		t.Fatalf("recorded TokensPerSecond = %v, want > 0 (the derived rate must reach the usage_events row, not just the scanner)", events[0].TokensPerSecond)
 	}
 }
+
+// TestPassthroughPlaceholderOnlyAnthropicStreamRecordsNoRate closes F3 for the
+// other direction: it is not enough for a POSITIVE rate to reach the recorded
+// usage_events row (TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent
+// above); the fix this row exists to prove is that a stream whose only usage
+// frame is message_start's PLACEHOLDER (`output_tokens: 1`) must NOT leave a
+// derived rate on that row either, because a recorded rate is a routing input
+// (recordUsage -> UpdateMappingOpportunisticMetrics) once opportunistic metrics
+// are enabled. Unlike the positive test, this stream never sends message_delta,
+// so isTerminalUsageFrame's gate is the only thing standing between this stream
+// and an invented `1 / window` sample landing in the row — asserting on the
+// scanner alone (TestPassthroughAnthropicFallbackNeedsAnAuthoritativeTerminalUsageFrame)
+// does not prove the gate actually reaches the recorded event through the full
+// native-passthrough server.
+func TestPassthroughPlaceholderOnlyAnthropicStreamRecordsNoRate(t *testing.T) {
+	body := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	prov := &recordingProxyProvider{respBody: body}
+	srv := newNativeProxyTestServer(prov, false, true)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	// The placeholder count itself is still recorded — only the derived rate is
+	// gated, since the rate is what would be presented as measured and blended
+	// into the mapping's throughput EWMA.
+	if events[0].OutputTokens != 1 {
+		t.Fatalf("recorded OutputTokens = %d, want 1 (the merged placeholder count is unchanged by this gate)", events[0].OutputTokens)
+	}
+	if events[0].TokensPerSecond != 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 0 (message_start's output_tokens is a placeholder, not an authoritative terminal usage frame, and must not reach the row as a measured rate)", events[0].TokensPerSecond)
+	}
+}
