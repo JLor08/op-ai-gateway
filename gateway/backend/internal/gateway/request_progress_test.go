@@ -218,20 +218,31 @@ func TestLiveProgressDTO(t *testing.T) {
 	cases := []struct {
 		name       string
 		p          *requestProgress
+		at         time.Time // the poll instant; zero means the shared `now` above
 		wantTokens int
 		wantTPS    float64
 		wantSource string
 		wantTTFT   int64
 	}{
-		{"upstream reported", upstream, 40, 21.5, "upstream", 500},
-		{"gateway derived", gateway, 50, 25, "gateway", 500},
-		{"no exact count", noCount, 0, 0, "", 500},
-		{"first token before start (clock skew)", beforeStart, 0, 0, "", 0},
-		{"no progress at all", nil, 0, 0, "", 0},
+		{"upstream reported", upstream, time.Time{}, 40, 21.5, "upstream", 500},
+		{"gateway derived", gateway, time.Time{}, 50, 25, "gateway", 500},
+		{"no exact count", noCount, time.Time{}, 0, 0, "", 500},
+		{"first token before start (clock skew)", beforeStart, time.Time{}, 0, 0, "", 0},
+		{"no progress at all", nil, time.Time{}, 0, 0, "", 0},
+		// A poll that lands inside minGatewayRateWindow of the first delta: the
+		// exact count is real, but 50/0.001s would render "50000.0" for one poll.
+		// No rate, no source -- the row keeps the em-dash it already showed.
+		{"gateway window below the floor", gateway, first.Add(time.Millisecond), 50, 0, "", 500},
+		// Exactly at the floor the window is trusted: 50 tokens / 0.05s = 1000.
+		{"gateway window at the floor", gateway, first.Add(minGatewayRateWindow), 50, 1000, "gateway", 500},
 	}
 	for _, tc := range cases {
 		row := ActiveRequest{StartedAt: start, Progress: tc.p}
-		tokens, tps, source, ttft := liveProgressDTO(row, now)
+		at := tc.at
+		if at.IsZero() {
+			at = now
+		}
+		tokens, tps, source, ttft := liveProgressDTO(row, at)
 		if tokens != tc.wantTokens || tps != tc.wantTPS || source != tc.wantSource || ttft != tc.wantTTFT {
 			t.Fatalf("%s: got (%d, %v, %q, %d)", tc.name, tokens, tps, source, ttft)
 		}

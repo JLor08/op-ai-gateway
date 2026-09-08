@@ -54,6 +54,17 @@ func (p *requestProgress) observeDelta(at time.Time, prog *inference.StreamProgr
 	}
 }
 
+// minGatewayRateWindow floors the generation window a GATEWAY-derived rate may be
+// computed over. Without it a DTO built microseconds after the first delta divides
+// an exact count by a window of ~0 and renders something like "1000000.0" for one
+// poll before self-correcting -- a nonsense figure in the one feature whose thesis
+// is that a displayed number is a real measurement. Suppressing a sub-50ms sample
+// costs nothing: the row showed the shared "never measured" em-dash a moment
+// earlier and shows it for one more poll. It does NOT apply to an
+// upstream-reported rate, which is a measurement the gateway did not make and has
+// no window of its own.
+const minGatewayRateWindow = 50 * time.Millisecond
+
 // liveProgressDTO resolves one in-flight request's counters into its wire values.
 // Nil-safe throughout: a request with no progress struct resolves to "not
 // measured" -- an explicit "" source rather than a fabricated zero.
@@ -78,8 +89,8 @@ func liveProgressDTO(row ActiveRequest, now time.Time) (outputTokens int, tps fl
 	if milli := p.upstreamTPSMilli.Load(); milli > 0 {
 		return outputTokens, float64(milli) / 1000, "upstream", ttftMS
 	}
-	if secs := now.Sub(firstAt).Seconds(); outputTokens > 0 && secs > 0 {
-		return outputTokens, float64(outputTokens) / secs, "gateway", ttftMS
+	if window := now.Sub(firstAt); outputTokens > 0 && window >= minGatewayRateWindow {
+		return outputTokens, float64(outputTokens) / window.Seconds(), "gateway", ttftMS
 	}
 	return outputTokens, 0, "", ttftMS
 }
