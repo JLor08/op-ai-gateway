@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1269,4 +1270,209 @@ func TestRouterPlainProxyDoesNotHijackAnUpgradeResponse(t *testing.T) {
 	}
 
 	assertReleasedExactlyOnce(t, cm, 3*time.Second, 200*time.Millisecond)
+}
+
+// ---------------------------------------------------------------------------
+// GET /upstream/{model}/props (issue #58): the allowlisted, never-starting
+// passthrough to a running managed child's /props.
+// ---------------------------------------------------------------------------
+
+// statusManager is a managerPort fake for the /upstream/{model}/props route:
+// Status() is fixed, and EnsureRunning must never be called (the route's
+// whole contract is that a probe never starts a child) -- ensures counts it.
+type statusManager struct {
+	statuses []Status
+	ensures  atomic.Int64
+}
+
+func (m *statusManager) EnsureRunning(context.Context, string) (string, func(), error) {
+	m.ensures.Add(1)
+	return "", nil, ErrModelNotManaged
+}
+func (m *statusManager) LoadedModels() []string { return nil }
+func (m *statusManager) Status() []Status       { return m.statuses }
+
+// decodeErrorCode decodes rec's body as the error envelope and returns the
+// wire code, reusing the file's existing decodeJSON idiom.
+func decodeErrorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	return decodeJSON[errorEnvelope](t, rec.Body).Error.Code
+}
+
+// childPort extracts the loopback port an httptest server listens on, so a
+// Status entry can point the route at it.
+func childPort(t *testing.T, rawURL string) int {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse httptest URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse httptest port: %v", err)
+	}
+	return port
+}
+
+// TestRouterUpstreamPropsForwardsToRunningChild: the headline case. A running
+// child receives GET at path EXACTLY /props with the inbound Authorization
+// and custom token header intact; the child's body/status come back verbatim;
+// EnsureRunning is never called. The model id carries a slash (HF style) --
+// the prefix/suffix decomposition this route exists to get right.
+func TestRouterUpstreamPropsForwardsToRunningChild(t *testing.T) {
+	var hits atomic.Int32
+	var gotPath, gotAuth, gotKey string
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		gotPath, gotAuth, gotKey = r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":true}}}`))
+	}))
+	defer child.Close()
+	port := childPort(t, child.URL)
+
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "org/model", State: StateRunning, Port: port}}}
+	rt := newRouter(m)
+
+	req := httptest.NewRequest(http.MethodGet, "/upstream/org/model/props", nil)
+	req.Header.Set("Authorization", "Bearer spec-tok")
+	req.Header.Set("X-Api-Key", "raw-tok")
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("child hits = %d, want 1", got)
+	}
+	if gotPath != "/props" {
+		t.Fatalf("child saw path %q, want exactly /props (the inbound /upstream path must never be forwarded)", gotPath)
+	}
+	if gotAuth != "Bearer spec-tok" || gotKey != "raw-tok" {
+		t.Fatalf("credentials not forwarded verbatim: Authorization=%q X-Api-Key=%q", gotAuth, gotKey)
+	}
+	if want := `{"default_generation_settings":{"params":{"timings_per_token":true}}}`; rec.Body.String() != want {
+		t.Fatalf("body not relayed verbatim: %q", rec.Body.String())
+	}
+	if n := m.ensures.Load(); n != 0 {
+		t.Fatalf("EnsureRunning called %d times, want 0 (the probe must never start a child)", n)
+	}
+}
+
+// TestRouterUpstreamPropsColdModelNeverStarts: a managed-but-cold spec
+// answers 404 runtime.model_not_running, and the REAL manager still reports
+// it StateStopped afterwards -- asserting on the manager, not just the
+// response (the TestRouterModelsListsAllManagedSpecs pattern).
+func TestRouterUpstreamPropsColdModelNeverStarts(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	spec := baseSpec("s1", "cold-model")
+	m.Apply(Config{Specs: []Spec{spec}}) // neither Pinned nor force_running: stays cold
+
+	rt := NewRouter(m)
+	req := httptest.NewRequest(http.MethodGet, "/upstream/cold-model/props", nil)
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec); code != "runtime.model_not_running" {
+		t.Fatalf("code = %q, want runtime.model_not_running", code)
+	}
+	for _, st := range m.Status() {
+		if st.State != StateStopped {
+			t.Fatalf("spec %s is %q after the probe, want %q -- the probe started a child", st.SpecID, st.State, StateStopped)
+		}
+	}
+}
+
+// TestRouterUpstreamPropsUnknownModelAndNilManager: both answer the existing
+// runtime.model_not_managed, and so does an empty model segment.
+func TestRouterUpstreamPropsUnknownModelAndNilManager(t *testing.T) {
+	cases := []struct {
+		name string
+		m    managerPort
+		path string
+	}{
+		{"unknown model", &statusManager{}, "/upstream/nope/props"},
+		{"nil manager", nil, "/upstream/nope/props"},
+		{"empty model", &statusManager{}, "/upstream//props"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newRouter(tc.m)
+			rec := httptest.NewRecorder()
+			rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rec.Code)
+			}
+			if code := decodeErrorCode(t, rec); code != "runtime.model_not_managed" {
+				t.Fatalf("code = %q, want runtime.model_not_managed", code)
+			}
+		})
+	}
+}
+
+// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props is the entire
+// allowlist. A running child must see ZERO traffic for a refused path.
+func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateRunning, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
+	for _, path := range []string{"/upstream/m/completion", "/upstream/m/props/", "/upstream/props", "/upstream/m/metrics"} {
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: status = %d, want 404", path, rec.Code)
+		}
+		if code := decodeErrorCode(t, rec); code != "runtime.upstream_endpoint_not_allowed" {
+			t.Fatalf("%s: code = %q, want runtime.upstream_endpoint_not_allowed", path, code)
+		}
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 (a refused path must never reach the child)", got)
+	}
+}
+
+// TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch: the M9 contract --
+// the new case is isGet-guarded, so a POST at the same path lands in
+// serveProxy and gets the body-dispatch 404, NOT the allowlist refusal.
+func TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch(t *testing.T) {
+	rt := newRouter(&statusManager{})
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/upstream/m/props", strings.NewReader(`{}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec); code != "runtime.model_not_managed" {
+		t.Fatalf("code = %q, want runtime.model_not_managed (serveProxy's empty-model answer -- proof of fall-through)", code)
+	}
+}
+
+// TestRouterUpstreamPropsUpstreamGoneOnDialFailure: the Status snapshot can
+// race an idle drain -- a dead port answers 502 runtime.upstream_gone.
+func TestRouterUpstreamPropsUpstreamGoneOnDialFailure(t *testing.T) {
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	port := childPort(t, child.URL)
+	child.Close() // the port is now dead
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateRunning, Port: port}}}
+	rt := newRouter(m)
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/m/props", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec); code != "runtime.upstream_gone" {
+		t.Fatalf("code = %q, want runtime.upstream_gone", code)
+	}
 }
