@@ -123,6 +123,44 @@ describe('ActiveRequestsPanel live metrics columns', () => {
     expect(screen.getByText('12.0')).toHaveAttribute('title', t.activityLiveTpsUpstream);
   });
 
+  it('distinguishes a measured rate that rounds to 0.0 from a measured zero', () => {
+    render(
+      <ActiveRequestsPanel
+        t={t}
+        active={[
+          // A real, upstream-exact count over a stalled generation window:
+          // 1 token / 25s. Rendering "0.0" here would make a genuine measurement
+          // indistinguishable from no throughput at all.
+          makeActive({
+            id: 'act_tiny',
+            tokens_per_second: 0.04,
+            tokens_per_second_source: 'gateway',
+            output_tokens: 1,
+            ttft_ms: 333,
+          }),
+          // The never-measured row, for contrast: still the shared em-dash.
+          makeActive({
+            id: 'act_none',
+            model: 'live-model-2',
+            tokens_per_second: 0,
+            tokens_per_second_source: '',
+            ttft_ms: 444,
+          }),
+        ]}
+        effectiveScope="own"
+      />,
+    );
+
+    const tinyRow = screen.getByRole('cell', { name: 'live-model' }).closest('tr')!;
+    expect(within(tinyRow).getByRole('cell', { name: '<0.1' })).toBeInTheDocument();
+    expect(within(tinyRow).queryByRole('cell', { name: '0.0' })).not.toBeInTheDocument();
+    // The provenance tooltip still says it was computed from the reported count.
+    expect(screen.getByText('<0.1')).toHaveAttribute('title', expect.stringContaining('1'));
+
+    const noneRow = screen.getByRole('cell', { name: 'live-model-2' }).closest('tr')!;
+    expect(within(noneRow).getByRole('cell', { name: '—' })).toBeInTheDocument();
+  });
+
   it('names the never-measured provenance in the tooltip', () => {
     render(
       <ActiveRequestsPanel
