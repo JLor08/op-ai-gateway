@@ -620,8 +620,9 @@ calls emits no text delta at all (the provider's stream loop forwards a text
 event only when the delta carries non-empty content or reasoning; tool-call
 argument fragments accumulate silently and surface only once the stream ends),
 so counting deltas would undercount such a turn by close to 100%; speculative
-decoding lands several tokens per delta, which undercounts by an amount dependent on the upstream model; and the Go
-backend has no tokenizer to count correctly by any other means. When no exact
+decoding lands several tokens per delta, which undercounts by an amount that
+depends on the upstream model; and the Go backend has no tokenizer to count
+correctly by any other means. When no exact
 count has been seen, the row shows the same shared "never measured" em dash
 (`formatMetric`, `shared/format.ts`) the rest of Activity uses for a metric
 that was never measured, never a derived zero.
@@ -636,21 +637,78 @@ from an absent field) and exactly one of three values:
 - `gateway` — computed here, output tokens over elapsed seconds since the
   first content delta, and only ever over the upstream's own exact count
   (vLLM reports an exact running `completion_tokens` but no rate of its own).
+  The window has a floor of 50 ms: a poll landing microseconds after the first
+  delta would divide an exact count by ~0 and render an absurd figure for one
+  poll, and the row simply keeps the em dash it was already showing.
 - `""` (empty) — not measured.
 
-**The allow-list.** Getting an exact mid-stream count at all needs two extra
-parameters on the *gateway-built* streaming request body: `timings_per_token`
-and `stream_options.continuous_usage_stats` (`openai_compatible.go`'s
-`CompleteStream`). Both are added only when the resolved target's provider is
+Because a *measured* value must never be mistakable for a measured zero, the
+live rate cell renders `<0.1` for a positive rate below the column's
+one-decimal resolution instead of `0.0` (a real 1-token/25s sample). That is a
+rendering local to this column, not a change to the shared `formatMetric`
+contract, whose fixed decimals other columns parse back as numbers to sort.
+
+**The allow-list is a performance hint, not a correctness gate.** Getting an
+exact mid-stream count at all needs two extra parameters on the
+*gateway-built* streaming request body: `timings_per_token` and
+`stream_options.continuous_usage_stats` (`openai_compatible.go`'s
+`CompleteStream`). They are added only when the resolved target's provider is
 in `liveProgressUpstreams` (`live_progress.go`) — today llama.cpp, llama-swap,
-vLLM, and server_agent — never unconditionally. The gate exists because
-tolerance for an unknown key is not universal: LiteLLM forwards unrecognized
-body keys straight through to its own upstream (OpenAI/Azure), which reject
-them with a 400 "Unrecognized request argument supplied" — so turning on live
-progress for a LiteLLM-fronted server would fail the *entire* request, not
-just leave one derived number unmeasured. The default is off, so a provider
-type added to the router later gets neither parameter until it is explicitly
-verified safe and added to the map — never a silent opt-in.
+vLLM, and server_agent, and LiteLLM deliberately not, since it forwards
+unrecognized body keys straight to its own upstream (OpenAI/Azure), which
+answer 400 "Unrecognized request argument supplied". But that list only
+decides who is *asked*; it is not what keeps an incompatible upstream safe.
+
+It cannot be, because an application **type does not imply the upstream's
+request schema**. `server_agent` is not an inference server at all: what
+serves is whatever `RuntimeSpec.Type` says (`"" | vllm | llama_cpp | tgi |
+ollama | custom`), where `custom` means nobody knows and `""` — auto-detect —
+is the value on every row that predates the runtime manager, and the agent's
+router forwards the request body byte-for-byte. `llama_swap` is a proxy: each
+model resolves either to a free-text `cmd` (any OpenAI-compatible server) or
+to a `peer` at an arbitrary base URL with an injected bearer token —
+llama-swap's own configuration example points at OpenRouter — so a
+`llama_swap` model can terminate at `api.openai.com`, which is exactly the
+case LiteLLM is excluded for.
+
+**Correctness comes from a retry.** No live figure may fail, delay or alter a
+request, so a schema rejection is made a *non-event* rather than predicted: an
+upstream that refuses the two parameters is re-asked once without them, and
+the stream proceeds minus one advisory number. Three guards, all of which must
+hold, are what make that retry invisible to the client:
+
+1. the parameters were actually sent — a request that never carried them is
+   never retried, so an ordinary 400 keeps its meaning;
+2. the failure is of the schema-rejection class: a 400 or 422 status, or an
+   in-stream error frame (some OpenAI-compatible proxies report a refused body
+   as an SSE error event after a 200). Never 503, which means
+   `ErrUpstreamStarting` and is consumed by the load runner, and never any
+   other status;
+3. nothing has been emitted yet — an explicit boolean set on the first
+   *successful* emit, so the invariant is checked rather than inferred from
+   where the code sits.
+
+Since the non-2xx check runs before the first emit, guard 3 holds for a
+rejected status by construction: nothing has been written to the client and
+nothing reported to the flavor handler, so the already-sent `200` +
+`text/event-stream` headers stop being a liability — there is no failure to
+report. Dropping the parameters restores `stream_options` to exactly
+`{"include_usage": true}` rather than deleting the key, because `include_usage`
+is what makes the terminal usage chunk arrive at all and every
+completed-request figure depends on it.
+
+**A negative-only memo** keeps the cost of a genuinely incompatible upstream at
+one wasted round trip per serving mapping per TTL instead of one per request.
+It is keyed by `RouteID` (the serving mapping id), bounded, concurrency-safe,
+expires after 5 minutes — the house TTL for a volatile negative — and is
+consulted before the parameters are added; an empty memo means "send them".
+It records **only** that a target rejected the parameters, never that one
+supports them, and that asymmetry is the safety property: a stale *negative*
+costs at most a missing advisory number, which the row already renders as the
+shared "never measured" em dash, and heals when the TTL expires, whereas a
+stale *positive* would send the parameters to an upstream that answers 400 —
+the dead stream this design exists to eliminate. There is therefore no
+positive entry that could go stale.
 
 **Native passthrough gets neither the parameter nor the live figures.**
 `proxyNative` forwards the client's own body unmodified (only the `model`
@@ -663,7 +721,32 @@ also reads llama.cpp's `timings` object off the Responses shape, and — for the
 Anthropic shape, which carries no timings on any frame — `usageScanner`
 derives a rate from the exact output-token count over the generation window
 (first content frame → last observed byte), mirroring the benchmark runner's
-own arithmetic. That scanning was deliberately moved off the response-capture
+own arithmetic.
+
+That derived rate requires an **authoritative terminal usage frame**
+(`isTerminalUsageFrame`, defined per flavor beside the content-frame
+definition it mirrors), not merely a non-zero output-token count.
+`mergePassthroughUsage` max-merges every usage object it sees into one field,
+so it cannot tell Anthropic's `message_start` snapshot — whose
+`output_tokens` is a placeholder of 1 — from a real `message_delta` total;
+`message_stop` does not qualify either, since it is terminal but carries no
+count at all. Without that gate, a stream that closed cleanly but reported
+only `message_start` would derive `1 / 20s` and present it as measured. This
+is the same "only from an exact count" rule the rest of the feature applies,
+aimed at *which* count is authoritative.
+
+The gate is not cosmetic, because a **recorded rate is a routing input**. Where
+the serving application has opportunistic metrics enabled, `recordUsage` feeds
+a successful request's `TokensPerSecond`/`PromptPerSecond` into the mapping's
+throughput EWMA (`UpdateMappingOpportunisticMetrics`) and stamps
+`MetricsSource = "opportunistic"`, and those figures are read back by the
+scorer and by a group's `MinTokensPerSecond` gate (§ routing). Before this
+change `Usage.TokensPerSecond` was always 0 on the passthrough path, so that
+feedback never fired for Codex/Claude-Code traffic; now that passthrough
+reports a rate, it can contribute — which is why the rate it reports must come
+from an exact, authoritative count and never from a placeholder.
+
+That scanning was deliberately moved off the response-capture
 tee buffer (bounded at `captureMaxBytes`, ~1 MiB) onto its own incremental scan
 fed directly from every chunk as it is copied to the client
 (`passthrough_usage_scan.go`), because the capture cap was silently dropping
