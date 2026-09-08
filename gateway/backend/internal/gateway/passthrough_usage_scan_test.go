@@ -201,3 +201,133 @@ func TestIsContentFrame(t *testing.T) {
 		}
 	}
 }
+
+// TestPassthroughAnthropicFallbackNeedsAnAuthoritativeTerminalUsageFrame is the
+// placeholder-only stream: message_start's usage.output_tokens is Anthropic's
+// PLACEHOLDER (1), a content frame does arrive, the stream closes cleanly with
+// message_stop 20s later -- and no message_delta ever reports the real total.
+// Deriving a rate here would record 1/20s = 0.05 t/s as a MEASURED sample, and a
+// recorded rate also feeds an opted-in mapping's throughput EWMA, so the invented
+// figure would become a routing input. No authoritative terminal usage frame, no
+// rate.
+func TestPassthroughAnthropicFallbackNeedsAnAuthoritativeTerminalUsageFrame(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+
+	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
+	s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base.Add(time.Second))
+	s.feed([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), base.Add(21*time.Second))
+
+	u := s.usage()
+	if u.TokensPerSecond != 0 {
+		t.Fatalf("TokensPerSecond = %v, want 0 (message_start's output_tokens is a placeholder and message_stop carries no count)", u.TokensPerSecond)
+	}
+	// The placeholder count itself is still recorded -- only the derived RATE is
+	// gated, since the rate is the value that would be presented as measured and
+	// blended into the routing EWMA.
+	if u.OutputTokens != 1 {
+		t.Fatalf("OutputTokens = %d, want 1 (the merged count is unchanged by this gate)", u.OutputTokens)
+	}
+}
+
+// TestIsTerminalUsageFrame pins the per-flavor "authoritative terminal usage
+// frame" definitions the gated fallback (and its doc comment) depend on. The two
+// Anthropic negatives are the point: message_start carries a placeholder count,
+// and message_stop is terminal but carries no count at all.
+func TestIsTerminalUsageFrame(t *testing.T) {
+	cases := []struct {
+		flavor  string
+		payload string
+		want    bool
+	}{
+		{"anthropic_messages", `{"type":"message_delta","usage":{"output_tokens":40}}`, true},
+		{"anthropic_messages", `{"type":"message","usage":{"output_tokens":40}}`, true},
+		{"anthropic_messages", `{"type":"message_start","message":{"usage":{"output_tokens":1}}}`, false},
+		{"anthropic_messages", `{"type":"message_stop"}`, false},
+		{"anthropic_messages", `{"type":"content_block_delta"}`, false},
+		{"openai_responses", `{"type":"response.completed","response":{"usage":{}}}`, true},
+		{"openai_responses", `{"type":"response.in_progress"}`, false},
+		{"openai_responses", `{"type":"response.output_text.delta"}`, false},
+		{"", `{"type":"message_delta"}`, false},
+		{"anthropic_messages", `not json`, false},
+	}
+	for _, tc := range cases {
+		if got := isTerminalUsageFrame(tc.flavor, []byte(tc.payload)); got != tc.want {
+			t.Fatalf("isTerminalUsageFrame(%q, %q) = %v, want %v", tc.flavor, tc.payload, got, tc.want)
+		}
+	}
+}
+
+// TestPassthroughRecordsResponsesUpstreamRateOnTheUsageEvent closes the branch's
+// headline claim for the Responses flavor at the level it was actually made:
+// before this branch the completed-activity table reported 0 tokens/sec for
+// every /v1/responses request. The existing coverage stopped at
+// parsePassthroughUsage's return value; this asserts the number reaches the
+// recorded usage_events row.
+func TestPassthroughRecordsResponsesUpstreamRateOnTheUsageEvent(t *testing.T) {
+	body := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r","usage":{"input_tokens":3,"output_tokens":7,"total_tokens":10}},"timings":{"prompt_per_second":120.5,"predicted_per_second":38.25}}` +
+		"\n\n"
+	prov := &recordingProxyProvider{respBody: body}
+	srv := newNativeProxyTestServer(prov, true, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].TokensPerSecond != 38.25 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 38.25 (llama.cpp's own predicted_per_second off the terminal frame)", events[0].TokensPerSecond)
+	}
+	if events[0].PromptPerSecond != 120.5 {
+		t.Fatalf("recorded PromptPerSecond = %v, want 120.5", events[0].PromptPerSecond)
+	}
+}
+
+// TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent is the same claim for
+// the Anthropic flavor, which carries no timings on any frame and therefore
+// depends on usageScanner's derived rate. The exact value is not assertable end to
+// end (the generation window is however long this in-process copy takes), so the
+// assertion is the one that actually changed: a POSITIVE recorded rate where the
+// pre-branch value was always exactly 0.
+func TestPassthroughRecordsAnthropicDerivedRateOnTheUsageEvent(t *testing.T) {
+	body := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","usage":{"output_tokens":40}}` + "\n\n" +
+		"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	prov := &recordingProxyProvider{respBody: body}
+	srv := newNativeProxyTestServer(prov, false, true)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].OutputTokens != 40 {
+		t.Fatalf("recorded OutputTokens = %d, want 40", events[0].OutputTokens)
+	}
+	if events[0].TokensPerSecond <= 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want > 0 (the derived rate must reach the usage_events row, not just the scanner)", events[0].TokensPerSecond)
+	}
+}

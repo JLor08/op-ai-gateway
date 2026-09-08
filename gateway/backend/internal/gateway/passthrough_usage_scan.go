@@ -45,6 +45,11 @@ type usageScanner struct {
 
 	haveFirstContent bool
 	firstContentAt   time.Time
+	// haveTerminalUsage records whether an AUTHORITATIVE TERMINAL usage frame was
+	// seen (isTerminalUsageFrame). usage()'s derived rate is gated on it, because
+	// the merged output-token count alone cannot say whether it came from a real
+	// total or from a placeholder snapshot.
+	haveTerminalUsage bool
 	// lastAt is the timestamp of the most recent feed/finish call: the best
 	// available estimate of "generation completed" for the Anthropic fallback
 	// rate's generation-window end (see usage below).
@@ -123,15 +128,19 @@ func (s *usageScanner) finish(at time.Time) {
 	s.carry = nil
 }
 
-// scan stamps the first-content-frame timestamp (if not already seen) and
-// merges payload's usage/timings fields into the running total.
+// scan stamps the first-content-frame timestamp and the
+// authoritative-terminal-usage flag — each once, the first time such a frame is
+// seen — and merges payload's usage/timings fields into the running total. The
+// per-payload probe stops running as soon as both flags are set.
 func (s *usageScanner) scan(payload []byte, at time.Time) {
-	if !s.haveFirstContent {
+	if !s.haveFirstContent || !s.haveTerminalUsage {
 		for _, p := range jsonPayloads(payload) {
-			if isContentFrame(s.apiFlavor, p) {
+			if !s.haveFirstContent && isContentFrame(s.apiFlavor, p) {
 				s.haveFirstContent = true
 				s.firstContentAt = at
-				break
+			}
+			if !s.haveTerminalUsage && isTerminalUsageFrame(s.apiFlavor, p) {
+				s.haveTerminalUsage = true
 			}
 		}
 	}
@@ -151,6 +160,19 @@ func (s *usageScanner) scan(payload []byte, at time.Time) {
 // streamOnce in benchmark_runner.go:113-118 (output tokens / generation
 // seconds).
 //
+// The fallback additionally requires an AUTHORITATIVE TERMINAL usage frame
+// (isTerminalUsageFrame). An output-token count on its own is not enough:
+// mergePassthroughUsage max-merges every usage object it sees into one field, so
+// it cannot tell Anthropic's `message_start` PLACEHOLDER (`output_tokens: 1`)
+// from a real `message_delta` total. Without this gate a stream that closes
+// cleanly but whose only usage frame was `message_start` would derive
+// `1 / 20s = 0.05` t/s and record it as a measured sample — and since a recorded
+// rate also feeds an opted-in mapping's throughput EWMA (recordUsage ->
+// UpdateMappingOpportunisticMetrics, inference_complete.go), that invented
+// figure would become a ROUTING input. This is the same "only from an exact
+// count" discipline the rest of the feature applies, aimed at *which* count is
+// authoritative.
+//
 // The Responses shape deliberately does NOT get this fallback: llama.cpp
 // attaches no timings to the Anthropic shape at all, which is the only reason
 // Anthropic needs a derived rate here. An absent Responses `timings` object is
@@ -161,7 +183,8 @@ func (s *usageScanner) usage() inference.Usage {
 	}
 	u := s.acc
 	finalizeTotalTokens(&u)
-	if s.apiFlavor == "anthropic_messages" && u.TokensPerSecond == 0 && u.OutputTokens > 0 && s.haveFirstContent {
+	if s.apiFlavor == "anthropic_messages" && u.TokensPerSecond == 0 && u.OutputTokens > 0 &&
+		s.haveFirstContent && s.haveTerminalUsage {
 		if genSecs := s.lastAt.Sub(s.firstContentAt).Seconds(); genSecs > 0 {
 			u.TokensPerSecond = float64(u.OutputTokens) / genSecs
 		}
@@ -209,6 +232,47 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta":
 			return true
 		}
+	}
+	return false
+}
+
+// isTerminalUsageFrame reports whether payload — one JSON usage/event object as
+// returned by jsonPayloads — is a frame whose own usage numbers are the
+// upstream's AUTHORITATIVE, FINAL output-token count for the response, as opposed
+// to a running or placeholder snapshot. It is what gates usage()'s derived rate,
+// and it is defined explicitly per API flavor here for the same reason
+// isContentFrame above is.
+//
+// Anthropic: `message_delta` is the frame carrying the final
+// `usage.output_tokens` of a streamed message, and a BUFFERED (non-streaming)
+// response is itself a `message` object with the same authoritative top-level
+// usage. Two frames are deliberately NOT authoritative:
+//   - `message_start` carries `message.usage.output_tokens` as a PLACEHOLDER
+//     (Anthropic sends 1) that mergePassthroughUsage cannot distinguish from a
+//     real total, since it max-merges both into the same field. That
+//     indistinguishability is the entire reason this predicate exists.
+//   - `message_stop` is terminal but carries no usage object at all. Accepting a
+//     frame that reports no count as evidence that an exact count WAS reported
+//     would readmit exactly the placeholder-only stream this rules out, so
+//     "terminal" alone is not the test — "terminal AND carries the total" is.
+//
+// Responses: `response.completed`, whose nested `response.usage` is the final
+// count and onto which llama.cpp bolts its `timings` object. Written down for
+// symmetry with isContentFrame; the Responses shape takes no derived rate at all
+// (see usage()), and a buffered Responses body carries no `type` discriminator to
+// match on, so this branch is inert either way today.
+func isTerminalUsageFrame(apiFlavor string, payload []byte) bool {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload, &probe) != nil {
+		return false
+	}
+	switch apiFlavor {
+	case "anthropic_messages":
+		return probe.Type == "message_delta" || probe.Type == "message"
+	case "openai_responses":
+		return probe.Type == "response.completed"
 	}
 	return false
 }
