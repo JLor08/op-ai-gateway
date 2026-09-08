@@ -703,8 +703,10 @@ verdict still can, same as any other type).
 can actually prove either answer, never from guessing at a value.** A
 background pass — the gateway's own context-probe pass
 (`cmd/gateway/app_health.go`, riding the SAME response its context-size probe
-already fetches) for an ordinary application, or the server-agent's own probe
-of its managed children (below) for a `server_agent` one — parses a llama.cpp
+already fetches, and since issue #58 also reaching a `server_agent`
+application's own children through the router's `/upstream/{model}/props`
+passthrough below) or the server-agent's own probe of its managed children
+(below) — parses a llama.cpp
 `/props` response's `default_generation_settings.params` object
 (`detectLiveProgressSupport`, `internal/provider/model_info.go`). The key
 `timings_per_token` present there means `"supported"`; the `params` object
@@ -779,12 +781,8 @@ change to one is a deliberate prompt to change the other identically; a
 reviewer finding them diverge is a real finding, finding them duplicated is
 expected.
 
-The agent's copy exists at all because the gateway **cannot** reach a managed
-`server_agent` child's `/props` itself: the agent's router 404s
-`runtime.model_not_managed` for any request whose JSON body doesn't name a
-managed model (`server-agent/internal/runtime/router.go`'s `serveProxy`), and
-a bare `/props` GET carries no such body. So the agent probes each of its own
-children directly over loopback instead — the mechanics are [Agent-Managed
+The agent's copy exists as the general-purpose path: the agent probes each of
+its own children directly over loopback — the mechanics are [Agent-Managed
 Model Runtime's per-child probing
 section](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time) —
 and reports the verdict back on the telemetry channel, where
@@ -792,7 +790,25 @@ and reports the verdict back on the telemetry channel, where
 onto the mapping under the same `runtime_model_probe` capability gate as the
 context write-back, and — like every writer here — deliberately **without**
 a `mapping.MetricsLocked` check: the capability write-back's own doc comment
-states this is the design's central decision, not an oversight.
+states this is the design's central decision, not an oversight. That probe is
+`runtime.Status`-based and carries no credential, by design
+([Agent-Managed Model Runtime
+§10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
+so an api-key-protected child still answers it with a conclusive, cached
+`401`/`403` and this write path alone never resolves that child's verdict.
+
+The gateway now has a second path to the same evidence (issue #58):
+`GET /upstream/{model}/props`, the router's GET-only, allowlisted passthrough
+([Agent-Managed Model Runtime §4.1](agent-runtime-manager.md#41-control-routes)) —
+probed only for an agent that declares `runtime_upstream_props`
+([§7](agent-runtime-manager.md#7-feature-negotiation)), since an older agent
+would 404 `runtime.model_not_managed` on every such request, forever. Unlike
+the loopback probe above, this one carries a credential: the gateway's
+app-health pass resolves `routing.SpecUpstreamAuth` per mapping and attaches
+it — the same per-mapping resolution [Agent-Managed Model Runtime
+§3.2](agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway)
+describes for ordinary inference — which is how an api-key-protected child's
+verdict becomes determinable at all.
 
 **An unchanged verdict is never rewritten, on either write path.** Both the
 gateway's own context-probe pass and the ingest write-back above compare the
