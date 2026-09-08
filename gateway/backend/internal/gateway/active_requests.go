@@ -51,6 +51,10 @@ type ActiveRequest struct {
 	AgentID       string
 	Stream        bool
 	StartedAt     time.Time
+	// Progress carries this request's live counters. Non-nil only where there is
+	// something to count (the streaming paths); nil on every non-streaming path and
+	// in test literals, so every read must be nil-safe.
+	Progress *requestProgress
 }
 
 // activeRegistry is a thread-safe, in-memory set of in-flight requests. It is
@@ -155,6 +159,10 @@ func (a *activeRegistry) ServerActivity(serverID string) (int, time.Time) {
 
 // Snapshot returns a copy of the current in-flight requests. A nil registry
 // returns nil. The returned slice is safe for the caller to mutate/sort.
+//
+// The copies are frozen EXCEPT for Progress, which is a pointer to live counters
+// still being written by the request's own goroutine. That is intentional: the DTO
+// builder runs outside the registry lock and needs current values.
 func (a *activeRegistry) Snapshot() []ActiveRequest {
 	if a == nil {
 		return nil
