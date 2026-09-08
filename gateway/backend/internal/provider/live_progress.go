@@ -9,32 +9,44 @@ import (
 	"time"
 )
 
-// liveProgressUpstreams lists the application types EXPECTED to tolerate the two
-// extra parameters this gateway adds to the STREAMING body it builds itself:
-// llama.cpp's `timings_per_token` and `stream_options.continuous_usage_stats`.
-// Both exist to get an EXACT mid-stream output-token count; without one, the
-// portal shows "not measured" rather than a guess.
+// liveProgressUpstreams is the "shape genuinely implies a tolerant upstream"
+// clause of wantsLiveProgress's three-layer rule -- the WEAKEST of the three
+// layers, consulted only when the mapping's persisted verdict
+// (routing.Target.LiveProgressSupport, sourced from
+// routing.ModelMapping.LiveProgressSupport) has never been determined ("").
+// A recorded verdict, "supported" or "unsupported", always overrides it: that
+// verdict is either an observed upstream answer or CompleteStream's own
+// retry-confirmed rejection, and an observation outranks a guess about the
+// application type either way. See wantsLiveProgress for the full rule.
 //
-// This list is a PERFORMANCE HINT, not a correctness gate. Correctness comes from
-// CompleteStream's retry: an upstream that rejects the parameters is re-asked
-// without them before anything has been written to the client, so a rejection
-// costs one wasted round trip and one missing advisory number instead of the
-// request. The list only keeps that round trip off the types known to reject.
+// The two extra parameters this clause is about are the ones this gateway adds
+// to the STREAMING body it builds itself: llama.cpp's `timings_per_token` and
+// `stream_options.continuous_usage_stats`. Both exist to get an EXACT
+// mid-stream output-token count; without one, the portal shows "not measured"
+// rather than a guess.
 //
-// It cannot be a correctness gate, because an application TYPE does not imply the
-// upstream's request schema:
+// It is deliberately narrow, keyed on ONLY llama_cpp and vllm, because an
+// application TYPE does not otherwise imply the upstream's request schema:
 //   - `server_agent` is not an inference server at all. What actually serves is
-//     whatever `RuntimeSpec.Type` says -- `"" | vllm | llama_cpp | tgi | ollama |
-//     custom` -- where `custom` means nobody knows and `""` (auto-detect) is the
-//     value on every pre-feature row. The agent's router forwards the request body
-//     byte-for-byte, so the gateway is really talking to an unknown server.
+//     whatever `routing.EffectiveRuntimeSpecType` resolves the spec to --
+//     `llama_cpp | vllm | tgi | ollama | custom` -- so a server_agent target is
+//     tested against target.LiveProgressSpecType (that resolved value, filled by
+//     routing.Resolver.targetFrom), never against target.Provider, which is
+//     always the literal "server_agent" and says nothing about the child. The
+//     map is keyed on the same two string values either clause needs
+//     (routing.ProviderLlamaCPP == "llama_cpp" == routing.RuntimeSpecTypeLlamaCpp,
+//     and likewise routing.ProviderVLLM == "vllm" == routing.RuntimeSpecTypeVLLM),
+//     so one lookup serves both.
 //   - `llama_swap` is a proxy. It resolves each model either to a free-text `cmd`
 //     (any OpenAI-compatible server) or to a `peer` at an arbitrary base URL with
 //     an injected `Authorization: Bearer` -- llama-swap's own configuration example
 //     uses OpenRouter. So a `llama_swap` model can terminate at api.openai.com,
-//     which is exactly the case `litellm` is excluded for.
+//     which is exactly the case `litellm` is excluded for. Its TYPE says nothing
+//     about what actually answers, so it stays off this list entirely (a
+//     llama_swap mapping can still send the parameters, but only on an observed
+//     "supported" verdict -- never from shape alone).
 //
-// What is known about the listed types when they DO serve directly:
+// What is known about the two listed kinds when they DO serve directly:
 //   - llama.cpp: its request schema is PULL-based (it iterates its own field list
 //     and looks each name up), so a key nobody asks for is never inspected. Its
 //     `stream_options` is a nested field that reads only its own subfields, so the
@@ -47,23 +59,49 @@ import (
 //     argument supplied". Listing it would buy nothing but a guaranteed wasted
 //     round trip on every request, which is why it stays off.
 //
-// The default is therefore OFF: a provider value that is not listed gets neither
-// parameter, so a type added later never opts in silently -- it just does not get
-// the (advisory) number until someone decides the round trip is worth it.
+// The default is therefore OFF: a value not listed here contributes nothing to
+// the shape clause, so a kind added later never opts in silently -- it just does
+// not get the (advisory) number from shape alone until someone decides it
+// belongs, though a per-mapping "supported" verdict can still opt it in sooner.
 var liveProgressUpstreams = map[string]struct{}{
-	routing.ProviderLlamaCPP:    {},
-	routing.ProviderLlamaSwap:   {},
-	routing.ProviderVLLM:        {},
-	routing.ProviderServerAgent: {},
+	routing.ProviderLlamaCPP: {},
+	routing.ProviderVLLM:     {},
 }
 
-// wantsLiveProgress reports whether the streaming request body for target may
-// carry the live-progress parameters at all, i.e. whether its application type is
-// on the allow-list above. It is only half the decision: CompleteStream also
-// consults its liveProgressMemo, so a target whose upstream already rejected the
-// parameters is not asked again until the memo's TTL expires.
+// wantsLiveProgress applies the three-layer rule that decides whether the
+// streaming request body for target may carry the live-progress parameters,
+// ordered by the quality of their evidence -- observation beats prediction,
+// prediction beats guessing, guessing beats silence:
+//
+//  1. target.LiveProgressSupport == "unsupported": always no. This is either an
+//     OBSERVED upstream rejection (CompleteStream's retry, on a 400/422) or a
+//     verdict copied from one -- no shape guess outranks it.
+//  2. target.LiveProgressSupport == "supported": always yes, for the same
+//     reason -- the verdict overrides the shape in either direction.
+//  3. target.LiveProgressSupport == "" (never determined): falls back to
+//     liveProgressUpstreams -- the shape clause. Send only when target's
+//     application type genuinely implies a tolerant upstream: directly for an
+//     ordinary application, or via target.LiveProgressSpecType (routing.
+//     EffectiveRuntimeSpecType, filled by targetFrom at no extra store cost)
+//     for a server_agent child.
+//
+// This is only half of CompleteStream's guard: it also consults its
+// liveProgressMemo (kept as a separate check at that call site, not folded in
+// here), so a target whose upstream already rejected the parameters in THIS
+// process is not asked again until the memo's TTL expires -- an observation
+// that outranks even a persisted "supported", exactly like layer 1 above.
 func wantsLiveProgress(target routing.Target) bool {
-	_, ok := liveProgressUpstreams[target.Provider]
+	switch target.LiveProgressSupport {
+	case "supported":
+		return true
+	case "unsupported":
+		return false
+	}
+	shape := target.Provider
+	if target.Provider == routing.ProviderServerAgent {
+		shape = target.LiveProgressSpecType
+	}
+	_, ok := liveProgressUpstreams[shape]
 	return ok
 }
 

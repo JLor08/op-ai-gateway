@@ -75,6 +75,14 @@ type Target struct {
 	// set, a successful real inference EWMA-updates the served mapping's throughput
 	// metrics from the usage event.
 	OpportunisticMetrics bool
+	// LiveProgressSupport is the mapping's PERSISTED verdict about whether this
+	// upstream tolerates the live-progress parameters: "", "supported",
+	// "unsupported". See wantsLiveProgress for how it combines with the shape.
+	LiveProgressSupport string
+	// LiveProgressSpecType is EffectiveRuntimeSpecType(spec) for a server_agent
+	// application, "" otherwise -- the only shape evidence available for a child
+	// whose application type says nothing about it.
+	LiveProgressSpecType string
 }
 
 // ReachabilityChecker reports whether an application is currently reachable.
@@ -1040,6 +1048,7 @@ func serverSelectable(server AIServer) bool {
 func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Application, mapping ModelMapping, apiFlavor string) (Target, error) {
 	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
 	var spec RuntimeSpec
+	var liveProgressSpecType string
 	if app.Type == ProviderServerAgent {
 		loaded, ok, err := r.store.RuntimeSpecByMapping(ctx, mapping.ID)
 		if err != nil {
@@ -1049,6 +1058,12 @@ func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Applicat
 			spec = loaded
 			flavors, responsesMode, messagesMode = spec.APIFlavors, spec.ResponsesMode, spec.MessagesMode
 		}
+		// EffectiveRuntimeSpecType is the only shape evidence available for a
+		// server_agent child: its application type says nothing about what
+		// actually serves. Set from the already-loaded spec (ok=false leaves
+		// spec zero-valued, whose empty Binary/Type detects to "custom"), so
+		// this costs no extra store lookup.
+		liveProgressSpecType = string(EffectiveRuntimeSpecType(spec))
 	}
 	// SpecUpstreamAuth resolves the SEALED token + effective header for this
 	// mapping (spec is zero-valued for non-server_agent apps and for a
@@ -1070,6 +1085,8 @@ func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Applicat
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
+		LiveProgressSupport:  mapping.LiveProgressSupport,
+		LiveProgressSpecType: liveProgressSpecType,
 	}, nil
 }
 
