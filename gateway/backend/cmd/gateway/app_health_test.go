@@ -879,6 +879,97 @@ func TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport(t *test
 	}
 }
 
+// TestRunAppHealthOnceContextProbeTemplateUnknownVerdictNeverOverwrites is the
+// {model}-branch counterpart to
+// TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists above, and it
+// guards the `support != ""` half of that branch's write condition -- the half
+// that keeps vLLM working. It was unguarded by any test: every {model}-branch
+// fixture reported a "supported" verdict, so deleting the term left the whole
+// suite green.
+//
+// This branch is llama-swap's DEFAULT shape, and llama-swap's `peer` mode
+// resolves a model to an arbitrary base URL whose /props answers with a
+// non-llama.cpp body -- i.e. verdict "". Without the term, that "" would be
+// seen as a change away from the stored "supported" and would overwrite a good
+// verdict with unknown, on exactly the deployment this feature exists to
+// recover.
+//
+// Asserted as a NUMERIC call count of zero on the writer spy, not by
+// inspecting the stored field: the field assertion alone would also hold if the
+// writer had been called with "", since the fake would then store "" over
+// "supported" -- which is precisely the regression -- so the count is what
+// makes this test fail on a revert. The context-size write must still land,
+// proving the probe ran at all and that the two writes are not coupled.
+func TestRunAppHealthOnceContextProbeTemplateUnknownVerdictNeverOverwrites(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxTemplateApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
+			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+		}},
+	}
+	prober := newFakeProber()
+	// A llama-swap `peer`-mode answer: a parseable body that yields a context
+	// size but NO live-progress verdict (LiveProgressSupport left "").
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"m-a"})
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := st.liveProgressSetCount(); n != 0 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an unknown verdict, want 0 -- unknown must never overwrite a stored verdict", n)
+	}
+	got, _ := st.mappingOf("m1")
+	if got.LiveProgressSupport != "supported" {
+		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", got.LiveProgressSupport, "supported")
+	}
+	if got.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192 (the context-size write is independent of the live-progress guard)", got.ContextSize)
+	}
+}
+
+// TestRunAppHealthOnceContextProbeTemplateUnchangedVerdictNotRewritten guards
+// the OTHER half of the same condition, `support != mp.LiveProgressSupport`, on
+// the {model} branch: no {model}-branch fixture seeded a stored verdict, so
+// deleting this term also left the suite green.
+//
+// The stored verdict and the probed one are both "supported" here, so the
+// correct behavior is zero writes -- and since this pass runs on the
+// application's own ~30 s cadence, losing the term means one UPDATE per loaded
+// model per application per tick, forever, for a value that can only change if
+// an operator swaps the upstream binary. The probe itself must still run
+// (asserted), so a zero count cannot be mistaken for "the branch never
+// executed".
+func TestRunAppHealthOnceContextProbeTemplateUnchangedVerdictNotRewritten(t *testing.T) {
+	shrinkRetryGap(t)
+	app := ctxTemplateApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{
+		"a1": {{
+			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
+			Status: routing.ServerStatusActive, LiveProgressSupport: "supported", ContextSize: 8192,
+		}},
+	}
+	prober := newFakeProber()
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"m-a"})
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if !prober.probedPath("/upstream/m-a/props") {
+		t.Fatalf("the per-model probe must have run -- otherwise a zero write count proves nothing")
+	}
+	if n := st.liveProgressSetCount(); n != 0 {
+		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an UNCHANGED verdict, want 0 -- this pass runs on the app's own cadence, forever", n)
+	}
+}
+
 // TestRunAppHealthOnceContextProbeTemplateLockedMappingPersistsCapabilityNotContextSize
 // closes a gap the Task 2 implementer correctly surfaced but was told not to
 // fix: the {model}-template branch's per-mapping skip used to read
