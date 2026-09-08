@@ -125,9 +125,10 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 // response was ever received at all (a transport-level failure: connection
 // refused, timeout, DNS failure, ...). ProbeContext ignores it -- its error
 // handling and caching policy are unchanged by this. ProbeLiveProgressSupport
-// uses it to tell a transient failure (status 0, or some other non-404
-// non-2xx status) from a conclusive 404 when deciding whether an
-// undetermined verdict is safe to cache.
+// uses it to tell a transient failure (status 0, or a non-2xx status that
+// says nothing final -- a 5xx above all) from a CONCLUSIVE refusal (404,
+// 401, 403, 405) when deciding whether an undetermined verdict is safe to
+// cache; see its own comment for why exactly those four are conclusive.
 func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -186,14 +187,17 @@ const LiveProgressProbePath = "/props"
 //
 //   - stable == true: the endpoint answered CONCLUSIVELY. Either a real
 //     /props document (verdict "supported"/"unsupported", exactly as
-//     before), or a 404 (this route does not exist on this build), or any
-//     other syntactically well-formed body that simply isn't that document
-//     (a vLLM/Ollama/TGI body, say). None of that can change while this
-//     process keeps running: the binary behind it does not change.
+//     before), or a status that settles the question for this pid -- 404
+//     (no such route on this build), 401/403 (the route is behind an api
+//     key this probe cannot supply), 405 (not for GET) -- or any other
+//     syntactically well-formed body that simply isn't that document (a
+//     vLLM/Ollama/TGI body, say). None of that can change while this
+//     process keeps running: the binary behind it, and the credential it
+//     was launched with, do not change.
 //   - stable == false: no conclusive answer was possible -- the fetch never
 //     got an HTTP response at all (connection refused, timeout, ...), the
-//     response was some other non-404 non-2xx status, or the body was
-//     syntactically invalid/truncated JSON. Any of these can describe a
+//     response was some OTHER non-2xx status (a 5xx above all), or the body
+//     was syntactically invalid/truncated JSON. Any of these can describe a
 //     child that is merely still warming up, so the caller must NOT cache
 //     "" here.
 //
@@ -203,12 +207,38 @@ const LiveProgressProbePath = "/props"
 func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) (verdict string, stable bool) {
 	body, status, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
 	if err != nil {
-		// No conclusive body in hand. A 404 is the one status that
-		// conclusively answers "this route does not exist here"; every
-		// other failure (status 0 -- no response at all -- or some other
-		// non-2xx status) might still resolve differently once the child
-		// finishes starting up.
-		return "", status == http.StatusNotFound
+		// No conclusive body in hand -- but SOME statuses are still a
+		// conclusive answer to "will this endpoint ever hand me a /props
+		// document?", and those must be cached or the caller re-GETs
+		// /props on every collect cycle (1 s default, 250 ms floor) for
+		// the child's entire lifetime.
+		//
+		// Conclusive, because none of them can change while THIS pid
+		// keeps running -- they are properties of the binary's routing
+		// table and of the credential it was started with, both fixed at
+		// exec time:
+		//   - 404: this build has no such route.
+		//   - 401/403: the route exists but demands a credential this
+		//     probe does not have and cannot obtain. `llama-server
+		//     --api-key ${API_TOKEN}` is a first-class supported spec
+		//     shape, and llama.cpp marks only /health and /v1/health as
+		//     public -- /props is behind the key. The agent's probe
+		//     cannot authenticate (runtime.Status carries no token), so
+		//     asking again buys nothing; the verdict stays undetermined
+		//     and the decision falls back to the shape clause. Lifting
+		//     that limitation is issue #58.
+		//   - 405: the route exists but not for GET, which is the same
+		//     kind of fixed, build-level fact as a 404.
+		//
+		// NOT conclusive: status 0 (no HTTP response at all -- connection
+		// refused, timeout) and every other non-2xx, notably 5xx. Those
+		// all describe a child that may merely still be starting up, so
+		// they must be retried rather than cached.
+		stable := status == http.StatusNotFound ||
+			status == http.StatusUnauthorized ||
+			status == http.StatusForbidden ||
+			status == http.StatusMethodNotAllowed
+		return "", stable
 	}
 	if !json.Valid(body) {
 		// Syntactically invalid/truncated JSON reads as a child still

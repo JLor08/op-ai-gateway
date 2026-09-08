@@ -2308,6 +2308,63 @@ func TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles(t *testing.T) 
 	}
 }
 
+// TestCollectOnceRuntimeLiveProgressApiKeyRefusalCachedAcrossCycles is the
+// final-review F1 case, and the one that is NOT hypothetical: a managed child
+// launched as `llama-server --api-key ${API_TOKEN}` (a first-class supported
+// spec shape) answers /props with 401, because llama.cpp marks only /health
+// and /v1/health as public. The agent's probe cannot authenticate --
+// runtime.Status carries no token (issue #58) -- so that refusal is as
+// conclusive as a 404 and must be cached: before this fix a 401 was
+// classified transient, so the agent re-GETs /props on EVERY collect cycle
+// (1 s default, 250 ms floor) for the child's entire lifetime, plus one
+// slog.Debug line per attempt.
+//
+// Asserted with a numeric hit counter after every cycle, exactly like its
+// 404 sibling above: the verdict is "" both before and after the fix, so a
+// verdict-only assertion would pass with the fix reverted.
+func TestCollectOnceRuntimeLiveProgressApiKeyRefusalCachedAcrossCycles(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":401,"message":"Invalid API Key","type":"authentication_error"}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_apikey_stable",
+			Model:  "llama-behind-a-key",
+			State:  runtimectl.StateRunning,
+			PID:    6013,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "custom",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	const cycles = 4
+	for cycle := 1; cycle <= cycles; cycle++ {
+		a.collectOnce(context.Background())
+		got := poster.last()
+		if got == nil || len(got.Runtimes) != 1 {
+			t.Fatalf("cycle %d: Runtimes = %+v", cycle, got)
+		}
+		if rs := got.Runtimes[0]; rs.LiveProgressSupport != "" {
+			t.Errorf("cycle %d: LiveProgressSupport = %q, want %q (unknown -- a 401 is not a verdict about the build's request schema)", cycle, rs.LiveProgressSupport, "")
+		}
+		if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+			t.Fatalf("cycle %d: /props hits = %d, want 1 (a 401 is conclusive: cache it and never ask again for this pid)", cycle, hits)
+		}
+	}
+}
+
 // TestCollectOnceRuntimeLiveProgressOtherShapeCachedAcrossCycles is required
 // test 2: a child whose /props answers with a well-formed body that simply
 // isn't a llama.cpp /props document (a vLLM-shaped body here) is also probed

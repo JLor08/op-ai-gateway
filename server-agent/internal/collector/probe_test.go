@@ -324,6 +324,58 @@ func TestProbeLiveProgressSupport_NotFound(t *testing.T) {
 	}
 }
 
+// TestProbeLiveProgressSupport_ConclusiveRefusals pins the OTHER conclusive
+// statuses beside the 404 above (final-review finding F1). 401/403 is the
+// supported `llama-server --api-key ${API_TOKEN}` shape: llama.cpp marks only
+// /health and /v1/health as public, so /props answers 401/403 for a probe
+// with no credential -- and the agent's probe HAS no credential
+// (runtime.Status carries no token, issue #58). 405 is the same class of
+// fixed, build-level fact as a 404: the route exists, but not for GET.
+//
+// None of the three can change while this pid lives, so all three MUST be
+// stable: treating them as transient re-GETs /props on every collect cycle
+// (1 s default, 250 ms floor) for the child's entire lifetime, plus one
+// slog.Debug line per attempt, forever. A 5xx stays transient -- it is
+// exactly the "child still warming up" case -- and is included here as the
+// control that proves the classifier still distinguishes the two.
+//
+// The verdict must stay "" in every row either way: a refusal is never
+// evidence about the build's request schema, only about its routing table.
+func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
+	cases := []struct {
+		status     int
+		wantStable bool
+		why        string
+	}{
+		{http.StatusUnauthorized, true, "401: /props is behind an api key this probe cannot supply -- fixed at exec time"},
+		{http.StatusForbidden, true, "403: same as 401, a credential decision fixed at exec time"},
+		{http.StatusMethodNotAllowed, true, "405: the route is not GETtable on this build -- as fixed as a 404"},
+		{http.StatusInternalServerError, false, "500: says nothing conclusive -- the child may still be starting up"},
+		{http.StatusServiceUnavailable, false, "503: same -- must be retried, never cached"},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				// A would-be "supported" document: if the status check were
+				// ever dropped, this body would parse to "supported" and the
+				// verdict assertion below would catch it.
+				_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`))
+			}))
+			defer ts.Close()
+
+			got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+			if got != "" {
+				t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a %d", got, "", tc.status)
+			}
+			if stable != tc.wantStable {
+				t.Errorf("ProbeLiveProgressSupport stable = %v, want %v -- %s", stable, tc.wantStable, tc.why)
+			}
+		})
+	}
+}
+
 // TestProbeLiveProgressSupport_OtherShape mirrors the gateway side's vLLM
 // case at the HTTP-probe level (not just the parse-rule level covered by
 // TestDetectLiveProgressSupport above): a vLLM-shaped body served back for

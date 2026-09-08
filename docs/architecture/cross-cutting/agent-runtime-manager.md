@@ -2801,13 +2801,20 @@ mirror). Three different cadences share the one collect cycle:
   The caching rule distinguishes **why** no verdict came back, not merely
   whether one did. A cache keyed by `(SpecID, PID)`, like the context cache,
   stores a verdict — `"supported"`, `"unsupported"`, **or** a deliberate `""`
-  — only once the probe's answer is *stable*: a real `/props` document, a 404
-  (this route does not exist on this build), or any other well-formed body
-  that simply is not that document. None of those can change while this pid's
-  process keeps running. A *transient* failure — connection refused, a
-  timeout, or unparseable/truncated JSON — is never cached, exactly like a
+  — only once the probe's answer is *stable*: a real `/props` document, any
+  other well-formed body that simply is not that document, or one of exactly
+  four conclusive refusals — **404** (no such route on this build), **401**
+  or **403** (the route is behind an api key this probe cannot supply),
+  **405** (the route exists, but not for `GET`). None of those can change
+  while this pid's process keeps running: the binary behind it, and the
+  credential it was launched with, are both fixed at exec time. A *transient*
+  failure — connection refused, a timeout, any OTHER non-2xx status (a `5xx`
+  above all), or unparseable/truncated JSON — is never cached, exactly like a
   failed context probe, because it might describe a child still warming up
-  rather than a conclusive answer. Collapsing this into "cache every
+  rather than a conclusive answer. Classifying the three refusals above as
+  transient is not a theoretical mistake: it re-GETs `/props` on every collect
+  cycle (1 s default, 250 ms floor) for the child's whole lifetime, plus a
+  `Debug` line per attempt. Collapsing this into "cache every
   non-empty verdict, retry every empty one" would re-probe `/props` on every
   single collect cycle, forever, for any non-llama.cpp child — a permanent
   per-cycle cost for a question whose answer cannot change; collapsing it the
@@ -2820,6 +2827,25 @@ mirror). Three different cadences share the one collect cycle:
   body — and why it is a byte-for-byte duplicate of the gateway's own copy —
   is [Telemetry, Usage Analytics & Observability
   §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
+
+  **Known gap: an api-key-protected child's verdict cannot be determined
+  today (issue #58).** `${API_TOKEN}` substitution in a spec's args is a
+  first-class feature ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)),
+  so `llama-server --api-key ${API_TOKEN}` is an expected, supported launch —
+  and llama.cpp marks only `/health` and `/v1/health` as public endpoints, so
+  `/props` sits behind that key. This probe cannot authenticate: it is handed
+  a loopback base URL and a `runtime.Status`, and `Status` carries no token at
+  all. Such a child therefore answers `401`/`403`, which is cached as a
+  conclusive non-verdict (above), and its `live_progress_support` stays `""`
+  forever. The consequence is concrete and not hidden: the per-request
+  decision falls through to its shape clause, which for a `custom`-typed spec
+  opts out — so a `custom`-typed llama.cpp child behind an api key does **not**
+  get the live-progress parameters, where the earlier provider-keyed allow-list
+  DID send them: it listed the bare application type `server_agent`, which
+  opted in every managed child regardless of what actually served. An operator can
+  work around it today by setting the spec's `Type` to `llama_cpp` explicitly
+  (the shape clause then opts in) or by dropping the api key on a loopback-only
+  child. Threading the spec's sealed token through to this probe is issue #58.
 
 Every probe shares the agent's existing ~2 s collect timeout and is
 best-effort throughout: a failure is logged at `Debug` and leaves the
