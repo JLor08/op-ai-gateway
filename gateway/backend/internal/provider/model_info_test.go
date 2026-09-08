@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"testing"
 )
 
@@ -180,6 +181,94 @@ func TestParseModelInfoLiveProgressSupport(t *testing.T) {
 				t.Fatalf("detectLiveProgressSupport(%s) = %q, want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDetectCapabilities is the decision-rule test for #49 sub-project 2's
+// capability detector: each case pins the shared contract that Task 3 (the
+// collector's identical copy) and Task 5 (the store write-back) both depend
+// on. The two "an older server" cases are the load-bearing ones: a key
+// absent from a document, or a key absent from an otherwise-present nested
+// object, must decode to "" (unknown), never "no" -- an older build simply
+// predates that key and has not answered the question. If either of those
+// starts asserting "no", that regression has landed; fix detectCapabilities,
+// not this test.
+func TestDetectCapabilities(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want Capabilities
+	}{
+		{
+			name: "full modalities and tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":true},
+			        "chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "yes", Tools: "yes"},
+		},
+		{
+			// An older server predates chat_template_caps (2026-01-22): tools
+			// is UNKNOWN, never "no" -- it was not asked.
+			name: "modalities without tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":false}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "no"},
+		},
+		{
+			// A key missing from a PRESENT modalities object is unknown too:
+			// an older server predates that key (audio 2025-05-23, video
+			// 2026-06-08).
+			name: "partial modalities object",
+			body: `{"modalities":{"vision":true}}`,
+			want: Capabilities{Vision: "yes"},
+		},
+		{
+			name: "tool caps without modalities",
+			body: `{"chat_template_caps":{"supports_tools":false}}`,
+			want: Capabilities{Tools: "no"},
+		},
+		{
+			// llama.cpp router mode answers /props with its OWN build's dummy
+			// (#55). Reading it as the child's evidence would be permanent
+			// under the no-rewrite discipline.
+			name: "router dummy yields nothing",
+			body: `{"role":"router","modalities":{"vision":true},"chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{},
+		},
+		{name: "not a props document", body: `{"data":[{"id":"m"}]}`, want: Capabilities{}},
+		{name: "invalid json", body: `{`, want: Capabilities{}},
+		{name: "null body", body: `null`, want: Capabilities{}},
+		{
+			name: "non-bool modality values are not evidence",
+			body: `{"modalities":{"vision":"yes","audio":1}}`,
+			want: Capabilities{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectCapabilities([]byte(tc.body))
+			if got.Vision != tc.want.Vision || got.Video != tc.want.Video ||
+				got.Audio != tc.want.Audio || got.Tools != tc.want.Tools {
+				t.Fatalf("detectCapabilities = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectCapabilitiesRouterGateMatchesLiveProgressGate pins the shared
+// router-dummy contract from this module's side: the two module copies must
+// not drift on the #55 gate, which detectLiveProgressSupport already
+// carries.
+//
+// Equality is via reflect.DeepEqual, not ==: Capabilities carries an Extra
+// []string field, which makes the struct non-comparable with == (the brief's
+// literal `got != (Capabilities{})` does not compile -- "struct containing
+// []string cannot be compared").
+func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
+	body := []byte(`{"role":"router","modalities":{"vision":true}}`)
+	if got := detectCapabilities(body); !reflect.DeepEqual(got, Capabilities{}) {
+		t.Fatalf("router dummy yielded %+v", got)
+	}
+	if got := detectLiveProgressSupport(body); got != "" {
+		t.Fatalf("sibling detector disagrees on the router gate: %q", got)
 	}
 }
 

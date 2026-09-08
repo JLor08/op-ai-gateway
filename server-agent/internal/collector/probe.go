@@ -313,6 +313,85 @@ func detectLiveProgressSupport(body []byte) string {
 	return "unsupported"
 }
 
+// Capabilities is the capability verdict set one probe document yields. Every
+// field is "" (this document said nothing about it) | "yes" | "no". The zero
+// value means "nothing determined", and no field may be written to storage
+// when it is "" -- see routing.CapabilityVerdicts.
+type Capabilities struct {
+	Vision string
+	Video  string
+	Audio  string
+	Tools  string
+	Extra  []string
+}
+
+// detectCapabilities is the capability detector for a llama.cpp /props
+// document (#49 sub-project 2). It reads two objects and nothing else:
+//
+//   - modalities{vision,video,audio}: the server's own per-modality input
+//     support. A key PRESENT as a bool answers yes/no; a key ABSENT from an
+//     otherwise present modalities object stays "" -- an older build simply
+//     predates it (audio landed 2025-05-23, video 2026-06-08), and absence is
+//     not a denial.
+//   - chat_template_caps.supports_tools: whether the model's chat template
+//     NATIVELY supports tool calls. It is not a claim that tool calls work:
+//     with --jinja (llama.cpp's default since 2025-11-27) tools are accepted
+//     for every model through a generic handler, so "no" here means degraded
+//     prompt quality, not a rejected request. The whole object is absent on
+//     servers older than 2026-01-22, which is "" -- not "no".
+//
+// A caveat that must travel with cap_video wherever it is shown: upstream's
+// modalities.video is true when the BINARY was built with video support AND
+// the model has a vision encoder (mtmd_helper_support_video returns
+// mtmd_support_vision under #ifdef MTMD_VIDEO). It is a build-plus-vision
+// fact, not "this model understands video".
+//
+// The router gate is the same one detectLiveProgressSupport carries and for
+// the same reason (#55): llama.cpp's ROUTER mode answers /props with a dummy
+// describing the ROUTER's build, not the child's. A wrong verdict read from
+// it would be permanent and self-reinforcing, because every later probe
+// returns the same dummy and the no-rewrite guard then keeps it.
+//
+// This is a DUPLICATE, on purpose, of detectCapabilities in
+// gateway/backend/internal/provider/model_info.go -- the two are separate Go
+// modules and cannot share code, mirroring the "DUPLICATED locally on
+// purpose" precedent at gateway/backend/internal/provider/memory_probe.go:111.
+// Whoever changes this rule must change that copy identically, or the two
+// halves of this feature will drift. A reviewer finding them divergent is a
+// real finding; finding them duplicated is expected.
+func detectCapabilities(body []byte) Capabilities {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return Capabilities{}
+	}
+	if role, ok := obj["role"].(string); ok && role == "router" {
+		return Capabilities{}
+	}
+	out := Capabilities{}
+	if mods, ok := obj["modalities"].(map[string]any); ok {
+		out.Vision = capVerdict(mods["vision"])
+		out.Video = capVerdict(mods["video"])
+		out.Audio = capVerdict(mods["audio"])
+	}
+	if caps, ok := obj["chat_template_caps"].(map[string]any); ok {
+		out.Tools = capVerdict(caps["supports_tools"])
+	}
+	return out
+}
+
+// capVerdict maps a JSON bool to "yes"/"no" and everything else -- absent,
+// null, a string, a number -- to "" (not evidence).
+func capVerdict(v any) string {
+	b, ok := v.(bool)
+	if !ok {
+		return ""
+	}
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
 // extractContext dispatches to the per-specType extraction rule.
 func extractContext(specType string, v any) (int, bool) {
 	switch specType {
