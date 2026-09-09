@@ -1674,6 +1674,50 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 			t.Fatalf("UpdateMappingVisionCapable calls = %d, want 0 -- vision_capable is already true, a steady state must not write amplify", got)
 		}
 	})
+
+	t.Run("metrics locked: cap_* still writes, vision_capable does not", func(t *testing.T) {
+		// The branch's central asymmetry, pinned directly: cap_vision carries
+		// no metrics_locked guard at all (a capability is not a metric an
+		// operator pins numbers against), while the SAME sample's vision sync
+		// goes through the lock-respecting UpdateMappingVisionCapable, whose
+		// SQL/MemoryStore guard turns a locked mapping's write into a benign
+		// no-op. seedRuntimeIngestSpec's own bool argument is VRAMLocked, not
+		// MetricsLocked -- an easy mix-up this sub-case exists to avoid -- so
+		// MetricsLocked is set here, directly on the mapping, after seeding.
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_vision_locked", false)
+		mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_locked")
+		if err != nil {
+			t.Fatalf("MappingByID (seed): %v", err)
+		}
+		mapping.MetricsLocked = true
+		if err := srv.Routes.UpdateMapping(ctx, mapping); err != nil {
+			t.Fatalf("seed MetricsLocked=true: %v", err)
+		}
+		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+		srv.Routes = counting
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_locked", `{"vision":"yes"}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.capabilitiesCalls.Load(); got != 1 {
+			t.Fatalf("UpdateMappingCapabilities calls = %d, want exactly 1 -- the lock-free cap_* write must still happen on a locked mapping", got)
+		}
+		if got := counting.visionCalls.Load(); got != 1 {
+			t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1 -- the sync still ATTEMPTS the call; the lock is enforced inside the writer's own guard, not by skipping the call", got)
+		}
+		got, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_locked")
+		if err != nil {
+			t.Fatalf("MappingByID (after ingest): %v", err)
+		}
+		if got.CapVision != "yes" {
+			t.Fatalf("CapVision = %q, want %q -- cap_* columns are lock-free", got.CapVision, "yes")
+		}
+		if got.VisionCapable {
+			t.Fatal("VisionCapable = true, want the untouched false -- a locked mapping's vision_capable must not be overwritten by the sync")
+		}
+	})
 }
 
 // TestIngestVisionSyncRepairsADesyncedBool proves the vision sync converges

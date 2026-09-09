@@ -2274,6 +2274,15 @@ func TestCollectOnceRuntimeLiveProgressUnsupported(t *testing.T) {
 // even if the whole capability probe were deleted -- see
 // TestProbeLiveProgressSupport_Unreachable's identical concern) is what
 // produces "".
+//
+// It also pins the nil-vs-all-empty Capabilities invariant on its TRANSIENT
+// side (final-review must-fix 3b): 503 is NOT in ProbePropsVerdicts'
+// CONCLUSIVE set (only 404/401/403/405 are), so stable comes back false and
+// probeRuntimeChildProps returns before ever reaching capabilitiesSample.
+// rs.Capabilities must therefore be exactly nil here -- "no conclusive
+// answer yet" -- never the non-nil all-empty struct a CONCLUSIVE refusal
+// leaves behind (TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles
+// covers that side).
 func TestCollectOnceRuntimeLiveProgressUnreachable(t *testing.T) {
 	var propsHits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2313,8 +2322,12 @@ func TestCollectOnceRuntimeLiveProgressUnreachable(t *testing.T) {
 	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 		t.Fatalf("/props hits = %d, want 1 (the probe must actually run for this test to cover its failure path)", hits)
 	}
-	if rs := got.Runtimes[0]; rs.LiveProgressSupport != "" {
+	rs := got.Runtimes[0]
+	if rs.LiveProgressSupport != "" {
 		t.Errorf("LiveProgressSupport = %q, want %q (unknown) for a non-2xx /props response, even one carrying a well-formed supported body", rs.LiveProgressSupport, "")
+	}
+	if rs.Capabilities != nil {
+		t.Errorf("Capabilities = %+v, want nil -- a TRANSIENT probe failure (503, not in the CONCLUSIVE set) has no conclusive answer yet and must not be cached as either nil-forever or an all-empty verdict", rs.Capabilities)
 	}
 }
 
@@ -2399,6 +2412,15 @@ func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
 // hit counter is asserted numerically after every cycle, not inferred from
 // the verdict alone -- a coincidental pass (e.g. a fixture where "" already
 // equals "") would not catch a reverted fix that re-asks every cycle.
+//
+// It also pins the nil-vs-all-empty Capabilities invariant on its CONCLUSIVE
+// side (final-review must-fix 3a): a 404 sits in ProbePropsVerdicts'
+// CONCLUSIVE set, so stable comes back true and probeRuntimeChildProps still
+// reaches capabilitiesSample, which always returns a non-nil pointer even
+// over a zero-value collector.Capabilities. rs.Capabilities must therefore be
+// a non-nil, ALL-EMPTY struct here -- "detection ran, determined nothing" --
+// never the nil reserved for a still-transient probe
+// (TestCollectOnceRuntimeLiveProgressUnreachable covers that side).
 func TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles(t *testing.T) {
 	var propsHits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2431,8 +2453,14 @@ func TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles(t *testing.T) 
 		if got == nil || len(got.Runtimes) != 1 {
 			t.Fatalf("cycle %d: Runtimes = %+v", cycle, got)
 		}
-		if rs := got.Runtimes[0]; rs.LiveProgressSupport != "" {
+		rs := got.Runtimes[0]
+		if rs.LiveProgressSupport != "" {
 			t.Errorf("cycle %d: LiveProgressSupport = %q, want %q (unknown -- a 404 is not a real verdict)", cycle, rs.LiveProgressSupport, "")
+		}
+		if rs.Capabilities == nil {
+			t.Errorf("cycle %d: Capabilities = nil, want a non-nil all-empty struct -- a 404 is a CONCLUSIVE refusal (\"detection ran, determined nothing\"), distinct from a still-transient probe's nil", cycle)
+		} else if !reflect.DeepEqual(*rs.Capabilities, sample.Capabilities{}) {
+			t.Errorf("cycle %d: Capabilities = %+v, want an all-empty struct", cycle, *rs.Capabilities)
 		}
 		if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 			t.Fatalf("cycle %d: /props hits = %d, want 1 (a 404 is conclusive: cache it and never ask again for this pid)", cycle, hits)
