@@ -899,8 +899,8 @@ against a mapping with no row must stay inert, while a PRESENT map key can only
 be an explicit statement. Collapsing the two rules into one would either
 re-open the minting defect or re-close the third state. The map accepts ANY
 capability name — the vocabulary is open below — and rejects a blank one, a
-value outside the three, and stating a capability whose legacy boolean the same
-request also sends. Its store error is PROPAGATED, unlike the accompanying
+value outside the three, stating a capability whose legacy boolean the same
+request also sends, and two keys that name one capability once trimmed. Its store error is PROPAGATED, unlike the accompanying
 upsert's best-effort write: relinquishing the verdict is the whole effect of
 the action, so swallowing the failure would report success for nothing. What is NOT closed is minting one by accident from a form gone stale
 mid-edit ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open is the *vocabulary*, not the

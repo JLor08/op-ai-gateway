@@ -935,6 +935,13 @@ func TestCreateMappingStatesANegativeCapabilityVerdict(t *testing.T) {
 			req:  CreateMappingRequest{GatewayModelName: "rejected-2", AppModelName: "rejected-2-up", CapabilityVerdicts: map[string]string{routing.CapabilityVision: "false"}},
 			want: ErrMappingCapabilityVerdictInvalid,
 		},
+		{
+			// Two keys naming one capability: refused here too, since both
+			// paths share normalizeCapabilityVerdicts.
+			name: "two keys that trim to the same capability",
+			req:  CreateMappingRequest{GatewayModelName: "rejected-3", AppModelName: "rejected-3-up", CapabilityVerdicts: map[string]string{routing.CapabilityMTP: routing.CapabilityNo, "mtp ": routing.CapabilityYes}},
+			want: ErrMappingCapabilityDuplicate,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := fx.svc.CreateMapping(ctx, ownerToken(), fx.appID, tc.req); !errors.Is(err, tc.want) {
@@ -1073,5 +1080,87 @@ func TestCreateMappingStatedUnknownSuppressesTheMTPNameHeuristic(t *testing.T) {
 	}
 	if got := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, unstated.ID))[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceLegacy {
 		t.Fatalf("mtp row for the SAME name with nothing stated = %+v, want yes/legacy -- the heuristic must still run", got)
+	}
+}
+
+// TestUpdateMappingTwoKeysForOneCapabilityAreRejected: a map holding two keys
+// that TRIM to the same capability is two different instructions about one
+// row, and it is refused rather than resolved.
+//
+// Resolving it was never really an option, because there is no rule to
+// resolve it BY. Both intents survive normalization, both compare equal in
+// its sort (sort.Slice is not stable), and the one upsert they reach is
+// last-write-wins -- so the verdict that landed followed Go's map iteration
+// order, measured at "no" 7 / "yes" 33 over 40 identical requests, inside the
+// function whose own doc comment promises a deterministic order.
+//
+// The pin is that the REQUEST is refused (without the check it answers 200,
+// so this assertion is not itself a coin flip) and that it wrote NOTHING: no
+// upsert, no delete, no row, and not even the unrelated context_size the same
+// body carried. The two contrasts below are what keep the check honest -- a
+// single padded key is still perfectly good input, and an exactly-duplicate
+// JSON key is a different thing entirely, collapsed by encoding/json to one
+// entry long before this code runs.
+func TestUpdateMappingTwoKeysForOneCapabilityAreRejected(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
+	fx := newCapabilityTestFixture(t, now, recorder)
+
+	newCtxSize := 999999
+	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+		ContextSize: &newCtxSize,
+		CapabilityVerdicts: map[string]string{
+			routing.CapabilityVision:       routing.CapabilityNo,
+			" " + routing.CapabilityVision: routing.CapabilityYes,
+		},
+	}); !errors.Is(err, ErrMappingCapabilityDuplicate) {
+		t.Fatalf("UpdateMapping err = %v, want %v", err, ErrMappingCapabilityDuplicate)
+	}
+	if len(recorder.upserts) != 0 || len(recorder.deletes) != 0 {
+		t.Fatalf("capability writes on the rejected request = upserts %+v / deletes %+v, want NONE -- the collision is detected before anything is mutated", recorder.upserts, recorder.deletes)
+	}
+	if rows := mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID); len(rows) != 0 {
+		t.Fatalf("capability rows after the rejected request = %+v, want NONE", rows)
+	}
+	list, err := fx.svc.ListMappings(ctx, ownerToken(), fx.appID)
+	if err != nil {
+		t.Fatalf("ListMappings: %v", err)
+	}
+	if got := list.Data[0].ContextSize; got != 4096 {
+		t.Fatalf("context_size after the rejected request = %d, want the created 4096 -- validation must run before any mutation", got)
+	}
+
+	// A single PADDED key is not a collision and must still work: the name
+	// arrives from an open vocabulary an upstream may pad, which is why it is
+	// trimmed at all.
+	single, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+		CapabilityVerdicts: map[string]string{"  " + routing.CapabilityVision + "  ": routing.CapabilityNo},
+	})
+	if err != nil {
+		t.Fatalf("UpdateMapping (one padded key): %v", err)
+	}
+	if got := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID))[routing.CapabilityVision]; got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceManual {
+		t.Fatalf("vision row after one padded key = %+v, want no/manual", got)
+	}
+	if seededVerdict(single, routing.CapabilityVision) != routing.CapabilityNo {
+		t.Fatalf("response seeds vision to %q, want %q", seededVerdict(single, routing.CapabilityVision), routing.CapabilityNo)
+	}
+
+	// An EXACTLY duplicate JSON key never reaches the check: the decoder
+	// collapses it to one map entry, last value wins. Decoded here rather
+	// than hand-built, because that collapse is the whole point.
+	var decoded UpdateMappingRequest
+	if err := json.Unmarshal([]byte(`{"capability_verdicts":{"mtp":"no","mtp":"yes"}}`), &decoded); err != nil {
+		t.Fatalf("unmarshal a body with a repeated JSON key: %v", err)
+	}
+	if len(decoded.CapabilityVerdicts) != 1 {
+		t.Fatalf("decoded capability_verdicts = %+v, want ONE entry -- encoding/json collapses a repeated key", decoded.CapabilityVerdicts)
+	}
+	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, decoded); err != nil {
+		t.Fatalf("UpdateMapping (repeated JSON key, decoded): %v", err)
+	}
+	if got := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID))[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceManual {
+		t.Fatalf("mtp row after the decoded repeated key = %+v, want yes/manual (the decoder's surviving value)", got)
 	}
 }

@@ -155,7 +155,7 @@ func TestPortalMappingCreateStatesACapabilityVerdict(t *testing.T) {
 	}
 }
 
-// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the three
+// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the four
 // sentinels reach the HTTP layer as 400s with their own codes rather than a
 // default 500 -- the same guard TestPortalMappingCreateNegativeMetricReturns400
 // provides for ErrMappingMetricInvalid, and equally easy to lose: a sentinel
@@ -182,6 +182,11 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 			name:     "state a capability and send its legacy boolean",
 			body:     `{"vision_capable":true,"capability_verdicts":{"vision":"no"}}`,
 			wantCode: "mapping.capability_conflict",
+		},
+		{
+			name:     "two keys that trim to the same capability",
+			body:     `{"capability_verdicts":{"vision":"no"," vision":"yes"}}`,
+			wantCode: "mapping.capability_duplicate",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

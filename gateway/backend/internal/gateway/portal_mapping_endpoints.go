@@ -134,6 +134,7 @@ var portalMappingErrRows = []errRow{
 	{err: portal.ErrMappingCapabilityNameRequired, status: http.StatusBadRequest, code: "mapping.capability_name_required", msg: "capability_verdicts must not contain an empty capability name"},
 	{err: portal.ErrMappingCapabilityVerdictInvalid, status: http.StatusBadRequest, code: "mapping.capability_verdict_invalid", msg: `capability_verdicts values must be "yes", "no" or "" (unknown)`},
 	{err: portal.ErrMappingCapabilityConflict, status: http.StatusBadRequest, code: "mapping.capability_conflict", msg: "a capability cannot be stated in capability_verdicts and in its is_mtp/vision_capable boolean in the same request"},
+	{err: portal.ErrMappingCapabilityDuplicate, status: http.StatusBadRequest, code: "mapping.capability_duplicate", msg: "capability_verdicts must not contain two keys naming the same capability"},
 	{err: portal.ErrMappingGatewayNameConflict, status: http.StatusConflict, code: "mapping.gateway_name_conflict", msg: "mapping gateway model name already in use"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeMappingNotFound, msg: msgMappingNotFound},
 }

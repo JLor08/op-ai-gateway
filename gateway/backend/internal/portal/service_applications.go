@@ -113,6 +113,20 @@ var (
 	// The portal's own form sends only the map (see MappingForm's submit); a
 	// client that sends both has a bug worth surfacing.
 	ErrMappingCapabilityConflict = errors.New("mapping.capability_conflict")
+	// ErrMappingCapabilityDuplicate rejects a CapabilityVerdicts map holding
+	// TWO keys that name the SAME capability once trimmed --
+	// `{"vision": "no", " vision": "yes"}`. That is the boolean conflict above
+	// in another shape: the caller has told us two different things about one
+	// row, and there is nothing to choose between them. Silently picking one
+	// would be the worse answer, because WHICH one is arbitrary: both intents
+	// survive normalization, both compare equal in its sort (sort.Slice is not
+	// stable), and the single upsert they reach is last-write-wins, so the
+	// stored verdict follows Go's map iteration order.
+	//
+	// An exactly-duplicate JSON key -- `{"vision":"no","vision":"yes"}` -- is
+	// NOT this case and is not rejected: encoding/json collapses it to one map
+	// entry (the last value wins) before any of this code sees it.
+	ErrMappingCapabilityDuplicate = errors.New("mapping.capability_duplicate")
 )
 
 const (
@@ -1442,7 +1456,9 @@ type CreateMappingRequest struct {
 	//
 	// Same validation as the update path: names are trimmed and a blank one is
 	// ErrMappingCapabilityNameRequired; a value that is not "yes", "no" or ""
-	// is ErrMappingCapabilityVerdictInvalid. The vocabulary is open.
+	// is ErrMappingCapabilityVerdictInvalid; two keys naming the same
+	// capability once trimmed are ErrMappingCapabilityDuplicate. The
+	// vocabulary is open.
 	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
@@ -1511,9 +1527,10 @@ type UpdateMappingRequest struct {
 	// constants the code reasons about, because an Ollama/agent-reported name
 	// gets its own row like any other and must be correctable like any other.
 	// Names are trimmed; a blank one is ErrMappingCapabilityNameRequired. A
-	// value outside the three above is ErrMappingCapabilityVerdictInvalid, and
-	// a capability named here whose legacy boolean is ALSO sent is
-	// ErrMappingCapabilityConflict.
+	// value outside the three above is ErrMappingCapabilityVerdictInvalid, a
+	// capability named here whose legacy boolean is ALSO sent is
+	// ErrMappingCapabilityConflict, and two keys that name the same capability
+	// once trimmed are ErrMappingCapabilityDuplicate.
 	//
 	// A JSON `null` on the booleans could not have carried the third state:
 	// IsMTP/VisionCapable are `*bool` with `omitempty`, so
@@ -2348,11 +2365,20 @@ type capabilityVerdictIntent struct {
 //     about one row, read by two different rules. The portal's form sends only
 //     this map (see MappingForm's submit), so this is a client bug rather than
 //     a state to reconcile.
+//   - TWO keys that name the same capability once trimmed are
+//     ErrMappingCapabilityDuplicate, for the same reason and detected the same
+//     way: AFTER trimming (so the padded key is caught) and BEFORE anything is
+//     mutated (so a rejected request writes nothing at all). Without it the
+//     deterministic order this function promises would not reach the store --
+//     both intents pass through, they compare equal in the sort below, and the
+//     upsert is last-write-wins, so the verdict that lands would follow Go's
+//     map iteration order.
 func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[string]bool) ([]capabilityVerdictIntent, error) {
 	if len(verdicts) == 0 {
 		return nil, nil
 	}
 	out := make([]capabilityVerdictIntent, 0, len(verdicts))
+	seen := make(map[string]struct{}, len(verdicts))
 	for name, verdict := range verdicts {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -2364,6 +2390,10 @@ func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[st
 		if sentBooleans[name] {
 			return nil, ErrMappingCapabilityConflict
 		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, ErrMappingCapabilityDuplicate
+		}
+		seen[name] = struct{}{}
 		out = append(out, capabilityVerdictIntent{Capability: name, Verdict: verdict})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })

@@ -553,9 +553,12 @@ plausible-looking validation rule would break the normal case:
   everything else and cannot be undone by the next save (the mapping form
   seeds once and never re-syncs). Stating a capability whose legacy
   `is_mtp`/`vision_capable` boolean the same request also sends is rejected —
-  two instructions about one row, read by two different rules — as are a blank
-  name and a value outside `yes`/`no`/`''`, both of which the store would
-  otherwise treat as a no-op or as a delete nobody asked for.
+  two instructions about one row, read by two different rules — and so are two
+  keys that name the same capability once trimmed, which is that same conflict
+  in another shape: both intents would reach one last-write-wins upsert, so
+  the verdict that landed would follow Go's map iteration order. Rejected too
+  are a blank name and a value outside `yes`/`no`/`''`, both of which the
+  store would otherwise treat as a no-op or as a delete nobody asked for.
   Every OTHER shape IS a benign no-op in both implementations — an unknown
   mapping id and an unknown capability name alike — and the driver conformance
   suite proves it on all three legs (memory, sqlite, postgres), unlike
