@@ -762,6 +762,17 @@ func TestMappingCapabilityRows(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("upsert m2: %v", err)
 		}
+		// m1 must carry at least TWO rows here, not one: a bulk reader whose
+		// per-parent accumulation is unpinned (e.g. `out[id] = []Row{r}`
+		// instead of `out[id] = append(out[id], r)`) keeps only the last row
+		// scanned for a mapping and would still pass a single-row mapping. m1
+		// currently has only "tools" left (vision was deleted above), so add a
+		// second capability back before reading it through the batch API.
+		if err := s.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+			{Capability: routing.CapabilityAudio, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert second capability on m1: %v", err)
+		}
 		batch, err := s.MappingCapabilitiesForMappings(ctx, []string{"m1", "m2", "nope"})
 		if err != nil {
 			t.Fatalf("batch: %v", err)
@@ -776,12 +787,103 @@ func TestMappingCapabilityRows(t *testing.T) {
 		if err != nil {
 			t.Fatalf("single read for the batch comparison: %v", err)
 		}
+		if len(single) < 2 {
+			t.Fatalf("fixture bug: m1 must carry >=2 rows to exercise the batch reader's accumulation, got %+v", single)
+		}
+		// Compare element-wise, not just by length: both readers select
+		// `order by capability`, so a lockstep comparison is deterministic and
+		// catches a reader that drops or overwrites a row a plain length check
+		// would miss (e.g. keeping only the mapping's LAST row).
 		if len(batch["m1"]) != len(single) {
-			t.Fatalf("batch and single reader disagree: batch=%+v single=%+v", batch["m1"], single)
+			t.Fatalf("batch and single reader disagree on count: batch=%+v single=%+v", batch["m1"], single)
+		}
+		for i := range single {
+			if batch["m1"][i] != single[i] {
+				t.Fatalf("batch and single reader disagree at row %d: batch=%+v single=%+v", i, batch["m1"], single)
+			}
 		}
 		// An empty id list does no lookup and yields an empty map.
 		if empty, err := s.MappingCapabilitiesForMappings(ctx, nil); err != nil || len(empty) != 0 {
 			t.Fatalf("empty batch: err=%v map=%+v", err, empty)
+		}
+	})
+}
+
+// TestUpsertMappingCapabilitiesRejectsInvalidRows proves both drivers reject
+// (via routing.ValidateCapabilityRow), rather than silently write, a row an
+// operator's documented invariant says cannot exist: an empty Capability or
+// Source, or a Verdict that is neither "yes" nor "no". A caller passing such
+// a row has a bug, and every caller of UpsertMappingCapabilities is
+// best-effort (it logs and carries on), so an error here costs nothing.
+func TestUpsertMappingCapabilitiesRejectsInvalidRows(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_capval", Name: "S1", Domain: "srv-capval.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv-capval.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_capval", ServerID: "srv_capval", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_capval", ApplicationID: "app_capval", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		cases := []struct {
+			name string
+			row  routing.CapabilityRow
+		}{
+			{"empty verdict", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: "", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"verdict neither yes nor no", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: "maybe", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"empty capability", routing.CapabilityRow{Capability: "", Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"empty source", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: "", CheckedAt: now}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{tc.row}); err == nil {
+					t.Fatalf("UpsertMappingCapabilities(%+v) = nil error, want a rejection", tc.row)
+				}
+				got, err := s.MappingCapabilities(ctx, "map_capval")
+				if err != nil {
+					t.Fatalf("read after rejected upsert: %v", err)
+				}
+				if len(got) != 0 {
+					t.Fatalf("a rejected row must not be written: %+v", got)
+				}
+			})
+		}
+
+		// An invalid row anywhere in a batch rejects the WHOLE batch -- no
+		// partial write of the valid rows alongside it.
+		if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityTools, Verdict: "bogus", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err == nil {
+			t.Fatal("a batch with one invalid row must be rejected entirely")
+		}
+		if got, err := s.MappingCapabilities(ctx, "map_capval"); err != nil || len(got) != 0 {
+			t.Fatalf("a rejected batch must leave no rows behind: err=%v got=%+v", err, got)
+		}
+
+		// A fully valid row still works after the rejections above.
+		if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("a valid row must still be accepted: %v", err)
 		}
 	})
 }

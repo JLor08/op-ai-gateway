@@ -1095,6 +1095,32 @@ func CapabilitySourceIsAuthoritative(source string) bool {
 	return source == CapabilitySourceManual || source == CapabilitySourceVisionBenchmark
 }
 
+// ValidateCapabilityRow rejects a CapabilityRow that could not have come from
+// a caller behaving correctly: an empty Capability or Source, or a Verdict
+// that is neither CapabilityYes nor CapabilityNo. That is not a stricter rule
+// than the type already documents -- CapabilityRow's own doc comment says
+// "there is no empty verdict to accidentally write" -- it is what makes the
+// claim true instead of aspirational.
+//
+// Both UpsertMappingCapabilities implementations call this exact function
+// (rather than each re-stating the check), so the two drivers cannot drift
+// apart. Every caller of UpsertMappingCapabilities is best-effort -- it logs
+// an error and carries on -- so failing loudly here costs nothing, and a
+// caller passing an empty Verdict/Capability/Source has a bug worth
+// surfacing rather than hiding.
+func ValidateCapabilityRow(r CapabilityRow) error {
+	if r.Capability == "" {
+		return fmt.Errorf("capability row: capability must not be empty")
+	}
+	if r.Source == "" {
+		return fmt.Errorf("capability row %q: source must not be empty", r.Capability)
+	}
+	if r.Verdict != CapabilityYes && r.Verdict != CapabilityNo {
+		return fmt.Errorf("capability row %q: verdict must be %q or %q, got %q", r.Capability, CapabilityYes, CapabilityNo, r.Verdict)
+	}
+	return nil
+}
+
 // MappingStore is CRUD for model mappings (gateway model name -> app model
 // name) plus the family of targeted, metrics_locked-respecting metric
 // updates (context probe, vision, benchmark, opportunistic EWMA, capacity,
@@ -1173,11 +1199,15 @@ type MappingStore interface {
 	// group member.
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
 	// UpsertMappingCapabilities writes rows, replacing any row for the same
-	// (mapping, capability). It does NOT apply the precedence rule -- callers
-	// do, because only they know whether they are a probe (see
-	// CapabilitySourceIsAuthoritative). It carries no metrics_locked guard and
-	// never touches metrics_source/metrics_updated_at: a capability is not a
-	// number an operator pins against automation.
+	// (mapping, capability), atomically as one set -- a caller passing several
+	// verdicts must never observe some of them applied and others not. It does
+	// NOT apply the precedence rule -- callers do, because only they know
+	// whether they are a probe (see CapabilitySourceIsAuthoritative). It
+	// carries no metrics_locked guard and never touches
+	// metrics_source/metrics_updated_at: a capability is not a number an
+	// operator pins against automation. It rejects (ValidateCapabilityRow),
+	// without writing anything, a row whose Verdict is neither CapabilityYes
+	// nor CapabilityNo or whose Capability or Source is empty.
 	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []CapabilityRow) error
 	// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a
 	// row is how "not determined" is expressed -- the state the pre-78 bool

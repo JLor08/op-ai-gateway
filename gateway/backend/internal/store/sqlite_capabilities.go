@@ -99,21 +99,41 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 // UpdateMappingCapabilities, carries no metrics_locked guard and never
 // touches metrics_source/metrics_updated_at: a capability is not a number an
 // operator pins against automation.
+//
+// Every row is validated (routing.ValidateCapabilityRow) before anything is
+// written, and the whole set is written inside ONE transaction (mirroring
+// SetCoResidencyRules): a caller such as a probe writer that hands over a
+// full verdict set must never leave the mapping with some capabilities from
+// the new set and some from the old — a half-written capability picture is
+// worse than an unchanged one.
 func (s *SQLiteStore) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error {
 	for _, r := range rows {
-		if _, err := s.exec(ctx, `
+		if err := routing.ValidateCapabilityRow(r); err != nil {
+			return err
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert mapping capabilities: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, r := range rows {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
 			insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
 			values (?, ?, ?, ?, ?)
 			on conflict(mapping_id, capability) do update set
 				verdict = excluded.verdict,
 				source = excluded.source,
-				checked_at = excluded.checked_at`,
+				checked_at = excluded.checked_at`),
 			mappingID, r.Capability, r.Verdict, r.Source, r.CheckedAt,
 		); err != nil {
 			return fmt.Errorf("upsert mapping capability %q: %w", r.Capability, err)
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeleteMappingCapability returns one capability to UNKNOWN by removing its

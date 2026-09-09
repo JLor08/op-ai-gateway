@@ -1146,7 +1146,16 @@ func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingI
 // natural replacement, matching the SQL on-conflict-do-update. It applies no
 // precedence rule (the caller does) and, unlike every metric writer here,
 // carries no metrics_locked guard.
+//
+// Every row is validated (ValidateCapabilityRow) before anything is written
+// — the same check SQLiteStore's UpsertMappingCapabilities makes, so the two
+// drivers cannot diverge on what counts as a valid row.
 func (m *MemoryStore) UpsertMappingCapabilities(_ context.Context, mappingID string, rows []CapabilityRow) error {
+	for _, r := range rows {
+		if err := ValidateCapabilityRow(r); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(rows) == 0 {
