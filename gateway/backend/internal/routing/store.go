@@ -1225,7 +1225,22 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // is the single place that answer lives. Pure: no I/O, no store access,
 // table-testable on its own.
 //
-// Two rules, in order:
+// Three rules, in order:
+//
+//  0. ONE ROW PER CAPABILITY NAME: where reported names the same capability
+//     twice, the FIRST occurrence decides and every later one is dropped --
+//     whether or not the first was itself written. The capability vocabulary
+//     is open on purpose (an upstream may report any name), so a reported
+//     name CAN collide with one this code reasons about: Ollama's
+//     manifest-declared capabilities literally include "vision", and
+//     runtimeSampleCapabilityRows carries a dedicated live-progress verdict
+//     beside an agent's open verdict list. Both producers therefore emit
+//     their STRUCTURED verdicts first and their open-vocabulary ones after,
+//     which is what makes first-wins mean "structured beats unstructured".
+//     Before this rule, two rows for one capability both passed and both
+//     reached the store, where the upsert loop's ordering made the last one
+//     win -- the opposite outcome, arrived at by an emergent property of a
+//     loop in another package rather than by a rule anyone had stated.
 //
 //  1. PRECEDENCE, the operator's rule and the reason this table carries a
 //     per-row source at all: a write is permitted iff
@@ -1246,25 +1261,38 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 //     needed at all -- see UpsertMappingCapabilities' own doc for what
 //     this table has instead of metrics_locked.
 //
-//  2. CHANGE DETECTION: a stored verdict that already AGREES issues no
-//     write, and this check runs only AFTER rule 1 permits the write --
-//     which matters for one case worth stating rather than leaving a reader
-//     to wonder: a benchmark verdict that AGREES with a stored MANUAL row
-//     never reaches this rule at all, because rule 1 already blocked it.
-//     That means it cannot refresh CheckedAt either. That is correct, not a
-//     gap: the operator's row is the record, and a benchmark agreeing with
-//     it is not a new measurement of anything the operator didn't already
-//     say. Absent that interaction, this rule exists because a build
-//     capability is stable by nature -- the same child build reports the
-//     same verdict every second for its whole life -- so without it every
-//     telemetry sample would drive one write per capability per mapping,
-//     forever, for a value that cannot change short of an operator swapping
-//     the upstream binary. It compares the VERDICT only: a legacy row that
-//     already agrees is left alone rather than re-stamped with a fresher
-//     source, because the verdict is what every reader acts on and the
-//     write would be pure amplification. An ABSENT row has an empty
-//     verdict, which can never equal a reported "yes"/"no", so a
-//     first-ever verdict always passes this rule too.
+//  2. CHANGE DETECTION: a write is dropped when the stored row already
+//     agrees on BOTH the verdict and the rank -- i.e. there is nothing left
+//     to record. This check runs only AFTER rule 1 permits the write, which
+//     matters for one case worth stating rather than leaving a reader to
+//     wonder: a benchmark verdict that AGREES with a stored MANUAL row never
+//     reaches this rule at all, because rule 1 already blocked it. That
+//     means it cannot refresh CheckedAt either. That is correct, not a gap:
+//     the operator's row is the record, and a benchmark agreeing with it is
+//     not a new measurement of anything the operator didn't already say.
+//
+//     Absent that interaction, this rule exists because a build capability
+//     is stable by nature -- the same child build reports the same verdict
+//     every second for its whole life -- so without it every telemetry
+//     sample would drive one write per capability per mapping, forever, for
+//     a value that cannot change short of an operator swapping the upstream
+//     binary. That is why an EQUAL rank plus an equal verdict is dropped:
+//     the row would be rewritten with the identical facts.
+//
+//     The rank is part of the comparison because it is itself a fact worth
+//     recording, and one only a WRITE can change. A vision benchmark that
+//     CONFIRMS a legacy or probe row's verdict is a real measurement of a
+//     value only a document-reader had asserted before: leaving the row at
+//     rank 1 would misattribute a measured verdict to a probe in the
+//     per-capability tooltip, and -- worse -- leave the row overwritable by
+//     the next probe, so a real measurement could still be talked over.
+//     Comparing the verdict alone hid that upgrade behind an agreement.
+//     This cannot reintroduce write amplification: a rank only ever RISES
+//     for a given (mapping, capability), at most twice, and a repeat from
+//     the same writer ties.
+//
+//     An ABSENT row has an empty verdict and rank 0, so a first-ever
+//     verdict always passes this rule too.
 //
 // reported must already hold only the verdicts this writer actually
 // determined, each with Verdict CapabilityYes or CapabilityNo and a
@@ -1279,13 +1307,26 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // len(rows) == 0 skips the store call entirely.
 func WritableCapabilityRows(reported []CapabilityRow, stored map[string]CapabilityRow) []CapabilityRow {
 	var out []CapabilityRow
+	// rule 0's bookkeeping. Starts nil and is built on the first row, so a
+	// nil or empty reported slice allocates nothing at all -- a nil map
+	// reads as empty, which is exactly what "no name claimed yet" means.
+	var seen map[string]struct{}
 	for _, r := range reported {
+		if _, dup := seen[r.Capability]; dup {
+			continue // rule 0: the first occurrence of a name decides
+		}
+		if seen == nil {
+			seen = make(map[string]struct{}, len(reported))
+		}
+		seen[r.Capability] = struct{}{}
 		cur := stored[r.Capability]
-		if capabilitySourceRank(r.Source) < capabilitySourceRank(cur.Source) {
+		incomingRank := capabilitySourceRank(r.Source)
+		currentRank := capabilitySourceRank(cur.Source)
+		if incomingRank < currentRank {
 			continue // outranked -- e.g. a probe (rank 1) against a manual verdict (rank 3)
 		}
-		if cur.Verdict == r.Verdict {
-			continue // already on file, no write amplification
+		if cur.Verdict == r.Verdict && incomingRank == currentRank {
+			continue // already on file at this rank, no write amplification
 		}
 		out = append(out, r)
 	}

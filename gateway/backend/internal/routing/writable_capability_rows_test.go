@@ -148,9 +148,9 @@ func TestWritableCapabilityRowsReturnsNilNotEmptySlice(t *testing.T) {
 // as uncovered: a legacy row's rank (1) does not block an incoming probe's
 // rank-1 write under rule 1 (a tie is writable), so without rule 2 an
 // agreeing legacy verdict would be pointlessly re-stamped with a fresh
-// CheckedAt on every sample. The comparison is verdict-only, not
-// source-or-CheckedAt, so this would also fail if rule 2 were changed to
-// compare anything else.
+// CheckedAt on every sample. Equal verdict AND equal rank is the exact
+// condition -- see TestWritableCapabilityRowsUpgradesTheRankOfAnAgreeingRow
+// for the other half, where an agreeing verdict at a HIGHER rank must write.
 func TestWritableCapabilityRowsAgreeingLegacyRowIsNotRewritten(t *testing.T) {
 	stored := map[string]CapabilityRow{
 		CapabilityVision: {Capability: CapabilityVision, Verdict: CapabilityYes, Source: CapabilitySourceLegacy},
@@ -159,5 +159,126 @@ func TestWritableCapabilityRowsAgreeingLegacyRowIsNotRewritten(t *testing.T) {
 	got := WritableCapabilityRows(reported, stored)
 	if got != nil {
 		t.Fatalf("WritableCapabilityRows = %#v, want nil -- an agreeing legacy verdict must not be rewritten even though rank permits it", got)
+	}
+}
+
+// TestWritableCapabilityRowsUpgradesTheRankOfAnAgreeingRow is rule 2's other
+// half: a write whose verdict AGREES with the stored one must still land when
+// its rank is HIGHER, because the rank is itself a fact only a write can
+// change.
+//
+// The case that matters is the vision benchmark confirming what a probe or a
+// migrated legacy row already asserted. Comparing the verdict alone dropped
+// that write, with two consequences: the per-capability tooltip -- the
+// headline gain of the capability table -- attributed a genuinely MEASURED
+// verdict to a probe re-reading a document, and the row stayed at rank 1, so
+// the next probe could still overwrite a real measurement.
+//
+// The equal-rank rows are the guard against solving that by writing always:
+// a repeat from the same writer, and a probe over an agreeing legacy row,
+// must both stay silent -- a build capability reports the same verdict every
+// second for its whole life. A rank can only ever RISE for one (mapping,
+// capability), at most twice, so this cannot amplify.
+func TestWritableCapabilityRowsUpgradesTheRankOfAnAgreeingRow(t *testing.T) {
+	cases := []struct {
+		name      string
+		incoming  string
+		current   string
+		wantWrite bool
+		why       string
+	}{
+		{
+			name: "benchmark confirms a probe row", incoming: CapabilitySourceVisionBenchmark,
+			current: CapabilitySourceLlamaCppProps, wantWrite: true,
+			why: "a real measurement of a verdict only /props had asserted -- the row must stop being probe-overwritable",
+		},
+		{
+			name: "benchmark confirms a legacy row", incoming: CapabilitySourceVisionBenchmark,
+			current: CapabilitySourceLegacy, wantWrite: true,
+			why: "same, for a verdict migration 78 inherited from a column whose writer is unknowable",
+		},
+		{
+			name: "manual confirms a benchmark row", incoming: CapabilitySourceManual,
+			current: CapabilitySourceVisionBenchmark, wantWrite: true,
+			why: "an operator agreeing with the measurement still makes the verdict permanently theirs (rank 3)",
+		},
+		{
+			name: "benchmark repeats itself", incoming: CapabilitySourceVisionBenchmark,
+			current: CapabilitySourceVisionBenchmark, wantWrite: false,
+			why: "equal rank, equal verdict: nothing left to record",
+		},
+		{
+			name: "probe repeats itself", incoming: CapabilitySourceLlamaCppProps,
+			current: CapabilitySourceLlamaCppProps, wantWrite: false,
+			why: "the amplification this rule exists to stop -- one write per sample, forever",
+		},
+		{
+			name: "probe agrees with a legacy row", incoming: CapabilitySourceLlamaCppProps,
+			current: CapabilitySourceLegacy, wantWrite: false,
+			why: "legacy and a probe are the SAME rank, so there is no upgrade to record",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := map[string]CapabilityRow{
+				CapabilityVision: {Capability: CapabilityVision, Verdict: CapabilityYes, Source: tc.current},
+			}
+			// The SAME verdict as the stored row, deliberately: this test is
+			// only about rule 2, so rule 1 must be the only other thing that
+			// could speak, and it permits every pair here.
+			reported := []CapabilityRow{{Capability: CapabilityVision, Verdict: CapabilityYes, Source: tc.incoming}}
+			got := WritableCapabilityRows(reported, stored)
+			if gotWrite := len(got) == 1; gotWrite != tc.wantWrite {
+				t.Fatalf("incoming %s over stored %s (verdicts agree) wrote=%v, want %v -- %s",
+					tc.incoming, tc.current, gotWrite, tc.wantWrite, tc.why)
+			}
+		})
+	}
+}
+
+// TestWritableCapabilityRowsKeepsTheFirstRowPerCapability pins rule 0. The
+// capability vocabulary is open on purpose, so a reported name CAN collide
+// with one the code reasons about -- Ollama's manifest-declared capabilities
+// literally include "vision", and the runtime write-back carries a dedicated
+// live-progress verdict beside an agent's open verdict list. Both producers
+// emit their STRUCTURED verdicts first, so keeping the first occurrence is
+// what makes "structured beats unstructured" a rule rather than an accident.
+//
+// Before rule 0 both rows passed and both reached the store, where the upsert
+// loop's ordering made the LAST one win -- the opposite outcome, decided by a
+// loop in another package rather than by anything anyone had stated.
+func TestWritableCapabilityRowsKeepsTheFirstRowPerCapability(t *testing.T) {
+	// A structured "no" followed by an open-vocabulary "yes" for the same
+	// name, with nothing on file: exactly the Ollama collision.
+	reported := []CapabilityRow{
+		{Capability: CapabilityVision, Verdict: CapabilityNo, Source: CapabilitySourceLlamaCppProps},
+		{Capability: CapabilityVision, Verdict: CapabilityYes, Source: CapabilitySourceLlamaCppProps},
+	}
+	got := WritableCapabilityRows(reported, map[string]CapabilityRow{})
+	if len(got) != 1 {
+		t.Fatalf("WritableCapabilityRows returned %d rows (%+v), want exactly 1 -- a duplicated capability name must never reach the upsert twice", len(got), got)
+	}
+	if got[0].Verdict != CapabilityNo {
+		t.Fatalf("the surviving row is %+v, want the FIRST occurrence (the structured no) -- an open-vocabulary name must not override a structured verdict", got[0])
+	}
+
+	// The first occurrence claims the name even when it is itself dropped by
+	// rule 2. Otherwise a later duplicate could still write, and "the first
+	// occurrence decides" would hold only when the first one happened to be
+	// writable.
+	stored := map[string]CapabilityRow{
+		CapabilityVision: {Capability: CapabilityVision, Verdict: CapabilityNo, Source: CapabilitySourceLlamaCppProps},
+	}
+	if got := WritableCapabilityRows(reported, stored); got != nil {
+		t.Fatalf("WritableCapabilityRows = %+v, want nil -- the first occurrence agreed with the stored row, so the duplicate behind it must not write either", got)
+	}
+
+	// Distinct names are untouched by rule 0.
+	two := []CapabilityRow{
+		{Capability: CapabilityVision, Verdict: CapabilityYes, Source: CapabilitySourceLlamaCppProps},
+		{Capability: CapabilityTools, Verdict: CapabilityYes, Source: CapabilitySourceLlamaCppProps},
+	}
+	if got := WritableCapabilityRows(two, map[string]CapabilityRow{}); len(got) != 2 {
+		t.Fatalf("WritableCapabilityRows returned %d rows for two DIFFERENT capabilities (%+v), want 2", len(got), got)
 	}
 }

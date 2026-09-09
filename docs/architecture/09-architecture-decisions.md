@@ -900,9 +900,18 @@ and an unrecognised source ranking 1 fails safe toward "treat it as a probe"
 rather than silently handing an unknown writer manual's immunity. `legacy` is
 the source migration 78 stamps on a verdict inherited from a column whose real
 origin is unknowable, ranked alongside a probe deliberately: treating a guess
-as authoritative would freeze it in forever. A verdict that already agrees is
-never rewritten, so a capability — stable by nature — costs no write per
-telemetry tick. **(c) The eleven columns are dropped** (migration 79), and
+as authoritative would freeze it in forever. A write whose verdict AND rank
+both already match is dropped, so a capability — stable by nature — costs no
+write per telemetry tick; an agreeing verdict at a HIGHER rank still writes,
+because the rank is a fact of its own that only a write can change (a
+benchmark confirming a probe's verdict has genuinely measured it, and leaving
+the row at rank 1 would both misattribute it in the tooltip and leave a real
+measurement overwritable by the next probe). Because the reported names are an
+open vocabulary, the same rule enforces **one row per capability name** per
+write, keeping the first occurrence: every producer emits its structured
+verdicts before its open-vocabulary ones, so structured beats unstructured
+deterministically instead of by whichever row the store's upsert loop happened
+to apply last. **(c) The eleven columns are dropped** (migration 79), and
 this is the line the decision draws. This repository's practice is to leave a
 superseded column **permanently inert** — migration 72's replacement of the
 `native_responses`/`native_messages` booleans left both in the schema ([ADR-033](#adr-033--endpoint-modes-replace-the-native_-booleans-independent-per-endpoint-disable-per-spec-snapshot))

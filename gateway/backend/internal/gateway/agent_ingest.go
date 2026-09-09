@@ -924,24 +924,26 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined
 // about its child's build, projected onto rows this probe may offer for
-// writing: the open Verdicts list plus the live-progress verdict, which is a
-// capability like any other and gets no writer of its own.
+// writing: the live-progress verdict, which is a capability like any other
+// and gets no writer of its own, plus the open Verdicts list.
 //
-// The live-progress row is appended LAST, so an agent that (absurdly) both
-// reported a "live_progress" verdict in its list AND filled
-// live_progress_support gets the dedicated field's answer -- rows for the
-// same capability are applied in order, last one wins. Nothing about the
-// vocabulary makes that collision impossible, and picking the explicit field
-// is the less surprising of the two.
+// The live-progress row goes FIRST, so an agent that (absurdly) both
+// reported a "live_progress" verdict in its open list AND filled
+// live_progress_support gets the DEDICATED field's answer: rule 0 of
+// routing.WritableCapabilityRows keeps the first row for a capability name
+// and drops every later one. Nothing about the vocabulary makes that
+// collision impossible, and picking the explicit field is the less
+// surprising of the two. This order is the mechanism, not a formatting
+// choice -- reversing it silently hands the open list the last word.
 func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.CapabilityRow {
-	rows := rt.Capabilities.capabilityRows(at)
+	var rows []routing.CapabilityRow
 	if verdict := routing.LiveProgressCapabilityVerdict(rt.LiveProgressSupport); verdict != "" {
 		rows = append(rows, routing.CapabilityRow{
 			Capability: routing.CapabilityLiveProgress, Verdict: verdict,
 			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: at,
 		})
 	}
-	return rows
+	return append(rows, rt.Capabilities.capabilityRows(at)...)
 }
 
 // resolvedCapabilities returns specID's memoized ownership resolution,

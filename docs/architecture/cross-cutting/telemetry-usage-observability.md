@@ -825,12 +825,14 @@ it — the same per-mapping resolution [Agent-Managed Model Runtime
 describes for ordinary inference — which is how an api-key-protected child's
 verdict becomes determinable at all.
 
-**An unchanged verdict is never rewritten, on either write path.** Both the
+**An unchanged verdict at an unchanged rank is never rewritten, on either write path.** Both the
 gateway's own context-probe pass and the ingest write-back above hand their
 freshly-observed verdicts, together with the mapping's CURRENTLY STORED rows,
 to `routing.WritableCapabilityRows` — the one place that answers "which of
 these may I write" — and call `UpsertMappingCapabilities` only for what comes
-back. A verdict that already agrees is dropped there. A capability is stable
+back. A verdict that already agrees, at a source of the same rank, is dropped
+there (an agreeing verdict from a HIGHER-ranked writer still lands, because
+the rank itself is new information). A capability is stable
 by nature — the same upstream build reports the same verdict every single time
 it is asked — so without that comparison either pass would drive one
 unconditional write per capability per mapping per probe cycle, forever, for a

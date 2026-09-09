@@ -1058,6 +1058,45 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
+// TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList proves the
+// resolution of the one collision the OPEN capability vocabulary makes
+// possible on this path: an agent that both reports a "live_progress" verdict
+// in its open Verdicts list AND fills the dedicated live_progress_support
+// field. The dedicated field wins.
+//
+// The mechanism is a pair, and neither half works alone:
+// runtimeSampleCapabilityRows emits the dedicated row FIRST, and rule 0 of
+// routing.WritableCapabilityRows keeps the first row for a capability name
+// and drops every later one. Before rule 0 the same outcome came out of the
+// upsert loop applying both rows in order and the last one winning -- which
+// is why the projection appended the dedicated row LAST. Keeping rule 0 and
+// that old order together would silently hand the open list the last word,
+// so the order is now load-bearing in the opposite direction.
+//
+// The write carries ONE row, not two: a duplicated name must never reach the
+// store twice, whatever the store would then do with it.
+func TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_dup", false)
+	counting := countingRowStore(srv)
+
+	// The dedicated field says unsupported; the open list claims the same
+	// capability is supported. The verdicts are opposite on purpose, so the
+	// assertion cannot pass because both happen to agree.
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_lp_dup","state":"running","live_progress_support":"unsupported",` +
+		`"capabilities":{"verdicts":[{"name":"live_progress","verdict":"yes"}]}}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 {
+		t.Fatalf("the write carried %d rows (%+v), want exactly 1 -- one capability name, one row", len(sent), sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_dup", routing.CapabilityLiveProgress,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+}
+
 // TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves an
 // "unsupported" sample lands as a live_progress row carrying the row model's
 // "no", and that an IDENTICAL second sample costs no further write. The
