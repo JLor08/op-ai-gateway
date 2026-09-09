@@ -507,7 +507,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-76-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -563,7 +563,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-76-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -732,7 +732,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-76-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -786,3 +786,68 @@ decision adds exactly the one route #58 needed.
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [API Surface](reference/api-surface.md#53-the-agents-own-router-port-not-a-gateway-endpoint).
+
+## ADR-038 — Auto-detected capabilities are three-state, outside the metrics lock, and sync onto the legacy vision bool
+**Context:** #49 sub-project 2 needed a persisted answer for "does this
+upstream take images/video/audio, and does its chat template support tool
+calls" — and two existing precedents on `model_mappings` point in opposite
+directions. `vision_capable` (migration 32) is a **bool**; among AUTOMATED
+writers it goes only through the **lock-respecting**
+`UpdateMappingVisionCapable`, which stamps `metrics_source = "vision"` like
+every other metric writer on the table — but the operator's own mapping-edit
+path bypasses the lock: the portal's mapping PUT (`Service.UpdateMapping`)
+writes it through the plain, unguarded `UpdateMapping`, stamping
+`metrics_source = "manual"` instead, exactly like every other operator-edited
+metric on the table.
+`live_progress_support` (migration 76, ADR before this one) is **three-state**
+(`""`/`supported`/`unsupported`), written through a dedicated writer that
+carries **no** `metrics_locked` guard and never touches `metrics_source` —
+because a build capability, unlike a throughput figure, is not a number an
+operator vouches for; pinning one could only ever produce a wrong answer, and
+a wrong capability fails silently rather than loudly. A bool cannot say "not
+probed": `vision_capable`'s zero value is indistinguishable from an observed
+"no," and the models list already ANDs it across every mapping serving a
+gateway model name, fail-closed by construction (a model starts `true` on
+first sight and is only ever ANDed down) — so a single never-probed mapping
+silently drags a model's whole vision flag to `false`, and the portal chat's
+image-attachment gate reads exactly that aggregate.
+**Decision:** new capabilities follow the `live_progress_support` precedent,
+not the `vision_capable` one. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools`
+(three-state) + `cap_extra` (open-vocabulary JSON array) + their own
+provenance pair (`capabilities_source`/`capabilities_checked_at`, migration
+77) live outside `metrics_locked`, written only where non-empty so a partial
+answer never clears a verdict another probe already established. The **one**
+place a capability *does* respect the lock is the compatibility surface, not
+the honest record: a **definitive** (`"yes"`/`"no"`) reported `cap_vision`
+verdict additionally calls the pre-existing, lock-guarded
+`UpdateMappingVisionCapable` — the same writer, the same
+`metrics_source = "vision"` stamp, the vision *benchmark* already uses — so an
+operator who has locked a mapping's metrics keeps that guarantee for the one
+bool actual consumers still read, exactly as they already expect for every
+other locked metric. The sync is driven by the reported verdict itself, not
+by whether the tri-state changed, so a bool the benchmark moved independently
+still converges on the next steady, unchanged probe result.
+**Consequence:** the honest record and the compatibility surface are
+deliberately separate columns answering to two different rules, rather than
+one column serving both badly. The chat image gate and the models list's
+AND-aggregate gain probe evidence — a llama.cpp-backed mapping's vision
+capability can now be established from its `/props` document alone, without
+ever running the benchmark — with no change to either consumer's own code,
+because both already read
+`vision_capable` through the same lock-respecting writer. `metrics_source` is
+not further overloaded with a third value to distinguish "the benchmark said
+so" from "the probe said so": both mean the same thing to a consumer of the
+bool, and the tri-state columns are where that distinction actually lives for
+anyone who needs it. vLLM and TGI remain uncovered by capability probing —
+neither one's reachable HTTP surface exposes a modality or tool-support
+field at all, which [Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)
+records with the specifics so the gap is not rediscovered — leaving the
+vision benchmark their only path to `vision_capable`, unchanged by this
+decision.
+→ [Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
+[Agent-Managed Model Runtime
+§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
+[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
+[API Surface](reference/api-surface.md#models-servers-applications-mappings).

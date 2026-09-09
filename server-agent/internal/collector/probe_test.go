@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -293,6 +295,98 @@ func TestDetectLiveProgressSupport(t *testing.T) {
 	}
 }
 
+// TestDetectCapabilities is the decision-rule test for #49 sub-project 2's
+// agent-side capability detector. These cases are DELIBERATELY the same as
+// gateway/backend/internal/provider/model_info_test.go's TestDetectCapabilities
+// table -- the two detectCapabilities copies (one per Go module) must decide
+// identically on identical input, and this shared table is what makes a
+// silent drift between them show up as a failing test on EITHER side instead
+// of going unnoticed.
+//
+// The two "an older server" cases are the load-bearing ones: a key absent
+// from a document, or a key absent from an otherwise-present nested object,
+// must decode to "" (unknown), never "no" -- an older build simply predates
+// that key and has not answered the question. If either starts asserting
+// "no", that regression has landed; fix detectCapabilities, not this test.
+func TestDetectCapabilities(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want Capabilities
+	}{
+		{
+			name: "full modalities and tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":true},
+			        "chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "yes", Tools: "yes"},
+		},
+		{
+			// An older server predates chat_template_caps (2026-01-22): tools
+			// is UNKNOWN, never "no" -- it was not asked.
+			name: "modalities without tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":false}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "no"},
+		},
+		{
+			// A key missing from a PRESENT modalities object is unknown too:
+			// an older server predates that key (audio 2025-05-23, video
+			// 2026-06-08).
+			name: "partial modalities object",
+			body: `{"modalities":{"vision":true}}`,
+			want: Capabilities{Vision: "yes"},
+		},
+		{
+			name: "tool caps without modalities",
+			body: `{"chat_template_caps":{"supports_tools":false}}`,
+			want: Capabilities{Tools: "no"},
+		},
+		{
+			// llama.cpp router mode answers /props with its OWN build's dummy
+			// (#55). Reading it as the child's evidence would be permanent
+			// under the no-rewrite discipline.
+			name: "router dummy yields nothing",
+			body: `{"role":"router","modalities":{"vision":true},"chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{},
+		},
+		{name: "not a props document", body: `{"data":[{"id":"m"}]}`, want: Capabilities{}},
+		{name: "invalid json", body: `{`, want: Capabilities{}},
+		{name: "null body", body: `null`, want: Capabilities{}},
+		{
+			name: "non-bool modality values are not evidence",
+			body: `{"modalities":{"vision":"yes","audio":1}}`,
+			want: Capabilities{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectCapabilities([]byte(tc.body))
+			if got.Vision != tc.want.Vision || got.Video != tc.want.Video ||
+				got.Audio != tc.want.Audio || got.Tools != tc.want.Tools {
+				t.Fatalf("detectCapabilities = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectCapabilitiesRouterGateMatchesLiveProgressGate pins the shared
+// router-dummy contract from this module's side: the two module copies must
+// not drift on the #55 gate, which detectLiveProgressSupport already
+// carries.
+//
+// Equality is via reflect.DeepEqual, not ==: Capabilities carries an Extra
+// []string field, which makes the struct non-comparable with == (the brief's
+// literal `got != (Capabilities{})` does not compile -- "struct containing
+// []string cannot be compared").
+func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
+	body := []byte(`{"role":"router","modalities":{"vision":true}}`)
+	if got := detectCapabilities(body); !reflect.DeepEqual(got, Capabilities{}) {
+		t.Fatalf("router dummy yielded %+v", got)
+	}
+	if got := detectLiveProgressSupport(body); got != "" {
+		t.Fatalf("sibling detector disagrees on the router gate: %q", got)
+	}
+}
+
 // TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this
 // probe GETs collector.LiveProgressProbePath ("/props") unconditionally,
 // with NO specType parameter at all -- unlike ProbeContext, it never
@@ -304,7 +398,8 @@ func TestDetectLiveProgressSupport(t *testing.T) {
 func TestProbeLiveProgressSupport_Supported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"timings_per_token":false}}}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "supported" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "supported")
 	}
@@ -319,7 +414,8 @@ func TestProbeLiveProgressSupport_Supported(t *testing.T) {
 func TestProbeLiveProgressSupport_Unsupported(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":{"n_ctx":8192,"params":{"n_predict":-1}}}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "unsupported" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q", got, "unsupported")
 	}
@@ -340,7 +436,8 @@ func TestProbeLiveProgressSupport_NotFound(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a 404", got, "")
 	}
@@ -390,7 +487,8 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+			verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+			got := verdicts.LiveProgress
 			if got != "" {
 				t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a %d", got, "", tc.status)
 			}
@@ -398,6 +496,67 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 				t.Errorf("ProbeLiveProgressSupport stable = %v, want %v -- %s", stable, tc.wantStable, tc.why)
 			}
 		})
+	}
+}
+
+// TestProbePropsVerdictsFetchesOnce is the entire point of widening the
+// probe (#49-2): one GET yields every verdict, so a llama_cpp child is not
+// asked for /props twice (once for live progress, once for capabilities) --
+// the hit counter is the assertion that matters.
+func TestProbePropsVerdictsFetchesOnce(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != LiveProgressProbePath {
+			t.Errorf("probed %q, want %q", r.URL.Path, LiveProgressProbePath)
+		}
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":false}},
+		                        "modalities":{"vision":true,"video":false,"audio":false},
+		                        "chat_template_caps":{"supports_tools":true}}`))
+	}))
+	defer srv.Close()
+
+	v, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+	if !stable {
+		t.Fatal("a parsed /props document must be stable")
+	}
+	if v.LiveProgress != "supported" {
+		t.Fatalf("LiveProgress = %q, want supported", v.LiveProgress)
+	}
+	if v.Caps.Vision != "yes" || v.Caps.Video != "no" || v.Caps.Tools != "yes" {
+		t.Fatalf("Caps = %+v", v.Caps)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("/props hits = %d, want exactly 1", got)
+	}
+}
+
+// TestProbePropsVerdictsKeepsTheConclusiveSet pins the conclusive/transient
+// contract as a regression anchor, restated here on the widened function:
+// ProbePropsVerdicts must keep ProbeLiveProgressSupport's exact conclusive
+// set ({404, 401, 403, 405}), transient/retry rule (status 0 and every other
+// non-2xx, notably 5xx), and stable-empty caching -- only the return payload
+// widened.
+func TestProbePropsVerdictsKeepsTheConclusiveSet(t *testing.T) {
+	for _, status := range []int{404, 401, 403, 405} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		v, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+		srv.Close()
+		if !stable {
+			t.Fatalf("status %d must be conclusive", status)
+		}
+		// reflect.DeepEqual, not ==: Capabilities carries an []string.
+		if v.LiveProgress != "" || !reflect.DeepEqual(v.Caps, Capabilities{}) {
+			t.Fatalf("status %d yielded verdicts: %+v", status, v)
+		}
+	}
+	for _, status := range []int{500, 503} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		_, stable := ProbePropsVerdicts(context.Background(), srv.Client(), srv.URL)
+		srv.Close()
+		if stable {
+			t.Fatalf("status %d must be transient", status)
+		}
 	}
 }
 
@@ -410,7 +569,8 @@ func TestProbeLiveProgressSupport_ConclusiveRefusals(t *testing.T) {
 func TestProbeLiveProgressSupport_OtherShape(t *testing.T) {
 	ts := newProbeServer(t, `{"object":"list","data":[{"id":"m1","max_model_len":4096}]}`)
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-/props shape", got, "")
 	}
@@ -439,7 +599,8 @@ func TestProbeLiveProgressSupport_TransientStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a non-2xx response, even one carrying a well-formed supported body", got, "")
 	}
@@ -459,7 +620,8 @@ func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
 	addr := ts.URL
 	ts.Close() // closed: nothing is listening on addr anymore
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), http.DefaultClient, addr)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), http.DefaultClient, addr)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for a refused connection", got, "")
 	}
@@ -475,7 +637,8 @@ func TestProbeLiveProgressSupport_ConnectionRefused(t *testing.T) {
 func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
 	ts := newProbeServer(t, `{"default_generation_settings":`) // truncated mid-object
 
-	got, stable := ProbeLiveProgressSupport(context.Background(), ts.Client(), ts.URL)
+	verdicts, stable := ProbePropsVerdicts(context.Background(), ts.Client(), ts.URL)
+	got := verdicts.LiveProgress
 	if got != "" {
 		t.Errorf("ProbeLiveProgressSupport verdict = %q, want %q (unknown) for unparseable JSON", got, "")
 	}

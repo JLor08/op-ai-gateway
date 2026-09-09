@@ -144,14 +144,36 @@ type RuntimeSample struct {
 	// LiveProgressSupport is the live-progress-capability verdict (issue #51,
 	// task 4): "supported", "unsupported", or "" (unknown -- not yet
 	// determined, or the child's /props endpoint never yielded a llama.cpp
-	// /props document). Filled by the agent's probeRuntimeChildLiveProgress
+	// /props document). Filled by the agent's probeRuntimeChildProps
 	// (internal/agent), independently of ContextProbe/ContextSize above -- a
 	// successful context probe never implies this was determined, and vice
 	// versa. Additive and byte-neutral: an older agent simply never
 	// populates it, and "" already means unknown to every consumer.
-	LiveProgressSupport string              `json:"live_progress_support"`
-	GPUs                []RuntimeGPUSample  `json:"gpus,omitempty"`
-	LastError           *RuntimeErrorSample `json:"last_error,omitempty"`
+	LiveProgressSupport string `json:"live_progress_support"`
+	// Capabilities is the auto-detected capability verdict set from the same
+	// /props document that yields LiveProgressSupport above (#49-2). A
+	// POINTER with omitempty, deliberately: nil distinguishes "this agent
+	// predates capability detection" from "detected, nothing determined"
+	// (an all-empty struct) -- a distinction the string fields above cannot
+	// make for themselves.
+	Capabilities *Capabilities       `json:"capabilities,omitempty"`
+	GPUs         []RuntimeGPUSample  `json:"gpus,omitempty"`
+	LastError    *RuntimeErrorSample `json:"last_error,omitempty"`
+}
+
+// Capabilities is RuntimeSample.Capabilities' payload: each verdict is
+// "" | "yes" | "no", and Extra carries capability names with no field of
+// their own (empty for a llama.cpp child; Ollama's open vocabulary fills it).
+// Named plainly (not "SampleCapabilities") to avoid the package/type-name
+// stutter revive flags -- mirroring the RuntimeSample.Host *Host precedent
+// above, and the collector package's own bare Capabilities type this one's
+// fields are copied from (agent.go's capabilitiesSample).
+type Capabilities struct {
+	Vision string   `json:"vision"`
+	Video  string   `json:"video"`
+	Audio  string   `json:"audio"`
+	Tools  string   `json:"tools"`
+	Extra  []string `json:"extra,omitempty"`
 }
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring

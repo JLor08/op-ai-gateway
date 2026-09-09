@@ -54,6 +54,16 @@ function makeRows(): GroupModelServerRow[] {
       // itself has no column for it, so '' (never determined) is a fine
       // minimal default for this fixture.
       live_progress_support: '',
+      // Task 6 (capability-autodetect-llamacpp): ModelServerRow gained these
+      // four required (persisted, not probe-gated) verdict fields plus
+      // capabilities_source; GroupServersSection itself has no column for
+      // them, so '' (never determined) is a fine minimal default for this
+      // fixture.
+      cap_vision: '',
+      cap_video: '',
+      cap_audio: '',
+      cap_tools: '',
+      capabilities_source: '',
       priority: 1,
     },
     {
@@ -80,6 +90,11 @@ function makeRows(): GroupModelServerRow[] {
       metrics_source: 'manual',
       metrics_updated_at: null,
       live_progress_support: '',
+      cap_vision: '',
+      cap_video: '',
+      cap_audio: '',
+      cap_tools: '',
+      capabilities_source: '',
       priority: 2,
     },
   ];

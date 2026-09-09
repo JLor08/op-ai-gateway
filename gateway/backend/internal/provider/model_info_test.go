@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"testing"
 )
 
@@ -38,6 +39,11 @@ func TestParseModelInfoProps(t *testing.T) {
 			`{"model":"m","default_generation_settings":{"n_ctx":100,"params":{"n_predict":-1}}}`,
 			[]ModelInfo{{Name: "m", ContextSize: 100, LiveProgressSupport: "unsupported"}},
 		},
+		{
+			"parseModelInfo plumbs the capability verdict set onto the returned entry (#49-2)",
+			`{"model":"m","default_generation_settings":{"n_ctx":100},"modalities":{"vision":true,"audio":false},"chat_template_caps":{"supports_tools":true}}`,
+			[]ModelInfo{{Name: "m", ContextSize: 100, Caps: Capabilities{Vision: "yes", Audio: "no", Tools: "yes"}}},
+		},
 	}
 	for _, tc := range cases {
 		got := parseModelInfo([]byte(tc.body))
@@ -45,7 +51,10 @@ func TestParseModelInfoProps(t *testing.T) {
 			t.Fatalf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 		for i := range got {
-			if got[i] != tc.want[i] {
+			// reflect.DeepEqual, not == : ModelInfo now carries a Capabilities
+			// field, which itself carries a []string (Extra), making both
+			// non-comparable with ==.
+			if !reflect.DeepEqual(got[i], tc.want[i]) {
 				t.Fatalf("%s: got %+v, want %+v", tc.name, got[i], tc.want[i])
 			}
 		}
@@ -96,6 +105,33 @@ func TestParseModelInfoNamelessBodyStillCarriesTheVerdict(t *testing.T) {
 	// entry only when there is something to report.
 	if got := parseModelInfo([]byte(`{"default_generation_settings":{"n_ctx":4096}}`)); got != nil {
 		t.Fatalf("parseModelInfo(no name, no verdict) = %+v, want nil", got)
+	}
+}
+
+// TestParseModelInfoNamelessBodyWithCapabilitiesOnlyStillCarriesThem is the
+// capability-detector's counterpart to
+// TestParseModelInfoNamelessBodyStillCarriesTheVerdict above: a body with NO
+// model/model_path AND no live-progress evidence at all (no
+// default_generation_settings.params object, so detectLiveProgressSupport
+// answers "" -- not merely "unsupported") but WITH modalities evidence must
+// still yield a nameless entry, because a capability is exactly the same kind
+// of server-BUILD property as the live-progress verdict is, and the widened
+// nameless-entry condition ("a determinable live-progress verdict OR any
+// determined capability") must fire on capabilities alone.
+func TestParseModelInfoNamelessBodyWithCapabilitiesOnlyStillCarriesThem(t *testing.T) {
+	const nameless = `{"modalities":{"vision":true}}`
+
+	got := parseModelInfo([]byte(nameless))
+	if len(got) != 1 {
+		t.Fatalf("parseModelInfo returned %d entries, want exactly 1 -- a nameless body still proves the build's capability", len(got))
+	}
+	want := ModelInfo{Caps: Capabilities{Vision: "yes"}}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Fatalf("got %+v, want %+v (no live-progress verdict, no name, no context size -- only the capability)", got[0], want)
+	}
+
+	if v := PickModelCapabilities(got, "some-model"); !reflect.DeepEqual(v, Capabilities{Vision: "yes"}) {
+		t.Fatalf("PickModelCapabilities = %+v, want {Vision: yes}", v)
 	}
 }
 
@@ -183,6 +219,94 @@ func TestParseModelInfoLiveProgressSupport(t *testing.T) {
 	}
 }
 
+// TestDetectCapabilities is the decision-rule test for #49 sub-project 2's
+// capability detector: each case pins the shared contract that Task 3 (the
+// collector's identical copy) and Task 5 (the store write-back) both depend
+// on. The two "an older server" cases are the load-bearing ones: a key
+// absent from a document, or a key absent from an otherwise-present nested
+// object, must decode to "" (unknown), never "no" -- an older build simply
+// predates that key and has not answered the question. If either of those
+// starts asserting "no", that regression has landed; fix detectCapabilities,
+// not this test.
+func TestDetectCapabilities(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want Capabilities
+	}{
+		{
+			name: "full modalities and tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":true},
+			        "chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "yes", Tools: "yes"},
+		},
+		{
+			// An older server predates chat_template_caps (2026-01-22): tools
+			// is UNKNOWN, never "no" -- it was not asked.
+			name: "modalities without tool caps",
+			body: `{"modalities":{"vision":true,"video":false,"audio":false}}`,
+			want: Capabilities{Vision: "yes", Video: "no", Audio: "no"},
+		},
+		{
+			// A key missing from a PRESENT modalities object is unknown too:
+			// an older server predates that key (audio 2025-05-23, video
+			// 2026-06-08).
+			name: "partial modalities object",
+			body: `{"modalities":{"vision":true}}`,
+			want: Capabilities{Vision: "yes"},
+		},
+		{
+			name: "tool caps without modalities",
+			body: `{"chat_template_caps":{"supports_tools":false}}`,
+			want: Capabilities{Tools: "no"},
+		},
+		{
+			// llama.cpp router mode answers /props with its OWN build's dummy
+			// (#55). Reading it as the child's evidence would be permanent
+			// under the no-rewrite discipline.
+			name: "router dummy yields nothing",
+			body: `{"role":"router","modalities":{"vision":true},"chat_template_caps":{"supports_tools":true}}`,
+			want: Capabilities{},
+		},
+		{name: "not a props document", body: `{"data":[{"id":"m"}]}`, want: Capabilities{}},
+		{name: "invalid json", body: `{`, want: Capabilities{}},
+		{name: "null body", body: `null`, want: Capabilities{}},
+		{
+			name: "non-bool modality values are not evidence",
+			body: `{"modalities":{"vision":"yes","audio":1}}`,
+			want: Capabilities{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectCapabilities([]byte(tc.body))
+			if got.Vision != tc.want.Vision || got.Video != tc.want.Video ||
+				got.Audio != tc.want.Audio || got.Tools != tc.want.Tools {
+				t.Fatalf("detectCapabilities = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectCapabilitiesRouterGateMatchesLiveProgressGate pins the shared
+// router-dummy contract from this module's side: the two module copies must
+// not drift on the #55 gate, which detectLiveProgressSupport already
+// carries.
+//
+// Equality is via reflect.DeepEqual, not ==: Capabilities carries an Extra
+// []string field, which makes the struct non-comparable with == (the brief's
+// literal `got != (Capabilities{})` does not compile -- "struct containing
+// []string cannot be compared").
+func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
+	body := []byte(`{"role":"router","modalities":{"vision":true}}`)
+	if got := detectCapabilities(body); !reflect.DeepEqual(got, Capabilities{}) {
+		t.Fatalf("router dummy yielded %+v", got)
+	}
+	if got := detectLiveProgressSupport(body); got != "" {
+		t.Fatalf("sibling detector disagrees on the router gate: %q", got)
+	}
+}
+
 func TestPickModelLiveProgressSupport(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -216,6 +340,46 @@ func TestPickModelLiveProgressSupport(t *testing.T) {
 	}
 }
 
+// TestPickModelCapabilities mirrors TestPickModelLiveProgressSupport's table
+// exactly, for PickModelCapabilities. Equality is via reflect.DeepEqual, not
+// ==: Capabilities carries a []string field (Extra), which is not comparable
+// with ==.
+func TestPickModelCapabilities(t *testing.T) {
+	cases := []struct {
+		name  string
+		infos []ModelInfo
+		model string
+		want  Capabilities
+	}{
+		{
+			"name-match wins even when a different info precedes",
+			[]ModelInfo{{Name: "other", Caps: Capabilities{Vision: "no"}}, {Name: "m", Caps: Capabilities{Vision: "yes"}}},
+			"m",
+			Capabilities{Vision: "yes"},
+		},
+		{
+			"first-non-empty fallback when no name matches (a per-model probe reporting a divergent name)",
+			[]ModelInfo{{Name: "some-basename", Caps: Capabilities{Tools: "yes"}}},
+			"m",
+			Capabilities{Tools: "yes"},
+		},
+		{
+			"skips entries with nothing determined",
+			[]ModelInfo{{Name: "m", Caps: Capabilities{}}, {Name: "x", Caps: Capabilities{Audio: "no"}}},
+			"m",
+			Capabilities{Audio: "no"},
+		},
+		{"empty -> zero value", nil, "m", Capabilities{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PickModelCapabilities(tc.infos, tc.model); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("PickModelCapabilities(%+v, %q) = %+v, want %+v", tc.infos, tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProbeModelInfoClient(t *testing.T) {
 	t.Run("GETs the probe path and parses props", func(t *testing.T) {
 		var gotPath string
@@ -235,7 +399,8 @@ func TestProbeModelInfoClient(t *testing.T) {
 			t.Fatalf("GET path = %q, want /props", gotPath)
 		}
 		want := ModelInfo{Name: "up", ContextSize: 131072}
-		if len(got) != 1 || got[0] != want {
+		// reflect.DeepEqual, not == : see TestParseModelInfoProps for why.
+		if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 			t.Fatalf("ProbeModelInfo = %+v, want [%+v]", got, want)
 		}
 	})

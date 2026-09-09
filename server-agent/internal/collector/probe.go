@@ -115,7 +115,7 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 }
 
 // fetchProbeBody is the common GET-and-read-body step shared by ProbeContext
-// and ProbeLiveProgressSupport: build baseURL+path, issue the request
+// and ProbePropsVerdicts: build baseURL+path, issue the request
 // through client (falling back to http.DefaultClient for a nil one, matching
 // ProbeContext's long-standing contract), and return the raw response body
 // on a 2xx status. It never interprets the bytes -- each caller applies its
@@ -124,11 +124,11 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 // The returned status is the HTTP status code actually received, or 0 if no
 // response was ever received at all (a transport-level failure: connection
 // refused, timeout, DNS failure, ...). ProbeContext ignores it -- its error
-// handling and caching policy are unchanged by this. ProbeLiveProgressSupport
+// handling and caching policy are unchanged by this. ProbePropsVerdicts
 // uses it to tell a transient failure (status 0, or a non-2xx status that
 // says nothing final -- a 5xx above all) from a CONCLUSIVE refusal (404,
-// 401, 403, 405) when deciding whether an undetermined verdict is safe to
-// cache; see its own comment for why exactly those four are conclusive.
+// 401, 403, 405) when deciding whether an undetermined verdict set is safe
+// to cache; see its own comment for why exactly those four are conclusive.
 func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -153,22 +153,42 @@ func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path stri
 }
 
 // LiveProgressProbePath is the fixed path GETted for the live-progress-
-// capability verdict (issue #51, task 4). Unlike contextPath above, this
-// path is NOT type-derived and NOT overridable: routing.DeriveProbePaths
-// gives a "custom"-typed spec no context path at all, so a custom-typed
-// child (DetectRuntimeSpecType's fallback, or an explicit operator choice)
-// would otherwise never be probed here -- exactly the case this detector
-// exists to recover. The agent's probeRuntimeChildLiveProgress (agent.go)
-// GETs this path unconditionally for every StateRunning child with a live
-// port, regardless of st.Type or st.ContextProbePath.
+// capability verdict (issue #51, task 4) and, since #49-2, every other
+// /props-derived capability verdict too -- ProbePropsVerdicts fetches this
+// path exactly once and derives all of them from that same document. Unlike
+// contextPath above, this path is NOT type-derived and NOT overridable:
+// routing.DeriveProbePaths gives a "custom"-typed spec no context path at
+// all, so a custom-typed child (DetectRuntimeSpecType's fallback, or an
+// explicit operator choice) would otherwise never be probed here -- exactly
+// the case this detector exists to recover. The agent's probeRuntimeChildProps
+// (agent.go) GETs this path unconditionally for every StateRunning child with
+// a live port, regardless of st.Type or st.ContextProbePath.
 const LiveProgressProbePath = "/props"
 
-// ProbeLiveProgressSupport GETs baseURL+LiveProgressProbePath and returns
-// the live-progress-capability verdict for whatever answered: "supported",
-// "unsupported", or "" (unknown -- the body is not a llama.cpp /props
-// document at all). It reuses fetchProbeBody, the exact GET-and-read-body
-// step ProbeContext uses, then hands the raw bytes to
-// detectLiveProgressSupport for the actual evidence rule.
+// PropsVerdicts is everything one /props document tells us. Widened from a
+// single live-progress verdict (#51) so that a llama_cpp child is fetched
+// ONCE per cache miss rather than once per verdict kind (#49-2): the context
+// probe already GETs /props separately, and a third GET for capabilities
+// would have made three requests per cycle for the same document.
+type PropsVerdicts struct {
+	// LiveProgress is the unchanged #51 verdict: "supported" | "unsupported"
+	// | "" (unknown).
+	LiveProgress string
+	// Caps is the capability verdict set from the same document (#49-2).
+	Caps Capabilities
+}
+
+// ProbePropsVerdicts GETs baseURL+LiveProgressProbePath and returns every
+// verdict that one /props document yields, together in a PropsVerdicts: the
+// live-progress-capability verdict -- "supported", "unsupported", or ""
+// (unknown -- the body is not a llama.cpp /props document at all) -- and the
+// capability verdict set from the identical bytes. It reuses fetchProbeBody,
+// the exact GET-and-read-body step ProbeContext uses, then hands the raw
+// bytes to detectLiveProgressSupport and detectCapabilities for their own
+// evidence rules -- ONE fetch, both verdict kinds, which is the entire point
+// of this function (see PropsVerdicts' doc comment): a llama_cpp child used
+// to be fetched once per verdict kind, and is now fetched once per cache
+// miss regardless of how many kinds of verdict the document yields.
 //
 // This is a SIBLING of ProbeContext, not a case folded into it:
 // ProbeContext is hard-typed to (int, error) and every extractor beneath it
@@ -178,9 +198,9 @@ const LiveProgressProbePath = "/props"
 // this a separate function is the deliberate shape choice.
 //
 // The second return, stable, tells the caller whether this outcome
-// (including a "" one) is safe to cache and stop asking about, or must be
-// retried next cycle. This is a resource-usage fix: without it, a
-// non-llama.cpp child would have its /props endpoint hit every single
+// (including a zero-value PropsVerdicts{}) is safe to cache and stop asking
+// about, or must be retried next cycle. This is a resource-usage fix: without
+// it, a non-llama.cpp child would have its /props endpoint hit every single
 // collect cycle for its entire lifetime, because "" was never cached at all.
 // The split is about WHY no verdict could be determined, not about the
 // verdict's value:
@@ -204,7 +224,13 @@ const LiveProgressProbePath = "/props"
 // A caller that collapses this into one branch either reintroduces the
 // permanent per-cycle /props traffic (by never caching) or permanently
 // misses a verdict for a slow-starting child (by caching everything).
-func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL string) (verdict string, stable bool) {
+//
+// Caps rides the exact same fetch and the exact same stable/transient split
+// as LiveProgress: it is derived from the identical document, so there is no
+// separate cache-ability question to answer for it (#49-2) -- a caller never
+// needs to ask "was Caps determined?" independently of "was LiveProgress
+// determined?"; the single stable return answers both at once.
+func ProbePropsVerdicts(ctx context.Context, client *http.Client, baseURL string) (verdicts PropsVerdicts, stable bool) {
 	body, status, err := fetchProbeBody(ctx, client, baseURL, LiveProgressProbePath)
 	if err != nil {
 		// No conclusive body in hand -- but SOME statuses are still a
@@ -238,14 +264,17 @@ func ProbeLiveProgressSupport(ctx context.Context, client *http.Client, baseURL 
 			status == http.StatusUnauthorized ||
 			status == http.StatusForbidden ||
 			status == http.StatusMethodNotAllowed
-		return "", stable
+		return PropsVerdicts{}, stable
 	}
 	if !json.Valid(body) {
 		// Syntactically invalid/truncated JSON reads as a child still
 		// mid-response, not a conclusive answer -- do not cache it.
-		return "", false
+		return PropsVerdicts{}, false
 	}
-	return detectLiveProgressSupport(body), true
+	return PropsVerdicts{
+		LiveProgress: detectLiveProgressSupport(body),
+		Caps:         detectCapabilities(body),
+	}, true
 }
 
 // detectLiveProgressSupport is the agent-side half of the live-progress-
@@ -311,6 +340,85 @@ func detectLiveProgressSupport(body []byte) string {
 		return "supported"
 	}
 	return "unsupported"
+}
+
+// Capabilities is the capability verdict set one probe document yields. Every
+// field is "" (this document said nothing about it) | "yes" | "no". The zero
+// value means "nothing determined", and no field may be written to storage
+// when it is "" -- see routing.CapabilityVerdicts.
+type Capabilities struct {
+	Vision string
+	Video  string
+	Audio  string
+	Tools  string
+	Extra  []string
+}
+
+// detectCapabilities is the capability detector for a llama.cpp /props
+// document (#49 sub-project 2). It reads two objects and nothing else:
+//
+//   - modalities{vision,video,audio}: the server's own per-modality input
+//     support. A key PRESENT as a bool answers yes/no; a key ABSENT from an
+//     otherwise present modalities object stays "" -- an older build simply
+//     predates it (audio landed 2025-05-23, video 2026-06-08), and absence is
+//     not a denial.
+//   - chat_template_caps.supports_tools: whether the model's chat template
+//     NATIVELY supports tool calls. It is not a claim that tool calls work:
+//     with --jinja (llama.cpp's default since 2025-11-27) tools are accepted
+//     for every model through a generic handler, so "no" here means degraded
+//     prompt quality, not a rejected request. The whole object is absent on
+//     servers older than 2026-01-22, which is "" -- not "no".
+//
+// A caveat that must travel with cap_video wherever it is shown: upstream's
+// modalities.video is true when the BINARY was built with video support AND
+// the model has a vision encoder (mtmd_helper_support_video returns
+// mtmd_support_vision under #ifdef MTMD_VIDEO). It is a build-plus-vision
+// fact, not "this model understands video".
+//
+// The router gate is the same one detectLiveProgressSupport carries and for
+// the same reason (#55): llama.cpp's ROUTER mode answers /props with a dummy
+// describing the ROUTER's build, not the child's. A wrong verdict read from
+// it would be permanent and self-reinforcing, because every later probe
+// returns the same dummy and the no-rewrite guard then keeps it.
+//
+// This is a DUPLICATE, on purpose, of detectCapabilities in
+// gateway/backend/internal/provider/model_info.go -- the two are separate Go
+// modules and cannot share code, mirroring the "DUPLICATED locally on
+// purpose" precedent at gateway/backend/internal/provider/memory_probe.go:111.
+// Whoever changes this rule must change that copy identically, or the two
+// halves of this feature will drift. A reviewer finding them divergent is a
+// real finding; finding them duplicated is expected.
+func detectCapabilities(body []byte) Capabilities {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return Capabilities{}
+	}
+	if role, ok := obj["role"].(string); ok && role == "router" {
+		return Capabilities{}
+	}
+	out := Capabilities{}
+	if mods, ok := obj["modalities"].(map[string]any); ok {
+		out.Vision = capVerdict(mods["vision"])
+		out.Video = capVerdict(mods["video"])
+		out.Audio = capVerdict(mods["audio"])
+	}
+	if caps, ok := obj["chat_template_caps"].(map[string]any); ok {
+		out.Tools = capVerdict(caps["supports_tools"])
+	}
+	return out
+}
+
+// capVerdict maps a JSON bool to "yes"/"no" and everything else -- absent,
+// null, a string, a number -- to "" (not evidence).
+func capVerdict(v any) string {
+	b, ok := v.(bool)
+	if !ok {
+		return ""
+	}
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 // extractContext dispatches to the per-specType extraction rule.

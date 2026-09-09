@@ -1110,6 +1110,25 @@ const de = {
   // Diagnostic text only -- see live_progress_checked_at's own doc-comment
   // (api/models.ts): no rendering decision may branch on this value.
   modelServerLiveProgressCheckedAt: (when: string) => `Geprüft am ${when}.`,
+  // Task 6 (capability-autodetect-llamacpp): the auto-detected capability
+  // chips column, beside Live-Fortschritt -- see ModelServersSection.tsx's
+  // capabilityChips for the fixed chip order and why a `no` verdict renders
+  // no chip at all, and capabilitiesTooltip for the provenance/checked-at/
+  // caveat text folded into the tooltip.
+  modelServerColCapabilities: 'Fähigkeiten',
+  capabilityVision: 'Vision',
+  capabilityVideo: 'Video',
+  capabilityAudio: 'Audio',
+  capabilityTools: 'Tools',
+  // The two upstream caveats an operator must know before acting on a
+  // capability chip: Video is a build-plus-vision-encoder fact, not "the
+  // model understands video"; Tools is "the chat template natively supports
+  // tool calls", not "tool calls fail without it" (llama.cpp's default
+  // --jinja handler accepts tools for every model).
+  modelServerCapabilitiesTooltip:
+    'Video bedeutet: Das Binary wurde mit Video-Unterstützung gebaut UND das Modell hat einen Vision-Encoder — nicht, dass das Modell Video versteht. Tools bedeutet: Die Chat-Vorlage unterstützt Tool-Aufrufe nativ — nicht, dass Tool-Aufrufe sonst fehlschlagen (llama.cpp akzeptiert mit --jinja Tools für jedes Modell).',
+  modelServerCapabilitiesSource: (source: string) => `Quelle: ${source}.`,
+  modelServerCapabilitiesCheckedAt: (when: string) => `Geprüft am ${when}.`,
   groupServersIntro: 'Modelle und Server, die diese Gruppe bedienen kann (Live-Priorität).',
   modelServerNotLoaded: 'Nicht geladen',
   // The merged Status column's "currently loading" state (runtime state
@@ -3313,6 +3332,15 @@ const en: PortalMessages = {
   modelServerLiveProgressTooltipUnsupported:
     "This build does not support the request's live-progress parameters — its request schema has no such field, so the live figure is unavailable.",
   modelServerLiveProgressCheckedAt: (when: string) => `Checked at ${when}.`,
+  modelServerColCapabilities: 'Capabilities',
+  capabilityVision: 'Vision',
+  capabilityVideo: 'Video',
+  capabilityAudio: 'Audio',
+  capabilityTools: 'Tools',
+  modelServerCapabilitiesTooltip:
+    'Video means the binary was built with video support AND the model has a vision encoder — not that the model understands video. Tools means the chat template natively supports tool calls — not that tool calls fail without it (llama.cpp with --jinja accepts tools for every model).',
+  modelServerCapabilitiesSource: (source: string) => `Source: ${source}.`,
+  modelServerCapabilitiesCheckedAt: (when: string) => `Checked at ${when}.`,
   groupServersIntro: 'Models and servers this group can serve (live priority).',
   modelServerNotLoaded: 'Not loaded',
   modelServerLoading: 'Loading',

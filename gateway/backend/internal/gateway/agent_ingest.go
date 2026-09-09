@@ -147,6 +147,25 @@ type agentRuntimeError struct {
 	StderrTail string    `json:"stderr_tail,omitempty"`
 }
 
+// agentRuntimeCapabilitiesSample is the gateway-side mirror of the agent's
+// sample.Capabilities wire payload (server-agent/internal/sample), one
+// managed child's auto-detected capability verdict set (#49 sub-project 2).
+// Field-for-field and JSON-tag-for-JSON-tag identical to the agent's type,
+// but its OWN type: the gateway and server-agent are separate Go modules and
+// cannot share code, mirroring routing.CapabilityVerdicts already doing the
+// same on the store side. Every verdict is "" (this probe determined nothing
+// about it) | "yes" | "no"; Extra carries capability names the upstream
+// reported with no field of their own here -- empty for a llama.cpp child,
+// forward-compatible with the open vocabulary a future probe (e.g. Ollama)
+// might fill.
+type agentRuntimeCapabilitiesSample struct {
+	Vision string   `json:"vision"`
+	Video  string   `json:"video"`
+	Audio  string   `json:"audio"`
+	Tools  string   `json:"tools"`
+	Extra  []string `json:"extra,omitempty"`
+}
+
 // agentRuntimeSample is one agent-managed model process's live state inside
 // the telemetry sample (agent-runtime-manager Task 9, design spec §7/§9):
 // state machine phase, OS-level identifiers, in-flight/restart counters, and
@@ -180,9 +199,21 @@ type agentRuntimeSample struct {
 	// probeRuntimeChildLiveProgress), so it is additive and byte-neutral for
 	// an older agent: the field is simply absent, decoding to "". See
 	// writeBackRuntimeLiveProgress for the gateway-side write-back.
-	LiveProgressSupport string                  `json:"live_progress_support"`
-	GPUs                []agentRuntimeGPUSample `json:"gpus,omitempty"`
-	LastError           *agentRuntimeError      `json:"last_error,omitempty"`
+	LiveProgressSupport string `json:"live_progress_support"`
+	// Capabilities is this child's auto-detected capability verdict set (#49
+	// sub-project 2), from the SAME /props probe pass that fills
+	// LiveProgressSupport above (server-agent's probeRuntimeChildProps). A
+	// POINTER, mirroring the agent's own sample.RuntimeSample.Capabilities
+	// *sample.Capabilities field byte-for-byte on the wire: nil distinguishes
+	// "this agent predates capability detection" (an older build -- nothing
+	// to say) from a non-nil, all-empty value ("detection ran, nothing
+	// determined") -- two different facts that both mean no write, but for
+	// different reasons, which is exactly why this field is a pointer rather
+	// than a bare struct. See writeBackRuntimeCapabilities for the
+	// gateway-side write-back.
+	Capabilities *agentRuntimeCapabilitiesSample `json:"capabilities,omitempty"`
+	GPUs         []agentRuntimeGPUSample         `json:"gpus,omitempty"`
+	LastError    *agentRuntimeError              `json:"last_error,omitempty"`
 }
 
 // maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
@@ -811,6 +842,320 @@ func (s *Server) writeBackRuntimeLiveProgress(ctx context.Context, serverID stri
 	}
 }
 
+// resolveRuntimeSpecCapabilities reports whether specID's owning mapping may
+// have its auto-detected capability verdicts written back for THIS sample,
+// reached from server serverID -- the capability write-back's sibling to
+// resolveRuntimeSpecLiveProgress above, resolving the SAME ownership chain
+// (RuntimeSpecByID -> MappingByID -> ApplicationByID -> application.ServerID)
+// for the SAME reason: spec_id is an agent-supplied body field with no other
+// verification anywhere in this path, and an agent authenticated for server A
+// must never be able to name a spec_id belonging to server B and overwrite
+// B's mapping capability verdicts.
+//
+// Deliberately does NOT check mapping.MetricsLocked, for the same reason
+// resolveRuntimeSpecLiveProgress does not: UpdateMappingCapabilities itself
+// carries no metrics_locked guard in its SQL -- a capability is not a metric
+// an operator pins numbers against. The one exception, the vision_capable
+// sync, is handled by the caller through the separately lock-guarded
+// UpdateMappingVisionCapable -- see writeBackRuntimeCapabilities' doc.
+//
+// On success returns the mapping id and its CURRENTLY STORED
+// CapVision/CapVideo/CapAudio/CapTools/CapExtra and VisionCapable (for the
+// caller's change-detection), true. Any failure to resolve -- a lookup
+// error, a spec/mapping/application that no longer exists, or a cross-server
+// mismatch -- returns ("", "", "", "", "", "", false, false); a cross-server
+// mismatch is logged at Warn (not Debug), matching
+// resolveRuntimeSpecLiveProgress's audit-trail discipline for the same
+// reason: an agent naming another server's resources is a signal worth
+// keeping, not a merely stale id.
+func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, specID string) (mappingID string, storedVision, storedVideo, storedAudio, storedTools, storedExtra string, storedVisionCapable bool, ok bool) {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	if err != nil {
+		slog.Debug("runtime capabilities write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return "", "", "", "", "", "", false, false
+	}
+	if !ok {
+		// The spec has since been deleted (or never existed); nothing to
+		// write the reported capabilities back to. Not an error.
+		return "", "", "", "", "", "", false, false
+	}
+	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
+	if err != nil {
+		slog.Debug("runtime capabilities write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return "", "", "", "", "", "", false, false
+	}
+	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		slog.Debug("runtime capabilities write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return "", "", "", "", "", "", false, false
+	}
+	if app.ServerID != serverID {
+		slog.Warn("capabilities write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return "", "", "", "", "", "", false, false
+	}
+	return mapping.ID, mapping.CapVision, mapping.CapVideo, mapping.CapAudio, mapping.CapTools, mapping.CapExtra, mapping.VisionCapable, true
+}
+
+// writeBackRuntimeCapabilities persists each managed child's auto-detected
+// capability verdicts onto its owning mapping (#49 sub-project 2).
+//
+// Structurally identical to writeBackRuntimeLiveProgress above -- read its
+// doc for the reasoning behind every guard here: the runtimes cap, ownership
+// memoized per DISTINCT spec_id with the cross-server rejection,
+// compare-to-stored so an unchanged verdict is never rewritten, best-effort
+// so a write failure never rejects the telemetry sample, and no
+// metrics_locked check (a capability is not a pinned metric).
+//
+// Two differences worth stating, because both are deliberate:
+//
+//   - A nil Capabilities (an agent predating capability detection) and an
+//     all-empty one (detection ran, nothing determined) are both "no write" --
+//     but they are different facts, which is why the wire field is a pointer.
+//   - A DEFINITIVE vision verdict additionally syncs onto the mapping's
+//     vision_capable bool, through UpdateMappingVisionCapable and therefore
+//     through its `and metrics_locked = 0` guard. That is not an
+//     inconsistency with the lock-free write above: cap_vision is the honest
+//     three-state record, while vision_capable is the compatibility surface
+//     the models list and the portal chat's image gate already read, and an
+//     operator who locked a mapping's metrics has pinned exactly that kind of
+//     consumer-visible answer. "" syncs nothing -- unknown is not a clear.
+//     Because vision_capable is a derived surface, this function is not its
+//     only writer: the vision benchmark moves the same bool through the same
+//     locked writer on its own schedule (see benchmark_runner.go's
+//     UpdateMappingVisionCapable call) and can desync it from cap_vision --
+//     including pinning a wrong, definitive false from a transient upstream
+//     failure. So the sync below is driven by THIS sample's reported verdict,
+//     not by whether cap_vision itself changed, and it runs even when every
+//     tri-state verdict is already on file: a steady, unchanged probe result
+//     must still be able to converge a bool another writer moved out from
+//     under it, not only the one sample that first changes cap_vision.
+//
+// The five per-verdict "reported AND differs from stored" comparisons live
+// in changedCapabilityVerdicts below; the vision sync itself lives in
+// syncVisionCapable below -- both carry their own focused doc, but this
+// comment stays the source of truth for WHY each behaves as it does.
+func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	now := time.Now().UTC()
+	// resolved memoizes the ownership resolution per DISTINCT spec_id, and is
+	// carried across the loop so a spec_id repeated inside ONE sample sees
+	// what the earlier iteration already wrote -- see capabilityResolution.
+	resolved := make(map[string]capabilityResolution, len(runtimes))
+	for _, rt := range runtimes {
+		s.writeBackOneRuntimeCapabilities(ctx, serverID, rt, resolved, now)
+	}
+}
+
+// writeBackOneRuntimeCapabilities is one runtime sample's half of
+// writeBackRuntimeCapabilities: the triage, the memoized ownership
+// resolution, the vision sync, and the write. Split out so the loop above
+// reads as what it is -- "do this per runtime" -- and so each guard here
+// sits at one nesting level instead of three.
+func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID string, rt agentRuntimeSample, resolved map[string]capabilityResolution, now time.Time) {
+	specID := strings.TrimSpace(rt.SpecID)
+	if specID == "" || rt.Capabilities == nil {
+		// No wire object at all -- an older agent that predates capability
+		// detection has nothing to say. Distinct from an all-empty object
+		// below, but both mean no write; see writeBackRuntimeCapabilities.
+		return
+	}
+	vision := strings.TrimSpace(rt.Capabilities.Vision)
+	video := strings.TrimSpace(rt.Capabilities.Video)
+	audio := strings.TrimSpace(rt.Capabilities.Audio)
+	tools := strings.TrimSpace(rt.Capabilities.Tools)
+	if noCapabilityEvidence(vision, video, audio, tools, rt.Capabilities.Extra) {
+		// Detection ran and determined nothing -- also no write, but for a
+		// different reason than nil above.
+		return
+	}
+	r, ok := s.resolvedCapabilities(ctx, serverID, specID, resolved)
+	if !ok {
+		return
+	}
+	caps := changedCapabilityVerdicts(vision, video, audio, tools, rt.Capabilities.Extra, r.stored())
+
+	// Vision sync: driven by `vision`, THIS sample's reported verdict -- not
+	// by caps.Vision, which is non-empty only when the tri-state itself
+	// changed. Deliberately runs before the no-write-amplification return
+	// below, and before the capabilities write it guards: see
+	// writeBackRuntimeCapabilities' doc for why vision_capable needs to
+	// converge on every definitive sample, not just the one that changes
+	// cap_vision.
+	r.storedVisionCapable = s.syncVisionCapable(ctx, serverID, specID, r.mappingID, vision, r.storedVisionCapable, now)
+	resolved[specID] = r
+
+	if noCapabilityEvidence(caps.Vision, caps.Video, caps.Audio, caps.Tools, caps.Extra) {
+		return // every verdict already on file -- no write amplification
+	}
+	if err := s.Routes.UpdateMappingCapabilities(ctx, r.mappingID, caps, now); err != nil {
+		slog.Debug("runtime capabilities write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
+		return
+	}
+	r.applyWritten(caps)
+	resolved[specID] = r
+}
+
+// resolvedCapabilities returns specID's memoized ownership resolution,
+// resolving it on first sight. The bool is the resolution's own ok: false
+// means the spec is unknown or owned by a DIFFERENT server (rejected with a
+// Warn inside resolveRuntimeSpecCapabilities), and the caller must not write.
+// A rejected resolution is memoized too, so a repeated spec_id costs one
+// lookup per sample, not one per occurrence.
+func (s *Server) resolvedCapabilities(ctx context.Context, serverID, specID string, resolved map[string]capabilityResolution) (capabilityResolution, bool) {
+	if r, seen := resolved[specID]; seen {
+		return r, r.ok
+	}
+	mappingID, storedVision, storedVideo, storedAudio, storedTools, storedExtra, storedVisionCapable, ok := s.resolveRuntimeSpecCapabilities(ctx, serverID, specID)
+	r := capabilityResolution{
+		mappingID:           mappingID,
+		storedVision:        storedVision,
+		storedVideo:         storedVideo,
+		storedAudio:         storedAudio,
+		storedTools:         storedTools,
+		storedExtra:         storedExtra,
+		storedVisionCapable: storedVisionCapable,
+		ok:                  ok,
+	}
+	resolved[specID] = r
+	return r, ok
+}
+
+// capabilityResolution is one spec_id's resolved mapping plus the capability
+// state currently STORED on it -- the baseline every comparison in this file
+// is made against, memoized per distinct spec_id for one sample.
+type capabilityResolution struct {
+	mappingID           string
+	storedVision        string
+	storedVideo         string
+	storedAudio         string
+	storedTools         string
+	storedExtra         string
+	storedVisionCapable bool
+	ok                  bool
+}
+
+// stored projects the resolution onto the comparison baseline
+// changedCapabilityVerdicts takes.
+func (r capabilityResolution) stored() storedCapabilityVerdicts {
+	return storedCapabilityVerdicts{
+		Vision: r.storedVision,
+		Video:  r.storedVideo,
+		Audio:  r.storedAudio,
+		Tools:  r.storedTools,
+		Extra:  r.storedExtra,
+	}
+}
+
+// applyWritten folds a just-written verdict set back into the memo, so the
+// rest of THIS sample compares against what is now on file: a malformed
+// payload naming the same spec_id twice must not write twice. Only non-empty
+// verdicts were written, so only those are folded in.
+func (r *capabilityResolution) applyWritten(caps routing.CapabilityVerdicts) {
+	if caps.Vision != "" {
+		r.storedVision = caps.Vision
+	}
+	if caps.Video != "" {
+		r.storedVideo = caps.Video
+	}
+	if caps.Audio != "" {
+		r.storedAudio = caps.Audio
+	}
+	if caps.Tools != "" {
+		r.storedTools = caps.Tools
+	}
+	if len(caps.Extra) > 0 {
+		if encoded, err := json.Marshal(caps.Extra); err == nil {
+			r.storedExtra = string(encoded)
+		}
+	}
+}
+
+// storedCapabilityVerdicts is the subset of a mapping's currently-stored
+// capability state changedCapabilityVerdicts compares a reported sample
+// against: the four tri-state columns verbatim, plus Extra already in its
+// stored, JSON-encoded form (mapping.CapExtra's own representation), so the
+// comparison below can re-encode the reported slice and compare strings.
+type storedCapabilityVerdicts struct {
+	Vision, Video, Audio, Tools, Extra string
+}
+
+// changedCapabilityVerdicts returns the routing.CapabilityVerdicts holding
+// only the reported verdicts that are non-empty AND differ from stored --
+// the five independent comparisons writeBackRuntimeCapabilities used to
+// spell out inline, one per capability, now named and table-testable on
+// their own. Pure: no I/O, no store access.
+//
+// cmd/gateway/app_health.go's applyCapabilityWrite has the identical shape
+// duplicated across the internal/gateway <-> main package boundary --
+// internal/gateway cannot import cmd/gateway (main) and a shared package is
+// not worth inventing for a helper this small, so this is a narrow,
+// deliberately duplicated helper, not a shared one; see that file's
+// diffCapabilityVerdicts for its sibling.
+func changedCapabilityVerdicts(vision, video, audio, tools string, extra []string, stored storedCapabilityVerdicts) routing.CapabilityVerdicts {
+	caps := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
+	if vision != "" && vision != stored.Vision {
+		caps.Vision = vision
+	}
+	if video != "" && video != stored.Video {
+		caps.Video = video
+	}
+	if audio != "" && audio != stored.Audio {
+		caps.Audio = audio
+	}
+	if tools != "" && tools != stored.Tools {
+		caps.Tools = tools
+	}
+	if len(extra) > 0 {
+		if encoded, err := json.Marshal(extra); err == nil && string(encoded) != stored.Extra {
+			caps.Extra = extra
+		}
+	}
+	return caps
+}
+
+// noCapabilityEvidence reports whether vision/video/audio/tools/extra carry
+// no verdict at all. writeBackRuntimeCapabilities uses it twice: once on a
+// sample's raw reported fields (detection ran and determined nothing -- see
+// its doc for how that differs from a nil Capabilities), and once on a
+// changedCapabilityVerdicts result (every verdict already on file, so
+// writing would only amplify).
+func noCapabilityEvidence(vision, video, audio, tools string, extra []string) bool {
+	return vision == "" && video == "" && audio == "" && tools == "" && len(extra) == 0
+}
+
+// syncVisionCapable is writeBackRuntimeCapabilities' vision-sync step,
+// extracted so the convergence property stands on its own -- see
+// writeBackRuntimeCapabilities' doc for the full reasoning (cap_vision vs.
+// vision_capable, and why this runs off the REPORTED verdict rather than
+// whatever changedCapabilityVerdicts ended up returning). reported is THIS
+// sample's cap_vision verdict ("" | "yes" | "no"); storedVisionCapable is
+// the mapping's currently-stored vision_capable. A "" reported verdict never
+// syncs (unknown is not a clear), and an already-matching stored bool is
+// never rewritten -- both mirrored from the original inline guard. A write
+// failure is logged at Debug and never surfaced, matching this write-back's
+// best-effort discipline. Returns the bool now on file: storedVisionCapable
+// unchanged when nothing was written or the write failed, so the caller can
+// fold the result straight back into its per-sample memo.
+func (s *Server) syncVisionCapable(ctx context.Context, serverID, specID, mappingID, reported string, storedVisionCapable bool, at time.Time) bool {
+	if reported == "" {
+		return storedVisionCapable
+	}
+	want := reported == "yes"
+	if want == storedVisionCapable {
+		return storedVisionCapable
+	}
+	if err := s.Routes.UpdateMappingVisionCapable(ctx, mappingID, want, at); err != nil {
+		slog.Debug("vision-capable sync failed", "server_id", serverID, "spec_id", specID, "mapping_id", mappingID, "err", err)
+		return storedVisionCapable
+	}
+	return want
+}
+
 // ProxyRouteSample is the gateway-side mirror of the agent's
 // sample.ProxyRouteSample wire type — no certificate material and no upstream
 // address, just the listen port, whether TLS is currently active on it, and
@@ -1169,6 +1514,15 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		// metric. Never rejects the sample; a failure here is logged and
 		// dropped.
 		s.writeBackRuntimeLiveProgress(ctx, serverID, req.Runtimes)
+		// Best-effort write-back of each managed process's auto-detected
+		// capability verdicts onto its owning mapping (#49 sub-project 2) --
+		// see writeBackRuntimeCapabilities. Shares writeBackRuntimeContext
+		// and writeBackRuntimeLiveProgress's gate immediately above for the
+		// same reason: the verdicts ride the SAME per-runtime probe pass that
+		// produces context_size and live_progress_support, so they share
+		// that pass's trust boundary. Never rejects the sample; a failure
+		// here is logged and dropped.
+		s.writeBackRuntimeCapabilities(ctx, serverID, req.Runtimes)
 	}
 	s.maybeFireReactivation(ctx, server)
 	return nil

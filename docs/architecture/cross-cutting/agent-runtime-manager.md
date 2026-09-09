@@ -2836,10 +2836,12 @@ mirror). Three different cadences share the one collect cycle:
   different model or config — short-circuits every cycle after the first
   success. A *failed* probe is never cached, so a child whose HTTP server is
   still warming up is retried next cycle rather than sticking at `0` forever.
-- **A fourth field, `LiveProgressSupport`, is probed the same way but on its
-  own fixed path and its own caching rule** (`probeRuntimeChildLiveProgress`,
-  timings-capability-detection Task 4; the decision this feeds is [Telemetry,
-  Usage Analytics &
+- **A fourth field, `LiveProgressSupport`, and a fifth, `Capabilities`, ride
+  the same fixed path and the same caching rule, from the same single fetch**
+  (`probeRuntimeChildProps` — renamed from the narrower
+  `probeRuntimeChildLiveProgress` when capability auto-detection (#49
+  sub-project 2) widened it; the decisions these feed are [Telemetry, Usage
+  Analytics &
   Observability §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
   Unlike `ContextProbePath` above, this probe is **not** derived from `Type`
   and does not depend on it at all: it always GETs the fixed path `/props`
@@ -2848,24 +2850,31 @@ mirror). Three different cadences share the one collect cycle:
   gives a `custom`-typed spec no context path at all
   ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), so a
   *type-based* rule would never probe a `custom`-typed llama.cpp child for
-  this capability, which is exactly the case this unconditional probe exists
-  to recover: one extra loopback GET per child lifetime once a verdict is
-  cached, on a path that is a package constant rather than
+  either capability, which is exactly the case this unconditional probe
+  exists to recover: one extra loopback GET per child lifetime once a verdict
+  set is cached, on a path that is a package constant rather than
   operator/config-supplied, so there is no SSRF surface to guard here the way
-  `MetricsPath`/`ContextProbePath` need one.
+  `MetricsPath`/`ContextProbePath` need one. **One fetch answers every
+  verdict this document can yield** — `collector.ProbePropsVerdicts` parses
+  the identical bytes for both `LiveProgressSupport` and `Capabilities`, so a
+  `llama_cpp` child that used to cost one `/props` GET per verdict kind now
+  costs one GET, period, per pid generation, however many verdicts the
+  document yields.
 
   The caching rule distinguishes **why** no verdict came back, not merely
   whether one did. A cache keyed by `(SpecID, PID)`, like the context cache,
-  stores a verdict — `"supported"`, `"unsupported"`, **or** a deliberate `""`
-  — only once the probe's answer is *stable*: a real `/props` document, any
-  other well-formed body that simply is not that document, or one of exactly
-  four conclusive refusals — **404** (no such route on this build), **401**
-  or **403** (the route is behind an api key this probe cannot supply),
-  **405** (the route exists, but not for `GET`). None of those can change
-  while this pid's process keeps running: the binary behind it, and the
-  credential it was launched with, are both fixed at exec time. A *transient*
-  failure — connection refused, a timeout, any OTHER non-2xx status (a `5xx`
-  above all), or unparseable/truncated JSON — is never cached, exactly like a
+  stores the whole verdict set (`collector.PropsVerdicts{LiveProgress, Caps}`
+  — `LiveProgress` one of `"supported"`/`"unsupported"`/a deliberate `""`;
+  `Caps` the four capability verdicts plus `Extra`) only once the probe's
+  answer is *stable*: a real `/props` document, any other well-formed body
+  that simply is not that document, or one of exactly four conclusive
+  refusals — **404** (no such route on this build), **401** or **403** (the
+  route is behind an api key this probe cannot supply), **405** (the route
+  exists, but not for `GET`). None of those can change while this pid's
+  process keeps running: the binary behind it, and the credential it was
+  launched with, are both fixed at exec time. A *transient* failure —
+  connection refused, a timeout, any OTHER non-2xx status (a `5xx` above
+  all), or unparseable/truncated JSON — is never cached, exactly like a
   failed context probe, because it might describe a child still warming up
   rather than a conclusive answer. Classifying the three refusals above as
   transient is not a theoretical mistake: it re-GETs `/props` on every collect
@@ -2878,10 +2887,11 @@ mirror). Three different cadences share the one collect cycle:
   misdiagnose a slow-starting child as incapable. This cache is kept
   deliberately **separate** from the context cache — a cached context size is
   proof only that the context probe succeeded on this pid generation, never
-  that the capability verdict was ever established — so a lookup in one never
-  consults the other. The evidence rule this probe applies to the fetched
-  body — and why it is a byte-for-byte duplicate of the gateway's own copy —
-  is [Telemetry, Usage Analytics & Observability
+  that either capability verdict was ever established — so a lookup in one
+  never consults the other. The evidence rule this probe applies to the
+  fetched body for each verdict kind — and why both are byte-for-byte
+  duplicates of the gateway's own copies — is [Telemetry, Usage Analytics &
+  Observability
   §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
 
   **An api-key-protected child's verdict is recovered at the gateway edge,
@@ -2899,9 +2909,17 @@ mirror). Three different cadences share the one collect cycle:
   probe instead was the originally sketched remedy, and it was rejected on
   exactly that basis. Such a child therefore still answers `401`/`403` here,
   still cached as a conclusive non-verdict (above), and this probe's own
-  `live_progress_support` write for it still stays `""` forever — unchanged,
-  and it remains the fast path for every *unprotected* child, and the only
-  source of truth at all for an agent that predates the passthrough below.
+  `live_progress_support` write for it still stays `""` forever — but its
+  `Capabilities` write is *not* `nil`: `401`/`403` sits in
+  `ProbePropsVerdicts`' CONCLUSIVE set, so `stable` comes back `true` and
+  `probeRuntimeChildProps` still reaches `capabilitiesSample`, which always
+  returns a non-nil pointer even over an all-empty `collector.Capabilities`.
+  Such a child therefore reports the non-nil, all-empty `Capabilities` —
+  "detection ran, determined nothing" — described below; `nil` is reserved
+  for a still-transient probe or an agent that predates the field. Otherwise
+  unchanged, and it remains the fast path for every *unprotected* child, and
+  the only source of truth at all for an agent that predates the passthrough
+  below.
 
   The gap instead closes on the **gateway** side, at the edge that already
   attaches a credential for ordinary inference: the gateway's app-health pass
@@ -2925,7 +2943,14 @@ mirror). Three different cadences share the one collect cycle:
   evidence rule and converge through the same compare-to-stored discipline, so
   which one's write lands first for a given mapping is never a contract. An
   operator can still work around a `custom`-typed spec's shape-clause opt-out
-  the same way as before, by setting `Type` to `llama_cpp` explicitly.
+  the same way as before, by setting `Type` to `llama_cpp` explicitly. The
+  same `{model}`-template pass resolves an api-key-protected child's
+  `Capabilities` the identical way, through the identical credential, on the
+  identical response — `applyCapabilityWrite` is this pass's other tail
+  ([Telemetry, Usage Analytics & Observability
+  §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)),
+  called right beside the live-progress write from one probe result, not a
+  second request.
 
 Every probe shares the agent's existing ~2 s collect timeout and is
 best-effort throughout: a failure is logged at `Debug` and leaves the
@@ -2976,7 +3001,12 @@ collect cycle. `LiveProgressSupport` gets **no** third `MetricsProbe`/
 already carries that information, since `""` covers both "not yet
 determined" and "never probed" identically, and no consumer needs to
 distinguish them the way a fabricated `0` needed distinguishing from a real
-one. What consumes the two states: the runtime admin's "Probes"
+one. `Capabilities` needs no reachability field either, for the identical
+reason: `nil` already means "not yet determined/never probed," distinct from
+the non-nil, all-empty struct a stable probe that determined nothing leaves
+behind ([Telemetry, Usage Analytics & Observability
+§8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+What consumes the two states: the runtime admin's "Probes"
 column ([§11.5](#115-what-each-remaining-tab-shows)) and the Models-detail
 gate that stops showing a fabricated `0` for the two probe-derived numbers
 ([§11.7](#117-live-runtime-state-on-the-models-catalog) — which also

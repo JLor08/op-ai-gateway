@@ -154,6 +154,76 @@ function liveProgressTooltip(
   return `${info.tooltip} ${t.modelServerLiveProgressCheckedAt(new Date(checkedAt).toLocaleString())}`;
 }
 
+// The row shape capabilityChips/capabilitiesTooltip need — a subset of
+// ModelServerRow, named for readability at the call site below.
+type CapabilityRow = Pick<
+  ModelServerRow,
+  | 'cap_vision'
+  | 'cap_video'
+  | 'cap_audio'
+  | 'cap_tools'
+  | 'cap_extra'
+  | 'capabilities_source'
+  | 'capabilities_checked_at'
+>;
+
+// capabilityChips returns one chip per DETERMINED capability, in a fixed
+// order (Vision, Video, Audio, Tools) so the column reads the same on every
+// row regardless of which verdicts happen to be set, followed by every
+// cap_extra entry VERBATIM (including a string this portal build doesn't
+// recognize -- the vocabulary is open-ended upstream, e.g. Ollama passes
+// manifest-declared capabilities straight through, so dropping an unknown
+// value here would silently hide a real, reported capability). A `no`
+// verdict renders NO chip at all -- negatives are not chips, only positives
+// and "reported but uncategorized" are. Verdict chips use the vetted
+// "success" key; cap_extra chips use the neutral "standby" key instead (see
+// the comment at the push site below) -- chips are still keyed by
+// `data-status`, never by colour, and there is no ranking within either
+// group.
+function capabilityChips(
+  row: CapabilityRow,
+  t: Translation,
+): { status: 'success' | 'standby'; label: string }[] {
+  const chips: { status: 'success' | 'standby'; label: string }[] = [];
+  const verdicts: [string, string][] = [
+    [row.cap_vision, t.capabilityVision],
+    [row.cap_video, t.capabilityVideo],
+    [row.cap_audio, t.capabilityAudio],
+    [row.cap_tools, t.capabilityTools],
+  ];
+  for (const [verdict, label] of verdicts) {
+    if (verdict === 'yes') chips.push({ status: 'success', label });
+  }
+  for (const extra of row.cap_extra ?? []) {
+    // NEUTRAL, not "success": the verdicts above are capabilities this
+    // codebase understands and caveats in the tooltip; cap_extra is an
+    // open-ended, un-vetted string from the upstream's own vocabulary. Same
+    // "reported, not verified" semantic liveProgressChipInfo's "unsupported"
+    // branch above already chose.
+    chips.push({ status: 'standby', label: extra });
+  }
+  return chips;
+}
+
+// capabilitiesTooltip folds the provenance (capabilities_source) and the
+// checked-at timestamp into the shared caveat text
+// (t.modelServerCapabilitiesTooltip -- the video-is-build-plus-vision-encoder
+// and tools-is-native-template-quality caveats every chip needs, regardless
+// of which capability it names). capabilities_checked_at exists ONLY for this
+// tooltip and for operator diagnostics (mirrors ModelMapping.
+// CapabilitiesCheckedAt's own doc-comment) -- no rendering DECISION may
+// branch on it, only this string.
+function capabilitiesTooltip(row: CapabilityRow, t: Translation): string {
+  const parts = [t.modelServerCapabilitiesTooltip];
+  if (row.capabilities_source) parts.push(t.modelServerCapabilitiesSource(row.capabilities_source));
+  if (row.capabilities_checked_at) {
+    parts.push(
+      t.modelServerCapabilitiesCheckedAt(new Date(row.capabilities_checked_at).toLocaleString()),
+    );
+  }
+  return parts.join(' ');
+}
+
 export function ModelServersSection({
   t,
   api,
@@ -361,6 +431,33 @@ export function ModelServersSection({
           <Tooltip title={liveProgressTooltip(info, r.live_progress_checked_at, t)}>
             <span>
               <StatusChip status={info.status} label={info.label} />
+            </span>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      id: 'capabilities',
+      label: t.modelServerColCapabilities,
+      value: (r) =>
+        capabilityChips(r, t)
+          .map((c) => c.label)
+          .join(' '),
+      searchable: true,
+      render: (r) => {
+        const chips = capabilityChips(r, t);
+        // The em-dash, not an empty cell: "the column exists, nothing
+        // determined yet" must be distinguishable from "the column is
+        // missing" -- an indistinguishable empty cell has already cost a real
+        // support report on a sibling table (see liveProgressChipInfo's own
+        // note, and issue #57).
+        if (chips.length === 0) return '—';
+        return (
+          <Tooltip title={capabilitiesTooltip(r, t)}>
+            <span>
+              {chips.map((c) => (
+                <StatusChip key={c.label} status={c.status} label={c.label} />
+              ))}
             </span>
           </Tooltip>
         );
