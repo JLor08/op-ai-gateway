@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
-	"strings"
 	"time"
 )
 
@@ -188,13 +187,10 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		insert into model_mappings (
 			id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		mapping.ID,
 		mapping.ApplicationID,
 		mapping.GatewayModelName,
@@ -204,8 +200,6 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.PromptTokensPerSecond,
 		mapping.LoadTimeMS,
 		mapping.ContextSize,
-		mapping.IsMTP,
-		mapping.VisionCapable,
 		mapping.EnergyWhPerToken,
 		mapping.MetricsLocked,
 		mapping.MetricsUpdatedAt,
@@ -213,15 +207,6 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
-		mapping.LiveProgressSupport,
-		mapping.LiveProgressCheckedAt,
-		mapping.CapVision,
-		mapping.CapVideo,
-		mapping.CapAudio,
-		mapping.CapTools,
-		mapping.CapExtra,
-		mapping.CapabilitiesSource,
-		mapping.CapabilitiesCheckedAt,
 		mapping.CreatedAt,
 		mapping.UpdatedAt,
 	)
@@ -242,12 +227,9 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		update model_mappings
 		set application_id = ?, gateway_model_name = ?, app_model_name = ?,
 			status = ?, gen_tokens_per_second = ?, prompt_tokens_per_second = ?,
-			load_time_ms = ?, context_size = ?, is_mtp = ?, vision_capable = ?, energy_wh_per_token = ?, metrics_locked = ?,
+			load_time_ms = ?, context_size = ?, energy_wh_per_token = ?, metrics_locked = ?,
 			metrics_updated_at = ?, metrics_source = ?,
 			max_concurrency = ?, recommended_concurrency = ?, gen_tokens_per_second_at_capacity = ?,
-			live_progress_support = ?, live_progress_checked_at = ?,
-			cap_vision = ?, cap_video = ?, cap_audio = ?, cap_tools = ?, cap_extra = ?,
-			capabilities_source = ?, capabilities_checked_at = ?,
 			updated_at = ?
 		where id = ?`,
 		mapping.ApplicationID,
@@ -258,8 +240,6 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.PromptTokensPerSecond,
 		mapping.LoadTimeMS,
 		mapping.ContextSize,
-		mapping.IsMTP,
-		mapping.VisionCapable,
 		mapping.EnergyWhPerToken,
 		mapping.MetricsLocked,
 		mapping.MetricsUpdatedAt,
@@ -267,15 +247,6 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
-		mapping.LiveProgressSupport,
-		mapping.LiveProgressCheckedAt,
-		mapping.CapVision,
-		mapping.CapVideo,
-		mapping.CapAudio,
-		mapping.CapTools,
-		mapping.CapExtra,
-		mapping.CapabilitiesSource,
-		mapping.CapabilitiesCheckedAt,
 		mapping.UpdatedAt,
 		mapping.ID,
 	)
@@ -305,104 +276,6 @@ func (s *SQLiteStore) UpdateMappingContextProbe(ctx context.Context, id string, 
 	)
 	if err != nil {
 		return fmt.Errorf("update mapping context probe: %w", err)
-	}
-	return nil // 0 rows affected (missing or locked) is a benign no-op
-}
-
-// UpdateMappingLiveProgressSupport records whether this mapping's upstream
-// tolerates the live-progress request parameters (#51).
-//
-// UNLIKE every other automated writer on this table, this one carries NO
-// `and metrics_locked = 0` guard and does not touch metrics_source /
-// metrics_updated_at. That is deliberate: metrics_locked exists so an operator
-// can pin NUMBERS THEY ANSWER FOR -- throughput, context size -- against
-// automation. A build capability is not such a number: pinning it could only
-// ever produce a wrong answer, and unlike a pinned throughput a wrong
-// capability has an operational consequence -- the live figure silently stays
-// off, with no visible reason, until someone thinks to unlock a mapping's
-// metrics. And because it is a capability rather than a metric, writing it must
-// not restamp the metrics provenance columns; doing so would misattribute this
-// mapping's throughput figures to a capability probe.
-func (s *SQLiteStore) UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error {
-	_, err := s.exec(ctx, `
-		update model_mappings
-		set live_progress_support = ?, live_progress_checked_at = ?
-		where id = ?`,
-		support, at, id,
-	)
-	if err != nil {
-		return fmt.Errorf("update mapping live progress support: %w", err)
-	}
-	return nil // 0 rows affected (missing mapping) is a benign no-op
-}
-
-// UpdateMappingCapabilities records auto-detected capability verdicts (#49-2).
-//
-// Only NON-EMPTY verdicts are written. That is the whole point: a probe that
-// determined vision but nothing about tools (an older llama.cpp answering
-// modalities without chat_template_caps) must leave cap_tools exactly as it
-// was, not clear it. "" is never a value, only ever "nothing to say".
-//
-// Like UpdateMappingLiveProgressSupport -- read its doc for the full
-// argument -- this carries NO `and metrics_locked = 0` guard and does not
-// touch metrics_source/metrics_updated_at: metrics_locked exists so an
-// operator can pin numbers they answer for, and a capability is not such a
-// number. The one place a capability DOES respect the lock is the vision sync
-// onto vision_capable, which deliberately goes through the lock-guarded
-// UpdateMappingVisionCapable instead (see the write-back callers).
-func (s *SQLiteStore) UpdateMappingCapabilities(ctx context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error {
-	sets := []string{}
-	args := []any{}
-	for _, f := range []struct {
-		col     string
-		verdict string
-	}{
-		{"cap_vision", caps.Vision},
-		{"cap_video", caps.Video},
-		{"cap_audio", caps.Audio},
-		{"cap_tools", caps.Tools},
-	} {
-		if f.verdict == "" {
-			continue
-		}
-		sets = append(sets, f.col+" = ?")
-		args = append(args, f.verdict)
-	}
-	if len(caps.Extra) > 0 {
-		encoded, err := json.Marshal(caps.Extra)
-		if err != nil {
-			return fmt.Errorf("update mapping capabilities: encode extra: %w", err)
-		}
-		sets = append(sets, "cap_extra = ?")
-		args = append(args, string(encoded))
-	}
-	if len(sets) == 0 {
-		return nil // nothing determined: not an error, and not a write
-	}
-	sets = append(sets, "capabilities_source = ?", "capabilities_checked_at = ?")
-	args = append(args, caps.Source, at, id)
-	_, err := s.exec(ctx, `update model_mappings set `+strings.Join(sets, ", ")+` where id = ?`, args...)
-	if err != nil {
-		return fmt.Errorf("update mapping capabilities: %w", err)
-	}
-	return nil // 0 rows affected (missing mapping) is a benign no-op
-}
-
-// UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
-// from a vision-capability check. The metrics_locked = 0 guard makes the lock
-// atomic in SQL: a locked (or missing) row matches 0 rows and is left untouched,
-// which is a benign no-op (not an error). A definitive "not capable" (false)
-// result can also be written. Only the flag + provenance are written, so a
-// concurrent edit of other fields cannot be clobbered.
-func (s *SQLiteStore) UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error {
-	_, err := s.exec(ctx, `
-		update model_mappings
-		set vision_capable = ?, metrics_source = ?, metrics_updated_at = ?
-		where id = ? and metrics_locked = 0`,
-		capable, "vision", at, id,
-	)
-	if err != nil {
-		return fmt.Errorf("update mapping vision capable: %w", err)
 	}
 	return nil // 0 rows affected (missing or locked) is a benign no-op
 }
@@ -529,11 +402,8 @@ func (s *SQLiteStore) MappingByID(ctx context.Context, id string) (routing.Model
 	row := s.queryRow(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where id = ?`, id)
@@ -544,11 +414,8 @@ func (s *SQLiteStore) MappingsByApplication(ctx context.Context, applicationID s
 	rows, err := s.query(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where application_id = ?
@@ -564,11 +431,8 @@ func (s *SQLiteStore) MappingsByServer(ctx context.Context, serverID string) ([]
 	rows, err := s.query(ctx, `
 		select m.id, m.application_id, m.gateway_model_name, m.app_model_name, m.status,
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
-			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
+			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
-			m.live_progress_support, m.live_progress_checked_at,
-			m.cap_vision, m.cap_video, m.cap_audio, m.cap_tools, m.cap_extra,
-			m.capabilities_source, m.capabilities_checked_at,
 			m.created_at, m.updated_at
 		from model_mappings m
 		join applications a on a.id = m.application_id
@@ -597,17 +461,32 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			a.created_at, a.updated_at,
 			m.id, m.application_id, m.gateway_model_name, m.app_model_name, m.status,
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
-			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
+			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
-			m.live_progress_support, m.live_progress_checked_at,
-			m.cap_vision, m.cap_video, m.cap_audio, m.cap_tools, m.cap_extra,
-			m.capabilities_source, m.capabilities_checked_at,
-			m.created_at, m.updated_at
+			m.created_at, m.updated_at,
+			mtp.verdict, lp.verdict
 		from model_mappings m
 		join applications a on a.id = m.application_id
 		join ai_servers srv on srv.id = a.server_id
+		-- Two FILTERED joins (one row per mapping each), not one unfiltered join
+		-- on model_mapping_capabilities and a Go-side pick of the two rows this
+		-- decision path needs: measured at roughly +6 microseconds EACH against
+		-- this per-request query's existing ~17 microsecond cost, and each still
+		-- returns AT MOST one row per mapping ((mapping_id, capability) is the
+		-- table's primary key), so the candidate result set's cardinality is
+		-- unchanged. An unfiltered join returns one row per (mapping,
+		-- capability) instead -- multiplying the result set by however many
+		-- capabilities a mapping has rows for -- which measured at roughly +79
+		-- microseconds and would need a Go-side collapse back to one candidate
+		-- per mapping to undo.
+		left join model_mapping_capabilities mtp
+		       on mtp.mapping_id = m.id and mtp.capability = ?
+		left join model_mapping_capabilities lp
+		       on lp.mapping_id = m.id and lp.capability = ?
 		where m.gateway_model_name = ? and m.status = ? and a.status = ?
-		order by m.id`, gatewayModel, routing.ServerStatusActive, routing.ServerStatusActive)
+		order by m.id`,
+		routing.CapabilityMTP, routing.CapabilityLiveProgress,
+		gatewayModel, routing.ServerStatusActive, routing.ServerStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list active mappings: %w", err)
 	}
@@ -638,12 +517,17 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		benchScheduleEnabled int64
 		oppMetricsEnabled    int64
 		proxyExcluded        int64
-		mapIsMTP             int64
-		mapVisionCapable     int64
 		mapLocked            int64
 		mapUpdatedNil        sql.NullTime
-		mapLiveProgressAtNil sql.NullTime
-		mapCapabilitiesAtNil sql.NullTime
+		// mtpVerdict/liveProgressVerdict are the two joined
+		// model_mapping_capabilities.verdict columns (nullable: a LEFT JOIN row
+		// with no match scans as NULL, i.e. Valid == false, String == "" -- the
+		// same "absent = never determined" reading routing.MTPFromVerdict /
+		// routing.LiveProgressSupportFromVerdict expect). The verdict column
+		// itself is NOT NULL when a row exists (migration78Up), so a valid,
+		// non-empty String is always exactly "yes" or "no".
+		mtpVerdict          sql.NullString
+		liveProgressVerdict sql.NullString
 	)
 	err := row.Scan(
 		&c.Server.ID, &c.Server.Name, &c.Server.Domain, &c.Server.ServerPathSuffix, &c.Server.Provider, &c.Server.Endpoint,
@@ -662,12 +546,10 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.ID, &c.Mapping.ApplicationID, &c.Mapping.GatewayModelName, &c.Mapping.AppModelName,
 		&c.Mapping.Status,
 		&c.Mapping.GenTokensPerSecond, &c.Mapping.PromptTokensPerSecond, &c.Mapping.LoadTimeMS, &c.Mapping.ContextSize,
-		&mapIsMTP, &mapVisionCapable, &c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
+		&c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
 		&c.Mapping.MaxConcurrency, &c.Mapping.RecommendedConcurrency, &c.Mapping.GenTokensPerSecondAtCapacity,
-		&c.Mapping.LiveProgressSupport, &mapLiveProgressAtNil,
-		&c.Mapping.CapVision, &c.Mapping.CapVideo, &c.Mapping.CapAudio, &c.Mapping.CapTools, &c.Mapping.CapExtra,
-		&c.Mapping.CapabilitiesSource, &mapCapabilitiesAtNil,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
+		&mtpVerdict, &liveProgressVerdict,
 	)
 	if err != nil {
 		return routing.MappingCandidate{}, fmt.Errorf("scan mapping candidate: %w", err)
@@ -676,20 +558,18 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	c.Application.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	c.Application.ProxyExcluded = proxyExcluded != 0
-	c.Mapping.IsMTP = mapIsMTP != 0
-	c.Mapping.VisionCapable = mapVisionCapable != 0
 	c.Mapping.MetricsLocked = mapLocked != 0
+	// The boundary conversion: c.IsMTP/c.LiveProgressSupport come from the
+	// JOINED capability rows, via the same routing.MTPFromVerdict /
+	// routing.LiveProgressSupportFromVerdict MemoryStore's mirror also calls.
+	// They live on the CANDIDATE, not on c.Mapping: routing.ModelMapping
+	// carries no capability field at all any more (migration 79 dropped the
+	// columns they were) -- see MappingCandidate's own doc.
+	c.IsMTP = routing.MTPFromVerdict(mtpVerdict.String)
+	c.LiveProgressSupport = routing.LiveProgressSupportFromVerdict(liveProgressVerdict.String)
 	if mapUpdatedNil.Valid {
 		t := mapUpdatedNil.Time
 		c.Mapping.MetricsUpdatedAt = &t
-	}
-	if mapLiveProgressAtNil.Valid {
-		t := mapLiveProgressAtNil.Time
-		c.Mapping.LiveProgressCheckedAt = &t
-	}
-	if mapCapabilitiesAtNil.Valid {
-		t := mapCapabilitiesAtNil.Time
-		c.Mapping.CapabilitiesCheckedAt = &t
 	}
 	if lastSeen.Valid {
 		t := lastSeen.Time
@@ -795,10 +675,8 @@ func scanApplications(rows *sql.Rows) ([]routing.Application, error) {
 
 func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	var mapping routing.ModelMapping
-	var isMTP, visionCapable, locked int64
+	var locked int64
 	var updatedNil sql.NullTime
-	var liveProgressAtNil sql.NullTime
-	var capabilitiesAtNil sql.NullTime
 	err := row.Scan(
 		&mapping.ID,
 		&mapping.ApplicationID,
@@ -809,8 +687,6 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.PromptTokensPerSecond,
 		&mapping.LoadTimeMS,
 		&mapping.ContextSize,
-		&isMTP,
-		&visionCapable,
 		&mapping.EnergyWhPerToken,
 		&locked,
 		&updatedNil,
@@ -818,15 +694,6 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.MaxConcurrency,
 		&mapping.RecommendedConcurrency,
 		&mapping.GenTokensPerSecondAtCapacity,
-		&mapping.LiveProgressSupport,
-		&liveProgressAtNil,
-		&mapping.CapVision,
-		&mapping.CapVideo,
-		&mapping.CapAudio,
-		&mapping.CapTools,
-		&mapping.CapExtra,
-		&mapping.CapabilitiesSource,
-		&capabilitiesAtNil,
 		&mapping.CreatedAt,
 		&mapping.UpdatedAt,
 	)
@@ -836,20 +703,10 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	if err != nil {
 		return routing.ModelMapping{}, fmt.Errorf("scan mapping: %w", err)
 	}
-	mapping.IsMTP = isMTP != 0
-	mapping.VisionCapable = visionCapable != 0
 	mapping.MetricsLocked = locked != 0
 	if updatedNil.Valid {
 		t := updatedNil.Time
 		mapping.MetricsUpdatedAt = &t
-	}
-	if liveProgressAtNil.Valid {
-		t := liveProgressAtNil.Time
-		mapping.LiveProgressCheckedAt = &t
-	}
-	if capabilitiesAtNil.Valid {
-		t := capabilitiesAtNil.Time
-		mapping.CapabilitiesCheckedAt = &t
 	}
 	return mapping, nil
 }

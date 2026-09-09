@@ -152,8 +152,21 @@ export type PortalModelMapping = {
   prompt_tokens_per_second: number;
   load_time_ms: number;
   context_size: number;
+  // The two-state FOLD of the "mtp"/"vision" capability rows: true only for a
+  // "yes" row, so a "no" row and a MISSING row both read false. They cannot
+  // express the third state -- that is what `capabilities` below is for.
   is_mtp: boolean;
   vision_capable: boolean;
+  // Every DETERMINED capability row for this mapping, mirroring the backend's
+  // ModelMappingDTO.Capabilities -- the SAME ModelServerCapability shape the
+  // model-servers rows carry, reused rather than re-declared so the two cannot
+  // drift. Alphabetical by capability, always an array and never
+  // undefined/null (empty when nothing has been determined).
+  //
+  // The absence of an entry is UNKNOWN, and reading these rows instead of the
+  // folded booleans above is what lets MappingForm offer three honest states
+  // and state any of them (see capability_verdicts).
+  capabilities: ModelServerCapability[];
   energy_wh_per_token: number;
   metrics_locked: boolean;
   metrics_source: string;
@@ -165,6 +178,12 @@ export type PortalModelMapping = {
 
 export type PortalMappingListResponse = { data: PortalModelMapping[] };
 
+// The three states a capability control can be in and send. '' is UNKNOWN and
+// it is a real value, not a placeholder: in the store, unknown is the ABSENCE
+// of a row, so there is no third verdict -- '' asks for the row to be deleted
+// (or, on a create, for none to be written).
+export type CapabilityVerdictInput = 'yes' | 'no' | '';
+
 export type CreateMappingRequest = {
   gateway_model_name: string;
   app_model_name: string;
@@ -173,6 +192,9 @@ export type CreateMappingRequest = {
   prompt_tokens_per_second?: number;
   load_time_ms?: number;
   context_size?: number;
+  // LEGACY. Plain booleans, so an unset `false` cannot be told from a control
+  // nobody looked at and only `true` writes a row -- state a NEGATIVE verdict
+  // through capability_verdicts instead.
   is_mtp?: boolean;
   vision_capable?: boolean;
   energy_wh_per_token?: number;
@@ -180,6 +202,11 @@ export type CreateMappingRequest = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
+  // A capability's verdict, stated outright and keyed by capability name.
+  // 'yes'/'no' writes a `manual` row, '' writes none. A capability named here
+  // wins over the legacy boolean above and over the backend's MTP name
+  // heuristic. The vocabulary is open (any capability name is accepted).
+  capability_verdicts?: Record<string, CapabilityVerdictInput>;
 };
 
 export type UpdateMappingRequest = {
@@ -190,6 +217,13 @@ export type UpdateMappingRequest = {
   prompt_tokens_per_second?: number;
   load_time_ms?: number;
   context_size?: number;
+  // LEGACY, and the COMPATIBILITY path rather than the one to use: these are
+  // compared server-side against the two-state FOLD of the stored rows, where
+  // a verdict of 'no' and a MISSING row are both `false`. So an unconditional
+  // `vision_capable: false` writes nothing -- which is deliberate (it is what
+  // stops a client that submits every field on every save from minting a
+  // permanent operator verdict), and it is also why they cannot state a
+  // negative or reach unknown at all. MappingForm sends neither.
   is_mtp?: boolean;
   vision_capable?: boolean;
   energy_wh_per_token?: number;
@@ -197,6 +231,31 @@ export type UpdateMappingRequest = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
+  // The AUTHORITATIVE per-capability field, keyed by capability name, and the
+  // only one that can express all three states:
+  //
+  //   'yes'/'no' -> the operator's verdict, written as a `manual` row when it
+  //                 differs from the STORED ROW (a missing row counts as
+  //                 different, which is what makes unknown -> 'no' a real
+  //                 transition rather than a silent no-op).
+  //   ''         -> DELETE the row, returning the capability to unknown --
+  //                 the only way back out of a `manual` verdict, which
+  //                 outranks every probe and the vision benchmark for as long
+  //                 as it stands.
+  //   absent     -> no statement at all, so a save made for an unrelated
+  //                 reason cannot touch the capability.
+  //
+  // It rides on this same PATCH rather than on a DELETE of its own, and that
+  // is what makes a reset stick: MappingForm seeds once and never re-syncs, so
+  // a reset applied by a separate request would be undone by the operator's
+  // next unrelated edit. Naming a capability here AND sending its legacy
+  // boolean is a 400 (two statements about one row, read by two different
+  // rules), as is a value outside the three above.
+  //
+  // A `null` on the booleans could not have carried the third state:
+  // is_mtp/vision_capable are optional, so `{vision_capable: null}` is
+  // indistinguishable from an absent key.
+  capability_verdicts?: Record<string, CapabilityVerdictInput>;
 };
 
 export type SyncResult = {
@@ -386,30 +445,34 @@ export type ModelServerRow = {
   // When that verdict was last determined; undefined/null when never
   // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
   live_progress_checked_at?: string | null;
-  // cap_vision/cap_video/cap_audio/cap_tools are the auto-detected capability
-  // verdicts (#49 sub-project 2): "" (never determined) | "yes" | "no". Mirrors
-  // the backend's ModelServerDTO (service_model_servers.go) -- like
-  // live_progress_support above, read straight off the persisted mapping
-  // field, so all four are always present (required, no `?`) rather than left
-  // "" for a gateway-injection pass to fill.
-  cap_vision: string;
-  cap_video: string;
-  cap_audio: string;
-  cap_tools: string;
-  // Capability names the upstream reported that have no dedicated column
-  // above ("thinking", "insert", ...); undefined/omitted when empty. The
-  // vocabulary is open-ended upstream, so this is rendered verbatim, never
-  // mapped onto a fixed enum.
-  cap_extra?: string[];
-  // Which probe produced the current cap_* verdicts: "llama_cpp_props" |
-  // "ollama_show" | "" (never determined). Always present, no `?`, same
-  // reasoning as the four verdicts above.
-  capabilities_source: string;
-  // When the cap_* verdicts were last determined; undefined/null when never
-  // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
-  capabilities_checked_at?: string | null;
+  // Every DETERMINED capability row for this (server, mapping) (the
+  // capability-table migration): one entry per capability that has ever been
+  // established -- "vision", "video", "audio", "tools", "mtp",
+  // "live_progress", and any name an upstream reports that this portal build
+  // has no dedicated UI for (the vocabulary is OPEN -- Ollama passes
+  // manifest-declared names straight through). A capability with no row is
+  // simply ABSENT from this array; there is no "" placeholder entry the way
+  // the old cap_vision/cap_video/cap_audio/cap_tools fields each needed one
+  // for "never determined" -- absence itself is that state now. Always an
+  // array, never undefined/null, even when empty (mirrors the backend's
+  // ModelServerDTO.Capabilities -- see its own doc-comment).
+  capabilities: ModelServerCapability[];
   // Live 1-based rank among this model's offering servers (0 = unknown/unranked).
   priority: number;
+};
+
+// One capability verdict on a ModelServerRow, mirroring the backend's
+// ModelServerCapabilityDTO field-for-field: which capability, its verdict
+// ("yes"/"no" -- "unknown" is the row's ABSENCE from ModelServerRow.
+// capabilities, never a value here), who established it, and when. source/
+// checked_at are what the per-capability tooltip renders that the old
+// shared, row-wide capabilities_source/capabilities_checked_at pair never
+// could: which verdict a given chip actually rests on.
+export type ModelServerCapability = {
+  capability: string;
+  verdict: string;
+  source: string;
+  checked_at: string;
 };
 
 // One (model, server) a model GROUP can serve, with a live rank across the whole

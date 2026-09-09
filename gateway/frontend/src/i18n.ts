@@ -493,6 +493,18 @@ const de = {
   mappingLoadTimeMs: 'Ladezeit (ms)',
   mappingIsMtp: 'MTP-Modell',
   mappingVisionCapable: 'Vision-Modell',
+  // Die drei Zustände der Capability-Auswahl. "Unbekannt" ist der leere Wert:
+  // keine Festlegung, im Speicher gar keine Zeile.
+  mappingCapabilityUnknown: 'Unbekannt',
+  mappingCapabilityYes: 'Ja',
+  mappingCapabilityNo: 'Nein',
+  // Was "Unbekannt" für DIESE Capability konkret bedeutet -- bewusst
+  // unterschiedlich, weil die Erkennung es ist: Vision kommt von selbst
+  // zurück, MTP nicht.
+  mappingIsMtpUnknownHint:
+    'Unbekannt = keine Festlegung. MTP wird nicht neu erkannt — an einer bestehenden Zuordnung prüft es nichts. Ohne Festlegung entfällt auch der MTP-Bonus bei der Server-Auswahl.',
+  mappingVisionCapableUnknownHint:
+    'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1110,11 +1122,11 @@ const de = {
   // Diagnostic text only -- see live_progress_checked_at's own doc-comment
   // (api/models.ts): no rendering decision may branch on this value.
   modelServerLiveProgressCheckedAt: (when: string) => `Geprüft am ${when}.`,
-  // Task 6 (capability-autodetect-llamacpp): the auto-detected capability
-  // chips column, beside Live-Fortschritt -- see ModelServersSection.tsx's
-  // capabilityChips for the fixed chip order and why a `no` verdict renders
-  // no chip at all, and capabilitiesTooltip for the provenance/checked-at/
-  // caveat text folded into the tooltip.
+  // The auto-detected capability chips column, beside Live-Fortschritt -- see
+  // ModelServersSection.tsx's capabilityChips for the fixed chip order and
+  // why a `no` verdict (or a missing row) renders no chip at all, and
+  // capabilityTooltip for the PER-CAPABILITY provenance/checked-at/caveat
+  // text folded into each chip's own tooltip.
   modelServerColCapabilities: 'Fähigkeiten',
   capabilityVision: 'Vision',
   capabilityVideo: 'Video',
@@ -2760,6 +2772,13 @@ const en: PortalMessages = {
   mappingLoadTimeMs: 'Load time (ms)',
   mappingIsMtp: 'MTP model',
   mappingVisionCapable: 'Vision model',
+  mappingCapabilityUnknown: 'Unknown',
+  mappingCapabilityYes: 'Yes',
+  mappingCapabilityNo: 'No',
+  mappingIsMtpUnknownHint:
+    'Unknown = no verdict on file. MTP is never re-detected — nothing probes it on an existing mapping. With no verdict the MTP bonus in server selection is gone too.',
+  mappingVisionCapableUnknownHint:
+    'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',

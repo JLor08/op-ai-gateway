@@ -316,6 +316,18 @@ func (_d *RoutingStoreWithTracing) DeleteMapping(ctx context.Context, id string)
 	return _d.Store.DeleteMapping(ctx, id)
 }
 
+func (_d *RoutingStoreWithTracing) DeleteMappingCapability(ctx context.Context, mappingID string, capability string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteMappingCapability")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteMappingCapability(ctx, mappingID, capability)
+}
+
 func (_d *RoutingStoreWithTracing) DeleteModelGroup(ctx context.Context, id string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.DeleteModelGroup")
 	defer span.End()
@@ -446,6 +458,30 @@ func (_d *RoutingStoreWithTracing) MappingByID(ctx context.Context, id string) (
 		}
 	}()
 	return _d.Store.MappingByID(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) MappingCapabilities(ctx context.Context, mappingID string) (ca1 []_sourceRouting.CapabilityRow, err error) {
+	ctx, span := Start(ctx, "routing.Store.MappingCapabilities")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.MappingCapabilities(ctx, mappingID)
+}
+
+func (_d *RoutingStoreWithTracing) MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (m1 map[string][]_sourceRouting.CapabilityRow, err error) {
+	ctx, span := Start(ctx, "routing.Store.MappingCapabilitiesForMappings")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.MappingCapabilitiesForMappings(ctx, mappingIDs)
 }
 
 func (_d *RoutingStoreWithTracing) MappingsByApplication(ctx context.Context, applicationID string) (ma1 []_sourceRouting.ModelMapping, err error) {
@@ -1252,18 +1288,6 @@ func (_d *RoutingStoreWithTracing) UpdateMappingEnergyEWMA(ctx context.Context, 
 	return _d.Store.UpdateMappingEnergyEWMA(ctx, id, sampleWhPerToken, alpha, at)
 }
 
-func (_d *RoutingStoreWithTracing) UpdateMappingLiveProgressSupport(ctx context.Context, id string, support string, at time.Time) (err error) {
-	ctx, span := Start(ctx, "routing.Store.UpdateMappingLiveProgressSupport")
-	defer span.End()
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-	}()
-	return _d.Store.UpdateMappingLiveProgressSupport(ctx, id, support, at)
-}
-
 func (_d *RoutingStoreWithTracing) UpdateMappingOpportunisticMetrics(ctx context.Context, id string, genSample float64, promptSample float64, alpha float64, at time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateMappingOpportunisticMetrics")
 	defer span.End()
@@ -1274,18 +1298,6 @@ func (_d *RoutingStoreWithTracing) UpdateMappingOpportunisticMetrics(ctx context
 		}
 	}()
 	return _d.Store.UpdateMappingOpportunisticMetrics(ctx, id, genSample, promptSample, alpha, at)
-}
-
-func (_d *RoutingStoreWithTracing) UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) (err error) {
-	ctx, span := Start(ctx, "routing.Store.UpdateMappingVisionCapable")
-	defer span.End()
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-	}()
-	return _d.Store.UpdateMappingVisionCapable(ctx, id, capable, at)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateModelGroup(ctx context.Context, group _sourceRouting.ModelGroup) (err error) {
@@ -1538,6 +1550,18 @@ func (_d *RoutingStoreWithTracing) UpsertCertificate(ctx context.Context, cert _
 		}
 	}()
 	return _d.Store.UpsertCertificate(ctx, cert)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []_sourceRouting.CapabilityRow) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertMappingCapabilities")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertMappingCapabilities(ctx, mappingID, rows)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertModelSetting(ctx context.Context, setting _sourceRouting.ModelSetting) (err error) {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/storeerr"
 	"sort"
@@ -125,6 +124,17 @@ type MemoryStore struct {
 	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
 	// same shape as `hardware` above.
 	runtimeReports map[string]ServerRuntimeReport
+	// mappingCapabilities mirrors model_mapping_capabilities (migration 78):
+	// mappingID -> capability -> its CapabilityRow. The capability is the
+	// inner map KEY, which is what makes an upsert a natural replacement (the
+	// SQL side's on-conflict-do-update) and the ABSENCE of an entry the way
+	// "unknown" is expressed — there is no empty verdict to store. Unordered
+	// on write; MappingCapabilities sorts by Capability on read, mirroring the
+	// SQL `order by capability` (same pattern as runtimeSpecGPUs/coresidency
+	// above). CapabilityRow has no slice/pointer fields, so a plain value-map
+	// assignment is a full copy (mirrors certificates above). Deleting a
+	// mapping cascades its whole entry (see deleteMappingLocked).
+	mappingCapabilities map[string]map[string]CapabilityRow
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -159,6 +169,7 @@ func NewMemoryStore() *MemoryStore {
 		coresidency:              map[string][]CoResidencyRule{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
+		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 	}
 }
 
@@ -945,7 +956,8 @@ func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 
 // deleteMappingLocked removes one mapping plus everything the SQL FK graph
 // cascades from `model_mappings`: its benchmark runs
-// (model_mapping_benchmarks.mapping_id), its runtime spec
+// (model_mapping_benchmarks.mapping_id), its capability rows
+// (model_mapping_capabilities.mapping_id), its runtime spec
 // (agent_runtime_specs.mapping_id) and that spec's per-GPU rows
 // (agent_runtime_spec_gpus.spec_id, a second hop), and any co-residency pair
 // naming it on EITHER side (agent_coresidency_rules.mapping_a_id /
@@ -955,6 +967,7 @@ func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 	delete(m.mappings, mappingID)
 	delete(m.benchmarks, mappingID)
+	delete(m.mappingCapabilities, mappingID)
 	for specID, spec := range m.runtimeSpecs {
 		if spec.MappingID == mappingID {
 			delete(m.runtimeSpecs, specID)
@@ -1019,92 +1032,106 @@ func (m *MemoryStore) UpdateMappingContextProbe(_ context.Context, id string, co
 	return nil
 }
 
-// UpdateMappingLiveProgressSupport records whether this mapping's upstream
-// tolerates the live-progress request parameters (#51).
-//
-// UNLIKE every other automated writer above, this one has NO MetricsLocked
-// guard and does not touch MetricsSource / MetricsUpdatedAt: mirrors
-// SQLiteStore.UpdateMappingLiveProgressSupport, see its doc comment for why
-// (a build capability is not a metric an operator pins numbers against). A
-// missing mapping is a benign no-op.
-func (m *MemoryStore) UpdateMappingLiveProgressSupport(_ context.Context, id, support string, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok {
-		return nil
-	}
-	mapping.LiveProgressSupport = support
-	t := at
-	mapping.LiveProgressCheckedAt = &t
-	m.mappings[id] = mapping
-	return nil
+// MappingCapabilities lists one mapping's capability rows ordered by
+// capability (mirroring the SQL `order by capability`; the map is unordered
+// on write, same pattern as runtimeSpecGPUs/coresidency). A mapping with no
+// rows yields an empty, non-nil slice.
+func (m *MemoryStore) MappingCapabilities(_ context.Context, mappingID string) ([]CapabilityRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.mappingCapabilitiesLocked(mappingID), nil
 }
 
-// UpdateMappingCapabilities records auto-detected capability verdicts (#49-2),
-// mirroring SQLiteStore.UpdateMappingCapabilities: only non-empty verdicts are
-// written (so a partial probe answer cannot clear a previously stored one),
-// there is NO MetricsLocked guard, and MetricsSource/MetricsUpdatedAt are left
-// untouched. A missing mapping, or a caps value with nothing determined, is a
-// benign no-op that does not stamp CapabilitiesSource/CapabilitiesCheckedAt.
-func (m *MemoryStore) UpdateMappingCapabilities(_ context.Context, id string, caps CapabilityVerdicts, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok {
-		return nil
+// mappingCapabilitiesLocked is MappingCapabilities' body, so the bulk reader
+// can reuse it under one lock. Callers must hold m.mu.
+func (m *MemoryStore) mappingCapabilitiesLocked(mappingID string) []CapabilityRow {
+	stored := m.mappingCapabilities[mappingID]
+	out := make([]CapabilityRow, 0, len(stored))
+	for _, row := range stored {
+		out = append(out, row)
 	}
-	wrote := false
-	if caps.Vision != "" {
-		mapping.CapVision = caps.Vision
-		wrote = true
-	}
-	if caps.Video != "" {
-		mapping.CapVideo = caps.Video
-		wrote = true
-	}
-	if caps.Audio != "" {
-		mapping.CapAudio = caps.Audio
-		wrote = true
-	}
-	if caps.Tools != "" {
-		mapping.CapTools = caps.Tools
-		wrote = true
-	}
-	if len(caps.Extra) > 0 {
-		encoded, err := json.Marshal(caps.Extra)
-		if err != nil {
-			return fmt.Errorf("update mapping capabilities: encode extra: %w", err)
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out
+}
+
+// MappingCapabilitiesForMappings mirrors the SQL bulk reader: a mapping with
+// no rows contributes NO key (not an empty slice), so a caller's zero-value
+// lookup means "every capability unknown" on both drivers alike.
+func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingIDs []string) (map[string][]CapabilityRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string][]CapabilityRow, len(mappingIDs))
+	for _, id := range mappingIDs {
+		if len(m.mappingCapabilities[id]) == 0 {
+			continue
 		}
-		mapping.CapExtra = string(encoded)
-		wrote = true
+		out[id] = m.mappingCapabilitiesLocked(id)
 	}
-	if !wrote {
-		return nil // nothing determined: not an error, and not a write
+	return out, nil
+}
+
+// UpsertMappingCapabilities writes rows, REPLACING any row for the same
+// (mapping, capability) — the map key is the capability, so a re-write is a
+// natural replacement, matching the SQL on-conflict-do-update. It applies no
+// precedence rule (the caller does — see WritableCapabilityRows) and,
+// unlike every metric writer here, carries no metrics_locked guard: see the
+// Store interface's own UpsertMappingCapabilities doc for the full argument,
+// which is what this table has instead of the lock the pre-78 capability
+// columns had to argue their way out of.
+//
+// Every row is validated (ValidateCapabilityRow) before anything is written
+// — the same check SQLiteStore's UpsertMappingCapabilities makes, so the two
+// drivers cannot diverge on what counts as a valid row.
+//
+// mappingID must reference an existing mapping — a hand-rolled FK existence
+// check against m.mappings, mirroring UpsertRuntimeSpec/InsertBenchmarkRun's
+// own checks above for the same reason: both SQL drivers reject this insert
+// with a real foreign-key violation (SQLite runs with referential integrity
+// on), so silently fabricating a mapping_capabilities entry for a mapping
+// that does not exist — the ORIGINAL behavior here — was a driver
+// divergence, not a deliberate design choice. It is reachable only via a
+// TOCTOU (the mapping deleted between a caller's resolve step and this
+// write); every current caller is best-effort, so the error surfaces as one
+// log line and never rejects the request or sample that triggered it. A
+// zero-length rows is still a true no-op regardless — checked first, before
+// the existence check, so it costs nothing and cannot fail on a mapping this
+// caller never intended to touch.
+func (m *MemoryStore) UpsertMappingCapabilities(_ context.Context, mappingID string, rows []CapabilityRow) error {
+	for _, r := range rows {
+		if err := ValidateCapabilityRow(r); err != nil {
+			return err
+		}
 	}
-	mapping.CapabilitiesSource = caps.Source
-	t := at
-	mapping.CapabilitiesCheckedAt = &t
-	m.mappings[id] = mapping
+	if len(rows) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mappings[mappingID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	byCapability := m.mappingCapabilities[mappingID]
+	if byCapability == nil {
+		byCapability = map[string]CapabilityRow{}
+		m.mappingCapabilities[mappingID] = byCapability
+	}
+	for _, row := range rows {
+		byCapability[row.Capability] = row
+	}
 	return nil
 }
 
-// UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
-// from a vision-capability check, only while it is unlocked. A missing or
-// locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
-// A definitive "not capable" (false) result can also be written.
-func (m *MemoryStore) UpdateMappingVisionCapable(_ context.Context, id string, capable bool, at time.Time) error {
+// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a row
+// that is not there is a benign no-op, mirroring the SQL delete's 0 rows
+// affected.
+func (m *MemoryStore) DeleteMappingCapability(_ context.Context, mappingID, capability string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok || mapping.MetricsLocked {
-		return nil
+	byCapability := m.mappingCapabilities[mappingID]
+	delete(byCapability, capability)
+	if len(byCapability) == 0 {
+		delete(m.mappingCapabilities, mappingID)
 	}
-	mapping.VisionCapable = capable
-	mapping.MetricsSource = "vision"
-	t := at
-	mapping.MetricsUpdatedAt = &t
-	m.mappings[id] = mapping
 	return nil
 }
 
@@ -1273,10 +1300,21 @@ func (m *MemoryStore) ActiveMappingsForModel(_ context.Context, gatewayModel str
 		if !ok {
 			continue
 		}
+		// mtpRow/liveProgressRow default to their zero CapabilityRow (Verdict ==
+		// "") when the mapping has no entry for that capability at all -- the
+		// same "absent = never determined" reading the SQL store's LEFT JOIN
+		// produces for scanMappingCandidate. MTPFromVerdict /
+		// LiveProgressSupportFromVerdict are the SAME functions the SQL store
+		// calls, so the two drivers cannot disagree about what a "no" row or an
+		// absent row means (see those functions' own docs).
+		mtpRow := m.mappingCapabilities[id][CapabilityMTP]
+		liveProgressRow := m.mappingCapabilities[id][CapabilityLiveProgress]
 		out = append(out, MappingCandidate{
-			Server:      copyAIServer(server),
-			Application: copyApplication(app),
-			Mapping:     mapping,
+			Server:              copyAIServer(server),
+			Application:         copyApplication(app),
+			Mapping:             mapping,
+			IsMTP:               MTPFromVerdict(mtpRow.Verdict),
+			LiveProgressSupport: LiveProgressSupportFromVerdict(liveProgressRow.Verdict),
 		})
 	}
 	return out, nil

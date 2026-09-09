@@ -2569,3 +2569,38 @@ describe('endpoint-mode i18n keys', () => {
     }
   });
 });
+
+describe('mapping capability i18n keys', () => {
+  it('defines the three-state option labels in de and en', () => {
+    const keys = [
+      'mappingCapabilityUnknown',
+      'mappingCapabilityYes',
+      'mappingCapabilityNo',
+    ] as const;
+    for (const k of keys) {
+      expect(messages.de[k]).toBeTruthy();
+      expect(messages.en[k]).toBeTruthy();
+    }
+  });
+
+  // The two "unknown" hints must stay DIFFERENT, in both languages. What
+  // happens after a reset genuinely differs per capability -- `vision` is
+  // re-detected on its own from a real llama.cpp /props upstream, `mtp` is
+  // never probed again on an existing mapping -- so one shared "let detection
+  // decide again" would be a promise the gateway does not keep. Collapsing
+  // them is the tidy-up this test exists to stop.
+  it('gives mtp and vision DIFFERENT unknown hints in both languages', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const mtp = messages[locale].mappingIsMtpUnknownHint;
+      const vision = messages[locale].mappingVisionCapableUnknownHint;
+      expect(mtp).toBeTruthy();
+      expect(vision).toBeTruthy();
+      expect(mtp).not.toBe(vision);
+    }
+    // ...and each says the thing that is true of ITS capability.
+    expect(messages.en.mappingVisionCapableUnknownHint).toMatch(/llama\.cpp/);
+    expect(messages.de.mappingVisionCapableUnknownHint).toMatch(/llama\.cpp/);
+    expect(messages.en.mappingIsMtpUnknownHint).toMatch(/never re-detected/);
+    expect(messages.de.mappingIsMtpUnknownHint).toMatch(/nicht neu erkannt/);
+  });
+});

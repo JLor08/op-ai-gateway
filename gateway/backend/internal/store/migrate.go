@@ -6,7 +6,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -108,11 +110,28 @@ var migrations = []migration{
 	{version: 75, name: "runtime_spec_type_probe", up: migration75Up},
 	{version: 76, name: "model_mappings_live_progress_support", up: migration76Up},
 	{version: 77, name: "model_mappings_capabilities", up: migration77Up},
+	{version: 78, name: "model_mapping_capabilities_table", up: migration78Up},
+	{version: 79, name: "model_mappings_drop_capability_columns", up: migration79Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
 // transaction each, every migration whose version has not been recorded yet.
 func (s *SQLStore) Migrate(ctx context.Context) error {
+	return s.migrateTo(ctx, math.MaxInt)
+}
+
+// migrateTo is Migrate bounded above: it applies every not-yet-recorded
+// migration whose version is <= maxVersion. Migrate passes math.MaxInt, so
+// the production path is "apply everything" and there is exactly one
+// implementation of the runner.
+//
+// The bound exists so a test can build a database at a HISTORICAL schema
+// version and then exercise a migration against it for real, instead of
+// reconstructing the old shape by hand on top of the current one. Migration
+// 79 made that necessary: it drops the columns migration 78 backfills from,
+// so migration 78's tests can only seed those columns on a database stopped
+// before 79 (see forEachDialectMigratedTo).
+func (s *SQLStore) migrateTo(ctx context.Context, maxVersion int) error {
 	if _, err := s.exec(ctx, `create table if not exists schema_migrations (
 		version integer primary key,
 		name text not null,
@@ -120,54 +139,90 @@ func (s *SQLStore) Migrate(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	applied := map[int]bool{}
-	rows, err := s.query(ctx, `select version from schema_migrations`)
+	applied, err := s.appliedMigrationVersions(ctx)
 	if err != nil {
-		return fmt.Errorf("read schema_migrations: %w", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("scan schema_migrations: %w", err)
-		}
-		applied[v] = true
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
-	_ = rows.Close()
 
 	ordered := append([]migration(nil), migrations...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].version < ordered[j].version })
 
 	for _, m := range ordered {
+		if m.version > maxVersion {
+			break // ordered ascending, so nothing further qualifies either
+		}
 		if applied[m.version] {
 			continue
 		}
-		if m.rawUp != nil {
-			if err := m.rawUp(ctx, s, m.version, m.name); err != nil {
-				return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
-			}
-			continue
+		if err := s.applyMigration(ctx, m); err != nil {
+			return err
 		}
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin migration %d: %w", m.version, err)
+	}
+	return nil
+}
+
+// appliedMigrationVersions reads the ledger: the set of versions
+// schema_migrations already records. A missing version is simply absent, so
+// migrateTo's `applied[m.version]` is the whole "has this one run" question.
+//
+// Its caller creates the table first, so an empty result here means a fresh
+// database rather than a missing ledger.
+func (s *SQLStore) appliedMigrationVersions(ctx context.Context) (map[int]bool, error) {
+	rows, err := s.query(ctx, `select version from schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan schema_migrations: %w", err)
 		}
-		if err := m.up(ctx, tx, s.dl); err != nil {
-			_ = tx.Rollback()
+		applied[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return applied, nil
+}
+
+// applyMigration runs ONE not-yet-recorded migration and records it, in
+// whichever of the two shapes the ledger entry declares:
+//
+//   - rawUp owns its own transactions (the documented escape hatch for a
+//     migration that cannot run inside one, e.g. sqlite's table rebuilds)
+//     and therefore records ITSELF -- nothing is stamped here for it.
+//   - up runs inside one transaction together with its schema_migrations
+//     insert, so a failure anywhere leaves neither the change nor the stamp:
+//     a half-applied migration that claims to be applied is the one outcome
+//     a replayable ledger must never produce.
+//
+// Every error names the version and the migration, because the version alone
+// is not enough to find it in a file of eighty entries.
+func (s *SQLStore) applyMigration(ctx context.Context, m migration) error {
+	if m.rawUp != nil {
+		if err := m.rawUp(ctx, s, m.version, m.name); err != nil {
 			return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
 		}
-		if _, err := tx.ExecContext(ctx, s.dl.rebind(
-			`insert into schema_migrations (version, name, applied_at) values (?, ?, ?)`),
-			m.version, m.name, time.Now().UTC()); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("record migration %d: %w", m.version, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %d: %w", m.version, err)
-		}
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", m.version, err)
+	}
+	if err := m.up(ctx, tx, s.dl); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(
+		`insert into schema_migrations (version, name, applied_at) values (?, ?, ?)`),
+		m.version, m.name, time.Now().UTC()); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record migration %d: %w", m.version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", m.version, err)
 	}
 	return nil
 }
@@ -207,6 +262,81 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 	}
 	if _, err := tx.ExecContext(ctx, stmt); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// dropColumnIfPresent runs `alter table <table> drop column <column>`
+// tolerantly of the column already being gone -- addColumnIfMissing's
+// mirror image, in the same shape and for the same reason: a migration must
+// be replayable, and both dialects reach the identical end state by
+// different syntax. Postgres has the clause (`drop column if exists`);
+// sqlite has none, so the statement runs as-is and the "no such column"
+// error it returns for an absent column is swallowed.
+//
+// column is a BARE identifier, never a list: one call per column, so a
+// failure names the column it was on. It is deliberately scoped by
+// (table, column) rather than by column name alone -- migration79Up drops
+// model_mappings.vision_capable while model_mapping_benchmarks.vision_capable,
+// a benchmark run's recorded history, must survive.
+//
+// The two things that make this safe on sqlite, which rebuilds the table
+// under the covers: sqlite REFUSES to drop a column that an index, view,
+// trigger, generated column or PRIMARY KEY/UNIQUE constraint mentions
+// (returning an error rather than silently reshaping the schema), and it
+// does not support dropping the last remaining column. A caller must
+// therefore check its columns against the table's indexes before using
+// this; migration79Up's are checked against the one index on model_mappings
+// (idx_model_mappings_application on application_id).
+//
+// That refusal is only a safety net if it can actually be SEEN, which is
+// what makes the swallow's precision load-bearing rather than cosmetic: a
+// swallow matching "no such column" anywhere in the message would hide
+// exactly the error the paragraph above relies on -- a blocked drop reported
+// as "the column is already gone", leaving sqlite with the column and
+// postgres (`drop column if exists`) without it, the migration recorded as
+// applied, and no diagnostic anywhere.
+//
+// So the swallow matches the absent-column error and nothing else, and the
+// DOUBLE QUOTES are the half that does the discriminating: sqlite's plain
+// absent-column error is the only message here that quotes the column
+// (`no such column: "note"`), and every refusal names it bare. The
+// `after drop column` clause is a SECOND, INDEPENDENT guard rather than an
+// equivalent one. It does hold for the refusals the drop itself provokes --
+// `error in index t2y after drop column: no such column: y`, and the same
+// shape for a rebuilt `table`, a `view`, or a `trigger` (the last naming
+// `new.<col>`) -- but it is NOT a property of every error a drop returns:
+//
+//   - sqlite re-validates the WHOLE schema around the edit, so a view or
+//     trigger that ALREADY did not parse aborts the drop as well, even a
+//     drop on an unrelated table. That error carries no clause and names
+//     whatever was already unresolvable rather than the dropped column:
+//     `error in view v1: no such column: d`. A view or trigger that
+//     references the dropped column AND something stale lands in this shape
+//     too (`error in trigger tr: no such column: new.z`).
+//   - `cannot drop UNIQUE column: "code"` does quote the column and carries
+//     no clause; it is harmless only because it never says "no such column".
+//
+// Matching on the clause ALONE would therefore swallow that first group and
+// restore the exact trap. Both halves are checked so that a future sqlite
+// rewording which started quoting the column in a refusal would not
+// silently restore it from the other direction.
+//
+// migration79Up is the first and only caller. See
+// TestDropColumnIfPresentSQLite for the present, the already-absent, the
+// nonexistent-table and four BLOCKED cases (index, view, trigger, and a
+// clause-less refusal).
+func dropColumnIfPresent(ctx context.Context, tx *sql.Tx, dl dialect, table, column string) error {
+	if dl.name() == "postgres" {
+		return execTx(ctx, tx, dl, "alter table "+table+" drop column if exists "+column)
+	}
+	if _, err := tx.ExecContext(ctx, "alter table "+table+" drop column "+column); err != nil {
+		msg := strings.ToLower(err.Error())
+		absent := strings.Contains(msg, `no such column: "`+strings.ToLower(column)+`"`)
+		if absent && !strings.Contains(msg, "after drop column") {
 			return nil
 		}
 		return err
@@ -3294,8 +3424,10 @@ func migration75Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 //
 // These two columns are deliberately NOT part of the metrics_locked group
 // this table otherwise guards every automated writer with: see
-// SQLiteStore.UpdateMappingLiveProgressSupport for why -- a build capability
-// is not a metric an operator pins numbers against.
+// routing.MappingStore.UpsertMappingCapabilities for why -- a build
+// capability is not a metric an operator pins numbers against. That is where
+// the argument lives now that the verdict is a model_mapping_capabilities row
+// (migration 78) rather than this column.
 func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	if err := addColumnIfMissing(ctx, tx, dl, "model_mappings",
 		"live_progress_support text not null default ''"); err != nil {
@@ -3316,7 +3448,10 @@ func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // capabilities_checked_at. Append-only, no backfill.
 //
 // Like migration76Up's columns and for the same reason, these are NOT part of
-// the metrics_locked group: see SQLiteStore.UpdateMappingCapabilities.
+// the metrics_locked group: see
+// routing.MappingStore.UpsertMappingCapabilities, which carries the argument
+// now that migration 78's per-capability rows -- not these columns -- are
+// what the probes write.
 func migration77Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	for _, col := range []string{
 		"cap_vision text not null default ''",
@@ -3332,4 +3467,283 @@ func migration77Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return addColumnIfMissing(ctx, tx, dl, "model_mappings",
 		"capabilities_checked_at "+dl.timestampType())
+}
+
+// migration78Up creates model_mapping_capabilities — one row per (mapping,
+// capability) carrying the verdict, its SOURCE and when it was established —
+// and backfills it from the columns it supersedes.
+//
+// It deliberately does NOT drop those columns: that happens in a later
+// migration once nothing reads or writes them, so this migration is safe to
+// apply to a database an older binary still serves.
+//
+// Absence of a row means UNKNOWN. That is why two backfill cases write NO
+// row: a vision_capable of 0 whose metrics_source proves no measurement
+// happened (the column conflated "no" with "never probed"), and an is_mtp of
+// 0 (the column is seeded from a NAME HEURISTIC, so its false means "the name
+// did not match", not "measured no"). Writing those as "no" would enter a
+// guess into the record as a measurement.
+func migration78Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := execTx(ctx, tx, dl, `
+		create table if not exists model_mapping_capabilities (
+			mapping_id text not null references model_mappings(id) on delete cascade,
+			capability text not null,
+			verdict text not null,
+			source text not null,
+			checked_at `+dl.timestampType()+` not null,
+			primary key (mapping_id, capability)
+		)`); err != nil {
+		return err
+	}
+	// One timestamp for the whole backfill, so every row a mapping's columns
+	// could not date shares the same "inherited at migration time" instant
+	// rather than drifting by statement.
+	now := time.Now().UTC()
+	// Backfill. One INSERT … SELECT per source column keeps each rule
+	// readable and independently reviewable; `on conflict do nothing` makes
+	// the whole migration idempotent.
+	//
+	// The `where … <> '' ` clauses are the zero-value-means-unknown
+	// convention (migration76Up/77Up) turned into row absence: a column that
+	// determined nothing produces nothing.
+	//
+	// The cap_* statements are spelled out rather than generated from a
+	// list of column names: a migration's SQL is read as the record of what
+	// it did, and building it by string-concatenating identifiers hides that
+	// record behind a loop. cap_vision is not here but in the vision block
+	// below, where its RANK places it among the other three writers of the
+	// same row.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'video', m.cap_video, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_video <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_video: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'audio', m.cap_audio, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_audio <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_audio: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'tools', m.cap_tools, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_tools <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_tools: %w", err)
+	}
+	// live_progress_support's "supported"/"unsupported" vocabulary becomes the
+	// table's yes/no. Its only writers are the two probe paths, hence
+	// llama_cpp_props.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'live_progress',
+			case m.live_progress_support when 'supported' then 'yes' else 'no' end,
+			'llama_cpp_props', coalesce(m.live_progress_checked_at, ?)
+		from model_mappings m where m.live_progress_support <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill live_progress_support: %w", err)
+	}
+	// vision is the one capability TWO dropped columns can both speak for:
+	// cap_vision (migration 77, written only by the /props probe) and
+	// vision_capable (migration 32, whose writer is recoverable only from the
+	// mapping-wide metrics_source — 'vision' was the vision benchmark,
+	// 'manual' an operator, and anything else cannot be attributed at all).
+	//
+	// So the four statements below run in RANK order, highest first, and
+	// `on conflict do nothing` makes the first one to reach a mapping the one
+	// that keeps it. That is the same total order every capability WRITER
+	// obeys at runtime (routing.capabilitySourceRank: manual 3 >
+	// vision_benchmark 2 > llama_cpp_props/legacy 1), applied here because a
+	// backfill is a write like any other: ordering by column instead would
+	// let a probe's rank-1 verdict displace the operator's rank-3 one, which
+	// is precisely the inversion this table exists to make impossible — and
+	// migration 79 drops the columns, so nothing could read them again to
+	// repair it.
+	//
+	// Rank 1 against rank 1 (cap_vision before the legacy fallback) resolves
+	// for the direct /props signal over a column whose real origin is
+	// unknowable — the only pair for which "the newer verdict wins" was ever
+	// the whole story.
+	//
+	// A verdict per statement rather than per column: within one rank band
+	// vision_capable's 1 and 0 are the same evidence, so they share a
+	// statement and a `case`. The `in (0, 1)` guard keeps a value neither
+	// writer could have produced out of the table entirely, exactly as the
+	// per-verdict statements it replaces did.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', case m.vision_capable when 1 then 'yes' else 'no' end,
+			'manual', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.metrics_source = 'manual' and m.vision_capable in (0, 1)
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable (manual): %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', case m.vision_capable when 1 then 'yes' else 'no' end,
+			'vision_benchmark', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.metrics_source = 'vision' and m.vision_capable in (0, 1)
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable (vision_benchmark): %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', m.cap_vision, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_vision <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_vision: %w", err)
+	}
+	// The legacy fallback, and the one place a vision_capable of 0 writes NO
+	// row: without a metrics_source that proves a measurement happened, the 0
+	// is the column's default and says nothing — and unknown is a row's
+	// absence. A 1 is inherited as legacy (probe-overwritable, see
+	// routing.CapabilitySourceLegacy) because a guess treated as
+	// authoritative would be frozen in forever.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', 'yes', 'legacy', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.vision_capable = 1 and m.metrics_source not in ('vision', 'manual')
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable (legacy): %w", err)
+	}
+	// is_mtp = 1 only. The column is seeded from a name heuristic at creation
+	// and is also operator-settable, and the two are indistinguishable after
+	// the fact — so a true is inherited as 'legacy' (probe-overwritable), and
+	// a false, which only means "the name did not match", produces no row.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'mtp', 'yes', 'legacy', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m where m.is_mtp = 1
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill is_mtp: %w", err)
+	}
+	return migration78BackfillCapExtra(ctx, tx, dl, now)
+}
+
+// migration78BackfillCapExtra turns cap_extra — a JSON array of capability
+// names with no column of their own — into one 'yes' row per name. A reported
+// extra capability is a positive assertion, hence yes.
+//
+// This one case runs in Go because SQL cannot portably split a JSON array
+// (SQLite's json_each and Postgres' jsonb_array_elements_text share no
+// syntax). A malformed value is SKIPPED silently rather than failing the
+// migration: the column is empty in practice today (llama.cpp never
+// populates it), so an unparseable value is a curiosity, not a reason to
+// block an upgrade.
+func migration78BackfillCapExtra(ctx context.Context, tx *sql.Tx, dl dialect, now time.Time) error {
+	// Read the whole column set FIRST and close the cursor before inserting:
+	// a tx holds a single connection, so an insert issued while its own rows
+	// cursor is still open would contend with it.
+	pending, err := migration78ReadCapExtra(ctx, tx, dl)
+	if err != nil {
+		return err
+	}
+	for _, e := range pending {
+		for _, name := range e.names {
+			if name == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, dl.rebind(`
+				insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+				select m.id, ?, 'yes', 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+				from model_mappings m where m.id = ?
+				on conflict (mapping_id, capability) do nothing`),
+				name, now, e.mappingID); err != nil {
+				return fmt.Errorf("backfill cap_extra %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// capExtraNames is one mapping's decoded cap_extra array.
+type capExtraNames struct {
+	mappingID string
+	names     []string
+}
+
+// migration78ReadCapExtra decodes every non-empty cap_extra. A value that is
+// not a JSON array of strings is skipped: see migration78BackfillCapExtra.
+func migration78ReadCapExtra(ctx context.Context, tx *sql.Tx, dl dialect) ([]capExtraNames, error) {
+	rows, err := tx.QueryContext(ctx, dl.rebind(
+		`select id, cap_extra from model_mappings where cap_extra <> '' and cap_extra <> '[]'`))
+	if err != nil {
+		return nil, fmt.Errorf("read cap_extra: %w", err)
+	}
+	defer rows.Close()
+	out := make([]capExtraNames, 0)
+	for rows.Next() {
+		var mappingID, encoded string
+		if err := rows.Scan(&mappingID, &encoded); err != nil {
+			return nil, fmt.Errorf("scan cap_extra: %w", err)
+		}
+		var names []string
+		if err := json.Unmarshal([]byte(encoded), &names); err != nil {
+			continue // malformed: skip, never fail the migration
+		}
+		out = append(out, capExtraNames{mappingID: mappingID, names: names})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cap_extra: %w", err)
+	}
+	return out, nil
+}
+
+// migration79Up drops the eleven model_mappings columns
+// model_mapping_capabilities superseded, now that nothing reads or writes
+// any of them: migration 77's cap_vision/cap_video/cap_audio/cap_tools/
+// cap_extra/capabilities_source/capabilities_checked_at, migration 32's
+// vision_capable, the baseline's is_mtp, and migration 76's
+// live_progress_support/live_progress_checked_at.
+//
+// THE ORDER RELATIVE TO 78 IS LOAD-BEARING. Migration 78 READS these columns
+// to backfill the table from them; this migration removes them. A fresh
+// install replays both in this order against an empty table and an upgraded
+// database replays them against real rows, and both must end on the same
+// schema with the backfilled rows intact -- pinned by
+// TestMigration79FreshInstallMatchesUpgradedSchema. Nothing may ever be
+// inserted between the two.
+//
+// It also DEPARTS from this repository's practice of leaving a superseded
+// column inert (the native_responses/native_messages booleans migration 72
+// replaced are still there). ADR-039 records why the case differs rather
+// than establishing a precedent: these eleven shipped days earlier and had
+// no reader outside the feature being rewritten, where those booleans were
+// long-established with consumers beyond their own. A column with outside
+// readers still stays.
+//
+// model_mapping_benchmarks.vision_capable (migration 33) is NOT touched: it
+// is a benchmark run's recorded result, one row per measurement, not a
+// mapping's current verdict -- which is why dropColumnIfPresent is scoped by
+// (table, column) and this loop names its table explicitly.
+//
+// Safe on sqlite, which rebuilds the table to drop a column and refuses to
+// drop an INDEXED one: the only index on model_mappings is
+// idx_model_mappings_application on (application_id), and none of the eleven
+// appears in it or in any view, trigger or constraint.
+func migration79Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, column := range []string{
+		"cap_vision",
+		"cap_video",
+		"cap_audio",
+		"cap_tools",
+		"cap_extra",
+		"capabilities_source",
+		"capabilities_checked_at",
+		"vision_capable",
+		"is_mtp",
+		"live_progress_support",
+		"live_progress_checked_at",
+	} {
+		if err := dropColumnIfPresent(ctx, tx, dl, "model_mappings", column); err != nil {
+			return fmt.Errorf("drop model_mappings.%s: %w", column, err)
+		}
+	}
+	return nil
 }

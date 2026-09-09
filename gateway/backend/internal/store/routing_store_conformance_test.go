@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -55,6 +56,44 @@ func forEachRoutingStoreSeeded(t *testing.T, seedSQL func(t *testing.T, s *SQLSt
 			seedSQL(t, sqlStore)
 		}
 		run(t, sqlStore)
+	})
+	// The postgres leg, added with the capability table (#49-2 follow-up).
+	// Until then this harness ran memory + sqlite only, so every routing-store
+	// conformance assertion in this file -- including the SQL that dialects
+	// genuinely disagree about, `on conflict (...) do update`, `where ... in
+	// (...)` with rebound placeholders, and narrow-vs-wide column types
+	// (ADR-005) -- was unverified on the driver operators actually deploy.
+	// forEachDialect (conformance_test.go) already had this leg; this one is
+	// the same block, and adding it turned out to cost about five seconds and
+	// to pass unchanged, which is the argument for having it.
+	//
+	// It SKIPS silently without the DSN, exactly like its sibling: that is the
+	// documented convention (persistence.md), and AGENTS.md is the standing
+	// instruction to set it -- "verify store changes with
+	// OP_AI_GATEWAY_TEST_POSTGRES_DSN set". CI sets it.
+	t.Run("postgres", func(t *testing.T) {
+		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
+		if dsn == "" {
+			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
+		}
+		ctx := context.Background()
+		pgStore, err := OpenPostgres(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open postgres: %v", err)
+		}
+		defer pgStore.Close()
+		// Clean slate so the suite is deterministic against a reused database
+		// -- the same guard forEachDialect's postgres leg applies.
+		if err := dropAllTables(ctx, pgStore); err != nil {
+			t.Fatalf("drop tables: %v", err)
+		}
+		if err := pgStore.Migrate(ctx); err != nil {
+			t.Fatalf("migrate postgres: %v", err)
+		}
+		if seedSQL != nil {
+			seedSQL(t, pgStore)
+		}
+		run(t, pgStore)
 	})
 }
 
@@ -151,6 +190,92 @@ func TestRoutingStoreActiveMappingsForModel(t *testing.T) {
 		}
 		if len(none) != 0 {
 			t.Fatalf("expected 0 candidates for an unknown model, got %d: %+v", len(none), none)
+		}
+	})
+}
+
+// TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts (Task 4)
+// proves ActiveMappingsForModel's two filtered joins (SQL) and MemoryStore's
+// mirror apply the IDENTICAL three-state-to-bool/string boundary conversion
+// on every backend: an "mtp"/"yes" row -> IsMTP true, an "mtp"/"no" row ->
+// IsMTP false (the case a careless three-state-to-bool conversion gets
+// wrong -- mapping "no" to true), and no row at all -> IsMTP false; likewise
+// LiveProgressSupport is "supported"/"unsupported"/"" for a
+// "live_progress" yes/no/absent row. Because forEachRoutingStore runs the
+// SAME assertions against MemoryStore, sqlite and postgres, a divergence in
+// either driver's join/mirror or in the shared MTPFromVerdict /
+// LiveProgressSupportFromVerdict conversion surfaces here, not in
+// production.
+func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+			CreatedAt:       now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+
+		newMapping := func(id string) routing.ModelMapping {
+			return routing.ModelMapping{
+				ID: id, ApplicationID: "app1", GatewayModelName: "model-" + id, AppModelName: "up-" + id,
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+		for _, id := range []string{"map_yes", "map_no", "map_absent"} {
+			if err := s.CreateMapping(ctx, newMapping(id)); err != nil {
+				t.Fatalf("create mapping %s: %v", id, err)
+			}
+		}
+
+		if err := s.UpsertMappingCapabilities(ctx, "map_yes", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert map_yes capabilities: %v", err)
+		}
+		if err := s.UpsertMappingCapabilities(ctx, "map_no", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert map_no capabilities: %v", err)
+		}
+		// map_absent gets no capability rows at all -- "never determined".
+
+		for _, tc := range []struct {
+			model            string
+			wantIsMTP        bool
+			wantLiveProgress string
+		}{
+			{"model-map_yes", true, "supported"},
+			{"model-map_no", false, "unsupported"},
+			{"model-map_absent", false, ""},
+		} {
+			got, err := s.ActiveMappingsForModel(ctx, tc.model, routing.APIFlavorOpenAI)
+			if err != nil {
+				t.Fatalf("active mappings for %s: %v", tc.model, err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("active mappings for %s: got %d candidates, want 1: %+v", tc.model, len(got), got)
+			}
+			if got[0].IsMTP != tc.wantIsMTP {
+				t.Fatalf("model %s: IsMTP = %v, want %v", tc.model, got[0].IsMTP, tc.wantIsMTP)
+			}
+			if got[0].LiveProgressSupport != tc.wantLiveProgress {
+				t.Fatalf("model %s: LiveProgressSupport = %q, want %q", tc.model, got[0].LiveProgressSupport, tc.wantLiveProgress)
+			}
 		}
 	})
 }
@@ -367,22 +492,28 @@ func TestRoutingStoreOpportunisticMetricsEWMA(t *testing.T) {
 	})
 }
 
-// --- Live-progress capability verdict (#51) ---------------------------------
+// --- Capability rows and metrics_locked (#49-3) -----------------------------
 
-// TestUpdateMappingLiveProgressSupportIgnoresMetricsLock is the load-bearing
-// test for the deliberate deviation in UpdateMappingLiveProgressSupport: UNLIKE
-// every other targeted mapping writer (UpdateMappingContextProbe,
-// UpdateMappingVisionCapable, UpdateMappingBenchmarkMetrics,
-// UpdateMappingOpportunisticMetrics, UpdateMappingCapacityMetrics,
-// UpdateMappingEnergyEWMA -- six for six), this one must NOT be blocked by
-// MetricsLocked, and must NOT restamp MetricsSource / MetricsUpdatedAt. It
-// writes a mapping that is LOCKED, with a known MetricsSource, a known
-// MetricsUpdatedAt and a known GenTokensPerSecond, and asserts the verdict
-// lands while all four metrics fields stay exactly as seeded. If a future
-// change "fixes" this writer to look like its six siblings (adds the
-// `MetricsLocked` guard back, or starts stamping the metrics provenance
-// columns), this test must fail on both backends.
-func TestUpdateMappingLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
+// TestUpsertMappingCapabilitiesIgnoresMetricsLock is the load-bearing test for
+// the deliberate deviation in UpsertMappingCapabilities: UNLIKE every targeted
+// mapping METRIC writer (UpdateMappingContextProbe,
+// UpdateMappingBenchmarkMetrics, UpdateMappingOpportunisticMetrics,
+// UpdateMappingCapacityMetrics, UpdateMappingEnergyEWMA -- five for five),
+// this one must NOT be blocked by MetricsLocked, and must NOT restamp
+// MetricsSource / MetricsUpdatedAt. It writes a capability row on a mapping
+// that is LOCKED, with a known MetricsSource, a known MetricsUpdatedAt and a
+// known GenTokensPerSecond, and asserts the row lands while all four metrics
+// fields stay exactly as seeded. If a future change "fixes" this writer to
+// look like its metric siblings (adds a MetricsLocked guard, or starts
+// stamping the metrics provenance columns), this test must fail on both
+// backends.
+//
+// It is this file's converted form of the same test that pinned the property
+// for the pre-78 live_progress_support column: the argument
+// (routing.MappingStore.UpsertMappingCapabilities) survived the columns'
+// writers, so the test that pins it moved onto the table rather than being
+// deleted with them.
+func TestUpsertMappingCapabilitiesIgnoresMetricsLock(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
 		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
@@ -425,23 +556,36 @@ func TestUpdateMappingLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
 			t.Fatalf("lock mapping: %v", err)
 		}
 
-		// Write the live-progress verdict on the LOCKED mapping.
+		// Write a capability row on the LOCKED mapping.
 		verdictAt := now.Add(3 * time.Hour)
-		if err := s.UpdateMappingLiveProgressSupport(ctx, "m1", "supported", verdictAt); err != nil {
-			t.Fatalf("update mapping live progress support: %v", err)
+		if err := s.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{{
+			Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityYes,
+			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: verdictAt,
+		}}); err != nil {
+			t.Fatalf("upsert mapping capabilities: %v", err)
+		}
+
+		// The verdict landed -- the lock did NOT block it.
+		caps, err := s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("mapping capabilities: %v", err)
+		}
+		if len(caps) != 1 {
+			t.Fatalf("capability rows = %+v, want exactly 1 (MetricsLocked must not block this writer)", caps)
+		}
+		if caps[0].Capability != routing.CapabilityLiveProgress || caps[0].Verdict != routing.CapabilityYes {
+			t.Fatalf("capability row = %+v, want live_progress/yes", caps[0])
+		}
+		if caps[0].Source != routing.CapabilitySourceLlamaCppProps {
+			t.Fatalf("capability row Source = %q, want %q", caps[0].Source, routing.CapabilitySourceLlamaCppProps)
+		}
+		if !caps[0].CheckedAt.Equal(verdictAt) {
+			t.Fatalf("capability row CheckedAt = %v, want %v", caps[0].CheckedAt, verdictAt)
 		}
 
 		got, err := s.MappingByID(ctx, "m1")
 		if err != nil {
 			t.Fatalf("mapping by id: %v", err)
-		}
-
-		// The verdict landed -- the lock did NOT block it.
-		if got.LiveProgressSupport != "supported" {
-			t.Fatalf("LiveProgressSupport = %q, want %q (MetricsLocked must not block this writer)", got.LiveProgressSupport, "supported")
-		}
-		if got.LiveProgressCheckedAt == nil || !got.LiveProgressCheckedAt.Equal(verdictAt) {
-			t.Fatalf("LiveProgressCheckedAt = %v, want %v", got.LiveProgressCheckedAt, verdictAt)
 		}
 
 		// All four metrics fields are untouched.
@@ -460,97 +604,61 @@ func TestUpdateMappingLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
 	})
 }
 
-// TestUpdateMappingLiveProgressSupportRoundTrip proves the three accepted
-// verdict values round-trip through both backends, that a freshly created
-// mapping defaults to "" (never determined), and that a write against a
-// missing mapping id is a benign no-op, mirroring every sibling mapping
-// writer's missing-id convention.
-func TestUpdateMappingLiveProgressSupportRoundTrip(t *testing.T) {
+// TestUpsertMappingCapabilitiesUnknownMappingFails pins the ONE way
+// UpsertMappingCapabilities is NOT "the benign no-op every other targeted
+// mapping writer promises for a missing id" (see case (e) in
+// TestUpdateMappingMetrics* above, and DeleteMappingCapability's own doc):
+// model_mapping_capabilities.mapping_id carries a real FK
+// (`references model_mappings(id) on delete cascade`, migration 78), so
+// writing against a mapping id that does not exist fails on every driver
+// instead of silently creating an orphan row.
+//
+// This is a fix, not a pre-existing property: MemoryStore originally had no
+// existence check here at all (unlike its sibling mapping-child writers
+// UpsertRuntimeSpec/InsertBenchmarkRun) and would fabricate a capabilities
+// entry for a mapping that was never created -- invisible on the SQL drivers,
+// which have always rejected it via the real FK, so the divergence would
+// only ever have surfaced through a memory-mode-only bug report. This test
+// is what makes it visible instead: both backends must not only ERROR, they
+// must leave NO row behind.
+func TestUpsertMappingCapabilitiesUnknownMappingFails(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
-		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 
-		if err := s.CreateAIServer(ctx, routing.AIServer{
-			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
-			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
-			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
-		if err := s.CreateApplication(ctx, routing.Application{
-			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
-			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
-			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
-			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
-		mapping := routing.ModelMapping{
-			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
-			AppModelName: "up", Status: routing.ServerStatusActive,
-			CreatedAt: now, UpdatedAt: now,
-		}
-		if err := s.CreateMapping(ctx, mapping); err != nil {
-			t.Fatalf("create mapping: %v", err)
+		err := s.UpsertMappingCapabilities(ctx, "does-not-exist", []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now,
+		}})
+		if err == nil {
+			t.Fatalf("UpsertMappingCapabilities(missing mapping) = nil error, want a failure (FK violation on SQL, ErrNotFound on memory)")
 		}
 
-		// Default on a freshly created mapping: "" (never determined), no
-		// checked-at timestamp.
-		got, err := s.MappingByID(ctx, "m1")
+		caps, err := s.MappingCapabilities(ctx, "does-not-exist")
 		if err != nil {
-			t.Fatalf("mapping by id: %v", err)
+			t.Fatalf("MappingCapabilities: %v", err)
 		}
-		if got.LiveProgressSupport != "" {
-			t.Fatalf("LiveProgressSupport = %q, want \"\" (default)", got.LiveProgressSupport)
-		}
-		if got.LiveProgressCheckedAt != nil {
-			t.Fatalf("LiveProgressCheckedAt = %v, want nil (default)", got.LiveProgressCheckedAt)
-		}
-
-		// The three accepted values round-trip.
-		for i, tc := range []struct {
-			support string
-		}{
-			{"supported"},
-			{"unsupported"},
-			{""},
-		} {
-			at := now.Add(time.Duration(i+1) * time.Hour)
-			if err := s.UpdateMappingLiveProgressSupport(ctx, "m1", tc.support, at); err != nil {
-				t.Fatalf("update mapping live progress support (%q): %v", tc.support, err)
-			}
-			got, err := s.MappingByID(ctx, "m1")
-			if err != nil {
-				t.Fatalf("mapping by id (%q): %v", tc.support, err)
-			}
-			if got.LiveProgressSupport != tc.support {
-				t.Fatalf("LiveProgressSupport = %q, want %q", got.LiveProgressSupport, tc.support)
-			}
-			if got.LiveProgressCheckedAt == nil || !got.LiveProgressCheckedAt.Equal(at) {
-				t.Fatalf("LiveProgressCheckedAt = %v, want %v", got.LiveProgressCheckedAt, at)
-			}
-		}
-
-		// A write against a MISSING mapping id is a benign no-op (no error),
-		// mirroring every sibling mapping writer's missing-id convention.
-		if err := s.UpdateMappingLiveProgressSupport(ctx, "does-not-exist", "supported", now); err != nil {
-			t.Fatalf("update mapping live progress support (missing) = %v, want nil (benign no-op)", err)
+		if len(caps) != 0 {
+			t.Fatalf("capability rows = %+v, want none -- the rejected write must not leave an orphan row behind", caps)
 		}
 	})
 }
 
-// --- Capability verdicts (#49 sub-project 2) ---------------------------------
+// --- Capability rows (model_mapping_capabilities) ---------------------------
 
-// Capability verdicts round-trip, are written only for non-empty fields, and
-// are NOT guarded by metrics_locked (a capability is not a pinned metric --
-// the live_progress_support precedent this mirrors).
-func TestUpdateMappingCapabilities(t *testing.T) {
+// TestMappingCapabilityRows proves the per-capability row API on both
+// drivers: rows round-trip with their provenance, a second write for the same
+// (mapping, capability) REPLACES rather than duplicating, a delete returns a
+// capability to unknown, and "unknown" is expressed by the ABSENCE of a row
+// rather than by an empty verdict -- including in the bulk reader, which must
+// not invent a key for a mapping that has no rows.
+func TestMappingCapabilityRows(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
 		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 
 		// server + app + mapping "m1" exactly as
-		// TestUpdateMappingLiveProgressSupportIgnoresMetricsLock builds them.
+		// TestUpsertMappingCapabilitiesIgnoresMetricsLock builds them.
 		if err := s.CreateAIServer(ctx, routing.AIServer{
 			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
 			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
@@ -566,79 +674,243 @@ func TestUpdateMappingCapabilities(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		mapping := routing.ModelMapping{
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
 			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
 			AppModelName: "up", Status: routing.ServerStatusActive,
 			CreatedAt: now, UpdatedAt: now,
-		}
-		if err := s.CreateMapping(ctx, mapping); err != nil {
+		}); err != nil {
 			t.Fatalf("create mapping: %v", err)
 		}
 
-		caps := routing.CapabilityVerdicts{
-			Vision: "yes", Video: "no", Audio: "", Tools: "yes",
-			Extra: []string{"thinking"}, Source: "llama_cpp_props",
+		rows := []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityTools, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 		}
-		at := now.Add(time.Hour)
-		if err := s.UpdateMappingCapabilities(ctx, "m1", caps, at); err != nil {
-			t.Fatalf("UpdateMappingCapabilities: %v", err)
+		if err := s.UpsertMappingCapabilities(ctx, "m1", rows); err != nil {
+			t.Fatalf("upsert: %v", err)
 		}
-		got, err := s.MappingByID(ctx, "m1")
+		got, err := s.MappingCapabilities(ctx, "m1")
 		if err != nil {
-			t.Fatalf("MappingByID: %v", err)
+			t.Fatalf("read: %v", err)
 		}
-		if got.CapVision != "yes" || got.CapVideo != "no" || got.CapTools != "yes" {
-			t.Fatalf("verdicts not stored: %+v", got)
+		if len(got) != 2 {
+			t.Fatalf("got %d rows, want 2: %+v", len(got), got)
 		}
-		if got.CapAudio != "" {
-			t.Fatalf("an empty verdict must not be written: cap_audio = %q", got.CapAudio)
+		byName := map[string]routing.CapabilityRow{}
+		for _, r := range got {
+			byName[r.Capability] = r
 		}
-		if got.CapExtra != `["thinking"]` {
-			t.Fatalf("cap_extra = %q, want a JSON array", got.CapExtra)
+		if byName["vision"].Verdict != "yes" || byName["vision"].Source != "llama_cpp_props" {
+			t.Fatalf("vision row = %+v", byName["vision"])
 		}
-		if got.CapabilitiesSource != "llama_cpp_props" {
-			t.Fatalf("capabilities_source = %q", got.CapabilitiesSource)
+		if byName["vision"].CheckedAt.IsZero() {
+			t.Fatal("checked_at not stored")
 		}
-		if got.CapabilitiesCheckedAt == nil {
-			t.Fatal("capabilities_checked_at not stamped")
-		}
-
-		// An empty verdict must not CLEAR a stored one (the central discipline).
-		if err := s.UpdateMappingCapabilities(ctx, "m1",
-			routing.CapabilityVerdicts{Audio: "yes", Source: "llama_cpp_props"}, at); err != nil {
-			t.Fatalf("second write: %v", err)
-		}
-		got, _ = s.MappingByID(ctx, "m1")
-		if got.CapVision != "yes" || got.CapTools != "yes" {
-			t.Fatalf("an empty verdict cleared a stored one: %+v", got)
-		}
-		if got.CapAudio != "yes" {
-			t.Fatalf("cap_audio = %q, want the newly determined yes", got.CapAudio)
+		if _, present := byName["audio"]; present {
+			t.Fatal("an unwritten capability must be ABSENT, not a row -- absence is how unknown is expressed")
 		}
 
-		// metrics_locked does NOT block a capability write. There is no
-		// lock-setting helper: mutate the mapping and call UpdateMapping, exactly
-		// as TestUpdateMappingLiveProgressSupportIgnoresMetricsLock does.
-		locked := routing.ModelMapping{
-			ID: "m2", ApplicationID: "app1", GatewayModelName: "gpt-4o", AppModelName: "up2",
-			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		// Upsert replaces in place: same capability, new verdict, no duplicate row.
+		later := now.Add(time.Hour)
+		if err := s.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: later},
+		}); err != nil {
+			t.Fatalf("re-upsert: %v", err)
 		}
-		if err := s.CreateMapping(ctx, locked); err != nil {
-			t.Fatalf("create locked mapping: %v", err)
+		got, err = s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("read after re-upsert: %v", err)
 		}
-		locked.MetricsLocked = true
-		locked.MetricsSource = "benchmark"
-		locked.UpdatedAt = now.Add(2 * time.Hour)
-		if err := s.UpdateMapping(ctx, locked); err != nil {
-			t.Fatalf("lock mapping: %v", err)
+		if len(got) != 2 {
+			t.Fatalf("upsert duplicated a row: %d rows %+v", len(got), got)
 		}
-		if err := s.UpdateMappingCapabilities(ctx, "m2",
-			routing.CapabilityVerdicts{Video: "yes", Source: "llama_cpp_props"}, at); err != nil {
-			t.Fatalf("locked write: %v", err)
+		for _, r := range got {
+			if r.Capability == "vision" && (r.Verdict != "no" || r.Source != "vision_benchmark") {
+				t.Fatalf("upsert did not replace: %+v", r)
+			}
 		}
-		gotLocked, _ := s.MappingByID(ctx, "m2")
-		if gotLocked.CapVideo != "yes" {
-			t.Fatal("metrics_locked blocked a capability write -- it must not (a capability is not a pinned metric)")
+
+		// Delete returns a capability to unknown -- the state the old bool
+		// could not express.
+		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		got, err = s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("read after delete: %v", err)
+		}
+		for _, r := range got {
+			if r.Capability == "vision" {
+				t.Fatal("delete left the row behind")
+			}
+		}
+		// Deleting an absent row is a benign no-op, not an error.
+		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
+			t.Fatalf("delete of an absent row must be a no-op: %v", err)
+		}
+		// Every OTHER failing shape is a benign no-op too, on every driver: an
+		// unknown mapping id, a capability name no code knows, and an empty
+		// name. This is not a curiosity -- it is the reason the portal's reset
+		// path (an empty verdict in portal.Service.UpdateMapping's
+		// CapabilityVerdicts) has to carry BOTH its own authorisation
+		// (authorizeMapping) and its own empty-name rejection. The store hands
+		// that path NO existence signal to lean on: "refused", "the mapping does
+		// not exist" and "deleted nothing" are indistinguishable here by design,
+		// unlike UpsertMappingCapabilities, whose FK makes an unknown mapping an
+		// error (see TestUpsertMappingCapabilitiesUnknownMappingFails).
+		for _, absent := range []struct{ mappingID, capability string }{
+			{"does-not-exist", routing.CapabilityVision},
+			{"m1", "a_capability_no_code_knows"},
+			{"m1", ""},
+		} {
+			if err := s.DeleteMappingCapability(ctx, absent.mappingID, absent.capability); err != nil {
+				t.Fatalf("delete(%q, %q) must be a benign no-op, got: %v", absent.mappingID, absent.capability, err)
+			}
+		}
+		// ...and none of those touched the row that IS there.
+		if got, err = s.MappingCapabilities(ctx, "m1"); err != nil {
+			t.Fatalf("read after the no-op deletes: %v", err)
+		}
+		if len(got) != 1 || got[0].Capability != routing.CapabilityTools {
+			t.Fatalf("rows after the no-op deletes = %+v, want only the untouched %q row", got, routing.CapabilityTools)
+		}
+
+		// The batch reader returns exactly the requested parents, and an
+		// unknown id contributes no key at all (not an empty slice).
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "m2", ApplicationID: "app1", GatewayModelName: "gpt-4o",
+			AppModelName: "up2", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping m2: %v", err)
+		}
+		if err := s.UpsertMappingCapabilities(ctx, "m2", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLegacy, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert m2: %v", err)
+		}
+		// m1 must carry at least TWO rows here, not one: a bulk reader whose
+		// per-parent accumulation is unpinned (e.g. `out[id] = []Row{r}`
+		// instead of `out[id] = append(out[id], r)`) keeps only the last row
+		// scanned for a mapping and would still pass a single-row mapping. m1
+		// currently has only "tools" left (vision was deleted above), so add a
+		// second capability back before reading it through the batch API.
+		if err := s.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+			{Capability: routing.CapabilityAudio, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert second capability on m1: %v", err)
+		}
+		batch, err := s.MappingCapabilitiesForMappings(ctx, []string{"m1", "m2", "nope"})
+		if err != nil {
+			t.Fatalf("batch: %v", err)
+		}
+		if len(batch["m2"]) != 1 || batch["m2"][0].Capability != "mtp" {
+			t.Fatalf("batch m2 = %+v", batch["m2"])
+		}
+		if _, present := batch["nope"]; present {
+			t.Fatal("batch reader invented a key for an unknown mapping")
+		}
+		single, err := s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("single read for the batch comparison: %v", err)
+		}
+		if len(single) < 2 {
+			t.Fatalf("fixture bug: m1 must carry >=2 rows to exercise the batch reader's accumulation, got %+v", single)
+		}
+		// Compare element-wise, not just by length: both readers select
+		// `order by capability`, so a lockstep comparison is deterministic and
+		// catches a reader that drops or overwrites a row a plain length check
+		// would miss (e.g. keeping only the mapping's LAST row).
+		if len(batch["m1"]) != len(single) {
+			t.Fatalf("batch and single reader disagree on count: batch=%+v single=%+v", batch["m1"], single)
+		}
+		for i := range single {
+			if batch["m1"][i] != single[i] {
+				t.Fatalf("batch and single reader disagree at row %d: batch=%+v single=%+v", i, batch["m1"], single)
+			}
+		}
+		// An empty id list does no lookup and yields an empty map.
+		if empty, err := s.MappingCapabilitiesForMappings(ctx, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("empty batch: err=%v map=%+v", err, empty)
+		}
+	})
+}
+
+// TestUpsertMappingCapabilitiesRejectsInvalidRows proves both drivers reject
+// (via routing.ValidateCapabilityRow), rather than silently write, a row an
+// operator's documented invariant says cannot exist: an empty Capability or
+// Source, or a Verdict that is neither "yes" nor "no". A caller passing such
+// a row has a bug, and every caller of UpsertMappingCapabilities is
+// best-effort (it logs and carries on), so an error here costs nothing.
+func TestUpsertMappingCapabilitiesRejectsInvalidRows(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_capval", Name: "S1", Domain: "srv-capval.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv-capval.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_capval", ServerID: "srv_capval", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_capval", ApplicationID: "app_capval", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		cases := []struct {
+			name string
+			row  routing.CapabilityRow
+		}{
+			{"empty verdict", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: "", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"verdict neither yes nor no", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: "maybe", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"empty capability", routing.CapabilityRow{Capability: "", Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now}},
+			{"empty source", routing.CapabilityRow{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: "", CheckedAt: now}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{tc.row}); err == nil {
+					t.Fatalf("UpsertMappingCapabilities(%+v) = nil error, want a rejection", tc.row)
+				}
+				got, err := s.MappingCapabilities(ctx, "map_capval")
+				if err != nil {
+					t.Fatalf("read after rejected upsert: %v", err)
+				}
+				if len(got) != 0 {
+					t.Fatalf("a rejected row must not be written: %+v", got)
+				}
+			})
+		}
+
+		// An invalid row anywhere in a batch rejects the WHOLE batch -- no
+		// partial write of the valid rows alongside it.
+		if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityTools, Verdict: "bogus", Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err == nil {
+			t.Fatal("a batch with one invalid row must be rejected entirely")
+		}
+		if got, err := s.MappingCapabilities(ctx, "map_capval"); err != nil || len(got) != 0 {
+			t.Fatalf("a rejected batch must leave no rows behind: err=%v got=%+v", err, got)
+		}
+
+		// A fully valid row still works after the rejections above.
+		if err := s.UpsertMappingCapabilities(ctx, "map_capval", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("a valid row must still be accepted: %v", err)
 		}
 	})
 }

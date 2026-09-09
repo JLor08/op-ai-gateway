@@ -12,8 +12,12 @@ import (
 // liveProgressUpstreams is the "shape genuinely implies a tolerant upstream"
 // clause of wantsLiveProgress's three-layer rule -- the WEAKEST of the three
 // layers, consulted only when the mapping's persisted verdict
-// (routing.Target.LiveProgressSupport, sourced from
-// routing.ModelMapping.LiveProgressSupport) has never been determined ("").
+// (routing.Target.LiveProgressSupport, filled by routing.Resolver.targetFrom
+// from the joined "live_progress" row in model_mapping_capabilities --
+// routing.MappingCandidate.LiveProgressSupport, via
+// routing.LiveProgressSupportFromVerdict; the pre-migration-78
+// live_progress_support column it replaced is gone, dropped by migration 79)
+// has never been determined ("").
 // A recorded verdict, "supported" or "unsupported", always overrides it: that
 // verdict is either an observed upstream answer or CompleteStream's own
 // retry-confirmed rejection, and an observation outranks a guess about the

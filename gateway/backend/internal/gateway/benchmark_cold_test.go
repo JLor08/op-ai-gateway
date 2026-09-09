@@ -19,13 +19,18 @@ import (
 // model M evicts every OTHER model and loads M (a single-slot swapper). *coldLister does
 // NOT implement provider.ModelUnloader — use *coldUnloaderProvider for that.
 type coldLister struct {
-	mu           sync.Mutex
-	loaded       map[string]bool
-	streamed     []string
-	firstDelayMS int
-	calls        int
-	usage        inference.Usage
-	swapEvicts   bool
+	mu       sync.Mutex
+	loaded   map[string]bool
+	streamed []string
+	// streamedTargets records the routing.Target of every stream, alongside
+	// streamed's req.Model and under the same mutex, so a test can assert
+	// what the target BUILDER put on it (the live-progress decision inputs)
+	// and not only which model was asked for.
+	streamedTargets []routing.Target
+	firstDelayMS    int
+	calls           int
+	usage           inference.Usage
+	swapEvicts      bool
 }
 
 func newColdLister(loaded []string) *coldLister {
@@ -40,11 +45,12 @@ func (c *coldLister) Complete(context.Context, routing.Target, inference.Request
 	return provider.Response{}, nil
 }
 
-func (c *coldLister) CompleteStream(_ context.Context, _ routing.Target, req inference.Request, emit provider.StreamEmit) error {
+func (c *coldLister) CompleteStream(_ context.Context, target routing.Target, req inference.Request, emit provider.StreamEmit) error {
 	c.mu.Lock()
 	c.calls++
 	first := c.calls == 1
 	c.streamed = append(c.streamed, req.Model)
+	c.streamedTargets = append(c.streamedTargets, target)
 	if c.swapEvicts {
 		if c.loaded == nil {
 			c.loaded = map[string]bool{}
@@ -88,6 +94,13 @@ func (c *coldLister) streamedModels() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.streamed...)
+}
+
+// streamedTargetList is streamedModels' sibling for the recorded Targets.
+func (c *coldLister) streamedTargetList() []routing.Target {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]routing.Target(nil), c.streamedTargets...)
 }
 
 // coldUnloaderProvider adds provider.ModelUnloader to a coldLister. UnloadModel records the

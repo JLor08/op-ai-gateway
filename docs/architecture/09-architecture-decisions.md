@@ -507,7 +507,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-79-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -563,7 +563,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-79-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -732,7 +732,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-79-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -787,67 +787,214 @@ decision adds exactly the one route #58 needed.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [API Surface](reference/api-surface.md#53-the-agents-own-router-port-not-a-gateway-endpoint).
 
-## ADR-038 — Auto-detected capabilities are three-state, outside the metrics lock, and sync onto the legacy vision bool
+## ADR-038 — Capability detection: one `/props` read, three states, an open vocabulary
 **Context:** #49 sub-project 2 needed a persisted answer for "does this
 upstream take images/video/audio, and does its chat template support tool
-calls" — and two existing precedents on `model_mappings` point in opposite
-directions. `vision_capable` (migration 32) is a **bool**; among AUTOMATED
-writers it goes only through the **lock-respecting**
-`UpdateMappingVisionCapable`, which stamps `metrics_source = "vision"` like
-every other metric writer on the table — but the operator's own mapping-edit
-path bypasses the lock: the portal's mapping PUT (`Service.UpdateMapping`)
-writes it through the plain, unguarded `UpdateMapping`, stamping
-`metrics_source = "manual"` instead, exactly like every other operator-edited
-metric on the table.
-`live_progress_support` (migration 76, ADR before this one) is **three-state**
-(`""`/`supported`/`unsupported`), written through a dedicated writer that
-carries **no** `metrics_locked` guard and never touches `metrics_source` —
-because a build capability, unlike a throughput figure, is not a number an
-operator vouches for; pinning one could only ever produce a wrong answer, and
-a wrong capability fails silently rather than loudly. A bool cannot say "not
-probed": `vision_capable`'s zero value is indistinguishable from an observed
-"no," and the models list already ANDs it across every mapping serving a
-gateway model name, fail-closed by construction (a model starts `true` on
-first sight and is only ever ANDed down) — so a single never-probed mapping
-silently drags a model's whole vision flag to `false`, and the portal chat's
-image-attachment gate reads exactly that aggregate.
-**Decision:** new capabilities follow the `live_progress_support` precedent,
-not the `vision_capable` one. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools`
-(three-state) + `cap_extra` (open-vocabulary JSON array) + their own
-provenance pair (`capabilities_source`/`capabilities_checked_at`, migration
-77) live outside `metrics_locked`, written only where non-empty so a partial
-answer never clears a verdict another probe already established. The **one**
-place a capability *does* respect the lock is the compatibility surface, not
-the honest record: a **definitive** (`"yes"`/`"no"`) reported `cap_vision`
-verdict additionally calls the pre-existing, lock-guarded
-`UpdateMappingVisionCapable` — the same writer, the same
-`metrics_source = "vision"` stamp, the vision *benchmark* already uses — so an
-operator who has locked a mapping's metrics keeps that guarantee for the one
-bool actual consumers still read, exactly as they already expect for every
-other locked metric. The sync is driven by the reported verdict itself, not
-by whether the tri-state changed, so a bool the benchmark moved independently
-still converges on the next steady, unchanged probe result.
-**Consequence:** the honest record and the compatibility surface are
-deliberately separate columns answering to two different rules, rather than
-one column serving both badly. The chat image gate and the models list's
-AND-aggregate gain probe evidence — a llama.cpp-backed mapping's vision
-capability can now be established from its `/props` document alone, without
-ever running the benchmark — with no change to either consumer's own code,
-because both already read
-`vision_capable` through the same lock-respecting writer. `metrics_source` is
-not further overloaded with a third value to distinguish "the benchmark said
-so" from "the probe said so": both mean the same thing to a consumer of the
-bool, and the tri-state columns are where that distinction actually lives for
-anyone who needs it. vLLM and TGI remain uncovered by capability probing —
-neither one's reachable HTTP surface exposes a modality or tool-support
-field at all, which [Telemetry, Usage Analytics & Observability
-§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)
-records with the specifics so the gap is not rediscovered — leaving the
-vision benchmark their only path to `vision_capable`, unchanged by this
-decision.
+calls" — and the two existing precedents on `model_mappings` pointed in
+opposite directions. `vision_capable` (migration 32) was a **bool**: its zero
+value could not distinguish an observed "no" from "never probed," and the
+models list already ANDs it across every mapping serving a gateway model name,
+fail-closed by construction — so a single never-probed mapping silently
+dragged a whole model's vision flag to `false`, and the portal chat's
+image-attachment gate read exactly that aggregate. `live_progress_support`
+(migration 76; [ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)
+later gave that verdict a second writer) was **three-state**
+(`""`/`supported`/`unsupported`), written by a dedicated writer that carried no
+`metrics_locked` guard and never touched `metrics_source` — because a build
+capability, unlike a throughput figure, is not a number an operator vouches
+for.
+**Decision:** capability verdicts are **detected, never assumed**, and the
+detector answers in three states. `detectCapabilities`
+(`internal/provider/model_info.go`, byte-for-byte duplicated in
+`server-agent/internal/collector/probe.go` under the two-Go-modules-no-shared-code
+precedent) reads exactly two objects out of the same `/props` document a
+single fetch already retrieves for the live-progress verdict:
+`modalities.{vision,video,audio}` and `chat_template_caps.supports_tools`. A
+key **present** as a bool is the verdict; a key **absent** is `""` —
+undetermined, never a denial, because an older build simply predates the
+field — and an undetermined verdict must never overwrite an established one.
+The same `"role": "router"` gate the live-progress detector applies holds
+here, for the same reason: llama.cpp's router-mode dummy document would
+otherwise yield a wrong verdict about the router's own build. The vocabulary
+is deliberately **open**: an upstream may report capability names this
+codebase has never heard of (Ollama passes manifest-declared names through
+verbatim), and those are carried, stored and displayed as-is rather than
+dropped. Two caveats travel with the verdicts wherever they are shown, because
+both invite a stronger reading than the field supports: `modalities.video`
+means the binary was built with video support **and** the model has a vision
+encoder, not that the model understands video; `supports_tools: false` means
+the model has no native tool-call template, not that tool calls fail (with
+`--jinja` a generic handler accepts tools for every model), so it means
+degraded prompt quality, never a rejected request.
+**Consequence:** the detector, its evidence rule and its refusals are what
+this decision durably records. **Where the verdicts LAND is no longer this
+decision's** — the first shape did not survive contact with the operator's
+requirement, and [ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+records what replaced it. That first shape persisted the verdicts as seven
+wide columns on `model_mappings` (migration 77) and, for the one bool actual
+consumers read, had a definitive `cap_vision` verdict additionally write
+through the lock-respecting `UpdateMappingVisionCapable`, with
+`metrics_locked` as the escape hatch. Both halves are gone — the three defects
+the operator's requirement exposed are stated once, in ADR-039's Context. What
+survives unchanged is that a capability is **not a metric**: no capability
+writer consults `metrics_locked` or restamps
+`metrics_source`/`metrics_updated_at`. vLLM and TGI also remain uncovered by
+capability probing — neither one's reachable HTTP surface exposes a modality
+or tool-support field at all, which [Telemetry, Usage Analytics &
+Observability §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)
+records with the specifics so the gap is not rediscovered — leaving the vision
+**benchmark** their only path to a vision verdict, unchanged by this decision
+except in where it writes and what it may overwrite.
 → [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-77-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-79-migrations),
+[API Surface](reference/api-surface.md#models-servers-applications-mappings).
+
+## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
+**Context:** the wide-column shape [ADR-038](#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)
+first shipped had three defects, and the operator's requirement — "my answer
+is the answer" — exposed all three at once. A column's zero value conflated
+"no" with "never determined" (`is_mtp = 0` never meant more than "the name
+heuristic did not match"). One mapping-wide provenance string could not say
+*who* established *which* verdict, so the only precedence the schema could
+express was "the probe wins unless the operator locks this mapping's metrics"
+— a lock over numbers, pressed into service as a per-capability guarantee it
+was never shaped for, and a probe overwrote a hand-set vision answer within
+about one telemetry tick until it was locked. And because the upstream
+vocabulary is open, a `cap_extra` JSON array had to ride beside the four real
+columns as an escape hatch. **Decision:** move every per-model capability
+verdict into a child table, `model_mapping_capabilities` (migration 78), and
+make provenance the mechanism rather than a lock. **(a) The shape:** one row
+per `(mapping_id, capability)` — that pair is the primary key — carrying
+`verdict` (`yes` or `no`, and **nothing else**), `source`, and a `not null`
+`checked_at`, with `mapping_id` a real `references model_mappings(id) on
+delete cascade`. **The absence of a row means UNKNOWN.** That is what turns
+"an undetermined verdict must never overwrite an established one" from a
+convention every writer has to remember into a structural fact: there is no
+empty verdict to write, `ValidateCapabilityRow` — the one function both
+drivers call — rejects an empty `capability`, an empty `source`, and any
+`verdict` that is neither `yes` nor `no`, and `DeleteMappingCapability` is the
+only way back to unknown. The operator reaches it through the MAPPING UPDATE —
+`UpdateMappingRequest.capability_verdicts`, a map keyed by capability name,
+carried on the same PATCH as everything else rather than on an endpoint of its
+own. That placement is structural: the mapping form seeds once and never
+re-syncs, so a reset applied by a separate request would be undone by the
+operator's next unrelated edit, which would re-establish a permanent `manual`
+row with an ordinary 200. The response is therefore post-write truth, and the
+form's two controls carry an explicit *unknown* state (an empty select option)
+rather than a checkbox's two.
+
+ONE field carries all three states, and that is the point rather than a
+convenience. `"yes"`/`"no"` is compared against the STORED ROW — a missing row
+counts as different — so an operator moving a control from unknown to `"no"`
+writes the `manual` row that stops a later probe from overwriting their
+judgement; `""` deletes the row; a value equal to what is stored writes
+nothing. The `is_mtp`/`vision_capable` booleans beside it keep the
+two-state-FOLD comparison they have always had, and that asymmetry is
+deliberate: a boolean can be an artefact of the form having been submitted (an
+old cached bundle, a script), so an unconditional `vision_capable: false`
+against a mapping with no row must stay inert, while a PRESENT map key can only
+be an explicit statement. Collapsing the two rules into one would either
+re-open the minting defect or re-close the third state. The map accepts ANY
+capability name — the vocabulary is open below — and rejects a blank one, a
+value outside the three, stating a capability whose legacy boolean the same
+request also sends, and two keys that name one capability once trimmed. Its
+store error is PROPAGATED, unlike the accompanying upsert's best-effort write:
+relinquishing the verdict is the whole effect of the action, so swallowing the
+failure would report success for nothing. What is NOT closed is minting one by
+accident from a form gone stale mid-edit
+([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open
+is the *vocabulary*, not the validation: no check compares a name against a
+known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
+`mtp` and `live_progress` while an unrecognised upstream name is accepted,
+stored and shown verbatim — which is why the open vocabulary needs no escape
+hatch. The two verdicts the request path acts on reach it through the
+candidate query's own **filtered** LEFT JOINs and land on `MappingCandidate`,
+deliberately **not** on `ModelMapping`: a mapping loaded through `MappingByID`
+joins nothing, and a struct with no capability field cannot present a
+plausible-looking but unpopulated verdict — anything holding only a mapping
+has to ask for the rows. **(b) The precedence rule is a RANK,** not a
+probe/not-probe split: `manual` 3 > `vision_benchmark` 2 >
+`llama_cpp_props`/`legacy`/**any unrecognised source** 1 > no row 0, and a
+write is permitted **iff `rank(incoming) >= rank(current)`**
+(`WritableCapabilityRows` — pure, no I/O, applied by each writer rather than
+by the store, because only a writer knows what rank its own evidence carries).
+Four consequences are load-bearing: an operator's verdict is permanent against
+both the benchmark and every probe, with **no `metrics_locked` involved** —
+the lock does not guard capabilities at all any more; the benchmark still
+outranks every probe and loses only to an operator; an *equal* rank stays
+writable, so a probe repairs its own drift after an upstream build changes;
+and an unrecognised source ranking 1 fails safe toward "treat it as a probe"
+rather than silently handing an unknown writer manual's immunity. `legacy` is
+the source migration 78 stamps on a verdict inherited from a column whose real
+origin is unknowable, ranked alongside a probe deliberately: treating a guess
+as authoritative would freeze it in forever. A write whose verdict AND rank
+both already match is dropped, so a capability — stable by nature — costs no
+write per telemetry tick; an agreeing verdict at a HIGHER rank still writes,
+because the rank is a fact of its own that only a write can change (a
+benchmark confirming a probe's verdict has genuinely measured it, and leaving
+the row at rank 1 would both misattribute it in the tooltip and leave a real
+measurement overwritable by the next probe). Because the reported names are an
+open vocabulary, the same rule enforces **one row per capability name** per
+write, keeping the first occurrence: every producer emits its structured
+verdicts before its open-vocabulary ones, so structured beats unstructured
+deterministically instead of by whichever row the store's upsert loop happened
+to apply last. **(c) The eleven columns are dropped** (migration 79), and
+this is the line the decision draws. This repository's practice is to leave a
+superseded column **permanently inert** — migration 72's replacement of the
+`native_responses`/`native_messages` booleans left both in the schema ([ADR-033](#adr-033--endpoint-modes-replace-the-native_-booleans-independent-per-endpoint-disable-per-spec-snapshot))
+— and this departs from it because the case differs on facts that are worth
+stating rather than generalising: nine of the eleven had shipped in the
+preceding two days (migrations 76 and 77), and **all** eleven had no reader
+outside the one feature this change rewrites — the two older ones,
+`vision_capable` (migration 32) and `is_mtp` (the baseline), were read only by
+the models-list vision fold (and the portal chat's image gate behind it), the
+scorer's MTP bonus, and the portal DTOs and mapping form that display and edit
+these very verdicts, every one of which this change reroutes to the table in
+the same unit of work. A long-established column with consumers beyond its own
+feature still stays inert. **Consequence:** the two filtered joins keep one
+row per mapping — the `(mapping_id, capability)` primary key guarantees it —
+and measured ≈ +6 µs each against the query's ≈ 17 µs, where one *unfiltered*
+join costs ≈ +79 µs and multiplies rows. Two read paths cannot use them and
+read the row themselves instead: the affinity path (it resolves before the
+candidate query and returns its pin early, on a mapping that came from
+`MappingsByApplication`) and the benchmark runner (`benchmarkTargetFor`, whose
+one read serves a capacity run's whole stream fan-out); all three producers
+translate the same row through the same conversion, so none can drift into its
+own spelling of "supported". `MappingCapabilitiesForMappings` is this
+repository's **first** batch child-collection reader — every other child
+collection is an N+1 loop in Go — justified by two multipliers on the
+model-servers listing rather than by taste: the SSE stream recomputes the
+whole listing on every loaded-registry change, and the model-group endpoint
+calls the listing once per group member. Migration 78 *reads* the columns
+migration 79 drops, so **their order is load-bearing** and nothing may ever be
+inserted between them; a fresh install replays both and must land on the same
+schema, with the same rows, as an upgraded database, which is pinned by its
+own test. **One discipline this design earned, for whoever adds the next
+capability: enumerate every writer and every reader before writing the rule.**
+These rows have five writers (two probe paths, the vision benchmark, the MTP
+name heuristic at *both* mapping-creation sites, and the operator's form) and
+six readers (the candidate query, the affinity path, the benchmark runner, the
+models-list vision fold, the portal's per-row chips, and the mapping DTO that
+seeds the operator's edit form and is compared against on save). Every rule
+here is a rule about a value all of them touch, and a rule written with only
+its own writer in mind is what repeatedly failed: a probe outranking a human,
+a form save laundering an unchanged submission into a permanent `manual`
+verdict, a heuristic wired at one of its two creation sites. The rank a new
+writer may claim, and what it must never overwrite, follow from that
+enumeration — not from the writer's own point of view.
+**Rejected:** keeping the columns and adding a `capabilities_locked` flag (a
+second mapping-wide lock, still with no per-capability provenance, and still
+asking an operator to pin a value they should simply be able to state); and a
+third `unknown` verdict value instead of row absence (it would put back the
+empty verdict every writer has to remember not to write, which is the bug
+class this shape removes).
+→ [Data Model §1](reference/data-model.md#1-current-tables-by-area),
+[§4](reference/data-model.md#4-migration-history-79-migrations),
+[Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
+[Routing & Model Selection
+§7](cross-cutting/routing-and-model-selection.md#7-model-selection-metrics),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).

@@ -81,9 +81,7 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 	}
 	targets := make([]benchmarkTarget, 0, len(views))
 	for _, v := range views {
-		bt := benchmarkTarget{server: v.Server, app: v.App, mapping: v.Mapping}
-		bt.spec = s.benchmarkSpecFor(r.Context(), v.App, v.Mapping.ID)
-		targets = append(targets, bt)
+		targets = append(targets, s.benchmarkTargetFor(r.Context(), v.Server, v.App, v.Mapping))
 	}
 	go func() {
 		defer cancel()
@@ -117,8 +115,7 @@ func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token
 		return
 	}
 	v := views[0] // mapping scope → exactly one view
-	tgt := benchmarkTarget{server: v.Server, app: v.App, mapping: v.Mapping}
-	tgt.spec = s.benchmarkSpecFor(r.Context(), v.App, v.Mapping.ID)
+	tgt := s.benchmarkTargetFor(r.Context(), v.Server, v.App, v.Mapping)
 	go func() {
 		defer cancel()
 		s.runContextProbe(ctx, run, server.ID, tgt)
@@ -150,8 +147,7 @@ func (s *Server) startLoadModel(w http.ResponseWriter, r *http.Request, token au
 		return
 	}
 	v := views[0] // mapping scope → exactly one view
-	tgt := benchmarkTarget{server: v.Server, app: v.App, mapping: v.Mapping}
-	tgt.spec = s.benchmarkSpecFor(r.Context(), v.App, v.Mapping.ID)
+	tgt := s.benchmarkTargetFor(r.Context(), v.Server, v.App, v.Mapping)
 	go func() {
 		defer cancel()
 		s.runLoadModel(ctx, run, server.ID, tgt)
@@ -186,8 +182,7 @@ func (s *Server) startVRAMProbe(w http.ResponseWriter, r *http.Request, token au
 		return
 	}
 	v := views[0] // mapping scope → exactly one view
-	tgt := benchmarkTarget{server: v.Server, app: v.App, mapping: v.Mapping}
-	tgt.spec = s.benchmarkSpecFor(r.Context(), v.App, v.Mapping.ID)
+	tgt := s.benchmarkTargetFor(r.Context(), v.Server, v.App, v.Mapping)
 	plan, err := s.vramRunPlan(r.Context(), tgt)
 	if err != nil {
 		writeVRAMProbeError(w, err)

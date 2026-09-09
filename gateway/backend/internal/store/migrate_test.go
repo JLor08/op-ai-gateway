@@ -548,6 +548,177 @@ func TestAddColumnIfMissingSQLite(t *testing.T) {
 	}
 }
 
+// TestDropColumnIfPresentSQLite is TestAddColumnIfMissingSQLite's mirror for
+// dropColumnIfPresent (migration79Up's helper): the first call actually
+// removes the column, a second call with the column already gone is a
+// swallowed no-op rather than sqlite's "no such column", and a genuine
+// failure (a table that does not exist) still surfaces. The replayability
+// the middle case buys is what makes migration 79 safe to re-run.
+//
+// The four BLOCKED cases at the end are the ones the helper's own safety
+// argument rests on, and the only ones where a too-broad swallow is WRONG:
+// sqlite refuses to drop a column an index, a view or a trigger depends on,
+// and every one of those refusals contains "no such column" -- the same
+// substring the already-absent case matches. Swallowed, a blocked drop would
+// leave sqlite with the column, postgres (`drop column if exists`) without
+// it, and the migration recorded as applied. So each refusal must reach the
+// caller as an error, and the column must still be there afterwards.
+//
+// They are four rather than one because the two halves of the predicate
+// carry different cases. The index, view and trigger refusals all carry an
+// `after drop column` clause, so either half rejects them; the fourth
+// carries NO clause and therefore rests entirely on the double-quote half.
+// Without it, weakening that half to a bare "no such column" match would
+// leave every other case here passing.
+func TestDropColumnIfPresentSQLite(t *testing.T) {
+	ctx := context.Background()
+	s := openTestSQLite(t)
+	defer s.Close()
+
+	if _, err := s.db.ExecContext(ctx, `create table widgets (id text primary key, note text not null default 'unset')`); err != nil {
+		t.Fatalf("create widgets: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `insert into widgets (id) values ('w1')`); err != nil {
+		t.Fatalf("insert w1: %v", err)
+	}
+
+	runDropColumn := func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := dropColumnIfPresent(ctx, tx, s.dl, "widgets", "note"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if err := runDropColumn(); err != nil {
+		t.Fatalf("first dropColumnIfPresent: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`select count(*) from pragma_table_info('widgets') where name='note'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("note column still present after dropColumnIfPresent: n=%d err=%v", n, err)
+	}
+	// The row survives the table rebuild sqlite performs to drop a column.
+	if err := s.db.QueryRowContext(ctx, `select count(*) from widgets where id = 'w1'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("dropping a column lost the row: n=%d err=%v", n, err)
+	}
+
+	// Second call with the column already gone must be swallowed as a no-op
+	// (sqlite's "no such column") -- the case a replayed migration hits.
+	if err := runDropColumn(); err != nil {
+		t.Fatalf("second dropColumnIfPresent (already absent) returned %v, want nil", err)
+	}
+
+	// A genuine, non-absent-column failure (bad table name) must still surface.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = dropColumnIfPresent(ctx, tx, s.dl, "no_such_table", "note")
+	_ = tx.Rollback()
+	if err == nil {
+		t.Fatalf("dropColumnIfPresent on a nonexistent table returned nil error, want an error")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "no such column") {
+		t.Fatalf("dropColumnIfPresent on a nonexistent table was mistaken for an absent-column error: %v", err)
+	}
+
+	// The BLOCKED drops. Each case gets its OWN database: the clause-less
+	// case deliberately leaves a view in the schema that does not parse, and
+	// sqlite validates the schema around every drop, so one shared database
+	// would let that case decide the other three.
+	for _, tc := range []struct {
+		name    string
+		setup   []string
+		table   string
+		column  string
+		wantMsg string
+		why     string
+	}{
+		{
+			name: "index",
+			setup: []string{
+				`create table gadgets (id text primary key, label text not null default '')`,
+				`create index idx_gadgets_label on gadgets (label)`,
+			},
+			table: "gadgets", column: "label",
+			wantMsg: "error in index idx_gadgets_label after drop column: no such column: label",
+			why:     "an index is defined on the column",
+		},
+		{
+			name: "view",
+			setup: []string{
+				`create table sprockets (id text primary key, tag text not null default '')`,
+				`create view v_sprockets as select id, tag from sprockets`,
+			},
+			table: "sprockets", column: "tag",
+			wantMsg: "error in view v_sprockets after drop column: no such column: tag",
+			why:     "a view selects the column",
+		},
+		{
+			name: "trigger",
+			setup: []string{
+				`create table cogs (id text primary key, mark text not null default '')`,
+				`create table cog_log (id text, mark text)`,
+				`create trigger tr_cogs after insert on cogs begin insert into cog_log (id, mark) values (new.id, new.mark); end`,
+			},
+			table: "cogs", column: "mark",
+			wantMsg: "error in trigger tr_cogs after drop column: no such column: new.mark",
+			why:     "a trigger body reads new.<column>",
+		},
+		{
+			// The one refusal shape with NO `after drop column` clause, and
+			// so the only case that pins the double-quote half of the
+			// predicate on its own. The view depends on the dropped column
+			// (`tag`) AND on a name that never resolved (`zzz`), so sqlite's
+			// schema check trips over `zzz` and reports it without ever
+			// reaching the clause -- unquoted, and not even the column being
+			// dropped. The same shape reaches a caller that drops a column on
+			// a table an unparseable view does not mention at all.
+			name: "no `after drop column` clause",
+			setup: []string{
+				`create table sprags (id text primary key, tag text not null default '')`,
+				`create view v_sprags as select tag, zzz from sprags`,
+			},
+			table: "sprags", column: "tag",
+			wantMsg: "error in view v_sprags: no such column: zzz",
+			why:     "the schema already held a view sqlite cannot re-parse",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bs := openTestSQLite(t)
+			defer bs.Close()
+			for _, stmt := range tc.setup {
+				if _, err := bs.db.ExecContext(ctx, stmt); err != nil {
+					t.Fatalf("setup %q: %v", stmt, err)
+				}
+			}
+			btx, err := bs.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("begin tx: %v", err)
+			}
+			err = dropColumnIfPresent(ctx, btx, bs.dl, tc.table, tc.column)
+			_ = btx.Rollback()
+			if err == nil {
+				t.Fatalf("dropColumnIfPresent on %s.%s returned nil -- %s, so sqlite REFUSED the drop and the refusal was swallowed as "+
+					"\"already absent\", which would leave sqlite with the column, postgres without it, and the migration recorded as applied",
+					tc.table, tc.column, tc.why)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.wantMsg)) {
+				t.Fatalf("dropColumnIfPresent on %s.%s returned %v, want a refusal containing %q", tc.table, tc.column, err, tc.wantMsg)
+			}
+			var stillThere int
+			if err := bs.db.QueryRowContext(ctx,
+				`select count(*) from pragma_table_info('`+tc.table+`') where name = ?`, tc.column).Scan(&stillThere); err != nil || stillThere != 1 {
+				t.Fatalf("the blocked column must still be present: n=%d err=%v", stillThere, err)
+			}
+		})
+	}
+}
+
 // TestMigration70BackfillsProxyExcluded proves migration 70's backfill selects
 // EXACTLY the retired implicit own-TLS encoding — (scheme='https' AND
 // proxy_listen_port=0) — and nothing else, on BOTH dialects.

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"math/rand"
 	"op-ai-gateway/internal/gateway/visionassets"
@@ -61,6 +62,19 @@ type benchmarkTarget struct {
 	// back to the app token unchanged. Callers populate it at construction
 	// (benchmarkSpecFor); benchmarkTarget itself never loads it.
 	spec routing.RuntimeSpec
+	// liveProgressSupport is the mapping's live-progress capability verdict --
+	// "" (never determined) | "supported" | "unsupported" -- resolved from its
+	// model_mapping_capabilities row at construction
+	// (benchmarkLiveProgressSupport), the same way spec is. It is what
+	// benchmarkTargetReq puts on Target.LiveProgressSupport for
+	// provider.wantsLiveProgress to decide on.
+	//
+	// It is a FIELD here rather than a read inside benchmarkTargetReq because
+	// that builder is pure and is called repeatedly per run (a capacity run
+	// is 4 levels x 16 concurrent = 64 streams): resolving the verdict once
+	// per target keeps the store read out of the per-stream path, and keeps
+	// the builder table-testable with no store at all.
+	liveProgressSupport string
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -151,6 +165,72 @@ func (s *Server) benchmarkSpecFor(ctx context.Context, app routing.Application, 
 	return spec
 }
 
+// benchmarkLiveProgressSupport resolves a mapping's live-progress verdict
+// from its model_mapping_capabilities row, in the vocabulary
+// Target.LiveProgressSupport speaks ("" | "supported" | "unsupported").
+//
+// It exists because the benchmark path has no MappingCandidate: the four
+// endpoint handlers and the scheduler start from a plain
+// routing.ModelMapping (an authorized benchmark view, or
+// MappingsByApplication), and neither of those joins the capability table
+// the way ActiveMappingsForModel does. So this is a dedicated KEYED read,
+// mirroring routing.Resolver.resolveAffinity's for exactly the same reason
+// -- and it translates through the same routing.LiveProgressSupportFromVerdict
+// both store drivers use, so the benchmark path cannot drift into its own
+// reading of a "no" row.
+//
+// The verdict MATTERS MORE here than on a live request, which is why the
+// column it replaced could not simply be dropped: RouteID is deliberately ""
+// on this path and an empty RouteID is never memoized, so a mapping already
+// detected as "unsupported" would otherwise pay a 400 plus a retry on every
+// single stream of every run, forever, with the rejection memo unable to
+// suppress a single one. (benchmarkTargetReq's own comment carries the rest
+// of that argument.)
+//
+// The cost is one keyed read per TARGET -- not per stream: the result is
+// cached on benchmarkTarget.liveProgressSupport at construction, so a
+// capacity run's 64 streams share the one read. Best-effort, like
+// benchmarkSpecFor above: a read failure degrades to "" (never determined),
+// the same value an absent row produces, rather than failing a run over a
+// parameter hint. A nil s.Routes returns "" without dereferencing it, so a
+// Server built without a store still builds targets.
+func (s *Server) benchmarkLiveProgressSupport(ctx context.Context, mappingID string) string {
+	if s.Routes == nil {
+		return ""
+	}
+	rows, err := s.Routes.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		return ""
+	}
+	row, ok := routing.CapabilityRowsByName(rows)[routing.CapabilityLiveProgress]
+	if !ok {
+		return ""
+	}
+	return routing.LiveProgressSupportFromVerdict(row.Verdict)
+}
+
+// benchmarkTargetFor builds a benchmarkTarget with BOTH of its
+// store-resolved fields filled in: the resolved RuntimeSpec
+// (benchmarkSpecFor) and the mapping's live-progress capability verdict
+// (benchmarkLiveProgressSupport).
+//
+// Every construction site that starts from a plain routing.ModelMapping goes
+// through it -- the four benchmark/probe/load/vram endpoint handlers and the
+// scheduler -- so neither field can be filled at four sites and forgotten at
+// the fifth. (The model warmer is the one exception: it already holds a
+// routing.MappingCandidate, whose LiveProgressSupport came from
+// ActiveMappingsForModel's join, so it fills the field from that instead of
+// paying a second read for the same row.)
+func (s *Server) benchmarkTargetFor(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) benchmarkTarget {
+	return benchmarkTarget{
+		server:              server,
+		app:                 app,
+		mapping:             mapping,
+		spec:                s.benchmarkSpecFor(ctx, app, mapping.ID),
+		liveProgressSupport: s.benchmarkLiveProgressSupport(ctx, mapping.ID),
+	}
+}
+
 // benchmarkTargetReq builds the routing.Target + a base inference.Request (from the first
 // benchmark prompt) a benchmark issues for a mapping. Shared by the speed (measureMapping)
 // and capacity (measureMappingCapacity) paths so both hit an identical target/request.
@@ -193,7 +273,13 @@ func benchmarkTargetReq(tgt benchmarkTarget) (routing.Target, inference.Request)
 		// floor when that reports no rate. These parameters only ADD
 		// mid-stream chunks, which streamOnce ignores entirely (they reach
 		// StreamProgress on delta events, not Usage).
-		LiveProgressSupport:  tgt.mapping.LiveProgressSupport,
+		//
+		// The verdict comes from tgt.liveProgressSupport -- the mapping's
+		// model_mapping_capabilities row, resolved once per target at
+		// construction (benchmarkLiveProgressSupport). This builder stays
+		// pure: it never reads the store, which is what lets it be called
+		// per stream.
+		LiveProgressSupport:  tgt.liveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}
 	p := benchmarkPrompts[0]
@@ -481,9 +567,12 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // finishes the run (clearing the server-busy state) even on error/cancel. mode selects
 // what is measured per target: "speed" (throughput/load, the pre-CP2 behavior), "capacity"
 // (the OOM-safe concurrency ramp), "both" (speed then capacity, so metrics_source ends
-// "capacity"), or "vision" (the image-acceptance probe: persists vision_capable on the
-// mapping only on a definitive verdict, but always appends a kind=="vision" history row
-// — success or inconclusive). An empty mode is treated as "speed".
+// "capacity"), or "vision" (the image-acceptance probe: on a definitive verdict, writes
+// the mapping's `vision` capability row, sourced vision_benchmark, subject to the same
+// precedence rank every capability writer obeys -- routing.WritableCapabilityRows -- so
+// it never overwrites an operator's CapabilitySourceManual verdict; always appends a
+// kind=="vision" history row regardless — success or inconclusive). An empty mode is
+// treated as "speed".
 func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID string, targets []benchmarkTarget, mode string) {
 	var runErr string
 	defer func() {
@@ -521,7 +610,53 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 			dataURL, tokens := pickVisionImage() // random embedded asset
 			res = s.measureVisionTarget(ctx, tgt, s.Portal.VisionProbeMode(ctx), dataURL, tokens)
 			if res.VisionCapable != nil {
-				_ = s.Routes.UpdateMappingVisionCapable(ctx, tgt.mapping.ID, *res.VisionCapable, time.Now().UTC())
+				// A definitive verdict is projected as the mapping's `vision`
+				// capability row, sourced CapabilitySourceVisionBenchmark
+				// (#49-3), rank 2 (routing.capabilitySourceRank): a real
+				// measurement -- the gateway sent an actual image to the
+				// actual upstream and read the actual answer -- outranks a
+				// probe (rank 1), but NOT an operator's CapabilitySourceManual
+				// verdict (rank 3). So, like every other capability writer,
+				// this reads the mapping's current rows and asks
+				// routing.WritableCapabilityRows which of them it may
+				// actually write, instead of writing unconditionally.
+				//
+				// An operator explicitly starting this run authorizes
+				// MEASURING, not overwriting whatever verdict is already on
+				// file -- a migrated pre-78 manual row is exactly as
+				// reachable here as it is for a probe (migration 78 maps a
+				// mapping whose metrics_source was 'manual' onto
+				// CapabilitySourceManual), and unconditionally overwriting it
+				// would be a net LOSS of protection versus the
+				// metrics_locked guard this table replaced. An INCONCLUSIVE
+				// probe (VisionCapable nil) writes nothing at all -- "unknown"
+				// is the absence of a row, so there is no way for it to clear
+				// a stored verdict, which the pre-row vision_capable bool
+				// could not express.
+				//
+				// Unlike the bool it replaces this write carries no
+				// metrics_locked guard, because the table does not have one:
+				// routing.MappingStore.UpsertMappingCapabilities carries the
+				// argument for why a capability is not a number an operator
+				// pins. Best-effort like the history row below: a failed read
+				// writes nothing at all (writing blind would be exactly the
+				// overwrite the rank rule forbids), and a failed write is
+				// logged and never fails the run.
+				verdict := routing.CapabilityNo
+				if *res.VisionCapable {
+					verdict = routing.CapabilityYes
+				}
+				reported := []routing.CapabilityRow{{
+					Capability: routing.CapabilityVision, Verdict: verdict,
+					Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: time.Now().UTC(),
+				}}
+				if stored, err := s.Routes.MappingCapabilities(ctx, tgt.mapping.ID); err != nil {
+					slog.Debug("vision benchmark: capability read failed", "mapping_id", tgt.mapping.ID, "err", err)
+				} else if rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored)); len(rows) > 0 {
+					if err := s.Routes.UpsertMappingCapabilities(ctx, tgt.mapping.ID, rows); err != nil {
+						slog.Debug("vision benchmark: capability write-back failed", "mapping_id", tgt.mapping.ID, "err", err)
+					}
+				}
 			}
 			// Always append a vision-history row — success (a definitive verdict) AND an
 			// inconclusive probe (VisionCapable nil, res.Error set) — mirroring how the

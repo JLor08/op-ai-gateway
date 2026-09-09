@@ -107,6 +107,7 @@ function makeMapping(over: Partial<PortalModelMapping> = {}): PortalModelMapping
     context_size: 0,
     is_mtp: false,
     vision_capable: false,
+    capabilities: [],
     energy_wh_per_token: 0,
     metrics_locked: false,
     metrics_source: '',

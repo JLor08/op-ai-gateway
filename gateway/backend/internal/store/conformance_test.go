@@ -58,6 +58,51 @@ func forEachDialect(t *testing.T, run func(t *testing.T, s *SQLStore)) {
 	})
 }
 
+// forEachDialectMigratedTo is forEachDialect with the migration ledger
+// STOPPED at maxVersion, so a test can exercise a migration against a
+// genuine pre-migration database rather than reconstructing that shape by
+// hand on top of an already-migrated one.
+//
+// It exists for the migration-78 backfill tests: their seeding writes the
+// columns migration 79 drops, so on a fully migrated database those writes
+// would not merely fail -- an `update` naming a dropped column errors, but a
+// test rewritten to tolerate that would silently stop testing the backfill
+// at all. Stopping at 77 keeps the seeds valid SQL against the real
+// historical schema, and the test then invokes 78 itself
+// (reinvokeMigration78) and may finish the ledger with s.Migrate.
+func forEachDialectMigratedTo(t *testing.T, maxVersion int, run func(t *testing.T, s *SQLStore)) {
+	t.Run("sqlite", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "c.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if err := s.migrateTo(context.Background(), maxVersion); err != nil {
+			t.Fatal(err)
+		}
+		run(t, s)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
+		if dsn == "" {
+			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
+		}
+		ctx := context.Background()
+		s, err := OpenPostgres(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if err := dropAllTables(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.migrateTo(ctx, maxVersion); err != nil {
+			t.Fatal(err)
+		}
+		run(t, s)
+	})
+}
+
 // dropAllTables gives postgres a clean slate (sqlite subtests already get one
 // via a fresh temp file, so this is a no-op call site for sqlite — it is only
 // ever invoked from the postgres branch above).
@@ -3769,7 +3814,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 			PromptTokensPerSecond:        1300.25,
 			LoadTimeMS:                   8200,
 			ContextSize:                  131072,
-			IsMTP:                        true,
 			MetricsLocked:                false,
 			MetricsUpdatedAt:             &metricsAt,
 			MetricsSource:                "manual",
@@ -3797,9 +3841,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		}
 		if got.ContextSize != 131072 {
 			t.Fatalf("ContextSize = %v, want 131072", got.ContextSize)
-		}
-		if !got.IsMTP {
-			t.Fatalf("IsMTP = %v, want true", got.IsMTP)
 		}
 		if got.MetricsLocked {
 			t.Fatalf("MetricsLocked = %v, want false", got.MetricsLocked)
@@ -3831,9 +3872,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		if cm.ContextSize != 131072 {
 			t.Fatalf("candidate ContextSize = %v, want 131072", cm.ContextSize)
 		}
-		if !cm.IsMTP {
-			t.Fatalf("candidate IsMTP = %v, want true", cm.IsMTP)
-		}
 		if cm.MetricsLocked {
 			t.Fatalf("candidate MetricsLocked = %v, want false", cm.MetricsLocked)
 		}
@@ -3850,7 +3888,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		// UpdateMapping must persist the metric columns too: mutate a couple of
 		// distinct metrics and confirm they round-trip through the UPDATE + read.
 		mapping.ContextSize = 65536
-		mapping.IsMTP = false
 		mapping.MaxConcurrency = 32
 		mapping.RecommendedConcurrency = 24
 		mapping.GenTokensPerSecondAtCapacity = 900
@@ -3864,9 +3901,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		}
 		if updated.ContextSize != 65536 {
 			t.Fatalf("updated ContextSize = %v, want 65536", updated.ContextSize)
-		}
-		if updated.IsMTP {
-			t.Fatalf("updated IsMTP = %v, want false", updated.IsMTP)
 		}
 		if updated.MaxConcurrency != 32 || updated.RecommendedConcurrency != 24 || updated.GenTokensPerSecondAtCapacity != 900 {
 			t.Fatalf("updated capacity metrics = %d/%d/%v, want 32/24/900", updated.MaxConcurrency, updated.RecommendedConcurrency, updated.GenTokensPerSecondAtCapacity)
@@ -4480,118 +4514,6 @@ func TestConformanceMappingCapacityMetrics(t *testing.T) {
 		// A capacity write on a MISSING mapping is a benign no-op.
 		if err := s.UpdateMappingCapacityMetrics(ctx, "does-not-exist", 42, 42, 42, laterAt); err != nil {
 			t.Fatalf("update mapping capacity metrics (missing) = %v, want nil (benign no-op)", err)
-		}
-	})
-}
-
-// TestConformanceUpdateMappingVisionCapable verifies the vision-capability write
-// path: it stamps vision_capable + provenance ("vision") only while the mapping
-// is unlocked (a definitive "not capable" result can also be written), and is a
-// benign no-op when the mapping is locked or missing, on both dialects.
-func TestConformanceUpdateMappingVisionCapable(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, s *SQLStore) {
-		ctx := context.Background()
-		now := time.Now().UTC().Truncate(time.Second)
-
-		srv := routing.AIServer{
-			ID: "srv1", Name: "Server 1", Domain: "srv1.local", Provider: routing.ProviderOllama,
-			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
-			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
-		}
-		if err := s.CreateAIServer(ctx, srv); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
-
-		app := routing.Application{
-			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
-			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
-			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
-			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
-			CreatedAt:       now, UpdatedAt: now,
-		}
-		if err := s.CreateApplication(ctx, app); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
-
-		mapping := routing.ModelMapping{
-			ID: "map1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
-			AppModelName: "up", Status: routing.ServerStatusActive,
-			VisionCapable: false, MetricsLocked: false,
-			CreatedAt: now, UpdatedAt: now,
-		}
-		if err := s.CreateMapping(ctx, mapping); err != nil {
-			t.Fatalf("create mapping: %v", err)
-		}
-
-		// Default (never probed) is not vision-capable.
-		got, err := s.MappingByID(ctx, "map1")
-		if err != nil {
-			t.Fatalf("mapping by id: %v", err)
-		}
-		if got.VisionCapable {
-			t.Fatalf("VisionCapable = %v, want false (default)", got.VisionCapable)
-		}
-
-		// A write on an unlocked mapping stamps vision_capable + provenance.
-		visionAt := time.Date(2026, 8, 5, 13, 0, 0, 0, time.UTC)
-		if err := s.UpdateMappingVisionCapable(ctx, "map1", true, visionAt); err != nil {
-			t.Fatalf("update mapping vision capable: %v", err)
-		}
-		got, err = s.MappingByID(ctx, "map1")
-		if err != nil {
-			t.Fatalf("mapping by id: %v", err)
-		}
-		if !got.VisionCapable {
-			t.Fatalf("VisionCapable = %v, want true", got.VisionCapable)
-		}
-		if got.MetricsSource != "vision" {
-			t.Fatalf("MetricsSource = %q, want %q", got.MetricsSource, "vision")
-		}
-		if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(visionAt) {
-			t.Fatalf("MetricsUpdatedAt = %v, want %v", got.MetricsUpdatedAt, visionAt)
-		}
-
-		// A definitive "not capable" result can also be written.
-		notCapableAt := time.Date(2026, 8, 5, 13, 30, 0, 0, time.UTC)
-		if err := s.UpdateMappingVisionCapable(ctx, "map1", false, notCapableAt); err != nil {
-			t.Fatalf("update mapping vision capable (false): %v", err)
-		}
-		got, err = s.MappingByID(ctx, "map1")
-		if err != nil {
-			t.Fatalf("mapping by id: %v", err)
-		}
-		if got.VisionCapable {
-			t.Fatalf("VisionCapable = %v, want false (definitive not-capable write)", got.VisionCapable)
-		}
-
-		// Lock the mapping (manual pin) via UpdateMapping.
-		mapping.VisionCapable = true
-		mapping.MetricsLocked = true
-		mapping.MetricsSource = "manual"
-		mapping.UpdatedAt = now.Add(time.Minute)
-		if err := s.UpdateMapping(ctx, mapping); err != nil {
-			t.Fatalf("update mapping (lock): %v", err)
-		}
-
-		// A write on a LOCKED mapping is a no-op (no error, no change).
-		laterAt := time.Date(2026, 8, 5, 14, 0, 0, 0, time.UTC)
-		if err := s.UpdateMappingVisionCapable(ctx, "map1", false, laterAt); err != nil {
-			t.Fatalf("update mapping vision capable (locked): %v", err)
-		}
-		locked, err := s.MappingByID(ctx, "map1")
-		if err != nil {
-			t.Fatalf("mapping by id (locked): %v", err)
-		}
-		if !locked.VisionCapable {
-			t.Fatalf("locked VisionCapable = %v, want true (vision write must not overwrite a lock)", locked.VisionCapable)
-		}
-		if locked.MetricsSource != "manual" {
-			t.Fatalf("locked MetricsSource = %q, want %q (vision write must not overwrite a lock)", locked.MetricsSource, "manual")
-		}
-
-		// A write on a MISSING mapping is a benign no-op.
-		if err := s.UpdateMappingVisionCapable(ctx, "does-not-exist", true, laterAt); err != nil {
-			t.Fatalf("update mapping vision capable (missing) = %v, want nil (benign no-op)", err)
 		}
 	})
 }

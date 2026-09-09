@@ -1286,20 +1286,44 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type. Always returns a non-nil
-// pointer, even when every field is "" (nothing determined): that all-empty
-// struct is the "detection ran, found nothing" wire value, distinct from the
-// nil probeRuntimeChildProps leaves in place for an uncached, undetermined
-// probe -- see sample.RuntimeSample.Capabilities' own doc comment for why
-// that distinction is load-bearing.
+// RuntimeSample.Capabilities' wire pointer type: each of the four named
+// fields becomes one CapabilityVerdict entry keyed by its name, every Extra
+// name becomes a "yes" entry (a reported extra capability is a positive
+// assertion), and an empty ("" -- undetermined) field is skipped entirely
+// rather than carried as an entry, mirroring the store's
+// row-absence-means-unknown model.
+//
+// THE EMISSION ORDER IS LOAD-BEARING, not a formatting choice: on the gateway
+// side the ingest folds this list into capability rows and keeps the FIRST
+// entry for a given name, dropping every later one -- so a name that appears
+// both as a structured field and in Extra resolves to the STRUCTURED answer.
+// The four named fields therefore go first and Extra after; swapping the two
+// blocks silently hands the open list the last word.
+//
+// Always returns a non-nil pointer whose Verdicts is itself non-nil (though
+// possibly empty), even when every field is "" (nothing determined): that
+// all-empty Verdicts is the "detection ran, found nothing" wire value,
+// distinct from the nil probeRuntimeChildProps leaves in place for an
+// uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
+// doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities) *sample.Capabilities {
-	return &sample.Capabilities{
-		Vision: c.Vision,
-		Video:  c.Video,
-		Audio:  c.Audio,
-		Tools:  c.Tools,
-		Extra:  c.Extra,
+	verdicts := make([]sample.CapabilityVerdict, 0, 4+len(c.Extra))
+	if c.Vision != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
+	if c.Video != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "video", Verdict: c.Video})
+	}
+	if c.Audio != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "audio", Verdict: c.Audio})
+	}
+	if c.Tools != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "tools", Verdict: c.Tools})
+	}
+	for _, name := range c.Extra {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})
+	}
+	return &sample.Capabilities{Verdicts: verdicts}
 }
 
 // collectOnce builds one sample from the host, GPU, and scrape collectors and

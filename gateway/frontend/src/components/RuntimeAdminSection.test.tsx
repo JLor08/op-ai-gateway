@@ -120,6 +120,7 @@ function makeMapping(overrides: Partial<PortalModelMapping> = {}): PortalModelMa
     context_size: 0,
     is_mtp: false,
     vision_capable: false,
+    capabilities: [],
     energy_wh_per_token: 0,
     metrics_locked: false,
     metrics_source: '',

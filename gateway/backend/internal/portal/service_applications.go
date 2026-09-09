@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -82,6 +83,50 @@ var (
 	ErrMappingGatewayNameConflict = errors.New("mapping.gateway_name_conflict")
 	ErrMappingStatusInvalid       = errors.New("mapping.status_invalid")
 	ErrMappingMetricInvalid       = errors.New("mapping.metric_invalid")
+	// ErrMappingCapabilityNameRequired rejects an empty (or whitespace-only)
+	// KEY in a CapabilityVerdicts map. The store neither trims nor validates a
+	// capability name -- on the DELETE path an unknown name, an unknown
+	// mapping id and an empty name are all a benign nil on both drivers -- so
+	// without this check a blank key would return 200 having done nothing at
+	// all.
+	ErrMappingCapabilityNameRequired = errors.New("mapping.capability_name_required")
+	// ErrMappingCapabilityVerdictInvalid rejects a CapabilityVerdicts VALUE
+	// that is not one of the three the field can carry ("yes", "no" or "" for
+	// unknown). Without it a typo -- "true", "Yes", "unknown" -- would fall
+	// into whichever branch the code treats as its default, and the only
+	// sensible default is the reset: a mistyped verdict would silently DELETE
+	// an established row instead of being refused.
+	//
+	// Unlike the name, the value is NOT trimmed. The name comes from an open
+	// vocabulary an upstream may pad; the value is a closed three-item
+	// enumeration this codebase defines, so whitespace in it is a client bug,
+	// and reading " " as "hand this capability back to detection" would
+	// destroy a verdict on a typo.
+	ErrMappingCapabilityVerdictInvalid = errors.New("mapping.capability_verdict_invalid")
+	// ErrMappingCapabilityConflict rejects a request that states a capability
+	// in CapabilityVerdicts while ALSO sending that capability's LEGACY
+	// boolean (vision_capable <-> "vision", is_mtp <-> "mtp"). The two fields
+	// are read by different rules -- the map against the stored row, the
+	// boolean against the two-state fold -- so one request carrying both is
+	// two different instructions about one row, and guessing which the caller
+	// meant would silently write or silently keep a verdict nobody asked for.
+	// The portal's own form sends only the map (see MappingForm's submit); a
+	// client that sends both has a bug worth surfacing.
+	ErrMappingCapabilityConflict = errors.New("mapping.capability_conflict")
+	// ErrMappingCapabilityDuplicate rejects a CapabilityVerdicts map holding
+	// TWO keys that name the SAME capability once trimmed --
+	// `{"vision": "no", " vision": "yes"}`. That is the boolean conflict above
+	// in another shape: the caller has told us two different things about one
+	// row, and there is nothing to choose between them. Silently picking one
+	// would be the worse answer, because WHICH one is arbitrary: both intents
+	// survive normalization, both compare equal in its sort (sort.Slice is not
+	// stable), and the single upsert they reach is last-write-wins, so the
+	// stored verdict follows Go's map iteration order.
+	//
+	// An exactly-duplicate JSON key -- `{"vision":"no","vision":"yes"}` -- is
+	// NOT this case and is not rejected: encoding/json collapses it to one map
+	// entry (the last value wins) before any of this code sees it.
+	ErrMappingCapabilityDuplicate = errors.New("mapping.capability_duplicate")
 )
 
 const (
@@ -1329,25 +1374,46 @@ func normalizeApplicationAffinityTTLSeconds(affinityTTLSeconds int) int {
 
 // ModelMappingDTO is the portal-facing representation of a routing.ModelMapping.
 type ModelMappingDTO struct {
-	ID                           string     `json:"id"`
-	ApplicationID                string     `json:"application_id"`
-	GatewayModelName             string     `json:"gateway_model_name"`
-	AppModelName                 string     `json:"app_model_name"`
-	Status                       string     `json:"status"`
-	GenTokensPerSecond           float64    `json:"gen_tokens_per_second"`
-	PromptTokensPerSecond        float64    `json:"prompt_tokens_per_second"`
-	LoadTimeMS                   int        `json:"load_time_ms"`
-	ContextSize                  int        `json:"context_size"`
-	MaxConcurrency               int        `json:"max_concurrency"`
-	RecommendedConcurrency       int        `json:"recommended_concurrency"`
-	GenTokensPerSecondAtCapacity float64    `json:"gen_tokens_per_second_at_capacity"`
-	IsMtp                        bool       `json:"is_mtp"`
-	VisionCapable                bool       `json:"vision_capable"`
-	EnergyWhPerToken             float64    `json:"energy_wh_per_token"`
-	MetricsLocked                bool       `json:"metrics_locked"`
-	MetricsSource                string     `json:"metrics_source"`
-	MetricsUpdatedAt             *time.Time `json:"metrics_updated_at,omitempty"`
-	CreatedAt                    time.Time  `json:"created_at"`
+	ID                           string  `json:"id"`
+	ApplicationID                string  `json:"application_id"`
+	GatewayModelName             string  `json:"gateway_model_name"`
+	AppModelName                 string  `json:"app_model_name"`
+	Status                       string  `json:"status"`
+	GenTokensPerSecond           float64 `json:"gen_tokens_per_second"`
+	PromptTokensPerSecond        float64 `json:"prompt_tokens_per_second"`
+	LoadTimeMS                   int     `json:"load_time_ms"`
+	ContextSize                  int     `json:"context_size"`
+	MaxConcurrency               int     `json:"max_concurrency"`
+	RecommendedConcurrency       int     `json:"recommended_concurrency"`
+	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
+	// IsMtp/VisionCapable are the two-state FOLD of the "mtp"/"vision"
+	// capability rows (capabilityVerdictBool: only "yes" is true, so a "no"
+	// row and a MISSING row both read as false). They cannot express the third
+	// state, which is exactly why Capabilities below exists beside them --
+	// they are kept because the portal still renders this pair as the mapping
+	// list's MTP and vision columns (shared/mappingColumns.tsx, on both the
+	// mapping and the runtime-admin screens).
+	IsMtp         bool `json:"is_mtp"`
+	VisionCapable bool `json:"vision_capable"`
+	// Capabilities is every DETERMINED capability row for this mapping, in the
+	// SAME wire shape ModelServerDTO publishes (ModelServerCapabilityDTO is
+	// reused rather than re-declared, so the two cannot drift): one entry per
+	// (mapping, capability) that has ever been established, alphabetical by
+	// capability name, ALWAYS an array and never `null`.
+	//
+	// The absence of an entry is UNKNOWN. That is the whole reason this array
+	// is on the mapping DTO at all: the folded booleans above cannot tell a
+	// verdict of "no" apart from no row, so a form seeded from them can only
+	// ever offer two states -- it could neither state a negative verdict nor
+	// hand a capability back to detection (UpdateMappingRequest.
+	// CapabilityVerdicts). A consumer must not read a missing capability as
+	// "no" beyond its own fail-closed intent.
+	Capabilities     []ModelServerCapabilityDTO `json:"capabilities"`
+	EnergyWhPerToken float64                    `json:"energy_wh_per_token"`
+	MetricsLocked    bool                       `json:"metrics_locked"`
+	MetricsSource    string                     `json:"metrics_source"`
+	MetricsUpdatedAt *time.Time                 `json:"metrics_updated_at,omitempty"`
+	CreatedAt        time.Time                  `json:"created_at"`
 }
 
 type MappingListResponse struct {
@@ -1365,10 +1431,40 @@ type CreateMappingRequest struct {
 	MaxConcurrency               int     `json:"max_concurrency"`
 	RecommendedConcurrency       int     `json:"recommended_concurrency"`
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
-	IsMTP                        bool    `json:"is_mtp"`
-	VisionCapable                bool    `json:"vision_capable"`
-	EnergyWhPerToken             float64 `json:"energy_wh_per_token"`
-	MetricsLocked                bool    `json:"metrics_locked"`
+	// IsMTP/VisionCapable are the LEGACY two-state fields. They are plain
+	// bools, so an unset `false` is indistinguishable from "the operator never
+	// looked at this control" and only the `true` direction writes a row --
+	// which is why a stated NEGATIVE verdict needs CapabilityVerdicts below.
+	IsMTP            bool    `json:"is_mtp"`
+	VisionCapable    bool    `json:"vision_capable"`
+	EnergyWhPerToken float64 `json:"energy_wh_per_token"`
+	MetricsLocked    bool    `json:"metrics_locked"`
+	// CapabilityVerdicts states a capability's verdict outright, keyed by
+	// capability name: "yes" or "no" writes a `manual` row, "" writes none
+	// (there is nothing on file to relinquish under an id that did not exist a
+	// moment ago) -- but a present "" is still a STATEMENT, and it suppresses
+	// the legacy boolean and the MTP name heuristic for that capability just
+	// as a verdict does. "Writes no row" and "says nothing" are not the same
+	// thing here.
+	//
+	// Unlike the booleans above this can express a NEGATIVE verdict, which is
+	// a real and useful thing to state at create time: a `manual` "no" is what
+	// stops a later llama_cpp_props probe from writing "yes" on a model whose
+	// vision an operator has already judged unusable.
+	//
+	// A capability named here is the operator's own statement and WINS over
+	// both the legacy boolean and the MTP name heuristic for that capability
+	// (see CreateMapping). It is not a 400 the way the same pair is on the
+	// update path: there a boolean is a `*bool` and its presence is
+	// unambiguous, here a `false` cannot be told from an absent key at all, so
+	// there is nothing to reject on.
+	//
+	// Same validation as the update path: names are trimmed and a blank one is
+	// ErrMappingCapabilityNameRequired; a value that is not "yes", "no" or ""
+	// is ErrMappingCapabilityVerdictInvalid; two keys naming the same
+	// capability once trimmed are ErrMappingCapabilityDuplicate. The
+	// vocabulary is open.
+	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
 type UpdateMappingRequest struct {
@@ -1382,10 +1478,69 @@ type UpdateMappingRequest struct {
 	MaxConcurrency               *int     `json:"max_concurrency,omitempty"`
 	RecommendedConcurrency       *int     `json:"recommended_concurrency,omitempty"`
 	GenTokensPerSecondAtCapacity *float64 `json:"gen_tokens_per_second_at_capacity,omitempty"`
-	IsMTP                        *bool    `json:"is_mtp,omitempty"`
-	VisionCapable                *bool    `json:"vision_capable,omitempty"`
-	EnergyWhPerToken             *float64 `json:"energy_wh_per_token,omitempty"`
-	MetricsLocked                *bool    `json:"metrics_locked,omitempty"`
+	// IsMTP/VisionCapable are the LEGACY two-state fields, kept as the
+	// COMPATIBILITY path for a client that submits every field on every save
+	// -- an old cached portal bundle during a rollout, or a script. They are
+	// compared against capabilityVerdictBool, the two-state FOLD such a client
+	// was seeded with, so a submitted `false` against no row is an unchanged
+	// submission and writes nothing.
+	//
+	// That fold is why they cannot express the third state, and why they must
+	// NOT be re-pointed at the stored verdict: with "no row" and a verdict of
+	// "no" folding to the same `false`, comparing against the row would turn
+	// every unconditional `vision_capable: false` into a permanent `manual`
+	// "no" on a mapping that had none. An operator who means "no" states it
+	// through CapabilityVerdicts below, which is compared against the row
+	// precisely because a present key there is never an artefact of the form
+	// having been submitted.
+	IsMTP            *bool    `json:"is_mtp,omitempty"`
+	VisionCapable    *bool    `json:"vision_capable,omitempty"`
+	EnergyWhPerToken *float64 `json:"energy_wh_per_token,omitempty"`
+	MetricsLocked    *bool    `json:"metrics_locked,omitempty"`
+	// CapabilityVerdicts is the AUTHORITATIVE per-capability field, keyed by
+	// capability name, and the only one of the three that can express all
+	// three states a stored capability has:
+	//
+	//   "yes"/"no" -> the operator's verdict. Written as a `manual` row when
+	//                 it DIFFERS from the stored row's verdict, where "no row"
+	//                 counts as different -- which is what makes
+	//                 unknown -> "no" a real transition rather than a silent
+	//                 no-op.
+	//   ""         -> return the capability to UNKNOWN by DELETING its row,
+	//                 the only way back out of a `manual` verdict (which
+	//                 outranks every probe and the vision benchmark for as
+	//                 long as it stands -- manualCapabilityRow). A no-op when
+	//                 there is no row.
+	//   absent     -> no statement at all. Nothing is written, so a save made
+	//                 for an unrelated reason cannot touch a capability.
+	//
+	// A PRESENT key is an explicit operator intent, so it is compared against
+	// the STORED ROW rather than against the two-state fold the legacy
+	// booleans are compared against. That distinction is the whole reason both
+	// fields exist: see IsMTP/VisionCapable above.
+	//
+	// It rides on the MAPPING UPDATE rather than on an endpoint of its own, and
+	// that is a correctness requirement rather than a saving. MappingForm seeds
+	// once and never re-syncs from props: a delete fired from inside the open
+	// form would be undone by the operator's next unrelated edit, which would
+	// re-establish a permanent `manual` row with an ordinary 200 and nothing to
+	// notice. Carrying the intent in the same request removes that race
+	// structurally -- the response is the post-write DTO, so the form's next
+	// render re-seeds from truth.
+	//
+	// The NAME vocabulary is OPEN: any name is accepted, not just the six
+	// constants the code reasons about, because an Ollama/agent-reported name
+	// gets its own row like any other and must be correctable like any other.
+	// Names are trimmed; a blank one is ErrMappingCapabilityNameRequired. A
+	// value outside the three above is ErrMappingCapabilityVerdictInvalid, a
+	// capability named here whose legacy boolean is ALSO sent is
+	// ErrMappingCapabilityConflict, and two keys that name the same capability
+	// once trimmed are ErrMappingCapabilityDuplicate.
+	//
+	// A JSON `null` on the booleans could not have carried the third state:
+	// IsMTP/VisionCapable are `*bool` with `omitempty`, so
+	// `{"vision_capable": null}` is indistinguishable from an absent key.
+	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
 // SyncResultDTO summarizes a SyncApplicationModels reconciliation.
@@ -1406,9 +1561,29 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	if err != nil {
 		return MappingListResponse{}, err
 	}
+	mappingIDs := make([]string, len(mappings))
+	for i, mapping := range mappings {
+		mappingIDs[i] = mapping.ID
+	}
+	// ONE capability query for the whole listing, never one per mapping (the
+	// same N+1 guard Service.ModelServers documents at length).
+	//
+	// Deliberately NOT best-effort, unlike the model-servers listing's read:
+	// this listing is what MappingForm.tsx SEEDS its two capability selects
+	// from -- each from the matching row in Capabilities, and the seed is what
+	// the save is diffed against. A read failure that degraded to "nothing
+	// determined" would seed UNKNOWN over a stored verdict, so the operator's
+	// next choice would look like a change from unknown and write a PERMANENT
+	// manual row (see manualCapabilityRow). An error the operator can see and
+	// retry is strictly better than a form that quietly mis-states what is
+	// stored.
+	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if err != nil {
+		return MappingListResponse{}, err
+	}
 	out := make([]ModelMappingDTO, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, mappingDTO(mapping))
+		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID])))
 	}
 	return MappingListResponse{Data: out}, nil
 }
@@ -1428,6 +1603,14 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		return ModelMappingDTO{}, ErrMappingAppNameRequired
 	}
 	status, err := normalizeMappingStatus(req.Status)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
+	// sentBooleans is nil here: CreateMappingRequest's two capability fields
+	// are plain bools, so a `false` cannot be told from an absent key and
+	// there is no presence to reject a conflict on. The map WINS instead --
+	// see the capability rows further down.
+	capIntents, err := normalizeCapabilityVerdicts(req.CapabilityVerdicts, nil)
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
@@ -1456,9 +1639,12 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		return ModelMappingDTO{}, ErrMappingGatewayNameConflict
 	}
 	now := s.clock().UTC()
-	// Default IsMTP from the model NAME when the caller did not explicitly set it.
-	// A name-derived default is NOT a measurement, so it must NOT drive the
-	// provenance stamp below (metricValuesPresent keeps seeing the RAW req.IsMTP).
+	// Default the MTP verdict from the model NAME when the caller did not
+	// explicitly set it. The two origins DO stay apart below -- an explicit
+	// operator setting writes a manual capability row, the name heuristic a
+	// legacy (probe-overwritable) one -- but neither participates in the
+	// numeric metrics' provenance stamp any more (see metricValuesPresent's
+	// own doc-comment); the row carries its own Source.
 	isMTP := req.IsMTP
 	if !isMTP {
 		isMTP = routing.IsMTPModelName(appModelName)
@@ -1476,8 +1662,6 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		MaxConcurrency:               req.MaxConcurrency,
 		RecommendedConcurrency:       req.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: req.GenTokensPerSecondAtCapacity,
-		IsMTP:                        isMTP,
-		VisionCapable:                req.VisionCapable,
 		EnergyWhPerToken:             req.EnergyWhPerToken,
 		MetricsLocked:                req.MetricsLocked,
 		CreatedAt:                    now,
@@ -1488,12 +1672,89 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		loadMS: req.LoadTimeMS, contextSize: req.ContextSize,
 		maxConcurrency: req.MaxConcurrency, recommendedConcurrency: req.RecommendedConcurrency,
 		genTPSAtCapacity: req.GenTokensPerSecondAtCapacity, energyWhPerToken: req.EnergyWhPerToken,
-	}, req.IsMTP, req.VisionCapable) {
+	}) {
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now
 	}
 	if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
+	}
+	// The capability rows this create ESTABLISHES, written in one upsert
+	// below. A create only ever ADDS rows under a brand-new mapping id, so
+	// there is nothing stored for them to outrank and no precedence check is
+	// needed here -- unlike UpdateMapping, which must prove the operator
+	// actually said what the form submitted before it writes anything.
+	capRows := make([]routing.CapabilityRow, 0, 2+len(capIntents))
+	// The operator's OWN stated verdicts first, "no" exactly as effective as
+	// "yes" -- the whole reason this field exists beside the two booleans,
+	// which cannot express a negative at all. A stated "" writes nothing:
+	// unknown is the absence of a row, and under an id that did not exist a
+	// moment ago there is nothing to relinquish.
+	//
+	// A capability stated here is settled, so neither the legacy boolean nor
+	// the MTP name heuristic below may add a second row for it. Both of those
+	// are weaker signals -- one an unset-vs-false guess, the other a guess
+	// about the model NAME -- and letting either win would answer 200 with a
+	// verdict that contradicts what the caller asked for.
+	stated := make(map[string]bool, len(capIntents))
+	for _, intent := range capIntents {
+		stated[intent.Capability] = true
+		if intent.Verdict == "" {
+			continue
+		}
+		capRows = append(capRows, manualCapabilityRow(intent.Capability, intent.Verdict == routing.CapabilityYes, now))
+	}
+	if req.VisionCapable && !stated[routing.CapabilityVision] {
+		// The operator's vision_capable checkbox becomes the AUTHORITATIVE
+		// "vision" capability row (source manual) -- see manualCapabilityRow's
+		// own doc-comment for why this outranks every probe and the vision
+		// benchmark permanently.
+		//
+		// Only the `true` direction writes here: CreateMappingRequest.
+		// VisionCapable is a plain bool, so an unset `false` at CREATE time is
+		// indistinguishable from "the operator never touched this field" --
+		// the overwhelming common case, since most mappings are created
+		// without ever looking at this checkbox. Writing a manual "no" for
+		// every one of them would permanently close off the vision benchmark
+		// and every probe from ever determining the real answer, which is a
+		// regression this codebase's own IsMTP-default reasoning two lines
+		// above already rejects for the same reason. `true` has no such
+		// ambiguity: an operator had to actively check the box.
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, true, now))
+	}
+	switch {
+	case stated[routing.CapabilityMTP]:
+		// Already settled by CapabilityVerdicts above. The name heuristic
+		// below must not write its `legacy` row over an operator statement --
+		// including a stated "", which asks for no row at all.
+	case req.IsMTP:
+		// An EXPLICIT operator setting -- manual, exactly like vision above
+		// and with the same true-only asymmetry for the same reason.
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, true, now))
+	case isMTP:
+		// The NAME HEURISTIC said MTP. It still has to write a row: the
+		// scorer's +30 MTP bonus reads MappingCandidate.IsMTP, which is the
+		// JOINED "mtp" row's verdict (routing.MTPFromVerdict) and the only
+		// place the verdict lives at all now -- so a mapping created without
+		// a row would silently lose the bonus migration 78 gave every
+		// mapping that existed before it.
+		//
+		// Source LEGACY, not manual: a name heuristic is a GUESS, and it must
+		// stay beatable by the real detection PR C adds (a probe writes at
+		// rank 1, and the rule is rank(incoming) >= rank(current), so a
+		// probe can replace this row -- a manual one it could never touch).
+		// That is also exactly how migration 78 recorded the same guess when
+		// it lifted it off the column. See legacyMTPCapabilityRow --
+		// reconcileApplicationModels applies the identical heuristic on its
+		// own write path and shares this builder rather than re-deriving it.
+		capRows = append(capRows, legacyMTPCapabilityRow(now))
+	}
+	// What mappingDTO reports back to the form: the rows that actually landed
+	// (an empty map when the write failed or there was nothing to write --
+	// never a claim the store does not hold).
+	capsByName := map[string]routing.CapabilityRow{}
+	if s.writeOperatorCapabilities(ctx, mapping.ID, capRows) {
+		capsByName = routing.CapabilityRowsByName(capRows)
 	}
 	// Best-effort, after the successful store write: a mapping under the
 	// server_agent application is a runtime-config input (its two model-name
@@ -1501,7 +1762,7 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// notifyRuntimeChangedForMapping -- the gate is the owning application's
 	// type, not which field this request set.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping), nil
+	return mappingDTO(mapping, capsByName), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
@@ -1511,6 +1772,13 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		return ModelMappingDTO{}, err
 	}
 	// Validate everything that can fail BEFORE mutating the loaded mapping.
+	capIntents, err := normalizeCapabilityVerdicts(req.CapabilityVerdicts, map[string]bool{
+		routing.CapabilityVision: req.VisionCapable != nil,
+		routing.CapabilityMTP:    req.IsMTP != nil,
+	})
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
 	var gatewayName, appModelName, status string
 	if req.GatewayModelName != nil {
 		gatewayName = strings.TrimSpace(*req.GatewayModelName)
@@ -1604,26 +1872,114 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.RecommendedConcurrency = effRecConc
 	mapping.GenTokensPerSecondAtCapacity = effGenCap
 	mapping.EnergyWhPerToken = effEnergy
-	if req.IsMTP != nil {
-		mapping.IsMTP = *req.IsMTP
-	}
-	if req.VisionCapable != nil {
-		mapping.VisionCapable = *req.VisionCapable
-	}
+	// req.IsMTP / req.VisionCapable are NOT merged onto the mapping: it has
+	// no such field any more (migration 79 dropped the columns). The
+	// operative capability write is the differs-from-stored rule further
+	// down, which is the ONLY thing an operator's checkbox establishes.
 	if req.MetricsLocked != nil {
 		mapping.MetricsLocked = *req.MetricsLocked
 	}
 	// A MEASURED-value change stamps provenance; a MetricsLocked-only change (policy,
-	// not a measurement) deliberately does NOT.
-	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil || req.IsMTP != nil || req.VisionCapable != nil
+	// not a measurement) deliberately does NOT. IsMTP/VisionCapable no longer
+	// participate here: they are no longer mapping columns conceptually (a
+	// capability row carries its OWN provenance -- see
+	// manualCapabilityRow below), and metrics_source/metrics_updated_at
+	// describe the numeric metrics' provenance, not a capability's.
+	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil
 	if metricValueChanged {
 		now2 := s.clock().UTC()
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now2
 	}
+	// The mapping's STORED capability rows, read BEFORE the write so a read
+	// failure aborts the whole update instead of letting it proceed on a
+	// guess. Two things need them, and they are the two halves of the same
+	// guarantee:
+	//
+	//  1. The differs-from-stored rule below. A client may submit
+	//     vision_capable and is_mtp on EVERY save whatever field the operator
+	//     actually came to edit -- MappingForm.tsx did exactly that until it
+	//     learnt to send only a control the operator moved, and an old cached
+	//     bundle or a script still can -- so a non-nil pointer means "the
+	//     form was submitted", NOT "the operator changed this". Writing a
+	//     manual row on the pointer alone let an unrelated edit (a
+	//     context_size fix, say) replace a probe's verdict with a permanent
+	//     manual one, and a manual row outranks every probe AND the benchmark
+	//     for as long as it stands (manualCapabilityRow). Only a value that
+	//     DIFFERS from what is stored is an operator decision, so only that
+	//     writes.
+	//  2. mappingDTO's Capabilities array and its is_mtp/vision_capable fold,
+	//     which that same form seeds from -- so an untouched control
+	//     round-trips the truth rather than a stale snapshot.
+	//
+	// The LEGACY booleans are compared against capabilityVerdictBool, the
+	// exact two-state fold such a client was seeded with, NOT the raw
+	// three-state verdict: an absent row folds to `false`, so a submitted
+	// `false` against no row is an unchanged submission and must stay absent
+	// (still probeable), while a submitted `true` against no row is the
+	// operator actively checking the box. CapabilityVerdicts is compared
+	// against the ROW instead -- see operatorCapabilityWrites for why the two
+	// rules are not redundant and must not be collapsed into one.
+	storedCaps, err := s.routes.MappingCapabilities(ctx, mapping.ID)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
+	capsByName := routing.CapabilityRowsByName(storedCaps)
+	capChangedAt := s.clock().UTC()
+	capRows := make([]routing.CapabilityRow, 0, 2+len(capIntents))
+	if req.VisionCapable != nil && *req.VisionCapable != capabilityVerdictBool(capsByName, routing.CapabilityVision) {
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, *req.VisionCapable, capChangedAt))
+	}
+	if req.IsMTP != nil && *req.IsMTP != capabilityVerdictBool(capsByName, routing.CapabilityMTP) {
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, *req.IsMTP, capChangedAt))
+	}
+	statedRows, resetCaps := operatorCapabilityWrites(capIntents, capsByName, capChangedAt)
+	capRows = append(capRows, statedRows...)
 	mapping.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
+	}
+	// The RESET is not best-effort, and the asymmetry with the upsert two
+	// blocks below is deliberate rather than an oversight -- state it here,
+	// where both behaviours sit side by side, or the next reader "fixes" it.
+	//
+	// The upsert is swallowed because the mapping update it accompanies has
+	// already landed: the request's primary effect is real, and a lost
+	// capability row is a lesser harm than a 500 over a save that worked. A
+	// delete has no such accompanying effect to salvage -- returning a
+	// capability to unknown IS the whole point of the operator's action, so
+	// swallowing its failure would report success for nothing at all and the
+	// operator would walk away believing a permanent `manual` verdict was
+	// relinquished when it still stands.
+	//
+	// Two deletes in one request are NOT atomic with each other: the store
+	// method is per-capability and takes no transaction, so a failure on the
+	// second leaves the first applied. That is safe rather than merely
+	// tolerated, because deleting is idempotent -- an already-absent row is a
+	// benign no-op on every driver -- so the operator's retry of the same
+	// request converges instead of compounding.
+	if err := s.resetOperatorCapabilities(ctx, mapping.ID, resetCaps); err != nil {
+		return ModelMappingDTO{}, err
+	}
+	// Post-delete truth for the DTO, so the form's next render re-seeds from
+	// what the store now holds rather than from the pre-write read. Without
+	// this the reset is SELF-UNDOING: the form would re-seed the old verdict
+	// and the operator's next unrelated save would re-establish it as a
+	// permanent `manual` row, with an ordinary 200 and nothing to notice.
+	for _, capability := range resetCaps {
+		delete(capsByName, capability)
+	}
+	// A manual row is rank 3, the top of routing.WritableCapabilityRows'
+	// precedence, so it can never be outranked by what is already stored --
+	// which is why this writes directly rather than filtering through that
+	// helper the way a probe must. The guard on WHETHER to write is the
+	// differs-from-stored rule above, not a rank check.
+	if s.writeOperatorCapabilities(ctx, mapping.ID, capRows) {
+		// Fold what actually landed into what the DTO reports, so the form
+		// re-seeds from the new truth and not from the pre-write read.
+		for _, row := range capRows {
+			capsByName[row.Capability] = row
+		}
 	}
 	// Best-effort, after the successful store write: renaming a mapping under
 	// the server_agent application rewrites its spec's model/upstream_model in
@@ -1631,7 +1987,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// the agent's router for up to a minute while the old one still routes. See
 	// notifyRuntimeChangedForMapping.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping), nil
+	return mappingDTO(mapping, capsByName), nil
 }
 
 // DeleteMapping removes the mapping.
@@ -1776,18 +2132,31 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		} else {
 			result.Added++
 		}
+		isMTP := routing.IsMTPModelName(model)
 		mapping := routing.ModelMapping{
 			ID:               "map_" + compactRandomHex(16),
 			ApplicationID:    app.ID,
 			GatewayModelName: model,
 			AppModelName:     model,
 			Status:           status,
-			IsMTP:            routing.IsMTPModelName(model),
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
 		if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 			return SyncResultDTO{}, err
+		}
+		if isMTP {
+			// Same NAME HEURISTIC, same legacy-sourced row CreateMapping
+			// writes for it -- see legacyMTPCapabilityRow. This row is the
+			// ONLY place the heuristic's verdict lands now, so without it a
+			// mapping discovered here (the manual "Sync models" button and
+			// the background model_sync probe loop, i.e. the automatic path
+			// most mappings arrive through) would never earn the scorer's
+			// ROW-based +30 MTP bonus. Best-effort: this is a sync/reconcile
+			// loop, and a capability-write failure must not fail the
+			// reconcile whose primary effect (the mapping itself) already
+			// landed.
+			s.writeOperatorCapabilities(ctx, mapping.ID, []routing.CapabilityRow{legacyMTPCapabilityRow(now)})
 		}
 	}
 	for _, mapping := range existing {
@@ -1849,7 +2218,274 @@ func (s *Service) gatewayNameTakenOnServer(ctx context.Context, serverID string,
 	return false, nil
 }
 
-func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
+// manualCapabilityRow builds the OPERATOR's own verdict for one capability:
+// source CapabilitySourceManual, which under the shared precedence rule
+// (routing.WritableCapabilityRows / capabilitySourceRank) outranks every
+// probe AND the vision benchmark, PERMANENTLY, with no separate lock needed --
+// that is the whole trade the capability table makes instead of the
+// mapping-wide metrics_locked flag the pre-row-table columns would have
+// needed to argue their way out of.
+//
+// That permanence is the operator's guarantee, and it is equally the reason
+// CreateMapping/UpdateMapping write one of these only where they can prove
+// the operator actually said it: a manual row talks over every probe and the
+// benchmark for as long as it stands, so one written by accident costs a
+// capability its detection.
+//
+// Undoing one is a DELETE rather than a third verdict, because there is no
+// third verdict to write: unknown is the ABSENCE of a row. The operator
+// reaches it through UpdateMappingRequest.CapabilityVerdicts with an empty
+// value, which deletes the row (resetOperatorCapabilities); the form's third
+// select state is what produces that entry.
+func manualCapabilityRow(capability string, capable bool, at time.Time) routing.CapabilityRow {
+	verdict := routing.CapabilityNo
+	if capable {
+		verdict = routing.CapabilityYes
+	}
+	return routing.CapabilityRow{
+		Capability: capability,
+		Verdict:    verdict,
+		Source:     routing.CapabilitySourceManual,
+		CheckedAt:  at,
+	}
+}
+
+// legacyMTPCapabilityRow builds the "mtp" capability row for a NAME-HEURISTIC
+// match (routing.IsMTPModelName), source CapabilitySourceLegacy (rank 1) so a
+// real detector (PR C's /slots-based probe, also rank 1, "rank(incoming) >=
+// rank(current)") can still replace a guess -- see CreateMapping's isMTP case
+// for why this must never be manual (rank 3), which a probe could never
+// touch. Migration 78 recorded the same column-derived guess the same way.
+//
+// Shared by CreateMapping and reconcileApplicationModels: both apply the
+// identical heuristic to a brand-new mapping, so both write the identical row
+// through this one builder rather than each re-deriving it.
+func legacyMTPCapabilityRow(at time.Time) routing.CapabilityRow {
+	return routing.CapabilityRow{
+		Capability: routing.CapabilityMTP,
+		Verdict:    routing.CapabilityYes,
+		Source:     routing.CapabilitySourceLegacy,
+		CheckedAt:  at,
+	}
+}
+
+// capabilityVerdictBool folds one stored capability row's THREE-state verdict
+// ("yes" / "no" / no row at all) onto the two-state boolean the mapping form
+// binds to: only CapabilityYes is true, so a "no" row and a MISSING row both
+// read as false (the same fail-closed reading routing.MTPFromVerdict and
+// ModelServerDTO.IsMtp use).
+//
+// This is the fold mappingDTO ships beside the rows, and it is why
+// UpdateMapping compares a submitted LEGACY boolean against this value rather
+// than against the raw verdict: for a client that submits every field on every
+// save, "unchanged" is a statement about the value it was seeded with, not
+// about the row's three states.
+//
+// It is therefore NOT the comparison for UpdateMappingRequest.
+// CapabilityVerdicts, whose present keys are explicit statements and are
+// compared against the stored row -- the only comparison that can tell
+// unknown from a verdict of "no" (operatorCapabilityWrites).
+func capabilityVerdictBool(byName map[string]routing.CapabilityRow, capability string) bool {
+	return byName[capability].Verdict == routing.CapabilityYes
+}
+
+// mappingCapabilityDTOs projects a mapping's stored capability rows -- keyed
+// by name, the shape mappingDTO is handed -- onto the wire array, sorted by
+// capability name so the response is byte-stable across calls (a Go map's
+// iteration order is randomised, and MappingCapabilities' own SQL order is
+// alphabetical, so this reproduces it rather than inventing a second order).
+//
+// ALWAYS returns a non-nil slice, even for zero rows: `capabilities` must be
+// `[]` on the wire and never `null`, exactly as ModelServerDTO.Capabilities
+// promises -- a `null` would make the frontend branch on nil-vs-empty for a
+// distinction that does not exist (both mean "nothing determined").
+func mappingCapabilityDTOs(byName map[string]routing.CapabilityRow) []ModelServerCapabilityDTO {
+	out := make([]ModelServerCapabilityDTO, 0, len(byName))
+	for _, row := range byName {
+		out = append(out, ModelServerCapabilityDTO{
+			Capability: row.Capability,
+			Verdict:    row.Verdict,
+			Source:     row.Source,
+			CheckedAt:  row.CheckedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out
+}
+
+// writeOperatorCapabilities persists the capability rows a mapping create or
+// update established, in ONE upsert, and reports whether they landed (a
+// caller folds them into the DTO it returns only if they did -- the response
+// must never claim a verdict the store does not hold).
+//
+// Best-effort, mirroring every other capability writer in this codebase
+// (agent_ingest.go, benchmark_runner.go, app_health.go): called AFTER the
+// mapping create/update has already succeeded, so a failure here must not
+// fail a request whose primary effect (the mapping itself) already landed --
+// it is logged and swallowed.
+func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) bool {
+	if len(rows) == 0 {
+		return false
+	}
+	if err := s.routes.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
+		slog.Warn("portal: mapping capability write failed", "mapping_id", mappingID, "rows", len(rows), "err", err)
+		return false
+	}
+	return true
+}
+
+// capabilityVerdictIntent is one normalized entry of a request's
+// CapabilityVerdicts map: a trimmed capability name and the state the caller
+// stated for it, where an empty Verdict is "return this capability to
+// UNKNOWN" (delete the row) rather than a third verdict to store.
+type capabilityVerdictIntent struct {
+	Capability string
+	Verdict    string
+}
+
+// normalizeCapabilityVerdicts validates a CapabilityVerdicts map and returns
+// its entries in a DETERMINISTIC order (a Go map iterates randomly, and the
+// order decides which capability's store error a multi-entry request surfaces
+// first). sentBooleans says which capabilities the same request also states
+// through a legacy boolean -- nil on the create path, where a boolean's
+// presence cannot be detected at all.
+//
+// Three rejections, all 400s, and none of them is something the store would
+// catch: ValidateCapabilityRow never sees a reset at all, and on the DELETE
+// path an unknown name, an unknown mapping id and an empty name are each a
+// benign nil on both drivers -- so a blank key or a mistyped verdict would
+// otherwise return 200 having done nothing, or having deleted a row nobody
+// asked it to.
+//
+//   - A blank name after trimming is ErrMappingCapabilityNameRequired. Note
+//     what is NOT rejected: any NON-empty name is accepted, including one this
+//     codebase has no constant for. The vocabulary is open (an upstream may
+//     report anything -- Ollama passes manifest-declared names through
+//     verbatim), so a name-whitelisting check would leave exactly those rows
+//     uncorrectable.
+//   - A value outside "yes"/"no"/"" is ErrMappingCapabilityVerdictInvalid. The
+//     value is deliberately NOT trimmed -- see the sentinel's own comment.
+//   - A name whose legacy boolean is ALSO non-nil in the same request is
+//     ErrMappingCapabilityConflict: the caller is stating two different things
+//     about one row, read by two different rules. The portal's form sends only
+//     this map (see MappingForm's submit), so this is a client bug rather than
+//     a state to reconcile.
+//   - TWO keys that name the same capability once trimmed are
+//     ErrMappingCapabilityDuplicate, for the same reason and detected the same
+//     way: AFTER trimming (so the padded key is caught) and BEFORE anything is
+//     mutated (so a rejected request writes nothing at all). Without it the
+//     deterministic order this function promises would not reach the store --
+//     both intents pass through, they compare equal in the sort below, and the
+//     upsert is last-write-wins, so the verdict that lands would follow Go's
+//     map iteration order.
+func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[string]bool) ([]capabilityVerdictIntent, error) {
+	if len(verdicts) == 0 {
+		return nil, nil
+	}
+	out := make([]capabilityVerdictIntent, 0, len(verdicts))
+	seen := make(map[string]struct{}, len(verdicts))
+	for name, verdict := range verdicts {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, ErrMappingCapabilityNameRequired
+		}
+		if verdict != routing.CapabilityYes && verdict != routing.CapabilityNo && verdict != "" {
+			return nil, ErrMappingCapabilityVerdictInvalid
+		}
+		if sentBooleans[name] {
+			return nil, ErrMappingCapabilityConflict
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, ErrMappingCapabilityDuplicate
+		}
+		seen[name] = struct{}{}
+		out = append(out, capabilityVerdictIntent{Capability: name, Verdict: verdict})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out, nil
+}
+
+// operatorCapabilityWrites turns one request's normalized verdict intents into
+// the rows to UPSERT and the capability names to DELETE, given what the store
+// currently holds (keyed by name; an absent key is the legitimate "nothing
+// determined").
+//
+// The comparison is against the stored row's RAW VERDICT, not against
+// capabilityVerdictBool's two-state fold, and an absent row counts as
+// different from both "yes" and "no". That is the whole point of the field: an
+// operator moving a control from unknown to "no" states something the fold
+// cannot represent, and comparing against the fold made that transition a
+// silent no-op that answered 200. Comparing against the row is only safe
+// BECAUSE a present key is an explicit statement -- the legacy booleans, which
+// a client may submit unconditionally, keep the fold comparison for exactly
+// that reason (see UpdateMappingRequest.IsMTP).
+//
+// An intent equal to what is stored writes nothing at all, so a save made for
+// an unrelated reason stays inert even when the form does restate a control.
+func operatorCapabilityWrites(intents []capabilityVerdictIntent, stored map[string]routing.CapabilityRow, at time.Time) (rows []routing.CapabilityRow, resets []string) {
+	for _, intent := range intents {
+		if intent.Verdict == stored[intent.Capability].Verdict {
+			continue
+		}
+		if intent.Verdict == "" {
+			resets = append(resets, intent.Capability)
+			continue
+		}
+		rows = append(rows, manualCapabilityRow(intent.Capability, intent.Verdict == routing.CapabilityYes, at))
+	}
+	return rows, resets
+}
+
+// resetOperatorCapabilities deletes one mapping's named capability rows --
+// the names UpdateMappingRequest.CapabilityVerdicts stated an empty verdict
+// for, and whose row actually exists -- returning each capability to UNKNOWN.
+// Unlike writeOperatorCapabilities above it PROPAGATES its error -- see
+// UpdateMapping's own comment at the call site for the full argument, and
+// for why two deletes in one request need no transaction.
+//
+// Authorisation is the caller's: every reset reaches here only past
+// authorizeMapping, which collapses an unknown mapping, a mapping the
+// principal may not see and an unauthorized principal alike to
+// ErrMappingNotFound. That is not belt-and-braces -- the store gives this path
+// NO existence signal at all (an unknown mapping id, an unknown capability and
+// an empty capability are all nil on both drivers), so the helper is the only
+// thing standing between a `gatewayUse` token and blanking another server's
+// verdicts.
+func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID string, capabilities []string) error {
+	for _, capability := range capabilities {
+		if err := s.routes.DeleteMappingCapability(ctx, mappingID, capability); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mappingDTO projects a mapping onto the wire shape the portal's mapping form
+// binds to. caps is that mapping's stored capability rows keyed by capability
+// name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
+// "nothing determined").
+//
+// Capabilities is what MappingForm.tsx SEEDS its two capability selects
+// from: one entry per determined row, and the ABSENCE of an entry is the
+// third state. IsMtp/VisionCapable are the two-state fold of the same rows,
+// kept for the mapping list's MTP and vision columns (and for the legacy
+// request booleans' differs-from-stored comparison in UpdateMapping) -- a
+// control seeded from them could never SHOW unknown, let alone return a
+// capability to it, because they read a determined "no" and a missing row as
+// the same `false`.
+//
+// Both halves coming from the ROWS is a CORRECTNESS requirement rather than
+// tidiness, and it is why the is_mtp/vision_capable columns #49-3 retired
+// every automated writer of could not simply be left inert. A form seeded
+// from a column nothing writes any more would show a stale `false`; the
+// operator's next choice would then differ from a value the store does not
+// hold, and the save would report it as their own verdict -- a manual row
+// outranking every probe and the vision benchmark for as long as it stands
+// (see manualCapabilityRow). Reading the row is what makes the form's seed
+// the truth; UpdateMapping's compare-before-write is the other half of the
+// same guarantee, and the way back out is an empty verdict in
+// UpdateMappingRequest.CapabilityVerdicts.
+func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
 		ApplicationID:                mapping.ApplicationID,
@@ -1863,8 +2499,9 @@ func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 		MaxConcurrency:               mapping.MaxConcurrency,
 		RecommendedConcurrency:       mapping.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: mapping.GenTokensPerSecondAtCapacity,
-		IsMtp:                        mapping.IsMTP,
-		VisionCapable:                mapping.VisionCapable,
+		IsMtp:                        capabilityVerdictBool(caps, routing.CapabilityMTP),
+		VisionCapable:                capabilityVerdictBool(caps, routing.CapabilityVision),
+		Capabilities:                 mappingCapabilityDTOs(caps),
 		EnergyWhPerToken:             mapping.EnergyWhPerToken,
 		MetricsLocked:                mapping.MetricsLocked,
 		MetricsSource:                mapping.MetricsSource,
@@ -1876,11 +2513,12 @@ func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 // mappingMetrics bundles the eight numeric per-mapping metric values shared by
 // validateMappingMetrics and metricValuesPresent below. CreateMapping builds
 // one straight from the request; UpdateMapping builds one from its already
-// pointer-merged "effective" values. isMTP/visionCapable stay separate
-// parameters on the functions below rather than bundled fields here, because
-// metricValuesPresent's caller deliberately passes the RAW req.IsMTP there
-// (never the name-defaulted value written onto the mapping) -- see its call
-// site's comment.
+// pointer-merged "effective" values. IsMTP/VisionCapable are deliberately NOT
+// bundled here (or passed to metricValuesPresent below) any more: they are no
+// longer mapping columns conceptually, and a capability's own provenance now
+// lives in its model_mapping_capabilities row (Source/CheckedAt), not in
+// this mapping's metrics_source/metrics_updated_at -- see
+// manualCapabilityRow.
 type mappingMetrics struct {
 	genTPS, promptTPS                      float64
 	loadMS, contextSize                    int
@@ -1898,8 +2536,12 @@ func validateMappingMetrics(m mappingMetrics) error {
 
 // metricValuesPresent reports whether any MEASURED value was supplied (the lock flag
 // alone is policy, not a measurement, so it does not stamp provenance).
-func metricValuesPresent(m mappingMetrics, isMTP, visionCapable bool) bool {
-	return m.genTPS != 0 || m.promptTPS != 0 || m.loadMS != 0 || m.contextSize != 0 || m.maxConcurrency != 0 || m.recommendedConcurrency != 0 || m.genTPSAtCapacity != 0 || m.energyWhPerToken != 0 || isMTP || visionCapable
+// IsMTP/VisionCapable no longer participate (see mappingMetrics' own
+// doc-comment): a capability toggle alone must not stamp the mapping's
+// metrics provenance any more, now that it carries its own (Source/
+// CheckedAt on its model_mapping_capabilities row).
+func metricValuesPresent(m mappingMetrics) bool {
+	return m.genTPS != 0 || m.promptTPS != 0 || m.loadMS != 0 || m.contextSize != 0 || m.maxConcurrency != 0 || m.recommendedConcurrency != 0 || m.genTPSAtCapacity != 0 || m.energyWhPerToken != 0
 }
 
 func normalizeMappingStatus(raw string) (string, error) {

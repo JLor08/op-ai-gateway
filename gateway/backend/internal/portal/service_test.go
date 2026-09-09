@@ -1577,6 +1577,21 @@ func newServerTestService(t *testing.T, now time.Time) (*Service, *routing.Memor
 	return svc, routeStore
 }
 
+// newServerTestServiceWithRoutes mirrors newServerTestService but takes the
+// routing.Store directly, so a test can WRAP the in-memory store first (to
+// count or fail a specific store call) before wiring it into the Service.
+func newServerTestServiceWithRoutes(t *testing.T, now time.Time, routes routing.Store) *Service {
+	t.Helper()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	for _, u := range []string{"usr_admin", "usr_owner", "usr_other"} {
+		if err := dir.CreateUser(context.Background(), store.User{ID: u, Email: u + "@example.test", DisplayName: u, Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateUser %s: %v", u, err)
+		}
+	}
+	seedServerTestGroups(t, dir, now)
+	return NewService(ServiceDeps{Users: dir, Groups: dir, Routes: routes, Clock: func() time.Time { return now }})
+}
+
 // newServerTestServiceWithDir mirrors newServerTestService but additionally
 // returns the underlying MemoryDirectory, for a test that needs to seed an
 // EXTRA group beyond the fixed testSystemGroupID/testAdminGroupID pair (e.g.

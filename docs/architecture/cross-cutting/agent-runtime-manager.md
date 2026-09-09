@@ -2909,7 +2909,9 @@ mirror). Three different cadences share the one collect cycle:
   probe instead was the originally sketched remedy, and it was rejected on
   exactly that basis. Such a child therefore still answers `401`/`403` here,
   still cached as a conclusive non-verdict (above), and this probe's own
-  `live_progress_support` write for it still stays `""` forever — but its
+  `live_progress_support` stays `""` forever — so the gateway writes that
+  mapping no `live_progress` capability row at all, which is precisely how the
+  row model spells "never determined" — but its
   `Capabilities` write is *not* `nil`: `401`/`403` sits in
   `ProbePropsVerdicts`' CONCLUSIVE set, so `stable` comes back `true` and
   `probeRuntimeChildProps` still reaches `capabilitiesSample`, which always
@@ -3438,7 +3440,7 @@ shows both but edits only its own:
 | `gateway_model_name` | editable | read-only | editable, required |
 | `app_model_name` | read-only | editable, required | editable, required |
 | `status` | editable (form + row toggle) | not shown | not shown |
-| metrics, `is_mtp`, `vision_capable`, `metrics_locked` | editable | not shown | not shown |
+| metrics, the `metrics_locked` checkbox, and the `is_mtp`/`vision_capable` capability selects | editable | not shown | not shown |
 
 The **mapping** owns the gateway-facing name and the active/disabled status:
 `status` gates whether the gateway routes the model at all, and the
@@ -3461,6 +3463,62 @@ sharp one: the spec form's state defaulted to `active`, so leaving the key in
 the body while removing the control would make every launch-config save
 re-enable a model an operator deliberately took out of service — no error, no
 diff, and no column on the specs tab that contradicts it.
+
+**The two capability controls are SELECTS with three states, and the one place
+this form has to prove the operator said something before it writes.** `is_mtp`
+and `vision_capable` are no longer mapping columns — each is a capability row
+whose `manual` source outranks every probe and the vision benchmark
+permanently ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+A checkbox could not represent that table: unknown is the ABSENCE of a row, and
+a verdict of `no` is a real decision, so `unknown`/`yes`/`no` needs the shared
+three-option `SelectField` (the same control three other screens use for a
+"follow global" empty option — there is no tri-state checkbox in this portal).
+Each control seeds from the DTO's capability ROW, never from the folded
+`is_mtp`/`vision_capable` boolean, which reads a determined `no` and a missing
+row as the same `false`.
+
+**The seed is what the write is proved against, and it is captured when the
+form opens.** `MappingForm` seeds once and never re-syncs from props, so submit
+compares each control against that captured value and emits: nothing at all
+when it is unchanged, and otherwise ONE `capability_verdicts` entry holding the
+value it was moved to — `yes`/`no` for a verdict, `''` for *unknown*, which
+DELETES the row. The legacy `is_mtp`/`vision_capable` booleans are never sent
+for these two capabilities (naming a capability in the map and sending its
+boolean is a `400`), and they could not carry the same meaning anyway:
+`Service.UpdateMapping` compares a BOOLEAN against the two-state fold of the
+stored rows, where a verdict of `no` and a missing row are both `false`, but a
+map ENTRY against the stored row itself. That split is what lets an operator
+move a control from *Unbekannt* to *Nein* and have it stick, while an old
+cached bundle that submits `vision_capable: false` on every save still writes
+nothing. Without the seed diff, a save that changed nothing but a throughput
+figure would launder an untouched control into a permanent operator verdict,
+freezing out every probe and the benchmark for a capability no one ever
+actually stated. A create needs no comparison — nothing is on file yet, which
+is also why `''` is unreachable there — but it takes the same map, so a stated
+`no` works there too, and it wins over both the legacy boolean and the
+backend's MTP name heuristic; the legacy booleans on the create request are
+plain bools, so only their `true` direction writes, an unset `false` being
+indistinguishable from a control the operator never looked at.
+
+**The reset rides on the mapping PATCH, and that is structural.** A delete
+fired from a button inside the open form would be self-undoing: the form does
+not re-seed, so the operator's next unrelated edit would re-establish the
+verdict they had just relinquished — with an ordinary 200 and nothing on
+screen. Carrying the intent in the same request removes that window, and the
+response is the post-write DTO so the next render seeds from truth. **The
+unknown option's caption is per-capability**, because the honest answer
+differs: `vision` (and video/audio/tools/live_progress) come back on their own
+within about a second of the next telemetry write-back or one app-health tick
+— *but only when the upstream really is a llama.cpp `/props` document*; for a
+router-shaped body, or vLLM/Ollama, nothing re-detects them. Nothing re-probes
+`mtp` at all on an existing mapping (the legacy name heuristic writes its row
+only for a brand-new one, and a re-sync skips an existing mapping), so
+returning it to unknown discards the verdict and the scorer's +30 MTP bonus
+until a human sets it again. Do not replace those two captions with one shared
+"let detection decide again"; an i18n test asserts they stay different in both
+languages. `metrics_locked` stays a **checkbox** — a policy flag over the
+numeric metrics, which ADR-039 is explicit does not guard the capability table
+any more.
 
 **Omission removes the clobber, not the race, and this split is the first thing
 that makes two simultaneous mapping writers a designed workflow.**
@@ -4814,11 +4872,14 @@ says nothing about whether the stored value is real.
 
 **The live-progress-support column follows the SAME persisted-value rule as
 context size, for the same reason, and it is deliberately NOT gated on a
-probe field either.** `live_progress_support` also reaches the row straight
-from the persisted mapping field
-(`LiveProgressSupport: view.mapping.LiveProgressSupport` in
-`portal/service_model_servers.go`) — written by a background detector
-(§8.4.3 of [Telemetry, Usage Analytics &
+probe field either.** `live_progress_support` also reaches the row from a
+persisted value rather than from the runtime-status registry — since the
+capability-table migration it is **folded from the mapping's `live_progress`
+capability row** (`routing.LiveProgressSupportFromVerdict` in
+`portal/service_model_servers.go`, out of the same batched capability read
+that fills the row's other capability fields; the `model_mappings` column it
+used to read was dropped once nothing wrote it) — written by a background
+detector (§8.4.3 of [Telemetry, Usage Analytics &
 Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
 not gateway-injected the way `state`/`active_requests`/`queue_depth`/
 `metrics_probe`/`context_probe` are — so there is no gateway-injection seam
@@ -4845,6 +4906,31 @@ table (issue #57, where the Probes column's `null` for both states read as
 row already applies to a metric that was simply never measured.
 `live_progress_checked_at` feeds only the cell's tooltip — never the badge or
 label choice, which depend solely on `live_progress_support`.
+
+**The capability column is one chip per established `yes`, and an unknown name
+is a chip too.** Each row also carries its mapping's whole capability row set
+(`capabilities`, one entry per determined `(mapping, capability)` — [API
+Surface](../reference/api-surface.md#models-servers-applications-mappings)),
+and `ModelServersSection.tsx` renders a chip for every `yes`: the four names
+the detector itself reasons about first, in a fixed order (`vision`, `video`,
+`audio`, `tools`) with translated labels, then any name this codebase does not
+know, **verbatim** and with the NEUTRAL `standby` badge — an upstream
+capability nobody here has heard of is information, not a warning, and
+dropping it would defeat the open vocabulary the rows exist to carry. `mtp`
+and `live_progress` are excluded from this column: both already have a column
+of their own (`is_mtp`'s is default-hidden, and so is the `vision` one that
+predates the chips — `vision` appears as a chip as well, since it is an
+ordinary row like any other). A `no` row and a missing row both render
+nothing, and a row set with no `yes` at all renders the same `—` placeholder
+the columns above use, for the identical reason. The tooltip is per
+capability: the two caveats that travel with these verdicts (§8.4.3 of
+[Telemetry, Usage Analytics & Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
+followed by **that chip's own** `source` and `checked_at` — which is what
+makes an operator's own verdict visibly distinguishable from a probe's on the
+screen where they look at it, and the reason the row carries provenance per
+capability rather than per mapping. Neither value affects the chip's badge or
+label; a `checked_at` a row never carried is omitted rather than rendered as a
+year-0001 date.
 
 **The former "Geladen" and "Live-Status" columns are now one "Status"
 column.** Two facts that used to sit in adjacent columns — the

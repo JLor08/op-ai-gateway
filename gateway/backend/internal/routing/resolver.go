@@ -291,6 +291,13 @@ type resolverStore interface {
 	AIServerByID(ctx context.Context, id string) (AIServer, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
+	// MappingCapabilities is read by resolveAffinity ONLY, to fill the synthetic
+	// MappingCandidate it builds for a sticky-pin hit -- that path's mapping comes
+	// from MappingsByApplication, which never joins model_mapping_capabilities.
+	// Before this read existed the affinity path served ModelMapping's
+	// (unwritten, pre-migration-78) column for the life of the pin -- up to
+	// AffinityTTLSeconds.
+	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
 }
 
 type Resolver struct {
@@ -518,7 +525,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		if !ok {
 			return Target{}, ErrNoHealthyHost
 		}
-		target, err := r.targetFrom(ctx, selected.Server, selected.Application, selected.Mapping, apiFlavor)
+		target, err := r.targetFrom(ctx, selected, apiFlavor)
 		if err != nil {
 			return Target{}, err
 		}
@@ -587,7 +594,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	// One server usually offers exactly one mapping for a given gateway model; pick the
 	// first (deterministic: the store's ActiveMappingsForModel result is stably ordered).
 	c := mine[0]
-	return r.targetFrom(ctx, c.Server, c.Application, c.Mapping, apiFlavor)
+	return r.targetFrom(ctx, c, apiFlavor)
 }
 
 // filterProvisioned drops candidates whose server the principal may not use under
@@ -716,7 +723,36 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
 		return Target{}, false, fmt.Errorf("update affinity: %w", err)
 	}
-	target, err := r.targetFrom(ctx, server, app, mapping, key.APIFlavor)
+	// resolveAffinity's mapping comes from activeMappingForApplication
+	// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
+	// model_mapping_capabilities, so unlike every other targetFrom call site
+	// this one has to fetch the verdict itself with a dedicated keyed read.
+	// That read is on a path that already makes five store calls just to
+	// reach this point (Affinity, ApplicationByID, AIServerByID,
+	// activeMappingForApplication's MappingsByApplication, UpsertAffinity);
+	// one more keyed lookup is the cost of the pin no longer serving a stale
+	// verdict for its entire TTL. Best-effort: a read failure degrades to ""
+	// (never-determined) -- the same reading an absent capability row would
+	// produce -- rather than failing an otherwise-servable affinity hit; the
+	// cost is that a transient store error can make one pinned request look
+	// like the verdict was never determined, which is strictly better than
+	// serving the wrong (frozen, possibly stale) column value.
+	//
+	// IsMTP is left at its zero value: targetFrom does not read it (only
+	// scoringRoute does, and this path never scores -- it returns a pin
+	// directly), so there is nothing to fill it from here.
+	liveProgressSupport := ""
+	if caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID); capErr == nil {
+		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
+			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
+		}
+	}
+	target, err := r.targetFrom(ctx, MappingCandidate{
+		Server:              server,
+		Application:         app,
+		Mapping:             mapping,
+		LiveProgressSupport: liveProgressSupport,
+	}, key.APIFlavor)
 	if err != nil {
 		return Target{}, false, err
 	}
@@ -1040,12 +1076,14 @@ func serverSelectable(server AIServer) bool {
 	return server.Status == ServerStatusActive && server.HealthStatus != HealthUnhealthy
 }
 
-// targetFrom builds the Target for a resolved (server, app, mapping) triple. For an
-// ordinary application the effective flavors/modes are the application's own; for a
+// targetFrom builds the Target for a resolved candidate (server + application +
+// mapping, plus the mapping's joined capability verdicts). For an ordinary
+// application the effective flavors/modes are the application's own; for a
 // server_agent mapping the RESOLVED RuntimeSpec is the sole authority for its model's
 // flavors + endpoint modes (the app's values are only the fallback for a mapping that
 // has no spec at all — design §3.3/§4).
-func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Application, mapping ModelMapping, apiFlavor string) (Target, error) {
+func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor string) (Target, error) {
+	server, app, mapping := c.Server, c.Application, c.Mapping
 	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
 	var spec RuntimeSpec
 	var liveProgressSpecType string
@@ -1085,7 +1123,17 @@ func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Applicat
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
-		LiveProgressSupport:  mapping.LiveProgressSupport,
+		// LiveProgressSupport reads the candidate's capability verdict
+		// (MappingCandidate.LiveProgressSupport). #49-3 moved every writer
+		// onto a "live_progress" capability row and migration 79 then dropped
+		// the column, so the mapping carries no verdict of its own to read by
+		// mistake. Both callers supply a FRESH verdict, by different routes:
+		// the candidate query joins the row, and resolveAffinity -- whose
+		// mapping comes from MappingsByApplication, which cannot carry a
+		// verdict -- does its own keyed MappingCapabilities read. That read
+		// exists precisely because forwarding the unwritten column was the
+		// bug; this is deliberately NOT a pass-through of prior behaviour.
+		LiveProgressSupport:  c.LiveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}, nil
 }
@@ -1496,7 +1544,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
 			return Target{}, err
 		}
-		return r.targetFrom(ctx, sel.Server, sel.Application, sel.Mapping, g.apiFlavor)
+		return r.targetFrom(ctx, sel, g.apiFlavor)
 	}
 
 	// The pin (and, under climb_up, the climb dance) decides this turn's member; an empty

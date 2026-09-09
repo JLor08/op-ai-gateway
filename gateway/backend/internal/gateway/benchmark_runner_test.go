@@ -729,8 +729,9 @@ func TestCapacityCurveSanitizesNonFiniteRates(t *testing.T) {
 
 // TestVisionRunWritesHistoryRow: a vision-mode run appends exactly ONE
 // benchmark-history row of kind "vision" carrying the definitive verdict, and
-// distills vision_capable onto the mapping. It also proves a vision run writes NO
-// speed-history row (the mode != "vision" guard).
+// distills the verdict onto the mapping's `vision` capability row. It also
+// proves a vision run writes NO speed-history row (the mode != "vision"
+// guard).
 func TestVisionRunWritesHistoryRow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
@@ -764,19 +765,25 @@ func TestVisionRunWritesHistoryRow(t *testing.T) {
 		t.Fatalf("history row Error = %q, want empty (a definitive verdict)", row.Error)
 	}
 
-	got, err := mem.MappingByID(ctx, "map1")
+	caps, err := mem.MappingCapabilities(ctx, "map1")
 	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
+		t.Fatalf("MappingCapabilities: %v", err)
 	}
-	if !got.VisionCapable {
-		t.Fatalf("mapping VisionCapable = false, want true (distilled from the definitive verdict)")
+	if len(caps) != 1 {
+		t.Fatalf("capability rows = %+v, want exactly 1 (the distilled vision verdict)", caps)
+	}
+	if caps[0].Capability != routing.CapabilityVision || caps[0].Verdict != routing.CapabilityYes {
+		t.Fatalf("capability row = %+v, want vision/yes (distilled from the definitive verdict)", caps[0])
 	}
 }
 
 // TestVisionRunInconclusiveWritesHistoryRowWithError: a vision run whose probe is
 // inconclusive (the baseline text call fails, so no verdict can be reached) still
 // appends a kind="vision" history row — with VisionCapable false and the error
-// recorded — and does NOT touch the mapping's vision_capable column.
+// recorded — and writes NO capability row at all: "unknown" is the ABSENCE of
+// a row, so an inconclusive probe has nothing to write and structurally
+// cannot clear a stored verdict (which the pre-row vision_capable bool, with
+// false doubling as both "no" and "not probed", could not express).
 func TestVisionRunInconclusiveWritesHistoryRowWithError(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
@@ -810,12 +817,166 @@ func TestVisionRunInconclusiveWritesHistoryRowWithError(t *testing.T) {
 		t.Fatalf("history row Error empty, want the inconclusive-probe error recorded")
 	}
 
-	got, err := mem.MappingByID(ctx, "map1")
+	caps, err := mem.MappingCapabilities(ctx, "map1")
 	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
+		t.Fatalf("MappingCapabilities: %v", err)
 	}
-	if got.VisionCapable {
-		t.Fatalf("mapping VisionCapable = true, want false (an inconclusive verdict must not be distilled)")
+	if len(caps) != 0 {
+		t.Fatalf("capability rows = %+v, want none (an inconclusive verdict must not be distilled)", caps)
+	}
+}
+
+// TestVisionBenchmarkWritesAnAuthoritativeRow proves the vision benchmark's
+// verdict lands as the mapping's `vision` row sourced vision_benchmark, and
+// that a subsequent PROBE reporting the opposite leaves it alone.
+//
+// That source is authoritative for a reason worth restating: the benchmark
+// sent a real image to the real upstream and read the real answer, while a
+// probe re-reads a /props document once a second. The rule itself lives in
+// routing.WritableCapabilityRows; the second half here exercises it
+// through the actual telemetry write-back rather than asserting on the helper
+// (TestIngestProbeDoesNotOverwriteABenchmarkVerdict is its sibling on the
+// ingest harness).
+//
+// The probe reports "no" against a benchmarked "yes", so the contradiction is
+// definitive in both directions -- neither side can pass by coincidence.
+func TestVisionBenchmarkWritesAnAuthoritativeRow(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	benchSeedStore(t, mem, now)
+
+	svc := portal.NewService(portal.ServiceDeps{SystemSettings: portal.NewMemorySystemSettings()})
+	reg := NewBenchmarkRegistry()
+	srv := &Server{Provider: visionFakeProvider{answer: "a photo"}, Routes: mem, Portal: svc, Benchmarks: reg}
+	run, ok := reg.TryStart("srv1", "mapping", "vision", 1, now, func() {})
+	if !ok {
+		t.Fatalf("TryStart did not start")
+	}
+	srv.runBenchmark(ctx, run, "srv1", []benchmarkTarget{benchTestTarget()}, "vision")
+
+	caps, err := mem.MappingCapabilities(ctx, "map1")
+	if err != nil {
+		t.Fatalf("MappingCapabilities: %v", err)
+	}
+	if len(caps) != 1 || caps[0].Capability != routing.CapabilityVision {
+		t.Fatalf("capability rows = %+v, want exactly one vision row", caps)
+	}
+	if caps[0].Verdict != routing.CapabilityYes {
+		t.Fatalf("vision verdict = %q, want %q (the upstream accepted the image)", caps[0].Verdict, routing.CapabilityYes)
+	}
+	if caps[0].Source != routing.CapabilitySourceVisionBenchmark {
+		t.Fatalf("vision source = %q, want %q -- the source is what makes the verdict outrank a probe", caps[0].Source, routing.CapabilitySourceVisionBenchmark)
+	}
+
+	// Now a probe, through the real write-back, reporting the opposite.
+	if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: "spec1", MappingID: "map1", Enabled: true, Binary: "/usr/bin/vllm",
+		Args: "[]", Env: "{}", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	srv.writeBackRuntimeCapabilities(ctx, "srv1", []agentRuntimeSample{{
+		SpecID: "spec1", State: "running",
+		Capabilities: &agentRuntimeCapabilitiesSample{Verdicts: []agentRuntimeCapabilityVerdict{
+			{Name: routing.CapabilityVision, Verdict: routing.CapabilityNo},
+		}},
+	}})
+
+	caps, err = mem.MappingCapabilities(ctx, "map1")
+	if err != nil {
+		t.Fatalf("MappingCapabilities (after the probe): %v", err)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("capability rows = %+v, want still exactly one", caps)
+	}
+	if caps[0].Verdict != routing.CapabilityYes || caps[0].Source != routing.CapabilitySourceVisionBenchmark {
+		t.Fatalf("vision row = %s/%s, want the untouched %s/%s -- a probe must never overwrite a real measurement", caps[0].Verdict, caps[0].Source, routing.CapabilityYes, routing.CapabilitySourceVisionBenchmark)
+	}
+}
+
+// TestVisionBenchmarkDoesNotOverwriteAManualVerdict proves the fix for the review's
+// Important finding: before this fix, runBenchmark's "vision" mode wrote its verdict
+// unconditionally, which meant it overwrote an OPERATOR's manual verdict too -- a net
+// loss of protection versus the metrics_locked guard model_mapping_capabilities
+// replaced (that guard's "where id = ? and metrics_locked = 0" made the same run a
+// no-op on a locked mapping). A manual row is reachable, not hypothetical: migration 78
+// maps a pre-78 mapping whose metrics_source was 'manual' onto CapabilitySourceManual.
+//
+// The benchmark here measures "yes" (visionFakeProvider accepts the image), directly
+// contradicting the seeded manual "no" -- so the row surviving unchanged is not a
+// coincidence of an agreeing verdict, it is the precedence rank actually blocking the
+// write (CapabilitySourceManual, rank 3, outranks CapabilitySourceVisionBenchmark,
+// rank 2 -- see routing.capabilitySourceRank).
+func TestVisionBenchmarkDoesNotOverwriteAManualVerdict(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	benchSeedStore(t, mem, now)
+	if err := mem.UpsertMappingCapabilities(ctx, "map1", []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceManual, CheckedAt: now,
+	}}); err != nil {
+		t.Fatalf("seed manual verdict: %v", err)
+	}
+
+	svc := portal.NewService(portal.ServiceDeps{SystemSettings: portal.NewMemorySystemSettings()})
+	reg := NewBenchmarkRegistry()
+	srv := &Server{Provider: visionFakeProvider{answer: "a photo"}, Routes: mem, Portal: svc, Benchmarks: reg}
+	run, ok := reg.TryStart("srv1", "mapping", "vision", 1, now, func() {})
+	if !ok {
+		t.Fatalf("TryStart did not start")
+	}
+	srv.runBenchmark(ctx, run, "srv1", []benchmarkTarget{benchTestTarget()}, "vision")
+
+	caps, err := mem.MappingCapabilities(ctx, "map1")
+	if err != nil {
+		t.Fatalf("MappingCapabilities: %v", err)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("capability rows = %+v, want still exactly one", caps)
+	}
+	if caps[0].Verdict != routing.CapabilityNo || caps[0].Source != routing.CapabilitySourceManual {
+		t.Fatalf("vision row = %s/%s, want the untouched manual/no -- the benchmark must never overwrite an operator's verdict", caps[0].Verdict, caps[0].Source)
+	}
+}
+
+// TestVisionBenchmarkOverwritesALegacyVerdict is TestVisionBenchmarkDoesNotOverwriteAManualVerdict's
+// contrasting case: a CapabilitySourceLegacy row (rank 1, a migrated guess -- see
+// routing.CapabilitySourceLegacy) is NOT authoritative against the benchmark's
+// CapabilitySourceVisionBenchmark (rank 2), so the benchmark's contradicting verdict
+// does replace it. Pins that the rank rule discriminates manual from legacy rather than
+// blocking every non-benchmark source alike.
+func TestVisionBenchmarkOverwritesALegacyVerdict(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	benchSeedStore(t, mem, now)
+	if err := mem.UpsertMappingCapabilities(ctx, "map1", []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceLegacy, CheckedAt: now,
+	}}); err != nil {
+		t.Fatalf("seed legacy verdict: %v", err)
+	}
+
+	svc := portal.NewService(portal.ServiceDeps{SystemSettings: portal.NewMemorySystemSettings()})
+	reg := NewBenchmarkRegistry()
+	srv := &Server{Provider: visionFakeProvider{answer: "a photo"}, Routes: mem, Portal: svc, Benchmarks: reg}
+	run, ok := reg.TryStart("srv1", "mapping", "vision", 1, now, func() {})
+	if !ok {
+		t.Fatalf("TryStart did not start")
+	}
+	srv.runBenchmark(ctx, run, "srv1", []benchmarkTarget{benchTestTarget()}, "vision")
+
+	caps, err := mem.MappingCapabilities(ctx, "map1")
+	if err != nil {
+		t.Fatalf("MappingCapabilities: %v", err)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("capability rows = %+v, want still exactly one", caps)
+	}
+	if caps[0].Verdict != routing.CapabilityYes || caps[0].Source != routing.CapabilitySourceVisionBenchmark {
+		t.Fatalf("vision row = %s/%s, want %s/%s -- a legacy row must not outrank a real measurement", caps[0].Verdict, caps[0].Source, routing.CapabilityYes, routing.CapabilitySourceVisionBenchmark)
 	}
 }
 
@@ -898,7 +1059,10 @@ func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
 // benchmarkTargetReq builds the Target for FIVE streaming callers (measureMapping,
 // measureMappingCapacity, the vision measurement, the load runner, the model warmer)
 // and set neither live-progress field, so provider.wantsLiveProgress saw an
-// undetermined verdict and no spec shape on every one of those streams. Two
+// undetermined verdict and no spec shape on every one of those streams. (The
+// verdict's SOURCE has since moved from the mapping's frozen column to its
+// model_mapping_capabilities row -- see benchmarkLiveProgressSupport -- but the
+// consequence of not carrying it is unchanged, which is why these pins stayed.) Two
 // consequences, both bad in opposite directions: a mapping already DETECTED as
 // "unsupported" still received the parameters (and RouteID is "" here, which the
 // rejection memo deliberately never memoizes, so the wasted 400-plus-retry repeats
@@ -909,10 +1073,12 @@ func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
 // TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs pins both fields at the
 // builder. The verdict is seeded "unsupported" and the spec type resolves to
 // "llama_cpp" -- both non-empty and distinct, so neither assertion can pass off a
-// zero value.
+// zero value. The verdict is set on benchmarkTarget.liveProgressSupport, which is
+// where benchmarkTargetFor resolves the mapping's capability row into (the
+// builder itself is pure and never reads the store).
 func TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs(t *testing.T) {
 	tgt := benchServerAgentTarget()
-	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.liveProgressSupport = "unsupported"
 	tgt.spec.Type = string(routing.RuntimeSpecTypeLlamaCpp)
 
 	target, _ := benchmarkTargetReq(tgt)
@@ -930,11 +1096,11 @@ func TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs(t *testing.T) {
 // EffectiveRuntimeSpecType would resolve a zero spec to "custom" -- a claim about a
 // managed child that does not exist. wantsLiveProgress never reads the field for a
 // non-server_agent target, so the wrong value would be inert today and a trap
-// tomorrow. The verdict, by contrast, is a property of the MAPPING and is carried
-// for every app type.
+// tomorrow. The verdict, by contrast, is a property of the MAPPING's capability
+// row and is carried for every app type.
 func TestBenchmarkTargetReqLiveProgressSpecTypeOnlyForServerAgent(t *testing.T) {
 	tgt := benchTestTarget() // ProviderMock, zero spec
-	tgt.mapping.LiveProgressSupport = "supported"
+	tgt.liveProgressSupport = "supported"
 
 	target, _ := benchmarkTargetReq(tgt)
 	if target.LiveProgressSpecType != "" {
@@ -954,7 +1120,7 @@ func TestMeasureMappingStreamCarriesLiveProgressVerdict(t *testing.T) {
 	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 42}}
 	srv := &Server{Provider: fake}
 	tgt := benchServerAgentTarget()
-	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.liveProgressSupport = "unsupported"
 	tgt.spec.Type = string(routing.RuntimeSpecTypeVLLM)
 
 	if _, err := srv.measureMapping(context.Background(), tgt); err != nil {
