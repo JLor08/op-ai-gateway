@@ -27,6 +27,13 @@ type ModelInfo struct {
 	// verdict -- see UpdateMappingLiveProgressSupport and the context-probe pass
 	// in cmd/gateway/app_health.go.
 	LiveProgressSupport string
+	// Caps is the auto-detected capability verdict set (#49 sub-project 2), as
+	// detected by detectCapabilities. Each field is "" (never determined) |
+	// "yes" | "no" (Extra carries capability names with no field of their own).
+	// "" must never overwrite an already-stored verdict -- see
+	// routing.UpdateMappingCapabilities and the capability write in
+	// cmd/gateway/app_health.go.
+	Caps Capabilities
 }
 
 // ModelInfoProber GETs target.Endpoint+probePath and parses model info (currently
@@ -73,20 +80,24 @@ func fetchModelInfo(ctx context.Context, httpClient *http.Client, target routing
 // parseModelInfo reads the llama.cpp /props shape: the loaded model's name (from
 // "model", or basename of "model_path") + n_ctx (default_generation_settings.n_ctx,
 // else top-level n_ctx) + the live-progress-capability verdict
-// (detectLiveProgressSupport).
+// (detectLiveProgressSupport) + the capability verdict set (detectCapabilities).
 //
-// A model NAME is required for the context size but NOT for the verdict, and the
-// two are reported independently:
+// A model NAME is required for the context size but NOT for either verdict, and
+// they are reported independently:
 //
-//   - name present: one entry carrying the name, the size, and the verdict --
+//   - name present: one entry carrying the name, the size, and both verdicts --
 //     the ordinary case, unchanged.
-//   - name absent, verdict determinable: one NAMELESS entry carrying ONLY the
-//     verdict. Returning nil here (as this did) silently discarded a real
-//     verdict, because the evidence rule needs no name at all: the verdict is a
-//     property of the server BUILD, while a context size is a property of a
-//     MODEL. The agent-side half never had this coupling -- it hands the raw
-//     body straight to the detector.
-//   - neither: nil, exactly as before.
+//   - name absent, a live-progress verdict OR any capability determinable: one
+//     NAMELESS entry carrying ONLY the verdict(s) -- no context size. Returning
+//     nil here (as this did, before either verdict existed) silently discarded a
+//     real verdict, because the evidence rule needs no name at all: a verdict is
+//     a property of the server BUILD, while a context size is a property of a
+//     MODEL. A capability is exactly the same kind of build property as the
+//     live-progress verdict -- neither says anything about which model is
+//     loaded -- which is why the nameless entry may carry a capability while
+//     deliberately still carrying no n_ctx. The agent-side half never had this
+//     coupling -- it hands the raw body straight to the detectors.
+//   - neither name nor any verdict: nil, exactly as before.
 //
 // The nameless entry deliberately carries NO context size, even when the body
 // reports an n_ctx. An unnamed size cannot be attributed: PickModelContextSize's
@@ -106,11 +117,12 @@ func parseModelInfo(body []byte) []ModelInfo {
 		name = path.Base(strings.TrimSpace(s))
 	}
 	support := detectLiveProgressSupport(body)
+	caps := detectCapabilities(body)
 	if name == "" {
-		if support == "" {
+		if support == "" && !capsAny(caps) {
 			return nil
 		}
-		return []ModelInfo{{LiveProgressSupport: support}}
+		return []ModelInfo{{LiveProgressSupport: support, Caps: caps}}
 	}
 	nctx := 0
 	if dgs, ok := obj["default_generation_settings"].(map[string]any); ok {
@@ -119,7 +131,7 @@ func parseModelInfo(body []byte) []ModelInfo {
 	if nctx == 0 {
 		nctx = intFromAny(obj["n_ctx"])
 	}
-	return []ModelInfo{{Name: name, ContextSize: nctx, LiveProgressSupport: support}}
+	return []ModelInfo{{Name: name, ContextSize: nctx, LiveProgressSupport: support, Caps: caps}}
 }
 
 // detectLiveProgressSupport is the live-progress-capability detector (#51): it
@@ -271,6 +283,16 @@ func capVerdict(v any) string {
 	return "no"
 }
 
+// capsAny reports whether c carries any determined verdict or Extra entry --
+// the "something to report" test parseModelInfo's nameless-entry branch and
+// PickModelCapabilities both need. Capabilities carries a []string field
+// (Extra), which makes it non-comparable with == (unlike LiveProgressSupport's
+// plain string), so this is the explicit field-by-field equivalent of a
+// `caps != Capabilities{}` check.
+func capsAny(c Capabilities) bool {
+	return c.Vision != "" || c.Video != "" || c.Audio != "" || c.Tools != "" || len(c.Extra) > 0
+}
+
 // ExpandModelPath substitutes the {model} placeholder in a probe path with the upstream model
 // name, so a per-model endpoint (e.g. "/upstream/{model}/props") can be queried. Each "/"-split
 // segment of the model name is URL-path-escaped (spaces/specials made safe) while "/" itself is
@@ -325,6 +347,31 @@ func PickModelLiveProgressSupport(infos []ModelInfo, model string) string {
 		}
 		if first == "" {
 			first = info.LiveProgressSupport
+		}
+	}
+	return first
+}
+
+// PickModelCapabilities returns the capability verdict set for a per-model
+// probe of the given model: an info whose Name matches (case-sensitive) wins;
+// otherwise the first info with any non-empty verdict (a per-model /props
+// probe returns one model, so this is that model's value). Returns the zero
+// value (Capabilities{}) when nothing usable is present -- callers must never
+// let that overwrite an already-stored verdict. Mirrors
+// PickModelLiveProgressSupport.
+func PickModelCapabilities(infos []ModelInfo, model string) Capabilities {
+	first := Capabilities{}
+	haveFirst := false
+	for _, info := range infos {
+		if !capsAny(info.Caps) {
+			continue
+		}
+		if info.Name == model {
+			return info.Caps
+		}
+		if !haveFirst {
+			first = info.Caps
+			haveFirst = true
 		}
 	}
 	return first

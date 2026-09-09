@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"op-ai-gateway/internal/capture"
@@ -61,6 +62,17 @@ type healthStore interface {
 	// it carries no metrics_locked guard -- see its doc comment on the store
 	// interface (routing.MappingStore) for why.
 	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
+	// UpdateMappingCapabilities records the auto-detected capability verdicts
+	// (#49-2) detected alongside the same probe. Like
+	// UpdateMappingLiveProgressSupport, it carries no metrics_locked guard --
+	// see routing.MappingStore's doc comment for why -- and writes only the
+	// non-empty verdicts, so a partial answer never clears one already stored.
+	UpdateMappingCapabilities(ctx context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error
+	// UpdateMappingVisionCapable syncs a mapping's consumer-visible
+	// vision_capable bool from a DEFINITIVE reported vision verdict. UNLIKE
+	// UpdateMappingCapabilities it DOES respect metrics_locked (see
+	// applyCapabilityWrite's doc for why the two writers deliberately differ).
+	UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
 	// RuntimeSpecsByApplication lists the runtime specs joined to the app's
 	// mappings (RuntimeSpec.MappingID keys back to the mapping). The {model}
@@ -443,6 +455,75 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 	return clampWakeInterval(nextSeconds)
 }
 
+// applyCapabilityWrite persists mp's reported capability verdicts (#49-2),
+// shared by both probe passes below (the {model}-template branch and the
+// single-probe branch of probeServer) -- it is their common tail, called once
+// per mapping with the caps that probe already attributed to that mapping
+// (via provider.PickModelCapabilities on the {model} branch, or the matched
+// ModelInfo.Caps directly on the single-probe branch).
+//
+// Structurally identical to writeBackRuntimeCapabilities in
+// internal/gateway/agent_ingest.go -- read that function's doc for the full
+// reasoning behind every guard here: only the verdicts that differ from what
+// is stored are sent (so an unchanged capability set issues no UPDATE on this
+// ~30s cadence), an unknown ("") verdict never reaches the writer (unknown
+// must never overwrite a stored verdict), and the write is NOT gated on
+// mp.MetricsLocked -- a capability is a property of the upstream build, not a
+// metric an operator pins numbers against, matching
+// UpdateMappingLiveProgressSupport beside it.
+//
+// The one exception, worth restating because Task 4's write-back got it wrong
+// on its first pass: the vision sync onto mp.VisionCapable is driven by
+// caps.Vision -- the verdict THIS probe reported -- not by whatever subset of
+// it ends up in the diff sent to UpdateMappingCapabilities. It runs even when
+// every tri-state verdict is already on file, so a vision_capable the
+// BENCHMARK moved independently (including pinning a wrong, definitive false
+// from a transient upstream failure) can still converge on a steady, unchanged
+// probe result -- not only on the one cycle that first changes cap_vision. It
+// still compares against mp.VisionCapable so an already-correct bool is never
+// rewritten, and still goes through the lock-respecting
+// UpdateMappingVisionCapable, unlike the lock-free UpdateMappingCapabilities
+// call below it.
+func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, at time.Time) {
+	diff := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
+	if caps.Vision != "" && caps.Vision != mp.CapVision {
+		diff.Vision = caps.Vision
+	}
+	if caps.Video != "" && caps.Video != mp.CapVideo {
+		diff.Video = caps.Video
+	}
+	if caps.Audio != "" && caps.Audio != mp.CapAudio {
+		diff.Audio = caps.Audio
+	}
+	if caps.Tools != "" && caps.Tools != mp.CapTools {
+		diff.Tools = caps.Tools
+	}
+	if len(caps.Extra) > 0 {
+		if encoded, err := json.Marshal(caps.Extra); err == nil && string(encoded) != mp.CapExtra {
+			diff.Extra = caps.Extra
+		}
+	}
+
+	// Vision sync: driven by caps.Vision, THIS probe's reported verdict -- not
+	// diff.Vision, which is non-empty only when the tri-state itself changed.
+	// See the doc above for why. "" still syncs nothing.
+	if caps.Vision != "" {
+		want := caps.Vision == "yes"
+		if want != mp.VisionCapable {
+			if err := r.store.UpdateMappingVisionCapable(ctx, mp.ID, want, at); err != nil {
+				log.Printf("app health: vision-capable sync for mapping %s failed: %v", mp.ID, err)
+			}
+		}
+	}
+
+	if diff.Vision == "" && diff.Video == "" && diff.Audio == "" && diff.Tools == "" && len(diff.Extra) == 0 {
+		return // every verdict already on file -- no write amplification
+	}
+	if err := r.store.UpdateMappingCapabilities(ctx, mp.ID, diff, at); err != nil {
+		log.Printf("app health: capability write-back for mapping %s failed: %v", mp.ID, err)
+	}
+}
+
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe
 // each active application whose per-application cadence is due (reusing the last
 // observed reachability otherwise), run the loaded-model + context-size probe
@@ -776,6 +857,18 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						if support := provider.PickModelLiveProgressSupport(infos, mp.AppModelName); support != "" && support != mp.LiveProgressSupport {
 							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, support, r.now())
 						}
+						// Additive capability write (#49-2), independent of both
+						// outcomes above and read off the SAME probe response --
+						// no extra request. Only the verdicts that differ from
+						// what is stored are sent, so an unchanged capability set
+						// issues no UPDATE on this ~30s cadence, and an unknown
+						// verdict is never sent at all (unknown must never
+						// overwrite a stored verdict). Deliberately not gated on
+						// mp.MetricsLocked, for the reason
+						// UpdateMappingCapabilities documents; the vision sync
+						// below DOES respect the lock, because vision_capable is
+						// the consumer-visible bool an operator pins.
+						r.applyCapabilityWrite(ctx, mp, provider.PickModelCapabilities(infos, mp.AppModelName), r.now())
 					}
 					return
 				}
@@ -811,6 +904,29 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 							if mp.AppModelName == info.Name && !mp.MetricsLocked && mp.ContextSize != info.ContextSize {
 								_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, info.ContextSize, r.now())
 							}
+						}
+					}
+					// Additive capability write (#49-2), independent of both the
+					// context-size outcome above and the live-progress outcome
+					// below -- read off the SAME probe response, no extra
+					// request. Only the verdicts that differ from what is
+					// stored are sent (applyCapabilityWrite), so an unchanged
+					// capability set issues no UPDATE on this ~30s cadence, and
+					// an unknown verdict is never sent at all (unknown must
+					// never overwrite a stored verdict). Deliberately placed
+					// BEFORE the live-progress block's `continue` below, so an
+					// info with no live-progress evidence at all still reaches
+					// this write. Mirrors that block's name-matching rule: a
+					// NAMELESS info (capability evidence but no model/model_path)
+					// reaches every mapping of this one-endpoint application,
+					// while a NAMED info keeps the strict name equality context
+					// attribution always had.
+					if info.Caps.Vision != "" || info.Caps.Video != "" || info.Caps.Audio != "" || info.Caps.Tools != "" || len(info.Caps.Extra) > 0 {
+						for _, mp := range mappings {
+							if info.Name != "" && mp.AppModelName != info.Name {
+								continue
+							}
+							r.applyCapabilityWrite(ctx, mp, info.Caps, r.now())
 						}
 					}
 					// Additive live-progress-support write (#51), independent of the
