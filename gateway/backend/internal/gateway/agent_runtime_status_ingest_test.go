@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -898,27 +899,110 @@ func TestIngestTelemetrySampleRuntimeProbeReachability(t *testing.T) {
 	}
 }
 
-// --- Task 5: per-mapping live-progress-support capability write-back ------
+// --- #49-3: the probe write path writes capability ROWS ------------------
+//
+// One writer now covers everything a per-runtime probe determines about a
+// child's build -- the open capability verdict list AND the live-progress
+// verdict, which lost its own writer when it became just another row. So the
+// tests below share one spy, and the live-progress tests assert the
+// routing.CapabilityLiveProgress row where they used to assert a column.
 
-// countingLiveProgressWriteStore counts the live-progress write-back's own
-// UPDATE (UpdateMappingLiveProgressSupport), so a test can assert exactly how
-// many times it fired -- writeBackRuntimeLiveProgress's sibling spy to
-// countingContextWriteStore/countingMeasuredWriteStore above, same mechanism,
-// different call.
-type countingLiveProgressWriteStore struct {
+// countingCapabilityRowWriteStore counts the write-back's own
+// UpsertMappingCapabilities calls and records the rows of each, so a test can
+// assert exactly how many writes fired and with what -- the row-shaped
+// successor to countingLiveProgressWriteStore/countingCapabilitiesWriteStore,
+// and a sibling of countingContextWriteStore/countingMeasuredWriteStore
+// above: same mechanism, different call.
+//
+// The CALL COUNT is what the no-write-amplification and precedence
+// assertions turn on: a probe that correctly declines to write and one that
+// writes an identical value reach the same stored state, so only the count
+// distinguishes them.
+type countingCapabilityRowWriteStore struct {
 	*routing.MemoryStore
-	updateCalls atomic.Int32
+	upsertCalls atomic.Int32
+
+	mu   sync.Mutex
+	sent [][]routing.CapabilityRow
 }
 
-func (c *countingLiveProgressWriteStore) UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error {
-	c.updateCalls.Add(1)
-	return c.MemoryStore.UpdateMappingLiveProgressSupport(ctx, id, support, at)
+func (c *countingCapabilityRowWriteStore) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error {
+	c.upsertCalls.Add(1)
+	c.mu.Lock()
+	c.sent = append(c.sent, append([]routing.CapabilityRow(nil), rows...))
+	c.mu.Unlock()
+	return c.MemoryStore.UpsertMappingCapabilities(ctx, mappingID, rows)
+}
+
+// lastSent returns the rows handed to the most recent
+// UpsertMappingCapabilities call (nil when there was none), so a test can
+// assert what ONE write carried rather than only the resulting state.
+func (c *countingCapabilityRowWriteStore) lastSent() []routing.CapabilityRow {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.sent) == 0 {
+		return nil
+	}
+	return c.sent[len(c.sent)-1]
+}
+
+// countingRowStore wraps srv.Routes in the spy above and returns it, the
+// three-line preamble every test below shares.
+func countingRowStore(srv *Server) *countingCapabilityRowWriteStore {
+	counting := &countingCapabilityRowWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+	return counting
+}
+
+// seedCapabilityRow writes one capability row directly through the store API
+// (never through the code path under test), so a test can establish "what is
+// already on file" -- an operator's manual verdict, the vision benchmark's
+// measurement, a legacy row migration 78 inherited, or an earlier probe's own
+// answer.
+func seedCapabilityRow(t *testing.T, srv *Server, mappingID, capability, verdict, source string) {
+	t.Helper()
+	if err := srv.Routes.UpsertMappingCapabilities(context.Background(), mappingID, []routing.CapabilityRow{{
+		Capability: capability, Verdict: verdict, Source: source,
+		CheckedAt: time.Now().UTC().Add(-time.Hour),
+	}}); err != nil {
+		t.Fatalf("seed %s=%s (%s) on %s: %v", capability, verdict, source, mappingID, err)
+	}
+}
+
+// capabilityRow reads one stored capability row back, keyed by name. ok is
+// false when the capability has NO row -- which is how "unknown" is expressed,
+// so a test distinguishing "never determined" from a definitive verdict has
+// to look at the bool, not at an empty verdict string.
+func capabilityRow(t *testing.T, srv *Server, mappingID, capability string) (routing.CapabilityRow, bool) {
+	t.Helper()
+	rows, err := srv.Routes.MappingCapabilities(context.Background(), mappingID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities(%s): %v", mappingID, err)
+	}
+	row, ok := routing.CapabilityRowsByName(rows)[capability]
+	return row, ok
+}
+
+// assertCapabilityRow fails unless mappingID's capability row holds exactly
+// this verdict and source. The SOURCE half is load-bearing, not decoration:
+// it is what the precedence rule reads, so a test that only checked the
+// verdict could not tell a probe's write from an operator's surviving one.
+func assertCapabilityRow(t *testing.T, srv *Server, mappingID, capability, wantVerdict, wantSource string) {
+	t.Helper()
+	row, ok := capabilityRow(t, srv, mappingID, capability)
+	if !ok {
+		t.Fatalf("%s has NO %q row, want %s/%s", mappingID, capability, wantVerdict, wantSource)
+	}
+	if row.Verdict != wantVerdict || row.Source != wantSource {
+		t.Fatalf("%s %q row = %s/%s, want %s/%s", mappingID, capability, row.Verdict, row.Source, wantVerdict, wantSource)
+	}
 }
 
 // liveProgressBody builds a minimal runtime_model_probe-declaring telemetry
 // body naming specID with the given live_progress_support verdict (omitted
-// entirely from the JSON when support is ""). It carries no gpus and no
-// context_size: that isolates the live-progress write-back's own resolution
+// entirely from the JSON when support is ""). It carries no gpus, no
+// context_size and no per-runtime capabilities object: that isolates the
+// live-progress verdict's own path through the shared capability write-back
 // from writeBackRuntimeVRAM's and writeBackRuntimeContext's, both of which
 // `continue` before ever resolving a spec when their own preconditions (GPUs
 // present / context_size > 0) are absent -- letting a memoization test count
@@ -932,82 +1016,106 @@ func liveProgressBody(specID, support string) string {
 		`"runtimes":[{"spec_id":"` + specID + `","state":"running"` + field + `}]}`
 }
 
-// TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves a
-// "supported" sample is written to the mapping's live_progress_support
-// column, and that an IDENTICAL second sample costs no further write. This is
-// writeBackRuntimeContext's F2 fix applied to a capability rather than a
-// metric -- and it matters MORE here: a build capability is stable by
-// nature, so the SAME child build reports the SAME verdict every single
-// second for its whole life. Without change detection this would drive one
-// UPDATE per second per mapping, forever, for a value that can never change
-// short of an operator swapping the upstream binary.
-func TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce(t *testing.T) {
+// TestIngestLiveProgressLandsAsARow proves the live-progress verdict from a
+// telemetry sample becomes a routing.CapabilityLiveProgress ROW -- "supported"
+// mapping onto the row model's "yes" -- written by the SHARED capability
+// write-back rather than by a writer of its own, and that an IDENTICAL second
+// sample costs no further write.
+//
+// The shared-path half is asserted by sending a sample that carries BOTH a
+// live-progress verdict and an ordinary capability verdict and requiring
+// exactly ONE upsert holding BOTH rows: they come off one /props document in
+// one probe pass, so a second write would mean the two facts had been split
+// apart again.
+//
+// The no-rewrite half is writeBackRuntimeContext's F2 fix applied to a
+// capability rather than a metric -- and it matters MORE here: a build
+// capability is stable by nature, so the SAME child build reports the SAME
+// verdict every single second for its whole life. Without change detection
+// this would drive one write per second per mapping, forever, for a value
+// that can never change short of an operator swapping the upstream binary.
+func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_once", false)
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_row", false)
+	counting := countingRowStore(srv)
 
-	body := liveProgressBody("rspec_lp_once", "supported")
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_lp_row","state":"running","live_progress_support":"supported",` +
+		`"capabilities":{"verdicts":[{"name":"vision","verdict":"yes"}]}}]}`
 	for i := 0; i < 2; i++ {
 		req, raw := ingestReq(t, body)
 		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
 	}
-	if got := counting.updateCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d across two samples carrying the SAME verdict, want exactly 1", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d across two samples carrying the SAME verdicts, want exactly 1", got)
 	}
-	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_lp_once")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
+	if got := len(counting.lastSent()); got != 2 {
+		t.Fatalf("the single write carried %d rows (%+v), want 2 -- the live-progress verdict must ride the SAME write as the capability verdicts, not a second one", got, counting.lastSent())
 	}
-	if mapping.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q", mapping.LiveProgressSupport, "supported")
+	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}
+
+// TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves an
+// "unsupported" sample lands as a live_progress row carrying the row model's
+// "no", and that an IDENTICAL second sample costs no further write. The
+// negative direction is the interesting one: it is the verdict a bool column
+// could not tell apart from "never probed", and the row model can.
+func TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_once", false)
+	counting := countingRowStore(srv)
+
+	body := liveProgressBody("rspec_lp_once", "unsupported")
+	for i := 0; i < 2; i++ {
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
 	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d across two samples carrying the SAME verdict, want exactly 1", got)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_once", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample proves a
 // sample whose live_progress_support is "" -- an older agent that predates
 // the field, or a child whose build this agent has not yet reached a stable
 // verdict for -- never writes: unknown must never overwrite a stored
-// verdict. The mapping is seeded to ALREADY hold "supported" via the Task 1
-// writer directly (not through the code path under test), so this assertion
-// cannot pass merely because both sides happen to be empty.
+// verdict. The mapping is seeded to ALREADY hold "yes" (through the store API
+// directly, not the code path under test), so this assertion cannot pass
+// merely because both sides happen to be empty.
 func TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_empty", false)
 	ctx := context.Background()
-	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_lp_empty", "supported", time.Now().UTC()); err != nil {
-		t.Fatalf("seed UpdateMappingLiveProgressSupport: %v", err)
-	}
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	seedCapabilityRow(t, srv, "map_rspec_lp_empty", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
 
 	body := liveProgressBody("rspec_lp_empty", "")
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if got := counting.updateCalls.Load(); got != 0 {
-		t.Fatalf(`UpdateMappingLiveProgressSupport calls = %d for an empty ("") sample, want 0 -- unknown must never overwrite a stored verdict`, got)
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf(`UpsertMappingCapabilities calls = %d for an empty ("") sample, want 0 -- unknown must never overwrite a stored verdict`, got)
 	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_empty")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", mapping.LiveProgressSupport, "supported")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_empty", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping proves
 // the deliberate difference from writeBackRuntimeContext: UNLIKE the
-// context-size write-back, a metrics_locked mapping's live-progress
-// capability IS still updated. A capability is a property of the upstream
-// build, not a metric an operator pins numbers against -- see
-// resolveRuntimeSpecLiveProgress's doc comment for the full rationale. The
-// mapping's manually pinned context_size/metrics_source must remain
-// untouched: only the orthogonal capability write is unlocked.
+// context-size write-back, a metrics_locked mapping's capabilities ARE still
+// written. A capability is a property of the upstream build, not a metric an
+// operator pins numbers against -- see
+// routing.MappingStore.UpsertMappingCapabilities for the full rationale, and
+// note that model_mapping_capabilities carries no lock guard for an in-Go
+// pre-check here to mirror. The mapping's manually pinned
+// context_size/metrics_source must remain untouched: only the orthogonal
+// capability write is unlocked.
 func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_locked", false)
@@ -1024,23 +1132,20 @@ func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testi
 		t.Fatalf("UpdateMapping: %v", err)
 	}
 
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 
 	body := liveProgressBody("rspec_lp_locked", "supported")
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if got := counting.updateCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want exactly 1 -- a locked mapping's capability must still be updated", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- a locked mapping's capability must still be written", got)
 	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_locked", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	got, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_locked")
 	if err != nil {
 		t.Fatalf("MappingByID: %v", err)
-	}
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q even though the mapping is metrics_locked", got.LiveProgressSupport, "supported")
 	}
 	if got.ContextSize != 4096 || got.MetricsSource != "manual" {
 		t.Fatalf("mapping = %#v, want the manually pinned context_size/metrics_source left untouched", got)
@@ -1054,38 +1159,31 @@ func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testi
 func TestIngestTelemetrySampleLiveProgressWriteBackWritesOnChange(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_change", false)
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 	ctx := context.Background()
 
 	req, raw := ingestReq(t, liveProgressBody("rspec_lp_change", "unsupported"))
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest 1: %v", err)
 	}
-	if got := counting.updateCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls after first ingest = %d, want 1", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls after first ingest = %d, want 1", got)
 	}
 
 	req, raw = ingestReq(t, liveProgressBody("rspec_lp_change", "supported"))
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest 2 (changed): %v", err)
 	}
-	if got := counting.updateCalls.Load(); got != 2 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d after a CHANGED verdict (unsupported -> supported), want 2", got)
+	if got := counting.upsertCalls.Load(); got != 2 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d after a CHANGED verdict (unsupported -> supported), want 2", got)
 	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_change")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want the changed %q", mapping.LiveProgressSupport, "supported")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_change", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
 // manyLiveProgressSamples builds n agentRuntimeSample entries all naming
 // specID with the given live_progress_support verdict and no gpus/
-// context_size -- isolating the live-progress write-back's own resolution
-// from writeBackRuntimeVRAM's and writeBackRuntimeContext's, both of which
+// context_size -- isolating the capability write-back's own resolution from
+// writeBackRuntimeVRAM's and writeBackRuntimeContext's, both of which
 // `continue` before ever resolving a spec when their own preconditions (GPUs
 // present / context_size > 0) are absent.
 func manyLiveProgressSamples(n int, specID, support string) []agentRuntimeSample {
@@ -1135,17 +1233,16 @@ func TestIngestTelemetrySampleLiveProgressWriteBackMemoizesRepeatedSpecID(t *tes
 // on this path, and the only thing binding a sample to a server is the
 // token-derived serverID. An agent authenticated for one server must not be
 // able to overwrite another server's mapping verdict by naming its spec_id.
-// Until this test, deleting resolveRuntimeSpecLiveProgress's ownership check
-// passed the whole suite.
+// Until this test, deleting the ownership check passed the whole suite.
 //
 // The sample carries TWO runtimes: the foreign spec plus a control spec the
 // reporting server does own. That makes the assertions unfalsifiable by
 // accident -- the write count must be exactly 1 (the control's), so removing
 // the ownership check turns it into 2, and the foreign mapping is seeded with
-// a DISTINGUISHABLE stored verdict ("unsupported") that the forged sample
-// would flip to "supported". The Warn is asserted too, matching the VRAM
-// sibling's audit-trail discipline: an agent naming another server's
-// resources is a signal worth keeping.
+// a DISTINGUISHABLE stored verdict ("no") that the forged sample would flip
+// to "yes". The Warn is asserted too, matching the VRAM sibling's audit-trail
+// discipline: an agent naming another server's resources is a signal worth
+// keeping.
 func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *testing.T) {
 	srv := NewTestServer()
 	ctx := context.Background()
@@ -1161,12 +1258,9 @@ func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *tes
 	// rspec_cross_lp belongs to otherServerID; rspec_own_lp to the reporting one.
 	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_lp", false)
 	seedRuntimeIngestSpec(t, srv, "rspec_own_lp", false)
-	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_cross_lp", "unsupported", now); err != nil {
-		t.Fatalf("seed the foreign mapping's stored verdict: %v", err)
-	}
+	seedCapabilityRow(t, srv, "map_rspec_cross_lp", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 
 	buf, restore := withCapturedSlog(t)
 	defer restore()
@@ -1179,23 +1273,11 @@ func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *tes
 		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
 	}
 
-	if got := counting.updateCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want exactly 1 (only the control spec this server owns)", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (only the control spec this server owns)", got)
 	}
-	foreign, err := srv.Routes.MappingByID(ctx, "map_rspec_cross_lp")
-	if err != nil {
-		t.Fatalf("MappingByID (foreign): %v", err)
-	}
-	if foreign.LiveProgressSupport != "unsupported" {
-		t.Fatalf("foreign LiveProgressSupport = %q, want the untouched %q -- an agent for one server must not overwrite another server's mapping verdict via spec_id", foreign.LiveProgressSupport, "unsupported")
-	}
-	own, err := srv.Routes.MappingByID(ctx, "map_rspec_own_lp")
-	if err != nil {
-		t.Fatalf("MappingByID (own): %v", err)
-	}
-	if own.LiveProgressSupport != "supported" {
-		t.Fatalf("own LiveProgressSupport = %q, want %q -- the ownership check must not become a blanket rejection", own.LiveProgressSupport, "supported")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_cross_lp", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_own_lp", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	if !findLogRecord(buf.Snapshot(), "WARN", "spec belongs to a different server") {
 		t.Fatal("a cross-server naming attempt must log a Warn, not a Debug -- an agent naming another server's resources is an audit signal, not a merely stale id")
 	}
@@ -1211,18 +1293,15 @@ func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *tes
 // from this path. That ruling had nothing protecting it -- the gate could be
 // deleted with the suite still green.
 //
-// The mapping is seeded with a stored "unsupported" that the ungated write
-// would flip to "supported", and the writer's call count is asserted at zero,
-// so neither assertion can pass off an empty-equals-empty coincidence.
+// The mapping is seeded with a stored "no" that the ungated write would flip
+// to "yes", and the writer's call count is asserted at zero, so neither
+// assertion can pass off an empty-equals-empty coincidence.
 func TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_nocap", false)
 	ctx := context.Background()
-	if err := srv.Routes.UpdateMappingLiveProgressSupport(ctx, "map_rspec_lp_nocap", "unsupported", time.Now().UTC()); err != nil {
-		t.Fatalf("seed stored verdict: %v", err)
-	}
-	counting := &countingLiveProgressWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	seedCapabilityRow(t, srv, "map_rspec_lp_nocap", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
 
 	// No "capabilities" object at all -- an agent that never declared
 	// runtime_model_probe, exactly like an older agent build.
@@ -1232,16 +1311,10 @@ func TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability(t *testin
 		t.Fatalf("ingest: %v", err)
 	}
 
-	if got := counting.updateCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingLiveProgressSupport calls = %d, want 0 (the agent did not declare runtime_model_probe)", got)
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want 0 (the agent did not declare runtime_model_probe)", got)
 	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_nocap")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.LiveProgressSupport != "unsupported" {
-		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", mapping.LiveProgressSupport, "unsupported")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_nocap", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO proves a runtime
@@ -1270,30 +1343,7 @@ func TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO(t *testing.T) {
 	}
 }
 
-// --- Task 4: per-mapping auto-detected capability write-back + vision sync ---
-
-// countingCapabilitiesWriteStore counts the capability write-back's own
-// UPDATE (UpdateMappingCapabilities) and, separately, the deliberate
-// vision_capable sync's UPDATE (UpdateMappingVisionCapable), so a test can
-// assert exactly how many times each fired -- writeBackRuntimeCapabilities'
-// own sibling spy to countingLiveProgressWriteStore above, same mechanism,
-// two counters because this write-back is the one path that calls both
-// writers.
-type countingCapabilitiesWriteStore struct {
-	*routing.MemoryStore
-	capabilitiesCalls atomic.Int32
-	visionCalls       atomic.Int32
-}
-
-func (c *countingCapabilitiesWriteStore) UpdateMappingCapabilities(ctx context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error {
-	c.capabilitiesCalls.Add(1)
-	return c.MemoryStore.UpdateMappingCapabilities(ctx, id, caps, at)
-}
-
-func (c *countingCapabilitiesWriteStore) UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error {
-	c.visionCalls.Add(1)
-	return c.MemoryStore.UpdateMappingVisionCapable(ctx, id, capable, at)
-}
+// --- #49-3: capability verdicts and the operator's precedence rule -------
 
 // capabilitiesBody builds a minimal runtime_model_probe-declaring telemetry
 // body naming specID, with the given JSON object embedded verbatim as the
@@ -1312,18 +1362,17 @@ func capabilitiesBody(specID, capsJSON string) string {
 }
 
 // TestIngestWritesBackCapabilities proves a sample carrying definitive
-// capability verdicts is written to the mapping's cap_* columns once, and
-// that an IDENTICAL second sample costs no further write -- the capability
-// write-back's own instance of writeBackRuntimeLiveProgress's compare-to-
-// stored discipline (TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce's
-// sibling): without it, every ~1s telemetry sample from every managed
-// process would drive one unconditional UPDATE per mapping, forever, for
-// verdicts that can only change if an operator swaps the upstream binary.
+// capability verdicts becomes one row per capability -- each stamped with the
+// llama_cpp_props SOURCE, which is what makes the precedence rule
+// expressible at all -- and that an IDENTICAL second sample costs no further
+// write: the capability write-back's own instance of the compare-to-stored
+// discipline. Without it, every ~1s telemetry sample from every managed
+// process would drive one write per mapping, forever, for verdicts that can
+// only change if an operator swaps the upstream binary.
 func TestIngestWritesBackCapabilities(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_caps_once", false)
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 
 	body := capabilitiesBody("rspec_caps_once", `{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"}]}`)
 	for i := 0; i < 2; i++ {
@@ -1332,57 +1381,212 @@ func TestIngestWritesBackCapabilities(t *testing.T) {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
 	}
-	if got := counting.capabilitiesCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d across two samples carrying the SAME verdicts, want exactly 1", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d across two samples carrying the SAME verdicts, want exactly 1", got)
 	}
-	mapping, err := srv.Routes.MappingByID(context.Background(), "map_rspec_caps_once")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.CapVision != "yes" || mapping.CapTools != "no" {
-		t.Fatalf("mapping caps = vision=%q tools=%q, want yes/no", mapping.CapVision, mapping.CapTools)
+	assertCapabilityRow(t, srv, "map_rspec_caps_once", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_caps_once", routing.CapabilityTools, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if _, ok := capabilityRow(t, srv, "map_rspec_caps_once", routing.CapabilityAudio); ok {
+		t.Fatal("an unreported capability must have NO row -- absence is how unknown is expressed, not an empty verdict")
 	}
 }
 
+// TestIngestProbeWritesANoVerdictOnAnUnknownCapabilityName is the trap the
+// pre-row shim left behind, pinned. The vocabulary of capability NAMES is
+// open: an upstream may report one this binary has never heard of. The old
+// projection could only fold such a name into a mapping-wide "extra" list
+// that had no verdict of its own, so an unknown name's "yes" survived as an
+// implicit positive while its "no" was silently DROPPED -- there was nowhere
+// to put it.
+//
+// With one row per capability there is. Both directions must land, and the
+// asymmetry must not survive the rewrite: this test sends a known name and
+// two unknown ones, one "yes" and one "no", and requires all three rows.
+func TestIngestProbeWritesANoVerdictOnAnUnknownCapabilityName(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_unknown", false)
+	counting := countingRowStore(srv)
+
+	body := capabilitiesBody("rspec_caps_unknown", `{"verdicts":[`+
+		`{"name":"vision","verdict":"yes"},`+
+		`{"name":"future_modality","verdict":"no"},`+
+		`{"name":"thinking","verdict":"yes"}]}`)
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1", got)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_caps_unknown", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_caps_unknown", "thinking", routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	row, ok := capabilityRow(t, srv, "map_rspec_caps_unknown", "future_modality")
+	if !ok {
+		t.Fatal(`no "future_modality" row -- an unknown capability name with a "no" verdict is a perfectly good row and must be written, not dropped the way the pre-row projection had to`)
+	}
+	if row.Verdict != routing.CapabilityNo {
+		t.Fatalf(`"future_modality" verdict = %q, want %q -- the negative direction is exactly what the old shim lost`, row.Verdict, routing.CapabilityNo)
+	}
+}
+
+// TestIngestProbeDoesNotOverwriteAManualVerdict is the operator's rule, and
+// the reason this whole sub-project exists: a verdict a HUMAN established
+// must survive a probe reporting the opposite, forever, without the operator
+// having to lock anything. Provenance replaces the lock -- see
+// routing.MappingStore.UpsertMappingCapabilities.
+//
+// The manual row says vision=no; the sample says vision=yes. The write count
+// must be zero FOR THAT CAPABILITY, which the test makes unfalsifiable by
+// sending a second, unmanaged verdict (tools) in the same document: exactly
+// one write must fire, and it must carry only the tools row. A test that
+// merely counted writes at zero could be satisfied by a write path that had
+// stopped working altogether.
+func TestIngestProbeDoesNotOverwriteAManualVerdict(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_manual", false)
+	seedCapabilityRow(t, srv, "map_rspec_caps_manual", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceManual)
+	counting := countingRowStore(srv)
+
+	body := capabilitiesBody("rspec_caps_manual", `{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"yes"}]}`)
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the unmanaged tools verdict)", got)
+	}
+	sent := counting.lastSent()
+	if len(sent) != 1 || sent[0].Capability != routing.CapabilityTools {
+		t.Fatalf("the write carried %+v, want exactly the tools row -- a probe must never send a capability a human established", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_caps_manual", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceManual)
+	assertCapabilityRow(t, srv, "map_rspec_caps_manual", routing.CapabilityTools, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}
+
+// TestIngestProbeDoesNotOverwriteABenchmarkVerdict is the same rule for the
+// other authoritative source: the vision benchmark MEASURED this -- it sent
+// a real image to the real upstream and read the real answer -- so a probe
+// re-reading a /props document must not talk over it either. This is also
+// the "and a subsequent probe leaves it alone" half of
+// TestVisionBenchmarkWritesAnAuthoritativeRow, which writes such a row
+// through the benchmark runner itself.
+//
+// Unfalsifiable the same way as the manual sibling: a second, unmanaged
+// verdict must still get through, so exactly one write fires and carries
+// only that row.
+func TestIngestProbeDoesNotOverwriteABenchmarkVerdict(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_bench", false)
+	seedCapabilityRow(t, srv, "map_rspec_caps_bench", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark)
+	counting := countingRowStore(srv)
+
+	body := capabilitiesBody("rspec_caps_bench", `{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"yes"}]}`)
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the unmanaged tools verdict)", got)
+	}
+	sent := counting.lastSent()
+	if len(sent) != 1 || sent[0].Capability != routing.CapabilityTools {
+		t.Fatalf("the write carried %+v, want exactly the tools row -- a probe must never send a capability a real measurement established", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_caps_bench", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark)
+}
+
+// TestIngestProbeOverwritesItsOwnAndLegacyVerdicts is precedence's other
+// half, and it is what keeps the rule from degenerating into "never write
+// anything": a row whose source is a PROBE source is overwritable, which is
+// how a verdict re-establishes itself after an operator swaps the upstream
+// binary. legacy (migration 78's inheritance from the pre-78 columns) counts
+// as a probe source deliberately -- its real origin is unknowable, and
+// treating a guess as authoritative would freeze it in forever.
+//
+// Three sub-cases, each on its own seeded mapping: a differing
+// llama_cpp_props row is replaced, a differing legacy row is replaced (and
+// re-sourced), and an AGREEING probe row is not rewritten at all.
+func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a differing llama_cpp_props row is replaced", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_own", false)
+		seedCapabilityRow(t, srv, "map_rspec_caps_own", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_caps_own", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- a probe's own earlier verdict is overwritable", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_caps_own", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("a differing legacy row is replaced", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_legacy", false)
+		seedCapabilityRow(t, srv, "map_rspec_caps_legacy", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_caps_legacy", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- a legacy verdict's real origin is unknowable, so it must stay probe-overwritable", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_caps_legacy", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("an agreeing probe row is not rewritten", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_agree", false)
+		seedCapabilityRow(t, srv, "map_rspec_caps_agree", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_caps_agree", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 0 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want 0 -- the stored verdict already agrees, and this sample arrives once a second forever", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_caps_agree", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+}
+
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities
-// object -- detection ran and determined nothing -- leaves stored verdicts
+// object -- detection ran and determined nothing -- leaves stored rows
 // untouched and calls the writer zero times: unknown must never overwrite a
-// stored verdict. The mapping is seeded to ALREADY hold "yes" via the Task 1
-// writer directly (not through the code path under test), so this assertion
-// cannot pass merely because both sides happen to be empty.
+// stored verdict. The mapping is seeded to ALREADY hold "yes" through the
+// store API directly (not through the code path under test), so this
+// assertion cannot pass merely because both sides happen to be empty.
 func TestIngestCapabilitiesEmptyNeverClears(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_caps_empty", false)
 	ctx := context.Background()
-	if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_caps_empty", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
-		t.Fatalf("seed UpdateMappingCapabilities: %v", err)
-	}
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	seedCapabilityRow(t, srv, "map_rspec_caps_empty", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
 
 	body := capabilitiesBody("rspec_caps_empty", `{}`)
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if got := counting.capabilitiesCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d for an all-empty capabilities object, want 0 -- unknown must never overwrite a stored verdict", got)
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d for an all-empty capabilities object, want 0 -- unknown must never overwrite a stored verdict", got)
 	}
-	if got := counting.visionCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingVisionCapable calls = %d for an all-empty capabilities object, want 0", got)
-	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_caps_empty")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.CapVision != "yes" {
-		t.Fatalf("CapVision = %q, want the untouched %q", mapping.CapVision, "yes")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_caps_empty", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestIngestCapabilitiesNilIsNotAClear proves a sample with NO "capabilities"
 // key at all inside a runtime entry -- an agent build that predates
-// capability detection -- is also zero writes, stored verdicts untouched.
+// capability detection -- is also zero writes, stored rows untouched.
 // Nil and all-empty are DIFFERENT facts (see agentRuntimeSample.Capabilities'
 // doc: an older agent vs. a detection pass that determined nothing), but
 // both are "no write" -- this test and TestIngestCapabilitiesEmptyNeverClears
@@ -1392,11 +1596,8 @@ func TestIngestCapabilitiesNilIsNotAClear(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_caps_nil", false)
 	ctx := context.Background()
-	if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_caps_nil", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
-		t.Fatalf("seed UpdateMappingCapabilities: %v", err)
-	}
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	seedCapabilityRow(t, srv, "map_rspec_caps_nil", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
 
 	// capsJSON == "" omits the "capabilities" key entirely from the runtime
 	// object -- rt.Capabilities decodes to a nil pointer, not a zero struct.
@@ -1405,35 +1606,25 @@ func TestIngestCapabilitiesNilIsNotAClear(t *testing.T) {
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if got := counting.capabilitiesCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d for a nil capabilities (no key at all), want 0", got)
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d for a nil capabilities (no key at all), want 0", got)
 	}
-	if got := counting.visionCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingVisionCapable calls = %d for a nil capabilities (no key at all), want 0", got)
-	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_caps_nil")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.CapVision != "yes" {
-		t.Fatalf("CapVision = %q, want the untouched %q", mapping.CapVision, "yes")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_caps_nil", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestIngestCapabilitiesWithoutFeatureNeverWrites pins the runtime_model_probe
 // gate on this write-back, mirroring
 // TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability: the
-// verdicts ride the same per-runtime probe pass that produces context_size
-// and live_progress_support, so they share that pass's trust boundary. An
-// agent that has never declared runtime_model_probe must never have a
-// mapping's stored capabilities touched from this path -- even though the
-// per-runtime "capabilities" object itself is present and definitive.
+// verdicts ride the same per-runtime probe pass that produces context_size,
+// so they share that pass's trust boundary. An agent that has never declared
+// runtime_model_probe must never have a mapping's stored capabilities touched
+// from this path -- even though the per-runtime "capabilities" object itself
+// is present and definitive.
 func TestIngestCapabilitiesWithoutFeatureNeverWrites(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_caps_nocap", false)
 	ctx := context.Background()
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 
 	// No top-level "capabilities" object at all -- an agent that never
 	// declared runtime_model_probe, exactly like an older agent build.
@@ -1442,15 +1633,11 @@ func TestIngestCapabilitiesWithoutFeatureNeverWrites(t *testing.T) {
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if got := counting.capabilitiesCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d, want 0 (the agent did not declare runtime_model_probe)", got)
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want 0 (the agent did not declare runtime_model_probe)", got)
 	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_caps_nocap")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if mapping.CapVision != "" {
-		t.Fatalf("CapVision = %q, want the untouched %q", mapping.CapVision, "")
+	if _, ok := capabilityRow(t, srv, "map_rspec_caps_nocap", routing.CapabilityVision); ok {
+		t.Fatal("a vision row exists, want none -- an agent that never declared runtime_model_probe must not reach this write path")
 	}
 }
 
@@ -1481,12 +1668,9 @@ func TestIngestCapabilitiesCrossServerRejected(t *testing.T) {
 	// reporting one.
 	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_caps", false)
 	seedRuntimeIngestSpec(t, srv, "rspec_own_caps", false)
-	if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_cross_caps", routing.CapabilityVerdicts{Vision: "no", Source: "llama_cpp_props"}, now); err != nil {
-		t.Fatalf("seed the foreign mapping's stored verdict: %v", err)
-	}
+	seedCapabilityRow(t, srv, "map_rspec_cross_caps", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
+	counting := countingRowStore(srv)
 
 	buf, restore := withCapturedSlog(t)
 	defer restore()
@@ -1499,23 +1683,11 @@ func TestIngestCapabilitiesCrossServerRejected(t *testing.T) {
 		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
 	}
 
-	if got := counting.capabilitiesCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d, want exactly 1 (only the control spec this server owns)", got)
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (only the control spec this server owns)", got)
 	}
-	foreign, err := srv.Routes.MappingByID(ctx, "map_rspec_cross_caps")
-	if err != nil {
-		t.Fatalf("MappingByID (foreign): %v", err)
-	}
-	if foreign.CapVision != "no" {
-		t.Fatalf("foreign CapVision = %q, want the untouched %q -- an agent for one server must not overwrite another server's mapping verdict via spec_id", foreign.CapVision, "no")
-	}
-	own, err := srv.Routes.MappingByID(ctx, "map_rspec_own_caps")
-	if err != nil {
-		t.Fatalf("MappingByID (own): %v", err)
-	}
-	if own.CapVision != "yes" {
-		t.Fatalf("own CapVision = %q, want %q -- the ownership check must not become a blanket rejection", own.CapVision, "yes")
-	}
+	assertCapabilityRow(t, srv, "map_rspec_cross_caps", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_own_caps", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	if !findLogRecord(buf.Snapshot(), "WARN", "spec belongs to a different server") {
 		t.Fatal("a cross-server naming attempt must log a Warn, not a Debug -- an agent naming another server's resources is an audit signal, not a merely stale id")
 	}
@@ -1577,254 +1749,4 @@ func TestAgentRuntimeCapabilitiesSampleDecode(t *testing.T) {
 			t.Errorf("Verdicts = %+v, want empty", caps.Verdicts)
 		}
 	})
-}
-
-// TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter proves the one
-// deliberate exception in writeBackRuntimeCapabilities' otherwise lock-free
-// write: a DEFINITIVE cap_vision verdict additionally syncs onto the
-// mapping's vision_capable bool through the lock-guarded
-// UpdateMappingVisionCapable -- see writeBackRuntimeCapabilities' doc for why
-// that is not an inconsistency with the lock-free write beside it. Four
-// sub-cases, each on its own seeded mapping so none can pass by coincidence:
-// "yes" writes true, "no" writes false, "" (vision absent from an otherwise
-// definitive sample) never touches vision_capable at all, and an unchanged
-// bool is not rewritten.
-func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("yes writes true", func(t *testing.T) {
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_yes", false)
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_yes", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.visionCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1", got)
-		}
-		mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_yes")
-		if err != nil {
-			t.Fatalf("MappingByID: %v", err)
-		}
-		if !mapping.VisionCapable {
-			t.Fatal("VisionCapable = false, want true")
-		}
-	})
-
-	t.Run("no writes false", func(t *testing.T) {
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_no", false)
-		// Seed VisionCapable=true directly so a "no" verdict has an actual
-		// change to make -- the bool's zero value is already false, so
-		// without this the call-count assertion below could not distinguish
-		// "wrote false" from "never touched it".
-		if err := srv.Routes.UpdateMappingVisionCapable(ctx, "map_rspec_vision_no", true, time.Now().UTC()); err != nil {
-			t.Fatalf("seed VisionCapable=true: %v", err)
-		}
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_no", `{"verdicts":[{"name":"vision","verdict":"no"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.visionCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1", got)
-		}
-		mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_no")
-		if err != nil {
-			t.Fatalf("MappingByID: %v", err)
-		}
-		if mapping.VisionCapable {
-			t.Fatal("VisionCapable = true, want false")
-		}
-	})
-
-	t.Run(`empty never syncs`, func(t *testing.T) {
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_empty", false)
-		// Seed VisionCapable=true directly so an incorrectly unguarded sync
-		// (treating an absent vision verdict as a definitive "no") would be
-		// CAUGHT: it would flip a true bool to false, which the assertions
-		// below would then observe both as an unwanted call and a corrupted
-		// value. Without this seed, the bool's zero value (false) would
-		// coincidentally already equal an unguarded want=false, and the
-		// assertions could not tell "correctly skipped" from "wrongly wrote
-		// the same value".
-		if err := srv.Routes.UpdateMappingVisionCapable(ctx, "map_rspec_vision_empty", true, time.Now().UTC()); err != nil {
-			t.Fatalf("seed VisionCapable=true: %v", err)
-		}
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		// vision is absent (""), but tools is definitive -- the capability
-		// write itself still happens; only the vision sync must not.
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_empty", `{"verdicts":[{"name":"tools","verdict":"no"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.capabilitiesCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingCapabilities calls = %d, want exactly 1 (the definitive tools verdict must still be written)", got)
-		}
-		if got := counting.visionCalls.Load(); got != 0 {
-			t.Fatalf(`UpdateMappingVisionCapable calls = %d for an empty ("") vision verdict, want 0 -- unknown is not a clear`, got)
-		}
-		mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_empty")
-		if err != nil {
-			t.Fatalf("MappingByID: %v", err)
-		}
-		if !mapping.VisionCapable {
-			t.Fatal("VisionCapable = false, want the untouched true")
-		}
-	})
-
-	t.Run("unchanged bool is not rewritten", func(t *testing.T) {
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_unchanged", false)
-		// Seed VisionCapable=true directly, matching what the incoming "yes"
-		// verdict would set -- so the sync has nothing to change even though
-		// the capability write itself still fires (cap_vision starts "").
-		if err := srv.Routes.UpdateMappingVisionCapable(ctx, "map_rspec_vision_unchanged", true, time.Now().UTC()); err != nil {
-			t.Fatalf("seed VisionCapable=true: %v", err)
-		}
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_unchanged", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.capabilitiesCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingCapabilities calls = %d, want exactly 1 (cap_vision itself is a fresh verdict)", got)
-		}
-		if got := counting.visionCalls.Load(); got != 0 {
-			t.Fatalf("UpdateMappingVisionCapable calls = %d, want 0 -- the bool is already true, an unchanged value must not be rewritten", got)
-		}
-	})
-
-	t.Run("already consistent: zero writes to both", func(t *testing.T) {
-		// The genuine steady state: cap_vision is ALREADY "yes" (unlike the
-		// "unchanged bool" sub-case above, where cap_vision started empty),
-		// vision_capable is ALREADY true, and the probe keeps reporting "yes".
-		// Nothing differs anywhere, so neither writer should fire at all --
-		// this is what pins that the convergence fix below does not turn a
-		// quiet steady state into perpetual write amplification.
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_steady", false)
-		if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_vision_steady", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
-			t.Fatalf("seed CapVision=yes: %v", err)
-		}
-		if err := srv.Routes.UpdateMappingVisionCapable(ctx, "map_rspec_vision_steady", true, time.Now().UTC()); err != nil {
-			t.Fatalf("seed VisionCapable=true: %v", err)
-		}
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_steady", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.capabilitiesCalls.Load(); got != 0 {
-			t.Fatalf("UpdateMappingCapabilities calls = %d, want 0 -- cap_vision is already \"yes\", nothing changed", got)
-		}
-		if got := counting.visionCalls.Load(); got != 0 {
-			t.Fatalf("UpdateMappingVisionCapable calls = %d, want 0 -- vision_capable is already true, a steady state must not write amplify", got)
-		}
-	})
-
-	t.Run("metrics locked: cap_* still writes, vision_capable does not", func(t *testing.T) {
-		// The branch's central asymmetry, pinned directly: cap_vision carries
-		// no metrics_locked guard at all (a capability is not a metric an
-		// operator pins numbers against), while the SAME sample's vision sync
-		// goes through the lock-respecting UpdateMappingVisionCapable, whose
-		// SQL/MemoryStore guard turns a locked mapping's write into a benign
-		// no-op. seedRuntimeIngestSpec's own bool argument is VRAMLocked, not
-		// MetricsLocked -- an easy mix-up this sub-case exists to avoid -- so
-		// MetricsLocked is set here, directly on the mapping, after seeding.
-		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_vision_locked", false)
-		mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_locked")
-		if err != nil {
-			t.Fatalf("MappingByID (seed): %v", err)
-		}
-		mapping.MetricsLocked = true
-		if err := srv.Routes.UpdateMapping(ctx, mapping); err != nil {
-			t.Fatalf("seed MetricsLocked=true: %v", err)
-		}
-		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-		srv.Routes = counting
-
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_locked", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
-		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-			t.Fatalf("ingest: %v", err)
-		}
-		if got := counting.capabilitiesCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingCapabilities calls = %d, want exactly 1 -- the lock-free cap_* write must still happen on a locked mapping", got)
-		}
-		if got := counting.visionCalls.Load(); got != 1 {
-			t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1 -- the sync still ATTEMPTS the call; the lock is enforced inside the writer's own guard, not by skipping the call", got)
-		}
-		got, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_locked")
-		if err != nil {
-			t.Fatalf("MappingByID (after ingest): %v", err)
-		}
-		if got.CapVision != "yes" {
-			t.Fatalf("CapVision = %q, want %q -- cap_* columns are lock-free", got.CapVision, "yes")
-		}
-		if got.VisionCapable {
-			t.Fatal("VisionCapable = true, want the untouched false -- a locked mapping's vision_capable must not be overwritten by the sync")
-		}
-	})
-}
-
-// TestIngestVisionSyncRepairsADesyncedBool proves the vision sync converges
-// vision_capable even when the tri-state cap_vision verdict does NOT change
-// this sample -- the fix for the defect flagged in Task 4's review: driving
-// the sync from caps.Vision (non-empty only on a tri-state CHANGE) meant a
-// bool desynced by another writer (the vision benchmark, through the same
-// UpdateMappingVisionCapable) could never be repaired once cap_vision itself
-// stopped moving. Seeds the exact desynced state -- cap_vision "yes" already
-// on file, vision_capable left at its false zero value -- then ingests a
-// sample reporting vision "yes" again, so cap_vision is UNCHANGED and the
-// capabilities write itself is correctly skipped (compare-to-stored), while
-// the sync must still run off the reported verdict and flip the bool.
-func TestIngestVisionSyncRepairsADesyncedBool(t *testing.T) {
-	srv := NewTestServer()
-	ctx := context.Background()
-	seedRuntimeIngestSpec(t, srv, "rspec_vision_desync", false)
-	if err := srv.Routes.UpdateMappingCapabilities(ctx, "map_rspec_vision_desync", routing.CapabilityVerdicts{Vision: "yes", Source: "llama_cpp_props"}, time.Now().UTC()); err != nil {
-		t.Fatalf("seed CapVision=yes: %v", err)
-	}
-	// VisionCapable is left at its false zero value -- the desync: cap_vision
-	// says "yes" but vision_capable still says false, exactly as if a vision
-	// benchmark run had independently pinned false (e.g. from a transient
-	// upstream failure) after the probe had already recorded "yes".
-
-	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
-	srv.Routes = counting
-
-	req, raw := ingestReq(t, capabilitiesBody("rspec_vision_desync", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
-	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
-		t.Fatalf("ingest: %v", err)
-	}
-
-	if got := counting.capabilitiesCalls.Load(); got != 0 {
-		t.Fatalf("UpdateMappingCapabilities calls = %d, want 0 -- cap_vision is unchanged (\"yes\" -> \"yes\"), so the capabilities write must stay skipped", got)
-	}
-	if got := counting.visionCalls.Load(); got != 1 {
-		t.Fatalf("UpdateMappingVisionCapable calls = %d, want exactly 1 -- the sync must run off the REPORTED verdict even though the tri-state did not change, to repair the desync", got)
-	}
-	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_vision_desync")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
-	}
-	if !mapping.VisionCapable {
-		t.Fatal("VisionCapable = false, want true -- the desynced bool must converge to match the still-current cap_vision verdict")
-	}
-	if mapping.CapVision != "yes" {
-		t.Fatalf("CapVision = %q, want the untouched %q", mapping.CapVision, "yes")
-	}
 }

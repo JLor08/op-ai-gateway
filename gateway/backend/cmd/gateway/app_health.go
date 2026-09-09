@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"op-ai-gateway/internal/capture"
@@ -57,22 +56,19 @@ type healthStore interface {
 	SetServerHealth(ctx context.Context, serverID, health string) error
 	MappingsByApplication(ctx context.Context, applicationID string) ([]routing.ModelMapping, error)
 	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
-	// UpdateMappingLiveProgressSupport records the live-progress-support verdict
-	// (#51) detected alongside the context probe. UNLIKE UpdateMappingContextProbe
-	// it carries no metrics_locked guard -- see its doc comment on the store
-	// interface (routing.MappingStore) for why.
-	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
-	// UpdateMappingCapabilities records the auto-detected capability verdicts
-	// (#49-2) detected alongside the same probe. Like
-	// UpdateMappingLiveProgressSupport, it carries no metrics_locked guard --
-	// see routing.MappingStore's doc comment for why -- and writes only the
-	// non-empty verdicts, so a partial answer never clears one already stored.
-	UpdateMappingCapabilities(ctx context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error
-	// UpdateMappingVisionCapable syncs a mapping's consumer-visible
-	// vision_capable bool from a DEFINITIVE reported vision verdict. UNLIKE
-	// UpdateMappingCapabilities it DOES respect metrics_locked (see
-	// applyCapabilityWrite's doc for why the two writers deliberately differ).
-	UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error
+	// MappingCapabilities reads a mapping's stored capability rows -- the
+	// baseline applyCapabilityWrite judges a fresh probe result against, for
+	// both the operator's precedence rule and change detection. An absent
+	// capability is UNKNOWN and simply has no row.
+	MappingCapabilities(ctx context.Context, mappingID string) ([]routing.CapabilityRow, error)
+	// UpsertMappingCapabilities writes the capability rows this probe pass
+	// determined -- every verdict it reads off the same /props document,
+	// live-progress included. UNLIKE UpdateMappingContextProbe it carries no
+	// metrics_locked guard; see its doc comment on the store interface
+	// (routing.MappingStore) for the full argument, and note it applies no
+	// precedence rule of its own -- this caller does, via
+	// routing.WritableProbeCapabilityRows.
+	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
 	// RuntimeSpecsByApplication lists the runtime specs joined to the app's
 	// mappings (RuntimeSpec.MappingID keys back to the mapping). The {model}
@@ -455,126 +451,107 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 	return clampWakeInterval(nextSeconds)
 }
 
-// applyCapabilityWrite persists mp's reported capability verdicts (#49-2),
-// shared by both probe passes below (the {model}-template branch and the
-// single-probe branch of probeServer) -- it is their common tail, called once
-// per mapping with the caps that probe already attributed to that mapping
-// (via provider.PickModelCapabilities on the {model} branch, or the matched
-// ModelInfo.Caps directly on the single-probe branch).
+// applyCapabilityWrite persists everything ONE probe response said about a
+// mapping's upstream build as model_mapping_capabilities rows (#49-3) -- the
+// common tail of both probe passes below (the {model}-template branch and the
+// single-probe branch of probeServer), called once per mapping with the caps
+// AND the live-progress verdict that probe already attributed to it (via
+// provider.PickModelCapabilities / PickModelLiveProgressSupport on the
+// {model} branch, or the matched ModelInfo's own fields on the single-probe
+// branch).
+//
+// Both arrive here because they were never two facts: one GET, one document,
+// one set of rows. live-progress is simply the routing.CapabilityLiveProgress
+// row, which is why it no longer has a writer or a compare-to-stored of its
+// own.
 //
 // Structurally identical to writeBackRuntimeCapabilities in
 // internal/gateway/agent_ingest.go -- read that function's doc for the full
-// reasoning behind every guard here: only the verdicts that differ from what
-// is stored are sent (so an unchanged capability set issues no UPDATE on this
-// ~30s cadence), an unknown ("") verdict never reaches the writer (unknown
-// must never overwrite a stored verdict), and the write is NOT gated on
-// mp.MetricsLocked -- a capability is a property of the upstream build, not a
-// metric an operator pins numbers against, matching
-// UpdateMappingLiveProgressSupport beside it.
+// reasoning behind every guard, all three of which this pass shares:
 //
-// The one exception, worth restating because Task 4's write-back got it wrong
-// on its first pass: the vision sync onto mp.VisionCapable is driven by
-// caps.Vision -- the verdict THIS probe reported -- not by whatever subset of
-// it ends up in the diff sent to UpdateMappingCapabilities. It runs even when
-// every tri-state verdict is already on file, so a vision_capable the
-// BENCHMARK moved independently (including pinning a wrong, definitive false
-// from a transient upstream failure) can still converge on a steady, unchanged
-// probe result -- not only on the one cycle that first changes cap_vision. It
-// still compares against mp.VisionCapable so an already-correct bool is never
-// rewritten, and still goes through the lock-respecting
-// UpdateMappingVisionCapable, unlike the lock-free UpdateMappingCapabilities
-// call below it.
+//   - PRECEDENCE: a probe never overwrites a row a human (manual) or a real
+//     measurement (vision_benchmark) established. This ~30s pass re-reads the
+//     same /props document forever; it must not be able to talk over the
+//     operator. The rule lives in routing.WritableProbeCapabilityRows -- asked
+//     here rather than restated, so this pass and the telemetry write-back
+//     cannot drift apart on it. That shared helper is also what retired the
+//     old vision SYNC onto mp.VisionCapable: with one authoritative row per
+//     capability there is no second copy left to converge.
+//   - CHANGE DETECTION: an unchanged verdict issues no write, so a steady
+//     upstream costs nothing on this cadence.
+//   - NO metrics_locked gate: a capability is a property of the upstream
+//     build, not a number an operator pins -- see
+//     routing.MappingStore.UpsertMappingCapabilities for the argument, and
+//     note the table itself carries no such guard to gate against.
 //
-// The four per-verdict "reported AND differs from stored" comparisons live
-// in diffCapabilityVerdicts below; the vision sync itself lives in
-// syncVisionCapable below -- both carry their own focused doc, but this
-// comment stays the source of truth for WHY each behaves as it does.
-func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, at time.Time) {
-	diff := diffCapabilityVerdicts(caps, mp)
-
-	// Vision sync: driven by caps.Vision, THIS probe's reported verdict -- not
-	// diff.Vision, which is non-empty only when the tri-state itself changed.
-	// See the doc above for why. "" still syncs nothing.
-	if err := r.syncVisionCapable(ctx, mp, caps.Vision, at); err != nil {
-		log.Printf("app health: vision-capable sync for mapping %s failed: %v", mp.ID, err)
+// Best-effort: a read or write failure is logged and the pass carries on.
+func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, liveProgress string, at time.Time) {
+	reported := probedCapabilityRows(caps, liveProgress, at)
+	if len(reported) == 0 {
+		// This probe determined nothing at all -- no modalities, no
+		// chat_template_caps, no live-progress evidence. Returns before the
+		// store read, so a body that is not a llama.cpp /props document costs
+		// no round trip per mapping per cadence tick.
+		return
 	}
-
-	if noCapabilityEvidence(diff.Vision, diff.Video, diff.Audio, diff.Tools, diff.Extra) {
-		return // every verdict already on file -- no write amplification
+	stored, err := r.store.MappingCapabilities(ctx, mp.ID)
+	if err != nil {
+		log.Printf("app health: capability read for mapping %s failed: %v", mp.ID, err)
+		return
 	}
-	if err := r.store.UpdateMappingCapabilities(ctx, mp.ID, diff, at); err != nil {
+	rows := routing.WritableProbeCapabilityRows(reported, routing.CapabilityRowsByName(stored))
+	if len(rows) == 0 {
+		return // already on file, or outranked by a human's / a measurement's verdict
+	}
+	if err := r.store.UpsertMappingCapabilities(ctx, mp.ID, rows); err != nil {
 		log.Printf("app health: capability write-back for mapping %s failed: %v", mp.ID, err)
 	}
 }
 
-// diffCapabilityVerdicts returns the routing.CapabilityVerdicts holding only
-// the verdicts among caps that are non-empty AND differ from what mp already
-// has stored -- the four independent comparisons applyCapabilityWrite used
-// to spell out inline, one per capability, now named and table-testable on
-// their own. Pure: no I/O, no store access.
+// probedCapabilityRows projects ONE probe response onto the store's row shape
+// -- the verdicts this probe actually determined, attributed to
+// llama_cpp_props and stamped at -- ready for
+// routing.WritableProbeCapabilityRows to decide which of them may be written.
+// Pure: no I/O, no store access, table-testable on its own.
 //
-// internal/gateway/agent_ingest.go's writeBackRuntimeCapabilities has the
-// identical shape duplicated across the internal/gateway <-> main package
-// boundary -- internal/gateway cannot import cmd/gateway (main) and a shared
-// package is not worth inventing for a helper this small, so this is a
-// narrow, deliberately duplicated helper, not a shared one; see that file's
-// changedCapabilityVerdicts for its sibling.
-func diffCapabilityVerdicts(caps provider.Capabilities, mp routing.ModelMapping) routing.CapabilityVerdicts {
-	diff := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
-	if caps.Vision != "" && caps.Vision != mp.CapVision {
-		diff.Vision = caps.Vision
-	}
-	if caps.Video != "" && caps.Video != mp.CapVideo {
-		diff.Video = caps.Video
-	}
-	if caps.Audio != "" && caps.Audio != mp.CapAudio {
-		diff.Audio = caps.Audio
-	}
-	if caps.Tools != "" && caps.Tools != mp.CapTools {
-		diff.Tools = caps.Tools
-	}
-	if len(caps.Extra) > 0 {
-		if encoded, err := json.Marshal(caps.Extra); err == nil && string(encoded) != mp.CapExtra {
-			diff.Extra = caps.Extra
+// An undetermined ("") verdict yields NO row, which is how "unknown must
+// never overwrite a stored verdict" stops being a rule every writer has to
+// remember: "unknown" is the ABSENCE of a row, so there is nothing to write
+// for it. caps.Extra carries the capability names llama.cpp reported that
+// have no field of their own; each becomes its own row, an implicit "yes" --
+// the detector only ever lists a capability it saw asserted.
+//
+// internal/gateway's runtimeSampleCapabilityRows is this function's sibling
+// across the internal/gateway <-> cmd/gateway (main) package boundary: each
+// projects its OWN probe's answer shape, which is inherently per-source, so
+// the projections are separate while the RULES they feed
+// (WritableProbeCapabilityRows, LiveProgressCapabilityVerdict) are shared.
+func probedCapabilityRows(caps provider.Capabilities, liveProgress string, at time.Time) []routing.CapabilityRow {
+	row := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{
+			Capability: capability, Verdict: verdict,
+			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: at,
 		}
 	}
-	return diff
-}
-
-// noCapabilityEvidence reports whether vision/video/audio/tools/extra carry
-// no verdict at all. applyCapabilityWrite uses it on a diffCapabilityVerdicts
-// result: every verdict already on file, so writing would only amplify.
-// internal/gateway/agent_ingest.go has the identical helper of the same name
-// for its own two uses -- see that file's doc for why this is a narrow,
-// deliberately duplicated helper rather than a shared one.
-func noCapabilityEvidence(vision, video, audio, tools string, extra []string) bool {
-	return vision == "" && video == "" && audio == "" && tools == "" && len(extra) == 0
-}
-
-// syncVisionCapable is applyCapabilityWrite's vision-sync step, extracted so
-// the convergence property stands on its own -- see applyCapabilityWrite's
-// doc for the full reasoning (cap_vision vs. vision_capable, and why this
-// runs off the REPORTED verdict rather than whatever diffCapabilityVerdicts
-// ended up returning). reported is THIS probe's cap_vision verdict ("" |
-// "yes" | "no"). A "" reported verdict never syncs (unknown is not a clear),
-// and an already-matching mp.VisionCapable is never rewritten -- both
-// mirrored from the original inline guard. Returns the store write's error,
-// or nil when nothing needed writing, so the caller keeps its own log line.
-//
-// internal/gateway/agent_ingest.go's writeBackRuntimeCapabilities has the
-// identical shape duplicated across the internal/gateway <-> main package
-// boundary -- see its own syncVisionCapable for the sibling (that one also
-// folds the result into a per-sample memo, which this one-shot call has no
-// need for).
-func (r *appHealthRunner) syncVisionCapable(ctx context.Context, mp routing.ModelMapping, reported string, at time.Time) error {
-	if reported == "" {
-		return nil
+	out := make([]routing.CapabilityRow, 0, 5+len(caps.Extra))
+	for _, f := range []struct{ capability, verdict string }{
+		{routing.CapabilityVision, caps.Vision},
+		{routing.CapabilityVideo, caps.Video},
+		{routing.CapabilityAudio, caps.Audio},
+		{routing.CapabilityTools, caps.Tools},
+		{routing.CapabilityLiveProgress, routing.LiveProgressCapabilityVerdict(liveProgress)},
+	} {
+		if f.verdict != routing.CapabilityYes && f.verdict != routing.CapabilityNo {
+			continue
+		}
+		out = append(out, row(f.capability, f.verdict))
 	}
-	want := reported == "yes"
-	if want == mp.VisionCapable {
-		return nil
+	for _, name := range caps.Extra {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, row(name, routing.CapabilityYes))
+		}
 	}
-	return r.store.UpdateMappingVisionCapable(ctx, mp.ID, want, at)
+	return out
 }
 
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe
@@ -746,18 +723,20 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	// Skipped entirely for an off-mesh server under netbird_only so this pass
 	// never dials it.
 	//
-	// Riding the SAME probe response (#51): each ModelInfo also carries a
-	// LiveProgressSupport verdict (see provider.detectLiveProgressSupport) --
-	// "" when the body isn't a llama.cpp /props document at all (a vLLM
-	// /v1/models body, an Ollama /api/show body, ...), "supported"/
-	// "unsupported" when it is. Unlike context_size this is a CAPABILITY, not a
-	// metric, so its write (UpdateMappingLiveProgressSupport) carries no
-	// metrics_locked guard and is independent of the context-size outcome -- and
-	// independent of the reported model NAME too, where a nameless /props body
-	// leaves nothing to match on (a capability belongs to the server build, a
-	// context size to a model); an unknown ("") verdict never calls the writer,
-	// and an unchanged verdict is skipped so this pass does not issue an UPDATE
-	// per application per cadence tick forever.
+	// Riding the SAME probe response (#51, #49-2/3): each ModelInfo also
+	// carries a LiveProgressSupport verdict (see
+	// provider.detectLiveProgressSupport) and a Caps verdict set (see
+	// provider.detectCapabilities) -- all "" / empty when the body isn't a
+	// llama.cpp /props document at all (a vLLM /v1/models body, an Ollama
+	// /api/show body, ...). Unlike context_size these are CAPABILITIES, not
+	// metrics, so their write (applyCapabilityWrite -> one set of
+	// model_mapping_capabilities rows, live-progress among them) carries no
+	// metrics_locked guard and is independent of the context-size outcome --
+	// and independent of the reported model NAME too, where a nameless /props
+	// body leaves nothing to match on (a capability belongs to the server
+	// build, a context size to a model); an unknown verdict never becomes a
+	// row at all, an unchanged one issues no write, and a verdict a human or
+	// the vision benchmark established is never overwritten.
 	if r.prober != nil && !offMesh {
 		ctxProber, hasCtxProber := r.prober.(provider.ModelInfoProber)
 		for i := range active {
@@ -837,12 +816,12 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 					}
 					for _, mp := range mappings {
 						// Deliberately NOT also skipping mp.MetricsLocked here (#51 follow-up):
-						// a locked mapping's live-progress CAPABILITY still needs probing --
-						// UpdateMappingLiveProgressSupport below carries no lock guard, because a
-						// capability is a property of the upstream build, not a number an
-						// operator answers for (see its doc comment). Skipping the probe here
-						// would silently keep that capability undetectable forever for any
-						// locked mapping on this llama-swap-shaped {model} path. The cost: a
+						// a locked mapping's CAPABILITIES still need probing -- the row writer
+						// below carries no lock guard, because a capability is a property of
+						// the upstream build, not a number an operator answers for (see
+						// routing.MappingStore.UpsertMappingCapabilities). Skipping the probe
+						// here would silently keep those capabilities undetectable forever for
+						// any locked mapping on this llama-swap-shaped {model} path. The cost: a
 						// locked mapping is now probed (one GET per cadence tick per loaded
 						// model) where it previously was not; the context-size write below is
 						// unaffected because UpdateMappingContextProbe's own SQL/store guard
@@ -891,37 +870,28 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						if ctxSize > 0 && ctxSize <= maxProbedContextSize && ctxSize != mp.ContextSize {
 							_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, ctxSize, r.now())
 						}
-						// Additive live-progress-support write (#51), independent of the
-						// context-size outcome above -- and, since PickModelLiveProgress-
-						// Support falls back to the first non-empty verdict when no
-						// reported name matches, independent of the model NAME as well:
-						// this path attributed the probe DIRECTLY (it GETted this
-						// mapping's own expanded path), so a /props body carrying the
-						// capability evidence but no model/model_path still yields this
-						// mapping's verdict. An unknown ("") verdict never calls
-						// the writer -- unknown must never overwrite a stored verdict -- and
-						// an unchanged verdict is skipped too, so this ~30s-cadence pass does
-						// not issue an UPDATE per application per tick forever (the same
-						// reasoning writeBackRuntimeContext documents at length in
-						// internal/gateway/agent_ingest.go). UpdateMappingLiveProgressSupport
-						// itself carries no metrics_locked guard (a build capability, not a
-						// metric an operator pins numbers against), so this call is
-						// deliberately NOT gated on mp.MetricsLocked either.
-						if support := provider.PickModelLiveProgressSupport(infos, mp.AppModelName); support != "" && support != mp.LiveProgressSupport {
-							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, support, r.now())
-						}
-						// Additive capability write (#49-2), independent of both
-						// outcomes above and read off the SAME probe response --
-						// no extra request. Only the verdicts that differ from
-						// what is stored are sent, so an unchanged capability set
-						// issues no UPDATE on this ~30s cadence, and an unknown
-						// verdict is never sent at all (unknown must never
-						// overwrite a stored verdict). Deliberately not gated on
-						// mp.MetricsLocked, for the reason
-						// UpdateMappingCapabilities documents; the vision sync
-						// below DOES respect the lock, because vision_capable is
-						// the consumer-visible bool an operator pins.
-						r.applyCapabilityWrite(ctx, mp, provider.PickModelCapabilities(infos, mp.AppModelName), r.now())
+						// Additive capability write (#49-3 / #51), independent of
+						// the context-size outcome above and read off the SAME
+						// probe response -- no extra request. Every verdict that
+						// response carried, live-progress included, goes to
+						// applyCapabilityWrite as ONE set of rows: they came off
+						// one document in one GET, and the row model gives
+						// live-progress no reason to keep a writer of its own.
+						//
+						// Independent of the model NAME as well: both Pick*
+						// helpers fall back to the first non-empty verdict when
+						// no reported name matches, and this path attributed the
+						// probe DIRECTLY (it GETted this mapping's own expanded
+						// path), so a /props body carrying capability evidence
+						// but no model/model_path still yields this mapping's
+						// verdicts. Deliberately not gated on mp.MetricsLocked --
+						// see applyCapabilityWrite's doc; an unknown verdict
+						// becomes no row, an unchanged one no write, and a human's
+						// or the benchmark's verdict is never overwritten.
+						r.applyCapabilityWrite(ctx, mp,
+							provider.PickModelCapabilities(infos, mp.AppModelName),
+							provider.PickModelLiveProgressSupport(infos, mp.AppModelName),
+							r.now())
 					}
 					return
 				}
@@ -959,62 +929,38 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 							}
 						}
 					}
-					// Additive capability write (#49-2), independent of both the
-					// context-size outcome above and the live-progress outcome
-					// below -- read off the SAME probe response, no extra
-					// request. Only the verdicts that differ from what is
-					// stored are sent (applyCapabilityWrite), so an unchanged
-					// capability set issues no UPDATE on this ~30s cadence, and
-					// an unknown verdict is never sent at all (unknown must
-					// never overwrite a stored verdict). Deliberately placed
-					// BEFORE the live-progress block's `continue` below, so an
-					// info with no live-progress evidence at all still reaches
-					// this write. Mirrors that block's name-matching rule: a
-					// NAMELESS info (capability evidence but no model/model_path)
-					// reaches every mapping of this one-endpoint application,
-					// while a NAMED info keeps the strict name equality context
-					// attribution always had.
-					if info.Caps.Vision != "" || info.Caps.Video != "" || info.Caps.Audio != "" || info.Caps.Tools != "" || len(info.Caps.Extra) > 0 {
-						for _, mp := range mappings {
-							if info.Name != "" && mp.AppModelName != info.Name {
-								continue
-							}
-							r.applyCapabilityWrite(ctx, mp, info.Caps, r.now())
-						}
-					}
-					// Additive live-progress-support write (#51), independent of the
-					// context-size outcome above (and, unlike it, NOT gated on
-					// mp.MetricsLocked -- UpdateMappingLiveProgressSupport records a build
-					// capability, not a metric an operator pins numbers against, so it
-					// carries no metrics_locked guard; see its doc comment). An unknown
-					// ("") verdict never calls the writer -- unknown must never overwrite a
-					// stored verdict, which is what keeps a vLLM /v1/models response (no
-					// default_generation_settings.params at all) from ever being read as
-					// "unsupported". An unchanged verdict is skipped too, so this
-					// ~30s-cadence pass does not issue an UPDATE per application per tick
-					// forever (the same reasoning writeBackRuntimeContext documents at
-					// length in internal/gateway/agent_ingest.go).
+					// Additive capability write (#49-3 / #51), independent of the
+					// context-size outcome above and read off the SAME probe
+					// response -- no extra request. ONE pass over the mappings
+					// for everything this info carried, capability verdicts and
+					// live-progress verdict alike: they came off one document, so
+					// the row writer takes them together (applyCapabilityWrite)
+					// and an info carrying only one of the two still reaches it.
+					// An unknown verdict becomes no row (which is what keeps a
+					// vLLM /v1/models response, with no
+					// default_generation_settings.params at all, from ever being
+					// read as "unsupported"), an unchanged one issues no write on
+					// this ~30s cadence, and a verdict a human or the vision
+					// benchmark established is never overwritten. Deliberately
+					// not gated on mp.MetricsLocked -- see applyCapabilityWrite.
 					//
-					// Independent of the context SIZE, and -- for a NAMELESS info --
-					// of the reported model NAME too. parseModelInfo reports a nameless
-					// entry when a /props body carries the capability evidence but no
-					// model/model_path (the verdict needs no name: it is a property of
-					// the server build, not of a model). A single-probe application has
-					// exactly ONE endpoint, so every mapping it owns is served by that
-					// same build and an unattributable verdict is genuinely theirs.
-					// A NAMED info keeps the strict name equality it always had -- this
-					// widening applies only to the case whose alternative is dropping a
+					// The name-matching rule, for both: a NAMELESS info reaches
+					// every mapping of this one-endpoint application, while a
+					// NAMED info keeps the strict name equality context
+					// attribution always had. parseModelInfo reports a nameless
+					// entry when a /props body carries the evidence but no
+					// model/model_path -- a capability needs no name, being a
+					// property of the server build rather than of a model -- and
+					// a single-probe application has exactly ONE endpoint, so
+					// every mapping it owns is served by that same build and an
+					// unattributable verdict is genuinely theirs. The widening
+					// applies only to the case whose alternative is dropping a
 					// real verdict on the floor.
-					if info.LiveProgressSupport == "" {
-						continue
-					}
 					for _, mp := range mappings {
 						if info.Name != "" && mp.AppModelName != info.Name {
 							continue
 						}
-						if mp.LiveProgressSupport != info.LiveProgressSupport {
-							_ = r.store.UpdateMappingLiveProgressSupport(ctx, mp.ID, info.LiveProgressSupport, r.now())
-						}
+						r.applyCapabilityWrite(ctx, mp, info.Caps, info.LiveProgressSupport, r.now())
 					}
 				}
 			}(app, probePath)

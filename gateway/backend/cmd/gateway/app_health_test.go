@@ -6,7 +6,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -37,15 +36,18 @@ type fakeHealthStore struct {
 	apps     map[string][]routing.Application
 	settings map[string]string
 
-	mu                sync.Mutex
-	health            map[string]string
-	mappings          map[string][]routing.ModelMapping  // keyed by application id
-	ctxProbeSets      int                                // count of UpdateMappingContextProbe calls
-	liveProgressSets  int                                // count of UpdateMappingLiveProgressSupport calls
-	capabilitiesSets  int                                // count of UpdateMappingCapabilities calls
-	visionCapableSets int                                // count of UpdateMappingVisionCapable calls
-	availSamplesLog   []routing.ServerAvailabilitySample // append-ordered availability samples
-	failInsert        bool                               // when true, InsertServerAvailabilitySample errors
+	mu               sync.Mutex
+	health           map[string]string
+	mappings         map[string][]routing.ModelMapping // keyed by application id
+	ctxProbeSets     int                               // count of UpdateMappingContextProbe calls
+	capabilityWrites int                               // count of UpsertMappingCapabilities calls
+	// caps is the model_mapping_capabilities child table, keyed by mapping id
+	// then capability name -- a mapping with no entry has every capability
+	// UNKNOWN, which is what the absence of a row means (routing.CapabilityRow).
+	caps            map[string]map[string]routing.CapabilityRow
+	capsReadErr     bool                               // when true, MappingCapabilities errors
+	availSamplesLog []routing.ServerAvailabilitySample // append-ordered availability samples
+	failInsert      bool                               // when true, InsertServerAvailabilitySample errors
 	// runtimeSpecs backs RuntimeSpecsByApplication (issue #58 per-mapping
 	// upstream credentials); specsErr, when set, makes the call fail instead
 	// (exercising the fallback-to-app-token degrade path).
@@ -108,126 +110,107 @@ func (f *fakeHealthStore) ctxProbeSetCount() int {
 	return f.ctxProbeSets
 }
 
-// UpdateMappingLiveProgressSupport mirrors the store contract (#51): it stamps
-// live_progress_support + live_progress_checked_at UNCONDITIONALLY -- UNLIKE
-// UpdateMappingContextProbe above it carries NO metrics_locked guard, mirroring
-// SQLiteStore.UpdateMappingLiveProgressSupport (a build capability, not a
-// metric an operator pins numbers against).
-func (f *fakeHealthStore) UpdateMappingLiveProgressSupport(_ context.Context, id, support string, at time.Time) error {
+// MappingCapabilities mirrors the store contract (#49-3): one mapping's
+// capability rows, ordered by capability, and an EMPTY slice for a mapping
+// with none -- every capability simply unknown. capsReadErr makes it fail
+// instead, so a test can pin the write path's best-effort behaviour when the
+// baseline cannot be read.
+func (f *fakeHealthStore) MappingCapabilities(_ context.Context, mappingID string) ([]routing.CapabilityRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.liveProgressSets++
-	for appID, list := range f.mappings {
-		for i := range list {
-			if list[i].ID != id {
-				continue
-			}
-			list[i].LiveProgressSupport = support
-			t := at
-			list[i].LiveProgressCheckedAt = &t
-			f.mappings[appID] = list
-			return nil
+	if f.capsReadErr {
+		return nil, fmt.Errorf("mapping capabilities: boom")
+	}
+	out := make([]routing.CapabilityRow, 0, len(f.caps[mappingID]))
+	for _, row := range f.caps[mappingID] {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out, nil
+}
+
+// UpsertMappingCapabilities mirrors the store contract: rows REPLACE any row
+// for the same (mapping, capability), every row is validated before anything
+// is written (routing.ValidateCapabilityRow -- so a caller handing over an
+// empty verdict fails here exactly as it would against a real driver), and
+// there is NO metrics_locked guard, matching both drivers.
+func (f *fakeHealthStore) UpsertMappingCapabilities(_ context.Context, mappingID string, rows []routing.CapabilityRow) error {
+	for _, r := range rows {
+		if err := routing.ValidateCapabilityRow(r); err != nil {
+			return err
 		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.capabilityWrites++
+	if len(rows) == 0 {
+		return nil
+	}
+	if f.caps == nil {
+		f.caps = map[string]map[string]routing.CapabilityRow{}
+	}
+	if f.caps[mappingID] == nil {
+		f.caps[mappingID] = map[string]routing.CapabilityRow{}
+	}
+	for _, r := range rows {
+		f.caps[mappingID][r.Capability] = r
 	}
 	return nil
 }
 
-// liveProgressSetCount returns how many times UpdateMappingLiveProgressSupport
-// was called (a call-count spy for the no-rewrite property).
-func (f *fakeHealthStore) liveProgressSetCount() int {
+// capabilityWriteCount returns how many times UpsertMappingCapabilities was
+// called -- the call-count spy the no-write-amplification and precedence
+// assertions turn on: a probe that correctly declines to write and one that
+// rewrites an identical value reach the same stored state, so only the count
+// distinguishes them.
+func (f *fakeHealthStore) capabilityWriteCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.liveProgressSets
+	return f.capabilityWrites
 }
 
-// UpdateMappingCapabilities mirrors the store contract (#49-2): only
-// non-empty verdicts are written -- a partial probe answer must never clear
-// an already-stored one -- stamping CapabilitiesSource + CapabilitiesCheckedAt
-// only when something was actually written, mirroring
-// MemoryStore/SQLiteStore.UpdateMappingCapabilities. NO metrics_locked guard,
-// matching UpdateMappingLiveProgressSupport above.
-func (f *fakeHealthStore) UpdateMappingCapabilities(_ context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error {
+// seedCapability puts one capability row on file, standing in for whatever
+// established it -- an operator (manual), the vision benchmark, migration
+// 78's legacy inheritance, or an earlier probe.
+func (f *fakeHealthStore) seedCapability(mappingID, capability, verdict, source string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.capabilitiesSets++
-	for appID, list := range f.mappings {
-		for i := range list {
-			if list[i].ID != id {
-				continue
-			}
-			wrote := false
-			if caps.Vision != "" {
-				list[i].CapVision = caps.Vision
-				wrote = true
-			}
-			if caps.Video != "" {
-				list[i].CapVideo = caps.Video
-				wrote = true
-			}
-			if caps.Audio != "" {
-				list[i].CapAudio = caps.Audio
-				wrote = true
-			}
-			if caps.Tools != "" {
-				list[i].CapTools = caps.Tools
-				wrote = true
-			}
-			if len(caps.Extra) > 0 {
-				encoded, _ := json.Marshal(caps.Extra)
-				list[i].CapExtra = string(encoded)
-				wrote = true
-			}
-			if wrote {
-				list[i].CapabilitiesSource = caps.Source
-				t := at
-				list[i].CapabilitiesCheckedAt = &t
-			}
-			f.mappings[appID] = list
-			return nil
-		}
+	if f.caps == nil {
+		f.caps = map[string]map[string]routing.CapabilityRow{}
 	}
-	return nil
-}
-
-// capabilitiesSetCount returns how many times UpdateMappingCapabilities was
-// called (a call-count spy for the no-rewrite property, mirroring
-// liveProgressSetCount).
-func (f *fakeHealthStore) capabilitiesSetCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.capabilitiesSets
-}
-
-// UpdateMappingVisionCapable mirrors the store contract: sets vision_capable +
-// provenance ("vision") ONLY while the mapping is unlocked (a missing or
-// locked mapping is a benign no-op), mirroring
-// MemoryStore/SQLiteStore.UpdateMappingVisionCapable.
-func (f *fakeHealthStore) UpdateMappingVisionCapable(_ context.Context, id string, capable bool, at time.Time) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.visionCapableSets++
-	for appID, list := range f.mappings {
-		for i := range list {
-			if list[i].ID != id || list[i].MetricsLocked {
-				continue
-			}
-			list[i].VisionCapable = capable
-			list[i].MetricsSource = "vision"
-			t := at
-			list[i].MetricsUpdatedAt = &t
-			f.mappings[appID] = list
-			return nil
-		}
+	if f.caps[mappingID] == nil {
+		f.caps[mappingID] = map[string]routing.CapabilityRow{}
 	}
-	return nil
+	f.caps[mappingID][capability] = routing.CapabilityRow{
+		Capability: capability, Verdict: verdict, Source: source,
+		CheckedAt: time.Now().UTC().Add(-time.Hour),
+	}
 }
 
-// visionCapableSetCount returns how many times UpdateMappingVisionCapable was
-// called (a call-count spy for the vision-sync convergence property).
-func (f *fakeHealthStore) visionCapableSetCount() int {
+// capabilityOf reads one stored capability row back. ok is false when the
+// capability has NO row, which is how "unknown" is expressed -- so a test
+// telling "never determined" from a definitive verdict must look at the bool,
+// not at an empty verdict string.
+func (f *fakeHealthStore) capabilityOf(mappingID, capability string) (routing.CapabilityRow, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.visionCapableSets
+	row, ok := f.caps[mappingID][capability]
+	return row, ok
+}
+
+// assertCapability fails unless mappingID's capability row holds exactly this
+// verdict and source. The SOURCE half is load-bearing: it is what the
+// precedence rule reads, so a test checking only the verdict could not tell a
+// probe's write from an operator's surviving one.
+func (f *fakeHealthStore) assertCapability(t *testing.T, mappingID, capability, wantVerdict, wantSource string) {
+	t.Helper()
+	row, ok := f.capabilityOf(mappingID, capability)
+	if !ok {
+		t.Fatalf("%s has NO %q row, want %s/%s", mappingID, capability, wantVerdict, wantSource)
+	}
+	if row.Verdict != wantVerdict || row.Source != wantSource {
+		t.Fatalf("%s %q row = %s/%s, want %s/%s", mappingID, capability, row.Verdict, row.Source, wantVerdict, wantSource)
+	}
 }
 
 // InsertServerAvailabilitySample records an availability sample so the sampling
@@ -832,8 +815,10 @@ func TestRunAppHealthOnceContextProbeNoTemplateUsesSingleProbeNameMatch(t *testi
 // matches. Without this comparison the pass would issue an UPDATE per
 // application per cadence tick forever -- the same reasoning
 // writeBackRuntimeContext documents at length in
-// internal/gateway/agent_ingest.go. Uses a call-count spy
-// (liveProgressSetCount), mirroring the repo's existing ctxProbeSetCount spy.
+// internal/gateway/agent_ingest.go. The verdict now lands as the mapping's
+// routing.CapabilityLiveProgress ROW -- #49-3 gave it no writer of its own --
+// so the spy is capabilityWriteCount, mirroring the repo's existing
+// ctxProbeSetCount spy.
 func TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCycle(t *testing.T) {
 	shrinkRetryGap(t)
 	app := ctxProbeApp("a1", "s1", 8001)
@@ -848,20 +833,17 @@ func TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCyc
 
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q", got.LiveProgressSupport, "supported")
-	}
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times after the first cycle, want 1", n)
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after the first cycle, want 1", n)
 	}
 
 	// A second cycle with a fresh cadence state (as if the next tick's interval
 	// had elapsed) reports the SAME verdict -- it must not be rewritten.
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
 	}
 }
 
@@ -869,10 +851,12 @@ func TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCyc
 // is TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAnIdenticalCycle's
 // counterpart for the capability write (#49-2) on the {model}-template branch:
 // a llama.cpp /props body carrying modalities + chat_template_caps evidence
-// must be persisted on the first cycle, and a second, otherwise-identical
-// cycle must NOT reissue the write, since the stored verdicts already match --
-// the same no-rewrite property applyCapabilityWrite documents. Uses the new
-// call-count spy (capabilitiesSetCount), mirroring liveProgressSetCount.
+// must be persisted on the first cycle as one row per capability, and a
+// second, otherwise-identical cycle must NOT reissue the write, since the
+// stored verdicts already match -- the same no-rewrite property
+// applyCapabilityWrite documents. Uses the call-count spy
+// (capabilityWriteCount), which is what distinguishes "correctly declined"
+// from "rewrote the same value".
 func TestRunAppHealthOnceContextProbeTemplateCapabilitiesPersistOnceNotAgainOnAnIdenticalCycle(t *testing.T) {
 	shrinkRetryGap(t)
 	app := ctxTemplateApp("a1", "s1", 8001)
@@ -892,32 +876,27 @@ func TestRunAppHealthOnceContextProbeTemplateCapabilitiesPersistOnceNotAgainOnAn
 	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	got, _ := st.mappingOf("m1")
-	if got.CapVision != "yes" || got.CapTools != "yes" {
-		t.Fatalf("CapVision=%q CapTools=%q, want yes/yes", got.CapVision, got.CapTools)
-	}
-	if got.CapabilitiesSource != "llama_cpp_props" {
-		t.Fatalf("CapabilitiesSource = %q, want %q", got.CapabilitiesSource, "llama_cpp_props")
-	}
-	if n := st.capabilitiesSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingCapabilities called %d times after the first cycle, want 1", n)
+	st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	st.assertCapability(t, "m1", routing.CapabilityTools, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after the first cycle, want 1", n)
 	}
 
 	// A second cycle with a fresh cadence state reports the SAME verdicts --
 	// they must not be rewritten.
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.capabilitiesSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingCapabilities called %d times across two identical cycles, want 1 (an unchanged capability set must not be rewritten)", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times across two identical cycles, want 1 (an unchanged capability set must not be rewritten)", n)
 	}
 }
 
 // TestRunAppHealthOnceContextProbeTemplateAllEmptyCapabilitiesNeverWrite proves
 // an all-empty verdict set (detection ran, determined nothing -- e.g. a body
 // with no modalities/chat_template_caps objects at all) never calls
-// UpdateMappingCapabilities: applyCapabilityWrite's diff stays entirely empty,
-// so the write is skipped rather than issuing a pointless round trip that the
-// store would have no-op'd anyway.
+// UpsertMappingCapabilities: probedCapabilityRows yields no rows at all, so
+// applyCapabilityWrite returns before even READING the stored baseline --
+// "unknown" is the absence of a row, and there is nothing to write for it.
 func TestRunAppHealthOnceContextProbeTemplateAllEmptyCapabilitiesNeverWrite(t *testing.T) {
 	shrinkRetryGap(t)
 	app := ctxTemplateApp("a1", "s1", 8001)
@@ -935,12 +914,16 @@ func TestRunAppHealthOnceContextProbeTemplateAllEmptyCapabilitiesNeverWrite(t *t
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.capabilitiesSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingCapabilities called %d times for an all-empty verdict set, want 0", n)
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times for an all-empty verdict set, want 0", n)
 	}
-	got, _ := st.mappingOf("m1")
-	if got.CapVision != "" || got.CapVideo != "" || got.CapAudio != "" || got.CapTools != "" {
-		t.Fatalf("capability fields = %+v, want all empty", got)
+	for _, capability := range []string{
+		routing.CapabilityVision, routing.CapabilityVideo,
+		routing.CapabilityAudio, routing.CapabilityTools, routing.CapabilityLiveProgress,
+	} {
+		if row, ok := st.capabilityOf("m1", capability); ok {
+			t.Fatalf("m1 has a %q row (%+v), want none -- every capability must stay UNKNOWN", capability, row)
+		}
 	}
 }
 
@@ -971,75 +954,170 @@ func TestRunAppHealthOnceSingleProbeNamelessCapabilitiesReachEveryMapping(t *tes
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.capabilitiesSetCount(); n != 2 {
-		t.Fatalf("UpdateMappingCapabilities called %d times, want 2 -- a nameless verdict belongs to every mapping of this one-endpoint application", n)
+	if n := st.capabilityWriteCount(); n != 2 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 2 -- a nameless verdict belongs to every mapping of this one-endpoint application", n)
 	}
 	for _, id := range []string{"m1", "m2"} {
+		st.assertCapability(t, id, routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 		got, _ := st.mappingOf(id)
-		if got.CapVision != "yes" {
-			t.Fatalf("%s CapVision = %q, want %q", id, got.CapVision, "yes")
-		}
 		if got.ContextSize != 0 {
 			t.Fatalf("%s ContextSize = %d, want 0 (a nameless entry reports no size, so nothing may be attributed)", id, got.ContextSize)
 		}
 	}
 }
 
-// TestRunAppHealthOnceVisionSyncConvergesEvenWhenTriStateVerdictUnchanged is
-// the CONVERGENCE regression test named in the task brief: it pins the lesson
-// of Task 4's first (wrong) attempt at the vision sync in
-// internal/gateway/agent_ingest.go, on this package's own write-back.
-//
-// The mapping starts with CapVision already "yes" (matching what the probe is
-// about to report -- the tri-state is UNCHANGED) but VisionCapable is
-// desynced to false, as if the independent vision BENCHMARK
-// (benchmark_runner.go's UpdateMappingVisionCapable call) had pinned a wrong,
-// stale answer. Because the tri-state is unchanged, applyCapabilityWrite's
-// diff.Vision stays "" and UpdateMappingCapabilities is never called -- but
-// the vision sync must still run, because it is driven by caps.Vision (what
-// THIS probe reported), not by diff.Vision (what changed). A sync driven by
-// the changed-only verdict would never fire here, leaving VisionCapable stuck
-// at the wrong value forever on a build whose real vision support never
-// changes -- exactly the bug Task 4 shipped first.
-func TestRunAppHealthOnceVisionSyncConvergesEvenWhenTriStateVerdictUnchanged(t *testing.T) {
+// capabilityProbeRunner builds a {model}-template app-health runner over one
+// active mapping ("m1"/"m-a") whose /props probe reports caps, plus the store
+// it writes through -- the shared fixture for the precedence tests below,
+// which differ only in what is already ON FILE for that mapping.
+func capabilityProbeRunner(t *testing.T, caps provider.Capabilities) (*appHealthRunner, *fakeHealthStore) {
+	t.Helper()
 	shrinkRetryGap(t)
 	app := ctxTemplateApp("a1", "s1", 8001)
 	st := newHealthTestStore(app)
 	st.mappings = map[string][]routing.ModelMapping{
-		"a1": {{
-			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
-			Status: routing.ServerStatusActive,
-			// Tri-state already on file, matching the incoming probe exactly.
-			CapVision: "yes", CapabilitiesSource: "llama_cpp_props",
-			// Desynced: a benchmark (or a stale prior write) pinned false.
-			VisionCapable: false,
-		}},
+		"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a", Status: routing.ServerStatusActive}},
 	}
 	prober := newFakeProber()
-	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{
-		Name: "m-a", ContextSize: 8192,
-		Caps: provider.Capabilities{Vision: "yes"},
-	}}
-	reg := gateway.NewAppHealthRegistry(nil)
+	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, Caps: caps}}
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"m-a"})
+	runner := &appHealthRunner{
+		store: st, prober: prober, syncer: nil, registry: gateway.NewAppHealthRegistry(nil),
+		loaded: loaded, agents: nil, groups: nil, settings: st,
+		probeTimeout: time.Second, cipher: nil, now: time.Now,
+	}
+	return runner, st
+}
 
-	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+// runCapabilityCycle runs one full app-health cycle with a fresh cadence
+// state -- what the ~30s tick does, and what these tests count writes across.
+func runCapabilityCycle(runner *appHealthRunner) {
+	runner.runOnce(context.Background(), &cycleState{
+		lastProbed: map[string]time.Time{},
+		lastAvail:  make(map[string]availWriteState),
+	})
+}
 
+// TestRunAppHealthOnceProbeDoesNotOverwriteAManualVerdict is the operator's
+// rule on this pass: a verdict a HUMAN established survives a probe reporting
+// the opposite, forever, without the operator having to lock anything.
+// Provenance replaces the lock -- see
+// routing.MappingStore.UpsertMappingCapabilities.
+//
+// It matters more here than on the telemetry path: this pass re-reads the same
+// /props document every ~30 seconds for the life of the deployment, so a
+// missing precedence check would not merely lose the operator's answer once,
+// it would keep overwriting it.
+//
+// Unfalsifiable by accident: the same probe response also carries an
+// UNMANAGED verdict (tools), so exactly one write must fire and must carry
+// only that row. A test that merely counted writes at zero would also pass if
+// the write path had stopped working altogether.
+func TestRunAppHealthOnceProbeDoesNotOverwriteAManualVerdict(t *testing.T) {
+	runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes", Tools: "yes"})
+	st.seedCapability("m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceManual)
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1 (the unmanaged tools verdict)", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceManual)
+	st.assertCapability(t, "m1", routing.CapabilityTools, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}
+
+// TestRunAppHealthOnceProbeDoesNotOverwriteABenchmarkVerdict is the same rule
+// for the other authoritative source: the vision benchmark MEASURED this --
+// it sent a real image to the real upstream and read the real answer -- so a
+// /props re-read must not talk over it either. Unfalsifiable the same way as
+// the manual sibling.
+func TestRunAppHealthOnceProbeDoesNotOverwriteABenchmarkVerdict(t *testing.T) {
+	runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes", Tools: "yes"})
+	st.seedCapability("m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark)
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1 (the unmanaged tools verdict)", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark)
+	st.assertCapability(t, "m1", routing.CapabilityTools, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}
+
+// TestRunAppHealthOnceProbeOverwritesItsOwnAndLegacyVerdicts is precedence's
+// other half, and it is what keeps the rule from degenerating into "never
+// write anything": a row whose source is a PROBE source is overwritable,
+// which is how a verdict re-establishes itself after an operator swaps the
+// upstream binary. legacy (migration 78's inheritance from the pre-78
+// columns) counts as a probe source deliberately -- its real origin is
+// unknowable, and treating a guess as authoritative would freeze it in
+// forever.
+func TestRunAppHealthOnceProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
+	t.Run("a differing llama_cpp_props row is replaced", func(t *testing.T) {
+		runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes"})
+		st.seedCapability("m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+
+		runCapabilityCycle(runner)
+
+		if n := st.capabilityWriteCount(); n != 1 {
+			t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1 -- a probe's own earlier verdict is overwritable", n)
+		}
+		st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("a differing legacy row is replaced", func(t *testing.T) {
+		runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes"})
+		st.seedCapability("m1", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+
+		runCapabilityCycle(runner)
+
+		if n := st.capabilityWriteCount(); n != 1 {
+			t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1 -- a legacy verdict's real origin is unknowable, so it must stay probe-overwritable", n)
+		}
+		st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("an agreeing probe row is not rewritten", func(t *testing.T) {
+		runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes"})
+		st.seedCapability("m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+
+		runCapabilityCycle(runner)
+
+		if n := st.capabilityWriteCount(); n != 0 {
+			t.Fatalf("UpsertMappingCapabilities called %d times, want 0 -- the stored verdict already agrees, and this pass runs on the app's cadence forever", n)
+		}
+		st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+}
+
+// TestRunAppHealthOnceCapabilityReadFailureWritesNothing pins the write
+// path's best-effort behaviour when the STORED baseline cannot be read: the
+// precedence rule and change detection are both judged against those rows, so
+// a probe with no baseline must decline rather than guess -- writing blind
+// would be exactly the overwrite the operator's rule forbids. It logs and the
+// cycle carries on; nothing about a store hiccup may fail the health pass.
+func TestRunAppHealthOnceCapabilityReadFailureWritesNothing(t *testing.T) {
+	runner, st := capabilityProbeRunner(t, provider.Capabilities{Vision: "yes"})
+	st.capsReadErr = true
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after a failed baseline read, want 0 -- writing blind could overwrite a verdict a human established", n)
+	}
+	if !strings.Contains(buf.String(), "capability read for mapping m1 failed") {
+		t.Fatalf("log output = %q, want the capability-read failure logged", buf.String())
+	}
+	// The context-size write is independent and must still land, proving the
+	// probe itself ran and that one failing read does not stall the pass.
 	got, _ := st.mappingOf("m1")
-	if !got.VisionCapable {
-		t.Fatalf("VisionCapable = false, want true -- an unchanged tri-state verdict must still converge a desynced vision_capable bool")
-	}
-	if n := st.visionCapableSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingVisionCapable called %d times, want 1", n)
-	}
-	// The tri-state itself was unchanged, so the capability writer must not
-	// have been called at all -- this is what makes the mutation (driving the
-	// sync from the changed-only diff instead of the reported verdict) fail:
-	// with that mutation, diff.Vision is empty and the sync above would never
-	// fire, leaving VisionCapable stuck at false.
-	if n := st.capabilitiesSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingCapabilities called %d times for an unchanged tri-state verdict, want 0", n)
+	if got.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192 (a capability-read failure must not stall the rest of the pass)", got.ContextSize)
 	}
 }
 
@@ -1107,16 +1185,16 @@ func TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping(t *t
 	if !prober.probedPath("/upstream/up/props") {
 		t.Fatalf("expected the server_agent implicit default path /upstream/up/props to be probed")
 	}
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times after the first cycle, want 1", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after the first cycle, want 1", n)
 	}
 
 	// A second cycle with a fresh cadence state (as if the next tick's interval
 	// had elapsed) reports the SAME verdict -- it must not be rewritten.
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times across two identical cycles, want 1 (an unchanged verdict must not be rewritten)", n)
 	}
 }
 
@@ -1155,8 +1233,8 @@ func TestRunAppHealthOnceServerAgentWithoutFeatureNeverProbes(t *testing.T) {
 			if n := prober.ctxProbeCallCount(); n != 0 {
 				t.Fatalf("ProbeModelInfo called %d times without the declared feature, want 0", n)
 			}
-			if n := st.liveProgressSetCount(); n != 0 {
-				t.Fatalf("UpdateMappingLiveProgressSupport called %d times without the declared feature, want 0", n)
+			if n := st.capabilityWriteCount(); n != 0 {
+				t.Fatalf("UpsertMappingCapabilities called %d times without the declared feature, want 0", n)
 			}
 		})
 	}
@@ -1271,8 +1349,8 @@ func TestRunAppHealthOnceServerAgentProbeCarriesSpecToken(t *testing.T) {
 	if b.authorization != "" {
 		t.Fatalf("mapping B Authorization = %q, want empty (custom header source, no Authorization sent)", b.authorization)
 	}
-	if n := st.liveProgressSetCount(); n != 2 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 2", n)
+	if n := st.capabilityWriteCount(); n != 2 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 2", n)
 	}
 }
 
@@ -1302,8 +1380,8 @@ func TestRunAppHealthOnceServerAgentAuthRejectedLogsAndNeverWrites(t *testing.T)
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times on a rejected probe, want 0", n)
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times on a rejected probe, want 0", n)
 	}
 	if !strings.Contains(buf.String(), "check the runtime spec's API token") {
 		t.Fatalf("log output = %q, want it to contain the misconfigured-token signal", buf.String())
@@ -1380,8 +1458,8 @@ func TestRunAppHealthOnceServerAgentSpecReadFailureFallsBackToAppToken(t *testin
 	if auth != "Bearer app-tok" {
 		t.Fatalf("Authorization = %q, want %q (a spec read failure must fall back to the app token)", auth, "Bearer app-tok")
 	}
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1 (the probe must still proceed on a spec read failure)", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 1 (the probe must still proceed on a spec read failure)", n)
 	}
 }
 
@@ -1436,9 +1514,10 @@ func TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists(t *testing.T) {
 	st.mappings = map[string][]routing.ModelMapping{
 		"a1": {{
 			ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up",
-			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+			Status: routing.ServerStatusActive,
 		}},
 	}
+	st.seedCapability("m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	prober := newFakeProber()
 	// Stands in for a vLLM /v1/models response: ProbeModelInfo reports a context
 	// size but LiveProgressSupport is unknown ("") -- the schema field it is
@@ -1448,13 +1527,11 @@ func TestRunAppHealthOnceUnknownLiveProgressSupportNeverPersists(t *testing.T) {
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an unknown verdict, want 0", n)
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times for an unknown verdict, want 0", n)
 	}
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q (unknown must never overwrite an already-stored verdict)", got.LiveProgressSupport, "supported")
-	}
 	if got.ContextSize != 4096 {
 		t.Fatalf("ContextSize = %d, want 4096 (context-size probing must be unaffected by the live-progress guard)", got.ContextSize)
 	}
@@ -1492,14 +1569,12 @@ func TestRunAppHealthOnceSingleProbeNamelessVerdictReachesEveryMapping(t *testin
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 2 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 2 -- a nameless verdict belongs to every mapping of this one-endpoint application", n)
+	if n := st.capabilityWriteCount(); n != 2 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 2 -- a nameless verdict belongs to every mapping of this one-endpoint application", n)
 	}
 	for _, id := range []string{"m1", "m2"} {
+		st.assertCapability(t, id, routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 		got, _ := st.mappingOf(id)
-		if got.LiveProgressSupport != "supported" {
-			t.Fatalf("%s LiveProgressSupport = %q, want %q", id, got.LiveProgressSupport, "supported")
-		}
 		if got.ContextSize != 0 {
 			t.Fatalf("%s ContextSize = %d, want 0 (a nameless entry reports no size, so nothing may be attributed)", id, got.ContextSize)
 		}
@@ -1530,16 +1605,12 @@ func TestRunAppHealthOnceSingleProbeNamedVerdictStaysNameMatched(t *testing.T) {
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1 -- a NAMED verdict must still reach only the name-matched mapping", n)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 1 -- a NAMED verdict must still reach only the name-matched mapping", n)
 	}
-	gotA, _ := st.mappingOf("m1")
-	if gotA.LiveProgressSupport != "supported" {
-		t.Fatalf("m-a LiveProgressSupport = %q, want %q (name-matched)", gotA.LiveProgressSupport, "supported")
-	}
-	gotB, _ := st.mappingOf("m2")
-	if gotB.LiveProgressSupport != "" {
-		t.Fatalf("m-b LiveProgressSupport = %q, want %q (the reported name did not match)", gotB.LiveProgressSupport, "")
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	if row, ok := st.capabilityOf("m2", routing.CapabilityLiveProgress); ok {
+		t.Fatalf("m-b has a live_progress row (%+v), want none (the reported name did not match)", row)
 	}
 }
 
@@ -1554,31 +1625,30 @@ func TestRunAppHealthOnceLiveProgressSupportPersistsChangedVerdict(t *testing.T)
 	st.mappings = map[string][]routing.ModelMapping{
 		"a1": {{
 			ID: "m1", ApplicationID: "a1", GatewayModelName: "gpt", AppModelName: "up",
-			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+			Status: routing.ServerStatusActive,
 		}},
 	}
+	st.seedCapability("m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	prober := newFakeProber()
 	prober.modelInfo["http://s1.local:8001"] = []provider.ModelInfo{{Name: "up", ContextSize: 4096, LiveProgressSupport: "unsupported"}}
 	reg := gateway.NewAppHealthRegistry(nil)
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: nil, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "unsupported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q (a changed verdict must be persisted)", got.LiveProgressSupport, "unsupported")
-	}
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1", n)
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 1", n)
 	}
 }
 
-// TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock proves
-// UpdateMappingLiveProgressSupport is deliberately NOT gated on
-// mp.MetricsLocked, unlike UpdateMappingContextProbe: a capability is not a
-// metric an operator pins numbers against (see the store method's doc
-// comment), so an operator locking a mapping's throughput/context-size
-// figures must not also silently suppress a real, freshly-detected build
-// capability.
+// TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock proves the
+// capability write is deliberately NOT gated on mp.MetricsLocked, unlike
+// UpdateMappingContextProbe: a capability is not a metric an operator pins
+// numbers against (see routing.MappingStore.UpsertMappingCapabilities), so an
+// operator locking a mapping's throughput/context-size figures must not also
+// silently suppress a real, freshly-detected build capability. What the
+// operator gets instead is per-capability provenance -- a manual row a probe
+// may not overwrite.
 func TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
 	shrinkRetryGap(t)
 	app := ctxProbeApp("a1", "s1", 8001)
@@ -1600,10 +1670,8 @@ func TestRunAppHealthOnceLiveProgressSupportIgnoresMetricsLock(t *testing.T) {
 	if got.ContextSize != 4096 {
 		t.Fatalf("locked ContextSize = %d, want 4096 (probe must not overwrite a lock)", got.ContextSize)
 	}
-	// ...but LiveProgressSupport is written regardless.
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q (must be written even when metrics are locked)", got.LiveProgressSupport, "supported")
-	}
+	// ...but the capability row is written regardless.
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
 // TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport proves
@@ -1626,12 +1694,9 @@ func TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport(t *test
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q (per-model probe must persist the verdict too)", got.LiveProgressSupport, "supported")
-	}
-	if n := st.liveProgressSetCount(); n != 1 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times, want 1", n)
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	if n := st.capabilityWriteCount(); n != 1 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 1", n)
 	}
 }
 
@@ -1650,12 +1715,12 @@ func TestRunAppHealthOnceContextProbeTemplatePersistsLiveProgressSupport(t *test
 // verdict with unknown, on exactly the deployment this feature exists to
 // recover.
 //
-// Asserted as a NUMERIC call count of zero on the writer spy, not by
-// inspecting the stored field: the field assertion alone would also hold if the
-// writer had been called with "", since the fake would then store "" over
-// "supported" -- which is precisely the regression -- so the count is what
-// makes this test fail on a revert. The context-size write must still land,
-// proving the probe ran at all and that the two writes are not coupled.
+// Asserted as a NUMERIC call count of zero on the writer spy, not only by
+// inspecting the stored row: with the row model an empty verdict cannot even
+// be handed to the writer (routing.ValidateCapabilityRow rejects it), so the
+// count is what proves the pass declined rather than that the store defended
+// itself. The context-size write must still land, proving the probe ran at all
+// and that the two writes are not coupled.
 func TestRunAppHealthOnceContextProbeTemplateUnknownVerdictNeverOverwrites(t *testing.T) {
 	shrinkRetryGap(t)
 	app := ctxTemplateApp("a1", "s1", 8001)
@@ -1663,9 +1728,10 @@ func TestRunAppHealthOnceContextProbeTemplateUnknownVerdictNeverOverwrites(t *te
 	st.mappings = map[string][]routing.ModelMapping{
 		"a1": {{
 			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
-			Status: routing.ServerStatusActive, LiveProgressSupport: "supported",
+			Status: routing.ServerStatusActive,
 		}},
 	}
+	st.seedCapability("m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	prober := newFakeProber()
 	// A llama-swap `peer`-mode answer: a parseable body that yields a context
 	// size but NO live-progress verdict (LiveProgressSupport left "").
@@ -1676,13 +1742,11 @@ func TestRunAppHealthOnceContextProbeTemplateUnknownVerdictNeverOverwrites(t *te
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	if n := st.liveProgressSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an unknown verdict, want 0 -- unknown must never overwrite a stored verdict", n)
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times for an unknown verdict, want 0 -- unknown must never overwrite a stored verdict", n)
 	}
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want the untouched %q", got.LiveProgressSupport, "supported")
-	}
 	if got.ContextSize != 8192 {
 		t.Fatalf("ContextSize = %d, want 8192 (the context-size write is independent of the live-progress guard)", got.ContextSize)
 	}
@@ -1707,9 +1771,10 @@ func TestRunAppHealthOnceContextProbeTemplateUnchangedVerdictNotRewritten(t *tes
 	st.mappings = map[string][]routing.ModelMapping{
 		"a1": {{
 			ID: "m1", ApplicationID: "a1", GatewayModelName: "g-a", AppModelName: "m-a",
-			Status: routing.ServerStatusActive, LiveProgressSupport: "supported", ContextSize: 8192,
+			Status: routing.ServerStatusActive, ContextSize: 8192,
 		}},
 	}
+	st.seedCapability("m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	prober := newFakeProber()
 	prober.modelInfoByPath["/upstream/m-a/props"] = []provider.ModelInfo{{Name: "m-a", ContextSize: 8192, LiveProgressSupport: "supported"}}
 	reg := gateway.NewAppHealthRegistry(nil)
@@ -1721,8 +1786,8 @@ func TestRunAppHealthOnceContextProbeTemplateUnchangedVerdictNotRewritten(t *tes
 	if !prober.probedPath("/upstream/m-a/props") {
 		t.Fatalf("the per-model probe must have run -- otherwise a zero write count proves nothing")
 	}
-	if n := st.liveProgressSetCount(); n != 0 {
-		t.Fatalf("UpdateMappingLiveProgressSupport called %d times for an UNCHANGED verdict, want 0 -- this pass runs on the app's own cadence, forever", n)
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times for an UNCHANGED verdict, want 0 -- this pass runs on the app's own cadence, forever", n)
 	}
 }
 
@@ -1732,14 +1797,14 @@ func TestRunAppHealthOnceContextProbeTemplateUnchangedVerdictNotRewritten(t *tes
 // `mp.Status != routing.ServerStatusActive || mp.MetricsLocked ||
 // mp.AppModelName == ""`, which skipped a LOCKED mapping before it was ever
 // probed -- so its live-progress capability could never be learned at all,
-// even though UpdateMappingLiveProgressSupport itself carries no lock guard
+// even though the capability writer itself carries no lock guard
 // (a capability is a property of the upstream build, not a number an
 // operator answers for). This is llama-swap's default {model} shape, so the
 // hole was not theoretical.
 //
 // The mapping starts with a distinguishable pre-existing state on BOTH
 // fields under test -- ContextSize 4096 (the probe reports a different
-// 8192) and LiveProgressSupport "" (the probe reports "supported") -- so
+// 8192) and NO live_progress row at all (the probe reports "supported") -- so
 // neither assertion can pass by an accidental "both sides already equal"
 // coincidence; each requires the fix to actually run the probe and the
 // store's own guard to actually block the context-size write.
@@ -1765,10 +1830,8 @@ func TestRunAppHealthOnceContextProbeTemplateLockedMappingPersistsCapabilityNotC
 	if !prober.probedPath("/upstream/m-a/props") {
 		t.Fatalf("a locked mapping must still be probed -- its capability cannot be learned without asking")
 	}
+	st.assertCapability(t, "m1", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	got, _ := st.mappingOf("m1")
-	if got.LiveProgressSupport != "supported" {
-		t.Fatalf("LiveProgressSupport = %q, want %q (a locked mapping's capability must still be persisted)", got.LiveProgressSupport, "supported")
-	}
 	// The pre-existing behavior must be unchanged: the store's own
 	// `and metrics_locked = 0` guard (SQLiteStore.UpdateMappingContextProbe;
 	// mirrored by MemoryStore and by fakeHealthStore.UpdateMappingContextProbe
@@ -1838,13 +1901,11 @@ func TestRunAppHealthOnceContextProbeTemplateSkipsNonActiveAndEmptyModelName(t *
 	if n := prober.ctxProbeCallCount(); n != 1 {
 		t.Fatalf("ProbeModelInfo called %d times, want 1 (only the active, named, loaded mapping)", n)
 	}
-	gotB, _ := st.mappingOf("m2")
-	if gotB.LiveProgressSupport != "" {
-		t.Fatalf("m-b LiveProgressSupport = %q, want %q (non-active mapping must not be probed nor written)", gotB.LiveProgressSupport, "")
+	if row, ok := st.capabilityOf("m2", routing.CapabilityLiveProgress); ok {
+		t.Fatalf("m-b has a live_progress row (%+v), want none (non-active mapping must not be probed nor written)", row)
 	}
-	gotC, _ := st.mappingOf("m3")
-	if gotC.LiveProgressSupport != "" {
-		t.Fatalf("m-c LiveProgressSupport = %q, want %q (empty upstream model name must not be probed nor written)", gotC.LiveProgressSupport, "")
+	if row, ok := st.capabilityOf("m3", routing.CapabilityLiveProgress); ok {
+		t.Fatalf("m-c has a live_progress row (%+v), want none (empty upstream model name must not be probed nor written)", row)
 	}
 }
 

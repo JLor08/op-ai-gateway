@@ -95,10 +95,14 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 // UpsertMappingCapabilities writes one row per verdict, replacing any row for
 // the same (mapping, capability). It applies NO precedence rule — the caller
 // decides whether its source may overwrite what is there (see
-// routing.CapabilitySourceIsAuthoritative) — and, like
-// UpdateMappingCapabilities, carries no metrics_locked guard and never
-// touches metrics_source/metrics_updated_at: a capability is not a number an
-// operator pins against automation.
+// routing.CapabilitySourceIsAuthoritative, and
+// routing.WritableProbeCapabilityRows for the shared answer) — and carries no
+// metrics_locked guard, never touching metrics_source/metrics_updated_at: a
+// capability is not a number an operator pins against automation. That
+// argument used to live on UpdateMappingCapabilities beside it; with the
+// columns' writers gone it lives on routing.MappingStore's own
+// UpsertMappingCapabilities, which is what every citation of it now points
+// at.
 //
 // Every row is validated (routing.ValidateCapabilityRow) before anything is
 // written, and the whole set is written inside ONE transaction (mirroring

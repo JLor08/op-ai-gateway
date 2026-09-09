@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/storeerr"
 	"sort"
@@ -1033,76 +1032,6 @@ func (m *MemoryStore) UpdateMappingContextProbe(_ context.Context, id string, co
 	return nil
 }
 
-// UpdateMappingLiveProgressSupport records whether this mapping's upstream
-// tolerates the live-progress request parameters (#51).
-//
-// UNLIKE every other automated writer above, this one has NO MetricsLocked
-// guard and does not touch MetricsSource / MetricsUpdatedAt: mirrors
-// SQLiteStore.UpdateMappingLiveProgressSupport, see its doc comment for why
-// (a build capability is not a metric an operator pins numbers against). A
-// missing mapping is a benign no-op.
-func (m *MemoryStore) UpdateMappingLiveProgressSupport(_ context.Context, id, support string, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok {
-		return nil
-	}
-	mapping.LiveProgressSupport = support
-	t := at
-	mapping.LiveProgressCheckedAt = &t
-	m.mappings[id] = mapping
-	return nil
-}
-
-// UpdateMappingCapabilities records auto-detected capability verdicts (#49-2),
-// mirroring SQLiteStore.UpdateMappingCapabilities: only non-empty verdicts are
-// written (so a partial probe answer cannot clear a previously stored one),
-// there is NO MetricsLocked guard, and MetricsSource/MetricsUpdatedAt are left
-// untouched. A missing mapping, or a caps value with nothing determined, is a
-// benign no-op that does not stamp CapabilitiesSource/CapabilitiesCheckedAt.
-func (m *MemoryStore) UpdateMappingCapabilities(_ context.Context, id string, caps CapabilityVerdicts, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok {
-		return nil
-	}
-	wrote := false
-	if caps.Vision != "" {
-		mapping.CapVision = caps.Vision
-		wrote = true
-	}
-	if caps.Video != "" {
-		mapping.CapVideo = caps.Video
-		wrote = true
-	}
-	if caps.Audio != "" {
-		mapping.CapAudio = caps.Audio
-		wrote = true
-	}
-	if caps.Tools != "" {
-		mapping.CapTools = caps.Tools
-		wrote = true
-	}
-	if len(caps.Extra) > 0 {
-		encoded, err := json.Marshal(caps.Extra)
-		if err != nil {
-			return fmt.Errorf("update mapping capabilities: encode extra: %w", err)
-		}
-		mapping.CapExtra = string(encoded)
-		wrote = true
-	}
-	if !wrote {
-		return nil // nothing determined: not an error, and not a write
-	}
-	mapping.CapabilitiesSource = caps.Source
-	t := at
-	mapping.CapabilitiesCheckedAt = &t
-	m.mappings[id] = mapping
-	return nil
-}
-
 // MappingCapabilities lists one mapping's capability rows ordered by
 // capability (mirroring the SQL `order by capability`; the map is unordered
 // on write, same pattern as runtimeSpecGPUs/coresidency). A mapping with no
@@ -1144,8 +1073,11 @@ func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingI
 // UpsertMappingCapabilities writes rows, REPLACING any row for the same
 // (mapping, capability) — the map key is the capability, so a re-write is a
 // natural replacement, matching the SQL on-conflict-do-update. It applies no
-// precedence rule (the caller does) and, unlike every metric writer here,
-// carries no metrics_locked guard.
+// precedence rule (the caller does — see WritableProbeCapabilityRows) and,
+// unlike every metric writer here, carries no metrics_locked guard: see the
+// Store interface's own UpsertMappingCapabilities doc for the full argument,
+// which is what this table has instead of the lock the pre-78 capability
+// columns had to argue their way out of.
 //
 // Every row is validated (ValidateCapabilityRow) before anything is written
 // — the same check SQLiteStore's UpsertMappingCapabilities makes, so the two
@@ -1183,25 +1115,6 @@ func (m *MemoryStore) DeleteMappingCapability(_ context.Context, mappingID, capa
 	if len(byCapability) == 0 {
 		delete(m.mappingCapabilities, mappingID)
 	}
-	return nil
-}
-
-// UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
-// from a vision-capability check, only while it is unlocked. A missing or
-// locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
-// A definitive "not capable" (false) result can also be written.
-func (m *MemoryStore) UpdateMappingVisionCapable(_ context.Context, id string, capable bool, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapping, ok := m.mappings[id]
-	if !ok || mapping.MetricsLocked {
-		return nil
-	}
-	mapping.VisionCapable = capable
-	mapping.MetricsSource = "vision"
-	t := at
-	mapping.MetricsUpdatedAt = &t
-	m.mappings[id] = mapping
 	return nil
 }
 

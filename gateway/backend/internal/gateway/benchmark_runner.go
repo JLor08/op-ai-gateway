@@ -481,9 +481,10 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // finishes the run (clearing the server-busy state) even on error/cancel. mode selects
 // what is measured per target: "speed" (throughput/load, the pre-CP2 behavior), "capacity"
 // (the OOM-safe concurrency ramp), "both" (speed then capacity, so metrics_source ends
-// "capacity"), or "vision" (the image-acceptance probe: persists vision_capable on the
-// mapping only on a definitive verdict, but always appends a kind=="vision" history row
-// — success or inconclusive). An empty mode is treated as "speed".
+// "capacity"), or "vision" (the image-acceptance probe: persists the mapping's `vision`
+// capability row, sourced vision_benchmark, only on a definitive verdict, but always
+// appends a kind=="vision" history row — success or inconclusive). An empty mode is
+// treated as "speed".
 func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID string, targets []benchmarkTarget, mode string) {
 	var runErr string
 	defer func() {
@@ -521,7 +522,35 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 			dataURL, tokens := pickVisionImage() // random embedded asset
 			res = s.measureVisionTarget(ctx, tgt, s.Portal.VisionProbeMode(ctx), dataURL, tokens)
 			if res.VisionCapable != nil {
-				_ = s.Routes.UpdateMappingVisionCapable(ctx, tgt.mapping.ID, *res.VisionCapable, time.Now().UTC())
+				// A definitive verdict lands as the mapping's `vision`
+				// capability row, sourced CapabilitySourceVisionBenchmark
+				// (#49-3). That source is AUTHORITATIVE: this is a real
+				// measurement -- the gateway sent an actual image to the
+				// actual upstream and read the actual answer -- so no probe
+				// re-reading a /props document may overwrite it (see
+				// routing.CapabilitySourceIsAuthoritative, and
+				// routing.WritableProbeCapabilityRows, which every probe
+				// write path asks). Conversely this writer applies NO
+				// precedence check of its own: an operator explicitly started
+				// this run, so recording what it measured is what they asked
+				// for. An INCONCLUSIVE probe (VisionCapable nil) writes
+				// nothing at all -- "unknown" is the absence of a row, so
+				// there is no way for it to clear a stored verdict, which the
+				// pre-row vision_capable bool could not express.
+				//
+				// Unlike the bool it replaces this write carries no
+				// metrics_locked guard, because the table does not have one:
+				// routing.MappingStore.UpsertMappingCapabilities carries the
+				// argument for why a capability is not a number an operator
+				// pins. Best-effort, like the history row below.
+				verdict := routing.CapabilityNo
+				if *res.VisionCapable {
+					verdict = routing.CapabilityYes
+				}
+				_ = s.Routes.UpsertMappingCapabilities(ctx, tgt.mapping.ID, []routing.CapabilityRow{{
+					Capability: routing.CapabilityVision, Verdict: verdict,
+					Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: time.Now().UTC(),
+				}})
 			}
 			// Always append a vision-history row — success (a definitive verdict) AND an
 			// inconclusive probe (VisionCapable nil, res.Error set) — mirroring how the

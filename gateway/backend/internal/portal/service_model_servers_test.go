@@ -197,9 +197,27 @@ func TestModelServersHiddenLockedSuppression(t *testing.T) {
 	}
 }
 
+// seedMappingLiveProgress stamps a mapping's persisted live-progress verdict
+// through UpdateMapping (the full-row writer), standing in for the targeted
+// writer #49-3 removed when every probe moved onto
+// model_mapping_capabilities rows. The DTO fill under test reads the column
+// either way, which is the seam these tests pin.
+func seedMappingLiveProgress(t *testing.T, routeStore *routing.MemoryStore, mappingID, support string, at time.Time) {
+	t.Helper()
+	mapping, err := routeStore.MappingByID(context.Background(), mappingID)
+	if err != nil {
+		t.Fatalf("MappingByID(%s): %v", mappingID, err)
+	}
+	mapping.LiveProgressSupport = support
+	mapping.LiveProgressCheckedAt = &at
+	if err := routeStore.UpdateMapping(context.Background(), mapping); err != nil {
+		t.Fatalf("UpdateMapping(%s): %v", mappingID, err)
+	}
+}
+
 // TestModelServersLiveProgressSupportPersisted: LiveProgressSupport/
-// LiveProgressCheckedAt are read straight off the PERSISTED mapping field (via
-// routing.Store.UpdateMappingLiveProgressSupport), exactly like ContextSize --
+// LiveProgressCheckedAt are read straight off the PERSISTED mapping field,
+// exactly like ContextSize --
 // NOT left zero/empty for a gateway-layer injection pass the way
 // State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe are. One row per
 // verdict, including the "never determined" default (no write at all), so a
@@ -214,15 +232,15 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	seedOffering(t, routeStore, now, "srv-unsupported", "app-unsupported", "map-unsupported", "shared", "up-unsupported", 0)
 	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
 
+	// Seeded through the full-row writer: #49-3 moved every probe onto
+	// model_mapping_capabilities rows, so the targeted live_progress_support
+	// writer is gone. This test is about ModelServers READING the stored
+	// column, not about who wrote it, so the seam it exercises is unchanged.
 	checkedAt := now.Add(-time.Hour)
-	if err := routeStore.UpdateMappingLiveProgressSupport(context.Background(), "map-supported", "supported", checkedAt); err != nil {
-		t.Fatalf("UpdateMappingLiveProgressSupport(supported): %v", err)
-	}
-	if err := routeStore.UpdateMappingLiveProgressSupport(context.Background(), "map-unsupported", "unsupported", checkedAt); err != nil {
-		t.Fatalf("UpdateMappingLiveProgressSupport(unsupported): %v", err)
-	}
-	// map-unknown gets no call at all: "never determined" is the mapping's
-	// untouched zero value, not a call with an empty string.
+	seedMappingLiveProgress(t, routeStore, "map-supported", "supported", checkedAt)
+	seedMappingLiveProgress(t, routeStore, "map-unsupported", "unsupported", checkedAt)
+	// map-unknown is not seeded at all: "never determined" is the mapping's
+	// untouched zero value, not a write with an empty string.
 
 	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
 	if err != nil {
@@ -278,7 +296,7 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 
 // TestModelServersCapabilitiesPersisted: CapVision/CapVideo/CapAudio/CapTools/
 // CapExtra/CapabilitiesSource/CapabilitiesCheckedAt are read straight off the
-// PERSISTED mapping fields (via routing.Store.UpdateMappingCapabilities),
+// PERSISTED mapping fields,
 // exactly like LiveProgressSupport -- NOT left zero/empty for a gateway-layer
 // injection pass. One row with every verdict determined (plus an open-ended
 // cap_extra entry) and one row with nothing determined at all (no write),
@@ -292,20 +310,25 @@ func TestModelServersCapabilitiesPersisted(t *testing.T) {
 	seedOffering(t, routeStore, now, "srv-determined", "app-determined", "map-determined", "shared", "up-determined", 0)
 	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
 
+	// Seeded through the full-row writer, for the reason
+	// TestModelServersLiveProgressSupportPersisted above states: the targeted
+	// cap_* writer is gone (#49-3), and this test pins the DTO fill's read of
+	// the stored columns.
 	checkedAt := now.Add(-time.Hour)
-	caps := routing.CapabilityVerdicts{
-		Vision: "yes",
-		Video:  "no",
-		Audio:  "yes",
-		Tools:  "no",
-		Extra:  []string{"thinking"},
-		Source: "llama_cpp_props",
+	seeded, err := routeStore.MappingByID(context.Background(), "map-determined")
+	if err != nil {
+		t.Fatalf("MappingByID(map-determined): %v", err)
 	}
-	if err := routeStore.UpdateMappingCapabilities(context.Background(), "map-determined", caps, checkedAt); err != nil {
-		t.Fatalf("UpdateMappingCapabilities: %v", err)
+	seeded.CapVision, seeded.CapVideo = "yes", "no"
+	seeded.CapAudio, seeded.CapTools = "yes", "no"
+	seeded.CapExtra = `["thinking"]`
+	seeded.CapabilitiesSource = "llama_cpp_props"
+	seeded.CapabilitiesCheckedAt = &checkedAt
+	if err := routeStore.UpdateMapping(context.Background(), seeded); err != nil {
+		t.Fatalf("UpdateMapping(map-determined): %v", err)
 	}
-	// map-unknown gets no call at all: "never determined" is the mapping's
-	// untouched zero value, not a call with all-empty verdicts.
+	// map-unknown is not seeded at all: "never determined" is the mapping's
+	// untouched zero value, not a write with all-empty verdicts.
 
 	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
 	if err != nil {

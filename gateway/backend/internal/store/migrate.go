@@ -3296,8 +3296,10 @@ func migration75Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 //
 // These two columns are deliberately NOT part of the metrics_locked group
 // this table otherwise guards every automated writer with: see
-// SQLiteStore.UpdateMappingLiveProgressSupport for why -- a build capability
-// is not a metric an operator pins numbers against.
+// routing.MappingStore.UpsertMappingCapabilities for why -- a build
+// capability is not a metric an operator pins numbers against. That is where
+// the argument lives now that the verdict is a model_mapping_capabilities row
+// (migration 78) rather than this column.
 func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	if err := addColumnIfMissing(ctx, tx, dl, "model_mappings",
 		"live_progress_support text not null default ''"); err != nil {
@@ -3318,7 +3320,10 @@ func migration76Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // capabilities_checked_at. Append-only, no backfill.
 //
 // Like migration76Up's columns and for the same reason, these are NOT part of
-// the metrics_locked group: see SQLiteStore.UpdateMappingCapabilities.
+// the metrics_locked group: see
+// routing.MappingStore.UpsertMappingCapabilities, which carries the argument
+// now that migration 78's per-capability rows -- not these columns -- are
+// what the probes write.
 func migration77Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	for _, col := range []string{
 		"cap_vision text not null default ''",

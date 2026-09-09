@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
-	"strings"
 	"time"
 )
 
@@ -305,104 +304,6 @@ func (s *SQLiteStore) UpdateMappingContextProbe(ctx context.Context, id string, 
 	)
 	if err != nil {
 		return fmt.Errorf("update mapping context probe: %w", err)
-	}
-	return nil // 0 rows affected (missing or locked) is a benign no-op
-}
-
-// UpdateMappingLiveProgressSupport records whether this mapping's upstream
-// tolerates the live-progress request parameters (#51).
-//
-// UNLIKE every other automated writer on this table, this one carries NO
-// `and metrics_locked = 0` guard and does not touch metrics_source /
-// metrics_updated_at. That is deliberate: metrics_locked exists so an operator
-// can pin NUMBERS THEY ANSWER FOR -- throughput, context size -- against
-// automation. A build capability is not such a number: pinning it could only
-// ever produce a wrong answer, and unlike a pinned throughput a wrong
-// capability has an operational consequence -- the live figure silently stays
-// off, with no visible reason, until someone thinks to unlock a mapping's
-// metrics. And because it is a capability rather than a metric, writing it must
-// not restamp the metrics provenance columns; doing so would misattribute this
-// mapping's throughput figures to a capability probe.
-func (s *SQLiteStore) UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error {
-	_, err := s.exec(ctx, `
-		update model_mappings
-		set live_progress_support = ?, live_progress_checked_at = ?
-		where id = ?`,
-		support, at, id,
-	)
-	if err != nil {
-		return fmt.Errorf("update mapping live progress support: %w", err)
-	}
-	return nil // 0 rows affected (missing mapping) is a benign no-op
-}
-
-// UpdateMappingCapabilities records auto-detected capability verdicts (#49-2).
-//
-// Only NON-EMPTY verdicts are written. That is the whole point: a probe that
-// determined vision but nothing about tools (an older llama.cpp answering
-// modalities without chat_template_caps) must leave cap_tools exactly as it
-// was, not clear it. "" is never a value, only ever "nothing to say".
-//
-// Like UpdateMappingLiveProgressSupport -- read its doc for the full
-// argument -- this carries NO `and metrics_locked = 0` guard and does not
-// touch metrics_source/metrics_updated_at: metrics_locked exists so an
-// operator can pin numbers they answer for, and a capability is not such a
-// number. The one place a capability DOES respect the lock is the vision sync
-// onto vision_capable, which deliberately goes through the lock-guarded
-// UpdateMappingVisionCapable instead (see the write-back callers).
-func (s *SQLiteStore) UpdateMappingCapabilities(ctx context.Context, id string, caps routing.CapabilityVerdicts, at time.Time) error {
-	sets := []string{}
-	args := []any{}
-	for _, f := range []struct {
-		col     string
-		verdict string
-	}{
-		{"cap_vision", caps.Vision},
-		{"cap_video", caps.Video},
-		{"cap_audio", caps.Audio},
-		{"cap_tools", caps.Tools},
-	} {
-		if f.verdict == "" {
-			continue
-		}
-		sets = append(sets, f.col+" = ?")
-		args = append(args, f.verdict)
-	}
-	if len(caps.Extra) > 0 {
-		encoded, err := json.Marshal(caps.Extra)
-		if err != nil {
-			return fmt.Errorf("update mapping capabilities: encode extra: %w", err)
-		}
-		sets = append(sets, "cap_extra = ?")
-		args = append(args, string(encoded))
-	}
-	if len(sets) == 0 {
-		return nil // nothing determined: not an error, and not a write
-	}
-	sets = append(sets, "capabilities_source = ?", "capabilities_checked_at = ?")
-	args = append(args, caps.Source, at, id)
-	_, err := s.exec(ctx, `update model_mappings set `+strings.Join(sets, ", ")+` where id = ?`, args...)
-	if err != nil {
-		return fmt.Errorf("update mapping capabilities: %w", err)
-	}
-	return nil // 0 rows affected (missing mapping) is a benign no-op
-}
-
-// UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
-// from a vision-capability check. The metrics_locked = 0 guard makes the lock
-// atomic in SQL: a locked (or missing) row matches 0 rows and is left untouched,
-// which is a benign no-op (not an error). A definitive "not capable" (false)
-// result can also be written. Only the flag + provenance are written, so a
-// concurrent edit of other fields cannot be clobbered.
-func (s *SQLiteStore) UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error {
-	_, err := s.exec(ctx, `
-		update model_mappings
-		set vision_capable = ?, metrics_source = ?, metrics_updated_at = ?
-		where id = ? and metrics_locked = 0`,
-		capable, "vision", at, id,
-	)
-	if err != nil {
-		return fmt.Errorf("update mapping vision capable: %w", err)
 	}
 	return nil // 0 rows affected (missing or locked) is a benign no-op
 }

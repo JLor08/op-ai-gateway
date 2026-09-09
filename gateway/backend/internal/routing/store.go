@@ -619,7 +619,13 @@ type ModelMapping struct {
 	// live-progress request parameters (#51): "" = never determined,
 	// "supported", "unsupported". It is a CAPABILITY of the upstream build, not
 	// a metric, so it deliberately sits outside the MetricsLocked group above --
-	// see UpdateMappingLiveProgressSupport for why.
+	// see UpsertMappingCapabilities for why: that is now where the argument
+	// lives, because it is what leaves model_mapping_capabilities without a
+	// metrics_locked guard either.
+	//
+	// No automated writer touches this column any more (#49-3): the verdict is
+	// a CapabilityLiveProgress row in model_mapping_capabilities, established
+	// by the same probe pass as every other capability.
 	LiveProgressSupport string
 	// LiveProgressCheckedAt is when that verdict was last determined. Operator
 	// diagnostics and the portal tooltip ONLY -- no decision logic reads it.
@@ -630,13 +636,17 @@ type ModelMapping struct {
 	// shows: a bool conflates "not probed" with "no", and the models list
 	// AND-aggregates it fail-closed, so one unprobed mapping silently disables
 	// a whole model's image attachment. "" must never overwrite a stored
-	// verdict -- see UpdateMappingCapabilities.
+	// verdict -- see UpsertMappingCapabilities.
 	//
 	// Deliberately OUTSIDE the metrics_locked group, like
 	// LiveProgressSupport above and for the same reason: a capability is not
-	// a number an operator answers for. The one exception is the vision SYNC
-	// onto VisionCapable, which goes through the lock-guarded
-	// UpdateMappingVisionCapable on purpose (see the write-back callers).
+	// a number an operator answers for -- the argument that now leaves
+	// model_mapping_capabilities without a metrics_locked guard either (see
+	// UpsertMappingCapabilities). No automated writer touches these columns
+	// any more (#49-3): every verdict is a row in that table carrying its own
+	// per-capability SOURCE, which is what retired the mapping-wide vision
+	// SYNC onto VisionCapable rather than merely fixing it -- with one source
+	// of truth per capability there is nothing left to sync.
 	//
 	// CapVideo carries an upstream subtlety worth knowing before acting on
 	// it: llama.cpp's modalities.video is true when the BINARY was built with
@@ -1018,19 +1028,6 @@ type ApplicationStore interface {
 	DeleteApplication(ctx context.Context, id string) error
 }
 
-// CapabilityVerdicts is one probe's capability answer set. Every verdict is
-// "" (this probe determined nothing about it) | "yes" | "no"; "" fields are
-// NOT written, so a partial answer (an older llama.cpp with modalities but no
-// chat_template_caps) cannot clear what another probe established.
-type CapabilityVerdicts struct {
-	Vision string
-	Video  string
-	Audio  string
-	Tools  string
-	Extra  []string
-	Source string
-}
-
 // CapabilityRow is one (mapping, capability) verdict together with WHO
 // established it and when -- the unit the model_mapping_capabilities table
 // stores, one row per capability.
@@ -1095,6 +1092,97 @@ func CapabilitySourceIsAuthoritative(source string) bool {
 	return source == CapabilitySourceManual || source == CapabilitySourceVisionBenchmark
 }
 
+// LiveProgressCapabilityVerdict maps the live-progress verdict vocabulary
+// ("supported" / "unsupported", what provider.detectLiveProgressSupport
+// produces and what the pre-78 live_progress_support column stored) onto the
+// row model's own ("yes" / "no"), returning "" for anything else -- an older
+// producer's empty string, or a value neither writer here recognises.
+//
+// The two vocabularies were never different facts, only different spellings,
+// and the row model has exactly one: CapabilityYes or CapabilityNo, with
+// "unknown" expressed by the ABSENCE of a row. Both probe write paths (the
+// telemetry write-back in internal/gateway and the app-health pass in
+// cmd/gateway) translate through this one function rather than each
+// re-spelling the switch, so they cannot disagree about what "supported"
+// means.
+func LiveProgressCapabilityVerdict(support string) string {
+	switch strings.TrimSpace(support) {
+	case "supported":
+		return CapabilityYes
+	case "unsupported":
+		return CapabilityNo
+	default:
+		return ""
+	}
+}
+
+// CapabilityRowsByName keys a mapping's stored capability rows by capability
+// name -- the shape every write path compares a fresh probe result against,
+// and the memo shape the telemetry write-back folds its own writes back into.
+// A capability with no row is simply absent from the map, so a zero-value
+// lookup is "unknown" and CapabilitySourceIsAuthoritative("") is correctly
+// false for it.
+func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
+	out := make(map[string]CapabilityRow, len(rows))
+	for _, r := range rows {
+		out[r.Capability] = r
+	}
+	return out
+}
+
+// WritableProbeCapabilityRows answers the one question every probe write path
+// has to ask -- which of the verdicts I just determined may I actually write,
+// given what is already on file -- and is the single place that answer lives.
+// Pure: no I/O, no store access, table-testable on its own.
+//
+// Two rules, in order:
+//
+//  1. PRECEDENCE, the operator's rule and the reason this table carries a
+//     per-row source at all: a row whose stored source is AUTHORITATIVE --
+//     asked via CapabilitySourceIsAuthoritative rather than re-compared here,
+//     so the comparison lives in exactly one place -- is never overwritten by
+//     a probe. A human's answer, or a real measurement, outranks re-reading
+//     the same /props document once a second. A probe source (llama_cpp_props,
+//     and the legacy rows migration 78 inherited) IS overwritable, which is
+//     what lets a verdict re-establish itself after a build changes.
+//  2. CHANGE DETECTION: a stored verdict that already AGREES issues no write.
+//     A build capability is stable by nature -- the same child build reports
+//     the same verdict every second for its whole life -- so without this
+//     every telemetry sample would drive one write per capability per mapping,
+//     forever, for a value that cannot change short of an operator swapping
+//     the upstream binary. It compares the VERDICT only: a legacy row that
+//     already agrees is left alone rather than re-stamped with a fresher
+//     source, because the verdict is what every reader acts on and the write
+//     would be pure amplification. An ABSENT row has an empty verdict, which
+//     can never equal a reported "yes"/"no", so a first-ever verdict always
+//     passes this rule.
+//
+// reported must already hold only the verdicts this probe actually determined,
+// each with Verdict CapabilityYes or CapabilityNo and a non-empty Capability
+// and Source: "unknown" is the ABSENCE of a row, so there is no empty verdict
+// to express it with, and UpsertMappingCapabilities rejects a malformed row
+// loudly (ValidateCapabilityRow) rather than half-writing a set. Projecting a
+// probe's own answer shape onto rows -- and dropping whatever it determined
+// nothing about -- is each caller's own step, because only the caller knows
+// what its probe reports.
+//
+// Returns nil (not an empty slice) when nothing may be written, so a caller's
+// len(rows) == 0 skips the store call entirely.
+func WritableProbeCapabilityRows(reported []CapabilityRow, stored map[string]CapabilityRow) []CapabilityRow {
+	var out []CapabilityRow
+	for _, r := range reported {
+		cur := stored[r.Capability]
+		if CapabilitySourceIsAuthoritative(cur.Source) {
+			continue // a human or a measurement established this; a probe never outranks it
+		}
+		if cur.Verdict == r.Verdict {
+			continue // already on file, no write amplification
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 // ValidateCapabilityRow rejects a CapabilityRow that could not have come from
 // a caller behaving correctly: an empty Capability or Source, or a Verdict
 // that is neither CapabilityYes nor CapabilityNo. That is not a stricter rule
@@ -1122,17 +1210,18 @@ func ValidateCapabilityRow(r CapabilityRow) error {
 }
 
 // MappingStore is CRUD for model mappings (gateway model name -> app model
-// name) plus the family of targeted, metrics_locked-respecting metric
-// updates (context probe, vision, benchmark, opportunistic EWMA, capacity,
-// energy EWMA), the routing-candidate lookup (ActiveMappingsForModel), and
-// UpdateMappingLiveProgressSupport / UpdateMappingCapabilities -- the two
-// targeted writers here that are NOT metrics_locked-respecting, because they
-// record a capability rather than a metric (see their doc comments).
+// name) plus the family of targeted, metrics_locked-respecting metric updates
+// (context probe, benchmark, opportunistic EWMA, capacity, energy EWMA) and
+// the routing-candidate lookup (ActiveMappingsForModel).
 //
 // It also owns the per-capability child rows (model_mapping_capabilities,
 // migration 78): one row per (mapping, capability) carrying the verdict, its
 // SOURCE and when it was established, where the ABSENCE of a row is
-// "unknown". See CapabilityRow.
+// "unknown". Those are the only writers here that do NOT respect
+// metrics_locked, because they record a capability rather than a metric --
+// UpsertMappingCapabilities carries the full argument, and it is the one this
+// table's capability columns and migrations 76/77/78 all cite. See
+// CapabilityRow.
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
@@ -1141,12 +1230,6 @@ type MappingStore interface {
 	// non-error, when the mapping is missing or locked). It touches only the three
 	// columns, so it cannot clobber a concurrent edit of other fields.
 	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
-	// UpdateMappingVisionCapable sets a mapping's vision_capable flag + provenance
-	// ("vision"), atomically and ONLY when metrics_locked is false (a no-op,
-	// non-error, when the mapping is missing or locked). A definitive "not capable"
-	// (false) result can also be written. Touches only the flag + provenance, so it
-	// cannot clobber a concurrent edit of other fields.
-	UpdateMappingVisionCapable(ctx context.Context, id string, capable bool, at time.Time) error
 	// UpdateMappingBenchmarkMetrics sets a mapping's measured throughput + load time
 	// from a benchmark run, atomically and ONLY when metrics_locked is false (a no-op,
 	// non-error, when the mapping is missing or locked). Touches only these four
@@ -1170,20 +1253,6 @@ type MappingStore interface {
 	// the energy reconciler to calibrate a mapping's coefficient from measured
 	// results (Tier 1 in the attribution engine).
 	UpdateMappingEnergyEWMA(ctx context.Context, id string, sampleWhPerToken, alpha float64, at time.Time) error
-	// UpdateMappingLiveProgressSupport records whether this mapping's upstream
-	// tolerates the live-progress request parameters (#51). UNLIKE every writer
-	// above, it carries NO metrics_locked guard and does not touch
-	// MetricsSource / MetricsUpdatedAt: a build capability is not a metric an
-	// operator pins numbers against -- see the SQLiteStore implementation for
-	// the full rationale.
-	UpdateMappingLiveProgressSupport(ctx context.Context, id, support string, at time.Time) error
-	// UpdateMappingCapabilities records the auto-detected capability verdicts
-	// (#49-2). Writes only the non-empty verdicts, stamps
-	// capabilities_source/capabilities_checked_at, and -- like
-	// UpdateMappingLiveProgressSupport and unlike every metric writer on this
-	// table -- carries NO metrics_locked guard and never touches
-	// metrics_source/metrics_updated_at.
-	UpdateMappingCapabilities(ctx context.Context, id string, caps CapabilityVerdicts, at time.Time) error
 	// MappingCapabilities lists one mapping's capability rows. An absent
 	// capability is UNKNOWN and simply has no row.
 	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
@@ -1202,12 +1271,32 @@ type MappingStore interface {
 	// (mapping, capability), atomically as one set -- a caller passing several
 	// verdicts must never observe some of them applied and others not. It does
 	// NOT apply the precedence rule -- callers do, because only they know
-	// whether they are a probe (see CapabilitySourceIsAuthoritative). It
-	// carries no metrics_locked guard and never touches
-	// metrics_source/metrics_updated_at: a capability is not a number an
-	// operator pins against automation. It rejects (ValidateCapabilityRow),
-	// without writing anything, a row whose Verdict is neither CapabilityYes
-	// nor CapabilityNo or whose Capability or Source is empty.
+	// whether they are a probe (see CapabilitySourceIsAuthoritative, and
+	// WritableProbeCapabilityRows for the answer every probe path shares). It
+	// rejects (ValidateCapabilityRow), without writing anything, a row whose
+	// Verdict is neither CapabilityYes nor CapabilityNo or whose Capability or
+	// Source is empty.
+	//
+	// UNLIKE every metric writer above it carries NO metrics_locked guard and
+	// never touches MetricsSource / MetricsUpdatedAt, and this doc comment is
+	// the canonical statement of why -- the argument migrations 76/77/78, both
+	// probe write paths and the ModelMapping capability fields all cite.
+	// metrics_locked exists so an operator can pin NUMBERS THEY ANSWER FOR --
+	// throughput, context size -- against automation. A capability is not such
+	// a number: pinning it could only ever produce a wrong answer, and unlike
+	// a pinned throughput a wrong capability has an operational consequence --
+	// the feature it gates silently stays off, with no visible reason, until
+	// someone thinks to unlock a mapping's metrics. And because it is a
+	// capability rather than a metric, writing one must not restamp the metrics
+	// provenance columns; doing so would misattribute this mapping's
+	// throughput figures to a capability probe.
+	//
+	// What an operator gets INSTEAD of that lock is provenance, and it is a
+	// strictly better trade: a row whose source is CapabilitySourceManual (or
+	// the equally authoritative CapabilitySourceVisionBenchmark) is never
+	// overwritten by a probe. That is a per-capability guarantee rather than a
+	// mapping-wide switch over numbers -- which is the whole reason the
+	// pre-78 columns needed the lock argument in the first place.
 	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []CapabilityRow) error
 	// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a
 	// row is how "not determined" is expressed -- the state the pre-78 bool

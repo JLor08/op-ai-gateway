@@ -63,8 +63,10 @@ type ModelServerDTO struct {
 	// MetricsProbe/ContextProbe (which Service.ModelServers leaves zero/empty
 	// for the gateway layer to inject from the runtime-status registry), this
 	// value is written directly to the mapping by the background detectors
-	// (routing.Store.UpdateMappingLiveProgressSupport), so it needs no
-	// gateway-injection seam -- Service.ModelServers fills it itself. No
+	// (until #49-3 moved them onto model_mapping_capabilities rows -- see
+	// routing.MappingStore.UpsertMappingCapabilities; this column is read-only
+	// legacy until the readers move), so it needs no gateway-injection seam --
+	// Service.ModelServers fills it itself. No
 	// `omitempty`: "never determined" must be an explicit "" on the wire, not a
 	// missing key -- same rule the wire encoding of State already follows.
 	LiveProgressSupport string `json:"live_progress_support"`
@@ -77,8 +79,11 @@ type ModelServerDTO struct {
 	// verdicts (#49 sub-project 2), each "" (never determined) | "yes" | "no",
 	// read straight off ModelMapping.CapVision/CapVideo/CapAudio/CapTools
 	// exactly like LiveProgressSupport above. Same gateway-injection-seam
-	// story as LiveProgressSupport: a background detector (routing.Store.
-	// UpdateMappingCapabilities) writes these to the mapping directly, so
+	// story as LiveProgressSupport: a background detector wrote these to the
+	// mapping directly (until #49-3 moved every probe onto
+	// model_mapping_capabilities rows -- see
+	// routing.MappingStore.UpsertMappingCapabilities, which is also where the
+	// no-metrics_locked-guard argument these columns cited now lives), so
 	// there is nothing for the gateway layer to inject after the fact --
 	// Service.ModelServers fills them itself. No `omitempty` on any of the
 	// four: "never determined" must be an explicit "" on the wire, not a

@@ -132,7 +132,15 @@ func TestTargetCarriesLiveProgressVerdictFromMapping(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	store := seededResolverStore(t, now) // app_fast/map_fast: Type=mock
-	must(t, store.UpdateMappingLiveProgressSupport(ctx, "map_fast", "supported", now))
+	// Seed the persisted verdict through the full-row writer: the targeted
+	// live_progress_support writer is gone (#49-3 moved every probe onto
+	// model_mapping_capabilities rows), and this test is about targetFrom
+	// COPYING the stored column, not about who wrote it.
+	mapping, err := store.MappingByID(ctx, "map_fast")
+	must(t, err)
+	mapping.LiveProgressSupport = "supported"
+	mapping.LiveProgressCheckedAt = &now
+	must(t, store.UpdateMapping(ctx, mapping))
 
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
 	target, err := resolver.Resolve(ctx, auth.Token{ID: "tok", UserID: "u", Active: true}, inference.Request{Model: "qwen-coder", APIFlavor: "openai_chat_completions"})

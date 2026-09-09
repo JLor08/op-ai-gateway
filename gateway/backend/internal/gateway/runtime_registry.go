@@ -64,8 +64,9 @@ type RuntimeStatusDTO struct {
 	// alongside the live process; carrying this one too keeps the registry's
 	// published shape coherent with what it already exposes, even though no
 	// current consumer reads it yet -- the durable verdict lives on the
-	// mapping (routing.ModelMapping.LiveProgressSupport, written by
-	// writeBackRuntimeLiveProgress in agent_ingest.go).
+	// mapping's routing.CapabilityLiveProgress row, written by
+	// writeBackRuntimeCapabilities in agent_ingest.go alongside every other
+	// capability the same probe pass determined.
 	LiveProgressSupport string `json:"live_progress_support"`
 	// GPUs is this frame's per-spec measured VRAM, and MeasuredAt is the
 	// GATEWAY's own arrival time for the frame that carried it -- never the

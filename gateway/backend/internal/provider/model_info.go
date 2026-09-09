@@ -24,15 +24,19 @@ type ModelInfo struct {
 	// request parameters (#51), as detected by detectLiveProgressSupport: ""
 	// (never determined -- the body wasn't a llama.cpp /props document at all),
 	// "supported", or "unsupported". "" must never overwrite an already-stored
-	// verdict -- see UpdateMappingLiveProgressSupport and the context-probe pass
-	// in cmd/gateway/app_health.go.
+	// verdict -- which the row model makes structural rather than a rule every
+	// writer remembers: "unknown" is the ABSENCE of a
+	// model_mapping_capabilities row, so a "" verdict has nothing to write.
+	// See routing.WritableProbeCapabilityRows and the context-probe pass in
+	// cmd/gateway/app_health.go.
 	LiveProgressSupport string
 	// Caps is the auto-detected capability verdict set (#49 sub-project 2), as
 	// detected by detectCapabilities. Each field is "" (never determined) |
 	// "yes" | "no" (Extra carries capability names with no field of their own).
 	// "" must never overwrite an already-stored verdict -- see
-	// routing.UpdateMappingCapabilities and the capability write in
-	// cmd/gateway/app_health.go.
+	// routing.WritableProbeCapabilityRows, which is where that rule and the
+	// operator's precedence rule both live, and the capability write in
+	// cmd/gateway/app_health.go that feeds it.
 	Caps Capabilities
 }
 
@@ -207,7 +211,8 @@ func detectLiveProgressSupport(body []byte) string {
 // Capabilities is the capability verdict set one probe document yields. Every
 // field is "" (this document said nothing about it) | "yes" | "no". The zero
 // value means "nothing determined", and no field may be written to storage
-// when it is "" -- see routing.CapabilityVerdicts.
+// when it is "" -- an undetermined capability simply gets no
+// model_mapping_capabilities row (see routing.CapabilityRow).
 type Capabilities struct {
 	Vision string
 	Video  string
