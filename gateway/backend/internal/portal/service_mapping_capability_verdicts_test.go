@@ -950,3 +950,128 @@ func TestCreateMappingStatesANegativeCapabilityVerdict(t *testing.T) {
 		t.Fatalf("mappings after the rejected creates = %d, want the %d there were -- validation must run before the store write", len(after.Data), len(before.Data))
 	}
 }
+
+// TestCreateMappingStatedVerdictBeatsTheLegacyVisionBoolean pins the first of
+// the create path's three documented precedence rules: a capability the
+// caller STATES is settled, so req.VisionCapable must not add a second row
+// for it.
+//
+// Both writers land in the same capRows slice and the same single upsert, and
+// the store's upsert is last-write-wins per capability -- so without the
+// `!stated[vision]` guard a create that was told "no" answers 200 with a
+// `manual` "yes", which outranks every probe and the vision benchmark for as
+// long as it stands. The rule is stated at the request field, at the call
+// site and in api-surface.md; until now nothing failed when it was removed.
+func TestCreateMappingStatedVerdictBeatsTheLegacyVisionBoolean(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	fx := newCapabilityTestFixture(t, now, routeStore)
+
+	created, err := fx.svc.CreateMapping(ctx, ownerToken(), fx.appID, CreateMappingRequest{
+		GatewayModelName: "stated-over-vision-bool", AppModelName: "stated-over-vision-bool-up",
+		VisionCapable:      true,
+		CapabilityVerdicts: map[string]string{routing.CapabilityVision: routing.CapabilityNo},
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping (stated no beside vision_capable true): %v", err)
+	}
+	rows := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, created.ID))
+	if len(rows) != 1 {
+		t.Fatalf("capability rows = %+v, want exactly the one stated vision row", rows)
+	}
+	if got := rows[routing.CapabilityVision]; got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceManual {
+		t.Fatalf("vision row = %+v, want no/manual -- the legacy BOOLEAN must not talk over the operator's own statement", got)
+	}
+	if created.VisionCapable || seededVerdict(created, routing.CapabilityVision) != routing.CapabilityNo {
+		t.Fatalf("create response reports vision %q/%v, want no/false -- the response must not claim a verdict the caller declined", seededVerdict(created, routing.CapabilityVision), created.VisionCapable)
+	}
+}
+
+// TestCreateMappingStatedVerdictBeatsTheLegacyMTPBoolean pins the same rule
+// for the OTHER legacy boolean, where it is carried by the ORDER of the
+// switch arms rather than by a guard: `case stated[mtp]` comes before
+// `case req.IsMTP`, and swapping the two lets the boolean append a second
+// `manual` "yes" after the stated "no" -- last-write-wins again.
+//
+// The model name here is deliberately NOT MTP-shaped, asserted below, so the
+// only two writers in play are the statement and the boolean: the name
+// heuristic (pinned separately) cannot be what supplies the row.
+func TestCreateMappingStatedVerdictBeatsTheLegacyMTPBoolean(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	fx := newCapabilityTestFixture(t, now, routeStore)
+
+	const plainName = "qwen3-32b-instruct"
+	if routing.IsMTPModelName(plainName) {
+		t.Fatalf("fixture model name %q is MTP-shaped -- this test would not isolate the BOOLEAN's precedence", plainName)
+	}
+	created, err := fx.svc.CreateMapping(ctx, ownerToken(), fx.appID, CreateMappingRequest{
+		GatewayModelName: "stated-over-mtp-bool", AppModelName: plainName,
+		IsMTP:              true,
+		CapabilityVerdicts: map[string]string{routing.CapabilityMTP: routing.CapabilityNo},
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping (stated no beside is_mtp true): %v", err)
+	}
+	rows := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, created.ID))
+	if len(rows) != 1 {
+		t.Fatalf("capability rows = %+v, want exactly the one stated mtp row", rows)
+	}
+	if got := rows[routing.CapabilityMTP]; got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceManual {
+		t.Fatalf("mtp row = %+v, want no/manual -- the legacy BOOLEAN must not talk over the operator's own statement", got)
+	}
+	if created.IsMtp || seededVerdict(created, routing.CapabilityMTP) != routing.CapabilityNo {
+		t.Fatalf("create response reports mtp %q/%v, want no/false", seededVerdict(created, routing.CapabilityMTP), created.IsMtp)
+	}
+}
+
+// TestCreateMappingStatedUnknownSuppressesTheMTPNameHeuristic pins the third
+// rule, and it is the one that most needed pinning: a PRESENT key holding ""
+// is a caller saying "I am telling you about mtp: nothing is determined", so
+// it settles the capability even though it is not a verdict. The name
+// heuristic must not answer that with a `legacy` "yes".
+//
+// `stated` is therefore recorded for every entry, BEFORE the empty-verdict
+// `continue` -- record it only for a non-empty verdict and this create
+// answers 200 with `mtp: yes/legacy`, a verdict the caller explicitly
+// declined to make, on the one capability nothing ever re-probes.
+//
+// The contrast in the same body is what keeps the assertion honest: the very
+// same MTP-shaped name still gets the heuristic's row where nothing was
+// stated, so this test cannot pass by having disabled the heuristic.
+func TestCreateMappingStatedUnknownSuppressesTheMTPNameHeuristic(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	fx := newCapabilityTestFixture(t, now, routeStore)
+
+	const mtpName = "glm-4.5-air-mtp"
+	if !routing.IsMTPModelName(mtpName) {
+		t.Fatalf("fixture model name %q is not MTP-shaped -- this test would prove nothing", mtpName)
+	}
+	stated, err := fx.svc.CreateMapping(ctx, ownerToken(), fx.appID, CreateMappingRequest{
+		GatewayModelName: "stated-unknown-mtp", AppModelName: mtpName,
+		CapabilityVerdicts: map[string]string{routing.CapabilityMTP: ""},
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping (stated unknown mtp): %v", err)
+	}
+	if rows := mustMappingCapabilities(t, routeStore, stated.ID); len(rows) != 0 {
+		t.Fatalf("capability rows after a stated unknown = %+v, want NONE -- unknown is the ABSENCE of a row, and a legacy/yes row is not absence", rows)
+	}
+	if stated.IsMtp || len(stated.Capabilities) != 0 {
+		t.Fatalf("create response reports is_mtp %v with capabilities %+v, want false/none", stated.IsMtp, stated.Capabilities)
+	}
+
+	unstated, err := fx.svc.CreateMapping(ctx, ownerToken(), fx.appID, CreateMappingRequest{
+		GatewayModelName: "unstated-mtp", AppModelName: mtpName,
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping (nothing stated): %v", err)
+	}
+	if got := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, unstated.ID))[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceLegacy {
+		t.Fatalf("mtp row for the SAME name with nothing stated = %+v, want yes/legacy -- the heuristic must still run", got)
+	}
+}
