@@ -152,8 +152,21 @@ export type PortalModelMapping = {
   prompt_tokens_per_second: number;
   load_time_ms: number;
   context_size: number;
+  // The two-state FOLD of the "mtp"/"vision" capability rows: true only for a
+  // "yes" row, so a "no" row and a MISSING row both read false. They cannot
+  // express the third state -- that is what `capabilities` below is for.
   is_mtp: boolean;
   vision_capable: boolean;
+  // Every DETERMINED capability row for this mapping, mirroring the backend's
+  // ModelMappingDTO.Capabilities -- the SAME ModelServerCapability shape the
+  // model-servers rows carry, reused rather than re-declared so the two cannot
+  // drift. Alphabetical by capability, always an array and never
+  // undefined/null (empty when nothing has been determined).
+  //
+  // The absence of an entry is UNKNOWN, and reading these rows instead of the
+  // folded booleans above is what lets MappingForm offer three honest states
+  // and hand a capability back to detection (see reset_capabilities).
+  capabilities: ModelServerCapability[];
   energy_wh_per_token: number;
   metrics_locked: boolean;
   metrics_source: string;
@@ -197,6 +210,20 @@ export type UpdateMappingRequest = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
+  // Return these capabilities to UNKNOWN by deleting their rows -- the only
+  // way back out of a `manual` verdict, which outranks every probe and the
+  // vision benchmark permanently.
+  //
+  // It rides on this same PATCH rather than on a DELETE of its own, and that
+  // is what makes it stick: MappingForm seeds once and re-submits its
+  // capability controls on every save, so a reset applied by a separate
+  // request would be undone by the operator's next unrelated edit. Sending
+  // both a capability's boolean AND its name here is a 400 (they are two
+  // different statements about one row), so the form sends exactly one.
+  //
+  // A `null` could not carry this: is_mtp/vision_capable are optional, so
+  // `{vision_capable: null}` is indistinguishable from an absent key.
+  reset_capabilities?: string[];
 };
 
 export type SyncResult = {

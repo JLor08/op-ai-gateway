@@ -18,6 +18,21 @@ import type { PortalApi } from './shared/types';
 
 const t = messages.de;
 
+// The two capability controls are non-native MUI Selects (shared/SelectField):
+// open by mouseDown on the combobox, then click the option in the portal.
+// `fireEvent.change` has no value setter to drive here.
+async function pickOption(comboLabel: string, optionLabel: string) {
+  fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
+  fireEvent.click(await screen.findByRole('option', { name: optionLabel }));
+}
+
+// One determined capability row, the shape the DTO's `capabilities` array
+// carries -- what the form SEEDS from (never the folded boolean, which cannot
+// express unknown).
+function capRow(capability: string, verdict: 'yes' | 'no') {
+  return { capability, verdict, source: 'manual', checked_at: '2026-07-16T12:00:00Z' };
+}
+
 const server: PortalServer = {
   id: 'srv_1',
   name: 'Server 1',
@@ -100,6 +115,7 @@ function makeMapping(overrides: Partial<PortalModelMapping> = {}): PortalModelMa
     context_size: 0,
     is_mtp: false,
     vision_capable: false,
+    capabilities: [],
     energy_wh_per_token: 0,
     metrics_locked: false,
     metrics_source: '',
@@ -125,6 +141,9 @@ function renderSection(
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
+  // The fake backend's own row state, so a SECOND save in one test starts from
+  // what the FIRST one returned rather than from the original fixture.
+  const mappingState = new Map(mappings.map((m) => [m.id, m]));
   const app = opts.application ?? application;
   const created: { serverId: string; body: CreateMappingRequest }[] = [];
   const updated: { id: string; body: UpdateMappingRequest }[] = [];
@@ -145,7 +164,37 @@ function renderSection(
     }),
     updateMapping: vi.fn(async (id: string, body: UpdateMappingRequest) => {
       updated.push({ id, body });
-      return makeMapping({ id, ...(body as Partial<PortalModelMapping>) });
+      // Faithful enough about CAPABILITIES for the reset to be observable,
+      // because that is the whole point of the round trip: a reset DELETES the
+      // row, a boolean writes a `manual` one, and the response carries
+      // POST-write truth -- which is what the re-opened form seeds from. A
+      // fake that echoed the request back would hide exactly the defect the
+      // reset's design exists to prevent.
+      const { reset_capabilities: reset = [], is_mtp, vision_capable, ...fields } = body;
+      const current = mappingState.get(id);
+      const caps = (current?.capabilities ?? []).filter((c) => !reset.includes(c.capability));
+      for (const [capability, value] of [
+        ['mtp', is_mtp],
+        ['vision', vision_capable],
+      ] as const) {
+        if (value === undefined) continue;
+        const row = capRow(capability, value ? 'yes' : 'no');
+        const at = caps.findIndex((c) => c.capability === capability);
+        if (at >= 0) caps[at] = row;
+        else caps.push(row);
+      }
+      const verdictOf = (capability: string) =>
+        caps.some((c) => c.capability === capability && c.verdict === 'yes');
+      const next = makeMapping({
+        ...(current ?? {}),
+        id,
+        ...(fields as Partial<PortalModelMapping>),
+        capabilities: caps,
+        is_mtp: verdictOf('mtp'),
+        vision_capable: verdictOf('vision'),
+      });
+      mappingState.set(id, next);
+      return next;
     }),
     deleteMapping: vi.fn(async () => ({ ok: true })),
     syncApplicationModels: vi.fn(async () => ({
@@ -206,8 +255,8 @@ describe('MappingSection performance metrics', () => {
     fireEvent.change(screen.getByLabelText(t.mappingGenTpsAtCapacity), {
       target: { value: '640.5' },
     });
-    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingIsMtp }));
-    fireEvent.click(screen.getByRole('checkbox', { name: t.mappingVisionCapable }));
+    await pickOption(t.mappingIsMtp, t.mappingCapabilityYes);
+    await pickOption(t.mappingVisionCapable, t.mappingCapabilityYes);
     fireEvent.click(screen.getByRole('checkbox', { name: t.mappingMetricsLocked }));
 
     // In the mask, the submit button carries the same "create" label.
@@ -239,6 +288,10 @@ describe('MappingSection performance metrics', () => {
           load_time_ms: 1500,
           is_mtp: true,
           vision_capable: true,
+          // The ROWS, not just the folded booleans: the two capability
+          // controls seed from these, so a fixture carrying `is_mtp: true`
+          // with no row would (correctly) render UNKNOWN.
+          capabilities: [capRow('mtp', 'yes'), capRow('vision', 'yes')],
           metrics_locked: true,
           max_concurrency: 16,
           recommended_concurrency: 8,
@@ -265,12 +318,12 @@ describe('MappingSection performance metrics', () => {
     expect((screen.getByLabelText(t.mappingGenTpsAtCapacity) as HTMLInputElement).value).toBe(
       '640.5',
     );
-    expect(
-      (screen.getByRole('checkbox', { name: t.mappingIsMtp }) as HTMLInputElement).checked,
-    ).toBe(true);
-    expect(
-      (screen.getByRole('checkbox', { name: t.mappingVisionCapable }) as HTMLInputElement).checked,
-    ).toBe(true);
+    expect(screen.getByRole('combobox', { name: t.mappingIsMtp }).textContent).toBe(
+      t.mappingCapabilityYes,
+    );
+    expect(screen.getByRole('combobox', { name: t.mappingVisionCapable }).textContent).toBe(
+      t.mappingCapabilityYes,
+    );
     expect(
       (screen.getByRole('checkbox', { name: t.mappingMetricsLocked }) as HTMLInputElement).checked,
     ).toBe(true);
@@ -284,13 +337,67 @@ describe('MappingSection performance metrics', () => {
       gen_tokens_per_second: 40.5,
       prompt_tokens_per_second: 200.25,
       load_time_ms: 1500,
-      is_mtp: true,
-      vision_capable: true,
       metrics_locked: true,
       max_concurrency: 16,
       recommended_concurrency: 8,
       gen_tokens_per_second_at_capacity: 640.5,
     });
+    // The two capability keys are the ONE exception to "resubmits them
+    // unchanged", and it is deliberate: a `manual` capability row outranks
+    // every probe and the vision benchmark permanently, so an untouched
+    // control must not be restated as an operator verdict. Unchanged means
+    // ABSENT -- neither the boolean nor a reset.
+    expect(updated[0].body).not.toHaveProperty('is_mtp');
+    expect(updated[0].body).not.toHaveProperty('vision_capable');
+    expect(updated[0].body).not.toHaveProperty('reset_capabilities');
+  });
+});
+
+describe('MappingSection capability reset', () => {
+  it('is not undone by the next unrelated save', async () => {
+    // The defect the whole design shape exists to prevent, end to end through
+    // the screen that owns the save. `MappingForm` seeds ONCE and never
+    // re-syncs from props, so the link that has to hold is: the reset's
+    // response carries post-delete truth, `submitEdit` stores it, and the
+    // re-opened form seeds from THAT. Break any link and the operator's next
+    // edit -- a context-size fix -- silently re-establishes a permanent
+    // `manual` verdict with an ordinary 200 and nothing on screen.
+    const { updated } = renderSection({
+      mappings: [
+        makeMapping({
+          id: 'map_1',
+          context_size: 4096,
+          is_mtp: true,
+          vision_capable: true,
+          capabilities: [capRow('vision', 'yes')],
+        }),
+      ],
+    });
+    await screen.findByText('gw-model');
+
+    // SAVE 1: hand `vision` back to detection.
+    fireEvent.click(screen.getByRole('button', { name: t.mappingEdit }));
+    await pickOption(t.mappingVisionCapable, t.mappingCapabilityUnknown);
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    expect(updated[0].body.reset_capabilities).toEqual(['vision']);
+
+    // SAVE 2: re-open the SAME mapping and change only the context size. The
+    // control must have re-seeded to unknown, so neither capability key may be
+    // sent -- if it re-seeded to the pre-reset "yes", this body would carry
+    // `vision_capable: true` and mint the permanent row all over again.
+    await waitFor(() => expect(screen.getByRole('button', { name: t.mappingEdit })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: t.mappingEdit }));
+    expect(screen.getByRole('combobox', { name: t.mappingVisionCapable }).textContent).toBe(
+      t.mappingCapabilityUnknown,
+    );
+    fireEvent.change(screen.getByLabelText(t.mappingContextSize), { target: { value: '262144' } });
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+
+    await waitFor(() => expect(updated).toHaveLength(2));
+    expect(updated[1].body.context_size).toBe(262144);
+    expect(updated[1].body).not.toHaveProperty('vision_capable');
+    expect(updated[1].body).not.toHaveProperty('reset_capabilities');
   });
 });
 

@@ -36,8 +36,26 @@ export type MappingFormValues = {
   load_time_ms: number;
   context_size: number;
   energy_wh_per_token: number;
-  is_mtp: boolean;
-  vision_capable: boolean;
+  /**
+   * The two capability verdicts, sent ONLY when the operator actually moved
+   * that control -- unlike every other key here, which is always emitted.
+   *
+   * A capability row whose source is `manual` outranks every probe and the
+   * vision benchmark permanently, so restating a value this form merely READ
+   * would launder an untouched control into an operator verdict. The backend
+   * carries the same differs-from-stored guard; both halves stay, because the
+   * form's seed and the store's row can disagree (a probe can write while the
+   * form is open).
+   */
+  is_mtp?: boolean;
+  vision_capable?: boolean;
+  /**
+   * Capabilities the operator moved back to UNKNOWN, which DELETES their rows.
+   * Never sent together with the same capability's boolean above -- that pair
+   * is a 400 -- and never populated by the create form, where nothing is on
+   * file to relinquish.
+   */
+  reset_capabilities?: string[];
   metrics_locked: boolean;
   max_concurrency: number;
   recommended_concurrency: number;
@@ -52,6 +70,28 @@ const num = (s: string) => {
 };
 
 const text = (n: number | undefined) => (n ? String(n) : '');
+
+/**
+ * The three states of a capability control. '' is UNKNOWN and it is a real,
+ * selectable value, not a placeholder: in the store, unknown is the ABSENCE of
+ * a row, so there is no third verdict to write -- moving a control here
+ * DELETES the row instead.
+ */
+type CapabilityChoice = '' | 'yes' | 'no';
+
+/**
+ * What a capability control is seeded with: the matching capability ROW's
+ * verdict, or '' when the mapping has no row for it.
+ *
+ * Deliberately NOT the folded `is_mtp`/`vision_capable` boolean, which is true
+ * only for a "yes" row and so reads a determined "no" and a missing row as the
+ * same `false`. Seeding from that boolean could never show unknown, which is
+ * the whole state this control exists to expose.
+ */
+function capabilitySeed(row: PortalModelMapping | null, capability: string): CapabilityChoice {
+  const verdict = row?.capabilities?.find((c) => c.capability === capability)?.verdict;
+  return verdict === 'yes' || verdict === 'no' ? verdict : '';
+}
 
 /**
  * The model-mapping create/edit mask, defined ONCE for the two screens that
@@ -134,8 +174,19 @@ export function MappingForm({
   const [genTps, setGenTps] = useState(() => text(row?.gen_tokens_per_second));
   const [promptTps, setPromptTps] = useState(() => text(row?.prompt_tokens_per_second));
   const [loadTimeMs, setLoadTimeMs] = useState(() => text(row?.load_time_ms));
-  const [isMtp, setIsMtp] = useState(() => row?.is_mtp ?? false);
-  const [visionCapable, setVisionCapable] = useState(() => row?.vision_capable ?? false);
+  // Each capability control carries its VALUE and the value the form OPENED
+  // with. The seed is what submit() diffs against, so "did the operator change
+  // this?" stays a question about what was loaded -- mirroring
+  // ApplicationSection's proxy_excluded seed, and for the same reason: a
+  // background list refresh must not be able to turn an untouched control into
+  // a write. Both are lazy from `row` and never re-synced (see the component's
+  // own note on initialisation).
+  const [isMtp, setIsMtp] = useState<CapabilityChoice>(() => capabilitySeed(row, 'mtp'));
+  const [isMtpSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'mtp'));
+  const [visionCapable, setVisionCapable] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'vision'),
+  );
+  const [visionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'vision'));
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -218,6 +269,42 @@ export function MappingForm({
 
   function submit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    // The capability half of the body, and the ONLY part of this form that is
+    // conditional. Three outcomes per control, from the seed diff:
+    //
+    //   unchanged        -> send NOTHING. This is what keeps a save made for an
+    //                       unrelated reason (a context-size fix) from minting a
+    //                       permanent `manual` row out of a value the form only
+    //                       ever read.
+    //   moved to yes/no  -> send the boolean. An operator verdict.
+    //   moved to unknown -> name it in reset_capabilities, which DELETES the
+    //                       row. Not a boolean: there is no third verdict to
+    //                       write, and sending both for one capability is a 400.
+    //
+    // On the create form every seed is '' and nothing is on file, so the
+    // unknown branch is unreachable there by construction.
+    const capabilities: Pick<
+      MappingFormValues,
+      'is_mtp' | 'vision_capable' | 'reset_capabilities'
+    > = {};
+    const reset: string[] = [];
+    for (const control of [
+      { capability: 'mtp', value: isMtp, seed: isMtpSeed, key: 'is_mtp' },
+      {
+        capability: 'vision',
+        value: visionCapable,
+        seed: visionCapableSeed,
+        key: 'vision_capable',
+      },
+    ] as const) {
+      if (control.value === control.seed) continue;
+      if (control.value === '') {
+        reset.push(control.capability);
+        continue;
+      }
+      capabilities[control.key] = control.value === 'yes';
+    }
+    if (reset.length > 0) capabilities.reset_capabilities = reset;
     onSubmit({
       gateway_model_name: gatewayName,
       app_model_name: appName,
@@ -227,8 +314,7 @@ export function MappingForm({
       load_time_ms: num(loadTimeMs),
       context_size: num(contextSize),
       energy_wh_per_token: num(energyWhPerToken),
-      is_mtp: isMtp,
-      vision_capable: visionCapable,
+      ...capabilities,
       metrics_locked: metricsLocked,
       max_concurrency: num(maxConcurrency),
       recommended_concurrency: num(recommendedConcurrency),
@@ -361,19 +447,43 @@ export function MappingForm({
           onChange={(e) => setGenTpsAtCapacity(e.target.value)}
           inputProps={{ min: 0, step: 'any' }}
         />
-        <FormControlLabel
-          control={<Checkbox checked={isMtp} onChange={(e) => setIsMtp(e.target.checked)} />}
+        {/* THREE states, not a checkbox, and `unknown` is the empty option --
+            the shared SelectField renders it as a real, selectable value with
+            a permanently shrunk label, exactly as three other screens already
+            do for their "follow global"/"auto" empty state. A tri-state
+            checkbox exists nowhere in this portal; do not build one.
+
+            The helper line appears only while UNKNOWN is selected, and it says
+            something DIFFERENT per capability because the honest answer is
+            different: vision comes back on its own from a real llama.cpp
+            /props upstream, MTP never comes back at all. One uniform "let
+            detection decide again" would be a promise the gateway does not
+            keep. */}
+        <SelectField
+          id="mapping-is-mtp"
           label={t.mappingIsMtp}
-        />
-        <FormControlLabel
-          control={
-            <Checkbox
-              checked={visionCapable}
-              onChange={(e) => setVisionCapable(e.target.checked)}
-            />
-          }
+          value={isMtp}
+          onChange={(e) => setIsMtp(e.target.value as CapabilityChoice)}
+          {...(isMtp === '' ? { helperText: t.mappingIsMtpUnknownHint } : {})}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          <option value="no">{t.mappingCapabilityNo}</option>
+        </SelectField>
+        <SelectField
+          id="mapping-vision-capable"
           label={t.mappingVisionCapable}
-        />
+          value={visionCapable}
+          onChange={(e) => setVisionCapable(e.target.value as CapabilityChoice)}
+          {...(visionCapable === '' ? { helperText: t.mappingVisionCapableUnknownHint } : {})}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          <option value="no">{t.mappingCapabilityNo}</option>
+        </SelectField>
+        {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
+            numeric metrics, not a capability, and ADR-039 is explicit that it
+            does not guard the capability table at all any more. */}
         <FormControlLabel
           control={
             <Checkbox
