@@ -154,26 +154,47 @@ type RuntimeSample struct {
 	// /props document that yields LiveProgressSupport above (#49-2). A
 	// POINTER with omitempty, deliberately: nil distinguishes "this agent
 	// predates capability detection" from "detected, nothing determined"
-	// (an all-empty struct) -- a distinction the string fields above cannot
-	// make for themselves.
+	// (a non-nil Capabilities with an empty Verdicts) -- a distinction the
+	// string fields above cannot make for themselves. See Capabilities' own
+	// doc comment below for the full reasoning, including why Verdicts is a
+	// keyed list rather than a map.
 	Capabilities *Capabilities       `json:"capabilities,omitempty"`
 	GPUs         []RuntimeGPUSample  `json:"gpus,omitempty"`
 	LastError    *RuntimeErrorSample `json:"last_error,omitempty"`
 }
 
-// Capabilities is RuntimeSample.Capabilities' payload: each verdict is
-// "" | "yes" | "no", and Extra carries capability names with no field of
-// their own (empty for a llama.cpp child; Ollama's open vocabulary fills it).
+// Capabilities is one managed child's auto-detected capability set (#49-2).
+//
+// A POINTER on RuntimeSample, and that is load-bearing: nil means "this agent
+// predates capability detection", while non-nil with an empty Verdicts means
+// "detection ran and determined nothing" — which is exactly what an
+// api-key-protected child reports, since a 401/403 is a CONCLUSIVE refusal.
+// A bare map with omitempty could not carry that distinction: an empty map
+// marshals away and the two cases collapse.
+//
+// Verdicts is a keyed LIST rather than a map because that is this file's own
+// idiom — Net, GPUs and ProxyRoutes are all keyed lists, there is no map on
+// this wire — and because Normalize can force a slice non-nil so it never
+// marshals as null.
+//
+// The vocabulary is OPEN: a name this binary has never heard of is carried
+// through unchanged rather than dropped, the same forward-compatibility rule
+// the declared-feature list already follows.
+//
 // Named plainly (not "SampleCapabilities") to avoid the package/type-name
 // stutter revive flags -- mirroring the RuntimeSample.Host *Host precedent
 // above, and the collector package's own bare Capabilities type this one's
-// fields are copied from (agent.go's capabilitiesSample).
+// entries are derived from (agent.go's capabilitiesSample).
 type Capabilities struct {
-	Vision string   `json:"vision"`
-	Video  string   `json:"video"`
-	Audio  string   `json:"audio"`
-	Tools  string   `json:"tools"`
-	Extra  []string `json:"extra,omitempty"`
+	Verdicts []CapabilityVerdict `json:"verdicts"`
+}
+
+// CapabilityVerdict is one capability's answer: Verdict is "yes" or "no" and
+// nothing else — an undetermined capability has NO entry, mirroring the
+// gateway's row-absence-means-unknown model.
+type CapabilityVerdict struct {
+	Name    string `json:"name"`
+	Verdict string `json:"verdict"`
 }
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring
@@ -304,6 +325,11 @@ func (s *Sample) Normalize() {
 	}
 	if len(s.Capabilities) == 0 {
 		s.Capabilities = EmptyCapabilities()
+	}
+	for i := range s.Runtimes {
+		if s.Runtimes[i].Capabilities != nil && s.Runtimes[i].Capabilities.Verdicts == nil {
+			s.Runtimes[i].Capabilities.Verdicts = []CapabilityVerdict{}
+		}
 	}
 }
 

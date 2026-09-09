@@ -2086,6 +2086,45 @@ func TestCollectOnceRuntimeLiveProgressCustomTypeSupported(t *testing.T) {
 	}
 }
 
+// TestCapabilitiesSampleCarriesEveryVerdictAsARow proves capabilitiesSample
+// converts each of the four named collector.Capabilities fields into its own
+// CapabilityVerdict entry, keyed by name, and skips every undetermined
+// ("") field entirely -- there must be no entry at all for Video/Audio here,
+// mirroring the store's row-absence-means-unknown model (#49-2, task 2).
+func TestCapabilitiesSampleCarriesEveryVerdictAsARow(t *testing.T) {
+	got := capabilitiesSample(collector.Capabilities{Vision: "yes", Tools: "no"})
+	if got == nil {
+		t.Fatal("capabilitiesSample = nil, want a non-nil pointer")
+	}
+	want := []sample.CapabilityVerdict{
+		{Name: "vision", Verdict: "yes"},
+		{Name: "tools", Verdict: "no"},
+	}
+	if !reflect.DeepEqual(got.Verdicts, want) {
+		t.Errorf("Verdicts = %+v, want exactly %+v (no entry for undetermined video/audio)", got.Verdicts, want)
+	}
+}
+
+// TestCapabilitiesSampleAllEmptyIsNonNilAndEmpty proves an all-empty
+// collector.Capabilities -- e.g. the zero value a router-mode /props dummy or
+// a 401/403 CONCLUSIVE refusal detects -- still yields a non-nil pointer
+// whose Verdicts is itself non-nil and empty. This is the distinction the
+// whole pointer wrapper exists for: nil means "this agent predates
+// capability detection", while this non-nil-but-empty value means
+// "detection ran and determined nothing".
+func TestCapabilitiesSampleAllEmptyIsNonNilAndEmpty(t *testing.T) {
+	got := capabilitiesSample(collector.Capabilities{})
+	if got == nil {
+		t.Fatal("capabilitiesSample = nil, want a non-nil pointer even when every field is undetermined")
+	}
+	if got.Verdicts == nil {
+		t.Error("Verdicts = nil, want a non-nil (but empty) slice")
+	}
+	if len(got.Verdicts) != 0 {
+		t.Errorf("Verdicts = %+v, want empty", got.Verdicts)
+	}
+}
+
 // TestCollectOnceRuntimeCapabilitiesCachedAcrossCycles proves the widened
 // cache carries capabilities too, exactly as it already does for
 // LiveProgressSupport (TestCollectOnceRuntimeLiveProgressApiKeyRefusalCachedAcrossCycles
@@ -2125,7 +2164,12 @@ func TestCollectOnceRuntimeCapabilitiesCachedAcrossCycles(t *testing.T) {
 	cfg := config.Config{Interval: time.Hour}
 	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
 
-	want := &sample.Capabilities{Vision: "yes", Video: "no", Audio: "no", Tools: "yes"}
+	want := &sample.Capabilities{Verdicts: []sample.CapabilityVerdict{
+		{Name: "vision", Verdict: "yes"},
+		{Name: "video", Verdict: "no"},
+		{Name: "audio", Verdict: "no"},
+		{Name: "tools", Verdict: "yes"},
+	}}
 	const cycles = 3
 	for cycle := 1; cycle <= cycles; cycle++ {
 		a.collectOnce(context.Background())
@@ -2187,7 +2231,12 @@ func TestCollectOnceRuntimeCapabilitiesPidChangeRearms(t *testing.T) {
 	cfg := config.Config{Interval: time.Hour}
 	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
 
-	want := &sample.Capabilities{Vision: "yes", Video: "no", Audio: "no", Tools: "yes"}
+	want := &sample.Capabilities{Verdicts: []sample.CapabilityVerdict{
+		{Name: "vision", Verdict: "yes"},
+		{Name: "video", Verdict: "no"},
+		{Name: "audio", Verdict: "no"},
+		{Name: "tools", Verdict: "yes"},
+	}}
 
 	a.collectOnce(context.Background())
 	a.collectOnce(context.Background())
@@ -2459,8 +2508,8 @@ func TestCollectOnceRuntimeLiveProgressNotFoundCachedAcrossCycles(t *testing.T) 
 		}
 		if rs.Capabilities == nil {
 			t.Errorf("cycle %d: Capabilities = nil, want a non-nil all-empty struct -- a 404 is a CONCLUSIVE refusal (\"detection ran, determined nothing\"), distinct from a still-transient probe's nil", cycle)
-		} else if !reflect.DeepEqual(*rs.Capabilities, sample.Capabilities{}) {
-			t.Errorf("cycle %d: Capabilities = %+v, want an all-empty struct", cycle, *rs.Capabilities)
+		} else if len(rs.Capabilities.Verdicts) != 0 {
+			t.Errorf("cycle %d: Capabilities.Verdicts = %+v, want empty", cycle, rs.Capabilities.Verdicts)
 		}
 		if hits := atomic.LoadInt32(&propsHits); hits != 1 {
 			t.Fatalf("cycle %d: /props hits = %d, want 1 (a 404 is conclusive: cache it and never ask again for this pid)", cycle, hits)

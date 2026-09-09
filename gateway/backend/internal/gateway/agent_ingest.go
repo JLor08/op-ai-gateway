@@ -147,23 +147,77 @@ type agentRuntimeError struct {
 	StderrTail string    `json:"stderr_tail,omitempty"`
 }
 
+// agentRuntimeCapabilityVerdict is one capability's answer inside an
+// agentRuntimeCapabilitiesSample -- the gateway-side mirror of the agent's
+// sample.CapabilityVerdict, field-for-field and JSON-tag-for-JSON-tag
+// identical, but its OWN type: the gateway and server-agent are separate Go
+// modules and cannot share code, mirroring routing.CapabilityVerdicts
+// already doing the same on the store side. Verdict is "yes" or "no" and
+// nothing else -- an undetermined capability has NO entry, mirroring the
+// store's row-absence-means-unknown model.
+type agentRuntimeCapabilityVerdict struct {
+	Name    string `json:"name"`
+	Verdict string `json:"verdict"`
+}
+
 // agentRuntimeCapabilitiesSample is the gateway-side mirror of the agent's
 // sample.Capabilities wire payload (server-agent/internal/sample), one
 // managed child's auto-detected capability verdict set (#49 sub-project 2).
 // Field-for-field and JSON-tag-for-JSON-tag identical to the agent's type,
 // but its OWN type: the gateway and server-agent are separate Go modules and
 // cannot share code, mirroring routing.CapabilityVerdicts already doing the
-// same on the store side. Every verdict is "" (this probe determined nothing
-// about it) | "yes" | "no"; Extra carries capability names the upstream
-// reported with no field of their own here -- empty for a llama.cpp child,
-// forward-compatible with the open vocabulary a future probe (e.g. Ollama)
-// might fill.
+// same on the store side.
+//
+// Verdicts is a keyed LIST, an OPEN vocabulary: a capability name this
+// binary has never heard of decodes and is carried through unchanged rather
+// than dropped -- the same forward-compatibility rule parseAgentCapabilities
+// already documents for the declared-feature list.
+//
+// The old write-back (writeBackOneRuntimeCapabilities) still consumes four
+// fixed names plus an Extra list, not Verdicts directly; legacyCapabilityFields
+// below is the shim that projects one onto the other so this task's diff
+// stays a pure wire change. TASK 3 DELETES legacyCapabilityFields once the
+// write-back itself is rewritten against the open vocabulary (and, later,
+// the child capability table).
 type agentRuntimeCapabilitiesSample struct {
-	Vision string   `json:"vision"`
-	Video  string   `json:"video"`
-	Audio  string   `json:"audio"`
-	Tools  string   `json:"tools"`
-	Extra  []string `json:"extra,omitempty"`
+	Verdicts []agentRuntimeCapabilityVerdict `json:"verdicts"`
+}
+
+// legacyCapabilityFields projects c.Verdicts back onto the four fixed
+// capability names plus an Extra list of every other reported "yes" --
+// the shape writeBackOneRuntimeCapabilities was written against before this
+// task. A nil receiver (no wire object at all) returns everything empty,
+// matching how the old nil-pointer check worked. Only a "yes" outside the
+// four known names becomes an Extra entry: the pre-existing Extra list had
+// no verdict of its own and was always an implicit positive, so a reported
+// "no" on an unknown name has nothing to project onto and is dropped here --
+// harmless, since this whole method is provisional.
+//
+// TASK 3 DELETES THIS METHOD (see agentRuntimeCapabilitiesSample's doc):
+// once the write-back reads Verdicts (or the child capability table)
+// directly, no projection back onto the four fixed names is needed at all.
+func (c *agentRuntimeCapabilitiesSample) legacyCapabilityFields() (vision, video, audio, tools string, extra []string) {
+	if c == nil {
+		return "", "", "", "", nil
+	}
+	for _, v := range c.Verdicts {
+		verdict := strings.TrimSpace(v.Verdict)
+		switch v.Name {
+		case "vision":
+			vision = verdict
+		case "video":
+			video = verdict
+		case "audio":
+			audio = verdict
+		case "tools":
+			tools = verdict
+		default:
+			if verdict == "yes" {
+				extra = append(extra, v.Name)
+			}
+		}
+	}
+	return vision, video, audio, tools, extra
 }
 
 // agentRuntimeSample is one agent-managed model process's live state inside
@@ -964,11 +1018,14 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 		// below, but both mean no write; see writeBackRuntimeCapabilities.
 		return
 	}
-	vision := strings.TrimSpace(rt.Capabilities.Vision)
-	video := strings.TrimSpace(rt.Capabilities.Video)
-	audio := strings.TrimSpace(rt.Capabilities.Audio)
-	tools := strings.TrimSpace(rt.Capabilities.Tools)
-	if noCapabilityEvidence(vision, video, audio, tools, rt.Capabilities.Extra) {
+	// legacyCapabilityFields is this task's shim (see
+	// agentRuntimeCapabilitiesSample's doc): it projects the wire's open
+	// Verdicts list back onto the four fixed names this write-back was
+	// written against, so this task's diff stays a pure wire change. TASK 3
+	// DELETES the shim and rewrites this function against Verdicts (or the
+	// child capability table) directly.
+	vision, video, audio, tools, extra := rt.Capabilities.legacyCapabilityFields()
+	if noCapabilityEvidence(vision, video, audio, tools, extra) {
 		// Detection ran and determined nothing -- also no write, but for a
 		// different reason than nil above.
 		return
@@ -977,7 +1034,7 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 	if !ok {
 		return
 	}
-	caps := changedCapabilityVerdicts(vision, video, audio, tools, rt.Capabilities.Extra, r.stored())
+	caps := changedCapabilityVerdicts(vision, video, audio, tools, extra, r.stored())
 
 	// Vision sync: driven by `vision`, THIS sample's reported verdict -- not
 	// by caps.Vision, which is non-empty only when the tri-state itself

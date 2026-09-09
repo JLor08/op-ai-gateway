@@ -594,6 +594,48 @@ func TestRuntimeSampleLiveProgressSupportRoundTrip(t *testing.T) {
 	}
 }
 
+// TestNormalizeForcesVerdictsNonNil proves Normalize forces a non-nil
+// Capabilities' Verdicts to marshal as [] rather than null -- the same rule
+// Normalize already applies to Net/GPUs/ProxyRoutes on this wire. A
+// RuntimeSample can carry a non-nil Capabilities (detection ran, determined
+// nothing) whose Verdicts was never explicitly set (a nil slice, Go's zero
+// value); nothing else on this path guarantees it round-trips as an empty
+// array instead of JSON's null, and null would break a decoder that treats
+// the key's presence as this capability's row-absence-means-unknown model.
+func TestNormalizeForcesVerdictsNonNil(t *testing.T) {
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{
+				SpecID:       "rspec_verdicts_nil",
+				Capabilities: &Capabilities{},
+			},
+		},
+	}
+	s.Normalize()
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var probe struct {
+		Runtimes []struct {
+			Capabilities struct {
+				Verdicts json.RawMessage `json:"verdicts"`
+			} `json:"capabilities"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 1 {
+		t.Fatalf("probe runtimes len = %d, want 1", len(probe.Runtimes))
+	}
+	if got := string(probe.Runtimes[0].Capabilities.Verdicts); got != "[]" {
+		t.Errorf("runtimes[0].capabilities.verdicts = %s, want [] (never null)", got)
+	}
+}
+
 func TestNormalizeDefaultsEmpty(t *testing.T) {
 	var s Sample
 	s.Normalize()

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1296,10 +1297,11 @@ func (c *countingCapabilitiesWriteStore) UpdateMappingVisionCapable(ctx context.
 
 // capabilitiesBody builds a minimal runtime_model_probe-declaring telemetry
 // body naming specID, with the given JSON object embedded verbatim as the
-// runtime entry's own "capabilities" field (e.g. `{"vision":"yes"}` or
-// `{}`). Pass "" to omit the key entirely -- an older agent that predates
-// capability detection, decoding to a nil *agentRuntimeCapabilitiesSample
-// rather than a zero-valued one.
+// runtime entry's own "capabilities" field (e.g.
+// `{"verdicts":[{"name":"vision","verdict":"yes"}]}` or `{}`). Pass "" to
+// omit the key entirely -- an older agent that predates capability
+// detection, decoding to a nil *agentRuntimeCapabilitiesSample rather than a
+// zero-valued one.
 func capabilitiesBody(specID, capsJSON string) string {
 	field := ""
 	if capsJSON != "" {
@@ -1323,7 +1325,7 @@ func TestIngestWritesBackCapabilities(t *testing.T) {
 	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 	srv.Routes = counting
 
-	body := capabilitiesBody("rspec_caps_once", `{"vision":"yes","tools":"no"}`)
+	body := capabilitiesBody("rspec_caps_once", `{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"}]}`)
 	for i := 0; i < 2; i++ {
 		req, raw := ingestReq(t, body)
 		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
@@ -1435,7 +1437,7 @@ func TestIngestCapabilitiesWithoutFeatureNeverWrites(t *testing.T) {
 
 	// No top-level "capabilities" object at all -- an agent that never
 	// declared runtime_model_probe, exactly like an older agent build.
-	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_caps_nocap","state":"running","capabilities":{"vision":"yes","tools":"no"}}]}`
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_caps_nocap","state":"running","capabilities":{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"}]}}]}`
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -1490,8 +1492,8 @@ func TestIngestCapabilitiesCrossServerRejected(t *testing.T) {
 	defer restore()
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},"runtimes":[` +
-		`{"spec_id":"rspec_cross_caps","state":"running","capabilities":{"vision":"yes"}},` +
-		`{"spec_id":"rspec_own_caps","state":"running","capabilities":{"vision":"yes"}}]}`
+		`{"spec_id":"rspec_cross_caps","state":"running","capabilities":{"verdicts":[{"name":"vision","verdict":"yes"}]}},` +
+		`{"spec_id":"rspec_own_caps","state":"running","capabilities":{"verdicts":[{"name":"vision","verdict":"yes"}]}}]}`
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest must succeed (best-effort write-back) even when the sample names another server's spec_id: %v", err)
@@ -1519,6 +1521,64 @@ func TestIngestCapabilitiesCrossServerRejected(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeCapabilitiesSampleDecode is the gateway-side decode half of
+// #49 sub-project 2, task 2: the wire shape is a keyed Verdicts list, and the
+// vocabulary is OPEN -- a capability name this binary has never heard of
+// must decode and be CARRIED, not dropped, the same forward-compatibility
+// rule parseAgentCapabilities already documents for the declared-feature
+// list. Also pins the nil-vs-non-nil-empty distinction at the decode layer:
+// no "capabilities" key at all decodes to a nil pointer (an agent that
+// predates capability detection), while an explicit empty verdicts list
+// decodes to a non-nil pointer with an empty (non-nil) Verdicts (detection
+// ran, determined nothing).
+func TestAgentRuntimeCapabilitiesSampleDecode(t *testing.T) {
+	t.Run("known and unknown verdicts both decode and are carried", func(t *testing.T) {
+		body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_decode","state":"running",` +
+			`"capabilities":{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"future_modality","verdict":"no"}]}}]}`
+		req, _ := ingestReq(t, body)
+		if len(req.Runtimes) != 1 {
+			t.Fatalf("runtimes = %+v, want 1", req.Runtimes)
+		}
+		caps := req.Runtimes[0].Capabilities
+		if caps == nil {
+			t.Fatal("Capabilities = nil, want a non-nil pointer")
+		}
+		want := []agentRuntimeCapabilityVerdict{
+			{Name: "vision", Verdict: "yes"},
+			{Name: "future_modality", Verdict: "no"},
+		}
+		if !reflect.DeepEqual(caps.Verdicts, want) {
+			t.Errorf("Verdicts = %+v, want %+v -- an unknown capability name must be CARRIED, not dropped", caps.Verdicts, want)
+		}
+	})
+
+	t.Run("no capabilities key decodes to nil", func(t *testing.T) {
+		body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_decode_nil","state":"running"}]}`
+		req, _ := ingestReq(t, body)
+		if len(req.Runtimes) != 1 {
+			t.Fatalf("runtimes = %+v, want 1", req.Runtimes)
+		}
+		if got := req.Runtimes[0].Capabilities; got != nil {
+			t.Errorf("Capabilities = %+v, want nil (no key at all -- an agent that predates capability detection)", got)
+		}
+	})
+
+	t.Run("empty verdicts list decodes to non-nil-empty", func(t *testing.T) {
+		body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_decode_empty","state":"running","capabilities":{"verdicts":[]}}]}`
+		req, _ := ingestReq(t, body)
+		if len(req.Runtimes) != 1 {
+			t.Fatalf("runtimes = %+v, want 1", req.Runtimes)
+		}
+		caps := req.Runtimes[0].Capabilities
+		if caps == nil {
+			t.Fatal("Capabilities = nil, want a non-nil pointer -- detection ran and determined nothing, distinct from the no-key case above")
+		}
+		if len(caps.Verdicts) != 0 {
+			t.Errorf("Verdicts = %+v, want empty", caps.Verdicts)
+		}
+	})
+}
+
 // TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter proves the one
 // deliberate exception in writeBackRuntimeCapabilities' otherwise lock-free
 // write: a DEFINITIVE cap_vision verdict additionally syncs onto the
@@ -1538,7 +1598,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 		srv.Routes = counting
 
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_yes", `{"vision":"yes"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_yes", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1567,7 +1627,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 		srv.Routes = counting
 
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_no", `{"vision":"no"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_no", `{"verdicts":[{"name":"vision","verdict":"no"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1602,7 +1662,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 
 		// vision is absent (""), but tools is definitive -- the capability
 		// write itself still happens; only the vision sync must not.
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_empty", `{"tools":"no"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_empty", `{"verdicts":[{"name":"tools","verdict":"no"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1633,7 +1693,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 		srv.Routes = counting
 
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_unchanged", `{"vision":"yes"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_unchanged", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1663,7 +1723,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 		srv.Routes = counting
 
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_steady", `{"vision":"yes"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_steady", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1697,7 +1757,7 @@ func TestIngestVisionSyncWritesTheBoolThroughTheLockedWriter(t *testing.T) {
 		counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 		srv.Routes = counting
 
-		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_locked", `{"vision":"yes"}`))
+		req, raw := ingestReq(t, capabilitiesBody("rspec_vision_locked", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
 		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
@@ -1746,7 +1806,7 @@ func TestIngestVisionSyncRepairsADesyncedBool(t *testing.T) {
 	counting := &countingCapabilitiesWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 	srv.Routes = counting
 
-	req, raw := ingestReq(t, capabilitiesBody("rspec_vision_desync", `{"vision":"yes"}`))
+	req, raw := ingestReq(t, capabilitiesBody("rspec_vision_desync", `{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
