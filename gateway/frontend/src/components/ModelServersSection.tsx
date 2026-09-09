@@ -175,14 +175,16 @@ type CapabilityRow = Pick<
 // manifest-declared capabilities straight through, so dropping an unknown
 // value here would silently hide a real, reported capability). A `no`
 // verdict renders NO chip at all -- negatives are not chips, only positives
-// and "reported but uncategorized" are. All chips share the same neutral
-// "success" status: there is no ranking among capabilities, and the house
-// rule is chips are keyed by `data-status`, never by colour.
+// and "reported but uncategorized" are. Verdict chips use the vetted
+// "success" key; cap_extra chips use the neutral "standby" key instead (see
+// the comment at the push site below) -- chips are still keyed by
+// `data-status`, never by colour, and there is no ranking within either
+// group.
 function capabilityChips(
   row: CapabilityRow,
   t: Translation,
-): { status: 'success'; label: string }[] {
-  const chips: { status: 'success'; label: string }[] = [];
+): { status: 'success' | 'standby'; label: string }[] {
+  const chips: { status: 'success' | 'standby'; label: string }[] = [];
   const verdicts: [string, string][] = [
     [row.cap_vision, t.capabilityVision],
     [row.cap_video, t.capabilityVideo],
@@ -193,7 +195,12 @@ function capabilityChips(
     if (verdict === 'yes') chips.push({ status: 'success', label });
   }
   for (const extra of row.cap_extra ?? []) {
-    chips.push({ status: 'success', label: extra });
+    // NEUTRAL, not "success": the verdicts above are capabilities this
+    // codebase understands and caveats in the tooltip; cap_extra is an
+    // open-ended, un-vetted string from the upstream's own vocabulary. Same
+    // "reported, not verified" semantic liveProgressChipInfo's "unsupported"
+    // branch above already chose.
+    chips.push({ status: 'standby', label: extra });
   }
   return chips;
 }

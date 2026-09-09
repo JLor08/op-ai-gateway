@@ -761,9 +761,19 @@ describe('ModelServersSection', () => {
     // must still surface rather than silently disappear.
     expect(within(cell).getByText('thinking')).toBeInTheDocument();
     expect(within(cell).getByText(t.capabilityAudio)).toBeInTheDocument();
-    // Fixed order: the Audio verdict chip precedes the cap_extra chip.
+    // The verdict chip is the vetted "active" key; the cap_extra chip is the
+    // neutral "standby" key -- an unrecognized, un-vetted string must not be
+    // equated with a caveated verdict this codebase actually vouches for.
+    expect(within(cell).getByText(t.capabilityAudio)).toHaveAttribute('data-status', 'active');
+    expect(within(cell).getByText('thinking')).toHaveAttribute('data-status', 'standby');
+    // Fixed order: the Audio verdict chip precedes the cap_extra chip. Scoped
+    // to BOTH keys (not just 'active') so the extra chip -- now 'standby' --
+    // is still picked up; if the push order were ever scrambled this would
+    // still catch it, since the two keys involved are distinct.
     const labels = within(cell)
-      .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
+      .getAllByText((_, el) =>
+        ['active', 'standby'].includes(el?.getAttribute('data-status') ?? ''),
+      )
       .map((el) => el.textContent);
     expect(labels).toEqual([t.capabilityAudio, 'thinking']);
   });
