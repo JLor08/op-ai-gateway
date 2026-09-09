@@ -125,6 +125,17 @@ type MemoryStore struct {
 	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
 	// same shape as `hardware` above.
 	runtimeReports map[string]ServerRuntimeReport
+	// mappingCapabilities mirrors model_mapping_capabilities (migration 78):
+	// mappingID -> capability -> its CapabilityRow. The capability is the
+	// inner map KEY, which is what makes an upsert a natural replacement (the
+	// SQL side's on-conflict-do-update) and the ABSENCE of an entry the way
+	// "unknown" is expressed — there is no empty verdict to store. Unordered
+	// on write; MappingCapabilities sorts by Capability on read, mirroring the
+	// SQL `order by capability` (same pattern as runtimeSpecGPUs/coresidency
+	// above). CapabilityRow has no slice/pointer fields, so a plain value-map
+	// assignment is a full copy (mirrors certificates above). Deleting a
+	// mapping cascades its whole entry (see deleteMappingLocked).
+	mappingCapabilities map[string]map[string]CapabilityRow
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -159,6 +170,7 @@ func NewMemoryStore() *MemoryStore {
 		coresidency:              map[string][]CoResidencyRule{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
+		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 	}
 }
 
@@ -945,7 +957,8 @@ func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 
 // deleteMappingLocked removes one mapping plus everything the SQL FK graph
 // cascades from `model_mappings`: its benchmark runs
-// (model_mapping_benchmarks.mapping_id), its runtime spec
+// (model_mapping_benchmarks.mapping_id), its capability rows
+// (model_mapping_capabilities.mapping_id), its runtime spec
 // (agent_runtime_specs.mapping_id) and that spec's per-GPU rows
 // (agent_runtime_spec_gpus.spec_id, a second hop), and any co-residency pair
 // naming it on EITHER side (agent_coresidency_rules.mapping_a_id /
@@ -955,6 +968,7 @@ func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 	delete(m.mappings, mappingID)
 	delete(m.benchmarks, mappingID)
+	delete(m.mappingCapabilities, mappingID)
 	for specID, spec := range m.runtimeSpecs {
 		if spec.MappingID == mappingID {
 			delete(m.runtimeSpecs, specID)
@@ -1086,6 +1100,80 @@ func (m *MemoryStore) UpdateMappingCapabilities(_ context.Context, id string, ca
 	t := at
 	mapping.CapabilitiesCheckedAt = &t
 	m.mappings[id] = mapping
+	return nil
+}
+
+// MappingCapabilities lists one mapping's capability rows ordered by
+// capability (mirroring the SQL `order by capability`; the map is unordered
+// on write, same pattern as runtimeSpecGPUs/coresidency). A mapping with no
+// rows yields an empty, non-nil slice.
+func (m *MemoryStore) MappingCapabilities(_ context.Context, mappingID string) ([]CapabilityRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.mappingCapabilitiesLocked(mappingID), nil
+}
+
+// mappingCapabilitiesLocked is MappingCapabilities' body, so the bulk reader
+// can reuse it under one lock. Callers must hold m.mu.
+func (m *MemoryStore) mappingCapabilitiesLocked(mappingID string) []CapabilityRow {
+	stored := m.mappingCapabilities[mappingID]
+	out := make([]CapabilityRow, 0, len(stored))
+	for _, row := range stored {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out
+}
+
+// MappingCapabilitiesForMappings mirrors the SQL bulk reader: a mapping with
+// no rows contributes NO key (not an empty slice), so a caller's zero-value
+// lookup means "every capability unknown" on both drivers alike.
+func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingIDs []string) (map[string][]CapabilityRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string][]CapabilityRow, len(mappingIDs))
+	for _, id := range mappingIDs {
+		if len(m.mappingCapabilities[id]) == 0 {
+			continue
+		}
+		out[id] = m.mappingCapabilitiesLocked(id)
+	}
+	return out, nil
+}
+
+// UpsertMappingCapabilities writes rows, REPLACING any row for the same
+// (mapping, capability) — the map key is the capability, so a re-write is a
+// natural replacement, matching the SQL on-conflict-do-update. It applies no
+// precedence rule (the caller does) and, unlike every metric writer here,
+// carries no metrics_locked guard.
+func (m *MemoryStore) UpsertMappingCapabilities(_ context.Context, mappingID string, rows []CapabilityRow) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(rows) == 0 {
+		return nil
+	}
+	byCapability := m.mappingCapabilities[mappingID]
+	if byCapability == nil {
+		byCapability = map[string]CapabilityRow{}
+		m.mappingCapabilities[mappingID] = byCapability
+	}
+	for _, row := range rows {
+		byCapability[row.Capability] = row
+	}
+	return nil
+}
+
+// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a row
+// that is not there is a benign no-op, mirroring the SQL delete's 0 rows
+// affected.
+func (m *MemoryStore) DeleteMappingCapability(_ context.Context, mappingID, capability string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byCapability := m.mappingCapabilities[mappingID]
+	delete(byCapability, capability)
+	if len(byCapability) == 0 {
+		delete(m.mappingCapabilities, mappingID)
+	}
 	return nil
 }
 

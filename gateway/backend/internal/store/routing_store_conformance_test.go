@@ -643,6 +643,149 @@ func TestUpdateMappingCapabilities(t *testing.T) {
 	})
 }
 
+// --- Capability rows (model_mapping_capabilities) ---------------------------
+
+// TestMappingCapabilityRows proves the per-capability row API on both
+// drivers: rows round-trip with their provenance, a second write for the same
+// (mapping, capability) REPLACES rather than duplicating, a delete returns a
+// capability to unknown, and "unknown" is expressed by the ABSENCE of a row
+// rather than by an empty verdict -- including in the bulk reader, which must
+// not invent a key for a mapping that has no rows.
+func TestMappingCapabilityRows(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		// server + app + mapping "m1" exactly as TestUpdateMappingCapabilities
+		// builds them.
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		rows := []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityTools, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}
+		if err := s.UpsertMappingCapabilities(ctx, "m1", rows); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		got, err := s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d rows, want 2: %+v", len(got), got)
+		}
+		byName := map[string]routing.CapabilityRow{}
+		for _, r := range got {
+			byName[r.Capability] = r
+		}
+		if byName["vision"].Verdict != "yes" || byName["vision"].Source != "llama_cpp_props" {
+			t.Fatalf("vision row = %+v", byName["vision"])
+		}
+		if byName["vision"].CheckedAt.IsZero() {
+			t.Fatal("checked_at not stored")
+		}
+		if _, present := byName["audio"]; present {
+			t.Fatal("an unwritten capability must be ABSENT, not a row -- absence is how unknown is expressed")
+		}
+
+		// Upsert replaces in place: same capability, new verdict, no duplicate row.
+		later := now.Add(time.Hour)
+		if err := s.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: later},
+		}); err != nil {
+			t.Fatalf("re-upsert: %v", err)
+		}
+		got, err = s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("read after re-upsert: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("upsert duplicated a row: %d rows %+v", len(got), got)
+		}
+		for _, r := range got {
+			if r.Capability == "vision" && (r.Verdict != "no" || r.Source != "vision_benchmark") {
+				t.Fatalf("upsert did not replace: %+v", r)
+			}
+		}
+
+		// Delete returns a capability to unknown -- the state the old bool
+		// could not express.
+		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		got, err = s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("read after delete: %v", err)
+		}
+		for _, r := range got {
+			if r.Capability == "vision" {
+				t.Fatal("delete left the row behind")
+			}
+		}
+		// Deleting an absent row is a benign no-op, not an error.
+		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
+			t.Fatalf("delete of an absent row must be a no-op: %v", err)
+		}
+
+		// The batch reader returns exactly the requested parents, and an
+		// unknown id contributes no key at all (not an empty slice).
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "m2", ApplicationID: "app1", GatewayModelName: "gpt-4o",
+			AppModelName: "up2", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping m2: %v", err)
+		}
+		if err := s.UpsertMappingCapabilities(ctx, "m2", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLegacy, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert m2: %v", err)
+		}
+		batch, err := s.MappingCapabilitiesForMappings(ctx, []string{"m1", "m2", "nope"})
+		if err != nil {
+			t.Fatalf("batch: %v", err)
+		}
+		if len(batch["m2"]) != 1 || batch["m2"][0].Capability != "mtp" {
+			t.Fatalf("batch m2 = %+v", batch["m2"])
+		}
+		if _, present := batch["nope"]; present {
+			t.Fatal("batch reader invented a key for an unknown mapping")
+		}
+		single, err := s.MappingCapabilities(ctx, "m1")
+		if err != nil {
+			t.Fatalf("single read for the batch comparison: %v", err)
+		}
+		if len(batch["m1"]) != len(single) {
+			t.Fatalf("batch and single reader disagree: batch=%+v single=%+v", batch["m1"], single)
+		}
+		// An empty id list does no lookup and yields an empty map.
+		if empty, err := s.MappingCapabilitiesForMappings(ctx, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("empty batch: err=%v map=%+v", err, empty)
+		}
+	})
+}
+
 // --- Sample reduction: availability + telemetry -----------------------------
 
 // TestRoutingStoreAvailabilitySampleReduction exercises

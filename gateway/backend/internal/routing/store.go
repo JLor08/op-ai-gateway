@@ -1031,6 +1031,70 @@ type CapabilityVerdicts struct {
 	Source string
 }
 
+// CapabilityRow is one (mapping, capability) verdict together with WHO
+// established it and when -- the unit the model_mapping_capabilities table
+// stores, one row per capability.
+//
+// Verdict is "yes" or "no" and nothing else: "unknown" is the ABSENCE of a
+// row, not a third value. That is what makes the never-overwrite-with-unknown
+// discipline structural instead of a convention every writer has to remember
+// -- there is no empty verdict to accidentally write.
+//
+// Source names the writer, and it is what makes the operator's rule
+// expressible at all: a probe must never overwrite a verdict a human or a
+// real measurement established. See CapabilitySource* below and
+// UpsertMappingCapabilities.
+type CapabilityRow struct {
+	Capability string
+	Verdict    string
+	Source     string
+	CheckedAt  time.Time
+}
+
+// Capability names. The vocabulary is deliberately OPEN -- an upstream may
+// report capabilities this codebase has never heard of (Ollama passes
+// manifest-declared names through verbatim), and those are stored and
+// displayed as-is rather than dropped. These constants exist only for the
+// capabilities the code itself reasons about.
+const (
+	CapabilityVision       = "vision"
+	CapabilityVideo        = "video"
+	CapabilityAudio        = "audio"
+	CapabilityTools        = "tools"
+	CapabilityMTP          = "mtp"
+	CapabilityLiveProgress = "live_progress"
+)
+
+// Capability verdicts.
+const (
+	CapabilityYes = "yes"
+	CapabilityNo  = "no"
+)
+
+// Capability sources. manual and vision_benchmark are AUTHORITATIVE: a probe
+// never overwrites a row carrying one of them (the operator's rule). The
+// probe sources are overwritable by a later probe, which is what lets a
+// verdict re-establish itself after a build changes.
+//
+// CapabilitySourceLegacy marks a verdict inherited by migration 78 from a
+// pre-78 column whose real origin is unknowable (is_mtp came from a NAME
+// HEURISTIC or an operator; vision_capable's provenance was a mapping-wide
+// string every writer overwrote). It is deliberately probe-overwritable:
+// treating a guess as authoritative would freeze it in forever.
+const (
+	CapabilitySourceManual          = "manual"
+	CapabilitySourceVisionBenchmark = "vision_benchmark"
+	CapabilitySourceLlamaCppProps   = "llama_cpp_props"
+	CapabilitySourceLegacy          = "legacy"
+)
+
+// CapabilitySourceIsAuthoritative reports whether source outranks a probe.
+// The single place the precedence rule is spelled out; every write path asks
+// it rather than repeating the comparison.
+func CapabilitySourceIsAuthoritative(source string) bool {
+	return source == CapabilitySourceManual || source == CapabilitySourceVisionBenchmark
+}
+
 // MappingStore is CRUD for model mappings (gateway model name -> app model
 // name) plus the family of targeted, metrics_locked-respecting metric
 // updates (context probe, vision, benchmark, opportunistic EWMA, capacity,
@@ -1038,6 +1102,11 @@ type CapabilityVerdicts struct {
 // UpdateMappingLiveProgressSupport / UpdateMappingCapabilities -- the two
 // targeted writers here that are NOT metrics_locked-respecting, because they
 // record a capability rather than a metric (see their doc comments).
+//
+// It also owns the per-capability child rows (model_mapping_capabilities,
+// migration 78): one row per (mapping, capability) carrying the verdict, its
+// SOURCE and when it was established, where the ABSENCE of a row is
+// "unknown". See CapabilityRow.
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
@@ -1089,6 +1158,31 @@ type MappingStore interface {
 	// table -- carries NO metrics_locked guard and never touches
 	// metrics_source/metrics_updated_at.
 	UpdateMappingCapabilities(ctx context.Context, id string, caps CapabilityVerdicts, at time.Time) error
+	// MappingCapabilities lists one mapping's capability rows. An absent
+	// capability is UNKNOWN and simply has no row.
+	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
+	// MappingCapabilitiesForMappings is the BULK reader: one query for many
+	// parents, keyed by mapping id. A mapping with no rows contributes no key.
+	//
+	// This repo has no other batch child-collection reader -- child collections
+	// are N+1 loops in Go. This one is not gratuitous: the model-servers
+	// listing already costs ~31 queries at the documented scale, and two
+	// multipliers would turn a per-row capability read into a real cost -- the
+	// SSE stream recomputes the entire listing on every loaded-registry
+	// change, and the model-group endpoint calls the whole listing once per
+	// group member.
+	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
+	// UpsertMappingCapabilities writes rows, replacing any row for the same
+	// (mapping, capability). It does NOT apply the precedence rule -- callers
+	// do, because only they know whether they are a probe (see
+	// CapabilitySourceIsAuthoritative). It carries no metrics_locked guard and
+	// never touches metrics_source/metrics_updated_at: a capability is not a
+	// number an operator pins against automation.
+	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []CapabilityRow) error
+	// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a
+	// row is how "not determined" is expressed -- the state the pre-78 bool
+	// columns could not represent.
+	DeleteMappingCapability(ctx context.Context, mappingID, capability string) error
 	MappingByID(ctx context.Context, id string) (ModelMapping, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	MappingsByServer(ctx context.Context, serverID string) ([]ModelMapping, error)

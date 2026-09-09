@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -108,6 +109,7 @@ var migrations = []migration{
 	{version: 75, name: "runtime_spec_type_probe", up: migration75Up},
 	{version: 76, name: "model_mappings_live_progress_support", up: migration76Up},
 	{version: 77, name: "model_mappings_capabilities", up: migration77Up},
+	{version: 78, name: "model_mapping_capabilities_table", up: migration78Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3332,4 +3334,200 @@ func migration77Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	return addColumnIfMissing(ctx, tx, dl, "model_mappings",
 		"capabilities_checked_at "+dl.timestampType())
+}
+
+// migration78Up creates model_mapping_capabilities — one row per (mapping,
+// capability) carrying the verdict, its SOURCE and when it was established —
+// and backfills it from the columns it supersedes.
+//
+// It deliberately does NOT drop those columns: that happens in a later
+// migration once nothing reads or writes them, so this migration is safe to
+// apply to a database an older binary still serves.
+//
+// Absence of a row means UNKNOWN. That is why two backfill cases write NO
+// row: a vision_capable of 0 whose metrics_source proves no measurement
+// happened (the column conflated "no" with "never probed"), and an is_mtp of
+// 0 (the column is seeded from a NAME HEURISTIC, so its false means "the name
+// did not match", not "measured no"). Writing those as "no" would enter a
+// guess into the record as a measurement.
+func migration78Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := execTx(ctx, tx, dl, `
+		create table if not exists model_mapping_capabilities (
+			mapping_id text not null references model_mappings(id) on delete cascade,
+			capability text not null,
+			verdict text not null,
+			source text not null,
+			checked_at `+dl.timestampType()+` not null,
+			primary key (mapping_id, capability)
+		)`); err != nil {
+		return err
+	}
+	// One timestamp for the whole backfill, so every row a mapping's columns
+	// could not date shares the same "inherited at migration time" instant
+	// rather than drifting by statement.
+	now := time.Now().UTC()
+	// Backfill. One INSERT … SELECT per source column keeps each rule
+	// readable and independently reviewable; `on conflict do nothing` makes
+	// the whole migration idempotent.
+	//
+	// The `where … <> '' ` clauses are the zero-value-means-unknown
+	// convention (migration76Up/77Up) turned into row absence: a column that
+	// determined nothing produces nothing.
+	//
+	// The four cap_* statements are spelled out rather than generated from a
+	// list of column names: a migration's SQL is read as the record of what
+	// it did, and building it by string-concatenating identifiers hides that
+	// record behind a loop.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', m.cap_vision, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_vision <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_vision: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'video', m.cap_video, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_video <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_video: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'audio', m.cap_audio, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_audio <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_audio: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'tools', m.cap_tools, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_tools <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_tools: %w", err)
+	}
+	// live_progress_support's "supported"/"unsupported" vocabulary becomes the
+	// table's yes/no. Its only writers are the two probe paths, hence
+	// llama_cpp_props.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'live_progress',
+			case m.live_progress_support when 'supported' then 'yes' else 'no' end,
+			'llama_cpp_props', coalesce(m.live_progress_checked_at, ?)
+		from model_mappings m where m.live_progress_support <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill live_progress_support: %w", err)
+	}
+	// vision_capable. This runs AFTER the cap_vision statement above ON
+	// PURPOSE: where both exist, `do nothing` leaves the cap_vision row in
+	// place — the newer, better-provenanced verdict wins. Reversing the two
+	// would let a stale vision_capable silently overwrite it.
+	//
+	// The provenance is recovered from the mapping-wide metrics_source, the
+	// only trace of who wrote the flag: 'vision' was the vision benchmark,
+	// 'manual' an operator, and anything else cannot be attributed, so it is
+	// marked legacy (probe-overwritable — see routing.CapabilitySourceLegacy).
+	const visionSource = `case m.metrics_source
+		when 'vision' then 'vision_benchmark'
+		when 'manual' then 'manual'
+		else 'legacy' end`
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', 'yes', `+visionSource+`, coalesce(m.metrics_updated_at, ?)
+		from model_mappings m where m.vision_capable = 1
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable=1: %w", err)
+	}
+	// A vision_capable of 0 becomes a "no" row ONLY when metrics_source proves
+	// a measurement happened. Without one, the 0 is the column's default and
+	// says nothing — no row, i.e. unknown.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', 'no', `+visionSource+`, coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.vision_capable = 0 and m.metrics_source in ('vision', 'manual')
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable=0: %w", err)
+	}
+	// is_mtp = 1 only. The column is seeded from a name heuristic at creation
+	// and is also operator-settable, and the two are indistinguishable after
+	// the fact — so a true is inherited as 'legacy' (probe-overwritable), and
+	// a false, which only means "the name did not match", produces no row.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'mtp', 'yes', 'legacy', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m where m.is_mtp = 1
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill is_mtp: %w", err)
+	}
+	return migration78BackfillCapExtra(ctx, tx, dl, now)
+}
+
+// migration78BackfillCapExtra turns cap_extra — a JSON array of capability
+// names with no column of their own — into one 'yes' row per name. A reported
+// extra capability is a positive assertion, hence yes.
+//
+// This one case runs in Go because SQL cannot portably split a JSON array
+// (SQLite's json_each and Postgres' jsonb_array_elements_text share no
+// syntax). A malformed value is SKIPPED silently rather than failing the
+// migration: the column is empty in practice today (llama.cpp never
+// populates it), so an unparseable value is a curiosity, not a reason to
+// block an upgrade.
+func migration78BackfillCapExtra(ctx context.Context, tx *sql.Tx, dl dialect, now time.Time) error {
+	// Read the whole column set FIRST and close the cursor before inserting:
+	// a tx holds a single connection, so an insert issued while its own rows
+	// cursor is still open would contend with it.
+	pending, err := migration78ReadCapExtra(ctx, tx, dl)
+	if err != nil {
+		return err
+	}
+	for _, e := range pending {
+		for _, name := range e.names {
+			if name == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, dl.rebind(`
+				insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+				select m.id, ?, 'yes', 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+				from model_mappings m where m.id = ?
+				on conflict (mapping_id, capability) do nothing`),
+				name, now, e.mappingID); err != nil {
+				return fmt.Errorf("backfill cap_extra %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// capExtraNames is one mapping's decoded cap_extra array.
+type capExtraNames struct {
+	mappingID string
+	names     []string
+}
+
+// migration78ReadCapExtra decodes every non-empty cap_extra. A value that is
+// not a JSON array of strings is skipped: see migration78BackfillCapExtra.
+func migration78ReadCapExtra(ctx context.Context, tx *sql.Tx, dl dialect) ([]capExtraNames, error) {
+	rows, err := tx.QueryContext(ctx, dl.rebind(
+		`select id, cap_extra from model_mappings where cap_extra <> '' and cap_extra <> '[]'`))
+	if err != nil {
+		return nil, fmt.Errorf("read cap_extra: %w", err)
+	}
+	defer rows.Close()
+	out := make([]capExtraNames, 0)
+	for rows.Next() {
+		var mappingID, encoded string
+		if err := rows.Scan(&mappingID, &encoded); err != nil {
+			return nil, fmt.Errorf("scan cap_extra: %w", err)
+		}
+		var names []string
+		if err := json.Unmarshal([]byte(encoded), &names); err != nil {
+			continue // malformed: skip, never fail the migration
+		}
+		out = append(out, capExtraNames{mappingID: mappingID, names: names})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cap_extra: %w", err)
+	}
+	return out, nil
 }

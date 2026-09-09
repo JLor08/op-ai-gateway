@@ -434,7 +434,8 @@ func assertCascadeState(t *testing.T, ctx context.Context, s routing.Store, affi
 // MemoryStore.DeleteMapping deleted only the mapping row, while the SQL side
 // cascades applications -> {model_mappings, agent_coresidency_rules,
 // route_affinity} and model_mappings -> {model_mapping_benchmarks,
-// agent_runtime_specs -> agent_runtime_spec_gpus, agent_coresidency_rules}.
+// agent_runtime_specs -> agent_runtime_spec_gpus, agent_coresidency_rules,
+// model_mapping_capabilities}.
 //
 // The mapping case also pins the PARTIAL co-residency removal a server or
 // application delete cannot distinguish: deleting ONE of an application's
@@ -504,6 +505,21 @@ func TestRoutingStoreDeleteApplicationAndMappingCascade(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("insert benchmark: %v", err)
 		}
+		// model_mapping_capabilities rows on the mapping deleted directly
+		// (map_dc_a) and on one deleted via its application (map_dc_b), so both
+		// hops of the cascade are read below.
+		for _, mid := range []string{"map_dc_a", "map_dc_b"} {
+			if err := s.UpsertMappingCapabilities(ctx, mid, []routing.CapabilityRow{
+				{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			}); err != nil {
+				t.Fatalf("upsert capabilities %s: %v", mid, err)
+			}
+		}
+		for _, mid := range []string{"map_dc_a", "map_dc_b"} {
+			if caps, err := s.MappingCapabilities(ctx, mid); err != nil || len(caps) != 1 {
+				t.Fatalf("capability rows must exist before the deletes: %s err=%v caps=%+v", mid, err, caps)
+			}
+		}
 		// (a,b) names map_dc_a; (b,c) does not.
 		if err := s.SetCoResidencyRules(ctx, "app_dc", []routing.CoResidencyRule{
 			{ApplicationID: "app_dc", MappingAID: "map_dc_a", MappingBID: "map_dc_b", CreatedAt: now},
@@ -526,6 +542,12 @@ func TestRoutingStoreDeleteApplicationAndMappingCascade(t *testing.T) {
 		}
 		if runs, err := s.BenchmarkRunsByMapping(ctx, "map_dc_a", 10); err != nil || len(runs) != 0 {
 			t.Fatalf("benchmark runs must cascade with the mapping: err=%v runs=%d", err, len(runs))
+		}
+		if caps, err := s.MappingCapabilities(ctx, "map_dc_a"); err != nil || len(caps) != 0 {
+			t.Fatalf("capability rows must cascade with the mapping: err=%v caps=%+v", err, caps)
+		}
+		if caps, err := s.MappingCapabilities(ctx, "map_dc_b"); err != nil || len(caps) != 1 {
+			t.Fatalf("a sibling mapping's capability rows must survive: err=%v caps=%+v", err, caps)
 		}
 		rules, err := s.CoResidencyRulesByApplication(ctx, "app_dc")
 		if err != nil {
@@ -595,6 +617,9 @@ func TestRoutingStoreDeleteApplicationAndMappingCascade(t *testing.T) {
 		}
 		if rules, err := s.CoResidencyRulesByApplication(ctx, "app_dc"); err != nil || len(rules) != 0 {
 			t.Fatalf("coresidency must cascade with the application: err=%v rules=%+v", err, rules)
+		}
+		if caps, err := s.MappingCapabilities(ctx, "map_dc_b"); err != nil || len(caps) != 0 {
+			t.Fatalf("capability rows must cascade with the application, through its mappings: err=%v caps=%+v", err, caps)
 		}
 		if _, ok, err := s.Affinity(ctx, affinityKey); err != nil || ok {
 			t.Fatalf("route affinity must cascade with the application: ok=%v err=%v", ok, err)
