@@ -824,6 +824,152 @@ func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
 	}
 }
 
+// TestProbeOllamaVerdictsCapabilities is ProbeOllamaVerdicts' happy path: a
+// 200 /api/show response carrying a capabilities array yields those
+// verdicts, and stable == true -- a real /api/show document is as
+// conclusive an answer as a real /props one. The point of this case is that
+// LiveProgress stays "" even though Caps is populated: the two verdicts
+// inside one PropsVerdicts must not be coupled to each other.
+func TestProbeOllamaVerdictsCapabilities(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["vision","tools"]}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+	if !stable {
+		t.Errorf("stable = false, want true (a real /api/show document is conclusive)")
+	}
+	if verdicts.LiveProgress != "" {
+		t.Errorf("LiveProgress = %q, want %q (Ollama has no live-progress surface)", verdicts.LiveProgress, "")
+	}
+	want := Capabilities{Vision: "yes", Tools: "yes"}
+	if !reflect.DeepEqual(verdicts.Caps, want) {
+		t.Errorf("Caps = %+v, want %+v", verdicts.Caps, want)
+	}
+}
+
+// TestProbeOllamaVerdictsLiveProgressNeverAVerdict pins the load-bearing rule
+// (#54, task 3): LiveProgress must stay "" even when the response body ALSO
+// happens to carry a key detectLiveProgressSupport would read as "supported"
+// on the llama.cpp side. If ProbeOllamaVerdicts ever routed its body through
+// detectLiveProgressSupport (a plausible but wrong copy from
+// ProbePropsVerdicts), this body would flip the verdict to "supported" -- an
+// unknown must never become ANY verdict here, because Ollama exposes no such
+// surface to have an opinion about, and "" is what tells the caller to write
+// no row rather than a permanent false claim.
+func TestProbeOllamaVerdictsLiveProgressNeverAVerdict(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["tools"],"default_generation_settings":{"params":{"timings_per_token":false}}}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+	if !stable {
+		t.Fatalf("stable = false, want true")
+	}
+	if verdicts.LiveProgress != "" {
+		t.Errorf("LiveProgress = %q, want %q even though the body carries a llama.cpp-shaped live-progress key", verdicts.LiveProgress, "")
+	}
+}
+
+// TestProbeOllamaVerdictsRequestShape pins the exact request
+// ProbeOllamaVerdicts issues: POST /api/show, body {"model":"<model>"},
+// using the request-recording newProbeServer gained for #54 (see
+// recordedProbeRequest).
+func TestProbeOllamaVerdictsRequestShape(t *testing.T) {
+	ts := newProbeServer(t, `{}`)
+
+	_, _ = ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+
+	got := ts.lastRequest()
+	if got == nil {
+		t.Fatal("server never received a request")
+	}
+	if got.Method != http.MethodPost {
+		t.Errorf("method = %q, want %q", got.Method, http.MethodPost)
+	}
+	if got.Path != "/api/show" {
+		t.Errorf("path = %q, want %q", got.Path, "/api/show")
+	}
+	wantBody := `{"model":"llama3"}`
+	if string(got.Body) != wantBody {
+		t.Errorf("body = %q, want %q", got.Body, wantBody)
+	}
+}
+
+// TestProbeOllamaVerdictsEmptyModel proves an empty model sends NO request at
+// all: Ollama's /api/show answers 400 "model is required" without one, so
+// sending it would only spend a round trip to learn nothing conclusive.
+func TestProbeOllamaVerdictsEmptyModel(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["vision"]}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "")
+	if stable {
+		t.Errorf("stable = true, want false (no model name -> no conclusive answer)")
+	}
+	if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+		t.Errorf("verdicts = %+v, want zero value", verdicts)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: an empty model must never be sent", got)
+	}
+}
+
+// TestProbeOllamaVerdictsConclusiveRefusals mirrors
+// TestProbeLiveProgressSupport_ConclusiveRefusals on the Ollama sibling:
+// ProbeOllamaVerdicts reuses ProbePropsVerdicts' conclusive-status set
+// verbatim, for the identical reason documented there -- 404/401/403/405 are
+// fixed properties of the binary's routing table and the credential it was
+// started with, both fixed at exec time.
+func TestProbeOllamaVerdictsConclusiveRefusals(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+			defer srv.Close()
+
+			verdicts, stable := ProbeOllamaVerdicts(context.Background(), srv.Client(), srv.URL, "llama3")
+			if !stable {
+				t.Errorf("status %d: stable = false, want true", status)
+			}
+			if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+				t.Errorf("status %d: verdicts = %+v, want zero value", status, verdicts)
+			}
+		})
+	}
+}
+
+// TestProbeOllamaVerdictsTransient covers the two transient cases: a 500 (the
+// child may still be starting up) and a fully refused connection (status 0,
+// no HTTP response at all). Neither is conclusive, so both must report
+// stable == false.
+func TestProbeOllamaVerdictsTransient(t *testing.T) {
+	t.Run("500", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), srv.Client(), srv.URL, "llama3")
+		if stable {
+			t.Errorf("stable = true, want false (a 500 may just mean the child is still starting up)")
+		}
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Errorf("verdicts = %+v, want zero value", verdicts)
+		}
+	})
+
+	t.Run("connection refused", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		addr := srv.URL
+		srv.Close() // closed: nothing is listening on addr anymore
+
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), http.DefaultClient, addr, "llama3")
+		if stable {
+			t.Errorf("stable = true, want false (a refused connection is transient -- retry, do not cache)")
+		}
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Errorf("verdicts = %+v, want zero value", verdicts)
+		}
+	})
+}
+
 // TestSafeProbePath is the agent's defense-in-depth SSRF guard: only an empty
 // or single-"/"-rooted relative path with no scheme/authority/whitespace is
 // safe to append to the loopback base. The attack vectors (@userinfo, //

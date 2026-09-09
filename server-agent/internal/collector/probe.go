@@ -505,6 +505,72 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 	return caps
 }
 
+// ollamaShowPath is the fixed, POST-only path ProbeOllamaVerdicts issues its
+// request against. It is not a caller-supplied contextPath like the one
+// ProbeContext's "ollama" dispatch takes: this probe always targets exactly
+// this path, the same way LiveProgressProbePath is fixed for
+// ProbePropsVerdicts.
+const ollamaShowPath = "/api/show"
+
+// ProbeOllamaVerdicts is the Ollama sibling of ProbePropsVerdicts (issue
+// #54): it POSTs baseURL+ollamaShowPath ("/api/show") with body
+// {"model": model} and derives the capability verdict set
+// detectOllamaCapabilities (task 1) reads from that one document, reusing
+// fetchProbeBodyWith (task 2) for the request/response plumbing.
+//
+// LiveProgress is ALWAYS "" here, never a real verdict of either kind:
+// Ollama exposes no timings_per_token-style surface at all, so there is no
+// evidence to read one way or the other. "" is the value that means exactly
+// that -- downstream, "" means "write no row", so this unknown can never
+// become a permanent false denial the way a fabricated "no" would.
+//
+// stable follows the IDENTICAL conclusive/transient split ProbePropsVerdicts
+// documents on its own comment, reused verbatim rather than restated here:
+// 404/401/403/405 are conclusive (fixed properties of the binary's routing
+// table and the credential it was started with, both fixed at exec time);
+// status 0 (no HTTP response at all) and everything else -- 5xx above all --
+// are transient and must be retried, never cached.
+//
+// An empty model issues NO request at all: Ollama's /api/show requires
+// {"model": "<name>"} and answers 400 "model is required" without one, so
+// sending it would only spend a round trip to learn nothing conclusive. The
+// caller gets stable == false (ask again once a model name is known).
+func ProbeOllamaVerdicts(ctx context.Context, client *http.Client, baseURL, model string) (PropsVerdicts, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return PropsVerdicts{}, false
+	}
+
+	reqBody, err := json.Marshal(struct {
+		Model string `json:"model"`
+	}{Model: model})
+	if err != nil {
+		return PropsVerdicts{}, false
+	}
+
+	body, status, err := fetchProbeBodyWith(ctx, client, baseURL, http.MethodPost, ollamaShowPath, reqBody)
+	if err != nil {
+		// See ProbePropsVerdicts' comment for the full reasoning -- it is
+		// identical here: these four statuses are fixed, build-level facts
+		// that cannot change while this pid keeps running, so they are safe
+		// to cache; status 0 and everything else (5xx above all) are not.
+		stable := status == http.StatusNotFound ||
+			status == http.StatusUnauthorized ||
+			status == http.StatusForbidden ||
+			status == http.StatusMethodNotAllowed
+		return PropsVerdicts{}, stable
+	}
+	if !json.Valid(body) {
+		// Syntactically invalid/truncated JSON reads as a child still
+		// mid-response, not a conclusive answer -- do not cache it.
+		return PropsVerdicts{}, false
+	}
+	return PropsVerdicts{
+		LiveProgress: "",
+		Caps:         detectOllamaCapabilities(body),
+	}, true
+}
+
 // capVerdict maps a JSON bool to "yes"/"no" and everything else -- absent,
 // null, a string, a number -- to "" (not evidence).
 func capVerdict(v any) string {
