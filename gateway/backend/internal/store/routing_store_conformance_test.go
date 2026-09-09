@@ -751,7 +751,8 @@ func TestMappingCapabilityRows(t *testing.T) {
 		// Every OTHER failing shape is a benign no-op too, on every driver:
 		// an unknown mapping id, a capability name no code knows, and an
 		// empty name. This is not a curiosity -- it is the reason the portal's
-		// reset path (portal.Service.UpdateMapping's ResetCapabilities) has to
+		// reset path (an empty verdict in portal.Service.UpdateMapping's
+		// CapabilityVerdicts) has to
 		// carry BOTH its own authorisation (authorizeMapping) and its own
 		// empty-name rejection. The store hands that path NO existence signal
 		// to lean on: "refused", "the mapping does not exist" and "deleted

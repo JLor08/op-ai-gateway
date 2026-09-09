@@ -56,32 +56,66 @@ func patchMapping(t *testing.T, srv *Server, id, body string) *httptest.Response
 	return rec
 }
 
-// TestPortalMappingCapabilityResetRoundTrip walks the operator's whole way
-// back to UNKNOWN over real HTTP: set a verdict, see it published as a
-// capability ROW (not just as the folded boolean), reset it, and see the row
-// gone from the very response the form re-seeds from.
+// patchMappingWire PATCHes one mapping, requires a 200 and returns the mapping
+// as the portal sees it.
+func patchMappingWire(t *testing.T, srv *Server, id, body string) mappingWire {
+	t.Helper()
+	rec := patchMapping(t, srv, id, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out mappingWire
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal mapping: %v", err)
+	}
+	return out
+}
+
+// TestPortalMappingCapabilityVerdictRoundTrip walks all three states over real
+// HTTP, by JSON name: a mapping with nothing determined, an operator stating
+// NO (the transition that used to answer 200 having written nothing), the same
+// row moved to yes, and then back to unknown -- each read back out of the very
+// response the form re-seeds from.
 //
 // The wire shape is the point. The DTO's `capabilities` array is what lets the
-// form tell a verdict of "no" from no row at all, and `reset_capabilities` is
-// what carries the third state back -- both by JSON name, on the existing
-// PATCH, with no new endpoint and so no new OpenAPI path.
-func TestPortalMappingCapabilityResetRoundTrip(t *testing.T) {
+// form tell a verdict of "no" from no row at all, and `capability_verdicts` is
+// what carries all three states back -- both on the existing PATCH, with no
+// new endpoint and so no new OpenAPI path.
+func TestPortalMappingCapabilityVerdictRoundTrip(t *testing.T) {
 	// system-scope: see TestPortalServerAgentTokenGenerateStatusRevoke.
 	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
 	appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8031,"scheme":"https"}`)
-	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reset","app_model_name":"cap-reset-up","context_size":4096,"vision_capable":true}`)
-	if !created.VisionCapable {
-		t.Fatalf("created vision_capable = false, want true")
-	}
-	if len(created.Capabilities) != 1 || created.Capabilities[0].Capability != "vision" {
-		t.Fatalf("created capabilities = %+v, want exactly the one \"vision\" row", created.Capabilities)
-	}
-	if got := created.Capabilities[0]; got.Verdict != "yes" || got.Source != "manual" {
-		t.Fatalf("created vision row = %+v, want yes/manual", got)
+	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-verdict","app_model_name":"cap-verdict-up","context_size":4096}`)
+	if len(created.Capabilities) != 0 {
+		t.Fatalf("created capabilities = %+v, want none -- this mapping starts UNKNOWN", created.Capabilities)
 	}
 
-	// The reset, on the SAME request that carries the booleans.
-	rec := patchMapping(t, srv, created.ID, `{"context_size":8192,"reset_capabilities":["vision"]}`)
+	// UNKNOWN -> "no", the defect: an ordinary 200 that wrote nothing at all.
+	stated := patchMappingWire(t, srv, created.ID, `{"context_size":8192,"capability_verdicts":{"vision":"no"}}`)
+	if len(stated.Capabilities) != 1 || stated.Capabilities[0].Capability != "vision" {
+		t.Fatalf("capabilities after a stated no = %+v, want exactly the one \"vision\" row", stated.Capabilities)
+	}
+	if got := stated.Capabilities[0]; got.Verdict != "no" || got.Source != "manual" {
+		t.Fatalf("vision row = %+v, want no/manual", got)
+	}
+	if stated.VisionCapable {
+		t.Fatalf("vision_capable for a stated no = true, want false (the FOLD of a \"no\" row is false)")
+	}
+	if stated.ContextSize != 8192 {
+		t.Fatalf("context_size = %d, want 8192 -- the rest of the update must still apply", stated.ContextSize)
+	}
+
+	// "no" -> "yes": still a verdict, still a row.
+	moved := patchMappingWire(t, srv, created.ID, `{"capability_verdicts":{"vision":"yes"}}`)
+	if len(moved.Capabilities) != 1 || moved.Capabilities[0].Verdict != "yes" {
+		t.Fatalf("capabilities after no -> yes = %+v, want one vision/yes row", moved.Capabilities)
+	}
+	if !moved.VisionCapable {
+		t.Fatalf("vision_capable after no -> yes = false, want true")
+	}
+
+	// "yes" -> unknown: an EMPTY verdict deletes the row.
+	rec := patchMapping(t, srv, created.ID, `{"capability_verdicts":{"vision":""}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reset status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -95,9 +129,6 @@ func TestPortalMappingCapabilityResetRoundTrip(t *testing.T) {
 	if reset.VisionCapable {
 		t.Fatalf("vision_capable after the reset = true, want false")
 	}
-	if reset.ContextSize != 8192 {
-		t.Fatalf("context_size = %d, want 8192 -- the rest of the update must still apply", reset.ContextSize)
-	}
 	// `[]`, never `null`: the frontend types `capabilities` as a required
 	// array and must not need a nil branch for "nothing determined".
 	if body := rec.Body.String(); !strings.Contains(body, `"capabilities":[]`) {
@@ -105,12 +136,31 @@ func TestPortalMappingCapabilityResetRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPortalMappingCapabilityResetRejectionsReturn400 guards that the two new
+// TestPortalMappingCreateStatesACapabilityVerdict: the create path carries the
+// same field, and the negative verdict it can express is the one
+// `vision_capable`/`is_mtp` cannot (a plain bool's unset `false` is
+// indistinguishable from a control nobody touched, so only `true` writes).
+func TestPortalMappingCreateStatesACapabilityVerdict(t *testing.T) {
+	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
+	appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8033,"scheme":"https"}`)
+	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-create","app_model_name":"cap-create-up","capability_verdicts":{"vision":"no"}}`)
+	if len(created.Capabilities) != 1 {
+		t.Fatalf("created capabilities = %+v, want exactly the one stated row", created.Capabilities)
+	}
+	if got := created.Capabilities[0]; got.Capability != "vision" || got.Verdict != "no" || got.Source != "manual" {
+		t.Fatalf("created vision row = %+v, want vision/no/manual", got)
+	}
+	if created.VisionCapable {
+		t.Fatalf("created vision_capable = true, want false")
+	}
+}
+
+// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the three
 // sentinels reach the HTTP layer as 400s with their own codes rather than a
 // default 500 -- the same guard TestPortalMappingCreateNegativeMetricReturns400
 // provides for ErrMappingMetricInvalid, and equally easy to lose: a sentinel
 // missing from portalMappingErrRows compiles and passes every service test.
-func TestPortalMappingCapabilityResetRejectionsReturn400(t *testing.T) {
+func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
 	appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8032,"scheme":"https"}`)
 	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reject","app_model_name":"cap-reject-up"}`)
@@ -120,12 +170,17 @@ func TestPortalMappingCapabilityResetRejectionsReturn400(t *testing.T) {
 	}{
 		{
 			name:     "an empty capability name",
-			body:     `{"reset_capabilities":["  "]}`,
+			body:     `{"capability_verdicts":{"  ":""}}`,
 			wantCode: "mapping.capability_name_required",
 		},
 		{
-			name:     "reset and set the same capability",
-			body:     `{"vision_capable":true,"reset_capabilities":["vision"]}`,
+			name:     "a verdict outside yes/no/empty",
+			body:     `{"capability_verdicts":{"vision":"maybe"}}`,
+			wantCode: "mapping.capability_verdict_invalid",
+		},
+		{
+			name:     "state a capability and send its legacy boolean",
+			body:     `{"vision_capable":true,"capability_verdicts":{"vision":"no"}}`,
 			wantCode: "mapping.capability_conflict",
 		},
 	} {

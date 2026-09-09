@@ -84,19 +84,34 @@ var (
 	ErrMappingStatusInvalid       = errors.New("mapping.status_invalid")
 	ErrMappingMetricInvalid       = errors.New("mapping.metric_invalid")
 	// ErrMappingCapabilityNameRequired rejects an empty (or whitespace-only)
-	// entry in UpdateMappingRequest.ResetCapabilities. The store neither trims
-	// nor validates a capability name on the DELETE path -- an unknown name,
-	// an unknown mapping id and an empty name are all a benign nil on both
-	// drivers -- so without this check a typo'd or blank name would return 200
-	// having deleted nothing at all.
+	// KEY in a CapabilityVerdicts map. The store neither trims nor validates a
+	// capability name -- on the DELETE path an unknown name, an unknown
+	// mapping id and an empty name are all a benign nil on both drivers -- so
+	// without this check a blank key would return 200 having done nothing at
+	// all.
 	ErrMappingCapabilityNameRequired = errors.New("mapping.capability_name_required")
-	// ErrMappingCapabilityConflict rejects a request that names a capability in
-	// ResetCapabilities while ALSO sending that capability's boolean: "return
-	// this to unknown" and "the verdict is yes/no" are two different
-	// instructions about the same row, and guessing which one the caller meant
-	// would silently write or silently keep a verdict nobody asked for. The
-	// portal's own form can never produce this pair (see MappingForm's submit);
-	// a client that does has a bug worth surfacing.
+	// ErrMappingCapabilityVerdictInvalid rejects a CapabilityVerdicts VALUE
+	// that is not one of the three the field can carry ("yes", "no" or "" for
+	// unknown). Without it a typo -- "true", "Yes", "unknown" -- would fall
+	// into whichever branch the code treats as its default, and the only
+	// sensible default is the reset: a mistyped verdict would silently DELETE
+	// an established row instead of being refused.
+	//
+	// Unlike the name, the value is NOT trimmed. The name comes from an open
+	// vocabulary an upstream may pad; the value is a closed three-item
+	// enumeration this codebase defines, so whitespace in it is a client bug,
+	// and reading " " as "hand this capability back to detection" would
+	// destroy a verdict on a typo.
+	ErrMappingCapabilityVerdictInvalid = errors.New("mapping.capability_verdict_invalid")
+	// ErrMappingCapabilityConflict rejects a request that states a capability
+	// in CapabilityVerdicts while ALSO sending that capability's LEGACY
+	// boolean (vision_capable <-> "vision", is_mtp <-> "mtp"). The two fields
+	// are read by different rules -- the map against the stored row, the
+	// boolean against the two-state fold -- so one request carrying both is
+	// two different instructions about one row, and guessing which the caller
+	// meant would silently write or silently keep a verdict nobody asked for.
+	// The portal's own form sends only the map (see MappingForm's submit); a
+	// client that sends both has a bug worth surfacing.
 	ErrMappingCapabilityConflict = errors.New("mapping.capability_conflict")
 )
 
@@ -1373,9 +1388,10 @@ type ModelMappingDTO struct {
 	// The absence of an entry is UNKNOWN. That is the whole reason this array
 	// is on the mapping DTO at all: the folded booleans above cannot tell a
 	// verdict of "no" apart from no row, so a form seeded from them can only
-	// ever offer two states and can never hand a capability back to detection
-	// (UpdateMappingRequest.ResetCapabilities). A consumer must not read a
-	// missing capability as "no" beyond its own fail-closed intent.
+	// ever offer two states -- it could neither state a negative verdict nor
+	// hand a capability back to detection (UpdateMappingRequest.
+	// CapabilityVerdicts). A consumer must not read a missing capability as
+	// "no" beyond its own fail-closed intent.
 	Capabilities     []ModelServerCapabilityDTO `json:"capabilities"`
 	EnergyWhPerToken float64                    `json:"energy_wh_per_token"`
 	MetricsLocked    bool                       `json:"metrics_locked"`
@@ -1399,10 +1415,35 @@ type CreateMappingRequest struct {
 	MaxConcurrency               int     `json:"max_concurrency"`
 	RecommendedConcurrency       int     `json:"recommended_concurrency"`
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
-	IsMTP                        bool    `json:"is_mtp"`
-	VisionCapable                bool    `json:"vision_capable"`
-	EnergyWhPerToken             float64 `json:"energy_wh_per_token"`
-	MetricsLocked                bool    `json:"metrics_locked"`
+	// IsMTP/VisionCapable are the LEGACY two-state fields. They are plain
+	// bools, so an unset `false` is indistinguishable from "the operator never
+	// looked at this control" and only the `true` direction writes a row --
+	// which is why a stated NEGATIVE verdict needs CapabilityVerdicts below.
+	IsMTP            bool    `json:"is_mtp"`
+	VisionCapable    bool    `json:"vision_capable"`
+	EnergyWhPerToken float64 `json:"energy_wh_per_token"`
+	MetricsLocked    bool    `json:"metrics_locked"`
+	// CapabilityVerdicts states a capability's verdict outright, keyed by
+	// capability name: "yes" or "no" writes a `manual` row, "" states nothing
+	// and writes none (there is nothing on file to relinquish under an id that
+	// did not exist a moment ago).
+	//
+	// Unlike the booleans above this can express a NEGATIVE verdict, which is
+	// a real and useful thing to state at create time: a `manual` "no" is what
+	// stops a later llama_cpp_props probe from writing "yes" on a model whose
+	// vision an operator has already judged unusable.
+	//
+	// A capability named here is the operator's own statement and WINS over
+	// both the legacy boolean and the MTP name heuristic for that capability
+	// (see CreateMapping). It is not a 400 the way the same pair is on the
+	// update path: there a boolean is a `*bool` and its presence is
+	// unambiguous, here a `false` cannot be told from an absent key at all, so
+	// there is nothing to reject on.
+	//
+	// Same validation as the update path: names are trimmed and a blank one is
+	// ErrMappingCapabilityNameRequired; a value that is not "yes", "no" or ""
+	// is ErrMappingCapabilityVerdictInvalid. The vocabulary is open.
+	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
 type UpdateMappingRequest struct {
@@ -1416,34 +1457,68 @@ type UpdateMappingRequest struct {
 	MaxConcurrency               *int     `json:"max_concurrency,omitempty"`
 	RecommendedConcurrency       *int     `json:"recommended_concurrency,omitempty"`
 	GenTokensPerSecondAtCapacity *float64 `json:"gen_tokens_per_second_at_capacity,omitempty"`
-	IsMTP                        *bool    `json:"is_mtp,omitempty"`
-	VisionCapable                *bool    `json:"vision_capable,omitempty"`
-	EnergyWhPerToken             *float64 `json:"energy_wh_per_token,omitempty"`
-	MetricsLocked                *bool    `json:"metrics_locked,omitempty"`
-	// ResetCapabilities returns the named capabilities to UNKNOWN by DELETING
-	// their rows -- the only way back out of a `manual` verdict, which outranks
-	// every probe and the vision benchmark permanently (manualCapabilityRow).
+	// IsMTP/VisionCapable are the LEGACY two-state fields, kept as the
+	// COMPATIBILITY path for a client that submits every field on every save
+	// -- an old cached portal bundle during a rollout, or a script. They are
+	// compared against capabilityVerdictBool, the two-state FOLD such a client
+	// was seeded with, so a submitted `false` against no row is an unchanged
+	// submission and writes nothing.
+	//
+	// That fold is why they cannot express the third state, and why they must
+	// NOT be re-pointed at the stored verdict: with "no row" and a verdict of
+	// "no" folding to the same `false`, comparing against the row would turn
+	// every unconditional `vision_capable: false` into a permanent `manual`
+	// "no" on a mapping that had none. An operator who means "no" states it
+	// through CapabilityVerdicts below, which is compared against the row
+	// precisely because a present key there is never an artefact of the form
+	// having been submitted.
+	IsMTP            *bool    `json:"is_mtp,omitempty"`
+	VisionCapable    *bool    `json:"vision_capable,omitempty"`
+	EnergyWhPerToken *float64 `json:"energy_wh_per_token,omitempty"`
+	MetricsLocked    *bool    `json:"metrics_locked,omitempty"`
+	// CapabilityVerdicts is the AUTHORITATIVE per-capability field, keyed by
+	// capability name, and the only one of the three that can express all
+	// three states a stored capability has:
+	//
+	//   "yes"/"no" -> the operator's verdict. Written as a `manual` row when
+	//                 it DIFFERS from the stored row's verdict, where "no row"
+	//                 counts as different -- which is what makes
+	//                 unknown -> "no" a real transition rather than a silent
+	//                 no-op.
+	//   ""         -> return the capability to UNKNOWN by DELETING its row,
+	//                 the only way back out of a `manual` verdict (which
+	//                 outranks every probe and the vision benchmark for as
+	//                 long as it stands -- manualCapabilityRow). A no-op when
+	//                 there is no row.
+	//   absent     -> no statement at all. Nothing is written, so a save made
+	//                 for an unrelated reason cannot touch a capability.
+	//
+	// A PRESENT key is an explicit operator intent, so it is compared against
+	// the STORED ROW rather than against the two-state fold the legacy
+	// booleans are compared against. That distinction is the whole reason both
+	// fields exist: see IsMTP/VisionCapable above.
 	//
 	// It rides on the MAPPING UPDATE rather than on an endpoint of its own, and
 	// that is a correctness requirement rather than a saving. MappingForm seeds
-	// once, never re-syncs from props, and re-submits its capability controls on
-	// EVERY save: an immediate delete fired from inside the open form would be
-	// undone by the operator's next unrelated edit, which would re-establish a
-	// permanent `manual` row with an ordinary 200 and nothing to notice.
-	// Carrying the intent in the same request that carries the booleans removes
-	// that race structurally -- the response is the post-delete DTO, so the
-	// form's next render re-seeds from truth.
+	// once and never re-syncs from props: a delete fired from inside the open
+	// form would be undone by the operator's next unrelated edit, which would
+	// re-establish a permanent `manual` row with an ordinary 200 and nothing to
+	// notice. Carrying the intent in the same request removes that race
+	// structurally -- the response is the post-write DTO, so the form's next
+	// render re-seeds from truth.
 	//
-	// The vocabulary is OPEN: any name is accepted, not just the six constants
-	// the code reasons about, because an Ollama/agent-reported name gets its own
-	// row like any other and must be resettable like any other. Names are
-	// trimmed; an empty one is ErrMappingCapabilityNameRequired, and naming a
-	// capability whose boolean is also sent is ErrMappingCapabilityConflict.
+	// The NAME vocabulary is OPEN: any name is accepted, not just the six
+	// constants the code reasons about, because an Ollama/agent-reported name
+	// gets its own row like any other and must be correctable like any other.
+	// Names are trimmed; a blank one is ErrMappingCapabilityNameRequired. A
+	// value outside the three above is ErrMappingCapabilityVerdictInvalid, and
+	// a capability named here whose legacy boolean is ALSO sent is
+	// ErrMappingCapabilityConflict.
 	//
-	// A JSON `null` could not carry this intent: IsMTP/VisionCapable are
-	// `*bool` with `omitempty`, so `{"vision_capable": null}` is
-	// indistinguishable from an absent key.
-	ResetCapabilities []string `json:"reset_capabilities,omitempty"`
+	// A JSON `null` on the booleans could not have carried the third state:
+	// IsMTP/VisionCapable are `*bool` with `omitempty`, so
+	// `{"vision_capable": null}` is indistinguishable from an absent key.
+	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
 // SyncResultDTO summarizes a SyncApplicationModels reconciliation.
@@ -1506,6 +1581,14 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		return ModelMappingDTO{}, ErrMappingAppNameRequired
 	}
 	status, err := normalizeMappingStatus(req.Status)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
+	// sentBooleans is nil here: CreateMappingRequest's two capability fields
+	// are plain bools, so a `false` cannot be told from an absent key and
+	// there is no presence to reject a conflict on. The map WINS instead --
+	// see the capability rows further down.
+	capIntents, err := normalizeCapabilityVerdicts(req.CapabilityVerdicts, nil)
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
@@ -1579,8 +1662,27 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// there is nothing stored for them to outrank and no precedence check is
 	// needed here -- unlike UpdateMapping, which must prove the operator
 	// actually said what the form submitted before it writes anything.
-	capRows := make([]routing.CapabilityRow, 0, 2)
-	if req.VisionCapable {
+	capRows := make([]routing.CapabilityRow, 0, 2+len(capIntents))
+	// The operator's OWN stated verdicts first, "no" exactly as effective as
+	// "yes" -- the whole reason this field exists beside the two booleans,
+	// which cannot express a negative at all. A stated "" writes nothing:
+	// unknown is the absence of a row, and under an id that did not exist a
+	// moment ago there is nothing to relinquish.
+	//
+	// A capability stated here is settled, so neither the legacy boolean nor
+	// the MTP name heuristic below may add a second row for it. Both of those
+	// are weaker signals -- one an unset-vs-false guess, the other a guess
+	// about the model NAME -- and letting either win would answer 200 with a
+	// verdict that contradicts what the caller asked for.
+	stated := make(map[string]bool, len(capIntents))
+	for _, intent := range capIntents {
+		stated[intent.Capability] = true
+		if intent.Verdict == "" {
+			continue
+		}
+		capRows = append(capRows, manualCapabilityRow(intent.Capability, intent.Verdict == routing.CapabilityYes, now))
+	}
+	if req.VisionCapable && !stated[routing.CapabilityVision] {
 		// The operator's vision_capable checkbox becomes the AUTHORITATIVE
 		// "vision" capability row (source manual) -- see manualCapabilityRow's
 		// own doc-comment for why this outranks every probe and the vision
@@ -1599,6 +1701,10 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, true, now))
 	}
 	switch {
+	case stated[routing.CapabilityMTP]:
+		// Already settled by CapabilityVerdicts above. The name heuristic
+		// below must not write its `legacy` row over an operator statement --
+		// including a stated "", which asks for no row at all.
 	case req.IsMTP:
 		// An EXPLICIT operator setting -- manual, exactly like vision above
 		// and with the same true-only asymmetry for the same reason.
@@ -1644,7 +1750,10 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		return ModelMappingDTO{}, err
 	}
 	// Validate everything that can fail BEFORE mutating the loaded mapping.
-	resetCaps, err := normalizeResetCapabilities(req)
+	capIntents, err := normalizeCapabilityVerdicts(req.CapabilityVerdicts, map[string]bool{
+		routing.CapabilityVision: req.VisionCapable != nil,
+		routing.CapabilityMTP:    req.IsMTP != nil,
+	})
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
@@ -1781,25 +1890,29 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	//     which that same form seeds from -- so an untouched control
 	//     round-trips the truth rather than a stale snapshot.
 	//
-	// The comparison is against capabilityVerdictBool, the exact two-state
-	// fold the form was seeded with, NOT the raw three-state verdict: an
-	// absent row seeds `false`, so a submitted `false` against no row is an
-	// unchanged submission and must stay absent (still probeable), while a
-	// submitted `true` against no row is the operator actively checking the
-	// box.
+	// The LEGACY booleans are compared against capabilityVerdictBool, the
+	// exact two-state fold such a client was seeded with, NOT the raw
+	// three-state verdict: an absent row folds to `false`, so a submitted
+	// `false` against no row is an unchanged submission and must stay absent
+	// (still probeable), while a submitted `true` against no row is the
+	// operator actively checking the box. CapabilityVerdicts is compared
+	// against the ROW instead -- see operatorCapabilityWrites for why the two
+	// rules are not redundant and must not be collapsed into one.
 	storedCaps, err := s.routes.MappingCapabilities(ctx, mapping.ID)
 	if err != nil {
 		return ModelMappingDTO{}, err
 	}
 	capsByName := routing.CapabilityRowsByName(storedCaps)
-	capRows := make([]routing.CapabilityRow, 0, 2)
 	capChangedAt := s.clock().UTC()
+	capRows := make([]routing.CapabilityRow, 0, 2+len(capIntents))
 	if req.VisionCapable != nil && *req.VisionCapable != capabilityVerdictBool(capsByName, routing.CapabilityVision) {
 		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, *req.VisionCapable, capChangedAt))
 	}
 	if req.IsMTP != nil && *req.IsMTP != capabilityVerdictBool(capsByName, routing.CapabilityMTP) {
 		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, *req.IsMTP, capChangedAt))
 	}
+	statedRows, resetCaps := operatorCapabilityWrites(capIntents, capsByName, capChangedAt)
+	capRows = append(capRows, statedRows...)
 	mapping.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
@@ -2097,11 +2210,11 @@ func (s *Service) gatewayNameTakenOnServer(ctx context.Context, serverID string,
 // benchmark for as long as it stands, so one written by accident costs a
 // capability its detection.
 //
-// Undoing one is a SEPARATE instruction rather than a third verdict, because
-// there is no third verdict to write: unknown is the ABSENCE of a row. The
-// operator reaches it through UpdateMappingRequest.ResetCapabilities, which
-// deletes the row (resetOperatorCapabilities); the form's third select state
-// is what produces that field.
+// Undoing one is a DELETE rather than a third verdict, because there is no
+// third verdict to write: unknown is the ABSENCE of a row. The operator
+// reaches it through UpdateMappingRequest.CapabilityVerdicts with an empty
+// value, which deletes the row (resetOperatorCapabilities); the form's third
+// select state is what produces that entry.
 func manualCapabilityRow(capability string, capable bool, at time.Time) routing.CapabilityRow {
 	verdict := routing.CapabilityNo
 	if capable {
@@ -2140,10 +2253,16 @@ func legacyMTPCapabilityRow(at time.Time) routing.CapabilityRow {
 // read as false (the same fail-closed reading routing.MTPFromVerdict and
 // ModelServerDTO.IsMtp use).
 //
-// This is the exact fold mappingDTO ships to the form, which is why
-// UpdateMapping compares the SUBMITTED boolean against this value rather than
-// against the raw verdict: "an unchanged form submission" is a statement
-// about the value the form was seeded with, not about the row's three states.
+// This is the fold mappingDTO ships beside the rows, and it is why
+// UpdateMapping compares a submitted LEGACY boolean against this value rather
+// than against the raw verdict: for a client that submits every field on every
+// save, "unchanged" is a statement about the value it was seeded with, not
+// about the row's three states.
+//
+// It is therefore NOT the comparison for UpdateMappingRequest.
+// CapabilityVerdicts, whose present keys are explicit statements and are
+// compared against the stored row -- the only comparison that can tell
+// unknown from a verdict of "no" (operatorCapabilityWrites).
 func capabilityVerdictBool(byName map[string]routing.CapabilityRow, capability string) bool {
 	return byName[capability].Verdict == routing.CapabilityYes
 }
@@ -2193,49 +2312,99 @@ func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID strin
 	return true
 }
 
-// normalizeResetCapabilities validates and trims
-// UpdateMappingRequest.ResetCapabilities, returning the names to delete.
+// capabilityVerdictIntent is one normalized entry of a request's
+// CapabilityVerdicts map: a trimmed capability name and the state the caller
+// stated for it, where an empty Verdict is "return this capability to
+// UNKNOWN" (delete the row) rather than a third verdict to store.
+type capabilityVerdictIntent struct {
+	Capability string
+	Verdict    string
+}
+
+// normalizeCapabilityVerdicts validates a CapabilityVerdicts map and returns
+// its entries in a DETERMINISTIC order (a Go map iterates randomly, and the
+// order decides which capability's store error a multi-entry request surfaces
+// first). sentBooleans says which capabilities the same request also states
+// through a legacy boolean -- nil on the create path, where a boolean's
+// presence cannot be detected at all.
 //
-// Two rejections, both 400s, and neither is something the store would catch:
-// DeleteMappingCapability neither trims nor validates, and an unknown name, an
-// unknown mapping id and an empty name are all a benign nil on both drivers --
-// so a blank or typo'd entry would otherwise return 200 having deleted nothing.
+// Three rejections, all 400s, and none of them is something the store would
+// catch: ValidateCapabilityRow never sees a reset at all, and on the DELETE
+// path an unknown name, an unknown mapping id and an empty name are each a
+// benign nil on both drivers -- so a blank key or a mistyped verdict would
+// otherwise return 200 having done nothing, or having deleted a row nobody
+// asked it to.
 //
-//   - An empty name after trimming is ErrMappingCapabilityNameRequired. Note
+//   - A blank name after trimming is ErrMappingCapabilityNameRequired. Note
 //     what is NOT rejected: any NON-empty name is accepted, including one this
 //     codebase has no constant for. The vocabulary is open (an upstream may
 //     report anything -- Ollama passes manifest-declared names through
-//     verbatim), so a name-whitelisting check would make exactly those rows
-//     unresettable.
-//   - A name whose boolean is ALSO non-nil in the same request is
+//     verbatim), so a name-whitelisting check would leave exactly those rows
+//     uncorrectable.
+//   - A value outside "yes"/"no"/"" is ErrMappingCapabilityVerdictInvalid. The
+//     value is deliberately NOT trimmed -- see the sentinel's own comment.
+//   - A name whose legacy boolean is ALSO non-nil in the same request is
 //     ErrMappingCapabilityConflict: the caller is stating two different things
-//     about one row. The portal's form can never send both (see MappingForm's
-//     submit), so this is a client bug rather than a state to reconcile.
-func normalizeResetCapabilities(req UpdateMappingRequest) ([]string, error) {
-	if len(req.ResetCapabilities) == 0 {
+//     about one row, read by two different rules. The portal's form sends only
+//     this map (see MappingForm's submit), so this is a client bug rather than
+//     a state to reconcile.
+func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[string]bool) ([]capabilityVerdictIntent, error) {
+	if len(verdicts) == 0 {
 		return nil, nil
 	}
-	sentBooleans := map[string]bool{
-		routing.CapabilityVision: req.VisionCapable != nil,
-		routing.CapabilityMTP:    req.IsMTP != nil,
-	}
-	out := make([]string, 0, len(req.ResetCapabilities))
-	for _, name := range req.ResetCapabilities {
+	out := make([]capabilityVerdictIntent, 0, len(verdicts))
+	for name, verdict := range verdicts {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			return nil, ErrMappingCapabilityNameRequired
 		}
+		if verdict != routing.CapabilityYes && verdict != routing.CapabilityNo && verdict != "" {
+			return nil, ErrMappingCapabilityVerdictInvalid
+		}
 		if sentBooleans[name] {
 			return nil, ErrMappingCapabilityConflict
 		}
-		out = append(out, name)
+		out = append(out, capabilityVerdictIntent{Capability: name, Verdict: verdict})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
 	return out, nil
 }
 
-// resetOperatorCapabilities deletes one mapping's named capability rows,
-// returning each capability to UNKNOWN. Unlike writeOperatorCapabilities above
-// it PROPAGATES its error -- see UpdateMapping's own comment at the call site
+// operatorCapabilityWrites turns one request's normalized verdict intents into
+// the rows to UPSERT and the capability names to DELETE, given what the store
+// currently holds (keyed by name; an absent key is the legitimate "nothing
+// determined").
+//
+// The comparison is against the stored row's RAW VERDICT, not against
+// capabilityVerdictBool's two-state fold, and an absent row counts as
+// different from both "yes" and "no". That is the whole point of the field: an
+// operator moving a control from unknown to "no" states something the fold
+// cannot represent, and comparing against the fold made that transition a
+// silent no-op that answered 200. Comparing against the row is only safe
+// BECAUSE a present key is an explicit statement -- the legacy booleans, which
+// a client may submit unconditionally, keep the fold comparison for exactly
+// that reason (see UpdateMappingRequest.IsMTP).
+//
+// An intent equal to what is stored writes nothing at all, so a save made for
+// an unrelated reason stays inert even when the form does restate a control.
+func operatorCapabilityWrites(intents []capabilityVerdictIntent, stored map[string]routing.CapabilityRow, at time.Time) (rows []routing.CapabilityRow, resets []string) {
+	for _, intent := range intents {
+		if intent.Verdict == stored[intent.Capability].Verdict {
+			continue
+		}
+		if intent.Verdict == "" {
+			resets = append(resets, intent.Capability)
+			continue
+		}
+		rows = append(rows, manualCapabilityRow(intent.Capability, intent.Verdict == routing.CapabilityYes, at))
+	}
+	return rows, resets
+}
+
+// resetOperatorCapabilities deletes one mapping's named capability rows --
+// the names UpdateMappingRequest.CapabilityVerdicts stated an empty verdict
+// for, and whose row actually exists -- returning each capability to UNKNOWN.
+// Unlike writeOperatorCapabilities above it PROPAGATES its error -- see UpdateMapping's own comment at the call site
 // for the full argument, and for why two deletes in one request need no
 // transaction.
 //
@@ -2279,8 +2448,8 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // outranking every probe and the vision benchmark for as long as it stands
 // (see manualCapabilityRow). Reading the row is what makes the form's seed
 // the truth; UpdateMapping's compare-before-write is the other half of the
-// same guarantee, and the way back out is
-// UpdateMappingRequest.ResetCapabilities.
+// same guarantee, and the way back out is an empty verdict in
+// UpdateMappingRequest.CapabilityVerdicts.
 func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
