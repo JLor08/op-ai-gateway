@@ -1122,13 +1122,16 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
-		// LiveProgressSupport reads the JOINED capability verdict
+		// LiveProgressSupport reads the candidate's capability verdict
 		// (MappingCandidate.LiveProgressSupport), NOT mapping.LiveProgressSupport
 		// -- that column is frozen since #49-3 moved every writer onto a
-		// "live_progress" capability row. A caller with no joined verdict to
-		// offer (resolveAffinity, whose mapping comes from MappingsByApplication,
-		// not ActiveMappingsForModel) passes it through c.LiveProgressSupport
-		// explicitly instead, preserving that path's pre-existing behaviour.
+		// "live_progress" capability row, so reading it would act on a stale
+		// answer. Both callers supply a FRESH verdict, by different routes:
+		// the candidate query joins the row, and resolveAffinity -- whose
+		// mapping comes from MappingsByApplication, which cannot carry a
+		// verdict -- does its own keyed MappingCapabilities read. That read
+		// exists precisely because forwarding the frozen column was the bug;
+		// this is deliberately NOT a pass-through of prior behaviour.
 		LiveProgressSupport:  c.LiveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}, nil
