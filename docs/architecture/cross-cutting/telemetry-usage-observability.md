@@ -434,21 +434,22 @@ agent that had suppressed its own unchanged report would never resend. A failed
 read degrades to writing unconditionally — a missed comparison costs one
 redundant write, a wrong one would silently drop a real measurement.
 
-> **A recurring wire-shape trap, worth stating once.** A nil Go collection and a
-> nil `json.RawMessage` marshal as `null`, not `{}`/`[]`, and the TypeScript
-> portal treats `null` as a crash-class value. The countermeasures are structural
-> and must be preserved: one canonical `sample.EmptyCapabilities()` shared by
-> both `Sample.Normalize()` and the agent's `capabilitiesJSON()` so both
-> producers emit identical bytes; the same normaliser forcing a non-nil
+> **A recurring wire-shape trap, worth stating once.** A nil Go collection and
+> a nil `json.RawMessage` marshal as `null`, not `{}`/`[]`, and the TypeScript
+> portal treats `null` as a crash-class value. The countermeasures are
+> structural and must be preserved: one canonical `sample.EmptyCapabilities()`
+> shared by both `Sample.Normalize()` and the agent's `capabilitiesJSON()` so
+> both producers emit identical bytes; the same normaliser forcing a non-nil
 > `Verdicts` slice inside a per-runtime `Capabilities` wrapper that is itself
-> present (a nil WRAPPER is a distinct, meaningful state — see §8.4.3); the runtime config parser normalising every
-> collection; the report builder re-applying that normalisation so a zero-value
-> config (the parse-error case) still marshals `[]`/`{}`; and a custom marshaller
-> mapping a nil measured-VRAM map to `{}`. Anything handing out a
-> `json.RawMessage` must return a **fresh copy per call** — it is a `[]byte`, so a
-> package-level literal shared by reference lets any future write through one
-> sample's field corrupt the value for every other sample. Any path that builds a
-> wire struct without going through the normaliser can reintroduce `null`.
+> present (a nil WRAPPER is a distinct, meaningful state — see §8.4.3); the
+> runtime config parser normalising every collection; the report builder
+> re-applying that normalisation so a zero-value config (the parse-error case)
+> still marshals `[]`/`{}`; and a custom marshaller mapping a nil
+> measured-VRAM map to `{}`. Anything handing out a `json.RawMessage` must
+> return a **fresh copy per call** — it is a `[]byte`, so a package-level
+> literal shared by reference lets any future write through one sample's field
+> corrupt the value for every other sample. Any path that builds a wire struct
+> without going through the normaliser can reintroduce `null`.
 
 ### 8.3.3 Hardware inventory sanitization
 
@@ -663,9 +664,11 @@ and `stream_options.continuous_usage_stats` (`openai_compatible.go`'s
 `CompleteStream`). `wantsLiveProgress` (`live_progress.go`) decides, per
 request, in this order:
 
-1. the mapping's PERSISTED verdict (`routing.ModelMapping.LiveProgressSupport`,
-   below) is `"unsupported"` — never send. This is either an observed upstream
-   rejection or a verdict copied from one; no shape guess outranks it.
+1. the mapping's PERSISTED verdict (`Target.LiveProgressSupport`, filled by
+   `targetFrom` from `MappingCandidate.LiveProgressSupport` — the mapping's
+   `live_progress` capability row, below) is `"unsupported"` — never send.
+   This is either an observed upstream rejection or a verdict copied from one;
+   no shape guess outranks it.
 2. the persisted verdict is `"supported"` — always send, for the same reason
    in reverse.
 3. the verdict has never been determined (`""`) — fall back to
@@ -837,11 +840,12 @@ a probe cannot walk over an operator's verdict; the rule and its consequences
 are [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped).
 
 **A second detector rides the identical `/props` fetch: auto-detected
-capabilities (#49 sub-project 2).** `detectCapabilities`
-(`internal/provider/model_info.go`, byte-for-byte duplicated in
-`server-agent/internal/collector/probe.go` under the exact same "two Go
-modules, no shared code" precedent as `detectLiveProgressSupport` above) reads
-two objects out of the same document, and nothing else:
+capabilities (#49 sub-project 2)** — the detector, its evidence rule and its
+refusals are [ADR-038](../09-architecture-decisions.md#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary).
+`detectCapabilities` (`internal/provider/model_info.go`, byte-for-byte
+duplicated in `server-agent/internal/collector/probe.go` under the exact same
+"two Go modules, no shared code" precedent as `detectLiveProgressSupport`
+above) reads two objects out of the same document, and nothing else:
 
 - `modalities.{vision,video,audio}` — the server's own per-modality input
   support. A key **present** as a bool is the verdict (`true` → `"yes"`,

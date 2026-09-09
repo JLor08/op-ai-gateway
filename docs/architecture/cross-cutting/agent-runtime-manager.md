@@ -3464,14 +3464,13 @@ the body while removing the control would make every launch-config save
 re-enable a model an operator deliberately took out of service — no error, no
 diff, and no column on the specs tab that contradicts it.
 
-**The two capability checkboxes are the case where the form DOES re-state
-what it captured, so the write has to prove the operator said it.**
-`is_mtp` and `vision_capable` are no longer mapping columns — each is a
-capability row whose `manual` source outranks every probe and the vision
-benchmark permanently
-([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)) —
-and `MappingForm` submits both on every save, seeded from what it read when it
-opened. So `Service.UpdateMapping` reads the stored rows first and writes a
+**The two capability checkboxes are the case where the form DOES re-state what
+it captured, so the write has to prove the operator said it.** `is_mtp` and
+`vision_capable` are no longer mapping columns — each is a capability row
+whose `manual` source outranks every probe and the vision benchmark
+permanently ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped))
+— and `MappingForm` submits both on every save, seeded from what it read when
+it opened. So `Service.UpdateMapping` reads the stored rows first and writes a
 `manual` row **only for a value that DIFFERS from the row on file**. Without
 that comparison, a save that changed nothing but a throughput figure would
 launder an untouched checkbox into a permanent operator verdict, freezing out
@@ -4867,25 +4866,24 @@ row already applies to a metric that was simply never measured.
 `live_progress_checked_at` feeds only the cell's tooltip — never the badge or
 label choice, which depend solely on `live_progress_support`.
 
-**The capability column is one chip per established `yes`, and an unknown
-name is a chip too.** Each row also carries its mapping's whole capability
-row set (`capabilities`, one entry per determined `(mapping, capability)` —
-[API Surface](../reference/api-surface.md#models-servers-applications-mappings)),
+**The capability column is one chip per established `yes`, and an unknown name
+is a chip too.** Each row also carries its mapping's whole capability row set
+(`capabilities`, one entry per determined `(mapping, capability)` — [API
+Surface](../reference/api-surface.md#models-servers-applications-mappings)),
 and `ModelServersSection.tsx` renders a chip for every `yes`: the four names
-the detector itself reasons about first, in a fixed order
-(`vision`, `video`, `audio`, `tools`) with translated labels, then any name
-this codebase does not know, **verbatim** and with the NEUTRAL `standby`
-badge — an upstream capability nobody here has heard of is information, not a
-warning, and dropping it would defeat the open vocabulary the rows exist to
-carry. `mtp` and `live_progress` are excluded from this column: both already
-have a column of their own (`is_mtp`'s is default-hidden, and so is the
-`vision` one that predates the chips — `vision` appears as a chip as well,
-since it is an ordinary row like any other). A `no` row and a missing row both
-render nothing, and a
-row set with no `yes` at all renders the same `—` placeholder the columns
-above use, for the identical reason. The tooltip is per capability: the two
-caveats that travel with these verdicts (§8.4.3 of [Telemetry, Usage Analytics
-& Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
+the detector itself reasons about first, in a fixed order (`vision`, `video`,
+`audio`, `tools`) with translated labels, then any name this codebase does not
+know, **verbatim** and with the NEUTRAL `standby` badge — an upstream
+capability nobody here has heard of is information, not a warning, and
+dropping it would defeat the open vocabulary the rows exist to carry. `mtp`
+and `live_progress` are excluded from this column: both already have a column
+of their own (`is_mtp`'s is default-hidden, and so is the `vision` one that
+predates the chips — `vision` appears as a chip as well, since it is an
+ordinary row like any other). A `no` row and a missing row both render
+nothing, and a row set with no `yes` at all renders the same `—` placeholder
+the columns above use, for the identical reason. The tooltip is per
+capability: the two caveats that travel with these verdicts (§8.4.3 of
+[Telemetry, Usage Analytics & Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
 followed by **that chip's own** `source` and `checked_at` — which is what
 makes an operator's own verdict visibly distinguishable from a probe's on the
 screen where they look at it, and the reason the row carries provenance per

@@ -69,17 +69,16 @@ store query.
 
 The same query also carries the two capability verdicts the request path acts
 on — `IsMTP` and `LiveProgressSupport` — through **two LEFT JOINs on
-`model_mapping_capabilities`, each filtered to its own capability name** in the
-join condition. Filtering there rather than in the `WHERE` clause is what
-keeps one row per mapping (the table's primary key is
-`(mapping_id, capability)`) and what makes an absent row read as "never
-determined" instead of dropping the mapping from the result. The measured cost
-is ≈ 6 µs per join against a ≈ 17 µs query, where a single *unfiltered* join
-costs ≈ 79 µs and multiplies rows. The verdicts sit on the **candidate**, not
-on `ModelMapping` — which carries no capability field at all — so a mapping
-read through `MappingByID`, which joins nothing, cannot present an
-unpopulated verdict as a real one
-([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+`model_mapping_capabilities`, each filtered to its own capability name** in
+the join condition. Filtering there rather than in the `WHERE` clause is what
+keeps one row per mapping (the table's primary key is `(mapping_id,
+capability)`) and what makes an absent row read as "never determined" instead
+of dropping the mapping from the result. The measured cost is ≈ 6 µs per join
+against a ≈ 17 µs query, where a single *unfiltered* join costs ≈ 79 µs and
+multiplies rows. The verdicts sit on the **candidate**, not on `ModelMapping`
+— which carries no capability field at all — so a mapping read through
+`MappingByID`, which joins nothing, cannot present an unpopulated verdict as a
+real one ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
 
 `ApplicationEndpoint(server, app)` (`internal/routing/store.go`) composes the
 reachable base URL: `scheme://domain:port` plus the server's and application's
@@ -152,7 +151,7 @@ flowchart TD
     Queue -->|slot signalled / recheck tick| Select
     Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout\n/ ErrAdmissionQueueFull"]
     Select -->|no reachable/viable candidate| ErrHost["ErrNoHealthyHost"]
-    Select -->|picked| Build["targetFrom(server, app, mapping)"]
+    Select -->|picked| Build["targetFrom(ctx, candidate, apiFlavor)"]
     Build --> Pin{"AffinityTTLSeconds > 0\nand token.ID set?"}
     Pin -->|yes| Upsert["UpsertAffinity + reservation.touch"]
     Pin -->|no| Dispatch
@@ -760,8 +759,7 @@ reconcile — each of which writes the guess as an `mtp` capability row with
 source `legacy`. `legacy` is deliberately a *probe-ranked* source: a guess
 must stay beatable by real detection, where an operator's own checkbox writes
 a `manual` row that outranks every automated writer permanently and needs no
-`metrics_locked`
-([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+`metrics_locked` ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
 A mapping created with no row at all simply has no MTP verdict, and the flat
 bonus in §3.1's tiebreak reads only a `yes`, so the heuristic has to write its
 row at every creation path or a new mapping silently loses a bonus every older

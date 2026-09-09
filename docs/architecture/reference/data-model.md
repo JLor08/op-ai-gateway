@@ -449,7 +449,7 @@ catch-all `model_override`, which has its own column).
 
 | # | Migration | Purpose |
 |---|---|---|
-| 77 | `model_mappings_capabilities` | Seven additive columns on `model_mappings` (capability auto-detection from llama.cpp `/props`, #49 sub-project 2), the first six `text not null default ''`. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` — one three-state verdict apiece, the same `''`(never determined)/`yes`/`no` convention migration 76's `live_progress_support` uses, each written by `UpdateMappingCapabilities` **only when non-empty**, so a partial answer (an older llama.cpp reporting `modalities` but no `chat_template_caps`) never clears a verdict a previous probe already established. `cap_extra` — a JSON-array string of capability names with no column of their own (open-ended upstream vocabulary, e.g. Ollama's manifest-declared capabilities; empty for a llama.cpp source), the same opaque-JSON-in-`text` convention `args`/`env`/`api_flavors` already use elsewhere in this schema. `capabilities_source` — which probe produced the current verdicts (`llama_cpp_props`; `''` before any probe has determined anything). `capabilities_checked_at` (nullable, `dl.timestampType()`, no default) — when last determined, mirroring `live_progress_checked_at`; diagnostics/tooltip only, no decision logic reads it. **None of the seven columns is part of the `metrics_locked` group**, for the identical reason migration 76's pair is not — see the field semantics below. **All seven dropped by migration 79**, the same day they shipped: one verdict per column could not carry per-capability provenance, and `cap_extra`'s JSON-array escape hatch for the open upstream vocabulary is a plain row per name in `model_mapping_capabilities` (migration 78) — [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped). |
+| 77 | `model_mappings_capabilities` | Seven additive columns on `model_mappings` (capability auto-detection from llama.cpp `/props`, #49 sub-project 2), the first six `text not null default ''`. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` — one three-state verdict apiece, the same `''`(never determined)/`yes`/`no` convention migration 76's `live_progress_support` uses, each written by the since-removed `UpdateMappingCapabilities` **only when non-empty**, so a partial answer (an older llama.cpp reporting `modalities` but no `chat_template_caps`) never cleared a verdict a previous probe had already established. `cap_extra` — a JSON-array string of capability names with no column of their own (open-ended upstream vocabulary, e.g. Ollama's manifest-declared capabilities; empty for a llama.cpp source), the same opaque-JSON-in-`text` convention `args`/`env`/`api_flavors` already use elsewhere in this schema. `capabilities_source` — which probe produced the current verdicts (`llama_cpp_props`; `''` before any probe has determined anything). `capabilities_checked_at` (nullable, `dl.timestampType()`, no default) — when last determined, mirroring `live_progress_checked_at`; diagnostics/tooltip only, no decision logic reads it. **None of the seven columns is part of the `metrics_locked` group**, for the identical reason migration 76's pair is not — see the field semantics below. **All seven dropped by migration 79**, the same day they shipped: one verdict per column could not carry per-capability provenance, and `cap_extra`'s JSON-array escape hatch for the open upstream vocabulary is a plain row per name in `model_mapping_capabilities` (migration 78) — [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped). |
 
 ### The per-model capability table
 
@@ -539,19 +539,19 @@ plausible-looking validation rule would break the normal case:
   `''` | `force_running` | `force_stopped`. `vram_locked` lives on the **spec**
   rather than per GPU, because an operator thinks "pin this model's numbers", not
   "pin GPU 2" (mirroring `metrics_locked`).
-- **`model_mapping_capabilities` has no "unknown" verdict, because the ROW
-  is the verdict.** `verdict` is `yes` or `no` and nothing else — unknown is
-  the absence of a row, and `ValidateCapabilityRow` (shared by both drivers)
+- **`model_mapping_capabilities` has no "unknown" verdict, because the ROW is
+  the verdict.** `verdict` is `yes` or `no` and nothing else — unknown is the
+  absence of a row, and `ValidateCapabilityRow` (shared by both drivers)
   rejects anything else, an empty `capability` and an empty `source` included.
   That is what makes "an undetermined verdict must never overwrite an
   established one" structural rather than a convention every writer has to
-  remember: there is no empty verdict for a writer to pass in the first
-  place. The only way back to unknown is `DeleteMappingCapability`. A capability NAME is not validated at all: the
-  vocabulary is open on purpose (`vision`, `video`, `audio`, `tools`, `mtp`,
-  `live_progress` are the names the code itself reasons about, while an
-  upstream may report others — Ollama passes manifest-declared names through
-  verbatim), so a name-checking validator would silently drop the very
-  verdicts the open shape exists to keep.
+  remember: there is no empty verdict for a writer to pass in the first place.
+  The only way back to unknown is `DeleteMappingCapability`. A capability NAME
+  is not validated at all: the vocabulary is open on purpose (`vision`,
+  `video`, `audio`, `tools`, `mtp`, `live_progress` are the names the code
+  itself reasons about, while an upstream may report others — Ollama passes
+  manifest-declared names through verbatim), so a name-checking validator
+  would silently drop the very verdicts the open shape exists to keep.
 - **`source` is a precedence RANK, and it is what this table has instead of
   `metrics_locked`.** `manual` (3) outranks `vision_benchmark` (2), which
   outranks `llama_cpp_props`/`legacy`/**any unrecognised source** (1); no
@@ -677,9 +677,9 @@ Read shapes and store-level behaviour worth knowing:
   runtime-config change, not bookkeeping.** The delete cascades the mapping's
   runtime spec, its per-spec GPU rows, its co-residency pairs and its
   capability rows (by FK on the SQL drivers, by hand in the memory driver), so
-  it removes a whole `specs[]` entry
-  from the agent's document — and the agent must be told. Reasoning about mapping
-  deletion as a routing-only concern misses all four.
+  it removes a whole `specs[]` entry from the agent's document — and the agent
+  must be told. Reasoning about mapping deletion as a routing-only concern
+  misses all four.
 
 ## See also
 
