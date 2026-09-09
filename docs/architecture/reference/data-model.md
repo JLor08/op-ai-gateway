@@ -37,7 +37,8 @@ not route-based).
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
-| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics, the persisted live-progress-capability verdict (migration 76), and the auto-detected capability verdict set (migration 77: `cap_vision`/`cap_video`/`cap_audio`/`cap_tools`/`cap_extra` + provenance) — capabilities, not metrics, so neither is covered by `metrics_locked` (a definitive `cap_vision` verdict is the one exception, syncing the legacy `vision_capable` bool through its own lock-respecting writer). |
+| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, energy/token), concurrency-capacity metrics, and their `metrics_locked`/`metrics_source`/`metrics_updated_at` provenance. Carries **no capability column at all** since migration 79 dropped the eleven it used to have — every per-model capability verdict is a `model_mapping_capabilities` row instead ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). |
+| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -168,6 +169,13 @@ erDiagram
         string app_model_name
         string status
     }
+    MODEL_MAPPING_CAPABILITIES {
+        string mapping_id FK "PK part, on delete cascade"
+        string capability "PK part, open vocabulary"
+        string verdict "yes | no -- absent row = unknown"
+        string source "manual | vision_benchmark | llama_cpp_props | legacy"
+        datetime checked_at
+    }
     AGENT_TOKENS {
         string id PK
         string server_id FK "unique: one per server"
@@ -190,9 +198,15 @@ erDiagram
     AI_SERVERS ||--o{ APPLICATIONS : "hosts"
     AI_SERVERS ||--o| AGENT_TOKENS : "authenticates agent"
     APPLICATIONS ||--o{ MODEL_MAPPINGS : "exposes"
+    MODEL_MAPPINGS ||--o{ MODEL_MAPPING_CAPABILITIES : "has verdicts for"
     USERS ||--o{ USAGE_EVENTS : "records (denormalized)"
     API_TOKENS ||--o{ USAGE_EVENTS : "records (denormalized)"
 ```
+
+`MODEL_MAPPING_CAPABILITIES` is on the request path: the candidate query joins
+it **twice**, filtered to the `mtp` and `live_progress` capabilities, so one
+row per mapping still comes back. A mapping with no row for a capability is
+UNKNOWN for it, which is why both joins are LEFT joins.
 
 `SERVER_OWNERS` is the `(server_id, user_id)` join table connecting `USERS`
 and `AI_SERVERS` many-to-many. `USAGE_EVENTS`'s links to `USERS` and
@@ -214,7 +228,9 @@ service, or project that produced it.
 | `store.Project` | `internal/store/models.go` | A cross-user usage-attribution grouping, optionally coupled to a user-group. |
 | `routing.AIServer` | `internal/routing/store.go` | A serving host: NetBird linkage, energy config, admin-group/certificate/HTTPS-switch overrides. |
 | `routing.Application` | `internal/routing/store.go` | An upstream API surface on a server: scoring inputs, health-check config, probes, sealed upstream token. |
-| `routing.ModelMapping` | `internal/routing/store.go` | A gateway-model ↔ app-model binding with performance and capacity metrics, plus the persisted live-progress-capability verdict. |
+| `routing.ModelMapping` | `internal/routing/store.go` | A gateway-model ↔ app-model binding with performance and capacity metrics. Deliberately carries **no** capability field: a mapping loaded through `MappingByID` never joins the capability rows, so it cannot present a plausible-looking but unpopulated verdict. |
+| `routing.CapabilityRow` | `internal/routing/store.go` | One `(capability, verdict, source, checked_at)` verdict for a mapping — the unit `model_mapping_capabilities` stores. `WritableCapabilityRows` (pure, no I/O) answers which of a writer's freshly-determined rows may actually be written, given what is on file. |
+| `routing.MappingCandidate` | `internal/routing/store.go` | One routable path for a gateway model — mapping + application + server — plus the two capability verdicts the candidate query joins (`IsMTP`, `LiveProgressSupport`). They sit on the candidate rather than on the mapping so "this came from the join" is a fact the type carries. |
 | `routing.ModelGroup` / `GroupMember` / `ModelSetting` | `internal/routing/store.go` | Priority-failover synthetic models, their ordered members, and per-model visibility. |
 | `routing.Service` / `ServiceDelegate` | `internal/routing/store.go` | A service account and its delegated managers. |
 | `routing.ResourceGroup` / `ResourceGroupProvision` | `internal/routing/store.go` | A server-management container and its polymorphic provisioning targets. |
@@ -224,7 +240,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (77 migrations)
+## 4. Migration history (79 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -277,8 +293,8 @@ set (see [Persistence §3](../cross-cutting/persistence.md#3-the-migration-runne
 |---|---|---|
 | 22 | `model_groups` | Creates `model_groups` + `model_group_members` (priority-failover synthetic models). |
 | 26 | `model_group_traversal` | Adds `model_groups.traversal` (subgroup expansion order: depth/breadth/round-robin). |
-| 32 | `model_mappings_vision_capable` | Adds `model_mappings.vision_capable`. |
-| 33 | `model_mapping_benchmarks_vision_capable` | Adds the definitive measured `vision_capable` flag to benchmark runs. |
+| 32 | `model_mappings_vision_capable` | Adds `model_mappings.vision_capable`. **Dropped by migration 79** — the verdict is a `model_mapping_capabilities` row (migration 78) now, and a bool could not say "never probed". |
+| 33 | `model_mapping_benchmarks_vision_capable` | Adds the definitive measured `vision_capable` flag to benchmark runs. **Not** touched by migration 79: a benchmark run's recorded result is history, one row per measurement, not a mapping's current verdict. |
 | 62 | `model_group_selection_settings` | Adds the five model-group selection-setting columns: `loaded_only`, `member_order`, `climb_speed_margin_percent`, `min_tokens_per_second`, `min_speed_fallback`. |
 
 ### Hardware & power telemetry
@@ -427,13 +443,20 @@ catch-all `model_override`, which has its own column).
 
 | # | Migration | Purpose |
 |---|---|---|
-| 76 | `model_mappings_live_progress_support` | Two additive columns on `model_mappings` (timings-capability-detection, issue #51 follow-up). `live_progress_support text not null default ''` — the persisted verdict on whether this mapping's upstream tolerates the live-progress streaming parameters: `''` (never determined, the same zero-value-means-unknown convention migration 32's `vision_capable` already uses), `supported`, or `unsupported`. `live_progress_checked_at` (nullable, `dl.timestampType()`, no default) — when that verdict was last determined, mirroring migration 9's `metrics_updated_at`; append-only like migration 75. **Neither column is part of the `metrics_locked` group this table otherwise guards every automated writer with** — see the field semantics below for why a capability is deliberately not covered by it. |
+| 76 | `model_mappings_live_progress_support` | Two additive columns on `model_mappings` (timings-capability-detection, issue #51 follow-up). `live_progress_support text not null default ''` — the persisted verdict on whether this mapping's upstream tolerates the live-progress streaming parameters: `''` (never determined, the same zero-value-means-unknown convention migration 32's `vision_capable` already uses), `supported`, or `unsupported`. `live_progress_checked_at` (nullable, `dl.timestampType()`, no default) — when that verdict was last determined, mirroring migration 9's `metrics_updated_at`; append-only like migration 75. **Neither column is part of the `metrics_locked` group this table otherwise guards every automated writer with** — see the field semantics below for why a capability is deliberately not covered by it. **Both columns dropped by migration 79**; the verdict is the `live_progress` row of `model_mapping_capabilities` (migration 78), where `supported`/`unsupported` became `yes`/`no` and `''` became the absence of a row. |
 
 ### Auto-detected model capabilities
 
 | # | Migration | Purpose |
 |---|---|---|
-| 77 | `model_mappings_capabilities` | Seven additive columns on `model_mappings` (capability auto-detection from llama.cpp `/props`, #49 sub-project 2), the first six `text not null default ''`. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` — one three-state verdict apiece, the same `''`(never determined)/`yes`/`no` convention migration 76's `live_progress_support` uses, each written by `UpdateMappingCapabilities` **only when non-empty**, so a partial answer (an older llama.cpp reporting `modalities` but no `chat_template_caps`) never clears a verdict a previous probe already established. `cap_extra` — a JSON-array string of capability names with no column of their own (open-ended upstream vocabulary, e.g. Ollama's manifest-declared capabilities; empty for a llama.cpp source), the same opaque-JSON-in-`text` convention `args`/`env`/`api_flavors` already use elsewhere in this schema. `capabilities_source` — which probe produced the current verdicts (`llama_cpp_props`; `''` before any probe has determined anything). `capabilities_checked_at` (nullable, `dl.timestampType()`, no default) — when last determined, mirroring `live_progress_checked_at`; diagnostics/tooltip only, no decision logic reads it. **None of the seven columns is part of the `metrics_locked` group**, for the identical reason migration 76's pair is not — see the field semantics below, and [ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool) for why a **definitive** `cap_vision` verdict is nonetheless the one case that also writes through the lock-respecting `UpdateMappingVisionCapable`, onto the pre-existing `vision_capable` bool. |
+| 77 | `model_mappings_capabilities` | Seven additive columns on `model_mappings` (capability auto-detection from llama.cpp `/props`, #49 sub-project 2), the first six `text not null default ''`. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` — one three-state verdict apiece, the same `''`(never determined)/`yes`/`no` convention migration 76's `live_progress_support` uses, each written by `UpdateMappingCapabilities` **only when non-empty**, so a partial answer (an older llama.cpp reporting `modalities` but no `chat_template_caps`) never clears a verdict a previous probe already established. `cap_extra` — a JSON-array string of capability names with no column of their own (open-ended upstream vocabulary, e.g. Ollama's manifest-declared capabilities; empty for a llama.cpp source), the same opaque-JSON-in-`text` convention `args`/`env`/`api_flavors` already use elsewhere in this schema. `capabilities_source` — which probe produced the current verdicts (`llama_cpp_props`; `''` before any probe has determined anything). `capabilities_checked_at` (nullable, `dl.timestampType()`, no default) — when last determined, mirroring `live_progress_checked_at`; diagnostics/tooltip only, no decision logic reads it. **None of the seven columns is part of the `metrics_locked` group**, for the identical reason migration 76's pair is not — see the field semantics below. **All seven dropped by migration 79**, the same day they shipped: one verdict per column could not carry per-capability provenance, and `cap_extra`'s JSON-array escape hatch for the open upstream vocabulary is a plain row per name in `model_mapping_capabilities` (migration 78) — [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped). |
+
+### The per-model capability table
+
+| # | Migration | Purpose |
+|---|---|---|
+| 78 | `model_mapping_capabilities_table` | Creates `model_mapping_capabilities` — `mapping_id text not null references model_mappings(id) on delete cascade`, `capability`/`verdict`/`source` `text not null`, `checked_at` (`dl.timestampType()`) **`not null` with no default**, `primary key (mapping_id, capability)` — and **backfills it from the columns migration 79 then drops** ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). One `insert … select` per source column, each ending `on conflict (mapping_id, capability) do nothing`, so the whole migration is replayable, and one `time.Now().UTC()` for the entire backfill so every row a column could not date shares the same "inherited at migration time" instant. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` become the `vision`/`video`/`audio`/`tools` rows verdict-for-verdict (`source = 'llama_cpp_props'`, `checked_at = coalesce(capabilities_checked_at, …)`); `live_progress_support`'s `supported`/`unsupported` becomes `live_progress` `yes`/`no`; each `cap_extra` name becomes its own `yes` row — decoded in **Go**, because SQLite's `json_each` and PostgreSQL's `jsonb_array_elements_text` share no syntax, reading the whole column set before the first insert (a transaction holds one connection) and skipping a malformed value rather than failing an upgrade; `is_mtp = 1` becomes an `mtp` `yes` row with `source = 'legacy'`. `vision_capable = 1` becomes a `vision` `yes` row whose provenance is recovered from the mapping-wide `metrics_source` — the only trace of who wrote the bool (`case … when 'vision' then 'vision_benchmark' when 'manual' then 'manual' else 'legacy' end`) — and that statement runs **after** the `cap_vision` one on purpose, so `do nothing` keeps the newer, better-provenanced verdict where a mapping has both. **Two cases deliberately write NO row**, which is how the table says *unknown*: a `vision_capable = 0` whose `metrics_source` is neither `vision` nor `manual` (that `0` is the column's default, and the column conflated "no" with "never probed"), and every `is_mtp = 0` (that column is seeded from a **name heuristic**, so its false means "the name did not match", not "measured no"). Writing either as `no` would enter a guess into the record as a measurement. `capabilities_source` is the one dropped column the backfill never reads: `llama_cpp_props` was its only non-empty value, so each statement writes that literal instead. Does **not** drop the columns it read — that is a separate migration, so this one is safe to apply to a database an older binary still serves. |
+| 79 | `model_mappings_drop_capability_columns` | Drops the eleven `model_mappings` columns the table supersedes, now that nothing reads or writes any of them: migration 77's `cap_vision`/`cap_video`/`cap_audio`/`cap_tools`/`cap_extra`/`capabilities_source`/`capabilities_checked_at`, migration 32's `vision_capable`, the baseline's `is_mtp`, and migration 76's `live_progress_support`/`live_progress_checked_at`. One `dropColumnIfPresent` call per column so a failure names the column it was on — `alter table … drop column if exists` on PostgreSQL, plain `alter table … drop column` on SQLite with the `no such column` error swallowed, `addColumnIfMissing`'s mirror image and idempotent on replay. **The order relative to migration 78 is load-bearing:** 78 *reads* these columns to backfill from them, so a fresh install replaying both must end on the same schema, with the same rows, as an upgraded database (pinned by `TestMigration79FreshInstallMatchesUpgradedSchema`) — nothing may ever be inserted between the two. Safe on SQLite, which rebuilds the table to drop a column and **refuses** to drop an indexed one: the only index on `model_mappings` is `idx_model_mappings_application` on `(application_id)`, and none of the eleven appears in it, in a view, a trigger or a constraint. `model_mapping_benchmarks.vision_capable` (migration 33) is **not** touched, which is why `dropColumnIfPresent` is scoped by `(table, column)` rather than by column name. This is the schema's **one** departure from the append-only practice migration 72 follows for the `native_responses`/`native_messages` booleans (still there, still inert) — deliberately narrow, and [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped) records the line it draws so the next reader does not read a drop as the new norm. |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
@@ -516,34 +539,45 @@ plausible-looking validation rule would break the normal case:
   `''` | `force_running` | `force_stopped`. `vram_locked` lives on the **spec**
   rather than per GPU, because an operator thinks "pin this model's numbers", not
   "pin GPU 2" (mirroring `metrics_locked`).
-- **`model_mappings.live_progress_support`/`live_progress_checked_at` are
-  deliberately NOT covered by `metrics_locked`, unlike every other automated
-  writer on this table.** `metrics_locked` exists so an operator can pin a
-  NUMBER they are answering for (throughput, context size); the live-progress
-  verdict is a capability of the upstream *build*, not a number an operator
-  vouches for, so pinning it could only ever produce a wrong answer — and
-  unlike a pinned throughput figure, a wrong capability has a silent cost: the
-  live figure stays off, with no visible reason, until someone thinks to
-  unlock the mapping. Writing it also does not restamp `metrics_source`/
-  `metrics_updated_at`, so it never misattributes this mapping's throughput
-  provenance to a capability probe. `live_progress_checked_at` is operator
-  diagnostics and the portal tooltip only — no decision logic anywhere reads
-  it.
-- **`model_mappings.cap_vision`/`cap_video`/`cap_audio`/`cap_tools`/`cap_extra`/
-  `capabilities_source`/`capabilities_checked_at` follow `live_progress_support`'s
-  own precedent above, not `vision_capable`'s** ([ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool)):
-  outside `metrics_locked`, for the identical reason — a capability is not a
-  number an operator vouches for — and `UpdateMappingCapabilities` never
-  restamps `metrics_source`/`metrics_updated_at` either. The **one** exception
-  is `vision_capable` itself: a **definitive** (`"yes"`/`"no"`, never `""`)
-  reported `cap_vision` verdict additionally calls the pre-existing,
-  lock-respecting `UpdateMappingVisionCapable` — the same writer the vision
-  *benchmark* uses, stamping the same `metrics_source = "vision"` — so an
-  operator who has locked a mapping's metrics still has the consumer-visible
-  bool (the models list's AND-aggregate, the portal chat's image gate) pinned
-  against an auto-detected change, exactly as they already expect for every
-  other locked metric. `capabilities_checked_at`, like `live_progress_checked_at`,
-  is diagnostics/tooltip only.
+- **`model_mapping_capabilities` has no "unknown" verdict, because the ROW
+  is the verdict.** `verdict` is `yes` or `no` and nothing else — unknown is
+  the absence of a row, and `ValidateCapabilityRow` (shared by both drivers)
+  rejects anything else, an empty `capability` and an empty `source` included.
+  That is what makes "an undetermined verdict must never overwrite an
+  established one" structural rather than a convention every writer has to
+  remember: there is no empty verdict for a writer to pass in the first
+  place. The only way back to unknown is `DeleteMappingCapability`. A capability NAME is not validated at all: the
+  vocabulary is open on purpose (`vision`, `video`, `audio`, `tools`, `mtp`,
+  `live_progress` are the names the code itself reasons about, while an
+  upstream may report others — Ollama passes manifest-declared names through
+  verbatim), so a name-checking validator would silently drop the very
+  verdicts the open shape exists to keep.
+- **`source` is a precedence RANK, and it is what this table has instead of
+  `metrics_locked`.** `manual` (3) outranks `vision_benchmark` (2), which
+  outranks `llama_cpp_props`/`legacy`/**any unrecognised source** (1); no
+  stored row at all is rank 0. A write is permitted iff
+  `rank(incoming) >= rank(current)` — so an operator's verdict is permanent
+  against both the benchmark and every probe with no lock involved, while an
+  equal rank stays writable and a probe can still repair its own drift after
+  an upstream build changes. An unrecognised source ranking 1 is the fail-safe
+  direction: it is treated as a probe rather than silently handed manual's
+  immunity. `legacy` marks a verdict migration 78 inherited from a column
+  whose real origin is unknowable, and it ranks alongside a probe deliberately
+  — treating a guess as authoritative would freeze it in forever. The rule
+  lives in `WritableCapabilityRows`, applied by each writer rather than by the
+  store, because only a writer knows what rank its own evidence carries
+  ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+- **No capability writer consults `metrics_locked` or touches
+  `metrics_source`/`metrics_updated_at`.** `metrics_locked` exists so an
+  operator can pin a NUMBER they are answering for (throughput, context
+  size); a capability is not that kind of number — pinning it could only ever
+  produce a wrong answer, and unlike a pinned throughput figure a wrong
+  capability has a silent cost: the feature it gates stays off, with no
+  visible reason, until someone thinks to unlock the mapping. And because a
+  capability is not a metric, writing one must not restamp the metrics
+  provenance columns, or this mapping's throughput figures would be
+  misattributed to a capability probe. `checked_at` is operator diagnostics
+  and the portal tooltip only — no decision logic anywhere reads it.
 - **VRAM ownership is split and must stay split.**
   `agent_runtime_spec_gpus.vram_estimate_mb` is operator-owned (written by the
   portal) and `vram_measured_mb` is agent-owned (written only by the telemetry
@@ -607,6 +641,31 @@ Read shapes and store-level behaviour worth knowing:
 
 - `ServerRuntimeReportByServer`, `RuntimeSpecByMapping` and `RuntimeSpecByID`
   return `(zero, false, nil)` when absent — a found-bool, not `ErrNotFound`.
+- **A capability read distinguishes "no rows" from "no key", and both mean
+  unknown.** `MappingCapabilities` returns an empty, non-nil slice for a
+  mapping with no rows; `MappingCapabilitiesForMappings` — the repo's **only**
+  batch child-collection reader, every other child collection being an N+1
+  loop in Go — omits such a mapping from its map entirely, so a zero-value
+  lookup through `CapabilityRowsByName` is "every capability unknown" rather
+  than a case to special-case. It exists because the model-servers listing has
+  two multipliers on it: the SSE stream recomputes the whole listing on every
+  loaded-registry change, and the model-group endpoint calls the listing once
+  per group member. It chunks its bound parameters at 1000 per query, under
+  both `SQLITE_MAX_VARIABLE_NUMBER` and PostgreSQL's 65535.
+- **`UpsertMappingCapabilities` validates every row before it writes any, and
+  writes the set in one transaction** (the `SetCoResidencyRules` discipline):
+  a caller passing several verdicts must never leave a half-written capability
+  picture behind, which is worse than an unchanged one. It applies **no**
+  precedence — that is the caller's step, since only the caller knows what
+  rank its own evidence carries. An unknown `mapping_id` is the one place it
+  is *not* the benign no-op the 0-rows-affected metric writers promise: the FK
+  is real (SQLite runs with `foreign_keys=ON`), so the insert fails, and
+  `MemoryStore` mirrors that with its own existence check (`ErrNotFound`) —
+  the drivers differ in the error value, not in refusing. In practice it is
+  reachable only through a TOCTOU (the mapping deleted between a caller's
+  resolve and this write), and every current caller is best-effort, so it
+  surfaces as one log line and never rejects the request or telemetry sample
+  behind it.
 - `UpsertRuntimeSpec`'s SQL is `insert … on conflict(mapping_id) do update`, and
   the update set-list **never touches `id`**. An upsert against a mapping that
   already has a spec therefore keeps the **stored** id (and `created_at`),
@@ -616,10 +675,11 @@ Read shapes and store-level behaviour worth knowing:
   build broken cross-references.
 - **Deleting a model mapping on a `server_agent` application is a real
   runtime-config change, not bookkeeping.** The delete cascades the mapping's
-  runtime spec, its per-spec GPU rows and its co-residency pairs (by FK on the SQL
-  drivers, by hand in the memory driver), so it removes a whole `specs[]` entry
+  runtime spec, its per-spec GPU rows, its co-residency pairs and its
+  capability rows (by FK on the SQL drivers, by hand in the memory driver), so
+  it removes a whole `specs[]` entry
   from the agent's document — and the agent must be told. Reasoning about mapping
-  deletion as a routing-only concern misses all three.
+  deletion as a routing-only concern misses all four.
 
 ## See also
 

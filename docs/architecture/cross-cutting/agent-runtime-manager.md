@@ -2909,7 +2909,9 @@ mirror). Three different cadences share the one collect cycle:
   probe instead was the originally sketched remedy, and it was rejected on
   exactly that basis. Such a child therefore still answers `401`/`403` here,
   still cached as a conclusive non-verdict (above), and this probe's own
-  `live_progress_support` write for it still stays `""` forever — but its
+  `live_progress_support` stays `""` forever — so the gateway writes that
+  mapping no `live_progress` capability row at all, which is precisely how the
+  row model spells "never determined" — but its
   `Capabilities` write is *not* `nil`: `401`/`403` sits in
   `ProbePropsVerdicts`' CONCLUSIVE set, so `stable` comes back `true` and
   `probeRuntimeChildProps` still reaches `capabilitiesSample`, which always
@@ -3438,7 +3440,7 @@ shows both but edits only its own:
 | `gateway_model_name` | editable | read-only | editable, required |
 | `app_model_name` | read-only | editable, required | editable, required |
 | `status` | editable (form + row toggle) | not shown | not shown |
-| metrics, `is_mtp`, `vision_capable`, `metrics_locked` | editable | not shown | not shown |
+| metrics, `metrics_locked`, and the `is_mtp`/`vision_capable` capability checkboxes | editable | not shown | not shown |
 
 The **mapping** owns the gateway-facing name and the active/disabled status:
 `status` gates whether the gateway routes the model at all, and the
@@ -3461,6 +3463,22 @@ sharp one: the spec form's state defaulted to `active`, so leaving the key in
 the body while removing the control would make every launch-config save
 re-enable a model an operator deliberately took out of service — no error, no
 diff, and no column on the specs tab that contradicts it.
+
+**The two capability checkboxes are the case where the form DOES re-state
+what it captured, so the write has to prove the operator said it.**
+`is_mtp` and `vision_capable` are no longer mapping columns — each is a
+capability row whose `manual` source outranks every probe and the vision
+benchmark permanently
+([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)) —
+and `MappingForm` submits both on every save, seeded from what it read when it
+opened. So `Service.UpdateMapping` reads the stored rows first and writes a
+`manual` row **only for a value that DIFFERS from the row on file**. Without
+that comparison, a save that changed nothing but a throughput figure would
+launder an untouched checkbox into a permanent operator verdict, freezing out
+every probe and the benchmark for a capability no one ever actually stated. A
+create is the mirror case and needs no comparison — nothing is on file yet —
+but only the `true` direction writes there, since an unset `false` at create
+time is indistinguishable from a checkbox the operator never looked at.
 
 **Omission removes the clobber, not the race, and this split is the first thing
 that makes two simultaneous mapping writers a designed workflow.**
@@ -4814,11 +4832,14 @@ says nothing about whether the stored value is real.
 
 **The live-progress-support column follows the SAME persisted-value rule as
 context size, for the same reason, and it is deliberately NOT gated on a
-probe field either.** `live_progress_support` also reaches the row straight
-from the persisted mapping field
-(`LiveProgressSupport: view.mapping.LiveProgressSupport` in
-`portal/service_model_servers.go`) — written by a background detector
-(§8.4.3 of [Telemetry, Usage Analytics &
+probe field either.** `live_progress_support` also reaches the row from a
+persisted value rather than from the runtime-status registry — since the
+capability-table migration it is **folded from the mapping's `live_progress`
+capability row** (`routing.LiveProgressSupportFromVerdict` in
+`portal/service_model_servers.go`, out of the same batched capability read
+that fills the row's other capability fields; the `model_mappings` column it
+used to read was dropped once nothing wrote it) — written by a background
+detector (§8.4.3 of [Telemetry, Usage Analytics &
 Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
 not gateway-injected the way `state`/`active_requests`/`queue_depth`/
 `metrics_probe`/`context_probe` are — so there is no gateway-injection seam
@@ -4845,6 +4866,32 @@ table (issue #57, where the Probes column's `null` for both states read as
 row already applies to a metric that was simply never measured.
 `live_progress_checked_at` feeds only the cell's tooltip — never the badge or
 label choice, which depend solely on `live_progress_support`.
+
+**The capability column is one chip per established `yes`, and an unknown
+name is a chip too.** Each row also carries its mapping's whole capability
+row set (`capabilities`, one entry per determined `(mapping, capability)` —
+[API Surface](../reference/api-surface.md#models-servers-applications-mappings)),
+and `ModelServersSection.tsx` renders a chip for every `yes`: the four names
+the detector itself reasons about first, in a fixed order
+(`vision`, `video`, `audio`, `tools`) with translated labels, then any name
+this codebase does not know, **verbatim** and with the NEUTRAL `standby`
+badge — an upstream capability nobody here has heard of is information, not a
+warning, and dropping it would defeat the open vocabulary the rows exist to
+carry. `mtp` and `live_progress` are excluded from this column: both already
+have a column of their own (`is_mtp`'s is default-hidden, and so is the
+`vision` one that predates the chips — `vision` appears as a chip as well,
+since it is an ordinary row like any other). A `no` row and a missing row both
+render nothing, and a
+row set with no `yes` at all renders the same `—` placeholder the columns
+above use, for the identical reason. The tooltip is per capability: the two
+caveats that travel with these verdicts (§8.4.3 of [Telemetry, Usage Analytics
+& Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
+followed by **that chip's own** `source` and `checked_at` — which is what
+makes an operator's own verdict visibly distinguishable from a probe's on the
+screen where they look at it, and the reason the row carries provenance per
+capability rather than per mapping. Neither value affects the chip's badge or
+label; a `checked_at` a row never carried is omitted rather than rendered as a
+year-0001 date.
 
 **The former "Geladen" and "Live-Status" columns are now one "Status"
 column.** Two facts that used to sit in adjacent columns — the

@@ -439,7 +439,9 @@ redundant write, a wrong one would silently drop a real measurement.
 > portal treats `null` as a crash-class value. The countermeasures are structural
 > and must be preserved: one canonical `sample.EmptyCapabilities()` shared by
 > both `Sample.Normalize()` and the agent's `capabilitiesJSON()` so both
-> producers emit identical bytes; the runtime config parser normalising every
+> producers emit identical bytes; the same normaliser forcing a non-nil
+> `Verdicts` slice inside a per-runtime `Capabilities` wrapper that is itself
+> present (a nil WRAPPER is a distinct, meaningful state — see §8.4.3); the runtime config parser normalising every
 > collection; the report builder re-applying that normalisation so a zero-value
 > config (the parse-error case) still marshals `[]`/`{}`; and a custom marshaller
 > mapping a nil measured-VRAM map to `{}`. Anything handing out a
@@ -753,20 +755,28 @@ works and the shape clause already sends it the parameters today. So a TGI
 leave the stored verdict exactly as it was, indistinguishable from a probe
 that never got a response at all.
 
-The verdict is persisted on the mapping (`model_mappings.live_progress_support`
-+ `live_progress_checked_at`, migration 76 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-77-migrations)) and it sits
-deliberately OUTSIDE the `metrics_locked` group that guards every other
-automated writer on that table. `metrics_locked` lets an operator pin a
-NUMBER they are answering for — throughput, context size; a capability is not
-that kind of number. Pinning it could only ever produce a WRONG answer, and
-unlike a pinned throughput figure a wrong capability has a silent operational
-cost: the live figure stays off, with no visible reason, until someone thinks
-to unlock the mapping. `UpdateMappingLiveProgressSupport` is therefore the
-first writer on `model_mappings` with no `metrics_locked` guard, and it also
-does not restamp `metrics_source`/`metrics_updated_at` — writing it must not
-misattribute this mapping's throughput provenance to a capability probe.
-`live_progress_checked_at` itself is operator diagnostics and the portal
+The verdict is persisted as the mapping's **`live_progress` capability row**
+(`model_mapping_capabilities`, migration 78 — see [Data Model
+§4](../reference/data-model.md#4-migration-history-79-migrations)), where the
+`supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
+undetermined `""` is the **absence of a row**. Both probe write paths
+translate through the one function, `routing.LiveProgressCapabilityVerdict`,
+rather than each re-spelling the switch, so they cannot disagree about what
+"supported" means — and because "undetermined" is now expressed by writing
+nothing at all, the no-overwrite rule above needs no writer to remember it.
+The row sits deliberately OUTSIDE the `metrics_locked` group that guards every
+automated METRIC writer on `model_mappings`. `metrics_locked` lets an operator
+pin a NUMBER they are answering for — throughput, context size; a capability is
+not that kind of number. Pinning it could only ever produce a WRONG answer,
+and unlike a pinned throughput figure a wrong capability has a silent
+operational cost: the live figure stays off, with no visible reason, until
+someone thinks to unlock the mapping. What an operator gets instead is the
+row's own `source` and the precedence rank built on it
+([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)):
+a per-capability guarantee rather than a mapping-wide switch over numbers. No
+capability writer restamps `metrics_source`/`metrics_updated_at` either —
+writing one must not misattribute this mapping's throughput provenance to a
+capability probe. The row's `checked_at` is operator diagnostics and the portal
 tooltip only ([API Surface](../reference/api-surface.md#models-servers-applications-mappings));
 no decision logic anywhere reads it.
 
@@ -786,12 +796,14 @@ its own children directly over loopback — the mechanics are [Agent-Managed
 Model Runtime's per-child probing
 section](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time) —
 and reports the verdict back on the telemetry channel, where
-`writeBackRuntimeLiveProgress` (`internal/gateway/agent_ingest.go`) writes it
-onto the mapping under the same `runtime_model_probe` capability gate as the
-context write-back, and — like every writer here — deliberately **without**
-a `mapping.MetricsLocked` check: the capability write-back's own doc comment
-states this is the design's central decision, not an oversight. That probe is
-`runtime.Status`-based and carries no credential, by design
+`writeBackRuntimeCapabilities` (`internal/gateway/agent_ingest.go`) writes it
+as the mapping's `live_progress` row — in the SAME row set as that sample's
+other capability verdicts, since a row per capability makes them one write
+rather than two writers — under the same `runtime_model_probe` capability gate
+as the context write-back, and, like every capability writer here,
+deliberately **without** a `mapping.MetricsLocked` check: the store's own
+`UpsertMappingCapabilities` doc comment is the canonical statement of why.
+That probe is `runtime.Status`-based and carries no credential, by design
 ([Agent-Managed Model Runtime
 §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
 so an api-key-protected child still answers it with a conclusive, cached
@@ -811,14 +823,18 @@ describes for ordinary inference — which is how an api-key-protected child's
 verdict becomes determinable at all.
 
 **An unchanged verdict is never rewritten, on either write path.** Both the
-gateway's own context-probe pass and the ingest write-back above compare the
-freshly-observed verdict against the mapping's CURRENTLY STORED one before
-calling `UpdateMappingLiveProgressSupport`, and skip the call when they
-already agree. A capability is stable by nature — the same upstream build
-reports the same verdict every single time it is asked — so without that
-comparison either pass would drive one unconditional `UPDATE` per mapping per
-probe cycle, forever, for a value that can only change if an operator swaps
-the upstream binary underneath the mapping.
+gateway's own context-probe pass and the ingest write-back above hand their
+freshly-observed verdicts, together with the mapping's CURRENTLY STORED rows,
+to `routing.WritableCapabilityRows` — the one place that answers "which of
+these may I write" — and call `UpsertMappingCapabilities` only for what comes
+back. A verdict that already agrees is dropped there. A capability is stable
+by nature — the same upstream build reports the same verdict every single time
+it is asked — so without that comparison either pass would drive one
+unconditional write per capability per mapping per probe cycle, forever, for a
+value that can only change if an operator swaps the upstream binary underneath
+the mapping. The same function applies the precedence rank first, which is why
+a probe cannot walk over an operator's verdict; the rule and its consequences
+are [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped).
 
 **A second detector rides the identical `/props` fetch: auto-detected
 capabilities (#49 sub-project 2).** `detectCapabilities`
@@ -870,66 +886,62 @@ agent's own probe (`probeRuntimeChildProps`, [Agent-Managed Model Runtime
 caches that whole pair keyed by `(SpecID, PID)` — once per process generation,
 exactly like the context and live-progress caches beside it.
 
-**Persistence sits beside `live_progress_support`, with one deliberate
-exception.** `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` (`""`/`"yes"`/
-`"no"`) and `cap_extra` (a JSON-array string of capability names with no
-column of their own — an open upstream vocabulary such as Ollama's
-manifest-declared capabilities, not this llama.cpp detector, is what actually
-populates it) live on `model_mappings` (migration 77 — [Data Model
-§4](../reference/data-model.md#4-migration-history-77-migrations)), alongside
-`capabilities_source` (`"llama_cpp_props"`) and `capabilities_checked_at`
-(diagnostics/tooltip only, exactly like `live_progress_checked_at` — no
-decision logic reads it). `UpdateMappingCapabilities` writes only the verdicts
-that are non-empty, so a partial answer (an older llama.cpp reporting
-`modalities` but no `chat_template_caps`) never clears a `cap_tools` a
-previous probe already established, and — like
-`UpdateMappingLiveProgressSupport` — it carries no `metrics_locked` guard and
-never restamps `metrics_source`/`metrics_updated_at`: a capability is not a
-number an operator pins. The **one** exception is `vision_capable`, the
-pre-existing legacy bool the models list's AND-aggregate and the portal
-chat's image gate already read: a **definitive** reported `cap_vision`
-verdict additionally calls the lock-respecting `UpdateMappingVisionCapable` —
-driven by THIS sample's `vision` value, not by whether `cap_vision` itself
-changed — so a bool the vision *benchmark* moved independently (including a
-wrong, definitive `false` from a transient upstream failure) still converges
-back on the next steady, unchanged probe result, not only on the one sample
-that first changes `cap_vision`. `""` never syncs anything. See
-[ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool)
-for the full reasoning.
+**Persistence is one row per capability, with a provenance rank where the
+columns had a lock.** Every verdict this detector yields is a
+`model_mapping_capabilities` row keyed by `(mapping_id, capability)`
+(migration 78; migration 79 then dropped the eleven `model_mappings` columns
+that used to hold these verdicts — [Data Model
+§4](../reference/data-model.md#4-migration-history-79-migrations)). The four
+names the detector itself reads are `vision`/`video`/`audio`/`tools`; every
+OTHER capability name an agent reports on the wire becomes its own row too,
+carried verbatim even when this codebase has never heard of it, so the open
+upstream vocabulary needs no `cap_extra` array beside four real columns any
+more. A verdict of `""` produces **no row at
+all**, and the absence of a row is what UNKNOWN means — which is why a partial
+answer (an older llama.cpp reporting `modalities` but no
+`chat_template_caps`) cannot clear a `tools` verdict a previous probe
+established: there is no empty verdict for it to write. Both probe write paths
+stamp `source = "llama_cpp_props"` and the observation time as the row's
+`checked_at`; neither consults `metrics_locked` or touches
+`metrics_source`/`metrics_updated_at`.
 
-**Consequence for the operator: a probe verdict can override what looks like
-a deliberate manual answer.** Because the sync above is driven by THIS
-sample's `vision` value and re-runs on every steady, unchanged probe result —
-not only the sample that first changes `cap_vision` — a **definitive**
-llama.cpp `/props` verdict overrides a `vision_capable` an operator set by
-hand (the checkbox in `MappingForm.tsx`) within about one telemetry tick
-(~1s, `OP_AGENT_INTERVAL`'s default), and it converges just as fast over a
-`vision_capable` the vision **benchmark**'s own **verify** mode most recently
-set. Verify mode matters here: it asks the model to name the two colors in a
-known test image and writes a definitive `false` when the answer does not
-contain them (`answerContainsTokens`, `benchmark_runner.go`) — i.e. an
-operator running verify mode has asked to filter out models that merely
-ACCEPT an image without understanding it, and `modalities.vision` (what this
-probe reads) only ever answers acceptance, never comprehension. The escape
-hatch is `metrics_locked`: every writer of `vision_capable` — this sync (on
-both write paths below) and the vision benchmark alike — goes through the
-same lock-respecting `UpdateMappingVisionCapable`, whose `and metrics_locked
-= 0` clause makes a locked mapping's row match zero rows and no-op,
-atomically, in SQL, with no separate check-then-write race to get wrong.
-`MappingForm` carries both the `vision_capable` and `metrics_locked`
-checkboxes, so one save can set the value and lock it in the same request.
+**An operator's verdict is permanent, and no probe can move it.** Every writer
+asks `routing.WritableCapabilityRows` before it writes, and that function
+permits a write only when `rank(incoming) >= rank(current)`: `manual` 3 >
+`vision_benchmark` 2 > `llama_cpp_props`/`legacy`/any unrecognised source 1 >
+no row 0. Three consequences matter operationally. The vision checkbox in
+`MappingForm.tsx` writes a `manual` row that neither probe path nor the
+benchmark can ever overwrite — with no `metrics_locked` in the story at all;
+the form writes it **only when the submitted value differs from the stored
+row**, because `MappingForm` submits every field on every save and an
+untouched checkbox must not be laundered into a permanent manual verdict by a
+save that only changed a throughput figure. The vision **benchmark** outranks
+a probe and replaces its `vision` verdict, but loses to an operator: that
+ordering is the point, since verify mode asks the model to name the two colors
+in a known test image and writes a definitive `no` when the answer does not
+contain them (`answerContainsTokens`, `benchmark_runner.go`) — an actual
+measurement of comprehension, where `modalities.vision`, what this probe
+reads, only ever answers acceptance. And a probe still overwrites its own
+earlier verdict or a migrated `legacy` one (rank 1 against rank 1), which is
+what lets a verdict re-establish itself after someone swaps the upstream
+binary underneath the mapping. The full rule, including why an unrecognised
+source ranks as a probe rather than as a human, is
+[ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped).
 
-**Both write paths mirror `live_progress_support`'s in what they actually
-share, not its full guard list.** The runtimes cap and per-`spec_id`
+**Both write paths write ONE row set, and share what matters rather than a
+guard list.** The runtimes cap and per-`spec_id`
 ownership resolution with the same cross-server rejection exist ONLY on the
 ingest path, because that path alone is handed a wire-supplied `spec_id`
 with no other verification; `applyCapabilityWrite` needs neither guard,
 since app-health resolves the mapping itself by iterating its own
 applications rather than trusting a field an agent supplied. What the two
 DO genuinely share: best-effort so a write failure never rejects the sample
-(or, on the app-health side, the probe pass), compare-to-stored so an
-unchanged verdict set issues no `UPDATE`, no `metrics_locked` guard on the
-tri-state columns, and the vision sync described above. The two writers are
+(or, on the app-health side, the probe pass); the shared
+`WritableCapabilityRows` gate — the rank first, then compare-to-stored — so an
+outranked or an already-agreeing verdict issues no write at all; one atomic
+`UpsertMappingCapabilities` per mapping, so a multi-verdict answer is never
+half-applied; and no `metrics_locked` guard and no restamping of
+`metrics_source`/`metrics_updated_at`. The two writers are
 the gateway's own ingest-side `writeBackRuntimeCapabilities`
 (`internal/gateway/agent_ingest.go`), gated on the identical
 `runtime_model_probe` capability as the context and live-progress
