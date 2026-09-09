@@ -3505,19 +3505,20 @@ fired from a button inside the open form would be self-undoing: the form does
 not re-seed, so the operator's next unrelated edit would re-establish the
 verdict they had just relinquished — with an ordinary 200 and nothing on
 screen. Carrying the intent in the same request removes that window, and the
-response is the post-write DTO so the next render seeds from truth. **The unknown option's caption is
-per-capability**, because the honest answer differs: `vision` (and
-video/audio/tools/live_progress) come back on their own within about a second
-of the next telemetry write-back or one app-health tick — *but only when the
-upstream really is a llama.cpp `/props` document*; for a router-shaped body, or
-vLLM/Ollama, nothing re-detects them. Nothing re-probes `mtp` at all on an
-existing mapping (the legacy name heuristic writes its row only for a
-brand-new one, and a re-sync skips an existing mapping), so returning it to
-unknown discards the verdict and the scorer's +30 MTP bonus until a human sets
-it again. Do not replace those two captions with one shared "let detection
-decide again"; an i18n test asserts they stay different in both languages.
-`metrics_locked` stays a **checkbox** — a policy flag over the numeric metrics,
-which ADR-039 is explicit does not guard the capability table any more.
+response is the post-write DTO so the next render seeds from truth. **The
+unknown option's caption is per-capability**, because the honest answer
+differs: `vision` (and video/audio/tools/live_progress) come back on their own
+within about a second of the next telemetry write-back or one app-health tick
+— *but only when the upstream really is a llama.cpp `/props` document*; for a
+router-shaped body, or vLLM/Ollama, nothing re-detects them. Nothing re-probes
+`mtp` at all on an existing mapping (the legacy name heuristic writes its row
+only for a brand-new one, and a re-sync skips an existing mapping), so
+returning it to unknown discards the verdict and the scorer's +30 MTP bonus
+until a human sets it again. Do not replace those two captions with one shared
+"let detection decide again"; an i18n test asserts they stay different in both
+languages. `metrics_locked` stays a **checkbox** — a policy flag over the
+numeric metrics, which ADR-039 is explicit does not guard the capability table
+any more.
 
 **Omission removes the clobber, not the race, and this split is the first thing
 that makes two simultaneous mapping writers a designed workflow.**

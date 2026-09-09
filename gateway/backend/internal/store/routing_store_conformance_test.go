@@ -748,16 +748,15 @@ func TestMappingCapabilityRows(t *testing.T) {
 		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
 			t.Fatalf("delete of an absent row must be a no-op: %v", err)
 		}
-		// Every OTHER failing shape is a benign no-op too, on every driver:
-		// an unknown mapping id, a capability name no code knows, and an
-		// empty name. This is not a curiosity -- it is the reason the portal's
-		// reset path (an empty verdict in portal.Service.UpdateMapping's
-		// CapabilityVerdicts) has to
-		// carry BOTH its own authorisation (authorizeMapping) and its own
-		// empty-name rejection. The store hands that path NO existence signal
-		// to lean on: "refused", "the mapping does not exist" and "deleted
-		// nothing" are indistinguishable here by design, unlike
-		// UpsertMappingCapabilities, whose FK makes an unknown mapping an
+		// Every OTHER failing shape is a benign no-op too, on every driver: an
+		// unknown mapping id, a capability name no code knows, and an empty
+		// name. This is not a curiosity -- it is the reason the portal's reset
+		// path (an empty verdict in portal.Service.UpdateMapping's
+		// CapabilityVerdicts) has to carry BOTH its own authorisation
+		// (authorizeMapping) and its own empty-name rejection. The store hands
+		// that path NO existence signal to lean on: "refused", "the mapping does
+		// not exist" and "deleted nothing" are indistinguishable here by design,
+		// unlike UpsertMappingCapabilities, whose FK makes an unknown mapping an
 		// error (see TestUpsertMappingCapabilitiesUnknownMappingFails).
 		for _, absent := range []struct{ mappingID, capability string }{
 			{"does-not-exist", routing.CapabilityVision},

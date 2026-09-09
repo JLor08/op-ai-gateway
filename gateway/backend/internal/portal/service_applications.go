@@ -2434,9 +2434,9 @@ func operatorCapabilityWrites(intents []capabilityVerdictIntent, stored map[stri
 // resetOperatorCapabilities deletes one mapping's named capability rows --
 // the names UpdateMappingRequest.CapabilityVerdicts stated an empty verdict
 // for, and whose row actually exists -- returning each capability to UNKNOWN.
-// Unlike writeOperatorCapabilities above it PROPAGATES its error -- see UpdateMapping's own comment at the call site
-// for the full argument, and for why two deletes in one request need no
-// transaction.
+// Unlike writeOperatorCapabilities above it PROPAGATES its error -- see
+// UpdateMapping's own comment at the call site for the full argument, and
+// for why two deletes in one request need no transaction.
 //
 // Authorisation is the caller's: every reset reaches here only past
 // authorizeMapping, which collapses an unknown mapping, a mapping the

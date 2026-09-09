@@ -900,21 +900,24 @@ be an explicit statement. Collapsing the two rules into one would either
 re-open the minting defect or re-close the third state. The map accepts ANY
 capability name — the vocabulary is open below — and rejects a blank one, a
 value outside the three, stating a capability whose legacy boolean the same
-request also sends, and two keys that name one capability once trimmed. Its store error is PROPAGATED, unlike the accompanying
-upsert's best-effort write: relinquishing the verdict is the whole effect of
-the action, so swallowing the failure would report success for nothing. What is NOT closed is minting one by accident from a form gone stale
-mid-edit ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open is the *vocabulary*, not the
-validation: no check compares a name against a known list, so the code reasons
-about `vision`, `video`, `audio`, `tools`, `mtp` and `live_progress` while an
-unrecognised upstream name is accepted, stored and shown verbatim — which is
-why the open vocabulary needs no escape hatch. The two verdicts the request
-path acts on reach it through the candidate query's own **filtered** LEFT
-JOINs and land on `MappingCandidate`, deliberately **not** on `ModelMapping`:
-a mapping loaded through `MappingByID` joins nothing, and a struct with no
-capability field cannot present a plausible-looking but unpopulated verdict —
-anything holding only a mapping has to ask for the rows. **(b) The precedence
-rule is a RANK,** not a probe/not-probe split: `manual` 3 > `vision_benchmark`
-2 > `llama_cpp_props`/`legacy`/**any unrecognised source** 1 > no row 0, and a
+request also sends, and two keys that name one capability once trimmed. Its
+store error is PROPAGATED, unlike the accompanying upsert's best-effort write:
+relinquishing the verdict is the whole effect of the action, so swallowing the
+failure would report success for nothing. What is NOT closed is minting one by
+accident from a form gone stale mid-edit
+([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open
+is the *vocabulary*, not the validation: no check compares a name against a
+known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
+`mtp` and `live_progress` while an unrecognised upstream name is accepted,
+stored and shown verbatim — which is why the open vocabulary needs no escape
+hatch. The two verdicts the request path acts on reach it through the
+candidate query's own **filtered** LEFT JOINs and land on `MappingCandidate`,
+deliberately **not** on `ModelMapping`: a mapping loaded through `MappingByID`
+joins nothing, and a struct with no capability field cannot present a
+plausible-looking but unpopulated verdict — anything holding only a mapping
+has to ask for the rows. **(b) The precedence rule is a RANK,** not a
+probe/not-probe split: `manual` 3 > `vision_benchmark` 2 >
+`llama_cpp_props`/`legacy`/**any unrecognised source** 1 > no row 0, and a
 write is permitted **iff `rank(incoming) >= rank(current)`**
 (`WritableCapabilityRows` — pure, no I/O, applied by each writer rather than
 by the store, because only a writer knows what rank its own evidence carries).
