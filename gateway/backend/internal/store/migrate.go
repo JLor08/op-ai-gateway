@@ -139,23 +139,10 @@ func (s *SQLStore) migrateTo(ctx context.Context, maxVersion int) error {
 	)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	applied := map[int]bool{}
-	rows, err := s.query(ctx, `select version from schema_migrations`)
+	applied, err := s.appliedMigrationVersions(ctx)
 	if err != nil {
-		return fmt.Errorf("read schema_migrations: %w", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("scan schema_migrations: %w", err)
-		}
-		applied[v] = true
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
-	_ = rows.Close()
 
 	ordered := append([]migration(nil), migrations...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].version < ordered[j].version })
@@ -167,29 +154,75 @@ func (s *SQLStore) migrateTo(ctx context.Context, maxVersion int) error {
 		if applied[m.version] {
 			continue
 		}
-		if m.rawUp != nil {
-			if err := m.rawUp(ctx, s, m.version, m.name); err != nil {
-				return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
-			}
-			continue
+		if err := s.applyMigration(ctx, m); err != nil {
+			return err
 		}
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin migration %d: %w", m.version, err)
+	}
+	return nil
+}
+
+// appliedMigrationVersions reads the ledger: the set of versions
+// schema_migrations already records. A missing version is simply absent, so
+// migrateTo's `applied[m.version]` is the whole "has this one run" question.
+//
+// Its caller creates the table first, so an empty result here means a fresh
+// database rather than a missing ledger.
+func (s *SQLStore) appliedMigrationVersions(ctx context.Context) (map[int]bool, error) {
+	rows, err := s.query(ctx, `select version from schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan schema_migrations: %w", err)
 		}
-		if err := m.up(ctx, tx, s.dl); err != nil {
-			_ = tx.Rollback()
+		applied[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return applied, nil
+}
+
+// applyMigration runs ONE not-yet-recorded migration and records it, in
+// whichever of the two shapes the ledger entry declares:
+//
+//   - rawUp owns its own transactions (the documented escape hatch for a
+//     migration that cannot run inside one, e.g. sqlite's table rebuilds)
+//     and therefore records ITSELF -- nothing is stamped here for it.
+//   - up runs inside one transaction together with its schema_migrations
+//     insert, so a failure anywhere leaves neither the change nor the stamp:
+//     a half-applied migration that claims to be applied is the one outcome
+//     a replayable ledger must never produce.
+//
+// Every error names the version and the migration, because the version alone
+// is not enough to find it in a file of eighty entries.
+func (s *SQLStore) applyMigration(ctx context.Context, m migration) error {
+	if m.rawUp != nil {
+		if err := m.rawUp(ctx, s, m.version, m.name); err != nil {
 			return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
 		}
-		if _, err := tx.ExecContext(ctx, s.dl.rebind(
-			`insert into schema_migrations (version, name, applied_at) values (?, ?, ?)`),
-			m.version, m.name, time.Now().UTC()); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("record migration %d: %w", m.version, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %d: %w", m.version, err)
-		}
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", m.version, err)
+	}
+	if err := m.up(ctx, tx, s.dl); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(
+		`insert into schema_migrations (version, name, applied_at) values (?, ?, ?)`),
+		m.version, m.name, time.Now().UTC()); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record migration %d: %w", m.version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", m.version, err)
 	}
 	return nil
 }
