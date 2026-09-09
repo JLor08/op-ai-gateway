@@ -293,22 +293,42 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 // (idx_model_mappings_application on application_id).
 //
 // That refusal is only a safety net if it can actually be SEEN, which is
-// what makes the swallow's precision load-bearing rather than cosmetic:
-// sqlite words every refusal as `error in <object> after drop column: no
-// such column: <col>`, so a swallow matching "no such column" anywhere in
-// the message hides exactly the error the paragraph above relies on -- a
-// blocked drop would be reported as "the column is already gone", leaving
-// sqlite with the column and postgres (`drop column if exists`) without it,
-// the migration recorded as applied, and no diagnostic anywhere. So the
-// swallow matches the absent-column error and nothing else: that one names
-// the column in DOUBLE QUOTES (`no such column: "note"`) and carries no
-// `after drop column` clause, while every refusal is the other way round on
-// both counts. Either half alone would discriminate; both are checked so a
-// future sqlite rewording of one does not silently restore the trap.
+// what makes the swallow's precision load-bearing rather than cosmetic: a
+// swallow matching "no such column" anywhere in the message would hide
+// exactly the error the paragraph above relies on -- a blocked drop reported
+// as "the column is already gone", leaving sqlite with the column and
+// postgres (`drop column if exists`) without it, the migration recorded as
+// applied, and no diagnostic anywhere.
+//
+// So the swallow matches the absent-column error and nothing else, and the
+// DOUBLE QUOTES are the half that does the discriminating: sqlite's plain
+// absent-column error is the only message here that quotes the column
+// (`no such column: "note"`), and every refusal names it bare. The
+// `after drop column` clause is a SECOND, INDEPENDENT guard rather than an
+// equivalent one. It does hold for the refusals the drop itself provokes --
+// `error in index t2y after drop column: no such column: y`, and the same
+// shape for a rebuilt `table`, a `view`, or a `trigger` (the last naming
+// `new.<col>`) -- but it is NOT a property of every error a drop returns:
+//
+//   - sqlite re-validates the WHOLE schema around the edit, so a view or
+//     trigger that ALREADY did not parse aborts the drop as well, even a
+//     drop on an unrelated table. That error carries no clause and names
+//     whatever was already unresolvable rather than the dropped column:
+//     `error in view v1: no such column: d`. A view or trigger that
+//     references the dropped column AND something stale lands in this shape
+//     too (`error in trigger tr: no such column: new.z`).
+//   - `cannot drop UNIQUE column: "code"` does quote the column and carries
+//     no clause; it is harmless only because it never says "no such column".
+//
+// Matching on the clause ALONE would therefore swallow that first group and
+// restore the exact trap. Both halves are checked so that a future sqlite
+// rewording which started quoting the column in a refusal would not
+// silently restore it from the other direction.
 //
 // migration79Up is the first and only caller. See
 // TestDropColumnIfPresentSQLite for the present, the already-absent, the
-// nonexistent-table and the BLOCKED cases.
+// nonexistent-table and four BLOCKED cases (index, view, trigger, and a
+// clause-less refusal).
 func dropColumnIfPresent(ctx context.Context, tx *sql.Tx, dl dialect, table, column string) error {
 	if dl.name() == "postgres" {
 		return execTx(ctx, tx, dl, "alter table "+table+" drop column if exists "+column)
