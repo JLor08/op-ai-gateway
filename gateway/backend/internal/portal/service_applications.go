@@ -1390,7 +1390,9 @@ type ModelMappingDTO struct {
 	// capability rows (capabilityVerdictBool: only "yes" is true, so a "no"
 	// row and a MISSING row both read as false). They cannot express the third
 	// state, which is exactly why Capabilities below exists beside them --
-	// they are kept because five frontend sites and six test files read them.
+	// they are kept because the portal still renders this pair as the mapping
+	// list's MTP and vision columns (shared/mappingColumns.tsx, on both the
+	// mapping and the runtime-admin screens).
 	IsMtp         bool `json:"is_mtp"`
 	VisionCapable bool `json:"vision_capable"`
 	// Capabilities is every DETERMINED capability row for this mapping, in the
@@ -2463,11 +2465,11 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // Capabilities is what MappingForm.tsx SEEDS its two capability selects
 // from: one entry per determined row, and the ABSENCE of an entry is the
 // third state. IsMtp/VisionCapable are the two-state fold of the same rows,
-// kept for the five frontend sites and six test files that read them (and for
-// the legacy request booleans' differs-from-stored comparison in
-// UpdateMapping) -- a control seeded from them could never SHOW unknown, let
-// alone return a capability to it, because they read a determined "no" and a
-// missing row as the same `false`.
+// kept for the mapping list's MTP and vision columns (and for the legacy
+// request booleans' differs-from-stored comparison in UpdateMapping) -- a
+// control seeded from them could never SHOW unknown, let alone return a
+// capability to it, because they read a determined "no" and a missing row as
+// the same `false`.
 //
 // Both halves coming from the ROWS is a CORRECTNESS requirement rather than
 // tidiness, and it is why the is_mtp/vision_capable columns #49-3 retired
