@@ -755,7 +755,7 @@ that never got a response at all.
 
 The verdict is persisted on the mapping (`model_mappings.live_progress_support`
 + `live_progress_checked_at`, migration 76 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-76-migrations)) and it sits
+§4](../reference/data-model.md#4-migration-history-77-migrations)) and it sits
 deliberately OUTSIDE the `metrics_locked` group that guards every other
 automated writer on that table. `metrics_locked` lets an operator pin a
 NUMBER they are answering for — throughput, context size; a capability is not
@@ -819,6 +819,116 @@ reports the same verdict every single time it is asked — so without that
 comparison either pass would drive one unconditional `UPDATE` per mapping per
 probe cycle, forever, for a value that can only change if an operator swaps
 the upstream binary underneath the mapping.
+
+**A second detector rides the identical `/props` fetch: auto-detected
+capabilities (#49 sub-project 2).** `detectCapabilities`
+(`internal/provider/model_info.go`, byte-for-byte duplicated in
+`server-agent/internal/collector/probe.go` under the exact same "two Go
+modules, no shared code" precedent as `detectLiveProgressSupport` above) reads
+two objects out of the same document, and nothing else:
+
+- `modalities.{vision,video,audio}` — the server's own per-modality input
+  support. A key **present** as a bool is the verdict (`true` → `"yes"`,
+  `false` → `"no"`); a key **absent** from an otherwise-present `modalities`
+  object stays `""` — an older build simply predates it (audio landed
+  2025-05-23, video 2026-06-08 upstream), and absence is not a denial. This is
+  the same trap the naive "no key ⇒ unsupported" reading falls into above,
+  applied to a second field: an older llama.cpp that reports `modalities`
+  without `video` at all must never read as "video: no."
+- `chat_template_caps.supports_tools` — whether the model's chat template
+  *natively* supports tool calls. The whole object is absent on servers older
+  than 2026-01-22, which is `""`, never `"no"`.
+
+The identical `"role": "router"` gate applies, for the identical reason: a
+llama.cpp router-mode dummy `/props` document yields the zero-value
+`Capabilities{}` regardless of what it otherwise contains, rather than a wrong
+verdict that the no-rewrite rule would then keep forever.
+
+**Two caveats travel with these verdicts wherever they are shown**, because
+both invite a stronger reading than the field actually supports:
+
+- `modalities.video: true` means the **binary was built with video support
+  AND the model has a vision encoder** (upstream's
+  `mtmd_helper_support_video` returns `mtmd_support_vision` under `#ifdef
+  MTMD_VIDEO`) — a build-plus-vision fact, not "this model understands
+  video."
+- `chat_template_caps.supports_tools: false` means the model has **no native
+  tool-call template**, not that tool calls fail: with `--jinja` (llama.cpp's
+  default since 2025-11-27) tools are accepted for every model through a
+  generic handler, so `"no"` here means degraded prompt quality, never a
+  rejected request.
+
+**One fetch answers every verdict this document can yield.**
+`ProbePropsVerdicts` (`server-agent/internal/collector/probe.go`, replacing
+the narrower, single-verdict `ProbeLiveProgressSupport`) GETs `/props` exactly
+once per cache miss and hands the identical bytes to both detectors, returning
+`PropsVerdicts{LiveProgress, Caps}` together — the whole point being that a
+`llama_cpp` child that used to be asked once per verdict kind is now asked
+once, period, regardless of how many verdicts the one document yields. The
+agent's own probe (`probeRuntimeChildProps`, [Agent-Managed Model Runtime
+§10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time))
+caches that whole pair keyed by `(SpecID, PID)` — once per process generation,
+exactly like the context and live-progress caches beside it.
+
+**Persistence sits beside `live_progress_support`, with one deliberate
+exception.** `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` (`""`/`"yes"`/
+`"no"`) and `cap_extra` (a JSON-array string of capability names with no
+column of their own — an open upstream vocabulary such as Ollama's
+manifest-declared capabilities, not this llama.cpp detector, is what actually
+populates it) live on `model_mappings` (migration 77 — [Data Model
+§4](../reference/data-model.md#4-migration-history-77-migrations)), alongside
+`capabilities_source` (`"llama_cpp_props"`) and `capabilities_checked_at`
+(diagnostics/tooltip only, exactly like `live_progress_checked_at` — no
+decision logic reads it). `UpdateMappingCapabilities` writes only the verdicts
+that are non-empty, so a partial answer (an older llama.cpp reporting
+`modalities` but no `chat_template_caps`) never clears a `cap_tools` a
+previous probe already established, and — like
+`UpdateMappingLiveProgressSupport` — it carries no `metrics_locked` guard and
+never restamps `metrics_source`/`metrics_updated_at`: a capability is not a
+number an operator pins. The **one** exception is `vision_capable`, the
+pre-existing legacy bool the models list's AND-aggregate and the portal
+chat's image gate already read: a **definitive** reported `cap_vision`
+verdict additionally calls the lock-respecting `UpdateMappingVisionCapable` —
+driven by THIS sample's `vision` value, not by whether `cap_vision` itself
+changed — so a bool the vision *benchmark* moved independently (including a
+wrong, definitive `false` from a transient upstream failure) still converges
+back on the next steady, unchanged probe result, not only on the one sample
+that first changes `cap_vision`. `""` never syncs anything. See
+[ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool)
+for the full reasoning.
+
+**Both write paths mirror `live_progress_support`'s exactly**, sharing every
+guard already described above — the runtimes cap, per-`spec_id` ownership
+resolution with the same cross-server rejection, best-effort so a write
+failure never rejects the sample, and compare-to-stored so an unchanged
+verdict set issues no `UPDATE`: the agent's `writeBackRuntimeCapabilities`
+(`internal/gateway/agent_ingest.go`), gated on the identical
+`runtime_model_probe` capability as the context and live-progress
+write-backs; and the gateway's own `applyCapabilityWrite`
+(`cmd/gateway/app_health.go`), called from both of `probeServer`'s probe
+passes — the `{model}`-template branch (which, since issue #58, also reaches
+an api-key-protected child through the router's `GET
+/upstream/{model}/props` passthrough) and the single-probe branch, which fans
+a **nameless** verdict set (capability evidence with no `model`/`model_path`
+in the body) out to every mapping of the one-endpoint application, mirroring
+the live-progress nameless-entry rule above. A nil `Capabilities` on the wire
+(an agent predating capability detection) and an all-empty one (detection
+ran, determined nothing) are both "no write," but they are different facts a
+pointer field can distinguish and a bare struct cannot — why
+`sample.RuntimeSample.Capabilities` is `*Capabilities`.
+
+**vLLM and TGI are not covered, and there is no HTTP surface left to probe
+for either.** vLLM's `/v1/models` `ModelCard` carries no modality field, its
+tool-call flags have been invisible over HTTP since v0.18.0, `/server_info`
+needs `VLLM_SERVER_DEV_MODE=1` set on the server itself (an operator choice
+this probe cannot make on their behalf), and `vllm:mm_cache_*` being
+registered unconditionally in `/metrics` means its mere presence proves
+nothing about the loaded model. TGI's `/info` has no modality or tools field
+at all, and its `model_pipeline_tag` is nullable and hub-controlled rather
+than a build fact. Both applications' only capability coverage stays the
+pre-existing vision **benchmark** (an actual image request, not a document
+read) — recorded here so the gap is not re-discovered and re-litigated by a
+future reader.
 
 **Correctness comes from a retry.** No live figure may fail, delay or alter a
 request, so a schema rejection is made a *non-event* rather than predicted: an

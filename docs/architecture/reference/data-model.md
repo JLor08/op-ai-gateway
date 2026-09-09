@@ -37,7 +37,7 @@ not route-based).
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
-| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics, and the persisted live-progress-capability verdict (migration 76) — a capability, not a metric, so it is not covered by `metrics_locked`. |
+| `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, vision capability, energy/token), concurrency-capacity metrics, the persisted live-progress-capability verdict (migration 76), and the auto-detected capability verdict set (migration 77: `cap_vision`/`cap_video`/`cap_audio`/`cap_tools`/`cap_extra` + provenance) — capabilities, not metrics, so neither is covered by `metrics_locked` (a definitive `cap_vision` verdict is the one exception, syncing the legacy `vision_capable` bool through its own lock-respecting writer). |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -224,7 +224,7 @@ service, or project that produced it.
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, and energy fields. |
 
-## 4. Migration history (76 migrations)
+## 4. Migration history (77 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -429,6 +429,12 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 76 | `model_mappings_live_progress_support` | Two additive columns on `model_mappings` (timings-capability-detection, issue #51 follow-up). `live_progress_support text not null default ''` — the persisted verdict on whether this mapping's upstream tolerates the live-progress streaming parameters: `''` (never determined, the same zero-value-means-unknown convention migration 32's `vision_capable` already uses), `supported`, or `unsupported`. `live_progress_checked_at` (nullable, `dl.timestampType()`, no default) — when that verdict was last determined, mirroring migration 9's `metrics_updated_at`; append-only like migration 75. **Neither column is part of the `metrics_locked` group this table otherwise guards every automated writer with** — see the field semantics below for why a capability is deliberately not covered by it. |
 
+### Auto-detected model capabilities
+
+| # | Migration | Purpose |
+|---|---|---|
+| 77 | `model_mappings_capabilities` | Seven additive columns on `model_mappings` (capability auto-detection from llama.cpp `/props`, #49 sub-project 2), the first six `text not null default ''`. `cap_vision`/`cap_video`/`cap_audio`/`cap_tools` — one three-state verdict apiece, the same `''`(never determined)/`yes`/`no` convention migration 76's `live_progress_support` uses, each written by `UpdateMappingCapabilities` **only when non-empty**, so a partial answer (an older llama.cpp reporting `modalities` but no `chat_template_caps`) never clears a verdict a previous probe already established. `cap_extra` — a JSON-array string of capability names with no column of their own (open-ended upstream vocabulary, e.g. Ollama's manifest-declared capabilities; empty for a llama.cpp source), the same opaque-JSON-in-`text` convention `args`/`env`/`api_flavors` already use elsewhere in this schema. `capabilities_source` — which probe produced the current verdicts (`llama_cpp_props`; `''` before any probe has determined anything). `capabilities_checked_at` (nullable, `dl.timestampType()`, no default) — when last determined, mirroring `live_progress_checked_at`; diagnostics/tooltip only, no decision logic reads it. **None of the seven columns is part of the `metrics_locked` group**, for the identical reason migration 76's pair is not — see the field semantics below, and [ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool) for why a **definitive** `cap_vision` verdict is nonetheless the one case that also writes through the lock-respecting `UpdateMappingVisionCapable`, onto the pre-existing `vision_capable` bool. |
+
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
 
@@ -523,6 +529,21 @@ plausible-looking validation rule would break the normal case:
   provenance to a capability probe. `live_progress_checked_at` is operator
   diagnostics and the portal tooltip only — no decision logic anywhere reads
   it.
+- **`model_mappings.cap_vision`/`cap_video`/`cap_audio`/`cap_tools`/`cap_extra`/
+  `capabilities_source`/`capabilities_checked_at` follow `live_progress_support`'s
+  own precedent above, not `vision_capable`'s** ([ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool)):
+  outside `metrics_locked`, for the identical reason — a capability is not a
+  number an operator vouches for — and `UpdateMappingCapabilities` never
+  restamps `metrics_source`/`metrics_updated_at` either. The **one** exception
+  is `vision_capable` itself: a **definitive** (`"yes"`/`"no"`, never `""`)
+  reported `cap_vision` verdict additionally calls the pre-existing,
+  lock-respecting `UpdateMappingVisionCapable` — the same writer the vision
+  *benchmark* uses, stamping the same `metrics_source = "vision"` — so an
+  operator who has locked a mapping's metrics still has the consumer-visible
+  bool (the models list's AND-aggregate, the portal chat's image gate) pinned
+  against an auto-detected change, exactly as they already expect for every
+  other locked metric. `capabilities_checked_at`, like `live_progress_checked_at`,
+  is diagnostics/tooltip only.
 - **VRAM ownership is split and must stay split.**
   `agent_runtime_spec_gpus.vram_estimate_mb` is operator-owned (written by the
   portal) and `vram_measured_mb` is agent-owned (written only by the telemetry
