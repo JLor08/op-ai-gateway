@@ -10,7 +10,7 @@ import {
   FormControlLabel,
   Typography,
 } from '@mui/material';
-import type { ApplicationStatus, PortalModelMapping } from '../api';
+import type { ApplicationStatus, CapabilityVerdictInput, PortalModelMapping } from '../api';
 import type { Translation, PortalApi } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
@@ -37,25 +37,26 @@ export type MappingFormValues = {
   context_size: number;
   energy_wh_per_token: number;
   /**
-   * The two capability verdicts, sent ONLY when the operator actually moved
-   * that control -- unlike every other key here, which is always emitted.
+   * The capability verdicts the operator actually STATED: one entry per
+   * control they moved -- unlike every other key here, which is always
+   * emitted -- carrying the value they moved it to ('yes', 'no', or '' for
+   * unknown, which DELETES the row).
    *
-   * A capability row whose source is `manual` outranks every probe and the
-   * vision benchmark permanently, so restating a value this form merely READ
-   * would launder an untouched control into an operator verdict. The backend
-   * carries the same differs-from-stored guard; both halves stay, because the
-   * form's seed and the store's row can disagree (a probe can write while the
-   * form is open).
+   * An untouched control contributes no entry at all. A capability row whose
+   * source is `manual` outranks every probe and the vision benchmark for as
+   * long as it stands, so restating a value this form merely READ would
+   * launder an untouched control into an operator verdict.
+   *
+   * The legacy `is_mtp`/`vision_capable` booleans are deliberately NOT part of
+   * this type: they cannot express a negative verdict or unknown (the backend
+   * compares them against a two-state fold, where a stored 'no' and a missing
+   * row are the same `false`), and sending one beside an entry here for the
+   * same capability is a 400. The backend keeps its own
+   * differs-from-what-is-stored guard behind this; both halves stay, because
+   * the form's seed and the store's row can disagree -- a probe can write
+   * while the form is open.
    */
-  is_mtp?: boolean;
-  vision_capable?: boolean;
-  /**
-   * Capabilities the operator moved back to UNKNOWN, which DELETES their rows.
-   * Never sent together with the same capability's boolean above -- that pair
-   * is a 400 -- and never populated by the create form, where nothing is on
-   * file to relinquish.
-   */
-  reset_capabilities?: string[];
+  capability_verdicts?: Record<string, CapabilityVerdictInput>;
   metrics_locked: boolean;
   max_concurrency: number;
   recommended_concurrency: number;
@@ -76,8 +77,11 @@ const text = (n: number | undefined) => (n ? String(n) : '');
  * selectable value, not a placeholder: in the store, unknown is the ABSENCE of
  * a row, so there is no third verdict to write -- moving a control here
  * DELETES the row instead.
+ *
+ * An alias of the wire type rather than a second declaration, so the control's
+ * states and the values `capability_verdicts` accepts cannot drift.
  */
-type CapabilityChoice = '' | 'yes' | 'no';
+type CapabilityChoice = CapabilityVerdictInput;
 
 /**
  * What a capability control is seeded with: the matching capability ROW's
@@ -181,12 +185,16 @@ export function MappingForm({
   // background list refresh must not be able to turn an untouched control into
   // a write. Both are lazy from `row` and never re-synced (see the component's
   // own note on initialisation).
-  const [isMtp, setIsMtp] = useState<CapabilityChoice>(() => capabilitySeed(row, 'mtp'));
+  //
+  // The seed state is declared FIRST and the value state is initialised from
+  // it, so `capabilitySeed` runs once per control rather than twice. Sharing
+  // the computed value is safe precisely because a CapabilityChoice is an
+  // immutable string -- do not extend this pattern to a control whose state is
+  // an object or an array, where the two would then alias one another.
   const [isMtpSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'mtp'));
-  const [visionCapable, setVisionCapable] = useState<CapabilityChoice>(() =>
-    capabilitySeed(row, 'vision'),
-  );
+  const [isMtp, setIsMtp] = useState<CapabilityChoice>(isMtpSeed);
   const [visionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'vision'));
+  const [visionCapable, setVisionCapable] = useState<CapabilityChoice>(visionCapableSeed);
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -270,41 +278,33 @@ export function MappingForm({
   function submit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     // The capability half of the body, and the ONLY part of this form that is
-    // conditional. Three outcomes per control, from the seed diff:
+    // conditional. Two outcomes per control, from the seed diff:
     //
-    //   unchanged        -> send NOTHING. This is what keeps a save made for an
-    //                       unrelated reason (a context-size fix) from minting a
-    //                       permanent `manual` row out of a value the form only
-    //                       ever read.
-    //   moved to yes/no  -> send the boolean. An operator verdict.
-    //   moved to unknown -> name it in reset_capabilities, which DELETES the
-    //                       row. Not a boolean: there is no third verdict to
-    //                       write, and sending both for one capability is a 400.
+    //   unchanged -> no entry at all. This is what keeps a save made for an
+    //                unrelated reason (a context-size fix) from minting a
+    //                permanent `manual` row out of a value the form only ever
+    //                read.
+    //   moved     -> one entry holding the value it was moved TO. 'yes'/'no'
+    //                is an operator verdict; '' DELETES the row, because there
+    //                is no third verdict to write.
     //
-    // On the create form every seed is '' and nothing is on file, so the
-    // unknown branch is unreachable there by construction.
-    const capabilities: Pick<
-      MappingFormValues,
-      'is_mtp' | 'vision_capable' | 'reset_capabilities'
-    > = {};
-    const reset: string[] = [];
+    // The legacy `is_mtp`/`vision_capable` booleans are never sent for these
+    // two capabilities: they cannot express a negative or unknown, and sending
+    // one beside an entry for the same capability is a 400.
+    //
+    // On the create form every seed is '' and nothing is on file, so the ''
+    // value is unreachable there by construction -- an operator who opens the
+    // control and puts it back has changed nothing.
+    const verdicts: Record<string, CapabilityVerdictInput> = {};
     for (const control of [
-      { capability: 'mtp', value: isMtp, seed: isMtpSeed, key: 'is_mtp' },
-      {
-        capability: 'vision',
-        value: visionCapable,
-        seed: visionCapableSeed,
-        key: 'vision_capable',
-      },
+      { capability: 'mtp', value: isMtp, seed: isMtpSeed },
+      { capability: 'vision', value: visionCapable, seed: visionCapableSeed },
     ] as const) {
       if (control.value === control.seed) continue;
-      if (control.value === '') {
-        reset.push(control.capability);
-        continue;
-      }
-      capabilities[control.key] = control.value === 'yes';
+      verdicts[control.capability] = control.value;
     }
-    if (reset.length > 0) capabilities.reset_capabilities = reset;
+    const capabilities: Pick<MappingFormValues, 'capability_verdicts'> =
+      Object.keys(verdicts).length > 0 ? { capability_verdicts: verdicts } : {};
     onSubmit({
       gateway_model_name: gatewayName,
       app_model_name: appName,

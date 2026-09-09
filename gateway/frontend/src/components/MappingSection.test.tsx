@@ -164,22 +164,22 @@ function renderSection(
     }),
     updateMapping: vi.fn(async (id: string, body: UpdateMappingRequest) => {
       updated.push({ id, body });
-      // Faithful enough about CAPABILITIES for the reset to be observable,
-      // because that is the whole point of the round trip: a reset DELETES the
-      // row, a boolean writes a `manual` one, and the response carries
-      // POST-write truth -- which is what the re-opened form seeds from. A
-      // fake that echoed the request back would hide exactly the defect the
-      // reset's design exists to prevent.
-      const { reset_capabilities: reset = [], is_mtp, vision_capable, ...fields } = body;
+      // Faithful enough about CAPABILITIES for the three states to be
+      // observable, because that is the whole point of the round trip: ''
+      // DELETES the row, 'yes'/'no' writes a `manual` one, and the response
+      // carries POST-write truth -- which is what the re-opened form seeds
+      // from. A fake that echoed the request back would hide exactly the
+      // defect this design exists to prevent.
+      const { capability_verdicts: verdicts = {}, ...fields } = body;
       const current = mappingState.get(id);
-      const caps = (current?.capabilities ?? []).filter((c) => !reset.includes(c.capability));
-      for (const [capability, value] of [
-        ['mtp', is_mtp],
-        ['vision', vision_capable],
-      ] as const) {
-        if (value === undefined) continue;
-        const row = capRow(capability, value ? 'yes' : 'no');
+      const caps = [...(current?.capabilities ?? [])];
+      for (const [capability, verdict] of Object.entries(verdicts)) {
         const at = caps.findIndex((c) => c.capability === capability);
+        if (verdict === '') {
+          if (at >= 0) caps.splice(at, 1);
+          continue;
+        }
+        const row = capRow(capability, verdict);
         if (at >= 0) caps[at] = row;
         else caps.push(row);
       }
@@ -268,13 +268,18 @@ describe('MappingSection performance metrics', () => {
       prompt_tokens_per_second: 200.25,
       load_time_ms: 1500,
       context_size: 131072,
-      is_mtp: true,
-      vision_capable: true,
+      // The two capability controls travel in the authoritative field, never
+      // as the legacy booleans: those are plain bools on the create request,
+      // so they can only ever say "yes" and an unset `false` is
+      // indistinguishable from a control nobody looked at.
+      capability_verdicts: { mtp: 'yes', vision: 'yes' },
       metrics_locked: true,
       max_concurrency: 16,
       recommended_concurrency: 8,
       gen_tokens_per_second_at_capacity: 640.5,
     });
+    expect(created[0].body).not.toHaveProperty('is_mtp');
+    expect(created[0].body).not.toHaveProperty('vision_capable');
   });
 
   it('populates every metric field on edit and resubmits them unchanged', async () => {
@@ -342,18 +347,19 @@ describe('MappingSection performance metrics', () => {
       recommended_concurrency: 8,
       gen_tokens_per_second_at_capacity: 640.5,
     });
-    // The two capability keys are the ONE exception to "resubmits them
+    // The capability controls are the ONE exception to "resubmits them
     // unchanged", and it is deliberate: a `manual` capability row outranks
-    // every probe and the vision benchmark permanently, so an untouched
-    // control must not be restated as an operator verdict. Unchanged means
-    // ABSENT -- neither the boolean nor a reset.
+    // every probe and the vision benchmark for as long as it stands, so an
+    // untouched control must not be restated as an operator verdict.
+    // Unchanged means ABSENT -- no entry in the authoritative field, and never
+    // the legacy booleans either.
+    expect(updated[0].body).not.toHaveProperty('capability_verdicts');
     expect(updated[0].body).not.toHaveProperty('is_mtp');
     expect(updated[0].body).not.toHaveProperty('vision_capable');
-    expect(updated[0].body).not.toHaveProperty('reset_capabilities');
   });
 });
 
-describe('MappingSection capability reset', () => {
+describe('MappingSection capability verdicts', () => {
   it('is not undone by the next unrelated save', async () => {
     // The defect the whole design shape exists to prevent, end to end through
     // the screen that owns the save. `MappingForm` seeds ONCE and never
@@ -380,12 +386,12 @@ describe('MappingSection capability reset', () => {
     await pickOption(t.mappingVisionCapable, t.mappingCapabilityUnknown);
     fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
     await waitFor(() => expect(updated).toHaveLength(1));
-    expect(updated[0].body.reset_capabilities).toEqual(['vision']);
+    expect(updated[0].body.capability_verdicts).toEqual({ vision: '' });
 
     // SAVE 2: re-open the SAME mapping and change only the context size. The
-    // control must have re-seeded to unknown, so neither capability key may be
-    // sent -- if it re-seeded to the pre-reset "yes", this body would carry
-    // `vision_capable: true` and mint the permanent row all over again.
+    // control must have re-seeded to unknown, so no capability entry may be
+    // sent at all -- if it re-seeded to the pre-reset "yes", this body would
+    // carry `{vision: 'yes'}` and mint the permanent row all over again.
     await waitFor(() => expect(screen.getByRole('button', { name: t.mappingEdit })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: t.mappingEdit }));
     expect(screen.getByRole('combobox', { name: t.mappingVisionCapable }).textContent).toBe(
@@ -396,8 +402,8 @@ describe('MappingSection capability reset', () => {
 
     await waitFor(() => expect(updated).toHaveLength(2));
     expect(updated[1].body.context_size).toBe(262144);
+    expect(updated[1].body).not.toHaveProperty('capability_verdicts');
     expect(updated[1].body).not.toHaveProperty('vision_capable');
-    expect(updated[1].body).not.toHaveProperty('reset_capabilities');
   });
 });
 

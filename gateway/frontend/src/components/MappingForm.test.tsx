@@ -144,7 +144,7 @@ describe('MappingForm capability controls', () => {
     expect(screen.getByText(t.mappingVisionCapableUnknownHint)).toBeInTheDocument();
   });
 
-  it('sends a reset when a control moves TO unknown, and never the boolean too', async () => {
+  it('sends an EMPTY verdict when a control moves TO unknown, and no legacy boolean', async () => {
     const { submitted } = renderForm({
       row: makeMapping({ capabilities: [capRow('vision', 'yes'), capRow('mtp', 'yes')] }),
     });
@@ -152,16 +152,19 @@ describe('MappingForm capability controls', () => {
     await save();
 
     await waitFor(() => expect(submitted).toHaveLength(1));
-    expect(submitted[0].reset_capabilities).toEqual(['vision']);
-    // Both for one capability is a 400: "return it to unknown" and "the
-    // verdict is yes/no" are two different instructions about one row.
+    // Only the moved control, and only in the authoritative field: '' asks
+    // for the row to be DELETED, which is the only way back out of a `manual`
+    // verdict. The UNTOUCHED control contributes no entry at all -- not a
+    // value restating what the form merely read, and not an empty one either.
+    expect(submitted[0].capability_verdicts).toEqual({ vision: '' });
+    // Never the legacy booleans for these two: naming a capability here AND
+    // sending its boolean is a 400 (two statements about one row), and a
+    // boolean cannot express '' in the first place.
     expect(submitted[0]).not.toHaveProperty('vision_capable');
-    // The UNTOUCHED control sends nothing at all -- not a boolean restating
-    // what the form merely read, and not a reset either.
     expect(submitted[0]).not.toHaveProperty('is_mtp');
   });
 
-  it('sends the boolean for a moved verdict and NOTHING for an untouched control', async () => {
+  it('sends the verdict for a moved control and NOTHING for an untouched one', async () => {
     const { submitted } = renderForm({
       row: makeMapping({ capabilities: [capRow('vision', 'yes'), capRow('mtp', 'yes')] }),
     });
@@ -171,9 +174,30 @@ describe('MappingForm capability controls', () => {
     await save();
 
     await waitFor(() => expect(submitted).toHaveLength(1));
-    expect(submitted[0].vision_capable).toBe(false);
-    expect(submitted[0]).not.toHaveProperty('reset_capabilities');
+    expect(submitted[0].capability_verdicts).toEqual({ vision: 'no' });
+    expect(submitted[0]).not.toHaveProperty('vision_capable');
     expect(submitted[0]).not.toHaveProperty('is_mtp');
+  });
+
+  it('sends "no" for a control moved from UNKNOWN, which a boolean could not state', async () => {
+    // The half of the defect that lives on this side of the wire. With
+    // nothing determined the control reads unknown, and an operator picking
+    // *Nein* is stating something real -- a `manual` "no" is what stops a
+    // later probe from writing "yes". The old form expressed that as
+    // `vision_capable: false`, which the backend compared against the
+    // two-state fold of the stored rows, where a missing row is ALSO `false`:
+    // no difference, nothing written, an ordinary 200, and the re-opened form
+    // read unknown again. The verdict has to travel as a stated value.
+    const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+    expect(screen.getByRole('combobox', { name: t.mappingVisionCapable }).textContent).toBe(
+      t.mappingCapabilityUnknown,
+    );
+    await pickOption(t.mappingVisionCapable, t.mappingCapabilityNo);
+    await save();
+
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0].capability_verdicts).toEqual({ vision: 'no' });
+    expect(submitted[0]).not.toHaveProperty('vision_capable');
   });
 
   it('sends neither key when a control is moved away and back to its seed', async () => {
@@ -188,15 +212,14 @@ describe('MappingForm capability controls', () => {
     await save();
 
     await waitFor(() => expect(submitted).toHaveLength(1));
-    expect(submitted[0]).not.toHaveProperty('vision_capable');
-    expect(submitted[0]).not.toHaveProperty('reset_capabilities');
+    expect(submitted[0]).not.toHaveProperty('capability_verdicts');
   });
 
-  it('never emits a reset from the CREATE form', async () => {
+  it('never emits an empty verdict from the CREATE form', async () => {
     // Nothing is on file for a mapping that does not exist yet, so every seed
-    // is unknown and the "moved TO unknown" branch is unreachable. A create
-    // that carried reset_capabilities would be asking to delete rows under a
-    // mapping id that has none.
+    // is unknown and an operator who opens a control and puts it back has
+    // changed nothing. A create that carried `{vision: ''}` would be asking
+    // to delete a row under a mapping id that has none.
     const { submitted } = renderForm({ row: null });
     expect(screen.getByRole('combobox', { name: t.mappingVisionCapable }).textContent).toBe(
       t.mappingCapabilityUnknown,
@@ -208,7 +231,7 @@ describe('MappingForm capability controls', () => {
     fireEvent.click(screen.getByRole('button', { name: t.mappingCreate }));
 
     await waitFor(() => expect(submitted).toHaveLength(1));
-    expect(submitted[0]).not.toHaveProperty('reset_capabilities');
+    expect(submitted[0]).not.toHaveProperty('capability_verdicts');
     expect(submitted[0]).not.toHaveProperty('vision_capable');
   });
 
@@ -232,8 +255,8 @@ describe('MappingForm capability controls', () => {
     await save();
 
     await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0]).not.toHaveProperty('capability_verdicts');
     expect(submitted[0]).not.toHaveProperty('vision_capable');
-    expect(submitted[0]).not.toHaveProperty('reset_capabilities');
   });
 
   it('leaves metrics_locked a CHECKBOX', () => {
