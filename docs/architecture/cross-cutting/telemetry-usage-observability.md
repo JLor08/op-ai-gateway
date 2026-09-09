@@ -944,7 +944,9 @@ applications rather than trusting a field an agent supplied. What the two
 DO genuinely share: best-effort so a write failure never rejects the sample
 (or, on the app-health side, the probe pass); the shared
 `WritableCapabilityRows` gate — the rank first, then compare-to-stored — so an
-outranked or an already-agreeing verdict issues no write at all; one atomic
+outranked verdict, or one that already agrees **at the same rank**, issues no
+write at all, while a higher-ranked writer's agreeing verdict still lands
+because the rank is itself new information; one atomic
 `UpsertMappingCapabilities` per mapping, so a multi-verdict answer is never
 half-applied; and no `metrics_locked` guard and no restamping of
 `metrics_source`/`metrics_updated_at`. The two writers are
