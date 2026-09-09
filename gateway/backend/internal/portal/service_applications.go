@@ -1472,13 +1472,14 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	// same N+1 guard Service.ModelServers documents at length).
 	//
 	// Deliberately NOT best-effort, unlike the model-servers listing's read:
-	// this listing is what MappingForm.tsx SEEDS its vision/MTP checkboxes
-	// from, and the form submits both back on every save. A read failure that
-	// degraded to "nothing determined" would seed a `false` the store does not
-	// hold, and UpdateMapping's differs-from-stored rule would then read that
-	// lie as the operator's own decision and write a PERMANENT manual row (see
-	// manualCapabilityRow). An error the operator can see and retry is
-	// strictly better than a form that quietly mis-states what is stored.
+	// this listing is what MappingForm.tsx SEEDS its two capability selects
+	// from -- each from the matching row in Capabilities, and the seed is what
+	// the save is diffed against. A read failure that degraded to "nothing
+	// determined" would seed UNKNOWN over a stored verdict, so the operator's
+	// next choice would look like a change from unknown and write a PERMANENT
+	// manual row (see manualCapabilityRow). An error the operator can see and
+	// retry is strictly better than a form that quietly mis-states what is
+	// stored.
 	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 	if err != nil {
 		return MappingListResponse{}, err
@@ -1764,19 +1765,21 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// guess. Two things need them, and they are the two halves of the same
 	// guarantee:
 	//
-	//  1. The differs-from-stored rule below. MappingForm.tsx ALWAYS submits
-	//     vision_capable and is_mtp, whatever field the operator actually
-	//     came to edit, so a non-nil pointer means "the form was submitted",
-	//     NOT "the operator changed this". Writing a manual row on the
-	//     pointer alone let an unrelated edit (a context_size fix, say)
-	//     replace a probe's verdict with a permanent manual one -- and a
-	//     manual row outranks every probe AND the benchmark forever, with no
-	//     operator-reachable way back (manualCapabilityRow). Only a value
-	//     that DIFFERS from what is stored is an operator decision, so only
-	//     that writes.
-	//  2. mappingDTO's is_mtp/vision_capable, which that same form seeds
-	//     from -- so an untouched checkbox round-trips the truth rather than
-	//     a stale snapshot.
+	//  1. The differs-from-stored rule below. A client may submit
+	//     vision_capable and is_mtp on EVERY save whatever field the operator
+	//     actually came to edit -- MappingForm.tsx did exactly that until it
+	//     learnt to send only a control the operator moved, and an old cached
+	//     bundle or a script still can -- so a non-nil pointer means "the
+	//     form was submitted", NOT "the operator changed this". Writing a
+	//     manual row on the pointer alone let an unrelated edit (a
+	//     context_size fix, say) replace a probe's verdict with a permanent
+	//     manual one, and a manual row outranks every probe AND the benchmark
+	//     for as long as it stands (manualCapabilityRow). Only a value that
+	//     DIFFERS from what is stored is an operator decision, so only that
+	//     writes.
+	//  2. mappingDTO's Capabilities array and its is_mtp/vision_capable fold,
+	//     which that same form seeds from -- so an untouched control
+	//     round-trips the truth rather than a stale snapshot.
 	//
 	// The comparison is against capabilityVerdictBool, the exact two-state
 	// fold the form was seeded with, NOT the raw three-state verdict: an
@@ -2258,24 +2261,26 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
 // "nothing determined").
 //
-// IsMtp/VisionCapable come from those ROWS. That is a CORRECTNESS
-// requirement, not tidiness, and it is why the is_mtp/vision_capable columns
-// #49-3 retired every automated writer of could not simply be left inert:
-// MappingForm.tsx seeds its two checkboxes from these fields and submits both
-// back on EVERY save, whatever field the operator actually came to edit.
-// Seeding them from a column nothing writes any more would hand the form a
-// stale `false`, and the save would then report that stale value as the
-// operator's own verdict: a manual row outranking every probe and the vision
-// benchmark permanently, with no operator-reachable way back (see
-// manualCapabilityRow). Reading the row is what makes an untouched checkbox
-// round-trip the TRUTH; UpdateMapping's differs-from-stored check is the
-// other half of the same guarantee.
+// Capabilities is what MappingForm.tsx SEEDS its two capability selects
+// from: one entry per determined row, and the ABSENCE of an entry is the
+// third state. IsMtp/VisionCapable are the two-state fold of the same rows,
+// kept for the five frontend sites and six test files that read them (and for
+// the legacy request booleans' differs-from-stored comparison in
+// UpdateMapping) -- a control seeded from them could never SHOW unknown, let
+// alone return a capability to it, because they read a determined "no" and a
+// missing row as the same `false`.
 //
-// Capabilities publishes the SAME rows unfolded, and it is what lets the form
-// offer the third state at all: a two-state boolean cannot tell "no" apart
-// from "no row", so a control seeded from IsMtp/VisionCapable could never
-// show -- let alone return a capability to -- unknown
-// (UpdateMappingRequest.ResetCapabilities).
+// Both halves coming from the ROWS is a CORRECTNESS requirement rather than
+// tidiness, and it is why the is_mtp/vision_capable columns #49-3 retired
+// every automated writer of could not simply be left inert. A form seeded
+// from a column nothing writes any more would show a stale `false`; the
+// operator's next choice would then differ from a value the store does not
+// hold, and the save would report it as their own verdict -- a manual row
+// outranking every probe and the vision benchmark for as long as it stands
+// (see manualCapabilityRow). Reading the row is what makes the form's seed
+// the truth; UpdateMapping's compare-before-write is the other half of the
+// same guarantee, and the way back out is
+// UpdateMappingRequest.ResetCapabilities.
 func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,

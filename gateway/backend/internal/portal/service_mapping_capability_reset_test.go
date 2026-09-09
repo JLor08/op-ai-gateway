@@ -122,9 +122,11 @@ func formCapabilityFields(seeded, chosen string) (boolean *bool, reset bool) {
 // and writes a PERMANENT manual row. An ordinary 200, nothing on screen, and
 // the capability is frozen against every probe and the benchmark again.
 //
-// Both saves here are built by the two helpers above from the DTO the previous
-// call actually returned, so the second body is the one the real form would
-// produce -- not one chosen to pass.
+// Both saves here have their capability half DERIVED by the two helpers above
+// from the DTO the previous call actually returned, so the second body is the
+// one the real form would produce rather than one chosen to pass. The helpers
+// themselves are not asserted on -- a test that checks its own helper against
+// its own doc comment proves nothing about either side of the wire.
 func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
@@ -153,14 +155,15 @@ func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	// SAVE 1: the operator moves vision to unknown. Everything else is
 	// re-submitted exactly as the form was seeded.
 	visionBool, visionReset := formCapabilityFields(seededVerdict(before, routing.CapabilityVision), "")
-	if visionBool != nil || !visionReset {
-		t.Fatalf("form fields for yes -> unknown = (%v, %v), want (nil, true)", visionBool, visionReset)
-	}
-	reset, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+	req1 := UpdateMappingRequest{
 		GatewayModelName: &before.GatewayModelName, AppModelName: &before.AppModelName,
 		Status: &before.Status, ContextSize: &before.ContextSize,
-		ResetCapabilities: []string{routing.CapabilityVision},
-	})
+		VisionCapable: visionBool,
+	}
+	if visionReset {
+		req1.ResetCapabilities = []string{routing.CapabilityVision}
+	}
+	reset, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, req1)
 	if err != nil {
 		t.Fatalf("UpdateMapping (reset vision): %v", err)
 	}
@@ -177,21 +180,25 @@ func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	}
 
 	// SAVE 2: an entirely unrelated edit -- only the context size moves. The
-	// capability controls are seeded from SAVE 1's response, so an unchanged
-	// unknown must send NEITHER field.
-	visionBool, visionReset = formCapabilityFields(seededVerdict(reset, routing.CapabilityVision), "")
-	if visionBool != nil || visionReset {
-		t.Fatalf("form fields for unknown -> unknown = (%v, %v), want (nil, false) -- an unchanged control sends nothing", visionBool, visionReset)
-	}
+	// capability control is seeded from SAVE 1's response and the operator
+	// leaves it alone, so whatever the form's own rule makes of that seed is
+	// what goes on the wire -- derived, not hand-picked.
+	//
 	// Re-wire the service so the second save's capability WRITES are counted:
 	// the stored row surviving absent is necessary but not sufficient, since a
 	// manual row written and then read back looks like any other row.
 	svc2 := newServerTestServiceWithRoutes(t, now, upserts)
 	newCtxSize := 262144
-	after, err := svc2.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+	visionBool, visionReset = formCapabilityFields(seededVerdict(reset, routing.CapabilityVision), "")
+	req2 := UpdateMappingRequest{
 		GatewayModelName: &reset.GatewayModelName, AppModelName: &reset.AppModelName,
 		Status: &reset.Status, ContextSize: &newCtxSize,
-	})
+		VisionCapable: visionBool,
+	}
+	if visionReset {
+		req2.ResetCapabilities = []string{routing.CapabilityVision}
+	}
+	after, err := svc2.UpdateMapping(ctx, ownerToken(), fx.mappingID, req2)
 	if err != nil {
 		t.Fatalf("UpdateMapping (unrelated edit): %v", err)
 	}

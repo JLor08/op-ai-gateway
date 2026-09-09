@@ -1951,18 +1951,20 @@ func (c *capabilityWriteRecorder) UpsertMappingCapabilities(ctx context.Context,
 }
 
 // TestUpdateMappingUnchangedFormSubmissionDoesNotWriteAManualRow is the
-// regression guard for the whole point of this path: MappingForm.tsx ALWAYS
-// submits vision_capable and is_mtp, whatever field the operator actually
-// came to edit, so a non-nil pointer means "the form was submitted", NOT "the
-// operator changed this". Writing a manual row on the pointer alone meant
-// that editing an unrelated field -- context_size here -- replaced a probe's
-// verdict with a manual one, and a manual row outranks every probe AND the
-// vision benchmark forever, with no operator-reachable way back: the portal
-// chat's image attach would go dark for that model permanently.
+// regression guard for the legacy request booleans: a client may submit
+// vision_capable and is_mtp on every save whatever field the operator
+// actually came to edit -- MappingForm.tsx did exactly that until it learnt
+// to send only a control the operator moved, and an old cached bundle or a
+// script still can -- so a non-nil pointer means "the form was submitted",
+// NOT "the operator changed this". Writing a manual row on the pointer alone
+// meant that editing an unrelated field -- context_size here -- replaced a
+// probe's verdict with a manual one, and a manual row outranks every probe
+// AND the vision benchmark for as long as it stands: the portal chat's image
+// attach would go dark for that model until someone cleared the row.
 //
-// So: probe-written vision AND mtp rows, then a FULL form submission (every
-// field the mask emits) that edits context_size and re-submits both
-// capability values exactly as the DTO handed them over. Nothing may be
+// So: probe-written vision AND mtp rows, then a FULL always-submit body
+// (every field the old mask emitted) that edits context_size and re-submits
+// both capability values exactly as the DTO handed them over. Nothing may be
 // written, and both rows must survive byte-identical -- source and
 // checked_at included, since a manual re-write of the same verdict would
 // change both while leaving the verdict alone.
