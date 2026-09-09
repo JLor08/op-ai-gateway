@@ -259,15 +259,31 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 // this; migration79Up's are checked against the one index on model_mappings
 // (idx_model_mappings_application on application_id).
 //
+// That refusal is only a safety net if it can actually be SEEN, which is
+// what makes the swallow's precision load-bearing rather than cosmetic:
+// sqlite words every refusal as `error in <object> after drop column: no
+// such column: <col>`, so a swallow matching "no such column" anywhere in
+// the message hides exactly the error the paragraph above relies on -- a
+// blocked drop would be reported as "the column is already gone", leaving
+// sqlite with the column and postgres (`drop column if exists`) without it,
+// the migration recorded as applied, and no diagnostic anywhere. So the
+// swallow matches the absent-column error and nothing else: that one names
+// the column in DOUBLE QUOTES (`no such column: "note"`) and carries no
+// `after drop column` clause, while every refusal is the other way round on
+// both counts. Either half alone would discriminate; both are checked so a
+// future sqlite rewording of one does not silently restore the trap.
+//
 // migration79Up is the first and only caller. See
-// TestDropColumnIfPresentSQLite for coverage of both the present and the
-// already-absent case.
+// TestDropColumnIfPresentSQLite for the present, the already-absent, the
+// nonexistent-table and the BLOCKED cases.
 func dropColumnIfPresent(ctx context.Context, tx *sql.Tx, dl dialect, table, column string) error {
 	if dl.name() == "postgres" {
 		return execTx(ctx, tx, dl, "alter table "+table+" drop column if exists "+column)
 	}
 	if _, err := tx.ExecContext(ctx, "alter table "+table+" drop column "+column); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no such column") {
+		msg := strings.ToLower(err.Error())
+		absent := strings.Contains(msg, `no such column: "`+strings.ToLower(column)+`"`)
+		if absent && !strings.Contains(msg, "after drop column") {
 			return nil
 		}
 		return err

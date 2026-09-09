@@ -554,6 +554,15 @@ func TestAddColumnIfMissingSQLite(t *testing.T) {
 // swallowed no-op rather than sqlite's "no such column", and a genuine
 // failure (a table that does not exist) still surfaces. The replayability
 // the middle case buys is what makes migration 79 safe to re-run.
+//
+// The last case is the one the helper's own safety argument rests on and the
+// only one where a too-broad swallow is WRONG: sqlite refuses to drop a
+// column an index depends on, and words that refusal `error in index <name>
+// after drop column: no such column: <col>` -- the same substring the
+// already-absent case matches. Swallowed, a blocked drop would leave sqlite
+// with the column, postgres (`drop column if exists`) without it, and the
+// migration recorded as applied. So the refusal must reach the caller as an
+// error, and the column must still be there afterwards.
 func TestDropColumnIfPresentSQLite(t *testing.T) {
 	ctx := context.Background()
 	s := openTestSQLite(t)
@@ -608,6 +617,33 @@ func TestDropColumnIfPresentSQLite(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "no such column") {
 		t.Fatalf("dropColumnIfPresent on a nonexistent table was mistaken for an absent-column error: %v", err)
+	}
+
+	// A BLOCKED drop: sqlite refuses to drop a column an index depends on,
+	// and its refusal contains "no such column" too. It must surface as an
+	// error, not be swallowed as "already absent".
+	if _, err := s.db.ExecContext(ctx, `create table gadgets (id text primary key, label text not null default '')`); err != nil {
+		t.Fatalf("create gadgets: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `create index idx_gadgets_label on gadgets (label)`); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	tx, err = s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = dropColumnIfPresent(ctx, tx, s.dl, "gadgets", "label")
+	_ = tx.Rollback()
+	if err == nil {
+		t.Fatalf("dropColumnIfPresent on an INDEXED column returned nil -- sqlite refused the drop and the error was swallowed as \"already absent\", " +
+			"which would leave sqlite with the column, postgres without it, and the migration recorded as applied")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "after drop column") {
+		t.Fatalf("dropColumnIfPresent on an indexed column returned %v, want sqlite's blocked-drop refusal", err)
+	}
+	var stillThere int
+	if err := s.db.QueryRowContext(ctx, `select count(*) from pragma_table_info('gadgets') where name='label'`).Scan(&stillThere); err != nil || stillThere != 1 {
+		t.Fatalf("the blocked column must still be present: n=%d err=%v", stillThere, err)
 	}
 }
 
