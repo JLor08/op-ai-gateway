@@ -408,6 +408,81 @@ func detectCapabilities(body []byte) Capabilities {
 	return out
 }
 
+// detectOllamaCapabilities is the Ollama sibling of detectCapabilities
+// (#54 project, task 1): it reads the "capabilities" array of a
+// POST /api/show response body and maps each declared name to a
+// Capabilities verdict.
+//
+// The evidence rule is asymmetric with detectCapabilities' modalities/
+// chat_template_caps rule, and deliberately so: this function can NEVER
+// produce "no". Verified against Ollama's own Go source (server/model.go /
+// server/routes.go, ollama/ollama): the capabilities array it returns is NOT
+// exhaustive. Upstream logs "unknown capabilities for model" when detection
+// yields an empty result rather than treating that as a real answer; the
+// JSON field is `omitempty`, so it can be entirely absent for reasons that
+// have nothing to do with what the model can do; a failed model-file read
+// silently shortens the list before it is ever serialized; the detection
+// itself is substring heuristics run over the chat template, not a
+// declared/compiled fact; and at least one filter deliberately strips a real
+// capability back out for certain builds. A name's ABSENCE from this array
+// therefore means "Ollama did not tell us", never "this model cannot do
+// that" -- so every field this function writes is "" (unknown) or "yes",
+// and a caller must never read a zero Capabilities field coming out of this
+// function as "no".
+//
+//   - "completion" is dropped on purpose, not filed under Extra as unknown
+//     noise: upstream ASSUMES this capability whenever a model has no
+//     pooling_type, rather than detecting it, so its presence or absence in
+//     the array is not evidence of anything and must not be surfaced at
+//     all.
+//   - "image" is NOT vision. In Ollama's own model this name is the
+//     image-GENERATION capability -- it was introduced as
+//     CapabilityImageGeneration, its error string reads "image generation",
+//     and the only code path that ever required it guards the
+//     /v1/images/generations endpoint. It is filed under Extra like any
+//     other unmapped name and must never be written to the Vision field.
+//   - unrecognized names ("thinking", a future/publisher-specific string,
+//     ...) are kept verbatim in Extra so they are visible without this
+//     detector needing to know about them in advance.
+//   - duplicates collapse to their first occurrence, in both the structured
+//     fields (idempotent by construction) and Extra (explicit dedup).
+//
+// This function is AGENT-ONLY today: server-agent is the only module that
+// probes Ollama's /api/show, so unlike detectCapabilities and
+// detectLiveProgressSupport above -- which exist as byte-identical copies in
+// both server-agent and gateway/backend because both modules probe
+// llama.cpp's /props -- this one has no gateway-side twin yet. It becomes
+// one, and must then be kept byte-identical to it the same way, the day the
+// gateway gains its own Ollama probe.
+func detectOllamaCapabilities(body []byte) Capabilities {
+	var doc struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return Capabilities{}
+	}
+	var caps Capabilities
+	seen := make(map[string]bool, len(doc.Capabilities))
+	for _, raw := range doc.Capabilities {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" || name == "completion" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		switch name {
+		case "vision":
+			caps.Vision = "yes"
+		case "tools":
+			caps.Tools = "yes"
+		case "audio":
+			caps.Audio = "yes"
+		default:
+			caps.Extra = append(caps.Extra, name)
+		}
+	}
+	return caps
+}
+
 // capVerdict maps a JSON bool to "yes"/"no" and everything else -- absent,
 // null, a string, a number -- to "" (not evidence).
 func capVerdict(v any) string {

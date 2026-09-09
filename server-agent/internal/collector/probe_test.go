@@ -387,6 +387,60 @@ func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
 	}
 }
 
+// TestDetectOllamaCapabilities is the decision-rule test for the Ollama
+// sibling of detectCapabilities (#54 project, task 1): it reads the
+// "capabilities" array of a POST /api/show response body, per
+// detectOllamaCapabilities's own doc comment.
+//
+// The load-bearing cases are the ones that look like they should assert "no"
+// and deliberately do not: Ollama's own capabilities array is NOT exhaustive
+// (upstream logs "unknown capabilities for model" for an empty result, the
+// field is `omitempty`, a failed model-file read silently shortens the list,
+// and detection is substring heuristics over the chat template), so a
+// missing name can only ever mean UNKNOWN, never a denial. This function
+// therefore has no way to produce "no" at all -- every field it ever writes
+// is "" or "yes".
+//
+//   - "completion" is dropped: upstream ASSUMES it whenever a model has no
+//     pooling_type, so its presence or absence carries no evidence either
+//     way.
+//   - "image" is Ollama's image-GENERATION capability (born as
+//     CapabilityImageGeneration, backing /v1/images/generations), not
+//     vision, so it must land in Extra and never touch the Vision field.
+func TestDetectOllamaCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want Capabilities
+	}{
+		{"absent field is undetermined, not denial", `{"model_info":{}}`, Capabilities{}},
+		{"empty array is undetermined", `{"capabilities":[]}`, Capabilities{}},
+		{
+			"structured names map to structured fields", `{"capabilities":["vision","tools","audio"]}`,
+			Capabilities{Vision: "yes", Tools: "yes", Audio: "yes"},
+		},
+		{"completion is dropped, it is an upstream assumption", `{"capabilities":["completion"]}`, Capabilities{}},
+		{"image is NOT vision", `{"capabilities":["image"]}`, Capabilities{Extra: []string{"image"}}},
+		{
+			"unknown publisher strings are kept verbatim", `{"capabilities":["thinking","weather.v2"]}`,
+			Capabilities{Extra: []string{"thinking", "weather.v2"}},
+		},
+		{
+			"duplicates collapse, first occurrence wins", `{"capabilities":["insert","insert"]}`,
+			Capabilities{Extra: []string{"insert"}},
+		},
+		{"a name is never a no", `{"capabilities":["tools"]}`, Capabilities{Tools: "yes"}},
+		{"malformed json yields nothing rather than panicking", `not json`, Capabilities{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectOllamaCapabilities([]byte(tc.body))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("detectOllamaCapabilities(%s) = %+v, want %+v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this
 // probe GETs collector.LiveProgressProbePath ("/props") unconditionally,
 // with NO specType parameter at all -- unlike ProbeContext, it never
