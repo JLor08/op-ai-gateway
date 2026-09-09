@@ -123,12 +123,16 @@ func TestCandidacyDoesNotModeGateServerAgent(t *testing.T) {
 	}
 }
 
-// TestTargetCarriesLiveProgressVerdictFromMapping pins that targetFrom copies the
-// mapping's persisted live-progress verdict onto Target.LiveProgressSupport for
-// an ORDINARY (non-server_agent) application, and that LiveProgressSpecType
-// stays empty there — set only for server_agent (provider/wantsLiveProgress's
-// server_agent clause must never be accidentally satisfied by another type).
-func TestTargetCarriesLiveProgressVerdictFromMapping(t *testing.T) {
+// TestTargetCarriesLiveProgressVerdictFromCapabilityRow pins that targetFrom
+// copies the JOINED "live_progress" capability row's verdict onto
+// Target.LiveProgressSupport for an ORDINARY (non-server_agent) application --
+// NOT the mapping's own persisted (frozen, pre-migration-78)
+// ModelMapping.LiveProgressSupport column, which this test's setup leaves at
+// its zero value specifically to prove the read no longer depends on it. It
+// also pins that LiveProgressSpecType stays empty there — set only for
+// server_agent (provider/wantsLiveProgress's server_agent clause must never
+// be accidentally satisfied by another type).
+func TestTargetCarriesLiveProgressVerdictFromCapabilityRow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	store := seededResolverStore(t, now) // app_fast/map_fast: Type=mock

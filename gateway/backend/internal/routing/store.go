@@ -865,7 +865,11 @@ type MappingCandidate struct {
 	// they are the same type. Keeping the verdict on MappingCandidate instead
 	// makes "this came from the join" a fact the TYPE carries, not a fact a
 	// caller has to remember. ModelMapping.IsMTP is removed only once every
-	// remaining reader has moved off it (Task 6).
+	// remaining reader has moved off it (Task 6) -- true for this field: the
+	// only other readers are the portal (scoped into Task 5) and ModelMapping's
+	// own population sites (scoped into Task 6 itself). Contrast with
+	// LiveProgressSupport below, where the identical-looking sentence does NOT
+	// hold.
 	IsMTP bool
 	// LiveProgressSupport is the mapping's "live_progress" capability verdict,
 	// filled the same way and for the same reason as IsMTP above, via
@@ -873,14 +877,34 @@ type MappingCandidate struct {
 	// "supported" for a "yes" row, "unsupported" for a "no" row -- the same
 	// vocabulary ModelMapping.LiveProgressSupport and Target.LiveProgressSupport
 	// already speak. targetFrom reads THIS field, NOT Mapping.LiveProgressSupport,
-	// when building a Target from a MappingCandidate that went through
-	// ActiveMappingsForModel.
+	// when building a Target from a MappingCandidate -- whether that candidate
+	// came from ActiveMappingsForModel's join or (as of Task 4's fix round)
+	// resolveAffinity's synthetic candidate, which now issues its own
+	// MappingCapabilities read rather than copying the mapping's frozen column
+	// (see resolveAffinity's comment).
 	//
 	// It is deliberately NOT (a second time on) ModelMapping for the identical
 	// reason IsMTP is not: ModelMapping.LiveProgressSupport is the
 	// pre-migration-78 column, frozen since #49-3 moved every writer onto a
 	// model_mapping_capabilities row, and a caller reading the wrong one of two
 	// same-typed fields would have no way to tell it had.
+	//
+	// UNLIKE IsMTP above, "removed only once every remaining reader has moved
+	// off it" is NOT true for ModelMapping.LiveProgressSupport: with
+	// resolveAffinity fixed, every ROUTING reader is gone, but
+	// internal/gateway/benchmark_runner.go's benchmarkTargetReq (~:197) still
+	// reads mapping.LiveProgressSupport directly to build a benchmark's Target,
+	// and it appears on NO remaining task's file list (Task 5 scopes the
+	// portal; Task 6 scopes routing/store.go, store/sqlite_applications.go,
+	// routing/memory_store.go and migrate.go -- none of which touch
+	// internal/gateway). Dropping the column will break that line at compile
+	// time, but the lazy fix -- deleting the assignment to make it compile --
+	// would silently leave every benchmark Target's LiveProgressSupport at ""
+	// forever, exactly the regression benchmarkTargetReq's own surrounding
+	// comment says matters MORE on the benchmark path than on a live request.
+	// Whoever does Task 6 must give benchmark_runner.go its own
+	// MappingCapabilities read (mirroring resolveAffinity's) before removing
+	// this column, not just resolve the compiler's complaint.
 	LiveProgressSupport string
 }
 

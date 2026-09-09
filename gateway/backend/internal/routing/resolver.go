@@ -291,6 +291,12 @@ type resolverStore interface {
 	AIServerByID(ctx context.Context, id string) (AIServer, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
+	// MappingCapabilities is read by resolveAffinity ONLY, to fill the synthetic
+	// MappingCandidate it builds for a sticky-pin hit -- that path's mapping comes
+	// from MappingsByApplication, which never joins model_mapping_capabilities, so
+	// without this the affinity path would keep reading ModelMapping's frozen
+	// pre-migration-78 column for the life of the pin (up to AffinityTTLSeconds).
+	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
 }
 
 type Resolver struct {
@@ -717,16 +723,34 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		return Target{}, false, fmt.Errorf("update affinity: %w", err)
 	}
 	// resolveAffinity's mapping comes from activeMappingForApplication
-	// (MappingsByApplication), NOT ActiveMappingsForModel -- it has no joined
-	// capability verdict to offer, so LiveProgressSupport is set explicitly
-	// from the mapping's own (pre-migration-78, frozen) column, preserving
-	// this path's exact pre-existing behaviour. IsMTP is left at its zero
-	// value: targetFrom never reads it.
+	// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
+	// model_mapping_capabilities, so unlike every other targetFrom call site
+	// this one has to fetch the verdict itself with a dedicated keyed read.
+	// That read is on a path that already makes five store calls just to
+	// reach this point (Affinity, ApplicationByID, AIServerByID,
+	// activeMappingForApplication's MappingsByApplication, UpsertAffinity);
+	// one more keyed lookup is the cost of the pin no longer serving a stale
+	// verdict for its entire TTL. Best-effort: a read failure degrades to ""
+	// (never-determined) -- the same reading an absent capability row would
+	// produce -- rather than failing an otherwise-servable affinity hit; the
+	// cost is that a transient store error can make one pinned request look
+	// like the verdict was never determined, which is strictly better than
+	// serving the wrong (frozen, possibly stale) column value.
+	//
+	// IsMTP is left at its zero value: targetFrom does not read it (only
+	// scoringRoute does, and this path never scores -- it returns a pin
+	// directly), so there is nothing to fill it from here.
+	liveProgressSupport := ""
+	if caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID); capErr == nil {
+		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
+			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
+		}
+	}
 	target, err := r.targetFrom(ctx, MappingCandidate{
 		Server:              server,
 		Application:         app,
 		Mapping:             mapping,
-		LiveProgressSupport: mapping.LiveProgressSupport,
+		LiveProgressSupport: liveProgressSupport,
 	}, key.APIFlavor)
 	if err != nil {
 		return Target{}, false, err
