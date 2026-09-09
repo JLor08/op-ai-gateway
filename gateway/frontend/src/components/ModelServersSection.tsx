@@ -98,9 +98,10 @@ function probeOk(probeState: string): boolean {
 // gated on a probe field, for exactly the reason the Kontext column's own
 // comment above gives: the portal service fills it once from the PERSISTED
 // mapping field (`LiveProgressSupport: view.mapping.LiveProgressSupport`,
-// service_model_servers.go), which a background detector writes directly to
-// the mapping (routing.Store.UpdateMappingLiveProgressSupport) -- there is
-// no gateway-injection seam to gate this on, unlike metrics_probe/
+// service_model_servers.go), which a background detector writes via the
+// capability table's writer (routing.Store.UpsertMappingCapabilities, a
+// model_mapping_capabilities row -- not this column directly any more) --
+// there is no gateway-injection seam to gate this on, unlike metrics_probe/
 // context_probe/state/active_requests/queue_depth above. Gating this cell on
 // a probe field would repeat the exact bug the Kontext column's fix already
 // closed: hiding a real, persisted verdict on every row a probe fixture

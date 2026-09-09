@@ -96,7 +96,7 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 // the same (mapping, capability). It applies NO precedence rule — the caller
 // decides whether its source may overwrite what is there (see
 // routing.CapabilitySourceIsAuthoritative, and
-// routing.WritableProbeCapabilityRows for the shared answer) — and carries no
+// routing.WritableCapabilityRows for the shared answer) — and carries no
 // metrics_locked guard, never touching metrics_source/metrics_updated_at: a
 // capability is not a number an operator pins against automation. That
 // argument used to live on UpdateMappingCapabilities beside it; with the
@@ -110,6 +110,15 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 // full verdict set must never leave the mapping with some capabilities from
 // the new set and some from the old — a half-written capability picture is
 // worse than an unchanged one.
+//
+// An unknown mappingID is NOT a benign no-op here — unlike DeleteMappingCapability
+// below — because model_mapping_capabilities.mapping_id carries a real FK
+// (`references model_mappings(id) on delete cascade`, migration 78), so the
+// insert fails with a foreign-key violation surfaced as a plain wrapped error
+// (deliberately not reclassified via s.dl.isForeignKeyViolation the way some
+// sibling child-table writers do — see routing.MappingStore's own
+// UpsertMappingCapabilities doc for why that is acceptable as-is). See
+// routing.MemoryStore's UpsertMappingCapabilities for the mirrored check.
 func (s *SQLiteStore) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error {
 	for _, r := range rows {
 		if err := routing.ValidateCapabilityRow(r); err != nil {

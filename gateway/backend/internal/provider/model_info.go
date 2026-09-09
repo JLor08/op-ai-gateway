@@ -27,14 +27,14 @@ type ModelInfo struct {
 	// verdict -- which the row model makes structural rather than a rule every
 	// writer remembers: "unknown" is the ABSENCE of a
 	// model_mapping_capabilities row, so a "" verdict has nothing to write.
-	// See routing.WritableProbeCapabilityRows and the context-probe pass in
+	// See routing.WritableCapabilityRows and the context-probe pass in
 	// cmd/gateway/app_health.go.
 	LiveProgressSupport string
 	// Caps is the auto-detected capability verdict set (#49 sub-project 2), as
 	// detected by detectCapabilities. Each field is "" (never determined) |
 	// "yes" | "no" (Extra carries capability names with no field of their own).
 	// "" must never overwrite an already-stored verdict -- see
-	// routing.WritableProbeCapabilityRows, which is where that rule and the
+	// routing.WritableCapabilityRows, which is where that rule and the
 	// operator's precedence rule both live, and the capability write in
 	// cmd/gateway/app_health.go that feeds it.
 	Caps Capabilities

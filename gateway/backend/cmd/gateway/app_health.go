@@ -67,7 +67,7 @@ type healthStore interface {
 	// metrics_locked guard; see its doc comment on the store interface
 	// (routing.MappingStore) for the full argument, and note it applies no
 	// precedence rule of its own -- this caller does, via
-	// routing.WritableProbeCapabilityRows.
+	// routing.WritableCapabilityRows.
 	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
 	// RuntimeSpecsByApplication lists the runtime specs joined to the app's
@@ -472,7 +472,7 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 //   - PRECEDENCE: a probe never overwrites a row a human (manual) or a real
 //     measurement (vision_benchmark) established. This ~30s pass re-reads the
 //     same /props document forever; it must not be able to talk over the
-//     operator. The rule lives in routing.WritableProbeCapabilityRows -- asked
+//     operator. The rule lives in routing.WritableCapabilityRows -- asked
 //     here rather than restated, so this pass and the telemetry write-back
 //     cannot drift apart on it. That shared helper is also what retired the
 //     old vision SYNC onto mp.VisionCapable: with one authoritative row per
@@ -499,7 +499,7 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 		log.Printf("app health: capability read for mapping %s failed: %v", mp.ID, err)
 		return
 	}
-	rows := routing.WritableProbeCapabilityRows(reported, routing.CapabilityRowsByName(stored))
+	rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored))
 	if len(rows) == 0 {
 		return // already on file, or outranked by a human's / a measurement's verdict
 	}
@@ -511,7 +511,7 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 // probedCapabilityRows projects ONE probe response onto the store's row shape
 // -- the verdicts this probe actually determined, attributed to
 // llama_cpp_props and stamped at -- ready for
-// routing.WritableProbeCapabilityRows to decide which of them may be written.
+// routing.WritableCapabilityRows to decide which of them may be written.
 // Pure: no I/O, no store access, table-testable on its own.
 //
 // An undetermined ("") verdict yields NO row, which is how "unknown must
@@ -525,7 +525,7 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 // across the internal/gateway <-> cmd/gateway (main) package boundary: each
 // projects its OWN probe's answer shape, which is inherently per-source, so
 // the projections are separate while the RULES they feed
-// (WritableProbeCapabilityRows, LiveProgressCapabilityVerdict) are shared.
+// (WritableCapabilityRows, LiveProgressCapabilityVerdict) are shared.
 func probedCapabilityRows(caps provider.Capabilities, liveProgress string, at time.Time) []routing.CapabilityRow {
 	row := func(capability, verdict string) routing.CapabilityRow {
 		return routing.CapabilityRow{

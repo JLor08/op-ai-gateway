@@ -518,6 +518,46 @@ func TestUpsertMappingCapabilitiesIgnoresMetricsLock(t *testing.T) {
 	})
 }
 
+// TestUpsertMappingCapabilitiesUnknownMappingFails pins the ONE way
+// UpsertMappingCapabilities is NOT "the benign no-op every other targeted
+// mapping writer promises for a missing id" (see case (e) in
+// TestUpdateMappingMetrics* above, and DeleteMappingCapability's own doc):
+// model_mapping_capabilities.mapping_id carries a real FK
+// (`references model_mappings(id) on delete cascade`, migration 78), so
+// writing against a mapping id that does not exist fails on every driver
+// instead of silently creating an orphan row.
+//
+// This is a fix, not a pre-existing property: MemoryStore originally had no
+// existence check here at all (unlike its sibling mapping-child writers
+// UpsertRuntimeSpec/InsertBenchmarkRun) and would fabricate a capabilities
+// entry for a mapping that was never created -- invisible on the SQL drivers,
+// which have always rejected it via the real FK, so the divergence would
+// only ever have surfaced through a memory-mode-only bug report. This test
+// is what makes it visible instead: both backends must not only ERROR, they
+// must leave NO row behind.
+func TestUpsertMappingCapabilitiesUnknownMappingFails(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		err := s.UpsertMappingCapabilities(ctx, "does-not-exist", []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now,
+		}})
+		if err == nil {
+			t.Fatalf("UpsertMappingCapabilities(missing mapping) = nil error, want a failure (FK violation on SQL, ErrNotFound on memory)")
+		}
+
+		caps, err := s.MappingCapabilities(ctx, "does-not-exist")
+		if err != nil {
+			t.Fatalf("MappingCapabilities: %v", err)
+		}
+		if len(caps) != 0 {
+			t.Fatalf("capability rows = %+v, want none -- the rejected write must not leave an orphan row behind", caps)
+		}
+	})
+}
+
 // --- Capability rows (model_mapping_capabilities) ---------------------------
 
 // TestMappingCapabilityRows proves the per-capability row API on both

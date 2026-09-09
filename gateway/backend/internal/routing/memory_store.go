@@ -1073,7 +1073,7 @@ func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingI
 // UpsertMappingCapabilities writes rows, REPLACING any row for the same
 // (mapping, capability) — the map key is the capability, so a re-write is a
 // natural replacement, matching the SQL on-conflict-do-update. It applies no
-// precedence rule (the caller does — see WritableProbeCapabilityRows) and,
+// precedence rule (the caller does — see WritableCapabilityRows) and,
 // unlike every metric writer here, carries no metrics_locked guard: see the
 // Store interface's own UpsertMappingCapabilities doc for the full argument,
 // which is what this table has instead of the lock the pre-78 capability
@@ -1082,16 +1082,33 @@ func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingI
 // Every row is validated (ValidateCapabilityRow) before anything is written
 // — the same check SQLiteStore's UpsertMappingCapabilities makes, so the two
 // drivers cannot diverge on what counts as a valid row.
+//
+// mappingID must reference an existing mapping — a hand-rolled FK existence
+// check against m.mappings, mirroring UpsertRuntimeSpec/InsertBenchmarkRun's
+// own checks above for the same reason: both SQL drivers reject this insert
+// with a real foreign-key violation (SQLite runs with referential integrity
+// on), so silently fabricating a mapping_capabilities entry for a mapping
+// that does not exist — the ORIGINAL behavior here — was a driver
+// divergence, not a deliberate design choice. It is reachable only via a
+// TOCTOU (the mapping deleted between a caller's resolve step and this
+// write); every current caller is best-effort, so the error surfaces as one
+// log line and never rejects the request or sample that triggered it. A
+// zero-length rows is still a true no-op regardless — checked first, before
+// the existence check, so it costs nothing and cannot fail on a mapping this
+// caller never intended to touch.
 func (m *MemoryStore) UpsertMappingCapabilities(_ context.Context, mappingID string, rows []CapabilityRow) error {
 	for _, r := range rows {
 		if err := ValidateCapabilityRow(r); err != nil {
 			return err
 		}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if len(rows) == 0 {
 		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mappings[mappingID]; !ok {
+		return storeerr.ErrNotFound
 	}
 	byCapability := m.mappingCapabilities[mappingID]
 	if byCapability == nil {

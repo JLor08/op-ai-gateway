@@ -1068,15 +1068,18 @@ const (
 	CapabilityNo  = "no"
 )
 
-// Capability sources. manual and vision_benchmark are AUTHORITATIVE: a probe
-// never overwrites a row carrying one of them (the operator's rule). The
-// probe sources are overwritable by a later probe, which is what lets a
+// Capability sources. Precedence between them is a strict RANK
+// (capabilitySourceRank), not a probe/not-probe split: manual outranks a
+// benchmark, a benchmark outranks a probe, and a probe still overwrites its
+// own or a migrated guess. manual and vision_benchmark are AUTHORITATIVE in
+// the sense that no probe can ever outrank them; the probe sources remain
+// overwritable by a later probe of the SAME rank, which is what lets a
 // verdict re-establish itself after a build changes.
 //
 // CapabilitySourceLegacy marks a verdict inherited by migration 78 from a
 // pre-78 column whose real origin is unknowable (is_mtp came from a NAME
 // HEURISTIC or an operator; vision_capable's provenance was a mapping-wide
-// string every writer overwrote). It is deliberately probe-overwritable:
+// string every writer overwrote). It ranks alongside a probe, deliberately:
 // treating a guess as authoritative would freeze it in forever.
 const (
 	CapabilitySourceManual          = "manual"
@@ -1085,11 +1088,53 @@ const (
 	CapabilitySourceLegacy          = "legacy"
 )
 
-// CapabilitySourceIsAuthoritative reports whether source outranks a probe.
-// The single place the precedence rule is spelled out; every write path asks
-// it rather than repeating the comparison.
+// capabilitySourceRank orders a capability row's source into the strict,
+// total precedence WritableCapabilityRows enforces: the higher rank always
+// wins a write, and an EQUAL rank is always overwritable -- a probe repairs
+// its own drift; two sources of the same rank negotiate nothing between
+// them.
+//
+//	3  CapabilitySourceManual          an operator's verdict.
+//	2  CapabilitySourceVisionBenchmark a real measurement -- an actual image
+//	                                   sent to the actual upstream, an actual
+//	                                   answer read back.
+//	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same /props
+//	   CapabilitySourceLegacy,         document, or a migrated heuristic,
+//	   or any unrecognised source      every time. An unrecognised source
+//	                                   ranks here too -- fail SAFE toward
+//	                                   "treat it as a probe" rather than
+//	                                   silently handing an unknown writer
+//	                                   manual's immunity.
+//	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
+//
+// WritableCapabilityRows is the only caller: a write is permitted iff
+// rank(incoming) >= rank(current).
+func capabilitySourceRank(source string) int {
+	switch source {
+	case CapabilitySourceManual:
+		return 3
+	case CapabilitySourceVisionBenchmark:
+		return 2
+	case CapabilitySourceLlamaCppProps, CapabilitySourceLegacy:
+		return 1
+	case "":
+		return 0
+	default:
+		return 1
+	}
+}
+
+// CapabilitySourceIsAuthoritative reports whether source outranks every
+// probe -- capabilitySourceRank(source) >= 2, i.e. CapabilitySourceManual or
+// CapabilitySourceVisionBenchmark. WritableCapabilityRows no longer calls
+// this itself (it compares ranks directly, since its own incoming source can
+// now be a benchmark's rank 2 rather than always a probe's rank 1), but the
+// predicate is kept: it is still the exact question a PROBE write path asks
+// ("is this row outranked by anything I could ever be"), it has its own
+// test, and it reads better at a probe call site than spelling out a rank
+// number.
 func CapabilitySourceIsAuthoritative(source string) bool {
-	return source == CapabilitySourceManual || source == CapabilitySourceVisionBenchmark
+	return capabilitySourceRank(source) >= 2
 }
 
 // LiveProgressCapabilityVerdict maps the live-progress verdict vocabulary
@@ -1130,50 +1175,70 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 	return out
 }
 
-// WritableProbeCapabilityRows answers the one question every probe write path
-// has to ask -- which of the verdicts I just determined may I actually write,
-// given what is already on file -- and is the single place that answer lives.
-// Pure: no I/O, no store access, table-testable on its own.
+// WritableCapabilityRows answers the one question every capability writer --
+// a probe, or the vision benchmark -- has to ask -- which of the verdicts I
+// just determined may I actually write, given what is already on file -- and
+// is the single place that answer lives. Pure: no I/O, no store access,
+// table-testable on its own.
 //
 // Two rules, in order:
 //
 //  1. PRECEDENCE, the operator's rule and the reason this table carries a
-//     per-row source at all: a row whose stored source is AUTHORITATIVE --
-//     asked via CapabilitySourceIsAuthoritative rather than re-compared here,
-//     so the comparison lives in exactly one place -- is never overwritten by
-//     a probe. A human's answer, or a real measurement, outranks re-reading
-//     the same /props document once a second. A probe source (llama_cpp_props,
-//     and the legacy rows migration 78 inherited) IS overwritable, which is
-//     what lets a verdict re-establish itself after a build changes.
-//  2. CHANGE DETECTION: a stored verdict that already AGREES issues no write.
-//     A build capability is stable by nature -- the same child build reports
-//     the same verdict every second for its whole life -- so without this
-//     every telemetry sample would drive one write per capability per mapping,
+//     per-row source at all: a write is permitted iff
+//     capabilitySourceRank(incoming) >= capabilitySourceRank(current). Three
+//     consequences fall out of that, and every existing caller relies on all
+//     three:
+//
+//     - A probe (rank 1) against another probe's or a legacy row's rank-1
+//     verdict is a TIE, and a tie is writable (>= holds at equality) -- so
+//     a probe still repairs its own drift after a build changes, exactly
+//     as before this rule was generalised from a boolean split.
+//     - No stored row at all is rank 0, always lower than any incoming rank,
+//     so a first-ever verdict from ANY source is always writable.
+//     - The vision benchmark (rank 2) now loses only to a manual verdict
+//     (rank 3) -- it still outranks and overwrites a probe or a legacy
+//     row exactly as before. manual outranks everything, including the
+//     benchmark, so an operator's verdict is permanent with no lock
+//     needed at all -- see UpsertMappingCapabilities' own doc for what
+//     this table has instead of metrics_locked.
+//
+//  2. CHANGE DETECTION: a stored verdict that already AGREES issues no
+//     write, and this check runs only AFTER rule 1 permits the write --
+//     which matters for one case worth stating rather than leaving a reader
+//     to wonder: a benchmark verdict that AGREES with a stored MANUAL row
+//     never reaches this rule at all, because rule 1 already blocked it.
+//     That means it cannot refresh CheckedAt either. That is correct, not a
+//     gap: the operator's row is the record, and a benchmark agreeing with
+//     it is not a new measurement of anything the operator didn't already
+//     say. Absent that interaction, this rule exists because a build
+//     capability is stable by nature -- the same child build reports the
+//     same verdict every second for its whole life -- so without it every
+//     telemetry sample would drive one write per capability per mapping,
 //     forever, for a value that cannot change short of an operator swapping
 //     the upstream binary. It compares the VERDICT only: a legacy row that
 //     already agrees is left alone rather than re-stamped with a fresher
-//     source, because the verdict is what every reader acts on and the write
-//     would be pure amplification. An ABSENT row has an empty verdict, which
-//     can never equal a reported "yes"/"no", so a first-ever verdict always
-//     passes this rule.
+//     source, because the verdict is what every reader acts on and the
+//     write would be pure amplification. An ABSENT row has an empty
+//     verdict, which can never equal a reported "yes"/"no", so a
+//     first-ever verdict always passes this rule too.
 //
-// reported must already hold only the verdicts this probe actually determined,
-// each with Verdict CapabilityYes or CapabilityNo and a non-empty Capability
-// and Source: "unknown" is the ABSENCE of a row, so there is no empty verdict
-// to express it with, and UpsertMappingCapabilities rejects a malformed row
-// loudly (ValidateCapabilityRow) rather than half-writing a set. Projecting a
-// probe's own answer shape onto rows -- and dropping whatever it determined
-// nothing about -- is each caller's own step, because only the caller knows
-// what its probe reports.
+// reported must already hold only the verdicts this writer actually
+// determined, each with Verdict CapabilityYes or CapabilityNo and a
+// non-empty Capability and Source: "unknown" is the ABSENCE of a row, so
+// there is no empty verdict to express it with, and UpsertMappingCapabilities
+// rejects a malformed row loudly (ValidateCapabilityRow) rather than
+// half-writing a set. Projecting a writer's own answer shape onto rows --
+// and dropping whatever it determined nothing about -- is each caller's own
+// step, because only the caller knows what it reports and at what rank.
 //
 // Returns nil (not an empty slice) when nothing may be written, so a caller's
 // len(rows) == 0 skips the store call entirely.
-func WritableProbeCapabilityRows(reported []CapabilityRow, stored map[string]CapabilityRow) []CapabilityRow {
+func WritableCapabilityRows(reported []CapabilityRow, stored map[string]CapabilityRow) []CapabilityRow {
 	var out []CapabilityRow
 	for _, r := range reported {
 		cur := stored[r.Capability]
-		if CapabilitySourceIsAuthoritative(cur.Source) {
-			continue // a human or a measurement established this; a probe never outranks it
+		if capabilitySourceRank(r.Source) < capabilitySourceRank(cur.Source) {
+			continue // outranked -- e.g. a probe (rank 1) against a manual verdict (rank 3)
 		}
 		if cur.Verdict == r.Verdict {
 			continue // already on file, no write amplification
@@ -1270,12 +1335,12 @@ type MappingStore interface {
 	// UpsertMappingCapabilities writes rows, replacing any row for the same
 	// (mapping, capability), atomically as one set -- a caller passing several
 	// verdicts must never observe some of them applied and others not. It does
-	// NOT apply the precedence rule -- callers do, because only they know
-	// whether they are a probe (see CapabilitySourceIsAuthoritative, and
-	// WritableProbeCapabilityRows for the answer every probe path shares). It
-	// rejects (ValidateCapabilityRow), without writing anything, a row whose
-	// Verdict is neither CapabilityYes nor CapabilityNo or whose Capability or
-	// Source is empty.
+	// NOT apply the precedence rule -- callers do, because only they know what
+	// rank their own write is (see capabilitySourceRank, and
+	// WritableCapabilityRows for the answer every writer shares -- a probe
+	// and the vision benchmark alike). It rejects (ValidateCapabilityRow),
+	// without writing anything, a row whose Verdict is neither CapabilityYes
+	// nor CapabilityNo or whose Capability or Source is empty.
 	//
 	// UNLIKE every metric writer above it carries NO metrics_locked guard and
 	// never touches MetricsSource / MetricsUpdatedAt, and this doc comment is
@@ -1292,11 +1357,30 @@ type MappingStore interface {
 	// throughput figures to a capability probe.
 	//
 	// What an operator gets INSTEAD of that lock is provenance, and it is a
-	// strictly better trade: a row whose source is CapabilitySourceManual (or
-	// the equally authoritative CapabilitySourceVisionBenchmark) is never
-	// overwritten by a probe. That is a per-capability guarantee rather than a
+	// strictly better trade: a row whose source is CapabilitySourceManual
+	// outranks every other source (capabilitySourceRank) and so is never
+	// overwritten by anything -- not a probe, and not the vision benchmark's
+	// CapabilitySourceVisionBenchmark either, which itself outranks a probe
+	// but not an operator. That is a per-capability guarantee rather than a
 	// mapping-wide switch over numbers -- which is the whole reason the
-	// pre-78 columns needed the lock argument in the first place.
+	// pre-78 columns needed the lock argument in the first place -- and unlike
+	// that lock it needs no separate flag: it falls out of provenance alone.
+	//
+	// An unknown mappingID is NOT the benign no-op every 0-rows-affected
+	// write elsewhere in this file promises: model_mapping_capabilities.
+	// mapping_id carries a real `references model_mappings(id) on delete
+	// cascade` (migration 78), enforced on both SQL drivers (SQLite runs
+	// with foreign_keys=ON), so this insert fails with a foreign-key
+	// violation. MemoryStore mirrors that with its own hand-rolled
+	// existence check (ErrNotFound), the same convention its sibling
+	// mapping-child writers (UpsertRuntimeSpec, InsertBenchmarkRun) already
+	// use -- silently fabricating a capabilities entry for a mapping that
+	// does not exist was a driver divergence, not a considered choice, and
+	// is fixed rather than merely documented. In practice this is reachable
+	// only via a TOCTOU (the mapping is deleted between a caller's resolve
+	// step and this write); every current caller is best-effort, so the
+	// failure surfaces as one log line and never rejects the request or
+	// telemetry sample that triggered it.
 	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []CapabilityRow) error
 	// DeleteMappingCapability returns one capability to UNKNOWN. Deleting a
 	// row is how "not determined" is expressed -- the state the pre-78 bool

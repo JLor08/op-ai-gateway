@@ -183,7 +183,7 @@ type agentRuntimeCapabilitiesSample struct {
 
 // capabilityRows projects c.Verdicts onto the store's row shape -- the rows
 // THIS probe determined, attributed to CapabilitySourceLlamaCppProps and
-// stamped at, ready for routing.WritableProbeCapabilityRows to decide which
+// stamped at, ready for routing.WritableCapabilityRows to decide which
 // of them may actually be written. A nil receiver (no wire object at all --
 // an agent predating capability detection) yields nothing, as does a non-nil
 // but empty one (detection ran, determined nothing): two different facts that
@@ -769,7 +769,7 @@ func (s *Server) writeBackRuntimeContext(ctx context.Context, serverID string, r
 // locked mapping's capabilities permanently undiscoverable. What the operator
 // gets INSTEAD is per-capability provenance -- a manual verdict outranks this
 // probe -- and that guard lives in the caller, not the store (see
-// routing.WritableProbeCapabilityRows).
+// routing.WritableCapabilityRows).
 //
 // On success returns the mapping id and its CURRENTLY STORED capability rows
 // keyed by capability -- the baseline the caller judges both the precedence
@@ -846,7 +846,7 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 //     overwrites a row whose source is AUTHORITATIVE -- a human's manual
 //     verdict, or the vision benchmark's real measurement. Re-reading the
 //     same /props document once a second must not be able to talk over
-//     either. The rule itself lives in routing.WritableProbeCapabilityRows,
+//     either. The rule itself lives in routing.WritableCapabilityRows,
 //     asked rather than restated, so both probe write paths (this one and
 //     cmd/gateway/app_health.go's) cannot drift apart on it.
 //  2. NO metrics_locked check, in either direction -- see
@@ -860,7 +860,7 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 //     non-nil empty one (detection ran, determined nothing) are different
 //     facts -- which is why the wire field is a pointer -- and both simply
 //     yield no rows. An unchanged verdict issues no write either
-//     (WritableProbeCapabilityRows' second rule), which matters more for a
+//     (WritableCapabilityRows' second rule), which matters more for a
 //     capability than for a metric: a build capability is stable by nature,
 //     so the SAME child build reports the SAME verdict every second for its
 //     whole life.
@@ -903,7 +903,7 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 	if !ok {
 		return
 	}
-	rows := routing.WritableProbeCapabilityRows(reported, r.stored)
+	rows := routing.WritableCapabilityRows(reported, r.stored)
 	if len(rows) == 0 {
 		// Every reported verdict is either already on file or outranked by a
 		// human's / a measurement's -- no write amplification, no talking
