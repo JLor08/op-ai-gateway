@@ -26,8 +26,18 @@ import (
 type capabilityResetRecorder struct {
 	*routing.MemoryStore
 	deletes []capabilityDelete
+	// upserts is recorded by the SAME wrapper on purpose. Two wrappers
+	// composed around one MemoryStore do not compose: the outer one promotes
+	// the inner one's OTHER methods off the embedded store instead, so the
+	// inner counter never sees them and an assertion on it passes trivially.
+	upserts []capabilityUpsert
 	// failWith, when non-nil, is returned INSTEAD of performing the delete.
 	failWith error
+}
+
+func (c *capabilityResetRecorder) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error {
+	c.upserts = append(c.upserts, capabilityUpsert{mappingID: mappingID, rows: rows})
+	return c.MemoryStore.UpsertMappingCapabilities(ctx, mappingID, rows)
 }
 
 type capabilityDelete struct {
@@ -205,13 +215,13 @@ func TestUpdateMappingCapabilityVerdictResetAndInertSave(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
-	upserts := &capabilityWriteRecorder{MemoryStore: recorder.MemoryStore}
 	fx := newCapabilityTestFixture(t, now, recorder)
 	if err := recorder.MemoryStore.UpsertMappingCapabilities(ctx, fx.mappingID, []routing.CapabilityRow{
 		{Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now.Add(-time.Hour)},
 	}); err != nil {
 		t.Fatalf("seed no row: %v", err)
 	}
+	recorder.upserts = nil // the seed went round the wrapper; it is not under test
 
 	// "no" -> unknown.
 	dto, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
@@ -234,9 +244,10 @@ func TestUpdateMappingCapabilityVerdictResetAndInertSave(t *testing.T) {
 
 	// unknown -> unknown, from a client that restates the state it read. The
 	// form itself would omit the key entirely; a script need not, and either
-	// way nothing may reach the store.
-	svc2 := newServerTestServiceWithRoutes(t, now, upserts)
-	if _, err := svc2.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+	// way NOTHING may reach the store -- neither an upsert nor the benign
+	// delete an unconditional reset would issue.
+	recorder.upserts = nil
+	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
 		CapabilityVerdicts: map[string]string{routing.CapabilityVision: ""},
 	}); err != nil {
 		t.Fatalf("UpdateMapping (unknown -> unknown): %v", err)
@@ -244,8 +255,51 @@ func TestUpdateMappingCapabilityVerdictResetAndInertSave(t *testing.T) {
 	if len(recorder.deletes) != 1 {
 		t.Fatalf("deletes after an unknown -> unknown save = %+v, want STILL 1 -- an intent equal to what is stored is inert", recorder.deletes)
 	}
-	if len(upserts.upserts) != 0 {
-		t.Fatalf("capability upserts on an unknown -> unknown save = %+v, want NONE", upserts.upserts)
+	if len(recorder.upserts) != 0 {
+		t.Fatalf("capability upserts on an unknown -> unknown save = %+v, want NONE", recorder.upserts)
+	}
+}
+
+// TestUpdateMappingCapabilityVerdictsApplyInADeterministicOrder: a Go map
+// iterates in a RANDOMISED order, and two resets in one request are not atomic
+// with each other (the store method is per-capability and takes no
+// transaction). Without a deterministic order, which capability a partial
+// failure leaves applied -- and which one's store error the operator sees --
+// would differ between two runs of the identical request, which is not
+// something a bug report could ever be reproduced from.
+//
+// Twenty iterations, because one run of an unsorted map has an even chance of
+// coming out alphabetical anyway.
+func TestUpdateMappingCapabilityVerdictsApplyInADeterministicOrder(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
+	fx := newCapabilityTestFixture(t, now, recorder)
+
+	for i := range 20 {
+		if err := recorder.MemoryStore.UpsertMappingCapabilities(ctx, fx.mappingID, []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+			{Capability: routing.CapabilityTools, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("seed rows: %v", err)
+		}
+		recorder.deletes = nil
+		if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+			CapabilityVerdicts: map[string]string{
+				routing.CapabilityVision: "", routing.CapabilityTools: "", routing.CapabilityMTP: "",
+			},
+		}); err != nil {
+			t.Fatalf("UpdateMapping (three resets): %v", err)
+		}
+		got := make([]string, 0, len(recorder.deletes))
+		for _, del := range recorder.deletes {
+			got = append(got, del.capability)
+		}
+		want := []string{routing.CapabilityMTP, routing.CapabilityTools, routing.CapabilityVision}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("iteration %d: deletes reached the store as %v, want %v (alphabetical, so an identical request behaves identically)", i, got, want)
+		}
 	}
 }
 
@@ -336,7 +390,6 @@ func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
-	upserts := &capabilityWriteRecorder{MemoryStore: recorder.MemoryStore}
 	fx := newCapabilityTestFixture(t, now, recorder)
 
 	// A probe determined vision. probedAt is deliberately not the service
@@ -386,12 +439,12 @@ func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	// leaves it alone, so whatever the form's own rule makes of that seed is
 	// what goes on the wire -- derived, not hand-picked.
 	//
-	// Re-wire the service so the second save's capability WRITES are counted:
-	// the stored row surviving absent is necessary but not sufficient, since a
+	// The second save's capability WRITES are counted, not just the stored
+	// rows: a row surviving absent is necessary but not sufficient, since a
 	// manual row written and then read back looks like any other row.
-	svc2 := newServerTestServiceWithRoutes(t, now, upserts)
+	recorder.upserts = nil
 	newCtxSize := 262144
-	after, err := svc2.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+	after, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
 		GatewayModelName: &reset.GatewayModelName, AppModelName: &reset.AppModelName,
 		Status: &reset.Status, ContextSize: &newCtxSize,
 		CapabilityVerdicts: formCapabilityVerdicts(
@@ -404,8 +457,8 @@ func TestUpdateMappingResetIsNotSelfUndoneByTheNextSave(t *testing.T) {
 	if after.ContextSize != newCtxSize {
 		t.Fatalf("context_size = %d, want %d (the edit the operator actually made)", after.ContextSize, newCtxSize)
 	}
-	if len(upserts.upserts) != 0 {
-		t.Fatalf("capability upserts on the unrelated save = %+v, want NONE -- the reset must not be undone by the next edit", upserts.upserts)
+	if len(recorder.upserts) != 0 {
+		t.Fatalf("capability upserts on the unrelated save = %+v, want NONE -- the reset must not be undone by the next edit", recorder.upserts)
 	}
 	if rows := mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID); len(rows) != 0 {
 		t.Fatalf("capability rows after the unrelated save = %+v, want STILL none", rows)
