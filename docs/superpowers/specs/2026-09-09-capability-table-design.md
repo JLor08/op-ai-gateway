@@ -118,7 +118,19 @@ DeleteMappingCapability(ctx, mappingID, capability string) error
 
 **Detectors are untouched.** `detectCapabilities` is a pure `[]byte → Capabilities` function on both sides; only the shape of what happens to its output changes. The byte-identity requirement between the two module copies stands.
 
-**Wire.** `sample.RuntimeSample.Capabilities` becomes an open-vocabulary keyed set rather than four fixed fields plus an unused `Extra`. `map[string]string` (capability → verdict) is the natural shape and matches the repo's existing keyed-set precedents; `nil` still means "an agent that predates capability detection", an empty map still means "detection ran, determined nothing". The gateway mirror follows. The agent's `collector.Capabilities` → wire conversion becomes a small mapping function.
+**Wire.** `sample.RuntimeSample.Capabilities` becomes an open-vocabulary set rather than four fixed fields plus an unused `Extra` — but it **keeps the pointer wrapper**, because a bare `map[string]string` with `omitempty` would silently destroy the nil-vs-all-empty distinction: an empty map marshals away, collapsing "detection ran, determined nothing" into "an agent that predates capability detection". That distinction is load-bearing (it is what a 401/403-protected child reports) and documented in three places. Shape:
+
+```go
+type Capabilities struct {
+	Verdicts []CapabilityVerdict `json:"verdicts"`
+}
+type CapabilityVerdict struct {
+	Name    string `json:"name"`
+	Verdict string `json:"verdict"` // "yes" | "no"
+}
+```
+
+A non-nil pointer means detection ran; an empty `Verdicts` means it determined nothing. The list-of-records shape (rather than a map) is deliberate: `sample.go` carries **no** map today — `Net`, `GPUs` and `ProxyRoutes` are all keyed lists — and `Normalize()` already forces such slices non-nil so they never marshal as `null`, which this slice joins. The gateway mirror follows field for field, as the two capability types already do. The agent's `collector.Capabilities` → wire conversion becomes a small mapping function, and `capabilitiesSample`'s always-return-a-pointer contract is preserved verbatim.
 
 **Portal.** `ModelServerDTO`'s seven `cap_*` fields become one `capabilities` array of `{capability, verdict, source, checked_at}`, filled from the batch reader. The frontend's `capabilityChips` renders one chip per `yes` — the four known capabilities first in fixed order, then unknown-vocabulary names verbatim with the neutral status (PR #66's decision) — the em-dash when there is nothing, and **a per-capability tooltip that finally names who established each verdict and when**. That is a real gain over the shared-provenance tooltip. `api/models.ts`'s `ModelServerRow` follows.
 
