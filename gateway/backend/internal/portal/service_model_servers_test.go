@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
@@ -31,13 +32,22 @@ func (f fakeLoadedModels) LoadedAppModels(appID, _ string) []string {
 // the store so tests can seed servers/apps/mappings directly.
 func newModelServersTestService(t *testing.T, now time.Time, loaded LoadedModelReader) (*Service, *routing.MemoryStore) {
 	t.Helper()
+	routeStore := routing.NewMemoryStore()
+	svc := newModelServersTestServiceWithRoutes(t, now, loaded, routeStore)
+	return svc, routeStore
+}
+
+// newModelServersTestServiceWithRoutes mirrors newModelServersTestService but
+// takes the routing.Store directly, so a test can wrap it first (e.g.
+// countingCapabilityStore, the N+1 guard's instrument) before wiring it into
+// the Service.
+func newModelServersTestServiceWithRoutes(t *testing.T, now time.Time, loaded LoadedModelReader, routes routing.Store) *Service {
+	t.Helper()
 	dir := NewMemoryDirectory(auth.NewTokenStore())
 	if err := dir.CreateUser(context.Background(), store.User{ID: "usr_admin", Email: "admin@example.test", DisplayName: "admin", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	routeStore := routing.NewMemoryStore()
-	svc := NewService(ServiceDeps{Users: dir, Routes: routeStore, LoadedModels: loaded, Clock: func() time.Time { return now }})
-	return svc, routeStore
+	return NewService(ServiceDeps{Users: dir, Routes: routes, LoadedModels: loaded, Clock: func() time.Time { return now }})
 }
 
 // seedOffering creates an active server (name == serverID) with one active
@@ -294,41 +304,49 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	}
 }
 
-// TestModelServersCapabilitiesPersisted: CapVision/CapVideo/CapAudio/CapTools/
-// CapExtra/CapabilitiesSource/CapabilitiesCheckedAt are read straight off the
-// PERSISTED mapping fields,
-// exactly like LiveProgressSupport -- NOT left zero/empty for a gateway-layer
-// injection pass. One row with every verdict determined (plus an open-ended
-// cap_extra entry) and one row with nothing determined at all (no write),
-// so a dropped fill in ModelServers cannot coincidentally satisfy this: the
-// untouched row must ALSO carry a nil CapabilitiesCheckedAt and a nil
-// CapExtra, which only holds if the fill genuinely reads the mapping rather
-// than defaulting.
-func TestModelServersCapabilitiesPersisted(t *testing.T) {
+// countingCapabilityStore wraps a *routing.MemoryStore and counts calls to
+// MappingCapabilitiesForMappings -- the N+1 guard test's instrument. Every
+// other method is the embedded store's own (promoted), unchanged.
+type countingCapabilityStore struct {
+	*routing.MemoryStore
+	capabilityCalls int
+}
+
+func (c *countingCapabilityStore) MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]routing.CapabilityRow, error) {
+	c.capabilityCalls++
+	return c.MemoryStore.MappingCapabilitiesForMappings(ctx, mappingIDs)
+}
+
+// TestModelServersCapabilitiesFromRows: ModelServerDTO.Capabilities/IsMtp/
+// VisionCapable are read from the model_mapping_capabilities ROWS batch
+// (routing.MappingCapabilitiesForMappings), not from ModelMapping's frozen
+// cap_vision/cap_video/cap_audio/cap_tools/is_mtp/vision_capable columns --
+// NOT left zero/empty for a gateway-layer injection pass, exactly like
+// LiveProgressSupport. One mapping carries a full row set (four known
+// capabilities plus an open-vocabulary "thinking" entry the codebase has no
+// constant for); a sibling mapping carries NO rows at all, so a dropped fill
+// in ModelServers cannot coincidentally satisfy this: the untouched row must
+// carry an EMPTY (non-nil) Capabilities slice and IsMtp/VisionCapable both
+// false, which only holds if the fill genuinely reads the rows rather than
+// defaulting.
+func TestModelServersCapabilitiesFromRows(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
 	seedOffering(t, routeStore, now, "srv-determined", "app-determined", "map-determined", "shared", "up-determined", 0)
 	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
 
-	// Seeded through the full-row writer, for the reason
-	// TestModelServersLiveProgressSupportPersisted above states: the targeted
-	// cap_* writer is gone (#49-3), and this test pins the DTO fill's read of
-	// the stored columns.
 	checkedAt := now.Add(-time.Hour)
-	seeded, err := routeStore.MappingByID(context.Background(), "map-determined")
-	if err != nil {
-		t.Fatalf("MappingByID(map-determined): %v", err)
+	if err := routeStore.UpsertMappingCapabilities(context.Background(), "map-determined", []routing.CapabilityRow{
+		{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: checkedAt},
+		{Capability: routing.CapabilityVideo, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: checkedAt},
+		{Capability: routing.CapabilityTools, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: checkedAt},
+		{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLegacy, CheckedAt: checkedAt},
+		{Capability: "thinking", Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: checkedAt},
+	}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities(map-determined): %v", err)
 	}
-	seeded.CapVision, seeded.CapVideo = "yes", "no"
-	seeded.CapAudio, seeded.CapTools = "yes", "no"
-	seeded.CapExtra = `["thinking"]`
-	seeded.CapabilitiesSource = "llama_cpp_props"
-	seeded.CapabilitiesCheckedAt = &checkedAt
-	if err := routeStore.UpdateMapping(context.Background(), seeded); err != nil {
-		t.Fatalf("UpdateMapping(map-determined): %v", err)
-	}
-	// map-unknown is not seeded at all: "never determined" is the mapping's
-	// untouched zero value, not a write with all-empty verdicts.
+	// map-unknown is not seeded at all: "never determined" is a total absence
+	// of rows, not a write of all-empty verdicts.
 
 	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
 	if err != nil {
@@ -343,81 +361,99 @@ func TestModelServersCapabilitiesPersisted(t *testing.T) {
 	}
 
 	determined := byServer["srv-determined"]
-	if determined.CapVision != "yes" || determined.CapVideo != "no" || determined.CapAudio != "yes" || determined.CapTools != "no" {
-		t.Fatalf("determined row verdicts = (%q, %q, %q, %q), want (yes, no, yes, no)", determined.CapVision, determined.CapVideo, determined.CapAudio, determined.CapTools)
+	if len(determined.Capabilities) != 5 {
+		t.Fatalf("determined row Capabilities = %+v, want 5 entries", determined.Capabilities)
 	}
-	if len(determined.CapExtra) != 1 || determined.CapExtra[0] != "thinking" {
-		t.Fatalf("determined row CapExtra = %v, want [\"thinking\"]", determined.CapExtra)
+	byName := map[string]ModelServerCapabilityDTO{}
+	for _, c := range determined.Capabilities {
+		byName[c.Capability] = c
 	}
-	if determined.CapabilitiesSource != "llama_cpp_props" {
-		t.Fatalf("determined row CapabilitiesSource = %q, want \"llama_cpp_props\"", determined.CapabilitiesSource)
+	if v := byName["vision"]; v.Verdict != "yes" || v.Source != "llama_cpp_props" || !v.CheckedAt.Equal(checkedAt) {
+		t.Fatalf("vision entry = %+v, want yes/llama_cpp_props/%v", v, checkedAt)
 	}
-	if determined.CapabilitiesCheckedAt == nil || !determined.CapabilitiesCheckedAt.Equal(checkedAt) {
-		t.Fatalf("determined row CapabilitiesCheckedAt = %v, want %v", determined.CapabilitiesCheckedAt, checkedAt)
+	if v := byName["video"]; v.Verdict != "no" {
+		t.Fatalf("video entry = %+v, want no", v)
+	}
+	if v := byName["tools"]; v.Verdict != "yes" {
+		t.Fatalf("tools entry = %+v, want yes", v)
+	}
+	if _, ok := byName["audio"]; ok {
+		t.Fatalf("audio entry present = %+v, want ABSENT (never determined, no row)", byName["audio"])
+	}
+	// The open-vocabulary "thinking" entry surfaces verbatim, not dropped --
+	// this codebase has no CapabilityThinking constant.
+	if v := byName["thinking"]; v.Verdict != "yes" {
+		t.Fatalf("thinking entry = %+v, want yes", v)
+	}
+	// IsMtp/VisionCapable fold from the SAME rows batch (mtp="yes" -> true;
+	// vision="yes" -> true), not from the frozen ModelMapping columns.
+	if !determined.IsMtp {
+		t.Fatalf("determined.IsMtp = false, want true (mtp row is yes)")
+	}
+	if !determined.VisionCapable {
+		t.Fatalf("determined.VisionCapable = false, want true (vision row is yes)")
 	}
 
 	unknown := byServer["srv-unknown"]
-	if unknown.CapVision != "" || unknown.CapVideo != "" || unknown.CapAudio != "" || unknown.CapTools != "" {
-		t.Fatalf("never-determined row verdicts = (%q, %q, %q, %q), want all \"\"", unknown.CapVision, unknown.CapVideo, unknown.CapAudio, unknown.CapTools)
+	if unknown.Capabilities == nil {
+		t.Fatalf("unknown row Capabilities = nil, want a non-nil EMPTY slice (never null on the wire)")
 	}
-	if unknown.CapExtra != nil {
-		t.Fatalf("never-determined row CapExtra = %v, want nil", unknown.CapExtra)
+	if len(unknown.Capabilities) != 0 {
+		t.Fatalf("unknown row Capabilities = %+v, want empty", unknown.Capabilities)
 	}
-	if unknown.CapabilitiesSource != "" {
-		t.Fatalf("never-determined row CapabilitiesSource = %q, want \"\"", unknown.CapabilitiesSource)
-	}
-	if unknown.CapabilitiesCheckedAt != nil {
-		t.Fatalf("never-determined row CapabilitiesCheckedAt = %v, want nil", unknown.CapabilitiesCheckedAt)
+	if unknown.IsMtp || unknown.VisionCapable {
+		t.Fatalf("unknown row IsMtp/VisionCapable = (%v, %v), want (false, false) -- a missing row is not capable", unknown.IsMtp, unknown.VisionCapable)
 	}
 
-	// The wire encoding of "never determined" must carry cap_vision/cap_video/
-	// cap_audio/cap_tools/capabilities_source with an explicit "" value, not
-	// omit them (no `omitempty` on any of the five) -- same rule
-	// live_progress_support already follows, for the same reason: a missing
-	// key is indistinguishable from a client that doesn't know the field yet.
-	// cap_extra and capabilities_checked_at, by contrast, DO omit when empty/nil.
+	// The wire encoding of "no rows" must carry `"capabilities":[]`, never
+	// `null` -- a client's array-processing code must not need a nil check.
 	blob, err := json.Marshal(unknown)
 	if err != nil {
 		t.Fatalf("json.Marshal(unknown): %v", err)
 	}
-	for _, want := range []string{`"cap_vision":""`, `"cap_video":""`, `"cap_audio":""`, `"cap_tools":""`, `"capabilities_source":""`} {
-		if !strings.Contains(string(blob), want) {
-			t.Fatalf("wire JSON = %s, want an explicit %s", blob, want)
-		}
-	}
-	for _, notWant := range []string{`"cap_extra"`, `"capabilities_checked_at"`} {
-		if strings.Contains(string(blob), notWant) {
-			t.Fatalf("wire JSON = %s, want %s OMITTED when empty/nil", blob, notWant)
-		}
+	if !strings.Contains(string(blob), `"capabilities":[]`) {
+		t.Fatalf("wire JSON = %s, want an explicit \"capabilities\":[]", blob)
 	}
 }
 
-// TestModelServersCapExtraDecodeFailureDegrades: a malformed CapExtra JSON
-// string (operator-invisible -- a background detector wrote it, never a
-// human) degrades that one field to nil/omitted rather than erroring the
-// whole row -- one corrupt mapping must not blank a server's entire listing.
-func TestModelServersCapExtraDecodeFailureDegrades(t *testing.T) {
+// TestModelServersCapabilitiesSingleBatchQuery is the N+1 guard: ModelServers
+// must issue exactly ONE MappingCapabilitiesForMappings query regardless of
+// how many mappings offer the model. This is the reason the batch reader
+// exists at all (see ModelServerDTO.Capabilities' own doc-comment) -- the
+// listing already costs ~31 queries at the documented scale, and it is
+// recomputed on every loaded-model-registry change over SSE, and once PER
+// GROUP MEMBER by handlePortalModelGroupServers, so a per-row capability read
+// would have multiplied both.
+func TestModelServersCapabilitiesSingleBatchQuery(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
-	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
-	seedOffering(t, routeStore, now, "srv-corrupt", "app-corrupt", "map-corrupt", "shared", "up-corrupt", 0)
-
-	mapping, err := routeStore.MappingByID(context.Background(), "map-corrupt")
-	if err != nil {
-		t.Fatalf("MappingByID: %v", err)
+	memStore := routing.NewMemoryStore()
+	const n = 5
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("map-%d", i)
+		seedOffering(t, memStore, now, fmt.Sprintf("srv-%d", i), fmt.Sprintf("app-%d", i), id, "shared", fmt.Sprintf("up-%d", i), 0)
+		if err := memStore.UpsertMappingCapabilities(context.Background(), id, []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+			Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: now,
+		}}); err != nil {
+			t.Fatalf("seed capability %s: %v", id, err)
+		}
 	}
-	mapping.CapExtra = "{not valid json"
-	if err := routeStore.UpdateMapping(context.Background(), mapping); err != nil {
-		t.Fatalf("UpdateMapping: %v", err)
-	}
+	counting := &countingCapabilityStore{MemoryStore: memStore}
+	svc := newModelServersTestServiceWithRoutes(t, now, fakeLoadedModels{}, counting)
 
 	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
 	if err != nil {
 		t.Fatalf("ModelServers: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("len(rows) = %d, want 1 (%+v)", len(rows), rows)
+	if len(rows) != n {
+		t.Fatalf("len(rows) = %d, want %d", len(rows), n)
 	}
-	if rows[0].CapExtra != nil {
-		t.Fatalf("CapExtra = %v, want nil (decode failure degrades to empty)", rows[0].CapExtra)
+	if counting.capabilityCalls != 1 {
+		t.Fatalf("capability batch calls = %d, want exactly 1 regardless of %d offering mappings (N+1 guard)", counting.capabilityCalls, n)
+	}
+	for _, r := range rows {
+		if len(r.Capabilities) != 1 || r.Capabilities[0].Capability != routing.CapabilityVision || r.Capabilities[0].Verdict != routing.CapabilityYes {
+			t.Fatalf("row %+v capabilities = %+v, want one vision/yes entry", r.MappingID, r.Capabilities)
+		}
 	}
 }

@@ -1547,7 +1547,10 @@ func TestCreateMappingStoresMetricsAndProvenance(t *testing.T) {
 		t.Fatalf("lock-only metrics_updated_at = %v, want nil (no measured value)", lockOnly.MetricsUpdatedAt)
 	}
 
-	// IsMTP alone IS a measured capability, so it DOES stamp provenance.
+	// IsMTP alone is NOT a measured metric any more (capability-table task 5):
+	// it no longer participates in metricValuesPresent, so it must NOT stamp
+	// the mapping's metrics provenance -- a capability now carries its OWN
+	// provenance on its model_mapping_capabilities row instead.
 	mtpOnly, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{
 		GatewayModelName: "mtp-only",
 		AppModelName:     "mtp-only-app",
@@ -1559,11 +1562,11 @@ func TestCreateMappingStoresMetricsAndProvenance(t *testing.T) {
 	if !mtpOnly.IsMtp {
 		t.Fatalf("mtp-only is_mtp = false, want true")
 	}
-	if mtpOnly.MetricsSource != "manual" {
-		t.Fatalf("mtp-only metrics_source = %q, want manual", mtpOnly.MetricsSource)
+	if mtpOnly.MetricsSource != "" {
+		t.Fatalf("mtp-only metrics_source = %q, want empty (IsMTP alone no longer stamps metrics provenance)", mtpOnly.MetricsSource)
 	}
-	if mtpOnly.MetricsUpdatedAt == nil {
-		t.Fatalf("mtp-only metrics_updated_at not stamped")
+	if mtpOnly.MetricsUpdatedAt != nil {
+		t.Fatalf("mtp-only metrics_updated_at = %v, want nil (IsMTP alone no longer stamps metrics provenance)", mtpOnly.MetricsUpdatedAt)
 	}
 }
 
@@ -1759,11 +1762,19 @@ func TestMappingConcurrencyCapacityMetrics(t *testing.T) {
 }
 
 // TestCreateMappingVisionCapableRoundTrip: a `vision_capable: true` create
-// round-trips onto ModelMappingDTO.VisionCapable, is a measured write (stamps
-// manual provenance), and an UpdateMapping patch of the flag round-trips too.
+// round-trips onto ModelMappingDTO.VisionCapable and writes an authoritative
+// "vision"/"yes" model_mapping_capabilities row with source "manual" -- but,
+// unlike before capability-table task 5, no longer stamps the mapping's
+// METRICS provenance (metricValuesPresent dropped IsMTP/VisionCapable: a
+// capability's provenance now lives on its own row, not on the mapping's
+// metrics_source/metrics_updated_at). An UpdateMapping patch of the flag
+// round-trips too, in EITHER direction, because UpdateMappingRequest's
+// pointer unambiguously means "the operator changed it right now" (see
+// writeManualVisionCapability's own doc-comment for why CreateMapping's
+// plain-bool request only ever writes the true direction).
 func TestCreateMappingVisionCapableRoundTrip(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	svc, _ := newServerTestService(t, now)
+	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
 	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
 	if err != nil {
@@ -1781,14 +1792,28 @@ func TestCreateMappingVisionCapableRoundTrip(t *testing.T) {
 	if !created.VisionCapable {
 		t.Fatalf("vision_capable = false, want true")
 	}
-	if created.MetricsSource != "manual" {
-		t.Fatalf("metrics_source = %q, want manual (vision_capable was set)", created.MetricsSource)
+	if created.MetricsSource != "" {
+		t.Fatalf("metrics_source = %q, want empty (vision_capable no longer stamps metrics provenance)", created.MetricsSource)
 	}
-	if created.MetricsUpdatedAt == nil {
-		t.Fatalf("metrics_updated_at not stamped after a vision_capable write")
+	if created.MetricsUpdatedAt != nil {
+		t.Fatalf("metrics_updated_at = %v, want nil (vision_capable no longer stamps metrics provenance)", created.MetricsUpdatedAt)
+	}
+	visionRows, err := routeStore.MappingCapabilities(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities(created): %v", err)
+	}
+	visionRow, ok := routing.CapabilityRowsByName(visionRows)[routing.CapabilityVision]
+	if !ok || visionRow.Verdict != routing.CapabilityYes || visionRow.Source != routing.CapabilitySourceManual {
+		t.Fatalf("created vision capability row = %+v (ok=%v), want yes/manual", visionRow, ok)
 	}
 
-	// A mapping created without vision_capable defaults to false.
+	// A mapping created without vision_capable defaults to false AND writes
+	// NO capability row at all: CreateMappingRequest.VisionCapable is a plain
+	// bool, so this unset `false` cannot be told apart from "the operator
+	// never touched the checkbox" -- the overwhelmingly common case -- and
+	// must not permanently freeze this mapping's vision capability to a
+	// manual "no", closing off the vision benchmark and every probe from
+	// ever determining the real answer.
 	plain, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{
 		GatewayModelName: "plain",
 		AppModelName:     "plain-app",
@@ -1799,8 +1824,17 @@ func TestCreateMappingVisionCapableRoundTrip(t *testing.T) {
 	if plain.VisionCapable {
 		t.Fatalf("plain vision_capable = true, want false (unset)")
 	}
+	plainRows, err := routeStore.MappingCapabilities(context.Background(), plain.ID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities(plain): %v", err)
+	}
+	if len(plainRows) != 0 {
+		t.Fatalf("plain capability rows = %+v, want none (an unset create-time checkbox writes nothing)", plainRows)
+	}
 
-	// UpdateMapping can flip it back to false, and the change stamps provenance.
+	// UpdateMapping can flip it back to false: the pointer is unambiguous, so
+	// THIS direction DOES write an authoritative "no" row, but it still does
+	// NOT stamp the mapping's metrics provenance.
 	falseVal := false
 	patched, err := svc.UpdateMapping(context.Background(), ownerToken(), created.ID, UpdateMappingRequest{VisionCapable: &falseVal})
 	if err != nil {
@@ -1809,8 +1843,88 @@ func TestCreateMappingVisionCapableRoundTrip(t *testing.T) {
 	if patched.VisionCapable {
 		t.Fatalf("patched vision_capable = true, want false")
 	}
-	if patched.MetricsSource != "manual" {
-		t.Fatalf("patched metrics_source = %q, want manual (vision_capable change)", patched.MetricsSource)
+	if patched.MetricsSource != "" {
+		t.Fatalf("patched metrics_source = %q, want empty (vision_capable no longer stamps metrics provenance)", patched.MetricsSource)
+	}
+	patchedRows, err := routeStore.MappingCapabilities(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities(patched): %v", err)
+	}
+	patchedVisionRow, ok := routing.CapabilityRowsByName(patchedRows)[routing.CapabilityVision]
+	if !ok || patchedVisionRow.Verdict != routing.CapabilityNo || patchedVisionRow.Source != routing.CapabilitySourceManual {
+		t.Fatalf("patched vision capability row = %+v (ok=%v), want no/manual", patchedVisionRow, ok)
+	}
+}
+
+// TestUpdateMappingVisionCapableSurvivesSubsequentProbe: the end-to-end proof
+// of the operator's rule (capability-table task 3's precedence, task 5's
+// manual write path) -- once UpdateMapping has written an authoritative
+// "vision" row with source manual, a later probe attempting to write a
+// DIFFERENT verdict at probe rank is outranked and never reaches the store,
+// so the operator's verdict survives unchanged. This exercises the exact
+// call sequence every real probe writer uses (routing.WritableCapabilityRows
+// then, only if it returns rows, UpsertMappingCapabilities) rather than
+// calling UpsertMappingCapabilities directly, which enforces no precedence
+// of its own -- callers do (see its own doc-comment).
+func TestUpdateMappingVisionCapableSurvivesSubsequentProbe(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	mapping, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "g", AppModelName: "a"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	trueVal := true
+	if _, err := svc.UpdateMapping(context.Background(), ownerToken(), mapping.ID, UpdateMappingRequest{VisionCapable: &trueVal}); err != nil {
+		t.Fatalf("UpdateMapping (vision_capable=true): %v", err)
+	}
+
+	ctx := context.Background()
+	stored, err := routeStore.MappingCapabilities(ctx, mapping.ID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities: %v", err)
+	}
+	storedByName := routing.CapabilityRowsByName(stored)
+	if storedByName[routing.CapabilityVision].Source != routing.CapabilitySourceManual {
+		t.Fatalf("stored vision source = %q, want manual (precondition)", storedByName[routing.CapabilityVision].Source)
+	}
+
+	// A probe determines the OPPOSITE verdict at probe rank -- exactly what a
+	// real llama.cpp /props re-probe or the vision benchmark would do if the
+	// operator's own answer were wrong. The shared precedence rule must
+	// refuse this write.
+	probed := []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now.Add(time.Hour),
+	}}
+	writable := routing.WritableCapabilityRows(probed, storedByName)
+	if len(writable) != 0 {
+		t.Fatalf("probe was able to write over a manual vision verdict: %+v", writable)
+	}
+	// The vision benchmark (rank 2) is outranked too -- only another manual
+	// write could ever change this mapping's vision verdict again.
+	benchmarked := []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: now.Add(time.Hour),
+	}}
+	if writable := routing.WritableCapabilityRows(benchmarked, storedByName); len(writable) != 0 {
+		t.Fatalf("vision benchmark was able to write over a manual vision verdict: %+v", writable)
+	}
+
+	// Nothing was written (both callers correctly skipped their Upsert given
+	// zero writable rows) -- confirm the store still reflects the operator's
+	// original verdict, unchanged.
+	after, err := routeStore.MappingCapabilities(ctx, mapping.ID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities (after): %v", err)
+	}
+	afterVision := routing.CapabilityRowsByName(after)[routing.CapabilityVision]
+	if afterVision.Verdict != routing.CapabilityYes || afterVision.Source != routing.CapabilitySourceManual {
+		t.Fatalf("vision capability after probe attempts = %+v, want unchanged yes/manual", afterVision)
 	}
 }
 

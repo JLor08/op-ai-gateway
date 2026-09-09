@@ -10,6 +10,7 @@ import {
   PortalApiError,
   type BenchmarkStatus,
   type ModelOption,
+  type ModelServerCapability,
   type ModelServerRow,
 } from '../api';
 import type { PortalApi } from './shared/types';
@@ -58,16 +59,12 @@ function makeRows(): ModelServerRow[] {
       // cannot coincidentally pass off another row's value.
       live_progress_support: 'supported',
       live_progress_checked_at: '2026-08-01T08:00:00Z',
-      // Task 6 (capability-autodetect-llamacpp): all-empty baseline for the
-      // Capabilities column, like every other verdict field's default here --
-      // individual tests below override these to exercise one determined
-      // scenario at a time.
-      cap_vision: '',
-      cap_video: '',
-      cap_audio: '',
-      cap_tools: '',
-      capabilities_source: '',
-      capabilities_checked_at: null,
+      // Capability-table task 5: the four cap_* verdict fields plus
+      // capabilities_source/capabilities_checked_at collapsed onto this one
+      // rows array -- all-empty baseline for the Capabilities column, like
+      // every other verdict field's default here -- individual tests below
+      // override this to exercise one determined scenario at a time.
+      capabilities: [],
       priority: 1,
     },
     {
@@ -94,12 +91,7 @@ function makeRows(): ModelServerRow[] {
       metrics_updated_at: null,
       live_progress_support: 'unsupported',
       live_progress_checked_at: '2026-08-01T07:00:00Z',
-      cap_vision: '',
-      cap_video: '',
-      cap_audio: '',
-      cap_tools: '',
-      capabilities_source: '',
-      capabilities_checked_at: null,
+      capabilities: [],
       priority: 3,
     },
     {
@@ -129,12 +121,7 @@ function makeRows(): ModelServerRow[] {
       // LiveProgressCheckedAt's doc-comment — nil until a verdict exists).
       live_progress_support: '',
       live_progress_checked_at: null,
-      cap_vision: '',
-      cap_video: '',
-      cap_audio: '',
-      cap_tools: '',
-      capabilities_source: '',
-      capabilities_checked_at: null,
+      capabilities: [],
       priority: 2,
     },
   ];
@@ -705,15 +692,38 @@ describe('ModelServersSection', () => {
     );
   });
 
-  // Task 6 (capability-autodetect-llamacpp): the Capabilities column, beside
-  // Live-Fortschritt. Scoped BY HEADER via cellForColumn throughout, not by
-  // cell position or a bare getByText: the neighbouring Live-Fortschritt
-  // column renders the identical "—" placeholder for its own not-determined
-  // case, so a positional assertion would keep passing even against the
-  // wrong cell if a column were ever inserted ahead of this one.
-  it('renders exactly one chip per determined `yes` verdict, and no chip at all for a `no`', async () => {
+  // capRow builds one ModelServerCapability fixture entry -- capability-table
+  // task 5's rows array replaced the four dedicated cap_* verdict fields, so
+  // every test below builds the array explicitly instead of setting a field.
+  function capRow(
+    capability: string,
+    verdict: string,
+    source = 'llama_cpp_props',
+    checkedAt = '2026-08-01T06:00:00Z',
+  ): ModelServerCapability {
+    return { capability, verdict, source, checked_at: checkedAt };
+  }
+
+  // Capability-table task 5: the Capabilities column, beside Live-Fortschritt.
+  // Scoped BY HEADER via cellForColumn throughout, not by cell position or a
+  // bare getByText: the neighbouring Live-Fortschritt column renders the
+  // identical "—" placeholder for its own not-determined case, so a
+  // positional assertion would keep passing even against the wrong cell if a
+  // column were ever inserted ahead of this one.
+  it('renders exactly one chip per determined `yes` verdict, and no chip at all for a `no` or a missing row', async () => {
     const rows = makeRows().map((r) =>
-      r.mapping_id === 'map-a' ? { ...r, cap_vision: 'yes', cap_video: 'no', cap_tools: 'yes' } : r,
+      r.mapping_id === 'map-a'
+        ? {
+            ...r,
+            capabilities: [
+              capRow('vision', 'yes'),
+              capRow('video', 'no'),
+              capRow('tools', 'yes'),
+              // 'audio' has NO row at all here -- never determined, same as a
+              // "no" for chip-rendering purposes, so no chip either.
+            ],
+          }
+        : r,
     );
     const { api } = makeApi({
       modelServers: vi.fn().mockResolvedValue(rows),
@@ -722,8 +732,8 @@ describe('ModelServersSection', () => {
     await screen.findByText('GPU-Box-C');
 
     const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
-    // Exactly two chips (Vision, Tools) -- cap_audio stayed "" (never
-    // determined, no chip) and cap_video is "no" (a negative, also no chip).
+    // Exactly two chips (Vision, Tools) -- audio has no row (never
+    // determined, no chip) and video is "no" (a negative, also no chip).
     expect(within(cell).getByText(t.capabilityVision)).toBeInTheDocument();
     expect(within(cell).getByText(t.capabilityTools)).toBeInTheDocument();
     expect(within(cell).queryByText(t.capabilityVideo)).not.toBeInTheDocument();
@@ -735,19 +745,21 @@ describe('ModelServersSection', () => {
     expect(within(cell).getByText(t.capabilityTools)).toHaveAttribute('data-status', 'active');
   });
 
-  it('renders the shared em-dash when every verdict is "" and cap_extra is empty', async () => {
+  it('renders the shared em-dash when the capabilities array is empty', async () => {
     const { api } = makeApi();
     renderSection(api);
     await screen.findByText('GPU-Box-C');
 
-    // rowB and rowC both carry all-empty capability fields in makeRows().
+    // rowB and rowC both carry an empty capabilities array in makeRows().
     expect(cellForColumn('GPU-Box-B', t.modelServerColCapabilities)).toHaveTextContent('—');
     expect(cellForColumn('GPU-Box-C', t.modelServerColCapabilities)).toHaveTextContent('—');
   });
 
-  it('renders a cap_extra entry as a chip labelled VERBATIM, after the fixed-order verdict chips', async () => {
+  it('renders an unrecognized capability name as a chip labelled VERBATIM, after the fixed-order verdict chips', async () => {
     const rows = makeRows().map((r) =>
-      r.mapping_id === 'map-b' ? { ...r, cap_audio: 'yes', cap_extra: ['thinking'] } : r,
+      r.mapping_id === 'map-b'
+        ? { ...r, capabilities: [capRow('audio', 'yes'), capRow('thinking', 'yes')] }
+        : r,
     );
     const { api } = makeApi({
       modelServers: vi.fn().mockResolvedValue(rows),
@@ -761,14 +773,15 @@ describe('ModelServersSection', () => {
     // must still surface rather than silently disappear.
     expect(within(cell).getByText('thinking')).toBeInTheDocument();
     expect(within(cell).getByText(t.capabilityAudio)).toBeInTheDocument();
-    // The verdict chip is the vetted "active" key; the cap_extra chip is the
-    // neutral "standby" key -- an unrecognized, un-vetted string must not be
-    // equated with a caveated verdict this codebase actually vouches for.
+    // The verdict chip is the vetted "active" key; the unrecognized-name chip
+    // is the neutral "standby" key -- an unrecognized, un-vetted string must
+    // not be equated with a caveated verdict this codebase actually vouches
+    // for.
     expect(within(cell).getByText(t.capabilityAudio)).toHaveAttribute('data-status', 'active');
     expect(within(cell).getByText('thinking')).toHaveAttribute('data-status', 'standby');
-    // Fixed order: the Audio verdict chip precedes the cap_extra chip. Scoped
-    // to BOTH keys (not just 'active') so the extra chip -- now 'standby' --
-    // is still picked up; if the push order were ever scrambled this would
+    // Fixed order: the Audio verdict chip precedes the unrecognized-name
+    // chip. Scoped to BOTH keys (not just 'active') so the standby chip is
+    // still picked up; if the push order were ever scrambled this would
     // still catch it, since the two keys involved are distinct.
     const labels = within(cell)
       .getAllByText((_, el) =>
@@ -778,15 +791,16 @@ describe('ModelServersSection', () => {
     expect(labels).toEqual([t.capabilityAudio, 'thinking']);
   });
 
-  it('opens the capabilities tooltip on hover, naming the provenance and the checked-at time', async () => {
+  // "mtp"/"live_progress" are rows in this SAME capabilities array now (they
+  // share the model_mapping_capabilities table with vision/video/audio/
+  // tools), but this table already has its OWN dedicated "MTP"/
+  // "Live-Fortschritt" columns for them -- without this exclusion they would
+  // ALSO fall into the verbatim unknown-name bucket and duplicate those
+  // columns as a raw, untranslated chip.
+  it('does not render a duplicate chip for mtp or live_progress -- they have their own columns', async () => {
     const rows = makeRows().map((r) =>
       r.mapping_id === 'map-a'
-        ? {
-            ...r,
-            cap_vision: 'yes',
-            capabilities_source: 'llama_cpp_props',
-            capabilities_checked_at: '2026-08-01T06:00:00Z',
-          }
+        ? { ...r, capabilities: [capRow('mtp', 'yes'), capRow('live_progress', 'yes')] }
         : r,
     );
     const { api } = makeApi({
@@ -795,15 +809,69 @@ describe('ModelServersSection', () => {
     renderSection(api);
     await screen.findByText('GPU-Box-C');
 
+    const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+    expect(within(cell).queryByText('mtp')).not.toBeInTheDocument();
+    expect(within(cell).queryByText('live_progress')).not.toBeInTheDocument();
+    // Neither is a known label either -- nothing else was seeded, so the
+    // column falls back to the shared em-dash.
+    expect(cell).toHaveTextContent('—');
+  });
+
+  // These two capabilities on the SAME row carry DIFFERENT source/checked-at
+  // values, so a test asserting on one chip's tooltip cannot coincidentally
+  // pass off the other's -- this is the whole point of the per-capability
+  // tooltip (the shared one this replaced could only ever show ONE
+  // source/date for the entire row). Two separate `it`s (rather than hovering
+  // one chip then the other in the same test) since a real user interaction
+  // is needed to dismiss the first tooltip before a second can be asserted on
+  // in isolation, and each `it` already gets its own fresh render.
+  function makeTwoCapabilityRows(): ModelServerRow[] {
+    return makeRows().map((r) =>
+      r.mapping_id === 'map-a'
+        ? {
+            ...r,
+            capabilities: [
+              capRow('vision', 'yes', 'llama_cpp_props', '2026-08-01T06:00:00Z'),
+              capRow('tools', 'yes', 'legacy', '2026-07-01T00:00:00Z'),
+            ],
+          }
+        : r,
+    );
+  }
+
+  it('opens the capabilities tooltip on hover, naming that capability’s own provenance and checked-at time', async () => {
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(makeTwoCapabilityRows()),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
     fireEvent.mouseOver(within(rowFor('GPU-Box-A')).getByText(t.capabilityVision));
     const tooltip = await screen.findByRole('tooltip');
-    // Provenance + checked-at, per the binding rendering rule.
     expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesSource('llama_cpp_props'));
     expect(tooltip).toHaveTextContent(
       t.modelServerCapabilitiesCheckedAt(new Date('2026-08-01T06:00:00Z').toLocaleString()),
     );
-    // The two upstream caveats (video = build + vision encoder, tools =
+    // The shared upstream caveats (video = build + vision encoder, tools =
     // native-template quality, not availability) are always folded in too.
     expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesTooltip);
+    // The OTHER capability's source on this same row must not leak in.
+    expect(tooltip).not.toHaveTextContent(t.modelServerCapabilitiesSource('legacy'));
+  });
+
+  it('names a DIFFERENT capability’s own provenance in its own tooltip, on the same row', async () => {
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(makeTwoCapabilityRows()),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    fireEvent.mouseOver(within(rowFor('GPU-Box-A')).getByText(t.capabilityTools));
+    const tooltip = await screen.findByRole('tooltip');
+    expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesSource('legacy'));
+    expect(tooltip).toHaveTextContent(
+      t.modelServerCapabilitiesCheckedAt(new Date('2026-07-01T00:00:00Z').toLocaleString()),
+    );
+    expect(tooltip).not.toHaveTextContent(t.modelServerCapabilitiesSource('llama_cpp_props'));
   });
 });

@@ -386,30 +386,34 @@ export type ModelServerRow = {
   // When that verdict was last determined; undefined/null when never
   // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
   live_progress_checked_at?: string | null;
-  // cap_vision/cap_video/cap_audio/cap_tools are the auto-detected capability
-  // verdicts (#49 sub-project 2): "" (never determined) | "yes" | "no". Mirrors
-  // the backend's ModelServerDTO (service_model_servers.go) -- like
-  // live_progress_support above, read straight off the persisted mapping
-  // field, so all four are always present (required, no `?`) rather than left
-  // "" for a gateway-injection pass to fill.
-  cap_vision: string;
-  cap_video: string;
-  cap_audio: string;
-  cap_tools: string;
-  // Capability names the upstream reported that have no dedicated column
-  // above ("thinking", "insert", ...); undefined/omitted when empty. The
-  // vocabulary is open-ended upstream, so this is rendered verbatim, never
-  // mapped onto a fixed enum.
-  cap_extra?: string[];
-  // Which probe produced the current cap_* verdicts: "llama_cpp_props" |
-  // "ollama_show" | "" (never determined). Always present, no `?`, same
-  // reasoning as the four verdicts above.
-  capabilities_source: string;
-  // When the cap_* verdicts were last determined; undefined/null when never
-  // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
-  capabilities_checked_at?: string | null;
+  // Every DETERMINED capability row for this (server, mapping) (the
+  // capability-table migration): one entry per capability that has ever been
+  // established -- "vision", "video", "audio", "tools", "mtp",
+  // "live_progress", and any name an upstream reports that this portal build
+  // has no dedicated UI for (the vocabulary is OPEN -- Ollama passes
+  // manifest-declared names straight through). A capability with no row is
+  // simply ABSENT from this array; there is no "" placeholder entry the way
+  // the old cap_vision/cap_video/cap_audio/cap_tools fields each needed one
+  // for "never determined" -- absence itself is that state now. Always an
+  // array, never undefined/null, even when empty (mirrors the backend's
+  // ModelServerDTO.Capabilities -- see its own doc-comment).
+  capabilities: ModelServerCapability[];
   // Live 1-based rank among this model's offering servers (0 = unknown/unranked).
   priority: number;
+};
+
+// One capability verdict on a ModelServerRow, mirroring the backend's
+// ModelServerCapabilityDTO field-for-field: which capability, its verdict
+// ("yes"/"no" -- "unknown" is the row's ABSENCE from ModelServerRow.
+// capabilities, never a value here), who established it, and when. source/
+// checked_at are what the per-capability tooltip renders that the old
+// shared, row-wide capabilities_source/capabilities_checked_at pair never
+// could: which verdict a given chip actually rests on.
+export type ModelServerCapability = {
+  capability: string;
+  verdict: string;
+  source: string;
+  checked_at: string;
 };
 
 // One (model, server) a model GROUP can serve, with a live rank across the whole

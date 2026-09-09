@@ -2015,6 +2015,22 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			fetch = func(ctx context.Context) ([]mappingView, error) { return s.visibleMappingViews(ctx, token) }
 		}
 		if views, err := fetch(ctx); err == nil {
+			// One batch capability read for every mapping this response is about
+			// to fold over -- the vision AND-fold below needs each mapping's
+			// "vision" row, and a per-mapping MappingCapabilities call here would
+			// turn this single-pass loop back into an N+1 (this same guard is why
+			// Service.ModelServers uses the identical batch call; see its own
+			// doc-comment). Best-effort: a store error degrades every mapping's
+			// capabilities to empty, which folds to visionOn==false everywhere --
+			// fail-closed, never fail-open.
+			mappingIDs := make([]string, len(views))
+			for i, view := range views {
+				mappingIDs[i] = view.mapping.ID
+			}
+			capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+			if capErr != nil {
+				capsByMapping = nil
+			}
 			// Derive both the per-model flavor set and the loaded-state from a
 			// single pass over the active mapping views (one store round-trip).
 			flavors := make(map[string]map[string]struct{})
@@ -2026,9 +2042,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			offeredOn := make(map[string]map[string]struct{})
 			// contextSizeOn: gateway model name -> MIN known (>0) mapping context_size; 0 = unknown.
 			contextSizeOn := make(map[string]int)
-			// visionOn: gateway model name -> AND of vision_capable across ALL of the
-			// model's offering mappings; fail-closed (a model starts true on first
-			// sight and only ever gets AND'd down, never up).
+			// visionOn: gateway model name -> AND of the "vision" capability row's
+			// verdict across ALL of the model's offering mappings; fail-closed (a
+			// model starts true on first sight and only ever gets AND'd down, never
+			// up). A row whose Verdict is CapabilityYes is the only thing that
+			// counts as capable: a "no" row AND a MISSING row (never probed) both
+			// AND in as false, unchanged from the pre-row-table bool's behaviour --
+			// see routing.CapabilityRow's doc-comment on why "unknown" is a row's
+			// absence rather than a third verdict.
 			visionOn := make(map[string]bool)
 			for _, view := range views {
 				name := view.mapping.GatewayModelName
@@ -2040,7 +2061,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					offeredOn[name] = make(map[string]struct{})
 				}
 				offeredOn[name][view.server.Name] = struct{}{}
-				visionOn[name] = visionOn[name] && view.mapping.VisionCapable
+				visionRow := routing.CapabilityRowsByName(capsByMapping[view.mapping.ID])[routing.CapabilityVision]
+				visionOn[name] = visionOn[name] && visionRow.Verdict == routing.CapabilityYes
 				if cs := view.mapping.ContextSize; cs > 0 {
 					if cur, ok := contextSizeOn[name]; !ok || cs < cur {
 						contextSizeOn[name] = cs

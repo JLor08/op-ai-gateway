@@ -16,7 +16,12 @@ import (
 // offered by two mappings (on different servers) and ONE of them is NOT
 // vision-capable, the DTO reports vision=false (AND across all offering
 // mappings, fail-closed). A model whose sole mapping is vision-capable reports
-// vision=true.
+// vision=true. "not vision-capable" is exercised BOTH ways a mapping can fail
+// to advertise vision now that the verdict lives on a row rather than a bool
+// column: an explicit "no" row, and NO row at all (never probed) -- both must
+// AND in as false, which is the fail-closed guarantee this table's row-
+// absence-means-unknown model exists to preserve (routing.CapabilityRow's own
+// doc-comment).
 func TestModelsResponseVisionAndAcrossMappings(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
@@ -31,32 +36,57 @@ func TestModelsResponseVisionAndAcrossMappings(t *testing.T) {
 			t.Fatalf("CreateApplication %s: %v", id, err)
 		}
 	}
-	mustMap := func(id, app, gateway string, vision bool) {
-		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: app, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, VisionCapable: vision, CreatedAt: now, UpdatedAt: now}); err != nil {
+	// mustMap creates the mapping with NO row written at all when verdict=="" --
+	// exercising "never probed", the ABSENCE case -- and writes an explicit
+	// "vision" capability row (source vision_benchmark, arbitrary here — the
+	// fold only cares about the verdict) for "yes"/"no".
+	mustMap := func(id, app, gateway, verdict string) {
+		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: app, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateMapping %s: %v", id, err)
 		}
+		if verdict == "" {
+			return
+		}
+		if err := routeStore.UpsertMappingCapabilities(ctx, id, []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: verdict,
+			Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: now,
+		}}); err != nil {
+			t.Fatalf("UpsertMappingCapabilities %s: %v", id, err)
+		}
 	}
-	// m1: two mappings, one vision-capable, one not -> AND -> false.
+	// m1: two mappings, one vision-capable, one explicitly NOT -> AND -> false.
 	mustServer("srv_a", "GPU-A")
 	mustApp("app_a", "srv_a", 8000)
-	mustMap("m_a", "app_a", "m1", true)
+	mustMap("m_a", "app_a", "m1", routing.CapabilityYes)
 	mustServer("srv_b", "GPU-B")
 	mustApp("app_b", "srv_b", 8000)
-	mustMap("m_b", "app_b", "m1", false)
+	mustMap("m_b", "app_b", "m1", routing.CapabilityNo)
 	// m2: single mapping, vision-capable -> true.
 	mustServer("srv_c", "GPU-C")
 	mustApp("app_c", "srv_c", 8000)
-	mustMap("m_c", "app_c", "m2", true)
+	mustMap("m_c", "app_c", "m2", routing.CapabilityYes)
+	// m3: two mappings, one vision-capable, one NEVER PROBED (no row at all)
+	// -> AND -> false. This is the fail-closed regression this table exists
+	// to prevent: a missing row must never silently count as capable.
+	mustServer("srv_d", "GPU-D")
+	mustApp("app_d", "srv_d", 8000)
+	mustMap("m_d", "app_d", "m3", routing.CapabilityYes)
+	mustServer("srv_e", "GPU-E")
+	mustApp("app_e", "srv_e", 8000)
+	mustMap("m_e", "app_e", "m3", "")
 
 	svc := NewService(ServiceDeps{Usage: usage.NewRecorder(), Routes: routeStore, Clock: func() time.Time { return now }})
 	got := svc.Models(ctx, auth.Token{UserID: "usr_1"})
 	byID := modelsByID(got)
 
 	if byID["m1"].Vision {
-		t.Fatalf("m1 vision = true, want false (AND with one non-vision mapping)")
+		t.Fatalf("m1 vision = true, want false (AND with one explicit non-vision mapping)")
 	}
 	if !byID["m2"].Vision {
 		t.Fatalf("m2 vision = false, want true (sole mapping is vision-capable)")
+	}
+	if byID["m3"].Vision {
+		t.Fatalf("m3 vision = true, want false (AND with one NEVER-PROBED mapping -- fail-closed)")
 	}
 }
 
@@ -106,8 +136,10 @@ func TestModelsResponseVisionGroupAggregation(t *testing.T) {
 }
 
 // offerModelVision seeds a server + application + one active mapping with an
-// explicit vision_capable flag, mirroring offerModel (service_model_groups_offering_test.go)
-// but threading VisionCapable through.
+// explicit "vision" capability row (yes/no per vision), mirroring offerModel
+// (service_model_groups_offering_test.go) but threading a vision verdict
+// through. Writes a ROW, not the frozen ModelMapping.VisionCapable column:
+// the fold under test (modelsResponse) reads model_mapping_capabilities now.
 func offerModelVision(t *testing.T, rs *routing.MemoryStore, srvID, srvName, appID string, flavors []string, gateway, appModel string, vision bool) {
 	t.Helper()
 	ctx := context.Background()
@@ -117,7 +149,18 @@ func offerModelVision(t *testing.T, rs *routing.MemoryStore, srvID, srvName, app
 	if err := rs.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: flavors, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
 		t.Fatalf("CreateApplication %s: %v", appID, err)
 	}
-	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: appID + "_map", ApplicationID: appID, GatewayModelName: gateway, AppModelName: appModel, Status: routing.ServerStatusActive, VisionCapable: vision, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+	mappingID := appID + "_map"
+	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: appModel, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
 		t.Fatalf("CreateMapping %s: %v", gateway, err)
+	}
+	verdict := routing.CapabilityNo
+	if vision {
+		verdict = routing.CapabilityYes
+	}
+	if err := rs.UpsertMappingCapabilities(ctx, mappingID, []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: verdict,
+		Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: offeringTime,
+	}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
 	}
 }

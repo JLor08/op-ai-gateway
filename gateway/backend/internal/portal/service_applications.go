@@ -1456,9 +1456,10 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		return ModelMappingDTO{}, ErrMappingGatewayNameConflict
 	}
 	now := s.clock().UTC()
-	// Default IsMTP from the model NAME when the caller did not explicitly set it.
-	// A name-derived default is NOT a measurement, so it must NOT drive the
-	// provenance stamp below (metricValuesPresent keeps seeing the RAW req.IsMTP).
+	// Default IsMTP from the model NAME when the caller did not explicitly set
+	// it. IsMTP no longer participates in the provenance stamp below at all
+	// (see metricValuesPresent's own doc-comment), so this default's origin no
+	// longer needs to be tracked separately from req.IsMTP for that purpose.
 	isMTP := req.IsMTP
 	if !isMTP {
 		isMTP = routing.IsMTPModelName(appModelName)
@@ -1488,12 +1489,30 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		loadMS: req.LoadTimeMS, contextSize: req.ContextSize,
 		maxConcurrency: req.MaxConcurrency, recommendedConcurrency: req.RecommendedConcurrency,
 		genTPSAtCapacity: req.GenTokensPerSecondAtCapacity, energyWhPerToken: req.EnergyWhPerToken,
-	}, req.IsMTP, req.VisionCapable) {
+	}) {
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now
 	}
 	if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
+	}
+	if req.VisionCapable {
+		// The operator's vision_capable checkbox is now the AUTHORITATIVE
+		// "vision" capability row (source manual), not just the legacy column
+		// above -- see writeManualVisionCapability's own doc-comment for why
+		// this outranks every probe and the vision benchmark permanently.
+		//
+		// Only the `true` direction writes here: CreateMappingRequest.
+		// VisionCapable is a plain bool, so an unset `false` at CREATE time is
+		// indistinguishable from "the operator never touched this field" --
+		// the overwhelming common case, since most mappings are created
+		// without ever looking at this checkbox. Writing a manual "no" for
+		// every one of them would permanently close off the vision benchmark
+		// and every probe from ever determining the real answer, which is a
+		// regression this codebase's own IsMTP-default reasoning two lines
+		// above already rejects for the same reason. `true` has no such
+		// ambiguity: an operator had to actively check the box.
+		s.writeManualVisionCapability(ctx, mapping.ID, true)
 	}
 	// Best-effort, after the successful store write: a mapping under the
 	// server_agent application is a runtime-config input (its two model-name
@@ -1614,8 +1633,12 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		mapping.MetricsLocked = *req.MetricsLocked
 	}
 	// A MEASURED-value change stamps provenance; a MetricsLocked-only change (policy,
-	// not a measurement) deliberately does NOT.
-	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil || req.IsMTP != nil || req.VisionCapable != nil
+	// not a measurement) deliberately does NOT. IsMTP/VisionCapable no longer
+	// participate here: they are no longer mapping columns conceptually (a
+	// capability row carries its OWN provenance -- see
+	// writeManualVisionCapability below), and metrics_source/metrics_updated_at
+	// describe the numeric metrics' provenance, not a capability's.
+	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil
 	if metricValueChanged {
 		now2 := s.clock().UTC()
 		mapping.MetricsSource = "manual"
@@ -1624,6 +1647,12 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
+	}
+	if req.VisionCapable != nil {
+		// The operator's vision_capable checkbox is now the AUTHORITATIVE
+		// "vision" capability row (source manual) -- see
+		// writeManualVisionCapability's own doc-comment.
+		s.writeManualVisionCapability(ctx, mapping.ID, *req.VisionCapable)
 	}
 	// Best-effort, after the successful store write: renaming a mapping under
 	// the server_agent application rewrites its spec's model/upstream_model in
@@ -1849,6 +1878,51 @@ func (s *Service) gatewayNameTakenOnServer(ctx context.Context, serverID string,
 	return false, nil
 }
 
+// writeManualVisionCapability records the operator's vision_capable checkbox
+// (CreateMapping/UpdateMapping) as a "vision" model_mapping_capabilities row
+// with source CapabilitySourceManual -- which, under the store's precedence
+// rule (routing.WritableCapabilityRows / capabilitySourceRank), outranks
+// every probe AND the vision benchmark, permanently, with no separate lock
+// needed: that is the whole trade the capability table makes instead of the
+// mapping-wide metrics_locked flag the pre-row-table column would have
+// needed to argue its way out of.
+//
+// capable is written LITERALLY as CapabilityYes/CapabilityNo -- there is no
+// third UI state for "the operator has no opinion" (the checkbox is strictly
+// boolean), so an operator who wants a capability back to UNKNOWN has no UI
+// for it yet; that would be routing.Store.DeleteMappingCapability, called
+// directly against the mapping id. UpdateMapping calls this for EITHER
+// direction once its VisionCapable pointer is non-nil, since a patch pointer
+// unambiguously means "the operator changed it right now". CreateMapping
+// calls this ONLY for capable==true, deliberately: CreateMappingRequest.
+// VisionCapable is a plain (non-pointer) bool, so an unset `false` at create
+// time cannot be told apart from "the operator never touched this field",
+// and the overwhelming majority of mappings are created without ever looking
+// at this checkbox -- writing a manual "no" for every one of them would
+// permanently close off the vision benchmark and every probe from ever
+// determining the real answer.
+//
+// Best-effort, mirroring every other capability writer in this codebase
+// (agent_ingest.go, benchmark_runner.go, app_health.go): called AFTER the
+// mapping create/update has already succeeded, so a failure here must not
+// fail a request whose primary effect (the mapping itself) already landed --
+// it is logged and swallowed.
+func (s *Service) writeManualVisionCapability(ctx context.Context, mappingID string, capable bool) {
+	verdict := routing.CapabilityNo
+	if capable {
+		verdict = routing.CapabilityYes
+	}
+	row := routing.CapabilityRow{
+		Capability: routing.CapabilityVision,
+		Verdict:    verdict,
+		Source:     routing.CapabilitySourceManual,
+		CheckedAt:  s.clock().UTC(),
+	}
+	if err := s.routes.UpsertMappingCapabilities(ctx, mappingID, []routing.CapabilityRow{row}); err != nil {
+		slog.Warn("manual vision capability write failed", "mapping_id", mappingID, "verdict", verdict, "err", err)
+	}
+}
+
 func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
@@ -1876,11 +1950,12 @@ func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 // mappingMetrics bundles the eight numeric per-mapping metric values shared by
 // validateMappingMetrics and metricValuesPresent below. CreateMapping builds
 // one straight from the request; UpdateMapping builds one from its already
-// pointer-merged "effective" values. isMTP/visionCapable stay separate
-// parameters on the functions below rather than bundled fields here, because
-// metricValuesPresent's caller deliberately passes the RAW req.IsMTP there
-// (never the name-defaulted value written onto the mapping) -- see its call
-// site's comment.
+// pointer-merged "effective" values. IsMTP/VisionCapable are deliberately NOT
+// bundled here (or passed to metricValuesPresent below) any more: they are no
+// longer mapping columns conceptually, and a capability's own provenance now
+// lives in its model_mapping_capabilities row (Source/CheckedAt), not in
+// this mapping's metrics_source/metrics_updated_at -- see
+// writeManualVisionCapability.
 type mappingMetrics struct {
 	genTPS, promptTPS                      float64
 	loadMS, contextSize                    int
@@ -1898,8 +1973,12 @@ func validateMappingMetrics(m mappingMetrics) error {
 
 // metricValuesPresent reports whether any MEASURED value was supplied (the lock flag
 // alone is policy, not a measurement, so it does not stamp provenance).
-func metricValuesPresent(m mappingMetrics, isMTP, visionCapable bool) bool {
-	return m.genTPS != 0 || m.promptTPS != 0 || m.loadMS != 0 || m.contextSize != 0 || m.maxConcurrency != 0 || m.recommendedConcurrency != 0 || m.genTPSAtCapacity != 0 || m.energyWhPerToken != 0 || isMTP || visionCapable
+// IsMTP/VisionCapable no longer participate (see mappingMetrics' own
+// doc-comment): a capability toggle alone must not stamp the mapping's
+// metrics provenance any more, now that it carries its own (Source/
+// CheckedAt on its model_mapping_capabilities row).
+func metricValuesPresent(m mappingMetrics) bool {
+	return m.genTPS != 0 || m.promptTPS != 0 || m.loadMS != 0 || m.contextSize != 0 || m.maxConcurrency != 0 || m.recommendedConcurrency != 0 || m.genTPSAtCapacity != 0 || m.energyWhPerToken != 0
 }
 
 func normalizeMappingStatus(raw string) (string, error) {

@@ -5,8 +5,8 @@ package portal
 
 import (
 	"context"
-	"encoding/json"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"sort"
 	"strings"
 	"time"
@@ -43,17 +43,25 @@ type ModelServerDTO struct {
 	MetricsProbe string `json:"metrics_probe"`
 	ContextProbe string `json:"context_probe"`
 
-	GenTokensPerSecond           float64    `json:"gen_tokens_per_second"`
-	PromptTokensPerSecond        float64    `json:"prompt_tokens_per_second"`
-	LoadTimeMS                   int        `json:"load_time_ms"`
-	ContextSize                  int        `json:"context_size"`
-	MaxConcurrency               int        `json:"max_concurrency"`
-	RecommendedConcurrency       int        `json:"recommended_concurrency"`
-	GenTokensPerSecondAtCapacity float64    `json:"gen_tokens_per_second_at_capacity"`
-	IsMtp                        bool       `json:"is_mtp"`
-	VisionCapable                bool       `json:"vision_capable"`
-	MetricsSource                string     `json:"metrics_source"`
-	MetricsUpdatedAt             *time.Time `json:"metrics_updated_at,omitempty"`
+	GenTokensPerSecond           float64 `json:"gen_tokens_per_second"`
+	PromptTokensPerSecond        float64 `json:"prompt_tokens_per_second"`
+	LoadTimeMS                   int     `json:"load_time_ms"`
+	ContextSize                  int     `json:"context_size"`
+	MaxConcurrency               int     `json:"max_concurrency"`
+	RecommendedConcurrency       int     `json:"recommended_concurrency"`
+	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
+	// IsMtp/VisionCapable are convenience booleans folded from Capabilities
+	// below (the "mtp"/"vision" row's Verdict == CapabilityYes; a missing row
+	// is NOT capable, same fail-closed rule Capabilities itself carries) --
+	// NOT read off ModelMapping.IsMTP/VisionCapable any more, which is why
+	// this fill needs the same capability-rows batch Capabilities does. Kept
+	// as dedicated booleans (rather than making every caller re-derive them
+	// from Capabilities) because GroupServersSection's "mtp"/vision columns
+	// mirror this DTO and already key off these two fields.
+	IsMtp            bool       `json:"is_mtp"`
+	VisionCapable    bool       `json:"vision_capable"`
+	MetricsSource    string     `json:"metrics_source"`
+	MetricsUpdatedAt *time.Time `json:"metrics_updated_at,omitempty"`
 
 	// LiveProgressSupport is the mapping's PERSISTED verdict on whether this
 	// upstream tolerates the live-progress two-parameter request (#51):
@@ -75,42 +83,47 @@ type ModelServerDTO struct {
 	// LiveProgressCheckedAt's own doc-comment -- no decision logic may read it.
 	LiveProgressCheckedAt *time.Time `json:"live_progress_checked_at,omitempty"`
 
-	// CapVision/CapVideo/CapAudio/CapTools are the auto-detected capability
-	// verdicts (#49 sub-project 2), each "" (never determined) | "yes" | "no",
-	// read straight off ModelMapping.CapVision/CapVideo/CapAudio/CapTools
-	// exactly like LiveProgressSupport above. Same gateway-injection-seam
-	// story as LiveProgressSupport: a background detector wrote these to the
-	// mapping directly (until #49-3 moved every probe onto
-	// model_mapping_capabilities rows -- see
-	// routing.MappingStore.UpsertMappingCapabilities, which is also where the
-	// no-metrics_locked-guard argument these columns cited now lives), so
-	// there is nothing for the gateway layer to inject after the fact --
-	// Service.ModelServers fills them itself. No `omitempty` on any of the
-	// four: "never determined" must be an explicit "" on the wire, not a
-	// missing key -- the same rule LiveProgressSupport's own doc-comment
-	// explains.
-	CapVision string `json:"cap_vision"`
-	CapVideo  string `json:"cap_video"`
-	CapAudio  string `json:"cap_audio"`
-	CapTools  string `json:"cap_tools"`
-	// CapExtra is ModelMapping.CapExtra's stored JSON array decoded into a
-	// []string for the wire, rather than passing the raw JSON-encoded string
-	// through -- the portal renders one chip per entry, not a JSON blob. Nil
-	// (omitted from the wire) when empty. Decoding is best-effort: the stored
-	// string is operator-invisible JSON a background detector wrote, so a
-	// decode failure degrades to nil/omitted rather than failing the whole
-	// row -- one malformed mapping must not blank a server's entire listing.
-	CapExtra []string `json:"cap_extra,omitempty"`
-	// CapabilitiesSource is ModelMapping.CapabilitiesSource read straight
-	// through: which probe produced the current verdicts ("llama_cpp_props" |
-	// "ollama_show" | ""). No `omitempty`, same reasoning as the four verdicts
-	// above.
-	CapabilitiesSource string `json:"capabilities_source"`
-	// CapabilitiesCheckedAt is ModelMapping.CapabilitiesCheckedAt read
-	// straight through; nil when never determined. Diagnostic/tooltip only,
-	// mirroring LiveProgressCheckedAt's own doc-comment -- no decision logic
-	// may read it.
-	CapabilitiesCheckedAt *time.Time `json:"capabilities_checked_at,omitempty"`
+	// Capabilities is every DETERMINED capability row for this mapping (#49
+	// sub-project 3, the capability-table migration), one entry per
+	// (mapping, capability) that has ever been established -- "vision",
+	// "video", "audio", "tools", "mtp", "live_progress", and any name an
+	// upstream reports that this codebase has no constant for (the vocabulary
+	// is OPEN -- Ollama passes manifest-declared names straight through). A
+	// capability with no row is simply ABSENT from this slice; there is no
+	// "" placeholder entry the way the old cap_vision/cap_video/cap_audio/
+	// cap_tools columns each needed one for "never determined" -- absence
+	// itself is that state now (routing.CapabilityRow's own doc-comment).
+	//
+	// Filled from ONE routing.MappingCapabilitiesForMappings batch call
+	// across every mapping ModelServers is about to return (see the fill
+	// below) -- never a per-row MappingCapabilities call: the listing
+	// already costs ~31 queries at the documented scale, and two multipliers
+	// make a per-row read genuinely expensive (the SSE stream recomputes the
+	// whole listing on every loaded-model-registry change, and
+	// handlePortalModelGroupServers calls the full listing once per group
+	// member).
+	//
+	// Never nil on the wire: a mapping with no rows carries an empty array,
+	// not `null` -- the frontend's capabilityChips renders the shared
+	// em-dash for an empty array, but a `null` would need its own
+	// nil-vs-empty branch for no reason.
+	Capabilities []ModelServerCapabilityDTO `json:"capabilities"`
+}
+
+// ModelServerCapabilityDTO is one routing.CapabilityRow on the wire,
+// field-for-field: which capability, its verdict ("yes"/"no" -- "unknown" is
+// the row's ABSENCE from ModelServerDTO.Capabilities, never a value here),
+// who established it (Source: "manual" | "vision_benchmark" |
+// "llama_cpp_props" | "legacy" | an unrecognised probe's own name), and when.
+// Source and CheckedAt are what the per-capability tooltip renders that the
+// old shared, mapping-wide CapabilitiesSource/CapabilitiesCheckedAt pair
+// never could: which verdict a given chip actually rests on, not just the
+// most recent probe's identity for the whole row.
+type ModelServerCapabilityDTO struct {
+	Capability string    `json:"capability"`
+	Verdict    string    `json:"verdict"`
+	Source     string    `json:"source"`
+	CheckedAt  time.Time `json:"checked_at"`
 }
 
 // GroupModelServerDTO is one (model, server) a model group can serve, with the live
@@ -178,11 +191,30 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 		return v
 	}
 
-	rows := make([]ModelServerDTO, 0)
+	// Filter to the offering views FIRST, so the capability batch call below
+	// (the N+1 guard: one query, period) asks for exactly the mapping ids
+	// this response needs -- not every active mapping in the system.
+	matched := make([]mappingView, 0)
 	for _, view := range views {
-		if view.mapping.GatewayModelName != gatewayModelName {
-			continue
+		if view.mapping.GatewayModelName == gatewayModelName {
+			matched = append(matched, view)
 		}
+	}
+	mappingIDs := make([]string, len(matched))
+	for i, view := range matched {
+		mappingIDs[i] = view.mapping.ID
+	}
+	// Best-effort, exactly ONE query regardless of how many mappings offer
+	// this model: a store error degrades every row's capabilities to empty
+	// (fail-closed -- see ModelServerDTO.Capabilities) rather than failing
+	// the whole listing, mirroring the ModelSettings best-effort read above.
+	capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if capErr != nil {
+		capsByMapping = nil
+	}
+
+	rows := make([]ModelServerDTO, 0, len(matched))
+	for _, view := range matched {
 		loaded := false
 		if s.loadedModels != nil && view.mapping.AppModelName != "" {
 			for _, m := range s.loadedModels.LoadedAppModels(view.app.ID, view.server.ID) {
@@ -192,6 +224,8 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 				}
 			}
 		}
+		caps := capsByMapping[view.mapping.ID]
+		byName := routing.CapabilityRowsByName(caps)
 		rows = append(rows, ModelServerDTO{
 			ServerID:                     view.server.ID,
 			ServerName:                   view.server.Name,
@@ -206,19 +240,13 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 			MaxConcurrency:               view.mapping.MaxConcurrency,
 			RecommendedConcurrency:       view.mapping.RecommendedConcurrency,
 			GenTokensPerSecondAtCapacity: view.mapping.GenTokensPerSecondAtCapacity,
-			IsMtp:                        view.mapping.IsMTP,
-			VisionCapable:                view.mapping.VisionCapable,
+			IsMtp:                        byName[routing.CapabilityMTP].Verdict == routing.CapabilityYes,
+			VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
 			MetricsSource:                view.mapping.MetricsSource,
 			MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
 			LiveProgressSupport:          view.mapping.LiveProgressSupport,
 			LiveProgressCheckedAt:        view.mapping.LiveProgressCheckedAt,
-			CapVision:                    view.mapping.CapVision,
-			CapVideo:                     view.mapping.CapVideo,
-			CapAudio:                     view.mapping.CapAudio,
-			CapTools:                     view.mapping.CapTools,
-			CapExtra:                     decodeCapExtra(view.mapping.CapExtra),
-			CapabilitiesSource:           view.mapping.CapabilitiesSource,
-			CapabilitiesCheckedAt:        view.mapping.CapabilitiesCheckedAt,
+			Capabilities:                 modelServerCapabilityDTOs(caps),
 		})
 	}
 	rows, err = s.filterAllowedModelServerRows(ctx, principal, rows)
@@ -234,20 +262,24 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 	return rows, nil
 }
 
-// decodeCapExtra decodes a mapping's stored CapExtra JSON-array string into a
-// []string for the wire (see ModelServerDTO.CapExtra). "" (nothing extra
-// reported) decodes to nil, same as a decode failure: the stored string is
-// operator-invisible JSON a background detector wrote, so a malformed value
-// must degrade this one field to empty rather than error the whole row.
-func decodeCapExtra(raw string) []string {
-	if raw == "" {
-		return nil
+// modelServerCapabilityDTOs projects a mapping's stored capability rows onto
+// the wire shape (see ModelServerCapabilityDTO), preserving
+// MappingCapabilitiesForMappings' order (alphabetical by capability -- the
+// frontend imposes its OWN fixed order for the known names and does not rely
+// on this one). ALWAYS returns a non-nil slice, even for zero rows: the DTO's
+// `capabilities` must be `[]` on the wire, never `null` (see
+// ModelServerDTO.Capabilities).
+func modelServerCapabilityDTOs(rows []routing.CapabilityRow) []ModelServerCapabilityDTO {
+	out := make([]ModelServerCapabilityDTO, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ModelServerCapabilityDTO{
+			Capability: r.Capability,
+			Verdict:    r.Verdict,
+			Source:     r.Source,
+			CheckedAt:  r.CheckedAt,
+		})
 	}
-	var extra []string
-	if err := json.Unmarshal([]byte(raw), &extra); err != nil {
-		return nil
-	}
-	return extra
+	return out
 }
 
 // filterAllowedModelServerRows drops any row whose ServerID the given principal

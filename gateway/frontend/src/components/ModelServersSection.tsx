@@ -4,7 +4,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { Tooltip } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
-import { PortalApiError, type ModelOption, type ModelServerRow } from '../api';
+import {
+  PortalApiError,
+  type ModelOption,
+  type ModelServerCapability,
+  type ModelServerRow,
+} from '../api';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
@@ -155,74 +160,90 @@ function liveProgressTooltip(
   return `${info.tooltip} ${t.modelServerLiveProgressCheckedAt(new Date(checkedAt).toLocaleString())}`;
 }
 
-// The row shape capabilityChips/capabilitiesTooltip need — a subset of
-// ModelServerRow, named for readability at the call site below.
-type CapabilityRow = Pick<
-  ModelServerRow,
-  | 'cap_vision'
-  | 'cap_video'
-  | 'cap_audio'
-  | 'cap_tools'
-  | 'cap_extra'
-  | 'capabilities_source'
-  | 'capabilities_checked_at'
->;
+// The known capability names this column gives a translated chip to, in the
+// FIXED display order every row uses regardless of which verdicts happen to
+// be set (PR #66's decision, carried over unchanged onto the rows array).
+const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => string }[] = [
+  { capability: 'vision', label: (t) => t.capabilityVision },
+  { capability: 'video', label: (t) => t.capabilityVideo },
+  { capability: 'audio', label: (t) => t.capabilityAudio },
+  { capability: 'tools', label: (t) => t.capabilityTools },
+];
+const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));
 
-// capabilityChips returns one chip per DETERMINED capability, in a fixed
+// "mtp" and "live_progress" already have their OWN dedicated, translated
+// columns on this same table (the 'mtp' and 'liveProgress' ListColumns
+// below) -- both are rows in the same model_mapping_capabilities table as
+// vision/video/audio/tools now, so without this exclusion they would ALSO
+// fall into the verbatim "unknown vocabulary" bucket below and duplicate
+// those columns as a raw, untranslated "mtp"/"live_progress" chip. Every
+// OTHER capability name this portal build has no dedicated column for still
+// surfaces here, verbatim, per capabilityChips' own doc-comment.
+const CAPABILITIES_COLUMN_EXCLUDED = new Set(['mtp', 'live_progress']);
+
+// One rendered chip: which STATUS key it uses (data-status, never colour),
+// its label, and the SOURCE ROW it came from -- the row is threaded through
+// so the caller can render a tooltip naming THIS capability's own
+// source/checked_at, not a shared one for the whole cell.
+type CapabilityChip = { status: 'success' | 'standby'; label: string; row: ModelServerCapability };
+
+// capabilityChips returns one chip per DETERMINED `yes` verdict, in a fixed
 // order (Vision, Video, Audio, Tools) so the column reads the same on every
-// row regardless of which verdicts happen to be set, followed by every
-// cap_extra entry VERBATIM (including a string this portal build doesn't
-// recognize -- the vocabulary is open-ended upstream, e.g. Ollama passes
-// manifest-declared capabilities straight through, so dropping an unknown
-// value here would silently hide a real, reported capability). A `no`
-// verdict renders NO chip at all -- negatives are not chips, only positives
-// and "reported but uncategorized" are. Verdict chips use the vetted
-// "success" key; cap_extra chips use the neutral "standby" key instead (see
+// row regardless of which verdicts happen to be set, followed by every OTHER
+// capability name this build has no dedicated column for, VERBATIM
+// (including a string this portal build doesn't recognize -- the vocabulary
+// is open-ended upstream, e.g. Ollama passes manifest-declared capabilities
+// straight through, so dropping an unknown value here would silently hide a
+// real, reported capability). A `no` verdict, and a capability with no row at
+// all, both render NO chip -- negatives are not chips, only positives and
+// "reported but uncategorized" are. Verdict chips use the vetted "success"
+// key; unknown-vocabulary chips use the neutral "standby" key instead (see
 // the comment at the push site below) -- chips are still keyed by
 // `data-status`, never by colour, and there is no ranking within either
 // group.
-function capabilityChips(
-  row: CapabilityRow,
-  t: Translation,
-): { status: 'success' | 'standby'; label: string }[] {
-  const chips: { status: 'success' | 'standby'; label: string }[] = [];
-  const verdicts: [string, string][] = [
-    [row.cap_vision, t.capabilityVision],
-    [row.cap_video, t.capabilityVideo],
-    [row.cap_audio, t.capabilityAudio],
-    [row.cap_tools, t.capabilityTools],
-  ];
-  for (const [verdict, label] of verdicts) {
-    if (verdict === 'yes') chips.push({ status: 'success', label });
+function capabilityChips(capabilities: ModelServerCapability[], t: Translation): CapabilityChip[] {
+  const byName = new Map(capabilities.map((c) => [c.capability, c]));
+  const chips: CapabilityChip[] = [];
+  for (const known of KNOWN_CAPABILITY_ORDER) {
+    const row = byName.get(known.capability);
+    if (row?.verdict === 'yes') {
+      chips.push({ status: 'success', label: known.label(t), row });
+    }
   }
-  for (const extra of row.cap_extra ?? []) {
+  for (const row of capabilities) {
+    if (
+      KNOWN_CAPABILITY_NAMES.has(row.capability) ||
+      CAPABILITIES_COLUMN_EXCLUDED.has(row.capability)
+    ) {
+      continue;
+    }
+    if (row.verdict !== 'yes') continue;
     // NEUTRAL, not "success": the verdicts above are capabilities this
-    // codebase understands and caveats in the tooltip; cap_extra is an
+    // codebase understands and caveats in the tooltip; this one is an
     // open-ended, un-vetted string from the upstream's own vocabulary. Same
     // "reported, not verified" semantic liveProgressChipInfo's "unsupported"
     // branch above already chose.
-    chips.push({ status: 'standby', label: extra });
+    chips.push({ status: 'standby', label: row.capability, row });
   }
   return chips;
 }
 
-// capabilitiesTooltip folds the provenance (capabilities_source) and the
+// capabilityTooltip folds ONE capability row's own provenance (source) and
 // checked-at timestamp into the shared caveat text
 // (t.modelServerCapabilitiesTooltip -- the video-is-build-plus-vision-encoder
 // and tools-is-native-template-quality caveats every chip needs, regardless
-// of which capability it names). capabilities_checked_at exists ONLY for this
-// tooltip and for operator diagnostics (mirrors ModelMapping.
-// CapabilitiesCheckedAt's own doc-comment) -- no rendering DECISION may
-// branch on it, only this string.
-function capabilitiesTooltip(row: CapabilityRow, t: Translation): string {
-  const parts = [t.modelServerCapabilitiesTooltip];
-  if (row.capabilities_source) parts.push(t.modelServerCapabilitiesSource(row.capabilities_source));
-  if (row.capabilities_checked_at) {
-    parts.push(
-      t.modelServerCapabilitiesCheckedAt(new Date(row.capabilities_checked_at).toLocaleString()),
-    );
-  }
-  return parts.join(' ');
+// of which capability it names). This is the gain the old shared, row-wide
+// capabilities_source/capabilities_checked_at pair could never give: which
+// verdict a given chip actually rests on, not just the most recent probe's
+// identity for the whole row -- source/checked_at exist ONLY for this
+// tooltip and for operator diagnostics, no rendering DECISION may branch on
+// them.
+function capabilityTooltip(row: ModelServerCapability, t: Translation): string {
+  return [
+    t.modelServerCapabilitiesTooltip,
+    t.modelServerCapabilitiesSource(row.source),
+    t.modelServerCapabilitiesCheckedAt(new Date(row.checked_at).toLocaleString()),
+  ].join(' ');
 }
 
 export function ModelServersSection({
@@ -441,26 +462,33 @@ export function ModelServersSection({
       id: 'capabilities',
       label: t.modelServerColCapabilities,
       value: (r) =>
-        capabilityChips(r, t)
+        capabilityChips(r.capabilities, t)
           .map((c) => c.label)
           .join(' '),
       searchable: true,
       render: (r) => {
-        const chips = capabilityChips(r, t);
+        const chips = capabilityChips(r.capabilities, t);
         // The em-dash, not an empty cell: "the column exists, nothing
         // determined yet" must be distinguishable from "the column is
         // missing" -- an indistinguishable empty cell has already cost a real
         // support report on a sibling table (see liveProgressChipInfo's own
         // note, and issue #57).
         if (chips.length === 0) return '—';
+        // Each chip gets its OWN tooltip, naming ITS row's source/checked-at
+        // -- the per-capability provenance gain the old shared, row-wide
+        // tooltip could never give (capabilityTooltip's own doc-comment).
+        // Tooltip wraps a <span>, not StatusChip directly: StatusChip is not
+        // a forwardRef, so MUI's Tooltip cannot attach its listeners to it.
         return (
-          <Tooltip title={capabilitiesTooltip(r, t)}>
-            <span>
-              {chips.map((c) => (
-                <StatusChip key={c.label} status={c.status} label={c.label} />
-              ))}
-            </span>
-          </Tooltip>
+          <>
+            {chips.map((c) => (
+              <Tooltip key={c.label} title={capabilityTooltip(c.row, t)}>
+                <span>
+                  <StatusChip status={c.status} label={c.label} />
+                </span>
+              </Tooltip>
+            ))}
+          </>
         );
       },
     },

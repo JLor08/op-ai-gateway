@@ -1110,11 +1110,11 @@ const de = {
   // Diagnostic text only -- see live_progress_checked_at's own doc-comment
   // (api/models.ts): no rendering decision may branch on this value.
   modelServerLiveProgressCheckedAt: (when: string) => `Geprüft am ${when}.`,
-  // Task 6 (capability-autodetect-llamacpp): the auto-detected capability
-  // chips column, beside Live-Fortschritt -- see ModelServersSection.tsx's
-  // capabilityChips for the fixed chip order and why a `no` verdict renders
-  // no chip at all, and capabilitiesTooltip for the provenance/checked-at/
-  // caveat text folded into the tooltip.
+  // The auto-detected capability chips column, beside Live-Fortschritt -- see
+  // ModelServersSection.tsx's capabilityChips for the fixed chip order and
+  // why a `no` verdict (or a missing row) renders no chip at all, and
+  // capabilityTooltip for the PER-CAPABILITY provenance/checked-at/caveat
+  // text folded into each chip's own tooltip.
   modelServerColCapabilities: 'Fähigkeiten',
   capabilityVision: 'Vision',
   capabilityVideo: 'Video',
