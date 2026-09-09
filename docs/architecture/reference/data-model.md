@@ -546,7 +546,14 @@ plausible-looking validation rule would break the normal case:
   That is what makes "an undetermined verdict must never overwrite an
   established one" structural rather than a convention every writer has to
   remember: there is no empty verdict for a writer to pass in the first place.
-  The only way back to unknown is `DeleteMappingCapability`. A capability NAME
+  The only way back to unknown is `DeleteMappingCapability` — and **no
+  operator-facing surface reaches it yet**: the store method and all four
+  drivers exist, with no portal control, HTTP endpoint or CLI path calling
+  them, so a `manual` verdict can be flipped (`manual/yes` ↔ `manual/no`,
+  rank 3 ≥ rank 3) but not relinquished, and detection cannot be handed back
+  the capability. Recorded in
+  [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
+  A capability NAME
   is not validated at all: the vocabulary is open on purpose (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress` are the names the code
   itself reasons about, while an upstream may report others — Ollama passes

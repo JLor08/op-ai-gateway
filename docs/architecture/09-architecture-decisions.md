@@ -876,7 +876,9 @@ convention every writer has to remember into a structural fact: there is no
 empty verdict to write, `ValidateCapabilityRow` — the one function both
 drivers call — rejects an empty `capability`, an empty `source`, and any
 `verdict` that is neither `yes` nor `no`, and `DeleteMappingCapability` is the
-only way back to unknown. What is open is the *vocabulary*, not the
+only way back to unknown — a store method **no operator-facing surface
+reaches yet**, so in this release a `manual` verdict can be flipped but not
+relinquished ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open is the *vocabulary*, not the
 validation: no check compares a name against a known list, so the code reasons
 about `vision`, `video`, `audio`, `tools`, `mtp` and `live_progress` while an
 unrecognised upstream name is accepted, stored and shown verbatim — which is
