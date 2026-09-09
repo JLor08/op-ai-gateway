@@ -942,96 +942,136 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 		runtimes = runtimes[:maxRuntimeSamplesPerSample]
 	}
 	now := time.Now().UTC()
-	type resolution struct {
-		mappingID           string
-		storedVision        string
-		storedVideo         string
-		storedAudio         string
-		storedTools         string
-		storedExtra         string
-		storedVisionCapable bool
-		ok                  bool
-	}
-	resolved := make(map[string]resolution, len(runtimes))
+	// resolved memoizes the ownership resolution per DISTINCT spec_id, and is
+	// carried across the loop so a spec_id repeated inside ONE sample sees
+	// what the earlier iteration already wrote -- see capabilityResolution.
+	resolved := make(map[string]capabilityResolution, len(runtimes))
 	for _, rt := range runtimes {
-		specID := strings.TrimSpace(rt.SpecID)
-		if specID == "" || rt.Capabilities == nil {
-			// No wire object at all -- an older agent that predates capability
-			// detection has nothing to say. Distinct from an all-empty object
-			// below, but both mean no write; see the doc above.
-			continue
-		}
-		vision := strings.TrimSpace(rt.Capabilities.Vision)
-		video := strings.TrimSpace(rt.Capabilities.Video)
-		audio := strings.TrimSpace(rt.Capabilities.Audio)
-		tools := strings.TrimSpace(rt.Capabilities.Tools)
-		if noCapabilityEvidence(vision, video, audio, tools, rt.Capabilities.Extra) {
-			// Detection ran and determined nothing -- also no write, but for a
-			// different reason than nil above; see the doc above.
-			continue
-		}
-		r, seen := resolved[specID]
-		if !seen {
-			mappingID, storedVision, storedVideo, storedAudio, storedTools, storedExtra, storedVisionCapable, ok := s.resolveRuntimeSpecCapabilities(ctx, serverID, specID)
-			r = resolution{
-				mappingID:           mappingID,
-				storedVision:        storedVision,
-				storedVideo:         storedVideo,
-				storedAudio:         storedAudio,
-				storedTools:         storedTools,
-				storedExtra:         storedExtra,
-				storedVisionCapable: storedVisionCapable,
-				ok:                  ok,
-			}
-			resolved[specID] = r
-		}
-		if !r.ok {
-			continue
-		}
-		caps := changedCapabilityVerdicts(vision, video, audio, tools, rt.Capabilities.Extra, storedCapabilityVerdicts{
-			Vision: r.storedVision,
-			Video:  r.storedVideo,
-			Audio:  r.storedAudio,
-			Tools:  r.storedTools,
-			Extra:  r.storedExtra,
-		})
+		s.writeBackOneRuntimeCapabilities(ctx, serverID, rt, resolved, now)
+	}
+}
 
-		// Vision sync: driven by `vision`, THIS sample's reported verdict --
-		// not by caps.Vision, which is non-empty only when the tri-state
-		// itself changed. Deliberately runs before the no-write-amplification
-		// `continue` below, and before the capabilities write it guards: see
-		// the doc above for why vision_capable needs to converge on every
-		// definitive sample, not just the one that changes cap_vision.
-		r.storedVisionCapable = s.syncVisionCapable(ctx, serverID, specID, r.mappingID, vision, r.storedVisionCapable, now)
-		resolved[specID] = r
+// writeBackOneRuntimeCapabilities is one runtime sample's half of
+// writeBackRuntimeCapabilities: the triage, the memoized ownership
+// resolution, the vision sync, and the write. Split out so the loop above
+// reads as what it is -- "do this per runtime" -- and so each guard here
+// sits at one nesting level instead of three.
+func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID string, rt agentRuntimeSample, resolved map[string]capabilityResolution, now time.Time) {
+	specID := strings.TrimSpace(rt.SpecID)
+	if specID == "" || rt.Capabilities == nil {
+		// No wire object at all -- an older agent that predates capability
+		// detection has nothing to say. Distinct from an all-empty object
+		// below, but both mean no write; see writeBackRuntimeCapabilities.
+		return
+	}
+	vision := strings.TrimSpace(rt.Capabilities.Vision)
+	video := strings.TrimSpace(rt.Capabilities.Video)
+	audio := strings.TrimSpace(rt.Capabilities.Audio)
+	tools := strings.TrimSpace(rt.Capabilities.Tools)
+	if noCapabilityEvidence(vision, video, audio, tools, rt.Capabilities.Extra) {
+		// Detection ran and determined nothing -- also no write, but for a
+		// different reason than nil above.
+		return
+	}
+	r, ok := s.resolvedCapabilities(ctx, serverID, specID, resolved)
+	if !ok {
+		return
+	}
+	caps := changedCapabilityVerdicts(vision, video, audio, tools, rt.Capabilities.Extra, r.stored())
 
-		if noCapabilityEvidence(caps.Vision, caps.Video, caps.Audio, caps.Tools, caps.Extra) {
-			continue // every verdict already on file -- no write amplification
+	// Vision sync: driven by `vision`, THIS sample's reported verdict -- not
+	// by caps.Vision, which is non-empty only when the tri-state itself
+	// changed. Deliberately runs before the no-write-amplification return
+	// below, and before the capabilities write it guards: see
+	// writeBackRuntimeCapabilities' doc for why vision_capable needs to
+	// converge on every definitive sample, not just the one that changes
+	// cap_vision.
+	r.storedVisionCapable = s.syncVisionCapable(ctx, serverID, specID, r.mappingID, vision, r.storedVisionCapable, now)
+	resolved[specID] = r
+
+	if noCapabilityEvidence(caps.Vision, caps.Video, caps.Audio, caps.Tools, caps.Extra) {
+		return // every verdict already on file -- no write amplification
+	}
+	if err := s.Routes.UpdateMappingCapabilities(ctx, r.mappingID, caps, now); err != nil {
+		slog.Debug("runtime capabilities write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
+		return
+	}
+	r.applyWritten(caps)
+	resolved[specID] = r
+}
+
+// resolvedCapabilities returns specID's memoized ownership resolution,
+// resolving it on first sight. The bool is the resolution's own ok: false
+// means the spec is unknown or owned by a DIFFERENT server (rejected with a
+// Warn inside resolveRuntimeSpecCapabilities), and the caller must not write.
+// A rejected resolution is memoized too, so a repeated spec_id costs one
+// lookup per sample, not one per occurrence.
+func (s *Server) resolvedCapabilities(ctx context.Context, serverID, specID string, resolved map[string]capabilityResolution) (capabilityResolution, bool) {
+	if r, seen := resolved[specID]; seen {
+		return r, r.ok
+	}
+	mappingID, storedVision, storedVideo, storedAudio, storedTools, storedExtra, storedVisionCapable, ok := s.resolveRuntimeSpecCapabilities(ctx, serverID, specID)
+	r := capabilityResolution{
+		mappingID:           mappingID,
+		storedVision:        storedVision,
+		storedVideo:         storedVideo,
+		storedAudio:         storedAudio,
+		storedTools:         storedTools,
+		storedExtra:         storedExtra,
+		storedVisionCapable: storedVisionCapable,
+		ok:                  ok,
+	}
+	resolved[specID] = r
+	return r, ok
+}
+
+// capabilityResolution is one spec_id's resolved mapping plus the capability
+// state currently STORED on it -- the baseline every comparison in this file
+// is made against, memoized per distinct spec_id for one sample.
+type capabilityResolution struct {
+	mappingID           string
+	storedVision        string
+	storedVideo         string
+	storedAudio         string
+	storedTools         string
+	storedExtra         string
+	storedVisionCapable bool
+	ok                  bool
+}
+
+// stored projects the resolution onto the comparison baseline
+// changedCapabilityVerdicts takes.
+func (r capabilityResolution) stored() storedCapabilityVerdicts {
+	return storedCapabilityVerdicts{
+		Vision: r.storedVision,
+		Video:  r.storedVideo,
+		Audio:  r.storedAudio,
+		Tools:  r.storedTools,
+		Extra:  r.storedExtra,
+	}
+}
+
+// applyWritten folds a just-written verdict set back into the memo, so the
+// rest of THIS sample compares against what is now on file: a malformed
+// payload naming the same spec_id twice must not write twice. Only non-empty
+// verdicts were written, so only those are folded in.
+func (r *capabilityResolution) applyWritten(caps routing.CapabilityVerdicts) {
+	if caps.Vision != "" {
+		r.storedVision = caps.Vision
+	}
+	if caps.Video != "" {
+		r.storedVideo = caps.Video
+	}
+	if caps.Audio != "" {
+		r.storedAudio = caps.Audio
+	}
+	if caps.Tools != "" {
+		r.storedTools = caps.Tools
+	}
+	if len(caps.Extra) > 0 {
+		if encoded, err := json.Marshal(caps.Extra); err == nil {
+			r.storedExtra = string(encoded)
 		}
-		if err := s.Routes.UpdateMappingCapabilities(ctx, r.mappingID, caps, now); err != nil {
-			slog.Debug("runtime capabilities write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
-			continue
-		}
-		// Keep the memo truthful for the rest of THIS sample: a malformed
-		// payload naming the same spec_id twice must not write twice.
-		if caps.Vision != "" {
-			r.storedVision = caps.Vision
-		}
-		if caps.Video != "" {
-			r.storedVideo = caps.Video
-		}
-		if caps.Audio != "" {
-			r.storedAudio = caps.Audio
-		}
-		if caps.Tools != "" {
-			r.storedTools = caps.Tools
-		}
-		if len(caps.Extra) > 0 {
-			if encoded, err := json.Marshal(caps.Extra); err == nil {
-				r.storedExtra = string(encoded)
-			}
-		}
-		resolved[specID] = r
 	}
 }
 
