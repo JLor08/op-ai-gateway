@@ -3438,17 +3438,12 @@ func migration78Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	// convention (migration76Up/77Up) turned into row absence: a column that
 	// determined nothing produces nothing.
 	//
-	// The four cap_* statements are spelled out rather than generated from a
+	// The cap_* statements are spelled out rather than generated from a
 	// list of column names: a migration's SQL is read as the record of what
 	// it did, and building it by string-concatenating identifiers hides that
-	// record behind a loop.
-	if _, err := tx.ExecContext(ctx, dl.rebind(`
-		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
-		select m.id, 'vision', m.cap_vision, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
-		from model_mappings m where m.cap_vision <> ''
-		on conflict (mapping_id, capability) do nothing`), now); err != nil {
-		return fmt.Errorf("backfill cap_vision: %w", err)
-	}
+	// record behind a loop. cap_vision is not here but in the vision block
+	// below, where its RANK places it among the other three writers of the
+	// same row.
 	if _, err := tx.ExecContext(ctx, dl.rebind(`
 		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
 		select m.id, 'video', m.cap_video, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
@@ -3482,36 +3477,71 @@ func migration78Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		on conflict (mapping_id, capability) do nothing`), now); err != nil {
 		return fmt.Errorf("backfill live_progress_support: %w", err)
 	}
-	// vision_capable. This runs AFTER the cap_vision statement above ON
-	// PURPOSE: where both exist, `do nothing` leaves the cap_vision row in
-	// place — the newer, better-provenanced verdict wins. Reversing the two
-	// would let a stale vision_capable silently overwrite it.
+	// vision is the one capability TWO dropped columns can both speak for:
+	// cap_vision (migration 77, written only by the /props probe) and
+	// vision_capable (migration 32, whose writer is recoverable only from the
+	// mapping-wide metrics_source — 'vision' was the vision benchmark,
+	// 'manual' an operator, and anything else cannot be attributed at all).
 	//
-	// The provenance is recovered from the mapping-wide metrics_source, the
-	// only trace of who wrote the flag: 'vision' was the vision benchmark,
-	// 'manual' an operator, and anything else cannot be attributed, so it is
-	// marked legacy (probe-overwritable — see routing.CapabilitySourceLegacy).
-	const visionSource = `case m.metrics_source
-		when 'vision' then 'vision_benchmark'
-		when 'manual' then 'manual'
-		else 'legacy' end`
+	// So the four statements below run in RANK order, highest first, and
+	// `on conflict do nothing` makes the first one to reach a mapping the one
+	// that keeps it. That is the same total order every capability WRITER
+	// obeys at runtime (routing.capabilitySourceRank: manual 3 >
+	// vision_benchmark 2 > llama_cpp_props/legacy 1), applied here because a
+	// backfill is a write like any other: ordering by column instead would
+	// let a probe's rank-1 verdict displace the operator's rank-3 one, which
+	// is precisely the inversion this table exists to make impossible — and
+	// migration 79 drops the columns, so nothing could read them again to
+	// repair it.
+	//
+	// Rank 1 against rank 1 (cap_vision before the legacy fallback) resolves
+	// for the direct /props signal over a column whose real origin is
+	// unknowable — the only pair for which "the newer verdict wins" was ever
+	// the whole story.
+	//
+	// A verdict per statement rather than per column: within one rank band
+	// vision_capable's 1 and 0 are the same evidence, so they share a
+	// statement and a `case`. The `in (0, 1)` guard keeps a value neither
+	// writer could have produced out of the table entirely, exactly as the
+	// per-verdict statements it replaces did.
 	if _, err := tx.ExecContext(ctx, dl.rebind(`
 		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
-		select m.id, 'vision', 'yes', `+visionSource+`, coalesce(m.metrics_updated_at, ?)
-		from model_mappings m where m.vision_capable = 1
-		on conflict (mapping_id, capability) do nothing`), now); err != nil {
-		return fmt.Errorf("backfill vision_capable=1: %w", err)
-	}
-	// A vision_capable of 0 becomes a "no" row ONLY when metrics_source proves
-	// a measurement happened. Without one, the 0 is the column's default and
-	// says nothing — no row, i.e. unknown.
-	if _, err := tx.ExecContext(ctx, dl.rebind(`
-		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
-		select m.id, 'vision', 'no', `+visionSource+`, coalesce(m.metrics_updated_at, ?)
+		select m.id, 'vision', case m.vision_capable when 1 then 'yes' else 'no' end,
+			'manual', coalesce(m.metrics_updated_at, ?)
 		from model_mappings m
-		where m.vision_capable = 0 and m.metrics_source in ('vision', 'manual')
+		where m.metrics_source = 'manual' and m.vision_capable in (0, 1)
 		on conflict (mapping_id, capability) do nothing`), now); err != nil {
-		return fmt.Errorf("backfill vision_capable=0: %w", err)
+		return fmt.Errorf("backfill vision_capable (manual): %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', case m.vision_capable when 1 then 'yes' else 'no' end,
+			'vision_benchmark', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.metrics_source = 'vision' and m.vision_capable in (0, 1)
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable (vision_benchmark): %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', m.cap_vision, 'llama_cpp_props', coalesce(m.capabilities_checked_at, ?)
+		from model_mappings m where m.cap_vision <> ''
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill cap_vision: %w", err)
+	}
+	// The legacy fallback, and the one place a vision_capable of 0 writes NO
+	// row: without a metrics_source that proves a measurement happened, the 0
+	// is the column's default and says nothing — and unknown is a row's
+	// absence. A 1 is inherited as legacy (probe-overwritable, see
+	// routing.CapabilitySourceLegacy) because a guess treated as
+	// authoritative would be frozen in forever.
+	if _, err := tx.ExecContext(ctx, dl.rebind(`
+		insert into model_mapping_capabilities (mapping_id, capability, verdict, source, checked_at)
+		select m.id, 'vision', 'yes', 'legacy', coalesce(m.metrics_updated_at, ?)
+		from model_mappings m
+		where m.vision_capable = 1 and m.metrics_source not in ('vision', 'manual')
+		on conflict (mapping_id, capability) do nothing`), now); err != nil {
+		return fmt.Errorf("backfill vision_capable (legacy): %w", err)
 	}
 	// is_mtp = 1 only. The column is seeded from a name heuristic at creation
 	// and is also operator-settable, and the two are indistinguishable after

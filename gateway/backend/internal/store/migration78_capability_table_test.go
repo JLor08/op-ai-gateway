@@ -287,29 +287,144 @@ func sameRows(ctx context.Context, t *testing.T, s *SQLStore, mappingID string, 
 	}
 }
 
-// TestMigration78VisionColumnDoesNotBeatCapVision pins the backfill's ORDER,
-// which is load-bearing: the cap_vision statement runs FIRST, so the later
-// vision_capable statement's `on conflict do nothing` leaves the newer,
-// better-provenanced verdict in place. With the order reversed, a stale
-// vision_capable would silently win.
-func TestMigration78VisionColumnDoesNotBeatCapVision(t *testing.T) {
+// TestMigration78VisionBackfillResolvesByRank is the strongest pin in this
+// file, because migration 78's vision backfill is the branch's ONE
+// irreversible inference: migration 79 drops both source columns in the same
+// release, so a wrong verdict here can never be recomputed from anything.
+//
+// TWO dropped columns can speak for the `vision` row -- cap_vision (always
+// the /props probe, rank 1) and vision_capable (rank 3, 2 or 1 depending on
+// what metrics_source says wrote it) -- and `on conflict do nothing` means
+// whichever statement runs first keeps the mapping. So the statements run in
+// RANK order, and this test walks every (cap_vision rank, vision_capable
+// rank) pair the two columns can present:
+//
+//   - 3 vs 1 and its fail-closed mirror: an operator's verdict, locked or
+//     not, must SURVIVE a probe's. This is the case the pre-fix order got
+//     backwards -- it inserted the probe's row first and let `do nothing`
+//     discard the operator's, the exact inversion the source rank exists to
+//     make impossible.
+//   - 2 vs 1, both directions: a real measurement (an image actually sent
+//     upstream) outranks a probe re-reading a document.
+//   - 1 vs 1: cap_vision still wins over a vision_capable whose origin is
+//     unattributable (`legacy`). That is the ONE pair the old
+//     cap_vision-first order was actually right about, and it is preserved
+//     deliberately -- a direct /props signal beats a column whose real
+//     writer is unknowable.
+//   - the SAME evidence with the other column empty, which must land at the
+//     same rank either way. Under the old order an operator's `manual`
+//     verdict became rank 3 or rank 1 depending on whether an unrelated
+//     column happened to be populated.
+//   - the two no-row rules, which the reordering must NOT turn into `no`
+//     rows: a vision_capable of 0 whose metrics_source proves no measurement
+//     happened, and (over in TestMigration78BackfillFromLegacyColumns) every
+//     is_mtp of 0.
+//
+// The two source columns are dated DIFFERENTLY on purpose --
+// capabilities_checked_at for cap_vision, metrics_updated_at for
+// vision_capable -- and every case asserts the surviving row's checked_at
+// too. That is what makes each case name the statement that actually wrote
+// the row rather than merely agreeing with its verdict.
+func TestMigration78VisionBackfillResolvesByRank(t *testing.T) {
+	// Distinct instants per source column, so a row's checked_at identifies
+	// which statement wrote it.
+	capsAt := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	metricsAt := time.Date(2026, 9, 2, 9, 30, 0, 0, time.UTC)
+
+	cases := []struct {
+		id            string
+		capVision     string // '' = the column determined nothing
+		visionCapable int
+		metricsSource string
+		wantNoRow     bool
+		wantVerdict   string
+		wantSource    string
+		wantCheckedAt time.Time
+		why           string
+	}{
+		{
+			id: "m_r3_over_r1", capVision: "yes", visionCapable: 0, metricsSource: "manual",
+			wantVerdict: routing.CapabilityNo, wantSource: routing.CapabilitySourceManual, wantCheckedAt: metricsAt,
+			why: "an operator's manual NO (rank 3) must survive a probe's yes (rank 1) -- image attach must stay off for a model the operator disabled it for",
+		},
+		{
+			id: "m_r3_over_r1_mirror", capVision: "no", visionCapable: 1, metricsSource: "manual",
+			wantVerdict: routing.CapabilityYes, wantSource: routing.CapabilitySourceManual, wantCheckedAt: metricsAt,
+			why: "the mirror: an operator's manual YES (rank 3) must survive a probe's no (rank 1)",
+		},
+		{
+			id: "m_r2_over_r1", capVision: "no", visionCapable: 1, metricsSource: "vision",
+			wantVerdict: routing.CapabilityYes, wantSource: routing.CapabilitySourceVisionBenchmark, wantCheckedAt: metricsAt,
+			why: "the vision benchmark measured this (rank 2) -- a probe re-reading /props (rank 1) must not displace it",
+		},
+		{
+			id: "m_r2_over_r1_mirror", capVision: "yes", visionCapable: 0, metricsSource: "vision",
+			wantVerdict: routing.CapabilityNo, wantSource: routing.CapabilitySourceVisionBenchmark, wantCheckedAt: metricsAt,
+			why: "the mirror: a measured no (rank 2) must survive a probe's yes (rank 1)",
+		},
+		{
+			id: "m_r1_tie", capVision: "no", visionCapable: 1, metricsSource: "benchmark",
+			wantVerdict: routing.CapabilityNo, wantSource: routing.CapabilitySourceLlamaCppProps, wantCheckedAt: capsAt,
+			why: "rank 1 against rank 1: the direct /props signal beats a vision_capable whose real writer is unknowable (legacy)",
+		},
+		{
+			id: "m_manual_alone", capVision: "", visionCapable: 1, metricsSource: "manual",
+			wantVerdict: routing.CapabilityYes, wantSource: routing.CapabilitySourceManual, wantCheckedAt: metricsAt,
+			why: "the SAME manual evidence with cap_vision empty must land at the same rank 3 -- a verdict's provenance cannot depend on whether an unrelated column happens to be populated",
+		},
+		{
+			id: "m_legacy_alone", capVision: "", visionCapable: 1, metricsSource: "benchmark",
+			wantVerdict: routing.CapabilityYes, wantSource: routing.CapabilitySourceLegacy, wantCheckedAt: metricsAt,
+			why: "an unattributable vision_capable with no cap_vision to lose to is still inherited, as legacy",
+		},
+		{
+			id: "m_zero_nonmeasuring_probe", capVision: "yes", visionCapable: 0, metricsSource: "probe",
+			wantVerdict: routing.CapabilityYes, wantSource: routing.CapabilitySourceLlamaCppProps, wantCheckedAt: capsAt,
+			why: "a vision_capable of 0 without a measuring provenance says NOTHING, so it must neither win nor turn into a no row -- the probe's verdict stands",
+		},
+		{
+			id: "m_zero_nonmeasuring_alone", capVision: "", visionCapable: 0, metricsSource: "probe",
+			wantNoRow: true,
+			why:       "and with no cap_vision either, that same silent 0 must produce NO row at all: absence is how the table says unknown",
+		},
+	}
+
 	forEachDialectMigratedTo(t, 77, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Now().UTC().Truncate(time.Second)
-		seedMigration78Mappings(ctx, t, s, now, "m_both")
-		// cap_vision says no (the newer probe); vision_capable says yes (the
-		// column it supersedes), with a provenance that would outrank it.
-		mustExec(ctx, t, s, `update model_mappings set cap_vision = 'no', vision_capable = 1,
-			metrics_source = 'manual' where id = ?`, "m_both")
+		ids := make([]string, 0, len(cases))
+		for _, tc := range cases {
+			ids = append(ids, tc.id)
+		}
+		seedMigration78Mappings(ctx, t, s, now, ids...)
+		for _, tc := range cases {
+			mustExec(ctx, t, s, `update model_mappings set cap_vision = ?, capabilities_checked_at = ?,
+				vision_capable = ?, metrics_source = ?, metrics_updated_at = ? where id = ?`,
+				tc.capVision, capsAt, tc.visionCapable, tc.metricsSource, metricsAt, tc.id)
+		}
 
 		reinvokeMigration78(ctx, t, s)
 
-		row, ok := capabilityRowMap(ctx, t, s, "m_both")["vision"]
-		if !ok {
-			t.Fatal("m_both: no vision row")
-		}
-		if row.Verdict != routing.CapabilityNo || row.Source != routing.CapabilitySourceLlamaCppProps {
-			t.Fatalf("vision row = %+v, want the cap_vision verdict (no/llama_cpp_props) to win over vision_capable", row)
+		for _, tc := range cases {
+			row, ok := capabilityRowMap(ctx, t, s, tc.id)["vision"]
+			if tc.wantNoRow {
+				if ok {
+					t.Errorf("%s: got vision row %+v, want NO row -- %s", tc.id, row, tc.why)
+				}
+				continue
+			}
+			if !ok {
+				t.Errorf("%s: no vision row at all, want %s/%s -- %s", tc.id, tc.wantVerdict, tc.wantSource, tc.why)
+				continue
+			}
+			if row.Verdict != tc.wantVerdict || row.Source != tc.wantSource {
+				t.Errorf("%s: vision row = %s/%s, want %s/%s -- %s",
+					tc.id, row.Verdict, row.Source, tc.wantVerdict, tc.wantSource, tc.why)
+			}
+			if !row.CheckedAt.Equal(tc.wantCheckedAt) {
+				t.Errorf("%s: vision checked_at = %v, want %v -- the surviving row must carry ITS OWN column's timestamp, which is what proves %s wrote it",
+					tc.id, row.CheckedAt, tc.wantCheckedAt, tc.wantSource)
+			}
 		}
 	})
 }
