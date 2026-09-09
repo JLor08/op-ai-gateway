@@ -503,12 +503,30 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			m.live_progress_support, m.live_progress_checked_at,
 			m.cap_vision, m.cap_video, m.cap_audio, m.cap_tools, m.cap_extra,
 			m.capabilities_source, m.capabilities_checked_at,
-			m.created_at, m.updated_at
+			m.created_at, m.updated_at,
+			mtp.verdict, lp.verdict
 		from model_mappings m
 		join applications a on a.id = m.application_id
 		join ai_servers srv on srv.id = a.server_id
+		-- Two FILTERED joins (one row per mapping each), not one unfiltered join
+		-- on model_mapping_capabilities and a Go-side pick of the two rows this
+		-- decision path needs: measured at roughly +6 microseconds EACH against
+		-- this per-request query's existing ~17 microsecond cost, and each still
+		-- returns AT MOST one row per mapping ((mapping_id, capability) is the
+		-- table's primary key), so the candidate result set's cardinality is
+		-- unchanged. An unfiltered join returns one row per (mapping,
+		-- capability) instead -- multiplying the result set by however many
+		-- capabilities a mapping has rows for -- which measured at roughly +79
+		-- microseconds and would need a Go-side collapse back to one candidate
+		-- per mapping to undo.
+		left join model_mapping_capabilities mtp
+		       on mtp.mapping_id = m.id and mtp.capability = ?
+		left join model_mapping_capabilities lp
+		       on lp.mapping_id = m.id and lp.capability = ?
 		where m.gateway_model_name = ? and m.status = ? and a.status = ?
-		order by m.id`, gatewayModel, routing.ServerStatusActive, routing.ServerStatusActive)
+		order by m.id`,
+		routing.CapabilityMTP, routing.CapabilityLiveProgress,
+		gatewayModel, routing.ServerStatusActive, routing.ServerStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list active mappings: %w", err)
 	}
@@ -545,6 +563,15 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		mapUpdatedNil        sql.NullTime
 		mapLiveProgressAtNil sql.NullTime
 		mapCapabilitiesAtNil sql.NullTime
+		// mtpVerdict/liveProgressVerdict are the two joined
+		// model_mapping_capabilities.verdict columns (nullable: a LEFT JOIN row
+		// with no match scans as NULL, i.e. Valid == false, String == "" -- the
+		// same "absent = never determined" reading routing.MTPFromVerdict /
+		// routing.LiveProgressSupportFromVerdict expect). The verdict column
+		// itself is NOT NULL when a row exists (migration78Up), so a valid,
+		// non-empty String is always exactly "yes" or "no".
+		mtpVerdict          sql.NullString
+		liveProgressVerdict sql.NullString
 	)
 	err := row.Scan(
 		&c.Server.ID, &c.Server.Name, &c.Server.Domain, &c.Server.ServerPathSuffix, &c.Server.Provider, &c.Server.Endpoint,
@@ -569,6 +596,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.CapVision, &c.Mapping.CapVideo, &c.Mapping.CapAudio, &c.Mapping.CapTools, &c.Mapping.CapExtra,
 		&c.Mapping.CapabilitiesSource, &mapCapabilitiesAtNil,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
+		&mtpVerdict, &liveProgressVerdict,
 	)
 	if err != nil {
 		return routing.MappingCandidate{}, fmt.Errorf("scan mapping candidate: %w", err)
@@ -580,6 +608,14 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	c.Mapping.IsMTP = mapIsMTP != 0
 	c.Mapping.VisionCapable = mapVisionCapable != 0
 	c.Mapping.MetricsLocked = mapLocked != 0
+	// The boundary conversion: c.IsMTP/c.LiveProgressSupport come from the
+	// JOINED capability rows, via the same routing.MTPFromVerdict /
+	// routing.LiveProgressSupportFromVerdict MemoryStore's mirror also calls --
+	// NOT from c.Mapping.IsMTP/c.Mapping.LiveProgressSupport just set above,
+	// which stay the frozen pre-migration-78 columns (see MappingCandidate's
+	// own doc for why the two are kept apart).
+	c.IsMTP = routing.MTPFromVerdict(mtpVerdict.String)
+	c.LiveProgressSupport = routing.LiveProgressSupportFromVerdict(liveProgressVerdict.String)
 	if mapUpdatedNil.Valid {
 		t := mapUpdatedNil.Time
 		c.Mapping.MetricsUpdatedAt = &t

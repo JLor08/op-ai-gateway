@@ -132,15 +132,16 @@ func TestTargetCarriesLiveProgressVerdictFromMapping(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	store := seededResolverStore(t, now) // app_fast/map_fast: Type=mock
-	// Seed the persisted verdict through the full-row writer: the targeted
-	// live_progress_support writer is gone (#49-3 moved every probe onto
-	// model_mapping_capabilities rows), and this test is about targetFrom
-	// COPYING the stored column, not about who wrote it.
-	mapping, err := store.MappingByID(ctx, "map_fast")
-	must(t, err)
-	mapping.LiveProgressSupport = "supported"
-	mapping.LiveProgressCheckedAt = &now
-	must(t, store.UpdateMapping(ctx, mapping))
+	// Seed the persisted verdict as a "live_progress" capability row (Task 4):
+	// the request path now joins model_mapping_capabilities via
+	// ActiveMappingsForModel, so this is what a real probe writes since #49-3
+	// moved every writer off the old live_progress_support column onto a row
+	// here. The mapping's OWN LiveProgressSupport column is deliberately left
+	// at its zero value ("") to prove targetFrom is no longer reading it for a
+	// candidate that came through ActiveMappingsForModel.
+	must(t, store.UpsertMappingCapabilities(ctx, "map_fast", []CapabilityRow{
+		{Capability: CapabilityLiveProgress, Verdict: CapabilityYes, Source: CapabilitySourceLlamaCppProps, CheckedAt: now},
+	}))
 
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
 	target, err := resolver.Resolve(ctx, auth.Token{ID: "tok", UserID: "u", Active: true}, inference.Request{Model: "qwen-coder", APIFlavor: "openai_chat_completions"})

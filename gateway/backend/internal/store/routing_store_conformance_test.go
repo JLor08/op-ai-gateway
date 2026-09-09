@@ -194,6 +194,92 @@ func TestRoutingStoreActiveMappingsForModel(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts (Task 4)
+// proves ActiveMappingsForModel's two filtered joins (SQL) and MemoryStore's
+// mirror apply the IDENTICAL three-state-to-bool/string boundary conversion
+// on every backend: an "mtp"/"yes" row -> IsMTP true, an "mtp"/"no" row ->
+// IsMTP false (the case a careless three-state-to-bool conversion gets
+// wrong -- mapping "no" to true), and no row at all -> IsMTP false; likewise
+// LiveProgressSupport is "supported"/"unsupported"/"" for a
+// "live_progress" yes/no/absent row. Because forEachRoutingStore runs the
+// SAME assertions against MemoryStore, sqlite and postgres, a divergence in
+// either driver's join/mirror or in the shared MTPFromVerdict /
+// LiveProgressSupportFromVerdict conversion surfaces here, not in
+// production.
+func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+			CreatedAt:       now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+
+		newMapping := func(id string) routing.ModelMapping {
+			return routing.ModelMapping{
+				ID: id, ApplicationID: "app1", GatewayModelName: "model-" + id, AppModelName: "up-" + id,
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+		for _, id := range []string{"map_yes", "map_no", "map_absent"} {
+			if err := s.CreateMapping(ctx, newMapping(id)); err != nil {
+				t.Fatalf("create mapping %s: %v", id, err)
+			}
+		}
+
+		if err := s.UpsertMappingCapabilities(ctx, "map_yes", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert map_yes capabilities: %v", err)
+		}
+		if err := s.UpsertMappingCapabilities(ctx, "map_no", []routing.CapabilityRow{
+			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
+		}); err != nil {
+			t.Fatalf("upsert map_no capabilities: %v", err)
+		}
+		// map_absent gets no capability rows at all -- "never determined".
+
+		for _, tc := range []struct {
+			model            string
+			wantIsMTP        bool
+			wantLiveProgress string
+		}{
+			{"model-map_yes", true, "supported"},
+			{"model-map_no", false, "unsupported"},
+			{"model-map_absent", false, ""},
+		} {
+			got, err := s.ActiveMappingsForModel(ctx, tc.model, routing.APIFlavorOpenAI)
+			if err != nil {
+				t.Fatalf("active mappings for %s: %v", tc.model, err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("active mappings for %s: got %d candidates, want 1: %+v", tc.model, len(got), got)
+			}
+			if got[0].IsMTP != tc.wantIsMTP {
+				t.Fatalf("model %s: IsMTP = %v, want %v", tc.model, got[0].IsMTP, tc.wantIsMTP)
+			}
+			if got[0].LiveProgressSupport != tc.wantLiveProgress {
+				t.Fatalf("model %s: LiveProgressSupport = %q, want %q", tc.model, got[0].LiveProgressSupport, tc.wantLiveProgress)
+			}
+		}
+	})
+}
+
 // --- Affinity upsert/lookup/delete round-trip -------------------------------
 
 // TestRoutingStoreAffinityRoundTrip proves UpsertAffinity/Affinity/DeleteAffinity

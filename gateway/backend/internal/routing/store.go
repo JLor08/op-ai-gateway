@@ -847,6 +847,84 @@ type MappingCandidate struct {
 	Server      AIServer
 	Application Application
 	Mapping     ModelMapping
+	// IsMTP is the mapping's "mtp" capability verdict (model_mapping_capabilities,
+	// migration 78), filled by ActiveMappingsForModel's joined query (SQL) or its
+	// MemoryStore mirror from the same capability map, via MTPFromVerdict: true
+	// for a "yes" row, false for a "no" row, and false for no row at all (never
+	// determined). The scorer (scoringRoute) reads this field, NOT Mapping.IsMTP.
+	//
+	// It is deliberately NOT on ModelMapping itself. ModelMapping.IsMTP is the
+	// pre-migration-78 column, frozen since the write paths that used to update
+	// it now write a capability row instead (#49-3) -- it is not kept in sync. A
+	// struct field populated only by THIS ONE QUERY would read, at the type
+	// level, as populated everywhere ModelMapping appears. The moment a mapping
+	// loaded via MappingByID (which never joins the capability table) reported
+	// IsMTP == false while a resolver's candidate for the SAME mapping reported
+	// the true joined verdict, whichever caller trusted the wrong one would be
+	// silently wrong with no compiler or reviewer able to tell the two apart --
+	// they are the same type. Keeping the verdict on MappingCandidate instead
+	// makes "this came from the join" a fact the TYPE carries, not a fact a
+	// caller has to remember. ModelMapping.IsMTP is removed only once every
+	// remaining reader has moved off it (Task 6).
+	IsMTP bool
+	// LiveProgressSupport is the mapping's "live_progress" capability verdict,
+	// filled the same way and for the same reason as IsMTP above, via
+	// LiveProgressSupportFromVerdict: "" for no row (never determined),
+	// "supported" for a "yes" row, "unsupported" for a "no" row -- the same
+	// vocabulary ModelMapping.LiveProgressSupport and Target.LiveProgressSupport
+	// already speak. targetFrom reads THIS field, NOT Mapping.LiveProgressSupport,
+	// when building a Target from a MappingCandidate that went through
+	// ActiveMappingsForModel.
+	//
+	// It is deliberately NOT (a second time on) ModelMapping for the identical
+	// reason IsMTP is not: ModelMapping.LiveProgressSupport is the
+	// pre-migration-78 column, frozen since #49-3 moved every writer onto a
+	// model_mapping_capabilities row, and a caller reading the wrong one of two
+	// same-typed fields would have no way to tell it had.
+	LiveProgressSupport string
+}
+
+// MTPFromVerdict maps a "mtp" capability verdict onto MappingCandidate.IsMTP:
+// CapabilityYes -> true, CapabilityNo -> false, and anything else -- in
+// practice only "", the value read back for a LEFT JOIN row that matched
+// nothing (absent = never determined) -- -> false. Written as an equality
+// check against CapabilityYes specifically (not "verdict != CapabilityNo" or
+// "verdict != \"\"") because those two alternatives are exactly the shape of
+// the classic three-state-to-bool bug this conversion has to avoid: either
+// would silently turn a "no" row -- an actual negative verdict -- into true.
+// TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts's "no" case
+// fails immediately if this ever regresses to one of them.
+//
+// Both ActiveMappingsForModel (SQL, from the joined mtp.verdict column) and
+// MemoryStore's mirror (from its capability map) call this SAME function, so
+// the two drivers cannot disagree about what a "no" row means.
+func MTPFromVerdict(verdict string) bool {
+	return verdict == CapabilityYes
+}
+
+// LiveProgressSupportFromVerdict maps a "live_progress" capability verdict
+// onto the pre-existing "" / "supported" / "unsupported" vocabulary that
+// ModelMapping.LiveProgressSupport, Target.LiveProgressSupport and
+// wantsLiveProgress's three-layer rule already speak: CapabilityYes ->
+// "supported", CapabilityNo -> "unsupported", anything else -- in practice
+// only "", an absent row -- -> "". It is the inverse of
+// LiveProgressCapabilityVerdict above (which goes the other way, from the
+// probe's support vocabulary to a row's verdict).
+//
+// Both ActiveMappingsForModel (SQL) and MemoryStore's mirror call this SAME
+// function on their respective source of the verdict, which is what keeps
+// the conformance suite's cross-driver comparison meaningful: a divergence
+// in either implementation's plumbing would surface as a suite failure, not
+// a difference in what this conversion itself does.
+func LiveProgressSupportFromVerdict(verdict string) string {
+	switch verdict {
+	case CapabilityYes:
+		return "supported"
+	case CapabilityNo:
+		return "unsupported"
+	default:
+		return ""
+	}
 }
 
 // Certificate is one ACME-managed TLS certificate, keyed by its FQDN. Kind is

@@ -518,7 +518,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		if !ok {
 			return Target{}, ErrNoHealthyHost
 		}
-		target, err := r.targetFrom(ctx, selected.Server, selected.Application, selected.Mapping, apiFlavor)
+		target, err := r.targetFrom(ctx, selected, apiFlavor)
 		if err != nil {
 			return Target{}, err
 		}
@@ -587,7 +587,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	// One server usually offers exactly one mapping for a given gateway model; pick the
 	// first (deterministic: the store's ActiveMappingsForModel result is stably ordered).
 	c := mine[0]
-	return r.targetFrom(ctx, c.Server, c.Application, c.Mapping, apiFlavor)
+	return r.targetFrom(ctx, c, apiFlavor)
 }
 
 // filterProvisioned drops candidates whose server the principal may not use under
@@ -716,7 +716,18 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
 		return Target{}, false, fmt.Errorf("update affinity: %w", err)
 	}
-	target, err := r.targetFrom(ctx, server, app, mapping, key.APIFlavor)
+	// resolveAffinity's mapping comes from activeMappingForApplication
+	// (MappingsByApplication), NOT ActiveMappingsForModel -- it has no joined
+	// capability verdict to offer, so LiveProgressSupport is set explicitly
+	// from the mapping's own (pre-migration-78, frozen) column, preserving
+	// this path's exact pre-existing behaviour. IsMTP is left at its zero
+	// value: targetFrom never reads it.
+	target, err := r.targetFrom(ctx, MappingCandidate{
+		Server:              server,
+		Application:         app,
+		Mapping:             mapping,
+		LiveProgressSupport: mapping.LiveProgressSupport,
+	}, key.APIFlavor)
 	if err != nil {
 		return Target{}, false, err
 	}
@@ -1040,12 +1051,14 @@ func serverSelectable(server AIServer) bool {
 	return server.Status == ServerStatusActive && server.HealthStatus != HealthUnhealthy
 }
 
-// targetFrom builds the Target for a resolved (server, app, mapping) triple. For an
-// ordinary application the effective flavors/modes are the application's own; for a
+// targetFrom builds the Target for a resolved candidate (server + application +
+// mapping, plus the mapping's joined capability verdicts). For an ordinary
+// application the effective flavors/modes are the application's own; for a
 // server_agent mapping the RESOLVED RuntimeSpec is the sole authority for its model's
 // flavors + endpoint modes (the app's values are only the fallback for a mapping that
 // has no spec at all — design §3.3/§4).
-func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Application, mapping ModelMapping, apiFlavor string) (Target, error) {
+func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor string) (Target, error) {
+	server, app, mapping := c.Server, c.Application, c.Mapping
 	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
 	var spec RuntimeSpec
 	var liveProgressSpecType string
@@ -1085,7 +1098,14 @@ func (r *Resolver) targetFrom(ctx context.Context, server AIServer, app Applicat
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
-		LiveProgressSupport:  mapping.LiveProgressSupport,
+		// LiveProgressSupport reads the JOINED capability verdict
+		// (MappingCandidate.LiveProgressSupport), NOT mapping.LiveProgressSupport
+		// -- that column is frozen since #49-3 moved every writer onto a
+		// "live_progress" capability row. A caller with no joined verdict to
+		// offer (resolveAffinity, whose mapping comes from MappingsByApplication,
+		// not ActiveMappingsForModel) passes it through c.LiveProgressSupport
+		// explicitly instead, preserving that path's pre-existing behaviour.
+		LiveProgressSupport:  c.LiveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}, nil
 }
@@ -1496,7 +1516,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
 			return Target{}, err
 		}
-		return r.targetFrom(ctx, sel.Server, sel.Application, sel.Mapping, g.apiFlavor)
+		return r.targetFrom(ctx, sel, g.apiFlavor)
 	}
 
 	// The pin (and, under climb_up, the climb dance) decides this turn's member; an empty
