@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,11 +46,27 @@ func SafeProbePath(p string) bool {
 	return true
 }
 
-// ProbeContext GETs baseURL+contextPath and extracts the served model's
+// ProbeContext fetches baseURL+contextPath and extracts the served model's
 // context length, per specType's JSON convention. specType is the resolved
 // lowercase RuntimeSpecType string ("vllm" | "llama_cpp" | "tgi" | "ollama" |
 // "custom" | ""); the collector package does not import the gateway routing
 // package, so this is a plain string rather than a shared type.
+//
+// Every type but "ollama" issues a bodyless GET, as it always has. "ollama"
+// is the one deliberate exception (issue #54): Ollama's /api/show is
+// POST-only -- since server v0.7.0 it answers a GET with a 405 (text/plain,
+// no context data at all; before that, a 404) via Go's
+// http.ServeMux-equivalent HandleMethodNotAllowed, so a GET can never
+// succeed against it. ProbeContext therefore POSTs {"model": "<model>"} for
+// this one type, built with json.Marshal (never string concatenation -- a
+// model name can contain characters, e.g. a literal '"', that need
+// escaping). model is REQUIRED for this type: an empty model returns
+// ErrOllamaModelRequired without issuing any request at all, because
+// Ollama's own answer to a modelless POST is a 400 "model is required" --
+// sending it would only spend a round trip to learn nothing conclusive, and
+// a clear local error beats a misleading upstream one. Every other type
+// ignores model entirely, including a non-empty one -- passing a model for
+// a non-ollama spec is harmless, not an error.
 //
 // Extraction rules verified against upstream sources on 2026-09-07:
 //
@@ -71,8 +88,9 @@ func SafeProbePath(p string) bool {
 //     "Info" schema,
 //     https://github.com/huggingface/text-generation-inference/blob/main/docs/openapi.json
 //
-//   - ollama: GET /api/show -> {"model_info":{"<arch>.context_length": N,
-//     ...}, ...}. The key is architecture-prefixed (e.g. "llama.context_length",
+//   - ollama: POST /api/show, body {"model": "<model>"} ->
+//     {"model_info":{"<arch>.context_length": N, ...}, ...}. The key is
+//     architecture-prefixed (e.g. "llama.context_length",
 //     "qwen2.context_length"), so it is matched by suffix, not an exact key.
 //     Source: ollama/ollama, docs/api.md "Show Model Information",
 //     https://github.com/ollama/ollama/blob/main/docs/api.md
@@ -92,13 +110,33 @@ func SafeProbePath(p string) bool {
 // reused against a different process later assigned that same port. A nil
 // client falls back to http.DefaultClient, for existing/incidental callers
 // that have no such concern.
-func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, contextPath string) (int, error) {
+func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, contextPath, model string) (int, error) {
 	path := strings.TrimSpace(contextPath)
 	if path == "" {
 		return 0, fmt.Errorf("probe context: no context path configured")
 	}
 
-	body, _, err := fetchProbeBody(ctx, client, baseURL, path)
+	normalizedType := strings.ToLower(strings.TrimSpace(specType))
+
+	var (
+		body []byte
+		err  error
+	)
+	if normalizedType == "ollama" {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return 0, ErrOllamaModelRequired
+		}
+		reqBody, merr := json.Marshal(struct {
+			Model string `json:"model"`
+		}{Model: model})
+		if merr != nil {
+			return 0, fmt.Errorf("probe context: %w", merr)
+		}
+		body, _, err = fetchProbeBodyWith(ctx, client, baseURL, http.MethodPost, path, reqBody)
+	} else {
+		body, _, err = fetchProbeBody(ctx, client, baseURL, path)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("probe context: %w", err)
 	}
@@ -108,12 +146,22 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 		return 0, fmt.Errorf("probe context: parse response: %w", err)
 	}
 
-	n, ok := extractContext(strings.ToLower(strings.TrimSpace(specType)), v)
+	n, ok := extractContext(normalizedType, v)
 	if !ok {
 		return 0, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
 	}
 	return n, nil
 }
+
+// ErrOllamaModelRequired is the distinct error ProbeContext returns for the
+// "ollama" spec type when no model name is available, WITHOUT issuing any
+// request: Ollama's POST /api/show answers a modelless request with 400
+// "model is required", so sending it would only spend a round trip to learn
+// nothing conclusive that this local check does not already know. Callers
+// that want to tell this apart from every other probe failure (a transport
+// error, a non-2xx status, an unparseable body, a missing context field) can
+// match on it with errors.Is.
+var ErrOllamaModelRequired = errors.New("probe context: ollama requires a model name")
 
 // fetchProbeBody issues the GET that /props-, /v1/models-, and /info-shaped
 // probes need. It is a thin wrapper so that every long-standing caller keeps

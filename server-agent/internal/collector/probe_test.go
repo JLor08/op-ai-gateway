@@ -71,7 +71,7 @@ func TestProbeContext_VLLM(t *testing.T) {
 	body := `{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"vllm","max_model_len":4096}]}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestProbeContext_LlamaCpp(t *testing.T) {
 	body := `{"default_generation_settings":{"id":0,"n_ctx":8192},"total_slots":1,"model_path":"/models/foo.gguf"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "llama_cpp", "/props")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "llama_cpp", "/props", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestProbeContext_TGI(t *testing.T) {
 	body := `{"model_id":"foo","max_concurrent_requests":128,"max_input_tokens":4095,"max_total_tokens":4096,"version":"2.0.0"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "tgi", "/info")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "tgi", "/info", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestProbeContext_Ollama(t *testing.T) {
 	body := `{"model_info":{"llama.context_length":8192,"llama.attention.head_count":32},"details":{"family":"llama"}}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "llama3")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestProbeContext_CustomContextLength(t *testing.T) {
 	body := `{"context_length":32768,"other":"field"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestProbeContext_CustomBestEffortNCtx(t *testing.T) {
 	body := `{"nested":{"n_ctx":2048}}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "", "/status", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestProbeContext_NoMatch(t *testing.T) {
 	body := `{"foo":"bar"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for a body with no recognizable context field, got (%d, nil)", got)
 	}
@@ -171,28 +171,31 @@ func TestProbeContext_NoMatch(t *testing.T) {
 // for #54: newProbeServer's handler used to be declared
 // func(w, _ *http.Request), so no test in this package had ever asserted a
 // probe's method, path, or body -- only the served response body. This pins
-// the request shape ProbeContext issues per spec type AS IT STANDS TODAY.
+// the request shape ProbeContext issues per spec type.
 //
 // The ollama row is the point of the whole exercise: /api/show is POST-only
-// upstream (issue #54), but ProbeContext has only ever sent GET, so this row
-// pins that GET as today's (buggy) behaviour, not as intended behaviour. The
-// task that fixes #54 flips this one row's wantMethod to http.MethodPost;
-// until then, this test is the discriminator that proves the fix actually
-// changed something -- it must fail the moment the row flips against
-// unpatched code, and pass again once ProbeContext is taught to POST to
-// Ollama.
+// upstream (issue #54: since server v0.7.0 it answers a GET with a 405
+// text/plain body carrying no context data at all; a 404 before that), so
+// ProbeContext POSTs {"model": "<model>"} for this one type and every other
+// type keeps the plain GET it always had. This row is the discriminator that
+// proves the fix actually changed something: reverting ONLY the POST branch
+// in ProbeContext (leaving every other type's GET path untouched) must make
+// this row -- and only this row -- fail again with the exact "method = GET,
+// want POST" mismatch this test caught the very first time it ran against
+// unpatched code.
 func TestProbeContextRequestShapePerSpecType(t *testing.T) {
 	for _, tc := range []struct {
 		specType   string
 		path       string
+		model      string
 		wantMethod string
 		wantBody   string
 	}{
-		{"llama_cpp", "/props", http.MethodGet, ""},
-		{"vllm", "/v1/models", http.MethodGet, ""},
-		{"tgi", "/info", http.MethodGet, ""},
-		{"custom", "/whatever", http.MethodGet, ""},
-		{"ollama", "/api/show", http.MethodGet, ""}, // Task 4 flips this row to POST: #54's bug is that Ollama's /api/show is POST-only and ProbeContext has always sent GET, so this pins that mistake as it exists today, not as intended behaviour.
+		{"llama_cpp", "/props", "", http.MethodGet, ""},
+		{"vllm", "/v1/models", "", http.MethodGet, ""},
+		{"tgi", "/info", "", http.MethodGet, ""},
+		{"custom", "/whatever", "", http.MethodGet, ""},
+		{"ollama", "/api/show", "probe-model", http.MethodPost, `{"model":"probe-model"}`}, // #54: Ollama's /api/show is POST-only; ProbeContext used to send a bodyless GET, which upstream answers with a 405 (text/plain, no context data at all) since server v0.7.0 (a 404 before that). Reverting the POST branch in ProbeContext makes this row -- and only this row -- fail again.
 	} {
 		t.Run(tc.specType, func(t *testing.T) {
 			// The response body is irrelevant here -- extraction correctness
@@ -202,7 +205,7 @@ func TestProbeContextRequestShapePerSpecType(t *testing.T) {
 			// deliberately ignored.
 			ts := newProbeServer(t, `{}`)
 
-			_, _ = ProbeContext(context.Background(), ts.Client(), ts.URL, tc.specType, tc.path)
+			_, _ = ProbeContext(context.Background(), ts.Client(), ts.URL, tc.specType, tc.path, tc.model)
 
 			got := ts.lastRequest()
 			if got == nil {
@@ -227,7 +230,7 @@ func TestProbeContext_NonOKStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for a non-2xx upstream status, got (%d, nil)", got)
 	}
@@ -237,12 +240,72 @@ func TestProbeContext_NonOKStatus(t *testing.T) {
 }
 
 func TestProbeContext_EmptyContextPath(t *testing.T) {
-	got, err := ProbeContext(context.Background(), &http.Client{}, "http://127.0.0.1:1", "vllm", "")
+	got, err := ProbeContext(context.Background(), &http.Client{}, "http://127.0.0.1:1", "vllm", "", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for an empty context path, got (%d, nil)", got)
 	}
 	if got != 0 {
 		t.Errorf("context = %d, want 0 on error", got)
+	}
+}
+
+// TestProbeContext_OllamaEmptyModelNoRequest pins #54's other load-bearing
+// rule: an "ollama" probe with no model name issues NO request at all and
+// returns the distinct ErrOllamaModelRequired. Ollama's own /api/show
+// answers a modelless POST with 400 "model is required", so sending it would
+// only spend a round trip to learn nothing conclusive that this local check
+// does not already know -- mirroring ProbeOllamaVerdicts' identical
+// empty-model short-circuit (TestProbeOllamaVerdictsEmptyModel above). The
+// request-recording newProbeServer makes the "no request sent" half of this
+// assertion checkable, not just inferable from the error.
+func TestProbeContext_OllamaEmptyModelNoRequest(t *testing.T) {
+	ts := newProbeServer(t, `{"model_info":{"llama.context_length":8192}}`)
+
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "")
+	if err != ErrOllamaModelRequired {
+		t.Fatalf("ProbeContext err = %v, want ErrOllamaModelRequired", err)
+	}
+	if got != 0 {
+		t.Errorf("context = %d, want 0 on error", got)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: an empty model must never be sent", got)
+	}
+}
+
+// TestProbeContext_OllamaBlankModelNoRequest covers a whitespace-only model:
+// it must be treated the same as an empty one (TrimSpace first), not sent
+// upstream as a literal " " that Ollama would accept as SOME string but
+// almost certainly not resolve to a real model.
+func TestProbeContext_OllamaBlankModelNoRequest(t *testing.T) {
+	ts := newProbeServer(t, `{}`)
+
+	_, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "   ")
+	if err != ErrOllamaModelRequired {
+		t.Fatalf("ProbeContext err = %v, want ErrOllamaModelRequired", err)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: a whitespace-only model must never be sent", got)
+	}
+}
+
+// TestProbeContext_OllamaModelNeedsEscaping proves the body is built with
+// json.Marshal, never string concatenation: a model name carrying a
+// character that needs JSON escaping (a literal '"' here) must come through
+// the wire correctly escaped, not corrupt the request body.
+func TestProbeContext_OllamaModelNeedsEscaping(t *testing.T) {
+	ts := newProbeServer(t, `{"model_info":{"llama.context_length":4096}}`)
+
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", `weird"model`)
+	if err != nil {
+		t.Fatalf("ProbeContext: %v", err)
+	}
+	if got != 4096 {
+		t.Errorf("context = %d, want 4096", got)
+	}
+	wantBody := `{"model":"weird\"model"}`
+	if gotReq := ts.lastRequest(); gotReq == nil || string(gotReq.Body) != wantBody {
+		t.Errorf("body = %q, want %q", gotReq.Body, wantBody)
 	}
 }
 
@@ -273,7 +336,7 @@ func TestProbeContext_UsesPassedClient(t *testing.T) {
 	rt := &recordingRoundTripper{body: `{"data":[{"id":"m1","max_model_len":4096}]}`}
 	client := &http.Client{Transport: rt}
 
-	got, err := ProbeContext(context.Background(), client, "http://probe-context-uses-passed-client.invalid", "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), client, "http://probe-context-uses-passed-client.invalid", "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -292,7 +355,7 @@ func TestProbeContext_NilClientFallsBackToDefault(t *testing.T) {
 	body := `{"data":[{"id":"m1","max_model_len":4096}]}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), nil, ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), nil, ts.URL, "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}

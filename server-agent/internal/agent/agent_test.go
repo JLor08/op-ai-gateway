@@ -1565,6 +1565,92 @@ func TestCollectOnceRuntimeContextCacheInvalidatesOnProbeConfigChange(t *testing
 	}
 }
 
+// TestCollectOnceRuntimeContextCacheInvalidatesOnModelChange is #54 task 4's
+// cache-invalidation proof: the runtime manager can repoint a RUNNING
+// `ollama serve` spec at a different model WITHOUT restarting the process --
+// same PID, same Type, same ContextProbePath. A cache keyed on
+// (pid, type, path) alone (the pre-#54 key) would keep serving the size
+// probed against the OLD model forever, because none of those three ever
+// changes; the cache must also invalidate on a Model change and re-probe
+// with the NEW model.
+//
+// The fake ollama server ties its answer to the REQUESTED model (read from
+// the POST body), not to the path or any fixed body, so a stale re-probe
+// that still sent the old model would be caught by the wrong context size
+// coming back, not just by the hit counter.
+func TestCollectOnceRuntimeContextCacheInvalidatesOnModelChange(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/show" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&hits, 1)
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Model {
+		case "llama3":
+			_, _ = w.Write([]byte(`{"model_info":{"llama.context_length":8192}}`))
+		case "llama3:70b":
+			_, _ = w.Write([]byte(`{"model_info":{"llama.context_length":4096}}`))
+		default:
+			http.Error(w, "unexpected model", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	baseStatus := runtimectl.Status{
+		SpecID:           "rspec_model_change",
+		Model:            "llama3",
+		State:            runtimectl.StateRunning,
+		PID:              4343, // unchanged across both cycles -- no restart.
+		Port:             portFromURL(t, srv.URL),
+		Type:             "ollama",
+		ContextProbePath: "/api/show",
+	}
+	drv.setStatuses([]runtimectl.Status{baseStatus})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	first := poster.first()
+	if first == nil || len(first.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 1) = %+v", first)
+	}
+	if got := first.Runtimes[0].ContextSize; got != 8192 {
+		t.Fatalf("ContextSize (cycle 1) = %d, want 8192", got)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("/api/show hits after cycle 1 = %d, want 1", got)
+	}
+
+	// The spec's MODEL changes (operator edit; runtime manager
+	// reconciliation) WITHOUT a restart: same SpecID, same PID, same Type,
+	// same ContextProbePath, new Model.
+	changed := baseStatus
+	changed.Model = "llama3:70b"
+	drv.setStatuses([]runtimectl.Status{changed})
+
+	a.collectOnce(context.Background())
+	last := poster.last()
+	if last == nil || len(last.Runtimes) != 1 {
+		t.Fatalf("Runtimes (cycle 2) = %+v", last)
+	}
+	if got := last.Runtimes[0].ContextSize; got != 4096 {
+		t.Errorf("ContextSize (cycle 2) = %d, want 4096 (must re-probe with the NEW model, not serve the cached old-model value)", got)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("/api/show hits after cycle 2 = %d, want 2 (a model-blind cache key would never re-probe)", got)
+	}
+}
+
 // TestCollectOnceRuntimeContextZeroSizeNotCached is FIX 4's proof: a context
 // probe that succeeds but returns a non-positive size (a JSON field present
 // but literally 0) is effectively "unknown" and must NOT be cached as final

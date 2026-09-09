@@ -1034,15 +1034,27 @@ func (a *Agent) appliedConfigETag() string {
 // runtimeCtxEntry is one cached context-probe result: the PID it was
 // measured against (so a restart -- a changed PID -- forces a re-probe,
 // since a new process generation may serve a different model/config), the
-// specType and contextProbePath it was probed with (so the runtime
-// manager's config reconciliation editing a RUNNING spec's Type or
-// ContextProbePath WITHOUT restarting the process -- same PID -- also
-// forces a re-probe instead of serving a stale size probed under the old
-// config forever), and the context size itself.
+// specType, contextProbePath, and model it was probed with (so the runtime
+// manager's config reconciliation editing a RUNNING spec's Type,
+// ContextProbePath, or Model WITHOUT restarting the process -- same PID --
+// also forces a re-probe instead of serving a stale size probed under the
+// old config forever), and the context size itself.
+//
+// model joins the invalidation key for the same reason Type and
+// ContextProbePath already did, plus one specific to Ollama (issue #54): an
+// ollama-typed spec's context probe now POSTs {"model": st.Model} (the model
+// determines WHICH model's context length /api/show reports, not just how
+// the body is shaped), so the runtime manager repointing a running
+// `ollama serve` instance at a different model -- same PID, same Type, same
+// ContextProbePath -- must still force a re-probe. Without comparing model, a
+// cache hit would silently keep serving the PREVIOUS model's context size
+// for the new one: nothing about the cached size or the request shape would
+// look invalid, so the mistake would never surface as an error.
 type runtimeCtxEntry struct {
 	pid              int
 	specType         string
 	contextProbePath string
+	model            string
 	size             int
 }
 
@@ -1091,16 +1103,23 @@ type runtimeCapabilityEntry struct {
 // idle 0. client is shared across all children probed this cycle.
 //
 // Metrics are scraped every call. Context is probed at most once per child
-// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type, and
-// st.ContextProbePath reuses the stored size (and reports "ok" -- a cached
-// size means a prior probe on this exact generation already succeeded); a
-// PID mismatch (the child restarted), a Type/ContextProbePath mismatch (the
-// runtime manager's config reconciliation changed a RUNNING spec's probe
-// config without restarting the process), or a cache miss all re-probe. A
-// failed metrics or context probe is logged at debug and leaves the
-// corresponding numeric field(s) at zero -- it never fails the collect
-// cycle. A context-probe FAILURE, and a context-probe SUCCESS that returns
-// a non-positive size (effectively "unknown" -- a JSON field present but
+// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type,
+// st.ContextProbePath, and st.Model reuses the stored size (and reports
+// "ok" -- a cached size means a prior probe on this exact generation already
+// succeeded); a PID mismatch (the child restarted), a
+// Type/ContextProbePath/Model mismatch (the runtime manager's config
+// reconciliation changed a RUNNING spec's probe config, or repointed it at a
+// different model, without restarting the process), or a cache miss all
+// re-probe. Model joined the cache key in #54, alongside the fix that
+// finally lets an ollama-typed spec's context probe succeed at all: its
+// POST body carries st.Model, so a config edit that only changes the model
+// (same PID, same Type, same ContextProbePath -- e.g. `ollama serve`
+// repointed at a different model) must still force a re-probe, or the cache
+// would keep answering with the PREVIOUS model's context length. A failed
+// metrics or context probe is logged at debug and leaves the corresponding
+// numeric field(s) at zero -- it never fails the collect cycle. A
+// context-probe FAILURE, and a context-probe SUCCESS that returns a
+// non-positive size (effectively "unknown" -- a JSON field present but
 // literally 0, or smaller), are both deliberately never cached, so a
 // transient condition (e.g. the child's HTTP server still warming up) is
 // retried next cycle instead of sticking at 0 forever.
@@ -1148,9 +1167,10 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 // returns the reachability state to store on rs.ContextProbe. It also fills
 // rs.ContextSize on a cache hit or a successful (size>0) probe, exactly as
 // probeRuntimeChild did inline before this was split out for readability --
-// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path
-// change), the deliberate non-caching of a probe error or a non-positive
-// size, and the debug logging are all unchanged.
+// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path/
+// model change -- model joined the key in #54, see runtimeCtxEntry), the
+// deliberate non-caching of a probe error or a non-positive size, and the
+// debug logging are all unchanged.
 func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.ContextProbePath == "" {
 		return "na"
@@ -1160,14 +1180,15 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		return "unreachable"
 	}
 	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
-		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath {
-		// A cached size means a prior probe on this exact (pid, type, path)
-		// generation already succeeded.
+		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath &&
+		entry.model == st.Model {
+		// A cached size means a prior probe on this exact (pid, type, path,
+		// model) generation already succeeded.
 		rs.ContextSize = entry.size
 		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath)
+	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, st.Model)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
@@ -1189,6 +1210,7 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		pid:              st.PID,
 		specType:         st.Type,
 		contextProbePath: st.ContextProbePath,
+		model:            st.Model,
 		size:             size,
 	}
 	rs.ContextSize = size
