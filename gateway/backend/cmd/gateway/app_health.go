@@ -521,6 +521,14 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 // have no field of their own; each becomes its own row, an implicit "yes" --
 // the detector only ever lists a capability it saw asserted.
 //
+// THE EMISSION ORDER IS LOAD-BEARING, not a formatting choice: rule 0 of
+// routing.WritableCapabilityRows keeps the FIRST row for a capability name and
+// drops every later one, and caps.Extra can collide with a structured field's
+// name (the vocabulary is open -- an upstream may report "vision" in the list
+// beside the field). The four named verdicts plus live_progress therefore go
+// first and Extra after, so a collision resolves to the STRUCTURED answer;
+// reversing the two loops silently hands the open list the last word.
+//
 // internal/gateway's runtimeSampleCapabilityRows is this function's sibling
 // across the internal/gateway <-> cmd/gateway (main) package boundary: each
 // projects its OWN probe's answer shape, which is inherently per-source, so

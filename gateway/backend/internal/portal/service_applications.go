@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -82,6 +83,21 @@ var (
 	ErrMappingGatewayNameConflict = errors.New("mapping.gateway_name_conflict")
 	ErrMappingStatusInvalid       = errors.New("mapping.status_invalid")
 	ErrMappingMetricInvalid       = errors.New("mapping.metric_invalid")
+	// ErrMappingCapabilityNameRequired rejects an empty (or whitespace-only)
+	// entry in UpdateMappingRequest.ResetCapabilities. The store neither trims
+	// nor validates a capability name on the DELETE path -- an unknown name,
+	// an unknown mapping id and an empty name are all a benign nil on both
+	// drivers -- so without this check a typo'd or blank name would return 200
+	// having deleted nothing at all.
+	ErrMappingCapabilityNameRequired = errors.New("mapping.capability_name_required")
+	// ErrMappingCapabilityConflict rejects a request that names a capability in
+	// ResetCapabilities while ALSO sending that capability's boolean: "return
+	// this to unknown" and "the verdict is yes/no" are two different
+	// instructions about the same row, and guessing which one the caller meant
+	// would silently write or silently keep a verdict nobody asked for. The
+	// portal's own form can never produce this pair (see MappingForm's submit);
+	// a client that does has a bug worth surfacing.
+	ErrMappingCapabilityConflict = errors.New("mapping.capability_conflict")
 )
 
 const (
@@ -1329,25 +1345,43 @@ func normalizeApplicationAffinityTTLSeconds(affinityTTLSeconds int) int {
 
 // ModelMappingDTO is the portal-facing representation of a routing.ModelMapping.
 type ModelMappingDTO struct {
-	ID                           string     `json:"id"`
-	ApplicationID                string     `json:"application_id"`
-	GatewayModelName             string     `json:"gateway_model_name"`
-	AppModelName                 string     `json:"app_model_name"`
-	Status                       string     `json:"status"`
-	GenTokensPerSecond           float64    `json:"gen_tokens_per_second"`
-	PromptTokensPerSecond        float64    `json:"prompt_tokens_per_second"`
-	LoadTimeMS                   int        `json:"load_time_ms"`
-	ContextSize                  int        `json:"context_size"`
-	MaxConcurrency               int        `json:"max_concurrency"`
-	RecommendedConcurrency       int        `json:"recommended_concurrency"`
-	GenTokensPerSecondAtCapacity float64    `json:"gen_tokens_per_second_at_capacity"`
-	IsMtp                        bool       `json:"is_mtp"`
-	VisionCapable                bool       `json:"vision_capable"`
-	EnergyWhPerToken             float64    `json:"energy_wh_per_token"`
-	MetricsLocked                bool       `json:"metrics_locked"`
-	MetricsSource                string     `json:"metrics_source"`
-	MetricsUpdatedAt             *time.Time `json:"metrics_updated_at,omitempty"`
-	CreatedAt                    time.Time  `json:"created_at"`
+	ID                           string  `json:"id"`
+	ApplicationID                string  `json:"application_id"`
+	GatewayModelName             string  `json:"gateway_model_name"`
+	AppModelName                 string  `json:"app_model_name"`
+	Status                       string  `json:"status"`
+	GenTokensPerSecond           float64 `json:"gen_tokens_per_second"`
+	PromptTokensPerSecond        float64 `json:"prompt_tokens_per_second"`
+	LoadTimeMS                   int     `json:"load_time_ms"`
+	ContextSize                  int     `json:"context_size"`
+	MaxConcurrency               int     `json:"max_concurrency"`
+	RecommendedConcurrency       int     `json:"recommended_concurrency"`
+	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
+	// IsMtp/VisionCapable are the two-state FOLD of the "mtp"/"vision"
+	// capability rows (capabilityVerdictBool: only "yes" is true, so a "no"
+	// row and a MISSING row both read as false). They cannot express the third
+	// state, which is exactly why Capabilities below exists beside them --
+	// they are kept because five frontend sites and six test files read them.
+	IsMtp         bool `json:"is_mtp"`
+	VisionCapable bool `json:"vision_capable"`
+	// Capabilities is every DETERMINED capability row for this mapping, in the
+	// SAME wire shape ModelServerDTO publishes (ModelServerCapabilityDTO is
+	// reused rather than re-declared, so the two cannot drift): one entry per
+	// (mapping, capability) that has ever been established, alphabetical by
+	// capability name, ALWAYS an array and never `null`.
+	//
+	// The absence of an entry is UNKNOWN. That is the whole reason this array
+	// is on the mapping DTO at all: the folded booleans above cannot tell a
+	// verdict of "no" apart from no row, so a form seeded from them can only
+	// ever offer two states and can never hand a capability back to detection
+	// (UpdateMappingRequest.ResetCapabilities). A consumer must not read a
+	// missing capability as "no" beyond its own fail-closed intent.
+	Capabilities     []ModelServerCapabilityDTO `json:"capabilities"`
+	EnergyWhPerToken float64                    `json:"energy_wh_per_token"`
+	MetricsLocked    bool                       `json:"metrics_locked"`
+	MetricsSource    string                     `json:"metrics_source"`
+	MetricsUpdatedAt *time.Time                 `json:"metrics_updated_at,omitempty"`
+	CreatedAt        time.Time                  `json:"created_at"`
 }
 
 type MappingListResponse struct {
@@ -1386,6 +1420,30 @@ type UpdateMappingRequest struct {
 	VisionCapable                *bool    `json:"vision_capable,omitempty"`
 	EnergyWhPerToken             *float64 `json:"energy_wh_per_token,omitempty"`
 	MetricsLocked                *bool    `json:"metrics_locked,omitempty"`
+	// ResetCapabilities returns the named capabilities to UNKNOWN by DELETING
+	// their rows -- the only way back out of a `manual` verdict, which outranks
+	// every probe and the vision benchmark permanently (manualCapabilityRow).
+	//
+	// It rides on the MAPPING UPDATE rather than on an endpoint of its own, and
+	// that is a correctness requirement rather than a saving. MappingForm seeds
+	// once, never re-syncs from props, and re-submits its capability controls on
+	// EVERY save: an immediate delete fired from inside the open form would be
+	// undone by the operator's next unrelated edit, which would re-establish a
+	// permanent `manual` row with an ordinary 200 and nothing to notice.
+	// Carrying the intent in the same request that carries the booleans removes
+	// that race structurally -- the response is the post-delete DTO, so the
+	// form's next render re-seeds from truth.
+	//
+	// The vocabulary is OPEN: any name is accepted, not just the six constants
+	// the code reasons about, because an Ollama/agent-reported name gets its own
+	// row like any other and must be resettable like any other. Names are
+	// trimmed; an empty one is ErrMappingCapabilityNameRequired, and naming a
+	// capability whose boolean is also sent is ErrMappingCapabilityConflict.
+	//
+	// A JSON `null` could not carry this intent: IsMTP/VisionCapable are
+	// `*bool` with `omitempty`, so `{"vision_capable": null}` is
+	// indistinguishable from an absent key.
+	ResetCapabilities []string `json:"reset_capabilities,omitempty"`
 }
 
 // SyncResultDTO summarizes a SyncApplicationModels reconciliation.
@@ -1585,6 +1643,10 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		return ModelMappingDTO{}, err
 	}
 	// Validate everything that can fail BEFORE mutating the loaded mapping.
+	resetCaps, err := normalizeResetCapabilities(req)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
 	var gatewayName, appModelName, status string
 	if req.GatewayModelName != nil {
 		gatewayName = strings.TrimSpace(*req.GatewayModelName)
@@ -1738,6 +1800,36 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
+	}
+	// The RESET is not best-effort, and the asymmetry with the upsert two
+	// blocks below is deliberate rather than an oversight -- state it here,
+	// where both behaviours sit side by side, or the next reader "fixes" it.
+	//
+	// The upsert is swallowed because the mapping update it accompanies has
+	// already landed: the request's primary effect is real, and a lost
+	// capability row is a lesser harm than a 500 over a save that worked. A
+	// delete has no such accompanying effect to salvage -- returning a
+	// capability to unknown IS the whole point of the operator's action, so
+	// swallowing its failure would report success for nothing at all and the
+	// operator would walk away believing a permanent `manual` verdict was
+	// relinquished when it still stands.
+	//
+	// Two deletes in one request are NOT atomic with each other: the store
+	// method is per-capability and takes no transaction, so a failure on the
+	// second leaves the first applied. That is safe rather than merely
+	// tolerated, because deleting is idempotent -- an already-absent row is a
+	// benign no-op on every driver -- so the operator's retry of the same
+	// request converges instead of compounding.
+	if err := s.resetOperatorCapabilities(ctx, mapping.ID, resetCaps); err != nil {
+		return ModelMappingDTO{}, err
+	}
+	// Post-delete truth for the DTO, so the form's next render re-seeds from
+	// what the store now holds rather than from the pre-write read. Without
+	// this the reset is SELF-UNDOING: the form would re-seed the old verdict
+	// and the operator's next unrelated save would re-establish it as a
+	// permanent `manual` row, with an ordinary 200 and nothing to notice.
+	for _, capability := range resetCaps {
+		delete(capsByName, capability)
 	}
 	// A manual row is rank 3, the top of routing.WritableCapabilityRows'
 	// precedence, so it can never be outranked by what is already stored --
@@ -1998,11 +2090,15 @@ func (s *Service) gatewayNameTakenOnServer(ctx context.Context, serverID string,
 //
 // That permanence is the operator's guarantee, and it is equally the reason
 // CreateMapping/UpdateMapping write one of these only where they can prove
-// the operator actually said it: an accidental manual row cannot be undone
-// from the portal at all. There is no third UI state for "the operator has no
-// opinion" (both checkboxes are strictly boolean), so returning a capability
-// to UNKNOWN has no UI yet -- that is routing.Store.DeleteMappingCapability,
-// called directly against the mapping id.
+// the operator actually said it: a manual row talks over every probe and the
+// benchmark for as long as it stands, so one written by accident costs a
+// capability its detection.
+//
+// Undoing one is a SEPARATE instruction rather than a third verdict, because
+// there is no third verdict to write: unknown is the ABSENCE of a row. The
+// operator reaches it through UpdateMappingRequest.ResetCapabilities, which
+// deletes the row (resetOperatorCapabilities); the form's third select state
+// is what produces that field.
 func manualCapabilityRow(capability string, capable bool, at time.Time) routing.CapabilityRow {
 	verdict := routing.CapabilityNo
 	if capable {
@@ -2049,6 +2145,30 @@ func capabilityVerdictBool(byName map[string]routing.CapabilityRow, capability s
 	return byName[capability].Verdict == routing.CapabilityYes
 }
 
+// mappingCapabilityDTOs projects a mapping's stored capability rows -- keyed
+// by name, the shape mappingDTO is handed -- onto the wire array, sorted by
+// capability name so the response is byte-stable across calls (a Go map's
+// iteration order is randomised, and MappingCapabilities' own SQL order is
+// alphabetical, so this reproduces it rather than inventing a second order).
+//
+// ALWAYS returns a non-nil slice, even for zero rows: `capabilities` must be
+// `[]` on the wire and never `null`, exactly as ModelServerDTO.Capabilities
+// promises -- a `null` would make the frontend branch on nil-vs-empty for a
+// distinction that does not exist (both mean "nothing determined").
+func mappingCapabilityDTOs(byName map[string]routing.CapabilityRow) []ModelServerCapabilityDTO {
+	out := make([]ModelServerCapabilityDTO, 0, len(byName))
+	for _, row := range byName {
+		out = append(out, ModelServerCapabilityDTO{
+			Capability: row.Capability,
+			Verdict:    row.Verdict,
+			Source:     row.Source,
+			CheckedAt:  row.CheckedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Capability < out[j].Capability })
+	return out
+}
+
 // writeOperatorCapabilities persists the capability rows a mapping create or
 // update established, in ONE upsert, and reports whether they landed (a
 // caller folds them into the DTO it returns only if they did -- the response
@@ -2070,6 +2190,69 @@ func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID strin
 	return true
 }
 
+// normalizeResetCapabilities validates and trims
+// UpdateMappingRequest.ResetCapabilities, returning the names to delete.
+//
+// Two rejections, both 400s, and neither is something the store would catch:
+// DeleteMappingCapability neither trims nor validates, and an unknown name, an
+// unknown mapping id and an empty name are all a benign nil on both drivers --
+// so a blank or typo'd entry would otherwise return 200 having deleted nothing.
+//
+//   - An empty name after trimming is ErrMappingCapabilityNameRequired. Note
+//     what is NOT rejected: any NON-empty name is accepted, including one this
+//     codebase has no constant for. The vocabulary is open (an upstream may
+//     report anything -- Ollama passes manifest-declared names through
+//     verbatim), so a name-whitelisting check would make exactly those rows
+//     unresettable.
+//   - A name whose boolean is ALSO non-nil in the same request is
+//     ErrMappingCapabilityConflict: the caller is stating two different things
+//     about one row. The portal's form can never send both (see MappingForm's
+//     submit), so this is a client bug rather than a state to reconcile.
+func normalizeResetCapabilities(req UpdateMappingRequest) ([]string, error) {
+	if len(req.ResetCapabilities) == 0 {
+		return nil, nil
+	}
+	sentBooleans := map[string]bool{
+		routing.CapabilityVision: req.VisionCapable != nil,
+		routing.CapabilityMTP:    req.IsMTP != nil,
+	}
+	out := make([]string, 0, len(req.ResetCapabilities))
+	for _, name := range req.ResetCapabilities {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, ErrMappingCapabilityNameRequired
+		}
+		if sentBooleans[name] {
+			return nil, ErrMappingCapabilityConflict
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// resetOperatorCapabilities deletes one mapping's named capability rows,
+// returning each capability to UNKNOWN. Unlike writeOperatorCapabilities above
+// it PROPAGATES its error -- see UpdateMapping's own comment at the call site
+// for the full argument, and for why two deletes in one request need no
+// transaction.
+//
+// Authorisation is the caller's: every reset reaches here only past
+// authorizeMapping, which collapses an unknown mapping, a mapping the
+// principal may not see and an unauthorized principal alike to
+// ErrMappingNotFound. That is not belt-and-braces -- the store gives this path
+// NO existence signal at all (an unknown mapping id, an unknown capability and
+// an empty capability are all nil on both drivers), so the helper is the only
+// thing standing between a `gatewayUse` token and blanking another server's
+// verdicts.
+func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID string, capabilities []string) error {
+	for _, capability := range capabilities {
+		if err := s.routes.DeleteMappingCapability(ctx, mappingID, capability); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // mappingDTO projects a mapping onto the wire shape the portal's mapping form
 // binds to. caps is that mapping's stored capability rows keyed by capability
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
@@ -2087,6 +2270,12 @@ func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID strin
 // manualCapabilityRow). Reading the row is what makes an untouched checkbox
 // round-trip the TRUTH; UpdateMapping's differs-from-stored check is the
 // other half of the same guarantee.
+//
+// Capabilities publishes the SAME rows unfolded, and it is what lets the form
+// offer the third state at all: a two-state boolean cannot tell "no" apart
+// from "no row", so a control seeded from IsMtp/VisionCapable could never
+// show -- let alone return a capability to -- unknown
+// (UpdateMappingRequest.ResetCapabilities).
 func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
@@ -2103,6 +2292,7 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		GenTokensPerSecondAtCapacity: mapping.GenTokensPerSecondAtCapacity,
 		IsMtp:                        capabilityVerdictBool(caps, routing.CapabilityMTP),
 		VisionCapable:                capabilityVerdictBool(caps, routing.CapabilityVision),
+		Capabilities:                 mappingCapabilityDTOs(caps),
 		EnergyWhPerToken:             mapping.EnergyWhPerToken,
 		MetricsLocked:                mapping.MetricsLocked,
 		MetricsSource:                mapping.MetricsSource,

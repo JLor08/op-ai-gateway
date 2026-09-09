@@ -748,6 +748,32 @@ func TestMappingCapabilityRows(t *testing.T) {
 		if err := s.DeleteMappingCapability(ctx, "m1", routing.CapabilityVision); err != nil {
 			t.Fatalf("delete of an absent row must be a no-op: %v", err)
 		}
+		// Every OTHER failing shape is a benign no-op too, on every driver:
+		// an unknown mapping id, a capability name no code knows, and an
+		// empty name. This is not a curiosity -- it is the reason the portal's
+		// reset path (portal.Service.UpdateMapping's ResetCapabilities) has to
+		// carry BOTH its own authorisation (authorizeMapping) and its own
+		// empty-name rejection. The store hands that path NO existence signal
+		// to lean on: "refused", "the mapping does not exist" and "deleted
+		// nothing" are indistinguishable here by design, unlike
+		// UpsertMappingCapabilities, whose FK makes an unknown mapping an
+		// error (see TestUpsertMappingCapabilitiesUnknownMappingFails).
+		for _, absent := range []struct{ mappingID, capability string }{
+			{"does-not-exist", routing.CapabilityVision},
+			{"m1", "a_capability_no_code_knows"},
+			{"m1", ""},
+		} {
+			if err := s.DeleteMappingCapability(ctx, absent.mappingID, absent.capability); err != nil {
+				t.Fatalf("delete(%q, %q) must be a benign no-op, got: %v", absent.mappingID, absent.capability, err)
+			}
+		}
+		// ...and none of those touched the row that IS there.
+		if got, err = s.MappingCapabilities(ctx, "m1"); err != nil {
+			t.Fatalf("read after the no-op deletes: %v", err)
+		}
+		if len(got) != 1 || got[0].Capability != routing.CapabilityTools {
+			t.Fatalf("rows after the no-op deletes = %+v, want only the untouched %q row", got, routing.CapabilityTools)
+		}
 
 		// The batch reader returns exactly the requested parents, and an
 		// unknown id contributes no key at all (not an empty slice).

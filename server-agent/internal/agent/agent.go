@@ -1293,6 +1293,13 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 // rather than carried as an entry, mirroring the store's
 // row-absence-means-unknown model.
 //
+// THE EMISSION ORDER IS LOAD-BEARING, not a formatting choice: on the gateway
+// side the ingest folds this list into capability rows and keeps the FIRST
+// entry for a given name, dropping every later one -- so a name that appears
+// both as a structured field and in Extra resolves to the STRUCTURED answer.
+// The four named fields therefore go first and Extra after; swapping the two
+// blocks silently hands the open list the last word.
+//
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
 // possibly empty), even when every field is "" (nothing determined): that
 // all-empty Verdicts is the "detection ran, found nothing" wire value,
