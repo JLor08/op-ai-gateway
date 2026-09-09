@@ -547,15 +547,20 @@ plausible-looking validation rule would break the normal case:
   established one" structural rather than a convention every writer has to
   remember: there is no empty verdict for a writer to pass in the first place.
   The only way back to unknown is `DeleteMappingCapability`, and the operator
-  reaches it through the mapping PATCH: `reset_capabilities`, a list of names
-  whose rows are deleted, riding on the same request that carries the verdicts
-  so a reset cannot be undone by the next save (the mapping form seeds once and
-  re-submits its capability controls every time). Naming a capability whose
-  boolean the same request also sends is rejected — two instructions about one
-  row — as is an empty name, which the store would silently treat as a no-op.
-  Every OTHER shape IS a benign no-op on all four drivers: an unknown mapping
-  id and an unknown capability name alike, unlike `UpsertMappingCapabilities`,
-  whose real FK makes an unknown mapping an error. That asymmetry is why the
+  reaches it through the mapping PATCH: an EMPTY value in
+  `capability_verdicts`, the map keyed by capability name that also carries the
+  `yes`/`no` verdicts themselves, so a reset rides on the same request as
+  everything else and cannot be undone by the next save (the mapping form
+  seeds once and never re-syncs). Stating a capability whose legacy
+  `is_mtp`/`vision_capable` boolean the same request also sends is rejected —
+  two instructions about one row, read by two different rules — as are a blank
+  name and a value outside `yes`/`no`/`''`, both of which the store would
+  otherwise treat as a no-op or as a delete nobody asked for.
+  Every OTHER shape IS a benign no-op in both implementations — an unknown
+  mapping id and an unknown capability name alike — and the driver conformance
+  suite proves it on all three legs (memory, sqlite, postgres), unlike
+  `UpsertMappingCapabilities`, whose real FK makes an unknown mapping an
+  error. That asymmetry is why the
   portal path carries its own authorization — the store hands it no existence
   signal to lean on. What remains open is not the way back but MINTING a
   `manual` verdict by accident from an edit form gone stale mid-save, recorded

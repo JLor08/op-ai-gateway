@@ -3480,27 +3480,32 @@ row as the same `false`.
 **The seed is what the write is proved against, and it is captured when the
 form opens.** `MappingForm` seeds once and never re-syncs from props, so submit
 compares each control against that captured value and emits: nothing at all
-when it is unchanged; the boolean when it moved to `yes`/`no`; the capability's
-name in `reset_capabilities` when it moved to *unknown*, which DELETES the row.
-Never both keys for one capability — that pair is a `400`. `Service.
-UpdateMapping` keeps its own differs-from-stored comparison behind that, and
-both halves stay: the form's seed and the store's row can disagree when a probe
-writes while the form is open. Without either, a save that changed nothing but
-a throughput figure would launder an untouched control into a permanent
-operator verdict, freezing out every probe and the benchmark for a capability
-no one ever actually stated. A create is the mirror case and needs no
-comparison — nothing is on file yet, which is also why the unknown branch is
-unreachable there — but only the `true` direction writes, since an unset
-`false` at create time is indistinguishable from a control the operator never
-looked at.
+when it is unchanged, and otherwise ONE `capability_verdicts` entry holding the
+value it was moved to — `yes`/`no` for a verdict, `''` for *unknown*, which
+DELETES the row. The legacy `is_mtp`/`vision_capable` booleans are never sent
+for these two capabilities (naming a capability in the map and sending its
+boolean is a `400`), and they could not carry the same meaning anyway:
+`Service.UpdateMapping` compares a BOOLEAN against the two-state fold of the
+stored rows, where a verdict of `no` and a missing row are both `false`, but a
+map ENTRY against the stored row itself. That split is what lets an operator
+move a control from *Unbekannt* to *Nein* and have it stick, while an old
+cached bundle that submits `vision_capable: false` on every save still writes
+nothing. Without the seed diff, a save that changed nothing but a throughput
+figure would launder an untouched control into a permanent operator verdict,
+freezing out every probe and the benchmark for a capability no one ever
+actually stated. A create needs no comparison — nothing is on file yet, which
+is also why `''` is unreachable there — but it takes the same map, so a stated
+`no` works there too, and it wins over both the legacy boolean and the
+backend's MTP name heuristic; the legacy booleans on the create request are
+plain bools, so only their `true` direction writes, an unset `false` being
+indistinguishable from a control the operator never looked at.
 
 **The reset rides on the mapping PATCH, and that is structural.** A delete
 fired from a button inside the open form would be self-undoing: the form does
-not re-seed, and it re-submits its capability controls on every save, so the
-operator's next unrelated edit would re-establish the verdict they had just
-relinquished — with an ordinary 200 and nothing on screen. Carrying the intent
-in the same request removes that window, and the response is the post-delete
-DTO so the next render seeds from truth. **The unknown option's caption is
+not re-seed, so the operator's next unrelated edit would re-establish the
+verdict they had just relinquished — with an ordinary 200 and nothing on
+screen. Carrying the intent in the same request removes that window, and the
+response is the post-write DTO so the next render seeds from truth. **The unknown option's caption is
 per-capability**, because the honest answer differs: `vision` (and
 video/audio/tools/live_progress) come back on their own within about a second
 of the next telemetry write-back or one app-health tick — *but only when the
