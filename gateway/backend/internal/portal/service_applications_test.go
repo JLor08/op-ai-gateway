@@ -2344,6 +2344,81 @@ func TestSyncApplicationModelsAddsFreshMappings(t *testing.T) {
 	}
 }
 
+// TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus mirrors
+// TestCreateMappingMTPHeuristicEarnsTheScorerBonus for the OTHER mapping
+// write path that applies routing.IsMTPModelName:
+// reconcileApplicationModels, i.e. the manual "Sync models" button and the
+// background model_sync probe loop -- the automatic path most mappings
+// arrive through (see that function's own "FOURTH mapping write path"
+// comment). It used to set the frozen ModelMapping.IsMTP column from the
+// heuristic and stop there, so a mapping discovered here silently lost the
+// scorer's +30 MTP bonus, which reads the JOINED "mtp" row
+// (routing.MTPFromVerdict), not the column.
+//
+// Asserted THROUGH THE SCORER (Resolver.ScoreModelServers), not by reading
+// the row back first: the row is the mechanism, the bonus is the
+// requirement. Both mappings are discovered through the same
+// SyncApplicationModels call, on the same server, identical in every scored
+// respect except the upstream model NAME.
+func TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	lister := &fakeLister{models: []string{"deepseek-v3", "qwen-coder"}}
+	svc, routeStore := newServerTestServiceWithLister(t, now, lister)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+
+	result, err := svc.SyncApplicationModels(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("SyncApplicationModels: %v", err)
+	}
+	if result.Added != 2 {
+		t.Fatalf("result = %#v, want added=2", result)
+	}
+
+	resolver := routing.NewResolver(routeStore, func() time.Time { return now }, nil)
+	scoreOf := func(model string) float64 {
+		t.Helper()
+		scores, err := resolver.ScoreModelServers(ctx, model, now)
+		if err != nil {
+			t.Fatalf("ScoreModelServers(%s): %v", model, err)
+		}
+		if len(scores) != 1 {
+			t.Fatalf("ScoreModelServers(%s) = %+v, want exactly 1 candidate", model, scores)
+		}
+		return scores[0].Score
+	}
+
+	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
+	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
+		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- model discovery must write an \"mtp\" row for a name-heuristic match, since the scorer reads the ROW's verdict and not the frozen column", delta, mtpBonusPoints)
+	}
+
+	// The row landed at the same rank CreateMapping uses for the identical
+	// heuristic: legacy (rank 1), so a real detector (PR C's /slots probe,
+	// also rank 1) can still replace this guess -- a manual row never could.
+	mappings, err := routeStore.MappingsByApplication(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("MappingsByApplication: %v", err)
+	}
+	var mtpMappingID string
+	for _, m := range mappings {
+		if m.AppModelName == "deepseek-v3" {
+			mtpMappingID = m.ID
+		}
+	}
+	if mtpMappingID == "" {
+		t.Fatalf("no mapping found for deepseek-v3 among %#v", mappings)
+	}
+	stored := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, mtpMappingID))
+	if got := stored[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceLegacy {
+		t.Fatalf("heuristic mtp row = %+v, want yes/legacy (beatable by a probe)", got)
+	}
+}
+
 func TestReconcileCarriesUpstreamToken(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	lister := &fakeLister{models: []string{"a"}}

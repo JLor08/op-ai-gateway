@@ -1557,13 +1557,10 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		// rank 1, and the rule is rank(incoming) >= rank(current), so a
 		// probe can replace this row -- a manual one it could never touch).
 		// That is also exactly how migration 78 recorded the same guess when
-		// it lifted it off the column.
-		capRows = append(capRows, routing.CapabilityRow{
-			Capability: routing.CapabilityMTP,
-			Verdict:    routing.CapabilityYes,
-			Source:     routing.CapabilitySourceLegacy,
-			CheckedAt:  now,
-		})
+		// it lifted it off the column. See legacyMTPCapabilityRow --
+		// reconcileApplicationModels applies the identical heuristic on its
+		// own write path and shares this builder rather than re-deriving it.
+		capRows = append(capRows, legacyMTPCapabilityRow(now))
 	}
 	// What mappingDTO reports back to the form: the rows that actually landed
 	// (an empty map when the write failed or there was nothing to write --
@@ -1914,18 +1911,31 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		} else {
 			result.Added++
 		}
+		isMTP := routing.IsMTPModelName(model)
 		mapping := routing.ModelMapping{
 			ID:               "map_" + compactRandomHex(16),
 			ApplicationID:    app.ID,
 			GatewayModelName: model,
 			AppModelName:     model,
 			Status:           status,
-			IsMTP:            routing.IsMTPModelName(model),
+			IsMTP:            isMTP,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
 		if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 			return SyncResultDTO{}, err
+		}
+		if isMTP {
+			// Same NAME HEURISTIC, same legacy-sourced row CreateMapping
+			// writes for it -- see legacyMTPCapabilityRow. Without this, a
+			// mapping discovered here (the manual "Sync models" button and
+			// the background model_sync probe loop, i.e. the automatic path
+			// most mappings arrive through) would set the frozen IsMTP
+			// column above but leave the scorer's ROW-based +30 MTP bonus
+			// unearned. Best-effort: this is a sync/reconcile loop, and a
+			// capability-write failure must not fail the reconcile whose
+			// primary effect (the mapping itself) already landed.
+			s.writeOperatorCapabilities(ctx, mapping.ID, []routing.CapabilityRow{legacyMTPCapabilityRow(now)})
 		}
 	}
 	for _, mapping := range existing {
@@ -2011,6 +2021,25 @@ func manualCapabilityRow(capability string, capable bool, at time.Time) routing.
 		Capability: capability,
 		Verdict:    verdict,
 		Source:     routing.CapabilitySourceManual,
+		CheckedAt:  at,
+	}
+}
+
+// legacyMTPCapabilityRow builds the "mtp" capability row for a NAME-HEURISTIC
+// match (routing.IsMTPModelName), source CapabilitySourceLegacy (rank 1) so a
+// real detector (PR C's /slots-based probe, also rank 1, "rank(incoming) >=
+// rank(current)") can still replace a guess -- see CreateMapping's isMTP case
+// for why this must never be manual (rank 3), which a probe could never
+// touch. Migration 78 recorded the same column-derived guess the same way.
+//
+// Shared by CreateMapping and reconcileApplicationModels: both apply the
+// identical heuristic to a brand-new mapping, so both write the identical row
+// through this one builder rather than each re-deriving it.
+func legacyMTPCapabilityRow(at time.Time) routing.CapabilityRow {
+	return routing.CapabilityRow{
+		Capability: routing.CapabilityMTP,
+		Verdict:    routing.CapabilityYes,
+		Source:     routing.CapabilitySourceLegacy,
 		CheckedAt:  at,
 	}
 }
