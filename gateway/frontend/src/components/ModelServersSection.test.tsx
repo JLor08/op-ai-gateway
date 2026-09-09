@@ -817,6 +817,63 @@ describe('ModelServersSection', () => {
     expect(cell).toHaveTextContent('—');
   });
 
+  // An upstream's capability vocabulary is OPEN, so nothing stops it
+  // reporting a name that happens to equal one of this build's own translated
+  // labels. Keyed by the LABEL, the verbatim "Vision" chip and the "vision"
+  // row's translated "Vision" chip collide, which React reports as a
+  // duplicate-key error and reconciles wrongly. Keyed by the capability name
+  // they cannot: two capabilities, two chips, no warning.
+  it('renders both chips when an upstream capability name equals a translated label', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, capabilities: [capRow('vision', 'yes'), capRow('Vision', 'yes')] }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getAllByText(t.capabilityVision)).toHaveLength(2);
+      const duplicateKeyWarnings = consoleError.mock.calls
+        .map((args) => args.join(' '))
+        .filter((message) => message.includes('same key'));
+      expect(duplicateKeyWarnings).toEqual([]);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  // A capability row carries `checked_at` as a Go time.Time with no
+  // `omitempty`, so a verdict that was never timestamped arrives as
+  // "0001-01-01T00:00:00Z" -- rendered unguarded, the tooltip claims the
+  // capability was determined in the year 1. Each part of the tooltip is
+  // guarded independently, exactly as the shared row-wide tooltip this
+  // replaced guarded its own two.
+  it('omits the source and checked-at clauses when the row carries neither', async () => {
+    const rows = makeRows().map((r) =>
+      r.mapping_id === 'map-a'
+        ? { ...r, capabilities: [capRow('vision', 'yes', '', '0001-01-01T00:00:00Z')] }
+        : r,
+    );
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(rows),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    fireEvent.mouseOver(within(rowFor('GPU-Box-A')).getByText(t.capabilityVision));
+    const tooltip = await screen.findByRole('tooltip');
+    // The shared caveat still shows -- it is the part that always applies.
+    expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesTooltip);
+    expect(tooltip.textContent ?? '').not.toMatch(/0*1\.|0001/);
+    expect(tooltip).not.toHaveTextContent(t.modelServerCapabilitiesSource(''));
+  });
+
   // These two capabilities on the SAME row carry DIFFERENT source/checked-at
   // values, so a test asserting on one chip's tooltip cannot coincidentally
   // pass off the other's -- this is the whole point of the per-capability

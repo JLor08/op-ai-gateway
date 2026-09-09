@@ -1928,6 +1928,271 @@ func TestUpdateMappingVisionCapableSurvivesSubsequentProbe(t *testing.T) {
 	}
 }
 
+// capabilityWriteRecorder wraps a *routing.MemoryStore and records every
+// UpsertMappingCapabilities call made through it -- the instrument for "a
+// form save that changed NOTHING about a capability must not write at all".
+// The stored row surviving intact is necessary but not sufficient evidence: a
+// re-write of the same verdict would still stamp source manual and a fresh
+// checked_at, and only a call count proves the write never happened. Every
+// other method is the embedded store's own (promoted), unchanged.
+type capabilityWriteRecorder struct {
+	*routing.MemoryStore
+	upserts []capabilityUpsert
+}
+
+type capabilityUpsert struct {
+	mappingID string
+	rows      []routing.CapabilityRow
+}
+
+func (c *capabilityWriteRecorder) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error {
+	c.upserts = append(c.upserts, capabilityUpsert{mappingID: mappingID, rows: rows})
+	return c.MemoryStore.UpsertMappingCapabilities(ctx, mappingID, rows)
+}
+
+// TestUpdateMappingUnchangedFormSubmissionDoesNotWriteAManualRow is the
+// regression guard for the whole point of this path: MappingForm.tsx ALWAYS
+// submits vision_capable and is_mtp, whatever field the operator actually
+// came to edit, so a non-nil pointer means "the form was submitted", NOT "the
+// operator changed this". Writing a manual row on the pointer alone meant
+// that editing an unrelated field -- context_size here -- replaced a probe's
+// verdict with a manual one, and a manual row outranks every probe AND the
+// vision benchmark forever, with no operator-reachable way back: the portal
+// chat's image attach would go dark for that model permanently.
+//
+// So: probe-written vision AND mtp rows, then a FULL form submission (every
+// field the mask emits) that edits context_size and re-submits both
+// capability values exactly as the DTO handed them over. Nothing may be
+// written, and both rows must survive byte-identical -- source and
+// checked_at included, since a manual re-write of the same verdict would
+// change both while leaving the verdict alone.
+func TestUpdateMappingUnchangedFormSubmissionDoesNotWriteAManualRow(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	recorder := &capabilityWriteRecorder{MemoryStore: routing.NewMemoryStore()}
+	svc := newServerTestServiceWithRoutes(t, now, recorder)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{
+		GatewayModelName: "g", AppModelName: "a", ContextSize: 4096,
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	// A probe determines both capabilities. probedAt is deliberately NOT the
+	// service clock's `now`, so a manual re-write (which stamps s.clock())
+	// would be visible in checked_at even if the verdict matched.
+	probedAt := now.Add(-3 * time.Hour)
+	probed := []routing.CapabilityRow{
+		{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: probedAt},
+		{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: probedAt},
+	}
+	if err := recorder.MemoryStore.UpsertMappingCapabilities(ctx, mapping.ID, probed); err != nil {
+		t.Fatalf("seed probe rows: %v", err)
+	}
+	recorder.upserts = nil // the seed is not a write under test
+
+	// What the form is SEEDED with, which is what it submits back untouched:
+	// the DTO's own capability-derived booleans, re-read the way the portal
+	// re-reads them (ListMappings) rather than hand-written here.
+	list, err := svc.ListMappings(ctx, ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("ListMappings: %v", err)
+	}
+	if len(list.Data) != 1 {
+		t.Fatalf("ListMappings returned %d mappings, want 1", len(list.Data))
+	}
+	seeded := list.Data[0]
+	if !seeded.VisionCapable || !seeded.IsMtp {
+		t.Fatalf("form seed = (vision %v, mtp %v), want both true -- the DTO must expose the probe-written ROW, not the frozen column", seeded.VisionCapable, seeded.IsMtp)
+	}
+
+	// The full form submission: only context_size differs from what is
+	// stored; both checkboxes carry the values the form was seeded with.
+	gateway, appModel, status := seeded.GatewayModelName, seeded.AppModelName, seeded.Status
+	genTPS, promptTPS, energy := 55.0, 900.0, 0.004
+	loadMS, contextSize, maxConc, recConc := 1200, 262144, 6, 3
+	genCap := 40.0
+	locked := true
+	visionSubmitted, mtpSubmitted := seeded.VisionCapable, seeded.IsMtp
+	patched, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{
+		GatewayModelName: &gateway, AppModelName: &appModel, Status: &status,
+		GenTokensPerSecond: &genTPS, PromptTokensPerSecond: &promptTPS,
+		LoadTimeMS: &loadMS, ContextSize: &contextSize,
+		MaxConcurrency: &maxConc, RecommendedConcurrency: &recConc,
+		GenTokensPerSecondAtCapacity: &genCap, EnergyWhPerToken: &energy,
+		MetricsLocked: &locked,
+		IsMTP:         &mtpSubmitted, VisionCapable: &visionSubmitted,
+	})
+	if err != nil {
+		t.Fatalf("UpdateMapping (unchanged capability values): %v", err)
+	}
+	if patched.ContextSize != 262144 {
+		t.Fatalf("patched context_size = %d, want 262144 (the edit the operator actually made)", patched.ContextSize)
+	}
+	if len(recorder.upserts) != 0 {
+		t.Fatalf("capability upserts = %+v, want NONE -- an unchanged form submission must not write a manual verdict it was never given", recorder.upserts)
+	}
+	after := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, mapping.ID))
+	for _, want := range probed {
+		got := after[want.Capability]
+		if got.Verdict != want.Verdict || got.Source != want.Source || !got.CheckedAt.Equal(want.CheckedAt) {
+			t.Fatalf("%s row after an unrelated edit = %+v, want the probe's own row %+v (verdict, SOURCE and checked_at all intact)", want.Capability, got, want)
+		}
+	}
+	// And the DTO still reports the probe's verdicts, so the next form render
+	// is seeded with the truth too.
+	if !patched.VisionCapable || !patched.IsMtp {
+		t.Fatalf("patched DTO = (vision %v, mtp %v), want both true (the probe's rows are untouched)", patched.VisionCapable, patched.IsMtp)
+	}
+
+	// An ACTUAL change is an operator decision and DOES write manual, for
+	// both capabilities and in the falsifying direction -- the half of the
+	// rule that keeps the checkbox meaningful at all.
+	changedVision, changedMTP := false, false
+	changed, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{
+		VisionCapable: &changedVision, IsMTP: &changedMTP,
+	})
+	if err != nil {
+		t.Fatalf("UpdateMapping (changed capability values): %v", err)
+	}
+	if changed.VisionCapable || changed.IsMtp {
+		t.Fatalf("changed DTO = (vision %v, mtp %v), want both false", changed.VisionCapable, changed.IsMtp)
+	}
+	if len(recorder.upserts) != 1 {
+		t.Fatalf("capability upserts = %d (%+v), want exactly 1 -- both changed rows in ONE write", len(recorder.upserts), recorder.upserts)
+	}
+	changedRows := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, mapping.ID))
+	for _, capability := range []string{routing.CapabilityVision, routing.CapabilityMTP} {
+		got := changedRows[capability]
+		if got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceManual || !got.CheckedAt.Equal(now) {
+			t.Fatalf("%s row after a real change = %+v, want no/manual@%v", capability, got, now)
+		}
+	}
+}
+
+// mustMappingCapabilities reads one mapping's capability rows or fails.
+func mustMappingCapabilities(t *testing.T, routeStore *routing.MemoryStore, mappingID string) []routing.CapabilityRow {
+	t.Helper()
+	rows, err := routeStore.MappingCapabilities(context.Background(), mappingID)
+	if err != nil {
+		t.Fatalf("MappingCapabilities(%s): %v", mappingID, err)
+	}
+	return rows
+}
+
+// TestListMappingsCapabilityReadFailureIsAnError pins the one capability read
+// in this package that is deliberately NOT best-effort. ListMappings is what
+// MappingForm.tsx seeds its vision/MTP checkboxes from, and the form submits
+// both back on every save; if a failed read degraded to "nothing determined"
+// the form would render a `false` the store does not hold, and UpdateMapping's
+// differs-from-stored rule would then read that lie as an operator decision
+// and write a PERMANENT manual row. An error the operator can see and retry is
+// the only safe outcome -- so this read must propagate, unlike the two
+// listing reads (which only decorate).
+func TestListMappingsCapabilityReadFailureIsAnError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	svc := newServerTestServiceWithRoutes(t, now, routeStore)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	if _, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "g", AppModelName: "a"}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	capErr := errors.New("capability table unavailable")
+	failingSvc := newServerTestServiceWithRoutes(t, now, &failingCapabilityStore{MemoryStore: routeStore, err: capErr})
+	if _, err := failingSvc.ListMappings(ctx, adminToken(), app.ID); !errors.Is(err, capErr) {
+		t.Fatalf("ListMappings error = %v, want the capability read's own error -- the mapping form must never be seeded from a degraded read", err)
+	}
+}
+
+// TestCreateMappingMTPHeuristicEarnsTheScorerBonus: a mapping created with an
+// MTP-suggesting name must write an "mtp" capability row, because the
+// scorer's +30 MTP bonus reads the JOINED row verdict
+// (MappingCandidate.IsMTP / routing.MTPFromVerdict), NOT the frozen
+// ModelMapping.IsMTP column. Without the row, every mapping created after
+// migration 78 silently lost a bonus every pre-migration mapping kept --
+// a change in the scorer's behaviour this sub-project is not allowed to make.
+//
+// Asserted THROUGH THE SCORER (Resolver.ScoreModelServers, the same
+// scoringRoute/Score path routing itself uses), not by reading the row back:
+// the row is the mechanism, the bonus is the requirement. The MTP-named and
+// plain mappings are identical in every scored respect and sit on the same
+// server, so the score difference IS the MTP bonus.
+//
+// The second half is why the heuristic writes source LEGACY rather than
+// manual: it is a guess, and a real detector (PR C's /slots-based detection,
+// at probe rank) must be able to correct it. A manual row could never be
+// corrected by anything.
+func TestCreateMappingMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	// Identical in every scored respect except the NAME.
+	mtpMapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "deepseek-v3", AppModelName: "deepseek-v3"})
+	if err != nil {
+		t.Fatalf("CreateMapping (mtp name): %v", err)
+	}
+	if _, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen-coder", AppModelName: "qwen-coder"}); err != nil {
+		t.Fatalf("CreateMapping (plain name): %v", err)
+	}
+
+	resolver := routing.NewResolver(routeStore, func() time.Time { return now }, nil)
+	scoreOf := func(model string) float64 {
+		t.Helper()
+		scores, err := resolver.ScoreModelServers(ctx, model, now)
+		if err != nil {
+			t.Fatalf("ScoreModelServers(%s): %v", model, err)
+		}
+		if len(scores) != 1 {
+			t.Fatalf("ScoreModelServers(%s) = %+v, want exactly 1 candidate", model, scores)
+		}
+		return scores[0].Score
+	}
+
+	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
+	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
+		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- the name heuristic must write an \"mtp\" row, since the scorer reads the ROW's verdict and not the frozen column", delta, mtpBonusPoints)
+	}
+
+	// The heuristic's row is a GUESS at probe rank, so a real detector can
+	// replace it -- the exact call sequence every capability writer makes.
+	stored := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, mtpMapping.ID))
+	if got := stored[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceLegacy {
+		t.Fatalf("heuristic mtp row = %+v, want yes/legacy (beatable by a probe)", got)
+	}
+	detected := []routing.CapabilityRow{{
+		Capability: routing.CapabilityMTP, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now.Add(time.Hour),
+	}}
+	writable := routing.WritableCapabilityRows(detected, stored)
+	if len(writable) != 1 {
+		t.Fatalf("detector-vs-legacy writable rows = %+v, want 1 (a real detector must be able to correct a name guess)", writable)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, mtpMapping.ID, writable); err != nil {
+		t.Fatalf("UpsertMappingCapabilities (detector): %v", err)
+	}
+	// Through the scorer again: the bonus is gone, so the replacement really
+	// reached the routing decision and not just the row.
+	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != 0 {
+		t.Fatalf("score delta after the detector overrode the name guess = %v, want 0", delta)
+	}
+}
+
 // TestMappingEnergyWhPerTokenRoundTrip: an `energy_wh_per_token` create
 // round-trips onto ModelMappingDTO.EnergyWhPerToken, is a measured write
 // (stamps manual provenance), an UpdateMapping patch of it round-trips too,

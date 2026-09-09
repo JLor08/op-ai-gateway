@@ -5,9 +5,11 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,6 +89,46 @@ func TestModelsResponseVisionAndAcrossMappings(t *testing.T) {
 	}
 	if byID["m3"].Vision {
 		t.Fatalf("m3 vision = true, want false (AND with one NEVER-PROBED mapping -- fail-closed)")
+	}
+}
+
+// TestModelsResponseCapabilityReadFailureDegradesAndLogs: a failing bulk
+// capability read in the models listing must NOT fail the listing -- the
+// models still come back, but fail-CLOSED, with vision withheld from every
+// one of them (the fold AND-s a missing row in as false) -- and it must LOG.
+// This degrade is a gateway-wide, fail-closed outage of one feature: the
+// portal chat's image attach gates on ModelOption.vision, so it silently
+// disappears for every model while the page otherwise renders perfectly
+// normally. Unlogged, there is nothing at all to diagnose it from.
+func TestModelsResponseCapabilityReadFailureDegradesAndLogs(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	// A single mapping with an explicit vision=yes row: the listing reports
+	// vision=true when the read works, so the degrade is observable.
+	offerModelVision(t, routeStore, "srv_v", "BoxV", "app_v", []string{routing.APIFlavorOpenAI}, "m1", "m1-up", true)
+
+	working := NewService(ServiceDeps{Usage: usage.NewRecorder(), Routes: routeStore, Clock: func() time.Time { return now }})
+	if !modelsByID(working.Models(ctx, auth.Token{UserID: "usr_1"}))["m1"].Vision {
+		t.Fatalf("precondition: m1 vision = false with a WORKING capability read, want true")
+	}
+
+	failing := &failingCapabilityStore{MemoryStore: routeStore, err: errors.New("capability table unavailable")}
+	svc := NewService(ServiceDeps{Usage: usage.NewRecorder(), Routes: failing, Clock: func() time.Time { return now }})
+	var got ModelsResponse
+	logged := captureSlog(t, func() {
+		got = svc.Models(ctx, auth.Token{UserID: "usr_1"})
+	})
+	byID := modelsByID(got)
+	model, ok := byID["m1"]
+	if !ok {
+		t.Fatalf("m1 missing from the listing: the capability read must DEGRADE, not drop models (%#v)", byID)
+	}
+	if model.Vision {
+		t.Fatalf("m1 vision = true after a failed capability read, want false (fail-closed)")
+	}
+	if !strings.Contains(logged, "capability read failed") || !strings.Contains(logged, "capability table unavailable") {
+		t.Fatalf("log output = %q, want a warning naming the failure -- withholding vision gateway-wide must leave a diagnostic trail", logged)
 	}
 }
 

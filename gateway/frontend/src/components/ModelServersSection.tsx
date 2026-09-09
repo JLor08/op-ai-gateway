@@ -238,12 +238,22 @@ function capabilityChips(capabilities: ModelServerCapability[], t: Translation):
 // identity for the whole row -- source/checked_at exist ONLY for this
 // tooltip and for operator diagnostics, no rendering DECISION may branch on
 // them.
+//
+// Each part is GUARDED, the way the shared row-wide tooltip this replaced
+// guarded its own two: a row carries `source`/`checked_at` as plain wire
+// values, and `checked_at` is a Go time.Time with no `omitempty`, so a row
+// whose timestamp was never set arrives as "0001-01-01T00:00:00Z" and would
+// render as a year-0001 "determined at" date -- a fabricated provenance for a
+// verdict nobody timestamped. `<= 0` (rather than only NaN) is what excludes
+// it: every real checked_at is well after the Unix epoch.
 function capabilityTooltip(row: ModelServerCapability, t: Translation): string {
-  return [
-    t.modelServerCapabilitiesTooltip,
-    t.modelServerCapabilitiesSource(row.source),
-    t.modelServerCapabilitiesCheckedAt(new Date(row.checked_at).toLocaleString()),
-  ].join(' ');
+  const parts = [t.modelServerCapabilitiesTooltip];
+  if (row.source) parts.push(t.modelServerCapabilitiesSource(row.source));
+  const checkedAt = row.checked_at ? new Date(row.checked_at) : null;
+  if (checkedAt && !Number.isNaN(checkedAt.getTime()) && checkedAt.getTime() > 0) {
+    parts.push(t.modelServerCapabilitiesCheckedAt(checkedAt.toLocaleString()));
+  }
+  return parts.join(' ');
 }
 
 export function ModelServersSection({
@@ -482,7 +492,13 @@ export function ModelServersSection({
         return (
           <>
             {chips.map((c) => (
-              <Tooltip key={c.label} title={capabilityTooltip(c.row, t)}>
+              // Keyed by the CAPABILITY NAME, not the label: a capability
+              // yields at most one chip (the known-name pass and the
+              // open-vocabulary pass are disjoint), but two DIFFERENT
+              // capabilities can share a label -- an upstream reporting a
+              // capability literally named "Vision" would collide with the
+              // "vision" row's translated chip.
+              <Tooltip key={c.row.capability} title={capabilityTooltip(c.row, t)}>
                 <span>
                   <StatusChip status={c.status} label={c.label} />
                 </span>

@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"sort"
@@ -63,24 +64,28 @@ type ModelServerDTO struct {
 	MetricsSource    string     `json:"metrics_source"`
 	MetricsUpdatedAt *time.Time `json:"metrics_updated_at,omitempty"`
 
-	// LiveProgressSupport is the mapping's PERSISTED verdict on whether this
-	// upstream tolerates the live-progress two-parameter request (#51):
-	// "supported" / "unsupported" / "" (never determined) -- routing.
-	// ModelMapping.LiveProgressSupport, read straight off view.mapping exactly
-	// like ContextSize above. Unlike State/ActiveRequests/QueueDepth/
-	// MetricsProbe/ContextProbe (which Service.ModelServers leaves zero/empty
-	// for the gateway layer to inject from the runtime-status registry), this
-	// value is written directly to the mapping by the background detectors
-	// (until #49-3 moved them onto model_mapping_capabilities rows -- see
-	// routing.MappingStore.UpsertMappingCapabilities; this column is read-only
-	// legacy until the readers move), so it needs no gateway-injection seam --
-	// Service.ModelServers fills it itself. No
-	// `omitempty`: "never determined" must be an explicit "" on the wire, not a
-	// missing key -- same rule the wire encoding of State already follows.
+	// LiveProgressSupport is the PERSISTED verdict on whether this upstream
+	// tolerates the live-progress two-parameter request (#51): "supported" /
+	// "unsupported" / "" (never determined). Folded from the "live_progress"
+	// row in the SAME Capabilities batch below (routing.
+	// LiveProgressSupportFromVerdict), NOT read off the frozen
+	// ModelMapping.LiveProgressSupport column: #49-3 moved the background
+	// detectors onto model_mapping_capabilities rows, so that column has no
+	// writer any more and would pin this column of the portal table to
+	// migration 78's snapshot -- an em-dash forever for every mapping created
+	// after it. Unlike State/ActiveRequests/QueueDepth/MetricsProbe/
+	// ContextProbe (which Service.ModelServers leaves zero/empty for the
+	// gateway layer to inject from the runtime-status registry), this one
+	// needs no gateway-injection seam -- Service.ModelServers fills it itself
+	// from the store. No `omitempty`: "never determined" must be an explicit
+	// "" on the wire, not a missing key -- same rule the wire encoding of
+	// State already follows.
 	LiveProgressSupport string `json:"live_progress_support"`
-	// LiveProgressCheckedAt is when that verdict was last determined; nil when
-	// never determined. Diagnostic/tooltip only, mirroring ModelMapping.
-	// LiveProgressCheckedAt's own doc-comment -- no decision logic may read it.
+	// LiveProgressCheckedAt is when that verdict was last determined (the
+	// "live_progress" row's own CheckedAt); nil when never determined, and
+	// nil rather than a year-0001 timestamp for a row that carries no time.
+	// Diagnostic/tooltip only, mirroring ModelMapping.LiveProgressCheckedAt's
+	// own doc-comment -- no decision logic may read it.
 	LiveProgressCheckedAt *time.Time `json:"live_progress_checked_at,omitempty"`
 
 	// Capabilities is every DETERMINED capability row for this mapping (#49
@@ -210,6 +215,14 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 	// the whole listing, mirroring the ModelSettings best-effort read above.
 	capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 	if capErr != nil {
+		// LOUDLY: degrading silently here renders as a perfectly normal page
+		// with every capability chip, the MTP/vision flags and the
+		// live-progress column all blank -- indistinguishable from "nothing
+		// has been determined yet", with no diagnostic trail at all. Every
+		// sibling best-effort read in this package logs for exactly that
+		// reason.
+		slog.Warn("portal: model-servers capability read failed; row capabilities withheld",
+			"model", gatewayModelName, "mappings", len(mappingIDs), "err", capErr)
 		capsByMapping = nil
 	}
 
@@ -226,6 +239,7 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 		}
 		caps := capsByMapping[view.mapping.ID]
 		byName := routing.CapabilityRowsByName(caps)
+		liveProgressRow := byName[routing.CapabilityLiveProgress]
 		rows = append(rows, ModelServerDTO{
 			ServerID:                     view.server.ID,
 			ServerName:                   view.server.Name,
@@ -244,8 +258,8 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 			VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
 			MetricsSource:                view.mapping.MetricsSource,
 			MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
-			LiveProgressSupport:          view.mapping.LiveProgressSupport,
-			LiveProgressCheckedAt:        view.mapping.LiveProgressCheckedAt,
+			LiveProgressSupport:          routing.LiveProgressSupportFromVerdict(liveProgressRow.Verdict),
+			LiveProgressCheckedAt:        capabilityCheckedAt(liveProgressRow),
 			Capabilities:                 modelServerCapabilityDTOs(caps),
 		})
 	}
@@ -260,6 +274,19 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 		return rows[i].MappingID < rows[j].MappingID
 	})
 	return rows, nil
+}
+
+// capabilityCheckedAt is one capability row's CheckedAt as an optional wire
+// timestamp: nil for a row that does not exist (zero Verdict) or that carries
+// no time at all. Returning &row.CheckedAt unconditionally would put Go's
+// zero time.Time on the wire, which renders as a year-0001 date in the
+// portal -- a fake "determined at" for a verdict nobody ever established.
+func capabilityCheckedAt(row routing.CapabilityRow) *time.Time {
+	if row.Verdict == "" || row.CheckedAt.IsZero() {
+		return nil
+	}
+	at := row.CheckedAt
+	return &at
 }
 
 // modelServerCapabilityDTOs projects a mapping's stored capability rows onto

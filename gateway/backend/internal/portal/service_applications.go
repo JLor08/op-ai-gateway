@@ -1406,9 +1406,28 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	if err != nil {
 		return MappingListResponse{}, err
 	}
+	mappingIDs := make([]string, len(mappings))
+	for i, mapping := range mappings {
+		mappingIDs[i] = mapping.ID
+	}
+	// ONE capability query for the whole listing, never one per mapping (the
+	// same N+1 guard Service.ModelServers documents at length).
+	//
+	// Deliberately NOT best-effort, unlike the model-servers listing's read:
+	// this listing is what MappingForm.tsx SEEDS its vision/MTP checkboxes
+	// from, and the form submits both back on every save. A read failure that
+	// degraded to "nothing determined" would seed a `false` the store does not
+	// hold, and UpdateMapping's differs-from-stored rule would then read that
+	// lie as the operator's own decision and write a PERMANENT manual row (see
+	// manualCapabilityRow). An error the operator can see and retry is
+	// strictly better than a form that quietly mis-states what is stored.
+	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if err != nil {
+		return MappingListResponse{}, err
+	}
 	out := make([]ModelMappingDTO, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, mappingDTO(mapping))
+		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID])))
 	}
 	return MappingListResponse{Data: out}, nil
 }
@@ -1496,11 +1515,17 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	if err := s.routes.CreateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
+	// The capability rows this create ESTABLISHES, written in one upsert
+	// below. A create only ever ADDS rows under a brand-new mapping id, so
+	// there is nothing stored for them to outrank and no precedence check is
+	// needed here -- unlike UpdateMapping, which must prove the operator
+	// actually said what the form submitted before it writes anything.
+	capRows := make([]routing.CapabilityRow, 0, 2)
 	if req.VisionCapable {
-		// The operator's vision_capable checkbox is now the AUTHORITATIVE
-		// "vision" capability row (source manual), not just the legacy column
-		// above -- see writeManualVisionCapability's own doc-comment for why
-		// this outranks every probe and the vision benchmark permanently.
+		// The operator's vision_capable checkbox is the AUTHORITATIVE "vision"
+		// capability row (source manual), not just the legacy column above --
+		// see manualCapabilityRow's own doc-comment for why this outranks
+		// every probe and the vision benchmark permanently.
 		//
 		// Only the `true` direction writes here: CreateMappingRequest.
 		// VisionCapable is a plain bool, so an unset `false` at CREATE time is
@@ -1512,7 +1537,40 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		// regression this codebase's own IsMTP-default reasoning two lines
 		// above already rejects for the same reason. `true` has no such
 		// ambiguity: an operator had to actively check the box.
-		s.writeManualVisionCapability(ctx, mapping.ID, true)
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, true, now))
+	}
+	switch {
+	case req.IsMTP:
+		// An EXPLICIT operator setting -- manual, exactly like vision above
+		// and with the same true-only asymmetry for the same reason.
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, true, now))
+	case isMTP:
+		// The NAME HEURISTIC said MTP. It still has to write a row: the
+		// scorer's +30 MTP bonus reads MappingCandidate.IsMTP, which is the
+		// JOINED "mtp" row's verdict now (routing.MTPFromVerdict), NOT the
+		// frozen ModelMapping.IsMTP column -- so a mapping created without
+		// one would silently lose the bonus migration 78 gave every mapping
+		// that existed before it.
+		//
+		// Source LEGACY, not manual: a name heuristic is a GUESS, and it must
+		// stay beatable by the real detection PR C adds (a probe writes at
+		// rank 1, and the rule is rank(incoming) >= rank(current), so a
+		// probe can replace this row -- a manual one it could never touch).
+		// That is also exactly how migration 78 recorded the same guess when
+		// it lifted it off the column.
+		capRows = append(capRows, routing.CapabilityRow{
+			Capability: routing.CapabilityMTP,
+			Verdict:    routing.CapabilityYes,
+			Source:     routing.CapabilitySourceLegacy,
+			CheckedAt:  now,
+		})
+	}
+	// What mappingDTO reports back to the form: the rows that actually landed
+	// (an empty map when the write failed or there was nothing to write --
+	// never a claim the store does not hold).
+	capsByName := map[string]routing.CapabilityRow{}
+	if s.writeOperatorCapabilities(ctx, mapping.ID, capRows) {
+		capsByName = routing.CapabilityRowsByName(capRows)
 	}
 	// Best-effort, after the successful store write: a mapping under the
 	// server_agent application is a runtime-config input (its two model-name
@@ -1520,7 +1578,7 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// notifyRuntimeChangedForMapping -- the gate is the owning application's
 	// type, not which field this request set.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping), nil
+	return mappingDTO(mapping, capsByName), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
@@ -1623,6 +1681,13 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.RecommendedConcurrency = effRecConc
 	mapping.GenTokensPerSecondAtCapacity = effGenCap
 	mapping.EnergyWhPerToken = effEnergy
+	// The two FROZEN columns. Nothing reads either of them for a decision any
+	// more (#49-3 moved routing, the listings and this file's own DTO onto
+	// model_mapping_capabilities rows), and neither of these assignments is
+	// the operative capability write -- that is the differs-from-stored rule
+	// further down, which is the ONLY thing an operator's checkbox now
+	// establishes. They stay purely so the store row keeps the shape it has
+	// until the task that drops the columns removes both lines with them.
 	if req.IsMTP != nil {
 		mapping.IsMTP = *req.IsMTP
 	}
@@ -1636,7 +1701,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// not a measurement) deliberately does NOT. IsMTP/VisionCapable no longer
 	// participate here: they are no longer mapping columns conceptually (a
 	// capability row carries its OWN provenance -- see
-	// writeManualVisionCapability below), and metrics_source/metrics_updated_at
+	// manualCapabilityRow below), and metrics_source/metrics_updated_at
 	// describe the numeric metrics' provenance, not a capability's.
 	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil
 	if metricValueChanged {
@@ -1644,15 +1709,59 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now2
 	}
+	// The mapping's STORED capability rows, read BEFORE the write so a read
+	// failure aborts the whole update instead of letting it proceed on a
+	// guess. Two things need them, and they are the two halves of the same
+	// guarantee:
+	//
+	//  1. The differs-from-stored rule below. MappingForm.tsx ALWAYS submits
+	//     vision_capable and is_mtp, whatever field the operator actually
+	//     came to edit, so a non-nil pointer means "the form was submitted",
+	//     NOT "the operator changed this". Writing a manual row on the
+	//     pointer alone let an unrelated edit (a context_size fix, say)
+	//     replace a probe's verdict with a permanent manual one -- and a
+	//     manual row outranks every probe AND the benchmark forever, with no
+	//     operator-reachable way back (manualCapabilityRow). Only a value
+	//     that DIFFERS from what is stored is an operator decision, so only
+	//     that writes.
+	//  2. mappingDTO's is_mtp/vision_capable, which that same form seeds
+	//     from -- so an untouched checkbox round-trips the truth rather than
+	//     a frozen column's stale snapshot.
+	//
+	// The comparison is against capabilityVerdictBool, the exact two-state
+	// fold the form was seeded with, NOT the raw three-state verdict: an
+	// absent row seeds `false`, so a submitted `false` against no row is an
+	// unchanged submission and must stay absent (still probeable), while a
+	// submitted `true` against no row is the operator actively checking the
+	// box.
+	storedCaps, err := s.routes.MappingCapabilities(ctx, mapping.ID)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
+	capsByName := routing.CapabilityRowsByName(storedCaps)
+	capRows := make([]routing.CapabilityRow, 0, 2)
+	capChangedAt := s.clock().UTC()
+	if req.VisionCapable != nil && *req.VisionCapable != capabilityVerdictBool(capsByName, routing.CapabilityVision) {
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityVision, *req.VisionCapable, capChangedAt))
+	}
+	if req.IsMTP != nil && *req.IsMTP != capabilityVerdictBool(capsByName, routing.CapabilityMTP) {
+		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, *req.IsMTP, capChangedAt))
+	}
 	mapping.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
 		return ModelMappingDTO{}, err
 	}
-	if req.VisionCapable != nil {
-		// The operator's vision_capable checkbox is now the AUTHORITATIVE
-		// "vision" capability row (source manual) -- see
-		// writeManualVisionCapability's own doc-comment.
-		s.writeManualVisionCapability(ctx, mapping.ID, *req.VisionCapable)
+	// A manual row is rank 3, the top of routing.WritableCapabilityRows'
+	// precedence, so it can never be outranked by what is already stored --
+	// which is why this writes directly rather than filtering through that
+	// helper the way a probe must. The guard on WHETHER to write is the
+	// differs-from-stored rule above, not a rank check.
+	if s.writeOperatorCapabilities(ctx, mapping.ID, capRows) {
+		// Fold what actually landed into what the DTO reports, so the form
+		// re-seeds from the new truth and not from the pre-write read.
+		for _, row := range capRows {
+			capsByName[row.Capability] = row
+		}
 	}
 	// Best-effort, after the successful store write: renaming a mapping under
 	// the server_agent application rewrites its spec's model/upstream_model in
@@ -1660,7 +1769,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// the agent's router for up to a minute while the old one still routes. See
 	// notifyRuntimeChangedForMapping.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping), nil
+	return mappingDTO(mapping, capsByName), nil
 }
 
 // DeleteMapping removes the mapping.
@@ -1878,52 +1987,87 @@ func (s *Service) gatewayNameTakenOnServer(ctx context.Context, serverID string,
 	return false, nil
 }
 
-// writeManualVisionCapability records the operator's vision_capable checkbox
-// (CreateMapping/UpdateMapping) as a "vision" model_mapping_capabilities row
-// with source CapabilitySourceManual -- which, under the store's precedence
-// rule (routing.WritableCapabilityRows / capabilitySourceRank), outranks
-// every probe AND the vision benchmark, permanently, with no separate lock
-// needed: that is the whole trade the capability table makes instead of the
-// mapping-wide metrics_locked flag the pre-row-table column would have
-// needed to argue its way out of.
+// manualCapabilityRow builds the OPERATOR's own verdict for one capability:
+// source CapabilitySourceManual, which under the shared precedence rule
+// (routing.WritableCapabilityRows / capabilitySourceRank) outranks every
+// probe AND the vision benchmark, PERMANENTLY, with no separate lock needed --
+// that is the whole trade the capability table makes instead of the
+// mapping-wide metrics_locked flag the pre-row-table columns would have
+// needed to argue their way out of.
 //
-// capable is written LITERALLY as CapabilityYes/CapabilityNo -- there is no
-// third UI state for "the operator has no opinion" (the checkbox is strictly
-// boolean), so an operator who wants a capability back to UNKNOWN has no UI
-// for it yet; that would be routing.Store.DeleteMappingCapability, called
-// directly against the mapping id. UpdateMapping calls this for EITHER
-// direction once its VisionCapable pointer is non-nil, since a patch pointer
-// unambiguously means "the operator changed it right now". CreateMapping
-// calls this ONLY for capable==true, deliberately: CreateMappingRequest.
-// VisionCapable is a plain (non-pointer) bool, so an unset `false` at create
-// time cannot be told apart from "the operator never touched this field",
-// and the overwhelming majority of mappings are created without ever looking
-// at this checkbox -- writing a manual "no" for every one of them would
-// permanently close off the vision benchmark and every probe from ever
-// determining the real answer.
+// That permanence is the operator's guarantee, and it is equally the reason
+// CreateMapping/UpdateMapping write one of these only where they can prove
+// the operator actually said it: an accidental manual row cannot be undone
+// from the portal at all. There is no third UI state for "the operator has no
+// opinion" (both checkboxes are strictly boolean), so returning a capability
+// to UNKNOWN has no UI yet -- that is routing.Store.DeleteMappingCapability,
+// called directly against the mapping id.
+func manualCapabilityRow(capability string, capable bool, at time.Time) routing.CapabilityRow {
+	verdict := routing.CapabilityNo
+	if capable {
+		verdict = routing.CapabilityYes
+	}
+	return routing.CapabilityRow{
+		Capability: capability,
+		Verdict:    verdict,
+		Source:     routing.CapabilitySourceManual,
+		CheckedAt:  at,
+	}
+}
+
+// capabilityVerdictBool folds one stored capability row's THREE-state verdict
+// ("yes" / "no" / no row at all) onto the two-state boolean the mapping form
+// binds to: only CapabilityYes is true, so a "no" row and a MISSING row both
+// read as false (the same fail-closed reading routing.MTPFromVerdict and
+// ModelServerDTO.IsMtp use).
+//
+// This is the exact fold mappingDTO ships to the form, which is why
+// UpdateMapping compares the SUBMITTED boolean against this value rather than
+// against the raw verdict: "an unchanged form submission" is a statement
+// about the value the form was seeded with, not about the row's three states.
+func capabilityVerdictBool(byName map[string]routing.CapabilityRow, capability string) bool {
+	return byName[capability].Verdict == routing.CapabilityYes
+}
+
+// writeOperatorCapabilities persists the capability rows a mapping create or
+// update established, in ONE upsert, and reports whether they landed (a
+// caller folds them into the DTO it returns only if they did -- the response
+// must never claim a verdict the store does not hold).
 //
 // Best-effort, mirroring every other capability writer in this codebase
 // (agent_ingest.go, benchmark_runner.go, app_health.go): called AFTER the
 // mapping create/update has already succeeded, so a failure here must not
 // fail a request whose primary effect (the mapping itself) already landed --
 // it is logged and swallowed.
-func (s *Service) writeManualVisionCapability(ctx context.Context, mappingID string, capable bool) {
-	verdict := routing.CapabilityNo
-	if capable {
-		verdict = routing.CapabilityYes
+func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) bool {
+	if len(rows) == 0 {
+		return false
 	}
-	row := routing.CapabilityRow{
-		Capability: routing.CapabilityVision,
-		Verdict:    verdict,
-		Source:     routing.CapabilitySourceManual,
-		CheckedAt:  s.clock().UTC(),
+	if err := s.routes.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
+		slog.Warn("portal: mapping capability write failed", "mapping_id", mappingID, "rows", len(rows), "err", err)
+		return false
 	}
-	if err := s.routes.UpsertMappingCapabilities(ctx, mappingID, []routing.CapabilityRow{row}); err != nil {
-		slog.Warn("manual vision capability write failed", "mapping_id", mappingID, "verdict", verdict, "err", err)
-	}
+	return true
 }
 
-func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
+// mappingDTO projects a mapping onto the wire shape the portal's mapping form
+// binds to. caps is that mapping's stored capability rows keyed by capability
+// name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
+// "nothing determined").
+//
+// IsMtp/VisionCapable come from those ROWS, never from the frozen
+// ModelMapping.IsMTP/VisionCapable columns whose automated writers #49-3
+// retired -- and that is a CORRECTNESS requirement, not tidiness.
+// MappingForm.tsx seeds its two checkboxes from these fields and submits both
+// back on EVERY save, whatever field the operator actually came to edit.
+// Seeding them from a column nothing writes any more would hand the form a
+// stale `false`, and the save would then report that stale value as the
+// operator's own verdict: a manual row outranking every probe and the vision
+// benchmark permanently, with no operator-reachable way back (see
+// manualCapabilityRow). Reading the row is what makes an untouched checkbox
+// round-trip the TRUTH; UpdateMapping's differs-from-stored check is the
+// other half of the same guarantee.
+func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
 		ApplicationID:                mapping.ApplicationID,
@@ -1937,8 +2081,8 @@ func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 		MaxConcurrency:               mapping.MaxConcurrency,
 		RecommendedConcurrency:       mapping.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: mapping.GenTokensPerSecondAtCapacity,
-		IsMtp:                        mapping.IsMTP,
-		VisionCapable:                mapping.VisionCapable,
+		IsMtp:                        capabilityVerdictBool(caps, routing.CapabilityMTP),
+		VisionCapable:                capabilityVerdictBool(caps, routing.CapabilityVision),
 		EnergyWhPerToken:             mapping.EnergyWhPerToken,
 		MetricsLocked:                mapping.MetricsLocked,
 		MetricsSource:                mapping.MetricsSource,
@@ -1955,7 +2099,7 @@ func mappingDTO(mapping routing.ModelMapping) ModelMappingDTO {
 // longer mapping columns conceptually, and a capability's own provenance now
 // lives in its model_mapping_capabilities row (Source/CheckedAt), not in
 // this mapping's metrics_source/metrics_updated_at -- see
-// writeManualVisionCapability.
+// manualCapabilityRow.
 type mappingMetrics struct {
 	genTPS, promptTPS                      float64
 	loadMS, contextSize                    int

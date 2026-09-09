@@ -661,7 +661,10 @@ func seedMapping(t *testing.T, routeStore *routing.MemoryStore, appID, name stri
 	if err := routeStore.CreateMapping(context.Background(), mapping); err != nil {
 		t.Fatalf("seed mapping %q: %v", name, err)
 	}
-	return mappingDTO(mapping)
+	// No capability rows: these fixtures are co-residency/runtime-spec
+	// subjects, and their names are not MTP-suggesting, so the two
+	// capability-derived DTO fields are false either way.
+	return mappingDTO(mapping, nil)
 }
 
 // seedTwoMappings creates a server_agent application on server and two
