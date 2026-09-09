@@ -53,12 +53,15 @@ type ModelServerDTO struct {
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
 	// IsMtp/VisionCapable are convenience booleans folded from Capabilities
 	// below (the "mtp"/"vision" row's Verdict == CapabilityYes; a missing row
-	// is NOT capable, same fail-closed rule Capabilities itself carries) --
-	// NOT read off ModelMapping.IsMTP/VisionCapable any more, which is why
-	// this fill needs the same capability-rows batch Capabilities does. Kept
-	// as dedicated booleans (rather than making every caller re-derive them
-	// from Capabilities) because GroupServersSection's "mtp"/vision columns
-	// mirror this DTO and already key off these two fields.
+	// is NOT capable, same fail-closed rule Capabilities itself carries).
+	// Historical note, kept deliberately: before migration 79 these were
+	// read straight off ModelMapping.IsMTP/VisionCapable; that field pair is
+	// gone now, and ModelMapping carries no capability field at all any
+	// more, which is why this fill needs the same capability-rows batch
+	// Capabilities does. Kept as dedicated booleans (rather than making
+	// every caller re-derive them from Capabilities) because
+	// GroupServersSection's "mtp"/vision columns mirror this DTO and already
+	// key off these two fields.
 	IsMtp            bool       `json:"is_mtp"`
 	VisionCapable    bool       `json:"vision_capable"`
 	MetricsSource    string     `json:"metrics_source"`
@@ -83,8 +86,13 @@ type ModelServerDTO struct {
 	// LiveProgressCheckedAt is when that verdict was last determined (the
 	// "live_progress" row's own CheckedAt); nil when never determined, and
 	// nil rather than a year-0001 timestamp for a row that carries no time.
-	// Diagnostic/tooltip only, mirroring ModelMapping.LiveProgressCheckedAt's
-	// own doc-comment -- no decision logic may read it.
+	// Diagnostic/tooltip only -- no decision logic may read it: a capability
+	// verdict carries no expiry of its own (WritableCapabilityRows' own
+	// doc-comment: "the verdict is what every reader acts on"), so how long
+	// ago it was checked says nothing about whether the verdict is still
+	// trusted -- only Verdict itself, already folded into LiveProgressSupport
+	// above, does. Acting on this timestamp would invent a staleness rule
+	// this system does not have.
 	LiveProgressCheckedAt *time.Time `json:"live_progress_checked_at,omitempty"`
 
 	// Capabilities is every DETERMINED capability row for this mapping (#49

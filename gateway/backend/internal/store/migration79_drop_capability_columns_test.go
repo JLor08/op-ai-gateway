@@ -32,39 +32,65 @@ var droppedCapabilityColumns = []string{
 	"live_progress_support", "live_progress_checked_at",
 }
 
-// tableColumns reads a table's column names from the database itself, per
-// dialect: sqlite has pragma_table_info, postgres has information_schema.
-// Reading the LIVE schema rather than the migration source is the point --
-// a migration that silently did nothing would still leave the source
-// looking correct.
-func tableColumns(ctx context.Context, t *testing.T, s *SQLStore, table string) []string {
+// tableColumnTypes reads a table's column names AND declared types from the
+// database itself, per dialect: sqlite's pragma_table_info exposes both in
+// one row (name, type), postgres' information_schema.columns calls them
+// column_name/data_type. Reading the LIVE schema rather than the migration
+// source is the point -- a migration that silently did nothing, or added a
+// column with the wrong type, would still leave the source looking correct.
+//
+// Fails loudly (rather than returning a zero value) if a reported type is
+// empty: that would make every type comparison below vacuously "equal"
+// without ever having compared anything.
+func tableColumnTypes(ctx context.Context, t *testing.T, s *SQLStore, table string) map[string]string {
 	t.Helper()
-	q := `select name from pragma_table_info(?)`
+	q := `select name, type from pragma_table_info(?)`
 	if s.dl.name() == "postgres" {
-		q = `select column_name from information_schema.columns
+		q = `select column_name, data_type from information_schema.columns
 			where table_schema = 'public' and table_name = ?`
 	}
 	rows, err := s.db.QueryContext(ctx, s.dl.rebind(q), table)
 	if err != nil {
-		t.Fatalf("read %s columns: %v", table, err)
+		t.Fatalf("read %s column types: %v", table, err)
 	}
 	defer rows.Close()
-	out := make([]string, 0)
+	out := make(map[string]string)
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatalf("scan %s column: %v", table, err)
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			t.Fatalf("scan %s column type: %v", table, err)
 		}
-		out = append(out, name)
+		if typ == "" {
+			t.Fatalf("%s.%s reported an empty type -- the query is reading the wrong column, or the driver is not returning one", table, name)
+		}
+		out[name] = typ
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate %s columns: %v", table, err)
+		t.Fatalf("iterate %s column types: %v", table, err)
 	}
 	if len(out) == 0 {
 		t.Fatalf("%s reported no columns at all -- does the table exist?", table)
 	}
+	return out
+}
+
+// sortedColumnNames is tableColumnTypes' name-only view, sorted -- what most
+// callers below actually want (they only care whether a column is present,
+// not what type it has).
+func sortedColumnNames(types map[string]string) []string {
+	out := make([]string, 0, len(types))
+	for name := range types {
+		out = append(out, name)
+	}
 	slices.Sort(out)
 	return out
+}
+
+// tableColumns reads a table's column names from the database itself, sorted.
+// See tableColumnTypes for how, and for the type-level view of the same read.
+func tableColumns(ctx context.Context, t *testing.T, s *SQLStore, table string) []string {
+	t.Helper()
+	return sortedColumnNames(tableColumnTypes(ctx, t, s, table))
 }
 
 // TestMigration79DropsTheElevenCapabilityColumns is this task's central
@@ -105,60 +131,73 @@ func TestMigration79KeepsTheBenchmarkHistoryColumn(t *testing.T) {
 	})
 }
 
-// freshlyMigratedColumns migrates a SECOND, empty database of the SAME
-// dialect through the whole ledger and returns one of its tables' columns --
-// the "fresh install" half of TestMigration79FreshInstallMatchesUpgradedSchema.
-//
-// On sqlite that is simply another temp file. On postgres there is one DSN
-// and the suite's own clean slate is `drop schema public cascade`, so the
-// fresh run reuses THIS connection with its schema dropped -- which
-// DESTROYS s. Call it last in a subtest, never before an assertion that
-// still needs s. (A postgres subtest already starts by dropping the schema,
-// so leaving a freshly migrated one behind affects nothing downstream.)
-func freshlyMigratedColumns(ctx context.Context, t *testing.T, s *SQLStore, table string) []string {
-	t.Helper()
-	if s.dl.name() == "postgres" {
-		if err := dropAllTables(ctx, s); err != nil {
-			t.Fatalf("drop schema for the fresh run: %v", err)
-		}
-		if err := s.Migrate(ctx); err != nil {
-			t.Fatalf("fresh Migrate: %v", err)
-		}
-		return tableColumns(ctx, t, s, table)
-	}
-	fresh, err := OpenSQLite(filepath.Join(t.TempDir(), "fresh.db"))
-	if err != nil {
-		t.Fatalf("open a fresh sqlite database: %v", err)
-	}
-	defer fresh.Close()
-	if err := fresh.Migrate(ctx); err != nil {
-		t.Fatalf("fresh Migrate: %v", err)
-	}
-	return tableColumns(ctx, t, fresh, table)
-}
-
 // TestMigration79FreshInstallMatchesUpgradedSchema pins the ORDER dependency
 // between 78 and 79: 78 READS the eleven columns to backfill from them, 79
 // drops them. A fresh install replays both against an empty table; an
 // upgraded database replays them against real rows. Both must land on the
-// same model_mappings shape -- and the upgrade must still be carrying the
-// rows 78 backfilled, which is the half a drop could silently undo.
+// same model_mappings SHAPE -- same column names AND same column types, not
+// merely the same names -- and the upgrade must still be carrying the rows
+// 78 backfilled, which is the half a drop could silently undo. The type
+// comparison is what would catch a future migration whose ALTER lands on a
+// different type than the baseline CREATE would have (ADR-005's narrow-vs-
+// wide column type hazard); a name-only comparison passes silently through
+// that class of bug.
+//
+// FRESH runs FIRST, UPGRADE second, and that order is deliberate rather than
+// incidental: forEachDialect already leaves s freshly migrated end-to-end, so
+// "fresh" costs nothing but reading its columns before anything below
+// touches the store. The upgrade half is the one that has to rebuild a
+// pre-78 shape -- on postgres, by dropping the schema and replaying the
+// ledger to 77 on this SAME connection, the only DSN there is, which
+// destroys whatever was there before. Doing that first would leave nothing
+// to compare "fresh" against, since a schema drop cannot be undone. Ordering
+// it this way means no helper has to warn a future caller "call me last": the
+// destructive step is simply this test's own final step, not a shared
+// function's precondition.
 func TestMigration79FreshInstallMatchesUpgradedSchema(t *testing.T) {
-	// The upgraded database: stop the ledger at 77 (the last version that
-	// still has the columns), write a mapping whose legacy columns say
-	// something, then run the rest -- 78 backfills from them, 79 drops them.
-	forEachDialectMigratedTo(t, 77, func(t *testing.T, s *SQLStore) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
+
+		// FRESH first, while s is still exactly what forEachDialect left it
+		// as: the full ledger applied to an empty database.
+		freshTypes := tableColumnTypes(ctx, t, s, "model_mappings")
+
+		// UPGRADE second: rebuild a genuine pre-78 shape (the last version
+		// that still has the columns), write a mapping whose legacy columns
+		// say something, then run the rest -- 78 backfills from them, 79
+		// drops them. Postgres has one DSN, so this reuses (and resets) s;
+		// sqlite gets a second temp file instead, since a file is cheap and
+		// there is no reason to destroy the one fresh already read from.
+		upgrade := s
+		if s.dl.name() == "postgres" {
+			if err := dropAllTables(ctx, s); err != nil {
+				t.Fatalf("drop schema for the upgrade run: %v", err)
+			}
+			if err := s.migrateTo(ctx, 77); err != nil {
+				t.Fatalf("migrate to 77: %v", err)
+			}
+		} else {
+			upgradeSQLite, err := OpenSQLite(filepath.Join(t.TempDir(), "upgrade.db"))
+			if err != nil {
+				t.Fatalf("open a pre-78 sqlite database: %v", err)
+			}
+			defer upgradeSQLite.Close()
+			if err := upgradeSQLite.migrateTo(ctx, 77); err != nil {
+				t.Fatalf("migrate to 77: %v", err)
+			}
+			upgrade = upgradeSQLite
+		}
+
 		now := time.Now().UTC().Truncate(time.Second)
-		seedMigration78Mappings(ctx, t, s, now, "m_upgrade")
-		mustExec(ctx, t, s, `update model_mappings set cap_vision = 'yes', is_mtp = 1,
+		seedMigration78Mappings(ctx, t, upgrade, now, "m_upgrade")
+		mustExec(ctx, t, upgrade, `update model_mappings set cap_vision = 'yes', is_mtp = 1,
 			live_progress_support = 'supported' where id = ?`, "m_upgrade")
 
-		if err := s.Migrate(ctx); err != nil {
+		if err := upgrade.Migrate(ctx); err != nil {
 			t.Fatalf("Migrate 78+79 over the pre-78 shape: %v", err)
 		}
 
-		got := capabilityRowMap(ctx, t, s, "m_upgrade")
+		got := capabilityRowMap(ctx, t, upgrade, "m_upgrade")
 		for _, capability := range []string{
 			routing.CapabilityVision, routing.CapabilityMTP, routing.CapabilityLiveProgress,
 		} {
@@ -166,12 +205,23 @@ func TestMigration79FreshInstallMatchesUpgradedSchema(t *testing.T) {
 				t.Fatalf("the %s row 78 backfilled did not survive 79: %+v", capability, got)
 			}
 		}
-		upgraded := tableColumns(ctx, t, s, "model_mappings")
+		upgradedTypes := tableColumnTypes(ctx, t, upgrade, "model_mappings")
 
-		// LAST: on postgres this reuses (and wipes) s -- see the helper.
-		fresh := freshlyMigratedColumns(ctx, t, s, "model_mappings")
+		fresh := sortedColumnNames(freshTypes)
+		upgraded := sortedColumnNames(upgradedTypes)
 		if !slices.Equal(fresh, upgraded) {
-			t.Fatalf("fresh install and upgrade disagree on model_mappings:\n fresh    = %v\n upgraded = %v", fresh, upgraded)
+			t.Fatalf("fresh install and upgrade disagree on model_mappings columns:\n fresh    = %v\n upgraded = %v", fresh, upgraded)
+		}
+		// Same names is not the same shape: a column that survived under the
+		// same name but landed on a different declared type (a narrower
+		// integer, a different timestamp precision, ...) would pass the
+		// check above silently. Compare WITHIN this dialect only -- fresh
+		// and upgraded are always the same dialect here, so no cross-dialect
+		// type-name normalisation is needed.
+		for _, name := range upgraded {
+			if freshTypes[name] != upgradedTypes[name] {
+				t.Fatalf("fresh install and upgrade disagree on the type of model_mappings.%s: fresh = %q, upgraded = %q", name, freshTypes[name], upgradedTypes[name])
+			}
 		}
 	})
 }

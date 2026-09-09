@@ -868,12 +868,12 @@ func MTPFromVerdict(verdict string) bool {
 	return verdict == CapabilityYes
 }
 
-// LiveProgressSupportFromVerdict maps a "live_progress" capability verdict
-// onto the pre-existing "" / "supported" / "unsupported" vocabulary that
-// ModelMapping.LiveProgressSupport, Target.LiveProgressSupport and
-// wantsLiveProgress's three-layer rule already speak: CapabilityYes ->
-// "supported", CapabilityNo -> "unsupported", anything else -- in practice
-// only "", an absent row -- -> "". It is the inverse of
+// LiveProgressSupportFromVerdict translates the "live_progress" capability
+// row's Verdict ("yes" / "no" / absent) into the "" / "supported" /
+// "unsupported" vocabulary that MappingCandidate.LiveProgressSupport,
+// Target.LiveProgressSupport and wantsLiveProgress's three-layer rule speak:
+// CapabilityYes -> "supported", CapabilityNo -> "unsupported", anything else
+// -- in practice only "", an absent row -- -> "". It is the inverse of
 // LiveProgressCapabilityVerdict above (which goes the other way, from the
 // probe's support vocabulary to a row's verdict).
 //
