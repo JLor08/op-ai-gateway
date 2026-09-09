@@ -929,6 +929,11 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 //     tri-state verdict is already on file: a steady, unchanged probe result
 //     must still be able to converge a bool another writer moved out from
 //     under it, not only the one sample that first changes cap_vision.
+//
+// The five per-verdict "reported AND differs from stored" comparisons live
+// in changedCapabilityVerdicts below; the vision sync itself lives in
+// syncVisionCapable below -- both carry their own focused doc, but this
+// comment stays the source of truth for WHY each behaves as it does.
 func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
 	if s.Routes == nil {
 		return
@@ -960,7 +965,7 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 		video := strings.TrimSpace(rt.Capabilities.Video)
 		audio := strings.TrimSpace(rt.Capabilities.Audio)
 		tools := strings.TrimSpace(rt.Capabilities.Tools)
-		if vision == "" && video == "" && audio == "" && tools == "" && len(rt.Capabilities.Extra) == 0 {
+		if noCapabilityEvidence(vision, video, audio, tools, rt.Capabilities.Extra) {
 			// Detection ran and determined nothing -- also no write, but for a
 			// different reason than nil above; see the doc above.
 			continue
@@ -983,46 +988,24 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 		if !r.ok {
 			continue
 		}
-		caps := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
-		if vision != "" && vision != r.storedVision {
-			caps.Vision = vision
-		}
-		if video != "" && video != r.storedVideo {
-			caps.Video = video
-		}
-		if audio != "" && audio != r.storedAudio {
-			caps.Audio = audio
-		}
-		if tools != "" && tools != r.storedTools {
-			caps.Tools = tools
-		}
-		if extra := rt.Capabilities.Extra; len(extra) > 0 {
-			if encoded, err := json.Marshal(extra); err == nil && string(encoded) != r.storedExtra {
-				caps.Extra = extra
-			}
-		}
+		caps := changedCapabilityVerdicts(vision, video, audio, tools, rt.Capabilities.Extra, storedCapabilityVerdicts{
+			Vision: r.storedVision,
+			Video:  r.storedVideo,
+			Audio:  r.storedAudio,
+			Tools:  r.storedTools,
+			Extra:  r.storedExtra,
+		})
 
 		// Vision sync: driven by `vision`, THIS sample's reported verdict --
 		// not by caps.Vision, which is non-empty only when the tri-state
 		// itself changed. Deliberately runs before the no-write-amplification
 		// `continue` below, and before the capabilities write it guards: see
 		// the doc above for why vision_capable needs to converge on every
-		// definitive sample, not just the one that changes cap_vision. ""
-		// still syncs nothing, and the compare against r.storedVisionCapable
-		// still guarantees an already-correct bool is never rewritten.
-		if vision != "" {
-			want := vision == "yes"
-			if want != r.storedVisionCapable {
-				if err := s.Routes.UpdateMappingVisionCapable(ctx, r.mappingID, want, now); err != nil {
-					slog.Debug("vision-capable sync failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
-				} else {
-					r.storedVisionCapable = want
-					resolved[specID] = r
-				}
-			}
-		}
+		// definitive sample, not just the one that changes cap_vision.
+		r.storedVisionCapable = s.syncVisionCapable(ctx, serverID, specID, r.mappingID, vision, r.storedVisionCapable, now)
+		resolved[specID] = r
 
-		if caps.Vision == "" && caps.Video == "" && caps.Audio == "" && caps.Tools == "" && len(caps.Extra) == 0 {
+		if noCapabilityEvidence(caps.Vision, caps.Video, caps.Audio, caps.Tools, caps.Extra) {
 			continue // every verdict already on file -- no write amplification
 		}
 		if err := s.Routes.UpdateMappingCapabilities(ctx, r.mappingID, caps, now); err != nil {
@@ -1050,6 +1033,87 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 		}
 		resolved[specID] = r
 	}
+}
+
+// storedCapabilityVerdicts is the subset of a mapping's currently-stored
+// capability state changedCapabilityVerdicts compares a reported sample
+// against: the four tri-state columns verbatim, plus Extra already in its
+// stored, JSON-encoded form (mapping.CapExtra's own representation), so the
+// comparison below can re-encode the reported slice and compare strings.
+type storedCapabilityVerdicts struct {
+	Vision, Video, Audio, Tools, Extra string
+}
+
+// changedCapabilityVerdicts returns the routing.CapabilityVerdicts holding
+// only the reported verdicts that are non-empty AND differ from stored --
+// the five independent comparisons writeBackRuntimeCapabilities used to
+// spell out inline, one per capability, now named and table-testable on
+// their own. Pure: no I/O, no store access.
+//
+// cmd/gateway/app_health.go's applyCapabilityWrite has the identical shape
+// duplicated across the internal/gateway <-> main package boundary --
+// internal/gateway cannot import cmd/gateway (main) and a shared package is
+// not worth inventing for a helper this small, so this is a narrow,
+// deliberately duplicated helper, not a shared one; see that file's
+// diffCapabilityVerdicts for its sibling.
+func changedCapabilityVerdicts(vision, video, audio, tools string, extra []string, stored storedCapabilityVerdicts) routing.CapabilityVerdicts {
+	caps := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
+	if vision != "" && vision != stored.Vision {
+		caps.Vision = vision
+	}
+	if video != "" && video != stored.Video {
+		caps.Video = video
+	}
+	if audio != "" && audio != stored.Audio {
+		caps.Audio = audio
+	}
+	if tools != "" && tools != stored.Tools {
+		caps.Tools = tools
+	}
+	if len(extra) > 0 {
+		if encoded, err := json.Marshal(extra); err == nil && string(encoded) != stored.Extra {
+			caps.Extra = extra
+		}
+	}
+	return caps
+}
+
+// noCapabilityEvidence reports whether vision/video/audio/tools/extra carry
+// no verdict at all. writeBackRuntimeCapabilities uses it twice: once on a
+// sample's raw reported fields (detection ran and determined nothing -- see
+// its doc for how that differs from a nil Capabilities), and once on a
+// changedCapabilityVerdicts result (every verdict already on file, so
+// writing would only amplify).
+func noCapabilityEvidence(vision, video, audio, tools string, extra []string) bool {
+	return vision == "" && video == "" && audio == "" && tools == "" && len(extra) == 0
+}
+
+// syncVisionCapable is writeBackRuntimeCapabilities' vision-sync step,
+// extracted so the convergence property stands on its own -- see
+// writeBackRuntimeCapabilities' doc for the full reasoning (cap_vision vs.
+// vision_capable, and why this runs off the REPORTED verdict rather than
+// whatever changedCapabilityVerdicts ended up returning). reported is THIS
+// sample's cap_vision verdict ("" | "yes" | "no"); storedVisionCapable is
+// the mapping's currently-stored vision_capable. A "" reported verdict never
+// syncs (unknown is not a clear), and an already-matching stored bool is
+// never rewritten -- both mirrored from the original inline guard. A write
+// failure is logged at Debug and never surfaced, matching this write-back's
+// best-effort discipline. Returns the bool now on file: storedVisionCapable
+// unchanged when nothing was written or the write failed, so the caller can
+// fold the result straight back into its per-sample memo.
+func (s *Server) syncVisionCapable(ctx context.Context, serverID, specID, mappingID, reported string, storedVisionCapable bool, at time.Time) bool {
+	if reported == "" {
+		return storedVisionCapable
+	}
+	want := reported == "yes"
+	if want == storedVisionCapable {
+		return storedVisionCapable
+	}
+	if err := s.Routes.UpdateMappingVisionCapable(ctx, mappingID, want, at); err != nil {
+		slog.Debug("vision-capable sync failed", "server_id", serverID, "spec_id", specID, "mapping_id", mappingID, "err", err)
+		return storedVisionCapable
+	}
+	return want
 }
 
 // ProxyRouteSample is the gateway-side mirror of the agent's

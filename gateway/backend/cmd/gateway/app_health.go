@@ -484,7 +484,42 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 // rewritten, and still goes through the lock-respecting
 // UpdateMappingVisionCapable, unlike the lock-free UpdateMappingCapabilities
 // call below it.
+//
+// The four per-verdict "reported AND differs from stored" comparisons live
+// in diffCapabilityVerdicts below; the vision sync itself lives in
+// syncVisionCapable below -- both carry their own focused doc, but this
+// comment stays the source of truth for WHY each behaves as it does.
 func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, at time.Time) {
+	diff := diffCapabilityVerdicts(caps, mp)
+
+	// Vision sync: driven by caps.Vision, THIS probe's reported verdict -- not
+	// diff.Vision, which is non-empty only when the tri-state itself changed.
+	// See the doc above for why. "" still syncs nothing.
+	if err := r.syncVisionCapable(ctx, mp, caps.Vision, at); err != nil {
+		log.Printf("app health: vision-capable sync for mapping %s failed: %v", mp.ID, err)
+	}
+
+	if noCapabilityEvidence(diff.Vision, diff.Video, diff.Audio, diff.Tools, diff.Extra) {
+		return // every verdict already on file -- no write amplification
+	}
+	if err := r.store.UpdateMappingCapabilities(ctx, mp.ID, diff, at); err != nil {
+		log.Printf("app health: capability write-back for mapping %s failed: %v", mp.ID, err)
+	}
+}
+
+// diffCapabilityVerdicts returns the routing.CapabilityVerdicts holding only
+// the verdicts among caps that are non-empty AND differ from what mp already
+// has stored -- the four independent comparisons applyCapabilityWrite used
+// to spell out inline, one per capability, now named and table-testable on
+// their own. Pure: no I/O, no store access.
+//
+// internal/gateway/agent_ingest.go's writeBackRuntimeCapabilities has the
+// identical shape duplicated across the internal/gateway <-> main package
+// boundary -- internal/gateway cannot import cmd/gateway (main) and a shared
+// package is not worth inventing for a helper this small, so this is a
+// narrow, deliberately duplicated helper, not a shared one; see that file's
+// changedCapabilityVerdicts for its sibling.
+func diffCapabilityVerdicts(caps provider.Capabilities, mp routing.ModelMapping) routing.CapabilityVerdicts {
 	diff := routing.CapabilityVerdicts{Source: "llama_cpp_props"}
 	if caps.Vision != "" && caps.Vision != mp.CapVision {
 		diff.Vision = caps.Vision
@@ -503,25 +538,43 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 			diff.Extra = caps.Extra
 		}
 	}
+	return diff
+}
 
-	// Vision sync: driven by caps.Vision, THIS probe's reported verdict -- not
-	// diff.Vision, which is non-empty only when the tri-state itself changed.
-	// See the doc above for why. "" still syncs nothing.
-	if caps.Vision != "" {
-		want := caps.Vision == "yes"
-		if want != mp.VisionCapable {
-			if err := r.store.UpdateMappingVisionCapable(ctx, mp.ID, want, at); err != nil {
-				log.Printf("app health: vision-capable sync for mapping %s failed: %v", mp.ID, err)
-			}
-		}
-	}
+// noCapabilityEvidence reports whether vision/video/audio/tools/extra carry
+// no verdict at all. applyCapabilityWrite uses it on a diffCapabilityVerdicts
+// result: every verdict already on file, so writing would only amplify.
+// internal/gateway/agent_ingest.go has the identical helper of the same name
+// for its own two uses -- see that file's doc for why this is a narrow,
+// deliberately duplicated helper rather than a shared one.
+func noCapabilityEvidence(vision, video, audio, tools string, extra []string) bool {
+	return vision == "" && video == "" && audio == "" && tools == "" && len(extra) == 0
+}
 
-	if diff.Vision == "" && diff.Video == "" && diff.Audio == "" && diff.Tools == "" && len(diff.Extra) == 0 {
-		return // every verdict already on file -- no write amplification
+// syncVisionCapable is applyCapabilityWrite's vision-sync step, extracted so
+// the convergence property stands on its own -- see applyCapabilityWrite's
+// doc for the full reasoning (cap_vision vs. vision_capable, and why this
+// runs off the REPORTED verdict rather than whatever diffCapabilityVerdicts
+// ended up returning). reported is THIS probe's cap_vision verdict ("" |
+// "yes" | "no"). A "" reported verdict never syncs (unknown is not a clear),
+// and an already-matching mp.VisionCapable is never rewritten -- both
+// mirrored from the original inline guard. Returns the store write's error,
+// or nil when nothing needed writing, so the caller keeps its own log line.
+//
+// internal/gateway/agent_ingest.go's writeBackRuntimeCapabilities has the
+// identical shape duplicated across the internal/gateway <-> main package
+// boundary -- see its own syncVisionCapable for the sibling (that one also
+// folds the result into a per-sample memo, which this one-shot call has no
+// need for).
+func (r *appHealthRunner) syncVisionCapable(ctx context.Context, mp routing.ModelMapping, reported string, at time.Time) error {
+	if reported == "" {
+		return nil
 	}
-	if err := r.store.UpdateMappingCapabilities(ctx, mp.ID, diff, at); err != nil {
-		log.Printf("app health: capability write-back for mapping %s failed: %v", mp.ID, err)
+	want := reported == "yes"
+	if want == mp.VisionCapable {
+		return nil
 	}
+	return r.store.UpdateMappingVisionCapable(ctx, mp.ID, want, at)
 }
 
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe
