@@ -275,3 +275,126 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 		t.Fatalf("wire JSON = %s, want live_progress_checked_at OMITTED when nil", blob)
 	}
 }
+
+// TestModelServersCapabilitiesPersisted: CapVision/CapVideo/CapAudio/CapTools/
+// CapExtra/CapabilitiesSource/CapabilitiesCheckedAt are read straight off the
+// PERSISTED mapping fields (via routing.Store.UpdateMappingCapabilities),
+// exactly like LiveProgressSupport -- NOT left zero/empty for a gateway-layer
+// injection pass. One row with every verdict determined (plus an open-ended
+// cap_extra entry) and one row with nothing determined at all (no write),
+// so a dropped fill in ModelServers cannot coincidentally satisfy this: the
+// untouched row must ALSO carry a nil CapabilitiesCheckedAt and a nil
+// CapExtra, which only holds if the fill genuinely reads the mapping rather
+// than defaulting.
+func TestModelServersCapabilitiesPersisted(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
+	seedOffering(t, routeStore, now, "srv-determined", "app-determined", "map-determined", "shared", "up-determined", 0)
+	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
+
+	checkedAt := now.Add(-time.Hour)
+	caps := routing.CapabilityVerdicts{
+		Vision: "yes",
+		Video:  "no",
+		Audio:  "yes",
+		Tools:  "no",
+		Extra:  []string{"thinking"},
+		Source: "llama_cpp_props",
+	}
+	if err := routeStore.UpdateMappingCapabilities(context.Background(), "map-determined", caps, checkedAt); err != nil {
+		t.Fatalf("UpdateMappingCapabilities: %v", err)
+	}
+	// map-unknown gets no call at all: "never determined" is the mapping's
+	// untouched zero value, not a call with all-empty verdicts.
+
+	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
+	if err != nil {
+		t.Fatalf("ModelServers: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("len(rows) = %d, want 2 (%+v)", len(rows), rows)
+	}
+	byServer := map[string]ModelServerDTO{}
+	for _, r := range rows {
+		byServer[r.ServerID] = r
+	}
+
+	determined := byServer["srv-determined"]
+	if determined.CapVision != "yes" || determined.CapVideo != "no" || determined.CapAudio != "yes" || determined.CapTools != "no" {
+		t.Fatalf("determined row verdicts = (%q, %q, %q, %q), want (yes, no, yes, no)", determined.CapVision, determined.CapVideo, determined.CapAudio, determined.CapTools)
+	}
+	if len(determined.CapExtra) != 1 || determined.CapExtra[0] != "thinking" {
+		t.Fatalf("determined row CapExtra = %v, want [\"thinking\"]", determined.CapExtra)
+	}
+	if determined.CapabilitiesSource != "llama_cpp_props" {
+		t.Fatalf("determined row CapabilitiesSource = %q, want \"llama_cpp_props\"", determined.CapabilitiesSource)
+	}
+	if determined.CapabilitiesCheckedAt == nil || !determined.CapabilitiesCheckedAt.Equal(checkedAt) {
+		t.Fatalf("determined row CapabilitiesCheckedAt = %v, want %v", determined.CapabilitiesCheckedAt, checkedAt)
+	}
+
+	unknown := byServer["srv-unknown"]
+	if unknown.CapVision != "" || unknown.CapVideo != "" || unknown.CapAudio != "" || unknown.CapTools != "" {
+		t.Fatalf("never-determined row verdicts = (%q, %q, %q, %q), want all \"\"", unknown.CapVision, unknown.CapVideo, unknown.CapAudio, unknown.CapTools)
+	}
+	if unknown.CapExtra != nil {
+		t.Fatalf("never-determined row CapExtra = %v, want nil", unknown.CapExtra)
+	}
+	if unknown.CapabilitiesSource != "" {
+		t.Fatalf("never-determined row CapabilitiesSource = %q, want \"\"", unknown.CapabilitiesSource)
+	}
+	if unknown.CapabilitiesCheckedAt != nil {
+		t.Fatalf("never-determined row CapabilitiesCheckedAt = %v, want nil", unknown.CapabilitiesCheckedAt)
+	}
+
+	// The wire encoding of "never determined" must carry cap_vision/cap_video/
+	// cap_audio/cap_tools/capabilities_source with an explicit "" value, not
+	// omit them (no `omitempty` on any of the five) -- same rule
+	// live_progress_support already follows, for the same reason: a missing
+	// key is indistinguishable from a client that doesn't know the field yet.
+	// cap_extra and capabilities_checked_at, by contrast, DO omit when empty/nil.
+	blob, err := json.Marshal(unknown)
+	if err != nil {
+		t.Fatalf("json.Marshal(unknown): %v", err)
+	}
+	for _, want := range []string{`"cap_vision":""`, `"cap_video":""`, `"cap_audio":""`, `"cap_tools":""`, `"capabilities_source":""`} {
+		if !strings.Contains(string(blob), want) {
+			t.Fatalf("wire JSON = %s, want an explicit %s", blob, want)
+		}
+	}
+	for _, notWant := range []string{`"cap_extra"`, `"capabilities_checked_at"`} {
+		if strings.Contains(string(blob), notWant) {
+			t.Fatalf("wire JSON = %s, want %s OMITTED when empty/nil", blob, notWant)
+		}
+	}
+}
+
+// TestModelServersCapExtraDecodeFailureDegrades: a malformed CapExtra JSON
+// string (operator-invisible -- a background detector wrote it, never a
+// human) degrades that one field to nil/omitted rather than erroring the
+// whole row -- one corrupt mapping must not blank a server's entire listing.
+func TestModelServersCapExtraDecodeFailureDegrades(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
+	seedOffering(t, routeStore, now, "srv-corrupt", "app-corrupt", "map-corrupt", "shared", "up-corrupt", 0)
+
+	mapping, err := routeStore.MappingByID(context.Background(), "map-corrupt")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	mapping.CapExtra = "{not valid json"
+	if err := routeStore.UpdateMapping(context.Background(), mapping); err != nil {
+		t.Fatalf("UpdateMapping: %v", err)
+	}
+
+	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
+	if err != nil {
+		t.Fatalf("ModelServers: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1 (%+v)", len(rows), rows)
+	}
+	if rows[0].CapExtra != nil {
+		t.Fatalf("CapExtra = %v, want nil (decode failure degrades to empty)", rows[0].CapExtra)
+	}
+}

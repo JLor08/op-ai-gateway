@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"op-ai-gateway/internal/auth"
 	"sort"
 	"strings"
@@ -71,6 +72,40 @@ type ModelServerDTO struct {
 	// never determined. Diagnostic/tooltip only, mirroring ModelMapping.
 	// LiveProgressCheckedAt's own doc-comment -- no decision logic may read it.
 	LiveProgressCheckedAt *time.Time `json:"live_progress_checked_at,omitempty"`
+
+	// CapVision/CapVideo/CapAudio/CapTools are the auto-detected capability
+	// verdicts (#49 sub-project 2), each "" (never determined) | "yes" | "no",
+	// read straight off ModelMapping.CapVision/CapVideo/CapAudio/CapTools
+	// exactly like LiveProgressSupport above. Same gateway-injection-seam
+	// story as LiveProgressSupport: a background detector (routing.Store.
+	// UpdateMappingCapabilities) writes these to the mapping directly, so
+	// there is nothing for the gateway layer to inject after the fact --
+	// Service.ModelServers fills them itself. No `omitempty` on any of the
+	// four: "never determined" must be an explicit "" on the wire, not a
+	// missing key -- the same rule LiveProgressSupport's own doc-comment
+	// explains.
+	CapVision string `json:"cap_vision"`
+	CapVideo  string `json:"cap_video"`
+	CapAudio  string `json:"cap_audio"`
+	CapTools  string `json:"cap_tools"`
+	// CapExtra is ModelMapping.CapExtra's stored JSON array decoded into a
+	// []string for the wire, rather than passing the raw JSON-encoded string
+	// through -- the portal renders one chip per entry, not a JSON blob. Nil
+	// (omitted from the wire) when empty. Decoding is best-effort: the stored
+	// string is operator-invisible JSON a background detector wrote, so a
+	// decode failure degrades to nil/omitted rather than failing the whole
+	// row -- one malformed mapping must not blank a server's entire listing.
+	CapExtra []string `json:"cap_extra,omitempty"`
+	// CapabilitiesSource is ModelMapping.CapabilitiesSource read straight
+	// through: which probe produced the current verdicts ("llama_cpp_props" |
+	// "ollama_show" | ""). No `omitempty`, same reasoning as the four verdicts
+	// above.
+	CapabilitiesSource string `json:"capabilities_source"`
+	// CapabilitiesCheckedAt is ModelMapping.CapabilitiesCheckedAt read
+	// straight through; nil when never determined. Diagnostic/tooltip only,
+	// mirroring LiveProgressCheckedAt's own doc-comment -- no decision logic
+	// may read it.
+	CapabilitiesCheckedAt *time.Time `json:"capabilities_checked_at,omitempty"`
 }
 
 // GroupModelServerDTO is one (model, server) a model group can serve, with the live
@@ -172,6 +207,13 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 			MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
 			LiveProgressSupport:          view.mapping.LiveProgressSupport,
 			LiveProgressCheckedAt:        view.mapping.LiveProgressCheckedAt,
+			CapVision:                    view.mapping.CapVision,
+			CapVideo:                     view.mapping.CapVideo,
+			CapAudio:                     view.mapping.CapAudio,
+			CapTools:                     view.mapping.CapTools,
+			CapExtra:                     decodeCapExtra(view.mapping.CapExtra),
+			CapabilitiesSource:           view.mapping.CapabilitiesSource,
+			CapabilitiesCheckedAt:        view.mapping.CapabilitiesCheckedAt,
 		})
 	}
 	rows, err = s.filterAllowedModelServerRows(ctx, principal, rows)
@@ -185,6 +227,22 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 		return rows[i].MappingID < rows[j].MappingID
 	})
 	return rows, nil
+}
+
+// decodeCapExtra decodes a mapping's stored CapExtra JSON-array string into a
+// []string for the wire (see ModelServerDTO.CapExtra). "" (nothing extra
+// reported) decodes to nil, same as a decode failure: the stored string is
+// operator-invisible JSON a background detector wrote, so a malformed value
+// must degrade this one field to empty rather than error the whole row.
+func decodeCapExtra(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var extra []string
+	if err := json.Unmarshal([]byte(raw), &extra); err != nil {
+		return nil
+	}
+	return extra
 }
 
 // filterAllowedModelServerRows drops any row whose ServerID the given principal
