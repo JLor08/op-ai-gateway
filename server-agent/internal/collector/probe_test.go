@@ -431,6 +431,34 @@ func TestDetectOllamaCapabilities(t *testing.T) {
 		},
 		{"a name is never a no", `{"capabilities":["tools"]}`, Capabilities{Tools: "yes"}},
 		{"malformed json yields nothing rather than panicking", `not json`, Capabilities{}},
+		// Each structured name gets its OWN case, so that swapping two switch
+		// arms breaks a test. Reviewed and found missing: with only the
+		// combined case above plus the isolated "tools" one, exchanging the
+		// vision and audio arms passed the whole suite.
+		{"vision alone lands in Vision", `{"capabilities":["vision"]}`, Capabilities{Vision: "yes"}},
+		{"audio alone lands in Audio", `{"capabilities":["audio"]}`, Capabilities{Audio: "yes"}},
+		// Video has no Ollama equivalent at all: no name maps to it, so the
+		// field stays unknown even when everything else is declared.
+		{
+			"video is never written, Ollama has no such name",
+			`{"capabilities":["vision","tools","audio","thinking"]}`,
+			Capabilities{Vision: "yes", Tools: "yes", Audio: "yes", Extra: []string{"thinking"}},
+		},
+		// Shapes a real server can send that must resolve to "unknown"
+		// rather than to a denial or a panic.
+		{"a null array is undetermined", `{"capabilities":null}`, Capabilities{}},
+		{"a non-array value is undetermined", `{"capabilities":"vision"}`, Capabilities{}},
+		{"a whitespace-only name is skipped", `{"capabilities":["   ","tools"]}`, Capabilities{Tools: "yes"}},
+		{
+			"names are matched case- and whitespace-insensitively",
+			`{"capabilities":[" Vision ","TOOLS"]}`,
+			Capabilities{Vision: "yes", Tools: "yes"},
+		},
+		{
+			"an unmapped name reaches Extra normalised, not byte-for-byte",
+			`{"capabilities":[" Weather.V2 "]}`,
+			Capabilities{Extra: []string{"weather.v2"}},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := detectOllamaCapabilities([]byte(tc.body))

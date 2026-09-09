@@ -442,8 +442,12 @@ func detectCapabilities(body []byte) Capabilities {
 //     /v1/images/generations endpoint. It is filed under Extra like any
 //     other unmapped name and must never be written to the Vision field.
 //   - unrecognized names ("thinking", a future/publisher-specific string,
-//     ...) are kept verbatim in Extra so they are visible without this
-//     detector needing to know about them in advance.
+//     ...) are carried into Extra so they are visible without this detector
+//     needing to know about them in advance. Carried, not copied
+//     byte-for-byte: every name is trimmed and lower-cased first, so that
+//     " Vision " matches the structured field and " Weather.V2 " reaches
+//     Extra as "weather.v2". Ollama's own capability tokens are already
+//     lower-case, so this only ever normalises a publisher's string.
 //   - duplicates collapse to their first occurrence, in both the structured
 //     fields (idempotent by construction) and Extra (explicit dedup).
 //
