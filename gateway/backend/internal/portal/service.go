@@ -2040,6 +2040,22 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
+			// The fold below asks each mapping exactly ONE capability
+			// question, so its row is picked out here in a single pass rather
+			// than by keying that mapping's whole row set by name inside the
+			// loop -- a map allocated per mapping to answer one lookup, on a
+			// path the SSE stream recomputes on every registry change. A
+			// mapping with no vision row is simply absent, which is what the
+			// fold reads as "not capable" (see below).
+			visionRows := make(map[string]routing.CapabilityRow, len(capsByMapping))
+			for mappingID, rows := range capsByMapping {
+				for _, row := range rows {
+					if row.Capability == routing.CapabilityVision {
+						visionRows[mappingID] = row
+						break
+					}
+				}
+			}
 			// Derive both the per-model flavor set and the loaded-state from a
 			// single pass over the active mapping views (one store round-trip).
 			flavors := make(map[string]map[string]struct{})
@@ -2070,8 +2086,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					offeredOn[name] = make(map[string]struct{})
 				}
 				offeredOn[name][view.server.Name] = struct{}{}
-				visionRow := routing.CapabilityRowsByName(capsByMapping[view.mapping.ID])[routing.CapabilityVision]
-				visionOn[name] = visionOn[name] && visionRow.Verdict == routing.CapabilityYes
+				visionOn[name] = visionOn[name] && visionRows[view.mapping.ID].Verdict == routing.CapabilityYes
 				if cs := view.mapping.ContextSize; cs > 0 {
 					if cur, ok := contextSizeOn[name]; !ok || cs < cur {
 						contextSizeOn[name] = cs

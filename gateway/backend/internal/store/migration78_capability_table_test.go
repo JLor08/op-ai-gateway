@@ -492,3 +492,49 @@ func TestMappingCapabilitiesForMappingsChunking(t *testing.T) {
 		}
 	})
 }
+
+// TestMappingCapabilitiesForMappingsRepeatedIDAcrossChunks pins the SQL bulk
+// reader against the one input on which it used to disagree with
+// routing.MemoryStore: the same mapping id named in TWO different chunks.
+// The scan appends per mapping id, so the second chunk appended that
+// mapping's rows a second time, while MemoryStore assigns per id and returns
+// them once. Neither caller can produce a duplicate today -- both build the
+// id list from distinct mapping views -- so this is about the two drivers not
+// being allowed to differ on an input either of them accepts.
+//
+// A duplicate INSIDE one chunk cannot show it: an `in (…)` list returns each
+// matching row once however often its id is named. The repeat therefore has
+// to straddle the 1000-id boundary, which is what the padding below is for.
+func TestMappingCapabilitiesForMappingsRepeatedIDAcrossChunks(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		seedMigration78Mappings(ctx, t, s, now, "m_dup")
+		if err := s.UpsertMappingCapabilities(ctx, "m_dup", []routing.CapabilityRow{
+			{
+				Capability: routing.CapabilityTools, Verdict: routing.CapabilityYes,
+				Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now,
+			},
+		}); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		// m_dup first, then enough unknown ids to fill the first chunk, then
+		// m_dup again -- so the two occurrences land in different queries.
+		ids := []string{"m_dup"}
+		for i := range capabilityBatchChunk {
+			ids = append(ids, fmt.Sprintf("m_pad_%04d", i))
+		}
+		ids = append(ids, "m_dup")
+
+		got, err := s.MappingCapabilitiesForMappings(ctx, ids)
+		if err != nil {
+			t.Fatalf("bulk read with a repeated id: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("bulk read = %d keys (%+v), want 1", len(got), got)
+		}
+		if len(got["m_dup"]) != 1 {
+			t.Fatalf("m_dup = %+v, want exactly ONE row -- an id repeated across a chunk boundary must not append its rows twice (routing.MemoryStore assigns and returns one)", got["m_dup"])
+		}
+	})
+}

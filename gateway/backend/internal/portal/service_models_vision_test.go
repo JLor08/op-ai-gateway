@@ -92,6 +92,65 @@ func TestModelsResponseVisionAndAcrossMappings(t *testing.T) {
 	}
 }
 
+// TestModelsResponseVisionReadsTheVisionRowAndNoOther: the fold picks the
+// mapping's "vision" row out of a row SET that also holds other
+// capabilities, and a mapping carrying other rows but no vision row still
+// folds to false.
+//
+// It exists because the models listing asks each mapping exactly one
+// capability question, so its vision row is picked out in one pass over the
+// batch read instead of by keying every mapping's whole row set by name
+// inside the per-view loop. That pass carries the name comparison the map
+// lookup used to do, and the rest of this file's cases only ever write a
+// vision row -- so nothing there would notice a pass that simply returned
+// whichever row came first. "tools" sorts before "vision", which is exactly
+// the order that would let such a mistake pass unnoticed.
+func TestModelsResponseVisionReadsTheVisionRowAndNoOther(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	offer := func(srvID, appID, mappingID, gateway string, rows ...routing.CapabilityRow) {
+		t.Helper()
+		if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer %s: %v", srvID, err)
+		}
+		if err := routeStore.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication %s: %v", appID, err)
+		}
+		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", mappingID, err)
+		}
+		if err := routeStore.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
+			t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
+		}
+	}
+	row := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{
+			Capability: capability, Verdict: verdict,
+			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now,
+		}
+	}
+	// m1: a tools=yes row and NO vision row -> false (never probed for
+	// vision, whatever else is known about it).
+	offer("srv_t", "app_t", "map_t", "m1", row(routing.CapabilityTools, routing.CapabilityYes))
+	// m2: the same tools row PLUS vision=yes -> true.
+	offer("srv_u", "app_u", "map_u", "m2",
+		row(routing.CapabilityTools, routing.CapabilityYes),
+		row(routing.CapabilityVision, routing.CapabilityYes))
+
+	svc := NewService(ServiceDeps{Usage: usage.NewRecorder(), Routes: routeStore, Clock: func() time.Time { return now }})
+	byID := modelsByID(svc.Models(ctx, auth.Token{UserID: "usr_1"}))
+	if _, ok := byID["m1"]; !ok {
+		t.Fatalf("m1 missing from the listing (%#v)", byID)
+	}
+	if byID["m1"].Vision {
+		t.Fatalf("m1 vision = true, want false -- its only row is tools=yes, and no vision row means never probed")
+	}
+	if !byID["m2"].Vision {
+		t.Fatalf("m2 vision = false, want true -- its vision=yes row must be found among the other capability rows")
+	}
+}
+
 // TestModelsResponseCapabilityReadFailureDegradesAndLogs: a failing bulk
 // capability read in the models listing must NOT fail the listing -- the
 // models still come back, but fail-CLOSED, with vision withheld from every

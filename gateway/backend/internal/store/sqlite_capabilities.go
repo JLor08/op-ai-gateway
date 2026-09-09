@@ -45,14 +45,32 @@ func (s *SQLiteStore) MappingCapabilities(ctx context.Context, mappingID string)
 }
 
 // MappingCapabilitiesForMappings is the bulk reader: one query per chunk of
-// ids instead of one per mapping. A mapping with no rows contributes NO key,
-// so a caller's zero-value lookup is "every capability unknown" without an
-// empty slice having to be manufactured for it.
+// DISTINCT ids instead of one per mapping. A mapping with no rows contributes
+// NO key, so a caller's zero-value lookup is "every capability unknown"
+// without an empty slice having to be manufactured for it.
+//
+// The ids are deduplicated first because the scan APPENDS per mapping id. A
+// repeat inside ONE chunk is harmless (an `in (…)` list returns each matching
+// row once however often its id is named), but the same id in TWO chunks
+// would append that mapping's rows twice, where routing.MemoryStore -- which
+// assigns per id -- returns them once. Neither caller can produce a
+// duplicate today (both build their id list from distinct mapping views), so
+// this is about the two drivers not being allowed to differ on an input
+// either of them accepts, not about a live bug.
 func (s *SQLiteStore) MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]routing.CapabilityRow, error) {
-	out := make(map[string][]routing.CapabilityRow, len(mappingIDs))
-	for start := 0; start < len(mappingIDs); start += capabilityBatchChunk {
-		end := min(start+capabilityBatchChunk, len(mappingIDs))
-		chunk := mappingIDs[start:end]
+	ids := make([]string, 0, len(mappingIDs))
+	seen := make(map[string]struct{}, len(mappingIDs))
+	for _, id := range mappingIDs {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	out := make(map[string][]routing.CapabilityRow, len(ids))
+	for start := 0; start < len(ids); start += capabilityBatchChunk {
+		end := min(start+capabilityBatchChunk, len(ids))
+		chunk := ids[start:end]
 		placeholders := make([]string, len(chunk))
 		args := make([]any, len(chunk))
 		for i, id := range chunk {
