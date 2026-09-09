@@ -1168,19 +1168,6 @@ func capabilitySourceRank(source string) int {
 	}
 }
 
-// CapabilitySourceIsAuthoritative reports whether source outranks every
-// probe -- capabilitySourceRank(source) >= 2, i.e. CapabilitySourceManual or
-// CapabilitySourceVisionBenchmark. WritableCapabilityRows no longer calls
-// this itself (it compares ranks directly, since its own incoming source can
-// now be a benchmark's rank 2 rather than always a probe's rank 1), but the
-// predicate is kept: it is still the exact question a PROBE write path asks
-// ("is this row outranked by anything I could ever be"), it has its own
-// test, and it reads better at a probe call site than spelling out a rank
-// number.
-func CapabilitySourceIsAuthoritative(source string) bool {
-	return capabilitySourceRank(source) >= 2
-}
-
 // LiveProgressCapabilityVerdict maps the live-progress verdict vocabulary
 // ("supported" / "unsupported", what provider.detectLiveProgressSupport
 // produces and what the pre-78 live_progress_support column stored) onto the
@@ -1209,8 +1196,8 @@ func LiveProgressCapabilityVerdict(support string) string {
 // name -- the shape every write path compares a fresh probe result against,
 // and the memo shape the telemetry write-back folds its own writes back into.
 // A capability with no row is simply absent from the map, so a zero-value
-// lookup is "unknown" and CapabilitySourceIsAuthoritative("") is correctly
-// false for it.
+// lookup is "unknown": its empty Source is rank 0, below every real writer's,
+// which is what makes a first-ever verdict always writable.
 func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 	out := make(map[string]CapabilityRow, len(rows))
 	for _, r := range rows {

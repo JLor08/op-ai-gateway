@@ -95,7 +95,6 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 // UpsertMappingCapabilities writes one row per verdict, replacing any row for
 // the same (mapping, capability). It applies NO precedence rule — the caller
 // decides whether its source may overwrite what is there (see
-// routing.CapabilitySourceIsAuthoritative, and
 // routing.WritableCapabilityRows for the shared answer) — and carries no
 // metrics_locked guard, never touching metrics_source/metrics_updated_at: a
 // capability is not a number an operator pins against automation. That
