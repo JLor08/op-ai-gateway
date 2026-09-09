@@ -4,6 +4,7 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -114,12 +115,22 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 	return n, nil
 }
 
-// fetchProbeBody is the common GET-and-read-body step shared by ProbeContext
-// and ProbePropsVerdicts: build baseURL+path, issue the request
-// through client (falling back to http.DefaultClient for a nil one, matching
-// ProbeContext's long-standing contract), and return the raw response body
-// on a 2xx status. It never interprets the bytes -- each caller applies its
-// own parse/evidence rule to the same body.
+// fetchProbeBody issues the GET that /props-, /v1/models-, and /info-shaped
+// probes need. It is a thin wrapper so that every long-standing caller keeps
+// its exact shape; fetchProbeBodyWith carries the method and body a
+// POST-only upstream endpoint needs (Ollama's /api/show -- see issue #54).
+func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
+	return fetchProbeBodyWith(ctx, client, baseURL, http.MethodGet, path, nil)
+}
+
+// fetchProbeBodyWith is the common request-and-read-body step shared by
+// ProbeContext and ProbePropsVerdicts: build baseURL+path, issue method
+// against it (writing body as the request body and setting
+// Content-Type: application/json when body is non-empty) through client
+// (falling back to http.DefaultClient for a nil one, matching ProbeContext's
+// long-standing contract), and return the raw response body on a 2xx
+// status. It never interprets the bytes -- each caller applies its own
+// parse/evidence rule to the same body.
 //
 // The returned status is the HTTP status code actually received, or 0 if no
 // response was ever received at all (a transport-level failure: connection
@@ -129,15 +140,22 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 // says nothing final -- a 5xx above all) from a CONCLUSIVE refusal (404,
 // 401, 403, 405) when deciding whether an undetermined verdict set is safe
 // to cache; see its own comment for why exactly those four are conclusive.
-func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path string) ([]byte, int, error) {
+func fetchProbeBodyWith(ctx context.Context, client *http.Client, baseURL, method, path string, body []byte) ([]byte, int, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
 
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, 0, err
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -148,8 +166,8 @@ func fetchProbeBody(ctx context.Context, client *http.Client, baseURL, path stri
 		return nil, resp.StatusCode, fmt.Errorf("probe: upstream status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return body, resp.StatusCode, err
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return respBody, resp.StatusCode, err
 }
 
 // LiveProgressProbePath is the fixed path GETted for the live-progress-

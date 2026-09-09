@@ -10,18 +10,59 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
-func newProbeServer(t *testing.T, body string) *httptest.Server {
+// recordedProbeRequest is what newProbeServer captures about the single
+// request its canned handler received: method, path, and raw body. It exists
+// so a test can assert the SHAPE of the request the code under test issued,
+// not just the body newProbeServer serves back -- see
+// TestProbeContextRequestShapePerSpecType, which pins exactly this for every
+// spec type (#54: no test in this package had ever asserted a probe's
+// method, path, or body before that test existed).
+type recordedProbeRequest struct {
+	Method string
+	Path   string
+	Body   []byte
+}
+
+// probeServer is a newProbeServer *httptest.Server with the last request it
+// received recorded alongside it. It embeds *httptest.Server so every
+// existing caller of newProbeServer keeps compiling unmodified -- ts.URL and
+// ts.Client() are unchanged; only a caller that wants the request calls
+// ts.lastRequest().
+type probeServer struct {
+	*httptest.Server
+
+	mu   sync.Mutex
+	last *recordedProbeRequest
+}
+
+// lastRequest returns the most recently recorded request, or nil if the
+// server has not been hit yet.
+func (p *probeServer) lastRequest() *recordedProbeRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.last
+}
+
+func newProbeServer(t *testing.T, body string) *probeServer {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	ps := &probeServer{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ := io.ReadAll(r.Body)
+		ps.mu.Lock()
+		ps.last = &recordedProbeRequest{Method: r.Method, Path: r.URL.Path, Body: reqBody}
+		ps.mu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(ts.Close)
-	return ts
+	ps.Server = ts
+	return ps
 }
 
 func TestProbeContext_VLLM(t *testing.T) {
@@ -123,6 +164,60 @@ func TestProbeContext_NoMatch(t *testing.T) {
 	}
 	if got != 0 {
 		t.Errorf("context = %d, want 0 on error", got)
+	}
+}
+
+// TestProbeContextRequestShapePerSpecType is the root-cause regression test
+// for #54: newProbeServer's handler used to be declared
+// func(w, _ *http.Request), so no test in this package had ever asserted a
+// probe's method, path, or body -- only the served response body. This pins
+// the request shape ProbeContext issues per spec type AS IT STANDS TODAY.
+//
+// The ollama row is the point of the whole exercise: /api/show is POST-only
+// upstream (issue #54), but ProbeContext has only ever sent GET, so this row
+// pins that GET as today's (buggy) behaviour, not as intended behaviour. The
+// task that fixes #54 flips this one row's wantMethod to http.MethodPost;
+// until then, this test is the discriminator that proves the fix actually
+// changed something -- it must fail the moment the row flips against
+// unpatched code, and pass again once ProbeContext is taught to POST to
+// Ollama.
+func TestProbeContextRequestShapePerSpecType(t *testing.T) {
+	for _, tc := range []struct {
+		specType   string
+		path       string
+		wantMethod string
+		wantBody   string
+	}{
+		{"llama_cpp", "/props", http.MethodGet, ""},
+		{"vllm", "/v1/models", http.MethodGet, ""},
+		{"tgi", "/info", http.MethodGet, ""},
+		{"custom", "/whatever", http.MethodGet, ""},
+		{"ollama", "/api/show", http.MethodGet, ""}, // Task 4 flips this row to POST: #54's bug is that Ollama's /api/show is POST-only and ProbeContext has always sent GET, so this pins that mistake as it exists today, not as intended behaviour.
+	} {
+		t.Run(tc.specType, func(t *testing.T) {
+			// The response body is irrelevant here -- extraction correctness
+			// per spec type is already covered by TestProbeContext_VLLM and
+			// its siblings above. This test only cares about the request
+			// ProbeContext issues, so ProbeContext's own return values are
+			// deliberately ignored.
+			ts := newProbeServer(t, `{}`)
+
+			_, _ = ProbeContext(context.Background(), ts.Client(), ts.URL, tc.specType, tc.path)
+
+			got := ts.lastRequest()
+			if got == nil {
+				t.Fatal("server never received a request")
+			}
+			if got.Method != tc.wantMethod {
+				t.Errorf("method = %q, want %q", got.Method, tc.wantMethod)
+			}
+			if got.Path != tc.path {
+				t.Errorf("path = %q, want %q", got.Path, tc.path)
+			}
+			if string(got.Body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", got.Body, tc.wantBody)
+			}
+		})
 	}
 }
 
