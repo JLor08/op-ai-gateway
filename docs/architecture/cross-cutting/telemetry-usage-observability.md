@@ -897,11 +897,40 @@ that first changes `cap_vision`. `""` never syncs anything. See
 [ADR-038](../09-architecture-decisions.md#adr-038--auto-detected-capabilities-are-three-state-outside-the-metrics-lock-and-sync-onto-the-legacy-vision-bool)
 for the full reasoning.
 
-**Both write paths mirror `live_progress_support`'s exactly**, sharing every
-guard already described above — the runtimes cap, per-`spec_id` ownership
-resolution with the same cross-server rejection, best-effort so a write
-failure never rejects the sample, and compare-to-stored so an unchanged
-verdict set issues no `UPDATE`: the agent's `writeBackRuntimeCapabilities`
+**Consequence for the operator: a probe verdict can override what looks like
+a deliberate manual answer.** Because the sync above is driven by THIS
+sample's `vision` value and re-runs on every steady, unchanged probe result —
+not only the sample that first changes `cap_vision` — a **definitive**
+llama.cpp `/props` verdict overrides a `vision_capable` an operator set by
+hand (the checkbox in `MappingForm.tsx`) within about one telemetry tick
+(~1s, `OP_AGENT_INTERVAL`'s default), and it converges just as fast over a
+`vision_capable` the vision **benchmark**'s own **verify** mode most recently
+set. Verify mode matters here: it asks the model to name the two colors in a
+known test image and writes a definitive `false` when the answer does not
+contain them (`answerContainsTokens`, `benchmark_runner.go`) — i.e. an
+operator running verify mode has asked to filter out models that merely
+ACCEPT an image without understanding it, and `modalities.vision` (what this
+probe reads) only ever answers acceptance, never comprehension. The escape
+hatch is `metrics_locked`: every writer of `vision_capable` — this sync (on
+both write paths below) and the vision benchmark alike — goes through the
+same lock-respecting `UpdateMappingVisionCapable`, whose `and metrics_locked
+= 0` clause makes a locked mapping's row match zero rows and no-op,
+atomically, in SQL, with no separate check-then-write race to get wrong.
+`MappingForm` carries both the `vision_capable` and `metrics_locked`
+checkboxes, so one save can set the value and lock it in the same request.
+
+**Both write paths mirror `live_progress_support`'s in what they actually
+share, not its full guard list.** The runtimes cap and per-`spec_id`
+ownership resolution with the same cross-server rejection exist ONLY on the
+ingest path, because that path alone is handed a wire-supplied `spec_id`
+with no other verification; `applyCapabilityWrite` needs neither guard,
+since app-health resolves the mapping itself by iterating its own
+applications rather than trusting a field an agent supplied. What the two
+DO genuinely share: best-effort so a write failure never rejects the sample
+(or, on the app-health side, the probe pass), compare-to-stored so an
+unchanged verdict set issues no `UPDATE`, no `metrics_locked` guard on the
+tri-state columns, and the vision sync described above. The two writers are
+the gateway's own ingest-side `writeBackRuntimeCapabilities`
 (`internal/gateway/agent_ingest.go`), gated on the identical
 `runtime_model_probe` capability as the context and live-progress
 write-backs; and the gateway's own `applyCapabilityWrite`

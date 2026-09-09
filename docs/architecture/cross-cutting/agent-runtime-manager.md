@@ -2909,10 +2909,17 @@ mirror). Three different cadences share the one collect cycle:
   probe instead was the originally sketched remedy, and it was rejected on
   exactly that basis. Such a child therefore still answers `401`/`403` here,
   still cached as a conclusive non-verdict (above), and this probe's own
-  `live_progress_support` write for it still stays `""` forever, and its
-  `Capabilities` write stays `nil` forever, too — unchanged, and it remains
-  the fast path for every *unprotected* child, and the only source of truth
-  at all for an agent that predates the passthrough below.
+  `live_progress_support` write for it still stays `""` forever — but its
+  `Capabilities` write is *not* `nil`: `401`/`403` sits in
+  `ProbePropsVerdicts`' CONCLUSIVE set, so `stable` comes back `true` and
+  `probeRuntimeChildProps` still reaches `capabilitiesSample`, which always
+  returns a non-nil pointer even over an all-empty `collector.Capabilities`.
+  Such a child therefore reports the non-nil, all-empty `Capabilities` —
+  "detection ran, determined nothing" — described below; `nil` is reserved
+  for a still-transient probe or an agent that predates the field. Otherwise
+  unchanged, and it remains the fast path for every *unprotected* child, and
+  the only source of truth at all for an agent that predates the passthrough
+  below.
 
   The gap instead closes on the **gateway** side, at the edge that already
   attaches a credential for ordinary inference: the gateway's app-health pass

@@ -791,9 +791,14 @@ decision adds exactly the one route #58 needed.
 **Context:** #49 sub-project 2 needed a persisted answer for "does this
 upstream take images/video/audio, and does its chat template support tool
 calls" — and two existing precedents on `model_mappings` point in opposite
-directions. `vision_capable` (migration 32) is a **bool**, written only
-through the **lock-respecting** `UpdateMappingVisionCapable`, which stamps
-`metrics_source = "vision"` like every other metric writer on the table.
+directions. `vision_capable` (migration 32) is a **bool**; among AUTOMATED
+writers it goes only through the **lock-respecting**
+`UpdateMappingVisionCapable`, which stamps `metrics_source = "vision"` like
+every other metric writer on the table — but the operator's own mapping-edit
+path bypasses the lock: the portal's mapping PUT (`Service.UpdateMapping`)
+writes it through the plain, unguarded `UpdateMapping`, stamping
+`metrics_source = "manual"` instead, exactly like every other operator-edited
+metric on the table.
 `live_progress_support` (migration 76, ADR before this one) is **three-state**
 (`""`/`supported`/`unsupported`), written through a dedicated writer that
 carries **no** `metrics_locked` guard and never touches `metrics_source` —
