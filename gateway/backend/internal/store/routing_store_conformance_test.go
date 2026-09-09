@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -55,6 +56,44 @@ func forEachRoutingStoreSeeded(t *testing.T, seedSQL func(t *testing.T, s *SQLSt
 			seedSQL(t, sqlStore)
 		}
 		run(t, sqlStore)
+	})
+	// The postgres leg, added with the capability table (#49-2 follow-up).
+	// Until then this harness ran memory + sqlite only, so every routing-store
+	// conformance assertion in this file -- including the SQL that dialects
+	// genuinely disagree about, `on conflict (...) do update`, `where ... in
+	// (...)` with rebound placeholders, and narrow-vs-wide column types
+	// (ADR-005) -- was unverified on the driver operators actually deploy.
+	// forEachDialect (conformance_test.go) already had this leg; this one is
+	// the same block, and adding it turned out to cost about five seconds and
+	// to pass unchanged, which is the argument for having it.
+	//
+	// It SKIPS silently without the DSN, exactly like its sibling: that is the
+	// documented convention (persistence.md), and AGENTS.md is the standing
+	// instruction to set it -- "verify store changes with
+	// OP_AI_GATEWAY_TEST_POSTGRES_DSN set". CI sets it.
+	t.Run("postgres", func(t *testing.T) {
+		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
+		if dsn == "" {
+			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
+		}
+		ctx := context.Background()
+		pgStore, err := OpenPostgres(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open postgres: %v", err)
+		}
+		defer pgStore.Close()
+		// Clean slate so the suite is deterministic against a reused database
+		// -- the same guard forEachDialect's postgres leg applies.
+		if err := dropAllTables(ctx, pgStore); err != nil {
+			t.Fatalf("drop tables: %v", err)
+		}
+		if err := pgStore.Migrate(ctx); err != nil {
+			t.Fatalf("migrate postgres: %v", err)
+		}
+		if seedSQL != nil {
+			seedSQL(t, pgStore)
+		}
+		run(t, pgStore)
 	})
 }
 
