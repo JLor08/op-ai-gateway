@@ -1440,9 +1440,12 @@ type CreateMappingRequest struct {
 	EnergyWhPerToken float64 `json:"energy_wh_per_token"`
 	MetricsLocked    bool    `json:"metrics_locked"`
 	// CapabilityVerdicts states a capability's verdict outright, keyed by
-	// capability name: "yes" or "no" writes a `manual` row, "" states nothing
-	// and writes none (there is nothing on file to relinquish under an id that
-	// did not exist a moment ago).
+	// capability name: "yes" or "no" writes a `manual` row, "" writes none
+	// (there is nothing on file to relinquish under an id that did not exist a
+	// moment ago) -- but a present "" is still a STATEMENT, and it suppresses
+	// the legacy boolean and the MTP name heuristic for that capability just
+	// as a verdict does. "Writes no row" and "says nothing" are not the same
+	// thing here.
 	//
 	// Unlike the booleans above this can express a NEGATIVE verdict, which is
 	// a real and useful thing to state at create time: a `manual` "no" is what
