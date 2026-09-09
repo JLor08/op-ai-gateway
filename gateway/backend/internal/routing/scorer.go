@@ -81,10 +81,11 @@ func scoringRoute(c MappingCandidate, tel ServerTelemetry, hasTel bool, k int, m
 		GenTokensPerSecond:    c.Mapping.GenTokensPerSecond,
 		PromptTokensPerSecond: c.Mapping.PromptTokensPerSecond,
 		// IsMTP reads the JOINED capability verdict (MappingCandidate.IsMTP,
-		// filled by ActiveMappingsForModel / MemoryStore's mirror), NOT
-		// c.Mapping.IsMTP -- that column is frozen since the write paths that
-		// used to update it now write a "mtp" capability row instead (#49-3).
-		// See MappingCandidate.IsMTP's own doc for why the two are kept apart.
+		// filled by ActiveMappingsForModel / MemoryStore's mirror). Every
+		// write path establishes a "mtp" capability row (#49-3), and c.Mapping
+		// has no MTP field to confuse this with -- migration 79 dropped the
+		// column. See MappingCandidate.IsMTP's own doc for why the verdict
+		// lives on the candidate.
 		IsMTP: c.IsMTP,
 
 		RecommendedConcurrency:       c.Mapping.RecommendedConcurrency,

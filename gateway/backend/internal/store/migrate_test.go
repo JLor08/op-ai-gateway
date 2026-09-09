@@ -548,6 +548,69 @@ func TestAddColumnIfMissingSQLite(t *testing.T) {
 	}
 }
 
+// TestDropColumnIfPresentSQLite is TestAddColumnIfMissingSQLite's mirror for
+// dropColumnIfPresent (migration79Up's helper): the first call actually
+// removes the column, a second call with the column already gone is a
+// swallowed no-op rather than sqlite's "no such column", and a genuine
+// failure (a table that does not exist) still surfaces. The replayability
+// the middle case buys is what makes migration 79 safe to re-run.
+func TestDropColumnIfPresentSQLite(t *testing.T) {
+	ctx := context.Background()
+	s := openTestSQLite(t)
+	defer s.Close()
+
+	if _, err := s.db.ExecContext(ctx, `create table widgets (id text primary key, note text not null default 'unset')`); err != nil {
+		t.Fatalf("create widgets: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `insert into widgets (id) values ('w1')`); err != nil {
+		t.Fatalf("insert w1: %v", err)
+	}
+
+	runDropColumn := func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := dropColumnIfPresent(ctx, tx, s.dl, "widgets", "note"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if err := runDropColumn(); err != nil {
+		t.Fatalf("first dropColumnIfPresent: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`select count(*) from pragma_table_info('widgets') where name='note'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("note column still present after dropColumnIfPresent: n=%d err=%v", n, err)
+	}
+	// The row survives the table rebuild sqlite performs to drop a column.
+	if err := s.db.QueryRowContext(ctx, `select count(*) from widgets where id = 'w1'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("dropping a column lost the row: n=%d err=%v", n, err)
+	}
+
+	// Second call with the column already gone must be swallowed as a no-op
+	// (sqlite's "no such column") -- the case a replayed migration hits.
+	if err := runDropColumn(); err != nil {
+		t.Fatalf("second dropColumnIfPresent (already absent) returned %v, want nil", err)
+	}
+
+	// A genuine, non-absent-column failure (bad table name) must still surface.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = dropColumnIfPresent(ctx, tx, s.dl, "no_such_table", "note")
+	_ = tx.Rollback()
+	if err == nil {
+		t.Fatalf("dropColumnIfPresent on a nonexistent table returned nil error, want an error")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "no such column") {
+		t.Fatalf("dropColumnIfPresent on a nonexistent table was mistaken for an absent-column error: %v", err)
+	}
+}
+
 // TestMigration70BackfillsProxyExcluded proves migration 70's backfill selects
 // EXACTLY the retired implicit own-TLS encoding — (scheme='https' AND
 // proxy_listen_port=0) — and nothing else, on BOTH dialects.

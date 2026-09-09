@@ -2008,7 +2008,7 @@ func TestUpdateMappingUnchangedFormSubmissionDoesNotWriteAManualRow(t *testing.T
 	}
 	seeded := list.Data[0]
 	if !seeded.VisionCapable || !seeded.IsMtp {
-		t.Fatalf("form seed = (vision %v, mtp %v), want both true -- the DTO must expose the probe-written ROW, not the frozen column", seeded.VisionCapable, seeded.IsMtp)
+		t.Fatalf("form seed = (vision %v, mtp %v), want both true -- the DTO must expose the probe-written ROW", seeded.VisionCapable, seeded.IsMtp)
 	}
 
 	// The full form submission: only context_size differs from what is
@@ -2118,9 +2118,9 @@ func TestListMappingsCapabilityReadFailureIsAnError(t *testing.T) {
 // TestCreateMappingMTPHeuristicEarnsTheScorerBonus: a mapping created with an
 // MTP-suggesting name must write an "mtp" capability row, because the
 // scorer's +30 MTP bonus reads the JOINED row verdict
-// (MappingCandidate.IsMTP / routing.MTPFromVerdict), NOT the frozen
-// ModelMapping.IsMTP column. Without the row, every mapping created after
-// migration 78 silently lost a bonus every pre-migration mapping kept --
+// (MappingCandidate.IsMTP / routing.MTPFromVerdict) and nothing else.
+// Without the row, every mapping created after migration 78 silently lost a
+// bonus every pre-migration mapping kept --
 // a change in the scorer's behaviour this sub-project is not allowed to make.
 //
 // Asserted THROUGH THE SCORER (Resolver.ScoreModelServers, the same
@@ -2166,7 +2166,7 @@ func TestCreateMappingMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
 
 	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
 	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
-		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- the name heuristic must write an \"mtp\" row, since the scorer reads the ROW's verdict and not the frozen column", delta, mtpBonusPoints)
+		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- the name heuristic must write an \"mtp\" row, since the ROW's verdict is the only thing the scorer reads", delta, mtpBonusPoints)
 	}
 
 	// The heuristic's row is a GUESS at probe rank, so a real detector can
@@ -2350,10 +2350,10 @@ func TestSyncApplicationModelsAddsFreshMappings(t *testing.T) {
 // reconcileApplicationModels, i.e. the manual "Sync models" button and the
 // background model_sync probe loop -- the automatic path most mappings
 // arrive through (see that function's own "FOURTH mapping write path"
-// comment). It used to set the frozen ModelMapping.IsMTP column from the
-// heuristic and stop there, so a mapping discovered here silently lost the
-// scorer's +30 MTP bonus, which reads the JOINED "mtp" row
-// (routing.MTPFromVerdict), not the column.
+// comment). It used to set the since-dropped ModelMapping.IsMTP column from
+// the heuristic and stop there, so a mapping discovered here silently lost
+// the scorer's +30 MTP bonus, which reads the JOINED "mtp" row
+// (routing.MTPFromVerdict).
 //
 // Asserted THROUGH THE SCORER (Resolver.ScoreModelServers), not by reading
 // the row back first: the row is the mechanism, the bonus is the
@@ -2394,7 +2394,7 @@ func TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus(t *testing.T)
 
 	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
 	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
-		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- model discovery must write an \"mtp\" row for a name-heuristic match, since the scorer reads the ROW's verdict and not the frozen column", delta, mtpBonusPoints)
+		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- model discovery must write an \"mtp\" row for a name-heuristic match, since the ROW's verdict is the only thing the scorer reads", delta, mtpBonusPoints)
 	}
 
 	// The row landed at the same rank CreateMapping uses for the identical

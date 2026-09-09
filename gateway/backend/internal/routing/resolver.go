@@ -293,9 +293,10 @@ type resolverStore interface {
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
 	// MappingCapabilities is read by resolveAffinity ONLY, to fill the synthetic
 	// MappingCandidate it builds for a sticky-pin hit -- that path's mapping comes
-	// from MappingsByApplication, which never joins model_mapping_capabilities, so
-	// without this the affinity path would keep reading ModelMapping's frozen
-	// pre-migration-78 column for the life of the pin (up to AffinityTTLSeconds).
+	// from MappingsByApplication, which never joins model_mapping_capabilities.
+	// Before this read existed the affinity path served ModelMapping's
+	// (unwritten, pre-migration-78) column for the life of the pin -- up to
+	// AffinityTTLSeconds.
 	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
 }
 
@@ -1123,15 +1124,15 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
 		// LiveProgressSupport reads the candidate's capability verdict
-		// (MappingCandidate.LiveProgressSupport), NOT mapping.LiveProgressSupport
-		// -- that column is frozen since #49-3 moved every writer onto a
-		// "live_progress" capability row, so reading it would act on a stale
-		// answer. Both callers supply a FRESH verdict, by different routes:
+		// (MappingCandidate.LiveProgressSupport). #49-3 moved every writer
+		// onto a "live_progress" capability row and migration 79 then dropped
+		// the column, so the mapping carries no verdict of its own to read by
+		// mistake. Both callers supply a FRESH verdict, by different routes:
 		// the candidate query joins the row, and resolveAffinity -- whose
 		// mapping comes from MappingsByApplication, which cannot carry a
 		// verdict -- does its own keyed MappingCapabilities read. That read
-		// exists precisely because forwarding the frozen column was the bug;
-		// this is deliberately NOT a pass-through of prior behaviour.
+		// exists precisely because forwarding the unwritten column was the
+		// bug; this is deliberately NOT a pass-through of prior behaviour.
 		LiveProgressSupport:  c.LiveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}, nil

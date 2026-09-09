@@ -62,6 +62,19 @@ type benchmarkTarget struct {
 	// back to the app token unchanged. Callers populate it at construction
 	// (benchmarkSpecFor); benchmarkTarget itself never loads it.
 	spec routing.RuntimeSpec
+	// liveProgressSupport is the mapping's live-progress capability verdict --
+	// "" (never determined) | "supported" | "unsupported" -- resolved from its
+	// model_mapping_capabilities row at construction
+	// (benchmarkLiveProgressSupport), the same way spec is. It is what
+	// benchmarkTargetReq puts on Target.LiveProgressSupport for
+	// provider.wantsLiveProgress to decide on.
+	//
+	// It is a FIELD here rather than a read inside benchmarkTargetReq because
+	// that builder is pure and is called repeatedly per run (a capacity run
+	// is 4 levels x 16 concurrent = 64 streams): resolving the verdict once
+	// per target keeps the store read out of the per-stream path, and keeps
+	// the builder table-testable with no store at all.
+	liveProgressSupport string
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -152,6 +165,72 @@ func (s *Server) benchmarkSpecFor(ctx context.Context, app routing.Application, 
 	return spec
 }
 
+// benchmarkLiveProgressSupport resolves a mapping's live-progress verdict
+// from its model_mapping_capabilities row, in the vocabulary
+// Target.LiveProgressSupport speaks ("" | "supported" | "unsupported").
+//
+// It exists because the benchmark path has no MappingCandidate: the four
+// endpoint handlers and the scheduler start from a plain
+// routing.ModelMapping (an authorized benchmark view, or
+// MappingsByApplication), and neither of those joins the capability table
+// the way ActiveMappingsForModel does. So this is a dedicated KEYED read,
+// mirroring routing.Resolver.resolveAffinity's for exactly the same reason
+// -- and it translates through the same routing.LiveProgressSupportFromVerdict
+// both store drivers use, so the benchmark path cannot drift into its own
+// reading of a "no" row.
+//
+// The verdict MATTERS MORE here than on a live request, which is why the
+// column it replaced could not simply be dropped: RouteID is deliberately ""
+// on this path and an empty RouteID is never memoized, so a mapping already
+// detected as "unsupported" would otherwise pay a 400 plus a retry on every
+// single stream of every run, forever, with the rejection memo unable to
+// suppress a single one. (benchmarkTargetReq's own comment carries the rest
+// of that argument.)
+//
+// The cost is one keyed read per TARGET -- not per stream: the result is
+// cached on benchmarkTarget.liveProgressSupport at construction, so a
+// capacity run's 64 streams share the one read. Best-effort, like
+// benchmarkSpecFor above: a read failure degrades to "" (never determined),
+// the same value an absent row produces, rather than failing a run over a
+// parameter hint. A nil s.Routes returns "" without dereferencing it, so a
+// Server built without a store still builds targets.
+func (s *Server) benchmarkLiveProgressSupport(ctx context.Context, mappingID string) string {
+	if s.Routes == nil {
+		return ""
+	}
+	rows, err := s.Routes.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		return ""
+	}
+	row, ok := routing.CapabilityRowsByName(rows)[routing.CapabilityLiveProgress]
+	if !ok {
+		return ""
+	}
+	return routing.LiveProgressSupportFromVerdict(row.Verdict)
+}
+
+// benchmarkTargetFor builds a benchmarkTarget with BOTH of its
+// store-resolved fields filled in: the resolved RuntimeSpec
+// (benchmarkSpecFor) and the mapping's live-progress capability verdict
+// (benchmarkLiveProgressSupport).
+//
+// Every construction site that starts from a plain routing.ModelMapping goes
+// through it -- the four benchmark/probe/load/vram endpoint handlers and the
+// scheduler -- so neither field can be filled at four sites and forgotten at
+// the fifth. (The model warmer is the one exception: it already holds a
+// routing.MappingCandidate, whose LiveProgressSupport came from
+// ActiveMappingsForModel's join, so it fills the field from that instead of
+// paying a second read for the same row.)
+func (s *Server) benchmarkTargetFor(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) benchmarkTarget {
+	return benchmarkTarget{
+		server:              server,
+		app:                 app,
+		mapping:             mapping,
+		spec:                s.benchmarkSpecFor(ctx, app, mapping.ID),
+		liveProgressSupport: s.benchmarkLiveProgressSupport(ctx, mapping.ID),
+	}
+}
+
 // benchmarkTargetReq builds the routing.Target + a base inference.Request (from the first
 // benchmark prompt) a benchmark issues for a mapping. Shared by the speed (measureMapping)
 // and capacity (measureMappingCapacity) paths so both hit an identical target/request.
@@ -194,7 +273,13 @@ func benchmarkTargetReq(tgt benchmarkTarget) (routing.Target, inference.Request)
 		// floor when that reports no rate. These parameters only ADD
 		// mid-stream chunks, which streamOnce ignores entirely (they reach
 		// StreamProgress on delta events, not Usage).
-		LiveProgressSupport:  tgt.mapping.LiveProgressSupport,
+		//
+		// The verdict comes from tgt.liveProgressSupport -- the mapping's
+		// model_mapping_capabilities row, resolved once per target at
+		// construction (benchmarkLiveProgressSupport). This builder stays
+		// pure: it never reads the store, which is what lets it be called
+		// per stream.
+		LiveProgressSupport:  tgt.liveProgressSupport,
 		LiveProgressSpecType: liveProgressSpecType,
 	}
 	p := benchmarkPrompts[0]

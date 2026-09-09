@@ -229,46 +229,27 @@ func seedMappingLiveProgress(t *testing.T, routeStore *routing.MemoryStore, mapp
 	}
 }
 
-// seedMappingLiveProgressColumn writes the FROZEN
-// ModelMapping.LiveProgressSupport/LiveProgressCheckedAt columns and nothing
-// else -- migration 78's snapshot, with no capability row behind it. Only the
-// "the DTO must NOT read this any more" case uses it.
-func seedMappingLiveProgressColumn(t *testing.T, routeStore *routing.MemoryStore, mappingID, support string, at time.Time) {
-	t.Helper()
-	mapping, err := routeStore.MappingByID(context.Background(), mappingID)
-	if err != nil {
-		t.Fatalf("MappingByID(%s): %v", mappingID, err)
-	}
-	mapping.LiveProgressSupport = support
-	mapping.LiveProgressCheckedAt = &at
-	if err := routeStore.UpdateMapping(context.Background(), mapping); err != nil {
-		t.Fatalf("UpdateMapping(%s): %v", mappingID, err)
-	}
-}
-
 // TestModelServersLiveProgressSupportPersisted: LiveProgressSupport/
 // LiveProgressCheckedAt are read from the mapping's "live_progress"
 // CAPABILITY ROW (out of the same single batch the Capabilities array already
-// costs), NOT from the frozen ModelMapping.LiveProgressSupport column -- and
-// NOT left zero/empty for a gateway-layer injection pass the way
-// State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe are. One row per
-// verdict, including the "never determined" default (no write at all), so a
-// dropped fill in ModelServers (leaving the DTO field at its Go zero value)
+// costs) -- and NOT left zero/empty for a gateway-layer injection pass the
+// way State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe are. One row
+// per verdict, including the "never determined" default (no write at all), so
+// a dropped fill in ModelServers (leaving the DTO field at its Go zero value)
 // cannot coincidentally satisfy this: the seeded "" row must ALSO carry a nil
 // CheckedAt, which only holds if the fill genuinely reads the store.
 //
-// The "frozen" row is the reason this test moved onto rows at all: #49-3
-// retired every writer of that column, so a DTO still reading it would pin
-// this portal column to migration 78's snapshot -- an em-dash forever for
-// every mapping created afterwards. That row has the column set and NO row,
-// and must report "" / nil.
+// A "frozen column" row used to sit here too -- a mapping with
+// ModelMapping.LiveProgressSupport set and no capability row, proving the DTO
+// ignored the column #49-3 had retired every writer of. Migration 79 dropped
+// that column and its struct field with it, so the case is no longer
+// expressible: the TYPE now guarantees what that row asserted.
 func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newModelServersTestService(t, now, fakeLoadedModels{})
 	seedOffering(t, routeStore, now, "srv-supported", "app-supported", "map-supported", "shared", "up-supported", 0)
 	seedOffering(t, routeStore, now, "srv-unsupported", "app-unsupported", "map-unsupported", "shared", "up-unsupported", 0)
 	seedOffering(t, routeStore, now, "srv-unknown", "app-unknown", "map-unknown", "shared", "up-unknown", 0)
-	seedOffering(t, routeStore, now, "srv-frozen", "app-frozen", "map-frozen", "shared", "up-frozen", 0)
 	seedOffering(t, routeStore, now, "srv-timeless", "app-timeless", "map-timeless", "shared", "up-timeless", 0)
 
 	// Seeded as capability ROWS, which is where #49-3's detectors write now.
@@ -277,9 +258,6 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	seedMappingLiveProgress(t, routeStore, "map-unsupported", "unsupported", checkedAt)
 	// map-unknown is not seeded at all: "never determined" is the absence of
 	// a row, not a write with an empty verdict.
-	// map-frozen carries migration 78's COLUMN value and no row -- the DTO
-	// must ignore it entirely (that column has no writer any more).
-	seedMappingLiveProgressColumn(t, routeStore, "map-frozen", "supported", checkedAt)
 	// map-timeless has a real verdict but no timestamp: the DTO must report
 	// the verdict and a NIL checked-at, never Go's zero time.Time (which the
 	// portal would render as a year-0001 "determined at").
@@ -294,8 +272,8 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ModelServers: %v", err)
 	}
-	if len(rows) != 5 {
-		t.Fatalf("len(rows) = %d, want 5 (%+v)", len(rows), rows)
+	if len(rows) != 4 {
+		t.Fatalf("len(rows) = %d, want 4 (%+v)", len(rows), rows)
 	}
 	byServer := map[string]ModelServerDTO{}
 	for _, r := range rows {
@@ -324,11 +302,6 @@ func TestModelServersLiveProgressSupportPersisted(t *testing.T) {
 	}
 	if unknown.LiveProgressCheckedAt != nil {
 		t.Fatalf("never-determined row LiveProgressCheckedAt = %v, want nil", unknown.LiveProgressCheckedAt)
-	}
-
-	frozen := byServer["srv-frozen"]
-	if frozen.LiveProgressSupport != "" || frozen.LiveProgressCheckedAt != nil {
-		t.Fatalf("frozen-column row LiveProgressSupport/CheckedAt = (%q, %v), want (\"\", nil) -- the DTO must read the live_progress ROW, never ModelMapping.LiveProgressSupport (no writer since #49-3)", frozen.LiveProgressSupport, frozen.LiveProgressCheckedAt)
 	}
 
 	timeless := byServer["srv-timeless"]
@@ -443,9 +416,10 @@ func TestModelServersCapabilityReadFailureDegradesAndLogs(t *testing.T) {
 
 // TestModelServersCapabilitiesFromRows: ModelServerDTO.Capabilities/IsMtp/
 // VisionCapable are read from the model_mapping_capabilities ROWS batch
-// (routing.MappingCapabilitiesForMappings), not from ModelMapping's frozen
-// cap_vision/cap_video/cap_audio/cap_tools/is_mtp/vision_capable columns --
-// NOT left zero/empty for a gateway-layer injection pass, exactly like
+// (routing.MappingCapabilitiesForMappings) -- the successors to the
+// cap_vision/cap_video/cap_audio/cap_tools/is_mtp/vision_capable columns
+// migration 79 dropped -- and NOT left zero/empty for a gateway-layer
+// injection pass, exactly like
 // LiveProgressSupport. One mapping carries a full row set (four known
 // capabilities plus an open-vocabulary "thinking" entry the codebase has no
 // constant for); a sibling mapping carries NO rows at all, so a dropped fill
@@ -510,7 +484,7 @@ func TestModelServersCapabilitiesFromRows(t *testing.T) {
 		t.Fatalf("thinking entry = %+v, want yes", v)
 	}
 	// IsMtp/VisionCapable fold from the SAME rows batch (mtp="yes" -> true;
-	// vision="yes" -> true), not from the frozen ModelMapping columns.
+	// vision="yes" -> true).
 	if !determined.IsMtp {
 		t.Fatalf("determined.IsMtp = false, want true (mtp row is yes)")
 	}

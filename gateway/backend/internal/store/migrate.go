@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -110,11 +111,27 @@ var migrations = []migration{
 	{version: 76, name: "model_mappings_live_progress_support", up: migration76Up},
 	{version: 77, name: "model_mappings_capabilities", up: migration77Up},
 	{version: 78, name: "model_mapping_capabilities_table", up: migration78Up},
+	{version: 79, name: "model_mappings_drop_capability_columns", up: migration79Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
 // transaction each, every migration whose version has not been recorded yet.
 func (s *SQLStore) Migrate(ctx context.Context) error {
+	return s.migrateTo(ctx, math.MaxInt)
+}
+
+// migrateTo is Migrate bounded above: it applies every not-yet-recorded
+// migration whose version is <= maxVersion. Migrate passes math.MaxInt, so
+// the production path is "apply everything" and there is exactly one
+// implementation of the runner.
+//
+// The bound exists so a test can build a database at a HISTORICAL schema
+// version and then exercise a migration against it for real, instead of
+// reconstructing the old shape by hand on top of the current one. Migration
+// 79 made that necessary: it drops the columns migration 78 backfills from,
+// so migration 78's tests can only seed those columns on a database stopped
+// before 79 (see forEachDialectMigratedTo).
+func (s *SQLStore) migrateTo(ctx context.Context, maxVersion int) error {
 	if _, err := s.exec(ctx, `create table if not exists schema_migrations (
 		version integer primary key,
 		name text not null,
@@ -144,6 +161,9 @@ func (s *SQLStore) Migrate(ctx context.Context) error {
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].version < ordered[j].version })
 
 	for _, m := range ordered {
+		if m.version > maxVersion {
+			break // ordered ascending, so nothing further qualifies either
+		}
 		if applied[m.version] {
 			continue
 		}
@@ -209,6 +229,45 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 	}
 	if _, err := tx.ExecContext(ctx, stmt); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// dropColumnIfPresent runs `alter table <table> drop column <column>`
+// tolerantly of the column already being gone -- addColumnIfMissing's
+// mirror image, in the same shape and for the same reason: a migration must
+// be replayable, and both dialects reach the identical end state by
+// different syntax. Postgres has the clause (`drop column if exists`);
+// sqlite has none, so the statement runs as-is and the "no such column"
+// error it returns for an absent column is swallowed.
+//
+// column is a BARE identifier, never a list: one call per column, so a
+// failure names the column it was on. It is deliberately scoped by
+// (table, column) rather than by column name alone -- migration79Up drops
+// model_mappings.vision_capable while model_mapping_benchmarks.vision_capable,
+// a benchmark run's recorded history, must survive.
+//
+// The two things that make this safe on sqlite, which rebuilds the table
+// under the covers: sqlite REFUSES to drop a column that an index, view,
+// trigger, generated column or PRIMARY KEY/UNIQUE constraint mentions
+// (returning an error rather than silently reshaping the schema), and it
+// does not support dropping the last remaining column. A caller must
+// therefore check its columns against the table's indexes before using
+// this; migration79Up's are checked against the one index on model_mappings
+// (idx_model_mappings_application on application_id).
+//
+// migration79Up is the first and only caller. See
+// TestDropColumnIfPresentSQLite for coverage of both the present and the
+// already-absent case.
+func dropColumnIfPresent(ctx context.Context, tx *sql.Tx, dl dialect, table, column string) error {
+	if dl.name() == "postgres" {
+		return execTx(ctx, tx, dl, "alter table "+table+" drop column if exists "+column)
+	}
+	if _, err := tx.ExecContext(ctx, "alter table "+table+" drop column "+column); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such column") {
 			return nil
 		}
 		return err
@@ -3535,4 +3594,57 @@ func migration78ReadCapExtra(ctx context.Context, tx *sql.Tx, dl dialect) ([]cap
 		return nil, fmt.Errorf("iterate cap_extra: %w", err)
 	}
 	return out, nil
+}
+
+// migration79Up drops the eleven model_mappings columns
+// model_mapping_capabilities superseded, now that nothing reads or writes
+// any of them: migration 77's cap_vision/cap_video/cap_audio/cap_tools/
+// cap_extra/capabilities_source/capabilities_checked_at, migration 32's
+// vision_capable, the baseline's is_mtp, and migration 76's
+// live_progress_support/live_progress_checked_at.
+//
+// THE ORDER RELATIVE TO 78 IS LOAD-BEARING. Migration 78 READS these columns
+// to backfill the table from them; this migration removes them. A fresh
+// install replays both in this order against an empty table and an upgraded
+// database replays them against real rows, and both must end on the same
+// schema with the backfilled rows intact -- pinned by
+// TestMigration79FreshInstallMatchesUpgradedSchema. Nothing may ever be
+// inserted between the two.
+//
+// It also DEPARTS from this repository's practice of leaving a superseded
+// column inert (the native_responses/native_messages booleans migration 72
+// replaced are still there). ADR-039 records why the case differs rather
+// than establishing a precedent: these eleven shipped days earlier and had
+// no reader outside the feature being rewritten, where those booleans were
+// long-established with consumers beyond their own. A column with outside
+// readers still stays.
+//
+// model_mapping_benchmarks.vision_capable (migration 33) is NOT touched: it
+// is a benchmark run's recorded result, one row per measurement, not a
+// mapping's current verdict -- which is why dropColumnIfPresent is scoped by
+// (table, column) and this loop names its table explicitly.
+//
+// Safe on sqlite, which rebuilds the table to drop a column and refuses to
+// drop an INDEXED one: the only index on model_mappings is
+// idx_model_mappings_application on (application_id), and none of the eleven
+// appears in it or in any view, trigger or constraint.
+func migration79Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, column := range []string{
+		"cap_vision",
+		"cap_video",
+		"cap_audio",
+		"cap_tools",
+		"cap_extra",
+		"capabilities_source",
+		"capabilities_checked_at",
+		"vision_capable",
+		"is_mtp",
+		"live_progress_support",
+		"live_progress_checked_at",
+	} {
+		if err := dropColumnIfPresent(ctx, tx, dl, "model_mappings", column); err != nil {
+			return fmt.Errorf("drop model_mappings.%s: %w", column, err)
+		}
+	}
+	return nil
 }

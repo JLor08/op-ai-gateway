@@ -109,7 +109,17 @@ func (w *modelWarmer) warmOnce(name string) {
 		return // nothing to warm (not a real model, or no active mapping)
 	}
 	cand := w.pickCandidate(cands)
-	bt := benchmarkTarget{server: cand.Server, app: cand.Application, mapping: cand.Mapping}
+	// The one benchmarkTarget built WITHOUT Server.benchmarkTargetFor: the
+	// candidate already carries the mapping's live-progress verdict, joined
+	// out of model_mapping_capabilities by ActiveMappingsForModel above, so
+	// taking it from there rather than re-reading the same row is one store
+	// call saved for the identical value.
+	bt := benchmarkTarget{
+		server:              cand.Server,
+		app:                 cand.Application,
+		mapping:             cand.Mapping,
+		liveProgressSupport: cand.LiveProgressSupport,
+	}
 	bt.spec = s.benchmarkSpecFor(ctx, cand.Application, cand.Mapping.ID)
 	target, req := benchmarkTargetReq(bt)
 	if target.Timeout <= 0 {

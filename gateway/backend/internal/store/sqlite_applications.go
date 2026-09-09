@@ -187,13 +187,10 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		insert into model_mappings (
 			id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		mapping.ID,
 		mapping.ApplicationID,
 		mapping.GatewayModelName,
@@ -203,8 +200,6 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.PromptTokensPerSecond,
 		mapping.LoadTimeMS,
 		mapping.ContextSize,
-		mapping.IsMTP,
-		mapping.VisionCapable,
 		mapping.EnergyWhPerToken,
 		mapping.MetricsLocked,
 		mapping.MetricsUpdatedAt,
@@ -212,15 +207,6 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
-		mapping.LiveProgressSupport,
-		mapping.LiveProgressCheckedAt,
-		mapping.CapVision,
-		mapping.CapVideo,
-		mapping.CapAudio,
-		mapping.CapTools,
-		mapping.CapExtra,
-		mapping.CapabilitiesSource,
-		mapping.CapabilitiesCheckedAt,
 		mapping.CreatedAt,
 		mapping.UpdatedAt,
 	)
@@ -241,12 +227,9 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		update model_mappings
 		set application_id = ?, gateway_model_name = ?, app_model_name = ?,
 			status = ?, gen_tokens_per_second = ?, prompt_tokens_per_second = ?,
-			load_time_ms = ?, context_size = ?, is_mtp = ?, vision_capable = ?, energy_wh_per_token = ?, metrics_locked = ?,
+			load_time_ms = ?, context_size = ?, energy_wh_per_token = ?, metrics_locked = ?,
 			metrics_updated_at = ?, metrics_source = ?,
 			max_concurrency = ?, recommended_concurrency = ?, gen_tokens_per_second_at_capacity = ?,
-			live_progress_support = ?, live_progress_checked_at = ?,
-			cap_vision = ?, cap_video = ?, cap_audio = ?, cap_tools = ?, cap_extra = ?,
-			capabilities_source = ?, capabilities_checked_at = ?,
 			updated_at = ?
 		where id = ?`,
 		mapping.ApplicationID,
@@ -257,8 +240,6 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.PromptTokensPerSecond,
 		mapping.LoadTimeMS,
 		mapping.ContextSize,
-		mapping.IsMTP,
-		mapping.VisionCapable,
 		mapping.EnergyWhPerToken,
 		mapping.MetricsLocked,
 		mapping.MetricsUpdatedAt,
@@ -266,15 +247,6 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
-		mapping.LiveProgressSupport,
-		mapping.LiveProgressCheckedAt,
-		mapping.CapVision,
-		mapping.CapVideo,
-		mapping.CapAudio,
-		mapping.CapTools,
-		mapping.CapExtra,
-		mapping.CapabilitiesSource,
-		mapping.CapabilitiesCheckedAt,
 		mapping.UpdatedAt,
 		mapping.ID,
 	)
@@ -430,11 +402,8 @@ func (s *SQLiteStore) MappingByID(ctx context.Context, id string) (routing.Model
 	row := s.queryRow(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where id = ?`, id)
@@ -445,11 +414,8 @@ func (s *SQLiteStore) MappingsByApplication(ctx context.Context, applicationID s
 	rows, err := s.query(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
-			is_mtp, vision_capable, energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
+			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
-			live_progress_support, live_progress_checked_at,
-			cap_vision, cap_video, cap_audio, cap_tools, cap_extra,
-			capabilities_source, capabilities_checked_at,
 			created_at, updated_at
 		from model_mappings
 		where application_id = ?
@@ -465,11 +431,8 @@ func (s *SQLiteStore) MappingsByServer(ctx context.Context, serverID string) ([]
 	rows, err := s.query(ctx, `
 		select m.id, m.application_id, m.gateway_model_name, m.app_model_name, m.status,
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
-			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
+			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
-			m.live_progress_support, m.live_progress_checked_at,
-			m.cap_vision, m.cap_video, m.cap_audio, m.cap_tools, m.cap_extra,
-			m.capabilities_source, m.capabilities_checked_at,
 			m.created_at, m.updated_at
 		from model_mappings m
 		join applications a on a.id = m.application_id
@@ -498,11 +461,8 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			a.created_at, a.updated_at,
 			m.id, m.application_id, m.gateway_model_name, m.app_model_name, m.status,
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
-			m.is_mtp, m.vision_capable, m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
+			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
-			m.live_progress_support, m.live_progress_checked_at,
-			m.cap_vision, m.cap_video, m.cap_audio, m.cap_tools, m.cap_extra,
-			m.capabilities_source, m.capabilities_checked_at,
 			m.created_at, m.updated_at,
 			mtp.verdict, lp.verdict
 		from model_mappings m
@@ -557,12 +517,8 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		benchScheduleEnabled int64
 		oppMetricsEnabled    int64
 		proxyExcluded        int64
-		mapIsMTP             int64
-		mapVisionCapable     int64
 		mapLocked            int64
 		mapUpdatedNil        sql.NullTime
-		mapLiveProgressAtNil sql.NullTime
-		mapCapabilitiesAtNil sql.NullTime
 		// mtpVerdict/liveProgressVerdict are the two joined
 		// model_mapping_capabilities.verdict columns (nullable: a LEFT JOIN row
 		// with no match scans as NULL, i.e. Valid == false, String == "" -- the
@@ -590,11 +546,8 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.ID, &c.Mapping.ApplicationID, &c.Mapping.GatewayModelName, &c.Mapping.AppModelName,
 		&c.Mapping.Status,
 		&c.Mapping.GenTokensPerSecond, &c.Mapping.PromptTokensPerSecond, &c.Mapping.LoadTimeMS, &c.Mapping.ContextSize,
-		&mapIsMTP, &mapVisionCapable, &c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
+		&c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
 		&c.Mapping.MaxConcurrency, &c.Mapping.RecommendedConcurrency, &c.Mapping.GenTokensPerSecondAtCapacity,
-		&c.Mapping.LiveProgressSupport, &mapLiveProgressAtNil,
-		&c.Mapping.CapVision, &c.Mapping.CapVideo, &c.Mapping.CapAudio, &c.Mapping.CapTools, &c.Mapping.CapExtra,
-		&c.Mapping.CapabilitiesSource, &mapCapabilitiesAtNil,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
 		&mtpVerdict, &liveProgressVerdict,
 	)
@@ -605,28 +558,18 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	c.Application.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	c.Application.ProxyExcluded = proxyExcluded != 0
-	c.Mapping.IsMTP = mapIsMTP != 0
-	c.Mapping.VisionCapable = mapVisionCapable != 0
 	c.Mapping.MetricsLocked = mapLocked != 0
 	// The boundary conversion: c.IsMTP/c.LiveProgressSupport come from the
 	// JOINED capability rows, via the same routing.MTPFromVerdict /
-	// routing.LiveProgressSupportFromVerdict MemoryStore's mirror also calls --
-	// NOT from c.Mapping.IsMTP/c.Mapping.LiveProgressSupport just set above,
-	// which stay the frozen pre-migration-78 columns (see MappingCandidate's
-	// own doc for why the two are kept apart).
+	// routing.LiveProgressSupportFromVerdict MemoryStore's mirror also calls.
+	// They live on the CANDIDATE, not on c.Mapping: routing.ModelMapping
+	// carries no capability field at all any more (migration 79 dropped the
+	// columns they were) -- see MappingCandidate's own doc.
 	c.IsMTP = routing.MTPFromVerdict(mtpVerdict.String)
 	c.LiveProgressSupport = routing.LiveProgressSupportFromVerdict(liveProgressVerdict.String)
 	if mapUpdatedNil.Valid {
 		t := mapUpdatedNil.Time
 		c.Mapping.MetricsUpdatedAt = &t
-	}
-	if mapLiveProgressAtNil.Valid {
-		t := mapLiveProgressAtNil.Time
-		c.Mapping.LiveProgressCheckedAt = &t
-	}
-	if mapCapabilitiesAtNil.Valid {
-		t := mapCapabilitiesAtNil.Time
-		c.Mapping.CapabilitiesCheckedAt = &t
 	}
 	if lastSeen.Valid {
 		t := lastSeen.Time
@@ -732,10 +675,8 @@ func scanApplications(rows *sql.Rows) ([]routing.Application, error) {
 
 func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	var mapping routing.ModelMapping
-	var isMTP, visionCapable, locked int64
+	var locked int64
 	var updatedNil sql.NullTime
-	var liveProgressAtNil sql.NullTime
-	var capabilitiesAtNil sql.NullTime
 	err := row.Scan(
 		&mapping.ID,
 		&mapping.ApplicationID,
@@ -746,8 +687,6 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.PromptTokensPerSecond,
 		&mapping.LoadTimeMS,
 		&mapping.ContextSize,
-		&isMTP,
-		&visionCapable,
 		&mapping.EnergyWhPerToken,
 		&locked,
 		&updatedNil,
@@ -755,15 +694,6 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.MaxConcurrency,
 		&mapping.RecommendedConcurrency,
 		&mapping.GenTokensPerSecondAtCapacity,
-		&mapping.LiveProgressSupport,
-		&liveProgressAtNil,
-		&mapping.CapVision,
-		&mapping.CapVideo,
-		&mapping.CapAudio,
-		&mapping.CapTools,
-		&mapping.CapExtra,
-		&mapping.CapabilitiesSource,
-		&capabilitiesAtNil,
 		&mapping.CreatedAt,
 		&mapping.UpdatedAt,
 	)
@@ -773,20 +703,10 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	if err != nil {
 		return routing.ModelMapping{}, fmt.Errorf("scan mapping: %w", err)
 	}
-	mapping.IsMTP = isMTP != 0
-	mapping.VisionCapable = visionCapable != 0
 	mapping.MetricsLocked = locked != 0
 	if updatedNil.Valid {
 		t := updatedNil.Time
 		mapping.MetricsUpdatedAt = &t
-	}
-	if liveProgressAtNil.Valid {
-		t := liveProgressAtNil.Time
-		mapping.LiveProgressCheckedAt = &t
-	}
-	if capabilitiesAtNil.Valid {
-		t := capabilitiesAtNil.Time
-		mapping.CapabilitiesCheckedAt = &t
 	}
 	return mapping, nil
 }

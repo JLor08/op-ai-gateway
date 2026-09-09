@@ -125,24 +125,23 @@ func TestCandidacyDoesNotModeGateServerAgent(t *testing.T) {
 
 // TestTargetCarriesLiveProgressVerdictFromCapabilityRow pins that targetFrom
 // copies the JOINED "live_progress" capability row's verdict onto
-// Target.LiveProgressSupport for an ORDINARY (non-server_agent) application --
-// NOT the mapping's own persisted (frozen, pre-migration-78)
-// ModelMapping.LiveProgressSupport column, which this test's setup leaves at
-// its zero value specifically to prove the read no longer depends on it. It
-// also pins that LiveProgressSpecType stays empty there — set only for
-// server_agent (provider/wantsLiveProgress's server_agent clause must never
-// be accidentally satisfied by another type).
+// Target.LiveProgressSupport for an ORDINARY (non-server_agent) application.
+// It used to contrast that against the mapping's own pre-migration-78
+// live_progress_support column, which the setup left at its zero value on
+// purpose; migration 79 dropped that column, so the row is now the only
+// place the verdict can have come from. It also pins that
+// LiveProgressSpecType stays empty here — set only for server_agent
+// (provider/wantsLiveProgress's server_agent clause must never be
+// accidentally satisfied by another type).
 func TestTargetCarriesLiveProgressVerdictFromCapabilityRow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	store := seededResolverStore(t, now) // app_fast/map_fast: Type=mock
-	// Seed the persisted verdict as a "live_progress" capability row (Task 4):
-	// the request path now joins model_mapping_capabilities via
-	// ActiveMappingsForModel, so this is what a real probe writes since #49-3
-	// moved every writer off the old live_progress_support column onto a row
-	// here. The mapping's OWN LiveProgressSupport column is deliberately left
-	// at its zero value ("") to prove targetFrom is no longer reading it for a
-	// candidate that came through ActiveMappingsForModel.
+	// Seed the persisted verdict as a "live_progress" capability row: the
+	// request path joins model_mapping_capabilities via
+	// ActiveMappingsForModel, and this is what a real probe writes since
+	// #49-3 moved every writer off the old live_progress_support column onto
+	// a row here.
 	must(t, store.UpsertMappingCapabilities(ctx, "map_fast", []CapabilityRow{
 		{Capability: CapabilityLiveProgress, Verdict: CapabilityYes, Source: CapabilitySourceLlamaCppProps, CheckedAt: now},
 	}))

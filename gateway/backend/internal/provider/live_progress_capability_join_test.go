@@ -12,8 +12,8 @@ import (
 // three-layer rule is unaffected by WHERE Target.LiveProgressSupport's value
 // now comes from on the request path: MappingCandidate.LiveProgressSupport,
 // filled from the joined "live_progress" capability row via
-// routing.LiveProgressSupportFromVerdict, rather than the frozen
-// pre-migration-78 ModelMapping.LiveProgressSupport column
+// routing.LiveProgressSupportFromVerdict, rather than the
+// pre-migration-78 live_progress_support column migration 79 dropped
 // (TestWantsLiveProgressThreeLayerRule already pins the rule itself against
 // the "" / "supported" / "unsupported" vocabulary directly).
 //

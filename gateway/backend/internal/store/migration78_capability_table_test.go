@@ -11,11 +11,14 @@ import (
 	"time"
 )
 
-// reinvokeMigration78 re-runs migration78Up in its own tx after the pre-78
-// column values have been forced in by hand, mirroring reinvokeMigration72.
-// The migration is idempotent (create table if not exists + on conflict do
-// nothing), so re-running it over an already-migrated database is safe — and
-// TestMigration78Idempotent below relies on exactly that.
+// reinvokeMigration78 runs migration78Up in its own tx. Its callers below
+// hold a database stopped at version 77 (forEachDialectMigratedTo), so this
+// is normally the migration's FIRST run, against a genuine pre-78 schema
+// whose legacy columns they have just seeded — mirroring
+// reinvokeMigration72's shape. The migration is also idempotent (create
+// table if not exists + on conflict do nothing), so calling it a second time
+// over its own output is safe, which is exactly what
+// TestMigration78Idempotent below does.
 func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 	t.Helper()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -33,6 +36,12 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 
 // seedMigration78Mappings creates one server, one application and one mapping
 // per id, so each id can then be forced into its own pre-78 column shape.
+//
+// It goes through the PUBLIC store API, which no longer writes the eleven
+// columns migration 79 dropped -- they are `not null default` at version 77,
+// so an insert that omits them still lands. Forcing a legacy value is then
+// the caller's own raw `update` (mustExec), which needs a database stopped
+// before 79: see forEachDialectMigratedTo.
 func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now time.Time, ids ...string) {
 	t.Helper()
 	if err := s.CreateAIServer(ctx, routing.AIServer{
@@ -78,23 +87,23 @@ func capabilityRowMap(ctx context.Context, t *testing.T, s *SQLStore, mappingID 
 	return out
 }
 
-// clearCapabilityRows removes every backfilled row so a re-run of
-// migration78Up has to reproduce them from the columns alone. Migrate() has
-// already applied migration 78 by the time a test body runs, so without this
-// the `on conflict do nothing` backfill would have nothing left to prove.
-func clearCapabilityRows(ctx context.Context, t *testing.T, s *SQLStore) {
-	t.Helper()
-	mustExec(ctx, t, s, `delete from model_mapping_capabilities`)
-}
-
 // TestMigration78BackfillFromLegacyColumns asserts every row of the design's
 // backfill table, INCLUDING the two cases that must produce no row at all:
 // a vision_capable of 0 whose metrics_source proves no measurement happened,
 // and an is_mtp of 0 (a name heuristic's false, not a measured no). Absence
 // of a row IS unknown, so writing either of those as "no" would enter a guess
-// into the record as a measurement.
+// into the record as a measurement. Those two rules have no other coverage
+// anywhere, which is why this test had to KEEP working across migration 79.
+//
+// It runs against a database stopped at version 77 -- the last one that
+// still has the columns -- so the seeding below stays exactly the raw SQL it
+// always was, and migration 78 is exercised against the genuine historical
+// schema it was written for rather than a shape reconstructed on top of the
+// current one. That is also the only honest option: after 79 the columns are
+// gone, and a seed rewritten to avoid them would still compile while
+// silently testing nothing.
 func TestMigration78BackfillFromLegacyColumns(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+	forEachDialectMigratedTo(t, 77, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Now().UTC().Truncate(time.Second)
 		checked := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
@@ -128,7 +137,6 @@ func TestMigration78BackfillFromLegacyColumns(t *testing.T) {
 			`["thinking","reasoning"]`, checked, "m_extra")
 		mustExec(ctx, t, s, `update model_mappings set cap_extra = ? where id = ?`, `not json at all`, "m_extra_bad")
 
-		clearCapabilityRows(ctx, t, s)
 		reinvokeMigration78(ctx, t, s)
 
 		// cap_vision/cap_video/cap_tools -> one row each, source
@@ -222,44 +230,61 @@ func TestMigration78BackfillFromLegacyColumns(t *testing.T) {
 	})
 }
 
-// TestMigration78Idempotent proves re-running the whole migration ledger (and
-// migration 78 by itself) neither fails nor duplicates a backfilled row: the
-// table create is `if not exists` and every backfill insert carries `on
-// conflict do nothing`.
+// TestMigration78Idempotent proves re-running migration 78 -- and then
+// finishing the ledger over its output -- neither fails nor duplicates nor
+// rewrites a backfilled row: the table create is `if not exists` and every
+// backfill insert carries `on conflict do nothing`.
+//
+// Finishing the ledger is the second half of the assertion and it is not
+// incidental: it applies migration 79, which DROPS the columns these rows
+// were derived from. The rows must survive that untouched -- a backfill
+// whose result the very next migration erased would be worse than no
+// backfill at all.
 func TestMigration78Idempotent(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+	forEachDialectMigratedTo(t, 77, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Now().UTC().Truncate(time.Second)
 		seedMigration78Mappings(ctx, t, s, now, "m_idem")
 		mustExec(ctx, t, s, `update model_mappings set cap_vision = 'yes', is_mtp = 1,
 			live_progress_support = 'supported' where id = ?`, "m_idem")
 
-		clearCapabilityRows(ctx, t, s)
-		// Migrate() is a no-op now (78 is already recorded), so run 78 itself
-		// to produce the rows, then run BOTH again over the result.
 		reinvokeMigration78(ctx, t, s)
 		first := capabilityRowMap(ctx, t, s, "m_idem")
 		if len(first) != 3 {
 			t.Fatalf("first pass = %+v, want vision/mtp/live_progress", first)
 		}
-		if err := s.Migrate(ctx); err != nil {
-			t.Fatalf("second Migrate: %v", err)
-		}
+		// The same migration a second time, over its own output and with the
+		// columns still in place.
 		reinvokeMigration78(ctx, t, s)
-		second := capabilityRowMap(ctx, t, s, "m_idem")
-		if len(second) != len(first) {
-			t.Fatalf("re-running the migration changed the row count: %d -> %d (%+v)", len(first), len(second), second)
+		sameRows(ctx, t, s, "m_idem", first, "re-running migration 78")
+
+		// Then the rest of the ledger: 78 again (it is not recorded yet, so
+		// Migrate runs it a THIRD time) followed by 79's column drop.
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("finish the ledger: %v", err)
 		}
-		for capability, row := range first {
-			again, ok := second[capability]
-			if !ok {
-				t.Fatalf("re-run lost the %s row", capability)
-			}
-			if again.Verdict != row.Verdict || again.Source != row.Source || !again.CheckedAt.Equal(row.CheckedAt) {
-				t.Fatalf("re-run rewrote the %s row: %+v -> %+v", capability, row, again)
-			}
-		}
+		sameRows(ctx, t, s, "m_idem", first, "finishing the ledger through migration 79")
 	})
+}
+
+// sameRows fails unless mappingID's capability rows still match want exactly
+// -- same set, same verdict, same source, same timestamp. Used to assert
+// that a repeated or continued migration changed nothing.
+func sameRows(ctx context.Context, t *testing.T, s *SQLStore, mappingID string, want map[string]routing.CapabilityRow, what string) {
+	t.Helper()
+	got := capabilityRowMap(ctx, t, s, mappingID)
+	if len(got) != len(want) {
+		t.Fatalf("%s changed the row count: %d -> %d (%+v)", what, len(want), len(got), got)
+	}
+	for capability, row := range want {
+		again, ok := got[capability]
+		if !ok {
+			t.Fatalf("%s lost the %s row", what, capability)
+		}
+		if again.Verdict != row.Verdict || again.Source != row.Source || !again.CheckedAt.Equal(row.CheckedAt) {
+			t.Fatalf("%s rewrote the %s row: %+v -> %+v", what, capability, row, again)
+		}
+	}
 }
 
 // TestMigration78VisionColumnDoesNotBeatCapVision pins the backfill's ORDER,
@@ -268,7 +293,7 @@ func TestMigration78Idempotent(t *testing.T) {
 // better-provenanced verdict in place. With the order reversed, a stale
 // vision_capable would silently win.
 func TestMigration78VisionColumnDoesNotBeatCapVision(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+	forEachDialectMigratedTo(t, 77, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Now().UTC().Truncate(time.Second)
 		seedMigration78Mappings(ctx, t, s, now, "m_both")
@@ -277,7 +302,6 @@ func TestMigration78VisionColumnDoesNotBeatCapVision(t *testing.T) {
 		mustExec(ctx, t, s, `update model_mappings set cap_vision = 'no', vision_capable = 1,
 			metrics_source = 'manual' where id = ?`, "m_both")
 
-		clearCapabilityRows(ctx, t, s)
 		reinvokeMigration78(ctx, t, s)
 
 		row, ok := capabilityRowMap(ctx, t, s, "m_both")["vision"]

@@ -58,6 +58,51 @@ func forEachDialect(t *testing.T, run func(t *testing.T, s *SQLStore)) {
 	})
 }
 
+// forEachDialectMigratedTo is forEachDialect with the migration ledger
+// STOPPED at maxVersion, so a test can exercise a migration against a
+// genuine pre-migration database rather than reconstructing that shape by
+// hand on top of an already-migrated one.
+//
+// It exists for the migration-78 backfill tests: their seeding writes the
+// columns migration 79 drops, so on a fully migrated database those writes
+// would not merely fail -- an `update` naming a dropped column errors, but a
+// test rewritten to tolerate that would silently stop testing the backfill
+// at all. Stopping at 77 keeps the seeds valid SQL against the real
+// historical schema, and the test then invokes 78 itself
+// (reinvokeMigration78) and may finish the ledger with s.Migrate.
+func forEachDialectMigratedTo(t *testing.T, maxVersion int, run func(t *testing.T, s *SQLStore)) {
+	t.Run("sqlite", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "c.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if err := s.migrateTo(context.Background(), maxVersion); err != nil {
+			t.Fatal(err)
+		}
+		run(t, s)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
+		if dsn == "" {
+			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
+		}
+		ctx := context.Background()
+		s, err := OpenPostgres(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if err := dropAllTables(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.migrateTo(ctx, maxVersion); err != nil {
+			t.Fatal(err)
+		}
+		run(t, s)
+	})
+}
+
 // dropAllTables gives postgres a clean slate (sqlite subtests already get one
 // via a fresh temp file, so this is a no-op call site for sqlite — it is only
 // ever invoked from the postgres branch above).
@@ -3769,7 +3814,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 			PromptTokensPerSecond:        1300.25,
 			LoadTimeMS:                   8200,
 			ContextSize:                  131072,
-			IsMTP:                        true,
 			MetricsLocked:                false,
 			MetricsUpdatedAt:             &metricsAt,
 			MetricsSource:                "manual",
@@ -3797,9 +3841,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		}
 		if got.ContextSize != 131072 {
 			t.Fatalf("ContextSize = %v, want 131072", got.ContextSize)
-		}
-		if !got.IsMTP {
-			t.Fatalf("IsMTP = %v, want true", got.IsMTP)
 		}
 		if got.MetricsLocked {
 			t.Fatalf("MetricsLocked = %v, want false", got.MetricsLocked)
@@ -3831,9 +3872,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		if cm.ContextSize != 131072 {
 			t.Fatalf("candidate ContextSize = %v, want 131072", cm.ContextSize)
 		}
-		if !cm.IsMTP {
-			t.Fatalf("candidate IsMTP = %v, want true", cm.IsMTP)
-		}
 		if cm.MetricsLocked {
 			t.Fatalf("candidate MetricsLocked = %v, want false", cm.MetricsLocked)
 		}
@@ -3850,7 +3888,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		// UpdateMapping must persist the metric columns too: mutate a couple of
 		// distinct metrics and confirm they round-trip through the UPDATE + read.
 		mapping.ContextSize = 65536
-		mapping.IsMTP = false
 		mapping.MaxConcurrency = 32
 		mapping.RecommendedConcurrency = 24
 		mapping.GenTokensPerSecondAtCapacity = 900
@@ -3864,9 +3901,6 @@ func TestConformanceModelMappingMetricsRoundTrip(t *testing.T) {
 		}
 		if updated.ContextSize != 65536 {
 			t.Fatalf("updated ContextSize = %v, want 65536", updated.ContextSize)
-		}
-		if updated.IsMTP {
-			t.Fatalf("updated IsMTP = %v, want false", updated.IsMTP)
 		}
 		if updated.MaxConcurrency != 32 || updated.RecommendedConcurrency != 24 || updated.GenTokensPerSecondAtCapacity != 900 {
 			t.Fatalf("updated capacity metrics = %d/%d/%v, want 32/24/900", updated.MaxConcurrency, updated.RecommendedConcurrency, updated.GenTokensPerSecondAtCapacity)

@@ -654,7 +654,6 @@ func seedMapping(t *testing.T, routeStore *routing.MemoryStore, appID, name stri
 		GatewayModelName: name,
 		AppModelName:     name,
 		Status:           routing.ServerStatusActive,
-		IsMTP:            routing.IsMTPModelName(name),
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
@@ -663,7 +662,8 @@ func seedMapping(t *testing.T, routeStore *routing.MemoryStore, appID, name stri
 	}
 	// No capability rows: these fixtures are co-residency/runtime-spec
 	// subjects, and their names are not MTP-suggesting, so the two
-	// capability-derived DTO fields are false either way.
+	// capability-derived DTO fields are false either way. (A mapping has no
+	// capability FIELD to seed instead -- migration 79 dropped the columns.)
 	return mappingDTO(mapping, nil)
 }
 

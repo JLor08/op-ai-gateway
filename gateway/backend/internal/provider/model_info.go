@@ -236,11 +236,11 @@ type Capabilities struct {
 //     prompt quality, not a rejected request. The whole object is absent on
 //     servers older than 2026-01-22, which is "" -- not "no".
 //
-// A caveat that must travel with cap_video wherever it is shown: upstream's
-// modalities.video is true when the BINARY was built with video support AND
-// the model has a vision encoder (mtmd_helper_support_video returns
-// mtmd_support_vision under #ifdef MTMD_VIDEO). It is a build-plus-vision
-// fact, not "this model understands video".
+// A caveat that must travel with the "video" verdict wherever it is shown:
+// upstream's modalities.video is true when the BINARY was built with video
+// support AND the model has a vision encoder (mtmd_helper_support_video
+// returns mtmd_support_vision under #ifdef MTMD_VIDEO). It is a
+// build-plus-vision fact, not "this model understands video".
 //
 // The router gate is the same one detectLiveProgressSupport carries and for
 // the same reason (#55): llama.cpp's ROUTER mode answers /props with a dummy

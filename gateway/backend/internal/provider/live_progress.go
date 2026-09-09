@@ -15,9 +15,9 @@ import (
 // (routing.Target.LiveProgressSupport, filled by routing.Resolver.targetFrom
 // from the joined "live_progress" row in model_mapping_capabilities --
 // routing.MappingCandidate.LiveProgressSupport, via
-// routing.LiveProgressSupportFromVerdict -- NOT from the frozen
-// pre-migration-78 routing.ModelMapping.LiveProgressSupport column, which
-// Task 6 removes entirely) has never been determined ("").
+// routing.LiveProgressSupportFromVerdict; the pre-migration-78
+// live_progress_support column it replaced is gone, dropped by migration 79)
+// has never been determined ("").
 // A recorded verdict, "supported" or "unsupported", always overrides it: that
 // verdict is either an observed upstream answer or CompleteStream's own
 // retry-confirmed rejection, and an observation outranks a guess about the

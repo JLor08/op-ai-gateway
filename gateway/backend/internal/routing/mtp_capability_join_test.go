@@ -8,25 +8,24 @@ import (
 	"time"
 )
 
-// TestScorerStillAwardsTheMTPBonusFromTheJoinedRow is Task 4's load-bearing
-// regression pin: moving IsMTP off ModelMapping onto the joined
-// MappingCandidate field must not change what the scorer actually does.
-// scoringRoute now reads c.IsMTP (the join), not c.Mapping.IsMTP (the frozen
-// pre-migration-78 column) -- this test proves that by scoring two
-// candidates through the REAL scorer (scoringRoute + Score, exactly what
-// argmaxByScore and ScoreModelServers call), identical in every field except
-// MappingCandidate.IsMTP, and asserting the score difference is EXACTLY
-// mtpBonus (30 points). Asserted through the scorer rather than by
-// inspecting MappingCandidate/Route fields directly, so it pins the actual
-// routing BEHAVIOUR the request path depends on, not the plumbing that feeds
-// it -- a refactor that quietly stopped wiring the bonus through would fail
-// this test even if every field still compiled.
+// TestScorerStillAwardsTheMTPBonusFromTheJoinedRow is the load-bearing
+// regression pin for moving IsMTP off ModelMapping onto the joined
+// MappingCandidate field: it must not change what the scorer actually does.
+// scoringRoute reads c.IsMTP (the join) -- this test proves the bonus still
+// arrives by scoring two candidates through the REAL scorer (scoringRoute +
+// Score, exactly what argmaxByScore and ScoreModelServers call), identical
+// in every field except MappingCandidate.IsMTP, and asserting the score
+// difference is EXACTLY mtpBonus (30 points). Asserted through the scorer
+// rather than by inspecting MappingCandidate/Route fields directly, so it
+// pins the actual routing BEHAVIOUR the request path depends on, not the
+// plumbing that feeds it -- a refactor that quietly stopped wiring the bonus
+// through would fail this test even if every field still compiled.
 //
-// Mapping.IsMTP is deliberately left false on BOTH candidates (the value a
-// mapping predating this feature, or one whose old column was never
-// populated, would have): if scoringRoute regressed to reading
-// c.Mapping.IsMTP instead of c.IsMTP, this test would fail with a 0-point
-// diff, not a wrong-but-nonzero one.
+// The candidates' Mapping carries no MTP value at all, and cannot: migration
+// 79 dropped the column and ModelMapping has no such field, so "the bonus
+// could only have come from the joined field" is now guaranteed by the type
+// rather than by a setup assertion at the end of this test (which is where
+// it used to live).
 func TestScorerStillAwardsTheMTPBonusFromTheJoinedRow(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	newCandidate := func(id string, isMTP bool) MappingCandidate {
@@ -34,7 +33,7 @@ func TestScorerStillAwardsTheMTPBonusFromTheJoinedRow(t *testing.T) {
 			Server:      AIServer{ID: "srv", Status: ServerStatusActive, HealthStatus: HealthHealthy},
 			Application: Application{ID: "app", Priority: 10, Weight: 50},
 			Mapping:     ModelMapping{ID: id, GatewayModelName: "m"},
-			IsMTP:       isMTP, // from the join -- Mapping.IsMTP stays false either way
+			IsMTP:       isMTP, // from the join: the Mapping has no MTP field to confuse it with
 		}
 	}
 	withoutMTP := newCandidate("map_plain", false)
@@ -54,8 +53,5 @@ func TestScorerStillAwardsTheMTPBonusFromTheJoinedRow(t *testing.T) {
 	}
 	if diff := scoreWith - scoreWithout; diff != mtpBonus {
 		t.Fatalf("mtp score diff = %v, want exactly mtpBonus (%v); with=%v without=%v", diff, mtpBonus, scoreWith, scoreWithout)
-	}
-	if withMTP.Mapping.IsMTP {
-		t.Fatalf("test setup bug: Mapping.IsMTP must stay false so the bonus can only have come from the joined MappingCandidate.IsMTP field")
 	}
 }

@@ -1059,7 +1059,10 @@ func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
 // benchmarkTargetReq builds the Target for FIVE streaming callers (measureMapping,
 // measureMappingCapacity, the vision measurement, the load runner, the model warmer)
 // and set neither live-progress field, so provider.wantsLiveProgress saw an
-// undetermined verdict and no spec shape on every one of those streams. Two
+// undetermined verdict and no spec shape on every one of those streams. (The
+// verdict's SOURCE has since moved from the mapping's frozen column to its
+// model_mapping_capabilities row -- see benchmarkLiveProgressSupport -- but the
+// consequence of not carrying it is unchanged, which is why these pins stayed.) Two
 // consequences, both bad in opposite directions: a mapping already DETECTED as
 // "unsupported" still received the parameters (and RouteID is "" here, which the
 // rejection memo deliberately never memoizes, so the wasted 400-plus-retry repeats
@@ -1070,10 +1073,12 @@ func TestBenchmarkTargetReqServerAgentNoSpecFallsBackToApp(t *testing.T) {
 // TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs pins both fields at the
 // builder. The verdict is seeded "unsupported" and the spec type resolves to
 // "llama_cpp" -- both non-empty and distinct, so neither assertion can pass off a
-// zero value.
+// zero value. The verdict is set on benchmarkTarget.liveProgressSupport, which is
+// where benchmarkTargetFor resolves the mapping's capability row into (the
+// builder itself is pure and never reads the store).
 func TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs(t *testing.T) {
 	tgt := benchServerAgentTarget()
-	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.liveProgressSupport = "unsupported"
 	tgt.spec.Type = string(routing.RuntimeSpecTypeLlamaCpp)
 
 	target, _ := benchmarkTargetReq(tgt)
@@ -1091,11 +1096,11 @@ func TestBenchmarkTargetReqCarriesLiveProgressDecisionInputs(t *testing.T) {
 // EffectiveRuntimeSpecType would resolve a zero spec to "custom" -- a claim about a
 // managed child that does not exist. wantsLiveProgress never reads the field for a
 // non-server_agent target, so the wrong value would be inert today and a trap
-// tomorrow. The verdict, by contrast, is a property of the MAPPING and is carried
-// for every app type.
+// tomorrow. The verdict, by contrast, is a property of the MAPPING's capability
+// row and is carried for every app type.
 func TestBenchmarkTargetReqLiveProgressSpecTypeOnlyForServerAgent(t *testing.T) {
 	tgt := benchTestTarget() // ProviderMock, zero spec
-	tgt.mapping.LiveProgressSupport = "supported"
+	tgt.liveProgressSupport = "supported"
 
 	target, _ := benchmarkTargetReq(tgt)
 	if target.LiveProgressSpecType != "" {
@@ -1115,7 +1120,7 @@ func TestMeasureMappingStreamCarriesLiveProgressVerdict(t *testing.T) {
 	fake := &benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 42}}
 	srv := &Server{Provider: fake}
 	tgt := benchServerAgentTarget()
-	tgt.mapping.LiveProgressSupport = "unsupported"
+	tgt.liveProgressSupport = "unsupported"
 	tgt.spec.Type = string(routing.RuntimeSpecTypeVLLM)
 
 	if _, err := srv.measureMapping(context.Background(), tgt); err != nil {

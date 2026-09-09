@@ -180,8 +180,9 @@ func TestModelsResponseVisionGroupAggregation(t *testing.T) {
 // offerModelVision seeds a server + application + one active mapping with an
 // explicit "vision" capability row (yes/no per vision), mirroring offerModel
 // (service_model_groups_offering_test.go) but threading a vision verdict
-// through. Writes a ROW, not the frozen ModelMapping.VisionCapable column:
-// the fold under test (modelsResponse) reads model_mapping_capabilities now.
+// through. The verdict is a ROW: the fold under test (modelsResponse) reads
+// model_mapping_capabilities, and the vision_capable column it replaced is
+// gone (migration 79).
 func offerModelVision(t *testing.T, rs *routing.MemoryStore, srvID, srvName, appID string, flavors []string, gateway, appModel string, vision bool) {
 	t.Helper()
 	ctx := context.Background()

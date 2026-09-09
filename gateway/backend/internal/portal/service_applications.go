@@ -1475,10 +1475,12 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		return ModelMappingDTO{}, ErrMappingGatewayNameConflict
 	}
 	now := s.clock().UTC()
-	// Default IsMTP from the model NAME when the caller did not explicitly set
-	// it. IsMTP no longer participates in the provenance stamp below at all
-	// (see metricValuesPresent's own doc-comment), so this default's origin no
-	// longer needs to be tracked separately from req.IsMTP for that purpose.
+	// Default the MTP verdict from the model NAME when the caller did not
+	// explicitly set it. The two origins DO stay apart below -- an explicit
+	// operator setting writes a manual capability row, the name heuristic a
+	// legacy (probe-overwritable) one -- but neither participates in the
+	// numeric metrics' provenance stamp any more (see metricValuesPresent's
+	// own doc-comment); the row carries its own Source.
 	isMTP := req.IsMTP
 	if !isMTP {
 		isMTP = routing.IsMTPModelName(appModelName)
@@ -1496,8 +1498,6 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		MaxConcurrency:               req.MaxConcurrency,
 		RecommendedConcurrency:       req.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: req.GenTokensPerSecondAtCapacity,
-		IsMTP:                        isMTP,
-		VisionCapable:                req.VisionCapable,
 		EnergyWhPerToken:             req.EnergyWhPerToken,
 		MetricsLocked:                req.MetricsLocked,
 		CreatedAt:                    now,
@@ -1522,10 +1522,10 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// actually said what the form submitted before it writes anything.
 	capRows := make([]routing.CapabilityRow, 0, 2)
 	if req.VisionCapable {
-		// The operator's vision_capable checkbox is the AUTHORITATIVE "vision"
-		// capability row (source manual), not just the legacy column above --
-		// see manualCapabilityRow's own doc-comment for why this outranks
-		// every probe and the vision benchmark permanently.
+		// The operator's vision_capable checkbox becomes the AUTHORITATIVE
+		// "vision" capability row (source manual) -- see manualCapabilityRow's
+		// own doc-comment for why this outranks every probe and the vision
+		// benchmark permanently.
 		//
 		// Only the `true` direction writes here: CreateMappingRequest.
 		// VisionCapable is a plain bool, so an unset `false` at CREATE time is
@@ -1547,10 +1547,10 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	case isMTP:
 		// The NAME HEURISTIC said MTP. It still has to write a row: the
 		// scorer's +30 MTP bonus reads MappingCandidate.IsMTP, which is the
-		// JOINED "mtp" row's verdict now (routing.MTPFromVerdict), NOT the
-		// frozen ModelMapping.IsMTP column -- so a mapping created without
-		// one would silently lose the bonus migration 78 gave every mapping
-		// that existed before it.
+		// JOINED "mtp" row's verdict (routing.MTPFromVerdict) and the only
+		// place the verdict lives at all now -- so a mapping created without
+		// a row would silently lose the bonus migration 78 gave every
+		// mapping that existed before it.
 		//
 		// Source LEGACY, not manual: a name heuristic is a GUESS, and it must
 		// stay beatable by the real detection PR C adds (a probe writes at
@@ -1678,19 +1678,10 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.RecommendedConcurrency = effRecConc
 	mapping.GenTokensPerSecondAtCapacity = effGenCap
 	mapping.EnergyWhPerToken = effEnergy
-	// The two FROZEN columns. Nothing reads either of them for a decision any
-	// more (#49-3 moved routing, the listings and this file's own DTO onto
-	// model_mapping_capabilities rows), and neither of these assignments is
-	// the operative capability write -- that is the differs-from-stored rule
-	// further down, which is the ONLY thing an operator's checkbox now
-	// establishes. They stay purely so the store row keeps the shape it has
-	// until the task that drops the columns removes both lines with them.
-	if req.IsMTP != nil {
-		mapping.IsMTP = *req.IsMTP
-	}
-	if req.VisionCapable != nil {
-		mapping.VisionCapable = *req.VisionCapable
-	}
+	// req.IsMTP / req.VisionCapable are NOT merged onto the mapping: it has
+	// no such field any more (migration 79 dropped the columns). The
+	// operative capability write is the differs-from-stored rule further
+	// down, which is the ONLY thing an operator's checkbox establishes.
 	if req.MetricsLocked != nil {
 		mapping.MetricsLocked = *req.MetricsLocked
 	}
@@ -1723,7 +1714,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	//     that writes.
 	//  2. mappingDTO's is_mtp/vision_capable, which that same form seeds
 	//     from -- so an untouched checkbox round-trips the truth rather than
-	//     a frozen column's stale snapshot.
+	//     a stale snapshot.
 	//
 	// The comparison is against capabilityVerdictBool, the exact two-state
 	// fold the form was seeded with, NOT the raw three-state verdict: an
@@ -1918,7 +1909,6 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 			GatewayModelName: model,
 			AppModelName:     model,
 			Status:           status,
-			IsMTP:            isMTP,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
@@ -1927,14 +1917,15 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		}
 		if isMTP {
 			// Same NAME HEURISTIC, same legacy-sourced row CreateMapping
-			// writes for it -- see legacyMTPCapabilityRow. Without this, a
+			// writes for it -- see legacyMTPCapabilityRow. This row is the
+			// ONLY place the heuristic's verdict lands now, so without it a
 			// mapping discovered here (the manual "Sync models" button and
 			// the background model_sync probe loop, i.e. the automatic path
-			// most mappings arrive through) would set the frozen IsMTP
-			// column above but leave the scorer's ROW-based +30 MTP bonus
-			// unearned. Best-effort: this is a sync/reconcile loop, and a
-			// capability-write failure must not fail the reconcile whose
-			// primary effect (the mapping itself) already landed.
+			// most mappings arrive through) would never earn the scorer's
+			// ROW-based +30 MTP bonus. Best-effort: this is a sync/reconcile
+			// loop, and a capability-write failure must not fail the
+			// reconcile whose primary effect (the mapping itself) already
+			// landed.
 			s.writeOperatorCapabilities(ctx, mapping.ID, []routing.CapabilityRow{legacyMTPCapabilityRow(now)})
 		}
 	}
@@ -2084,9 +2075,9 @@ func (s *Service) writeOperatorCapabilities(ctx context.Context, mappingID strin
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
 // "nothing determined").
 //
-// IsMtp/VisionCapable come from those ROWS, never from the frozen
-// ModelMapping.IsMTP/VisionCapable columns whose automated writers #49-3
-// retired -- and that is a CORRECTNESS requirement, not tidiness.
+// IsMtp/VisionCapable come from those ROWS. That is a CORRECTNESS
+// requirement, not tidiness, and it is why the is_mtp/vision_capable columns
+// #49-3 retired every automated writer of could not simply be left inert:
 // MappingForm.tsx seeds its two checkboxes from these fields and submits both
 // back on EVERY save, whatever field the operator actually came to edit.
 // Seeding them from a column nothing writes any more would hand the form a

@@ -68,12 +68,11 @@ type ModelServerDTO struct {
 	// tolerates the live-progress two-parameter request (#51): "supported" /
 	// "unsupported" / "" (never determined). Folded from the "live_progress"
 	// row in the SAME Capabilities batch below (routing.
-	// LiveProgressSupportFromVerdict), NOT read off the frozen
-	// ModelMapping.LiveProgressSupport column: #49-3 moved the background
-	// detectors onto model_mapping_capabilities rows, so that column has no
-	// writer any more and would pin this column of the portal table to
-	// migration 78's snapshot -- an em-dash forever for every mapping created
-	// after it. Unlike State/ActiveRequests/QueueDepth/MetricsProbe/
+	// LiveProgressSupportFromVerdict). It is the ONLY source now: #49-3 moved
+	// the background detectors onto model_mapping_capabilities rows, and
+	// migration 79 then dropped the live_progress_support column they had
+	// stopped writing -- which is why a mapping carries no such field to read
+	// by mistake. Unlike State/ActiveRequests/QueueDepth/MetricsProbe/
 	// ContextProbe (which Service.ModelServers leaves zero/empty for the
 	// gateway layer to inject from the runtime-status registry), this one
 	// needs no gateway-injection seam -- Service.ModelServers fills it itself

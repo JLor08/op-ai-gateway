@@ -609,73 +609,39 @@ type ModelMapping struct {
 	PromptTokensPerSecond float64    // prompt (prefill) throughput (tokens/s); 0 = unknown
 	LoadTimeMS            int        // model load/swap time in ms; 0 = unknown
 	ContextSize           int        // usable context window in tokens; 0 = unknown
-	IsMTP                 bool       // multi-token-prediction capable
-	VisionCapable         bool       // accepts image inputs (vision-capable model); false = unknown/no
 	EnergyWhPerToken      float64    // per-token energy coefficient (watt-hours/token); 0 = unknown
 	MetricsLocked         bool       // metrics are manually pinned (do not auto-overwrite)
 	MetricsUpdatedAt      *time.Time // when the metrics were last set; nil = never
 	MetricsSource         string     // provenance of the metrics (e.g. "manual"); '' = unknown
-	// LiveProgressSupport records whether this mapping's upstream tolerates the
-	// live-progress request parameters (#51): "" = never determined,
-	// "supported", "unsupported". It is a CAPABILITY of the upstream build, not
-	// a metric, so it deliberately sits outside the MetricsLocked group above --
-	// see UpsertMappingCapabilities for why: that is now where the argument
-	// lives, because it is what leaves model_mapping_capabilities without a
-	// metrics_locked guard either.
+	// A CAPABILITY IS NOT A FIELD HERE. There is deliberately no IsMTP,
+	// VisionCapable, LiveProgressSupport or Cap* on this struct: every
+	// per-mapping capability verdict is a CapabilityRow in
+	// model_mapping_capabilities, read through MappingCapabilities /
+	// MappingCapabilitiesForMappings and keyed by CapabilityRowsByName.
+	// Migration 79 dropped the eleven columns they used to be (see
+	// migration79Up).
 	//
-	// No automated writer touches this column any more (#49-3): the verdict is
-	// a CapabilityLiveProgress row in model_mapping_capabilities, established
-	// by the same probe pass as every other capability.
-	LiveProgressSupport string
-	// LiveProgressCheckedAt is when that verdict was last determined. Operator
-	// diagnostics and the portal tooltip ONLY -- no decision logic reads it.
-	LiveProgressCheckedAt *time.Time
-	// CapVision/CapVideo/CapAudio/CapTools are the auto-detected capability
-	// verdicts (#49 sub-project 2), each "" (never determined) | "yes" | "no".
-	// Three states, not a bool, for the reason vision_capable's own history
-	// shows: a bool conflates "not probed" with "no", and the models list
-	// AND-aggregates it fail-closed, so one unprobed mapping silently disables
-	// a whole model's image attachment. "" must never overwrite a stored
-	// verdict -- see UpsertMappingCapabilities.
+	// The shape is not cosmetic; it is what the columns could not express:
 	//
-	// Deliberately OUTSIDE the metrics_locked group, like
-	// LiveProgressSupport above and for the same reason: a capability is not
-	// a number an operator answers for -- the argument that now leaves
-	// model_mapping_capabilities without a metrics_locked guard either (see
-	// UpsertMappingCapabilities). No automated writer touches these columns
-	// any more (#49-3): every verdict is a row in that table carrying its own
-	// per-capability SOURCE, which is what retired the mapping-wide vision
-	// SYNC onto VisionCapable rather than merely fixing it -- with one source
-	// of truth per capability there is nothing left to sync.
+	//   - Three states, not a bool. A bool conflates "never probed" with
+	//     "no", and the models list AND-aggregates vision fail-closed, so one
+	//     unprobed mapping silently disabled a whole model's image
+	//     attachment. Absence of a row IS unknown, so nothing has to encode
+	//     it.
+	//   - Per-capability PROVENANCE, not one mapping-wide MetricsSource every
+	//     writer stamped over the last one's. That is what
+	//     WritableCapabilityRows' precedence rank is built on, and what
+	//     retired the mapping-wide vision SYNC rather than merely fixing it:
+	//     with one source of truth per capability there is nothing to sync.
+	//   - An OPEN vocabulary. cap_extra existed because the upstream set is
+	//     open-ended (Ollama passes manifest-declared capabilities through
+	//     unchanged); a row per name needs no escape hatch.
 	//
-	// CapVideo carries an upstream subtlety worth knowing before acting on
-	// it: llama.cpp's modalities.video is true when the BINARY was built with
-	// video support AND the model has a vision encoder -- it is not a claim
-	// that the model understands video.
-	//
-	// CapTools is "the chat template natively supports tool calls", NOT "tool
-	// calls work": llama.cpp with --jinja (its default) accepts tools for
-	// every model through a generic handler.
-	CapVision string
-	CapVideo  string
-	CapAudio  string
-	CapTools  string
-	// CapExtra is a JSON array of capability names the upstream reported that
-	// have no column here ("thinking", "insert", "embedding", ...). Stored
-	// verbatim rather than mapped onto an enum because the vocabulary is
-	// open-ended upstream (Ollama passes manifest-declared capabilities
-	// through unchanged), so an enum would silently drop future values. ""
-	// when nothing extra was reported.
-	CapExtra string
-	// CapabilitiesSource is which probe produced the current verdicts:
-	// "llama_cpp_props" | "ollama_show" | "". Per-capability-group
-	// provenance, deliberately NOT the mapping-wide MetricsSource, which one
-	// writer would otherwise stamp over another's.
-	CapabilitiesSource string
-	// CapabilitiesCheckedAt is when the verdicts were last determined; nil
-	// when never. Diagnostics and the portal tooltip ONLY -- no decision
-	// logic may read it (the LiveProgressCheckedAt rule).
-	CapabilitiesCheckedAt *time.Time
+	// Capabilities also sit OUTSIDE the MetricsLocked group this table
+	// otherwise guards every automated writer with, which is the other reason
+	// they are not simply renamed fields here: see
+	// MappingStore.UpsertMappingCapabilities, which carries that argument.
+
 	// Per-mapping concurrency-capacity metrics (later phases populate them).
 	// 0 = unknown everywhere.
 	MaxConcurrency               int     // max concurrent requests the model can serve; 0 = unknown
@@ -851,60 +817,36 @@ type MappingCandidate struct {
 	// migration 78), filled by ActiveMappingsForModel's joined query (SQL) or its
 	// MemoryStore mirror from the same capability map, via MTPFromVerdict: true
 	// for a "yes" row, false for a "no" row, and false for no row at all (never
-	// determined). The scorer (scoringRoute) reads this field, NOT Mapping.IsMTP.
+	// determined). The scorer (scoringRoute) reads this field.
 	//
-	// It is deliberately NOT on ModelMapping itself. ModelMapping.IsMTP is the
-	// pre-migration-78 column, frozen since the write paths that used to update
-	// it now write a capability row instead (#49-3) -- it is not kept in sync. A
-	// struct field populated only by THIS ONE QUERY would read, at the type
-	// level, as populated everywhere ModelMapping appears. The moment a mapping
-	// loaded via MappingByID (which never joins the capability table) reported
-	// IsMTP == false while a resolver's candidate for the SAME mapping reported
-	// the true joined verdict, whichever caller trusted the wrong one would be
-	// silently wrong with no compiler or reviewer able to tell the two apart --
-	// they are the same type. Keeping the verdict on MappingCandidate instead
-	// makes "this came from the join" a fact the TYPE carries, not a fact a
-	// caller has to remember. ModelMapping.IsMTP is removed only once every
-	// remaining reader has moved off it (Task 6) -- true for this field: the
-	// only other readers are the portal (scoped into Task 5) and ModelMapping's
-	// own population sites (scoped into Task 6 itself). Contrast with
-	// LiveProgressSupport below, where the identical-looking sentence does NOT
-	// hold.
+	// It sits on the CANDIDATE rather than on Mapping because "this came from
+	// the join" is then a fact the TYPE carries instead of one a caller has to
+	// remember. ModelMapping deliberately has no capability field of its own
+	// (migration 79 dropped the columns they were), so a mapping loaded
+	// through MappingByID -- which never joins the capability table -- cannot
+	// present a plausible-looking but unpopulated verdict. Anything holding
+	// only a ModelMapping has to ask for the rows explicitly
+	// (MappingCapabilities), which is exactly the reminder the type is there
+	// to give.
 	IsMTP bool
 	// LiveProgressSupport is the mapping's "live_progress" capability verdict,
 	// filled the same way and for the same reason as IsMTP above, via
 	// LiveProgressSupportFromVerdict: "" for no row (never determined),
 	// "supported" for a "yes" row, "unsupported" for a "no" row -- the same
-	// vocabulary ModelMapping.LiveProgressSupport and Target.LiveProgressSupport
-	// already speak. targetFrom reads THIS field, NOT Mapping.LiveProgressSupport,
-	// when building a Target from a MappingCandidate -- whether that candidate
-	// came from ActiveMappingsForModel's join or (as of Task 4's fix round)
-	// resolveAffinity's synthetic candidate, which now issues its own
-	// MappingCapabilities read rather than copying the mapping's frozen column
-	// (see resolveAffinity's comment).
+	// vocabulary Target.LiveProgressSupport speaks. targetFrom reads THIS
+	// field when building a Target from a MappingCandidate, whether the
+	// candidate came from ActiveMappingsForModel's join or from
+	// resolveAffinity, which issues its own keyed MappingCapabilities read
+	// because its mapping comes from MappingsByApplication and is therefore
+	// unjoined (see resolveAffinity's comment).
 	//
-	// It is deliberately NOT (a second time on) ModelMapping for the identical
-	// reason IsMTP is not: ModelMapping.LiveProgressSupport is the
-	// pre-migration-78 column, frozen since #49-3 moved every writer onto a
-	// model_mapping_capabilities row, and a caller reading the wrong one of two
-	// same-typed fields would have no way to tell it had.
-	//
-	// UNLIKE IsMTP above, "removed only once every remaining reader has moved
-	// off it" is NOT true for ModelMapping.LiveProgressSupport: with
-	// resolveAffinity fixed, every ROUTING reader is gone, but
-	// internal/gateway/benchmark_runner.go's benchmarkTargetReq (~:197) still
-	// reads mapping.LiveProgressSupport directly to build a benchmark's Target,
-	// and it appears on NO remaining task's file list (Task 5 scopes the
-	// portal; Task 6 scopes routing/store.go, store/sqlite_applications.go,
-	// routing/memory_store.go and migrate.go -- none of which touch
-	// internal/gateway). Dropping the column will break that line at compile
-	// time, but the lazy fix -- deleting the assignment to make it compile --
-	// would silently leave every benchmark Target's LiveProgressSupport at ""
-	// forever, exactly the regression benchmarkTargetReq's own surrounding
-	// comment says matters MORE on the benchmark path than on a live request.
-	// Whoever does Task 6 must give benchmark_runner.go its own
-	// MappingCapabilities read (mirroring resolveAffinity's) before removing
-	// this column, not just resolve the compiler's complaint.
+	// The benchmark path is the third producer of this verdict and does not
+	// go through a MappingCandidate at all: internal/gateway's
+	// benchmarkTargetFor reads the row itself
+	// (Server.benchmarkLiveProgressSupport) and carries it on
+	// benchmarkTarget. All three read the SAME row through the SAME
+	// LiveProgressSupportFromVerdict, so none of them can drift into its own
+	// spelling of "supported".
 	LiveProgressSupport string
 }
 
