@@ -546,12 +546,20 @@ plausible-looking validation rule would break the normal case:
   That is what makes "an undetermined verdict must never overwrite an
   established one" structural rather than a convention every writer has to
   remember: there is no empty verdict for a writer to pass in the first place.
-  The only way back to unknown is `DeleteMappingCapability` — and **no
-  operator-facing surface reaches it yet**: the store method and all four
-  drivers exist, with no portal control, HTTP endpoint or CLI path calling
-  them, so a `manual` verdict can be flipped (`manual/yes` ↔ `manual/no`,
-  rank 3 ≥ rank 3) but not relinquished, and detection cannot be handed back
-  the capability. Recorded in
+  The only way back to unknown is `DeleteMappingCapability`, and the operator
+  reaches it through the mapping PATCH: `reset_capabilities`, a list of names
+  whose rows are deleted, riding on the same request that carries the verdicts
+  so a reset cannot be undone by the next save (the mapping form seeds once and
+  re-submits its capability controls every time). Naming a capability whose
+  boolean the same request also sends is rejected — two instructions about one
+  row — as is an empty name, which the store would silently treat as a no-op.
+  Every OTHER shape IS a benign no-op on all four drivers: an unknown mapping
+  id and an unknown capability name alike, unlike `UpsertMappingCapabilities`,
+  whose real FK makes an unknown mapping an error. That asymmetry is why the
+  portal path carries its own authorization — the store hands it no existence
+  signal to lean on. What remains open is not the way back but MINTING a
+  `manual` verdict by accident from an edit form gone stale mid-save, recorded
+  in
   [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
   A capability NAME
   is not validated at all: the vocabulary is open on purpose (`vision`,

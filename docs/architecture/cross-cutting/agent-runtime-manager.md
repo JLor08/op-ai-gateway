@@ -3440,7 +3440,7 @@ shows both but edits only its own:
 | `gateway_model_name` | editable | read-only | editable, required |
 | `app_model_name` | read-only | editable, required | editable, required |
 | `status` | editable (form + row toggle) | not shown | not shown |
-| metrics, `metrics_locked`, and the `is_mtp`/`vision_capable` capability checkboxes | editable | not shown | not shown |
+| metrics, the `metrics_locked` checkbox, and the `is_mtp`/`vision_capable` capability selects | editable | not shown | not shown |
 
 The **mapping** owns the gateway-facing name and the active/disabled status:
 `status` gates whether the gateway routes the model at all, and the
@@ -3464,20 +3464,55 @@ the body while removing the control would make every launch-config save
 re-enable a model an operator deliberately took out of service — no error, no
 diff, and no column on the specs tab that contradicts it.
 
-**The two capability checkboxes are the case where the form DOES re-state what
-it captured, so the write has to prove the operator said it.** `is_mtp` and
-`vision_capable` are no longer mapping columns — each is a capability row
+**The two capability controls are SELECTS with three states, and the one place
+this form has to prove the operator said something before it writes.** `is_mtp`
+and `vision_capable` are no longer mapping columns — each is a capability row
 whose `manual` source outranks every probe and the vision benchmark
-permanently ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped))
-— and `MappingForm` submits both on every save, seeded from what it read when
-it opened. So `Service.UpdateMapping` reads the stored rows first and writes a
-`manual` row **only for a value that DIFFERS from the row on file**. Without
-that comparison, a save that changed nothing but a throughput figure would
-launder an untouched checkbox into a permanent operator verdict, freezing out
-every probe and the benchmark for a capability no one ever actually stated. A
-create is the mirror case and needs no comparison — nothing is on file yet —
-but only the `true` direction writes there, since an unset `false` at create
-time is indistinguishable from a checkbox the operator never looked at.
+permanently ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+A checkbox could not represent that table: unknown is the ABSENCE of a row, and
+a verdict of `no` is a real decision, so `unknown`/`yes`/`no` needs the shared
+three-option `SelectField` (the same control three other screens use for a
+"follow global" empty option — there is no tri-state checkbox in this portal).
+Each control seeds from the DTO's capability ROW, never from the folded
+`is_mtp`/`vision_capable` boolean, which reads a determined `no` and a missing
+row as the same `false`.
+
+**The seed is what the write is proved against, and it is captured when the
+form opens.** `MappingForm` seeds once and never re-syncs from props, so submit
+compares each control against that captured value and emits: nothing at all
+when it is unchanged; the boolean when it moved to `yes`/`no`; the capability's
+name in `reset_capabilities` when it moved to *unknown*, which DELETES the row.
+Never both keys for one capability — that pair is a `400`. `Service.
+UpdateMapping` keeps its own differs-from-stored comparison behind that, and
+both halves stay: the form's seed and the store's row can disagree when a probe
+writes while the form is open. Without either, a save that changed nothing but
+a throughput figure would launder an untouched control into a permanent
+operator verdict, freezing out every probe and the benchmark for a capability
+no one ever actually stated. A create is the mirror case and needs no
+comparison — nothing is on file yet, which is also why the unknown branch is
+unreachable there — but only the `true` direction writes, since an unset
+`false` at create time is indistinguishable from a control the operator never
+looked at.
+
+**The reset rides on the mapping PATCH, and that is structural.** A delete
+fired from a button inside the open form would be self-undoing: the form does
+not re-seed, and it re-submits its capability controls on every save, so the
+operator's next unrelated edit would re-establish the verdict they had just
+relinquished — with an ordinary 200 and nothing on screen. Carrying the intent
+in the same request removes that window, and the response is the post-delete
+DTO so the next render seeds from truth. **The unknown option's caption is
+per-capability**, because the honest answer differs: `vision` (and
+video/audio/tools/live_progress) come back on their own within about a second
+of the next telemetry write-back or one app-health tick — *but only when the
+upstream really is a llama.cpp `/props` document*; for a router-shaped body, or
+vLLM/Ollama, nothing re-detects them. Nothing re-probes `mtp` at all on an
+existing mapping (the legacy name heuristic writes its row only for a
+brand-new one, and a re-sync skips an existing mapping), so returning it to
+unknown discards the verdict and the scorer's +30 MTP bonus until a human sets
+it again. Do not replace those two captions with one shared "let detection
+decide again"; an i18n test asserts they stay different in both languages.
+`metrics_locked` stays a **checkbox** — a policy flag over the numeric metrics,
+which ADR-039 is explicit does not guard the capability table any more.
 
 **Omission removes the clobber, not the race, and this split is the first thing
 that makes two simultaneous mapping writers a designed workflow.**

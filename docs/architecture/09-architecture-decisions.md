@@ -876,9 +876,22 @@ convention every writer has to remember into a structural fact: there is no
 empty verdict to write, `ValidateCapabilityRow` — the one function both
 drivers call — rejects an empty `capability`, an empty `source`, and any
 `verdict` that is neither `yes` nor `no`, and `DeleteMappingCapability` is the
-only way back to unknown — a store method **no operator-facing surface
-reaches yet**, so in this release a `manual` verdict can be flipped but not
-relinquished ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open is the *vocabulary*, not the
+only way back to unknown. The operator reaches it through the MAPPING UPDATE —
+`UpdateMappingRequest.reset_capabilities`, a list of names to delete, carried
+on the same PATCH that carries the verdicts rather than on an endpoint of its
+own. That placement is structural: the mapping form seeds once and re-submits
+its capability controls on every save, so a reset applied by a separate request
+would be undone by the operator's next unrelated edit, which would re-establish
+a permanent `manual` row with an ordinary 200. The response is therefore
+post-delete truth, and the form's two controls carry an explicit *unknown*
+state (an empty select option) rather than a checkbox's two. The reset accepts
+ANY capability name — the vocabulary is open below — rejects an empty one, and
+rejects naming a capability whose boolean the same request also sends, since
+that is two instructions about one row. Its store error is PROPAGATED, unlike
+the accompanying upsert's best-effort write: relinquishing the verdict is the
+whole effect of the action, so swallowing the failure would report success for
+nothing. What is NOT closed is minting one by accident from a form gone stale
+mid-edit ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open is the *vocabulary*, not the
 validation: no check compares a name against a known list, so the code reasons
 about `vision`, `video`, `audio`, `tools`, `mtp` and `live_progress` while an
 unrecognised upstream name is accepted, stored and shown verbatim — which is
