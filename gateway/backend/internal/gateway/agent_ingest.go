@@ -202,6 +202,23 @@ type agentRuntimeCapabilitiesSample struct {
 // for it. Dropping an unrecognised verdict string here rather than passing it
 // on matters: UpsertMappingCapabilities is atomic and strict, so one
 // malformed verdict handed to it would reject the whole sample's row set.
+//
+// KNOWN LIMIT of the Source stamped here, recorded rather than papered over:
+// since #54 the agent runs TWO capability probes -- llama.cpp's /props and,
+// for an "ollama"-typed spec, POST /api/show -- and THIS WIRE CANNOT TELL
+// THEM APART. agentRuntimeSample carries the spec id, not the runtime type,
+// and neither agentRuntimeCapabilitiesSample nor its verdicts name the probe
+// or the endpoint, so an Ollama-declared verdict is currently written with
+// llama.cpp's source. routing.CapabilitySourceOllamaAPIShow exists for it and
+// is unused here on purpose: guessing the probe from the row CONTENT (Ollama
+// never reports a "no", never a live_progress) is a heuristic a
+// nothing-but-yes /props document would defeat, and a wrong provenance is
+// worse than a coarse one. The two ways to fix it properly are a design
+// decision, not a local one: carry the probe (or the type) on the wire, or
+// re-derive routing.EffectiveRuntimeSpecType from the spec
+// resolveRuntimeSpecCapabilities already loads -- the latter trading a report
+// for an inference, and reordering this path's deliberate build-rows-before-
+// resolving-ownership shortcut.
 func (c *agentRuntimeCapabilitiesSample) capabilityRows(at time.Time) []routing.CapabilityRow {
 	if c == nil {
 		return nil

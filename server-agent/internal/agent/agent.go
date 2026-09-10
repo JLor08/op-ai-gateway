@@ -1218,37 +1218,55 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 }
 
 // probeRuntimeChildProps fills rs.LiveProgressSupport and rs.Capabilities
-// with every verdict one /props document yields for st: the live-progress-
+// with every verdict ONE document yields for st: the live-progress-
 // capability verdict, task 4's agent-side half of issue #51 (the gateway's
 // half is detectLiveProgressSupport in
 // gateway/backend/internal/provider/model_info.go; collector.
 // detectLiveProgressSupport is a DELIBERATE duplicate of that exact rule --
 // see its doc comment -- and the two must never drift), and, since #49-2,
-// the llama.cpp capability verdict set (collector.detectCapabilities, the
-// same duplication precedent against gateway/backend's own copy). Both
-// verdict kinds ride the SAME single /props fetch
-// (collector.ProbePropsVerdicts) -- the whole point of widening the probe
-// was that a llama_cpp child is never asked for /props a second time just to
-// answer a second question.
+// the capability verdict set (collector.detectCapabilities, the same
+// duplication precedent against gateway/backend's own copy). Both verdict
+// kinds ride the SAME single fetch -- the whole point of widening the probe
+// was that a child is never asked a second time just to answer a second
+// question.
 //
-// Unlike probeRuntimeChildContext, this ALWAYS GETs
-// collector.LiveProgressProbePath ("/props"), regardless of st.Type or
-// whether st.ContextProbePath is even set: routing.DeriveProbePaths gives a
-// "custom"-typed spec no context path at all, so without this unconditional
-// probe a custom-typed llama.cpp child -- exactly the case a type-based
-// rule refuses -- would never be probed for this capability. One extra
-// loopback GET per child lifetime once a verdict set is cached; there is no
-// SSRF guard to apply here (unlike MetricsPath/ContextProbePath, this path
-// is a package constant, never operator/config-supplied).
+// WHICH document, and there are exactly two, is the only thing st.Type
+// decides here:
+//
+//   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
+//     {"model": st.Model} (#54). Ollama serves no /props at all, so probing
+//     it would spend a round trip to learn nothing; its capability array is
+//     the only surface there is. That verdict set carries capabilities only
+//     -- its LiveProgress is ALWAYS "", because Ollama exposes no
+//     timings_per_token-style surface and an unknown must never become a
+//     denial (see ProbeOllamaVerdicts' own doc).
+//   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
+//     GETs collector.LiveProgressProbePath ("/props").
+//
+// That second branch is deliberately unconditional -- it does not care what
+// st.Type is or whether st.ContextProbePath is even set -- and the reason it
+// must stay that way is unchanged by the ollama branch above:
+// routing.DeriveProbePaths gives a "custom"-typed spec no context path at
+// all, and "custom" is the type-detection FALLBACK, so a custom-typed
+// llama.cpp child -- exactly the case a type-based rule refuses -- would
+// never be probed for this capability if this half were type-gated too.
+// Only "ollama" is claimed by name; nothing else may be, or that fallback
+// loses its probe. One extra loopback request per child lifetime once a
+// verdict set is cached; there is no SSRF guard to apply to either path
+// (unlike MetricsPath/ContextProbePath, both are package constants, never
+// operator/config-supplied).
 //
 // Caching policy -- STABLE vs TRANSIENT, not "determined" vs "undetermined":
 //
 // A naive cache keyed only on whether a verdict was determined ("supported"/
-// "unsupported" cache, "" never caches) means every non-llama.cpp child
-// (vLLM/TGI/Ollama) re-GETs /props once per collect cycle, forever, for a
-// question whose answer cannot change while that pid lives -- a permanent
-// per-cycle cost, not a one-time one. The fix caches on WHY no verdict came
-// back, using collector.ProbePropsVerdicts's stable return:
+// "unsupported" cache, "" never caches) means every child whose document
+// yields nothing determinable (vLLM/TGI, or an Ollama build whose /api/show
+// declares no capability at all) re-asks for it once per collect cycle,
+// forever, for a question whose answer cannot change while that pid lives
+// -- a permanent per-cycle cost, not a one-time one. The fix caches on WHY
+// no verdict came back, using the probe's stable return (both
+// collector.ProbePropsVerdicts and collector.ProbeOllamaVerdicts answer to
+// one identical conclusive/transient contract):
 //
 //   - STABLE (a real "supported"/"unsupported" verdict and/or real
 //     capability verdicts, OR a zero-value collector.PropsVerdicts{} that is
@@ -1257,8 +1275,8 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 //     process keeps running, because the binary behind it does not change.
 //     Cache it -- zero value included -- in runtimeCapabilityCache, keyed
 //     and invalidated exactly like runtimeCtxCache (a changed st.PID
-//     re-arms the question), so this pid's /props endpoint is asked at most
-//     once, not once per cycle.
+//     re-arms the question), so this pid's endpoint is asked at most once,
+//     not once per cycle.
 //   - TRANSIENT (a connection refused, a timeout, or an unparseable/
 //     truncated body): the child may still be warming up, so the SAME
 //     silence must not be cached -- retry next cycle, exactly as
@@ -1281,9 +1299,9 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 //
 // This never overwrites an already-cached value with a fabricated one:
 // rs.LiveProgressSupport and rs.Capabilities are only ever set from a
-// verdict set collector.ProbePropsVerdicts (or a prior cache write) actually
-// produced, and an uncached probe leaves rs.LiveProgressSupport at its zero
-// value ("") and rs.Capabilities at its zero value (nil).
+// verdict set the probe (or a prior cache write) actually produced, and an
+// uncached probe leaves rs.LiveProgressSupport at its zero value ("") and
+// rs.Capabilities at its zero value (nil).
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
 	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID {
 		rs.LiveProgressSupport = entry.verdicts.LiveProgress
@@ -1291,7 +1309,15 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	verdicts, stable := collector.ProbePropsVerdicts(cctx, client, base)
+	var (
+		verdicts collector.PropsVerdicts
+		stable   bool
+	)
+	if st.Type == "ollama" {
+		verdicts, stable = collector.ProbeOllamaVerdicts(cctx, client, base, st.Model)
+	} else {
+		verdicts, stable = collector.ProbePropsVerdicts(cctx, client, base)
+	}
 	cancel()
 	if !stable {
 		// Transient: no conclusive answer yet. Do not cache; retry next

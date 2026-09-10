@@ -282,3 +282,85 @@ func TestWritableCapabilityRowsKeepsTheFirstRowPerCapability(t *testing.T) {
 		t.Fatalf("WritableCapabilityRows returned %d rows for two DIFFERENT capabilities (%+v), want 2", len(got), got)
 	}
 }
+
+// TestCapabilitySourceOllamaAPIShow pins everything the new Ollama probe
+// source (#54) needs from this package, all four of which were VERIFIED
+// rather than assumed when it was added:
+//
+//  1. IDENTITY. Its stored string is "ollama_api_show" and it is NOT
+//     CapabilitySourceLlamaCppProps. This is the whole point of naming it: the
+//     source column is provenance an operator reads, and a verdict that came
+//     from Ollama's declared capability array labelled as a llama.cpp /props
+//     read would be a false provenance -- precisely what per-capability
+//     source exists to prevent. Pinning the literal, not just the constant,
+//     is deliberate: the value is persisted in model_mapping_capabilities and
+//     rendered verbatim in the portal, so it is a contract, not an
+//     implementation detail.
+//  2. RANK 1, via capabilitySourceRank's DEFAULT branch -- no rank-table
+//     entry was added, and this test is what keeps that a decision rather
+//     than an omission: it asserts the rank equals the llama.cpp probe's and
+//     sits below vision_benchmark and manual.
+//  3. PRECEDENCE, the consequence of (2) through the rule itself: it can
+//     never overwrite a human's or a benchmark's verdict, and it CAN
+//     overwrite a probe's (its own included) -- drift repair at equal rank.
+//  4. VALIDATION. ValidateCapabilityRow accepts a row carrying it, in both
+//     verdict directions, so no allowlist stands between this source and the
+//     upsert. (The store's own DDL agrees: model_mapping_capabilities.source
+//     is `text not null` with no CHECK constraint, and the portal DTO plus the
+//     frontend both carry the value through as an opaque string -- the
+//     vocabulary is open by design.)
+func TestCapabilitySourceOllamaAPIShow(t *testing.T) {
+	// (1) identity
+	if CapabilitySourceOllamaAPIShow != "ollama_api_show" {
+		t.Errorf("CapabilitySourceOllamaAPIShow = %q, want %q (the persisted, operator-visible provenance string)", CapabilitySourceOllamaAPIShow, "ollama_api_show")
+	}
+	if CapabilitySourceOllamaAPIShow == CapabilitySourceLlamaCppProps {
+		t.Fatalf("CapabilitySourceOllamaAPIShow == CapabilitySourceLlamaCppProps (%q): an Ollama-declared verdict must be distinguishable from a llama.cpp /props read, or the source column carries a plausible-looking lie", CapabilitySourceLlamaCppProps)
+	}
+
+	// (2) rank -- from the default branch, not a case of its own
+	if got := capabilitySourceRank(CapabilitySourceOllamaAPIShow); got != 1 {
+		t.Errorf("capabilitySourceRank(%q) = %d, want 1 (a probe)", CapabilitySourceOllamaAPIShow, got)
+	}
+	if got, want := capabilitySourceRank(CapabilitySourceOllamaAPIShow), capabilitySourceRank(CapabilitySourceLlamaCppProps); got != want {
+		t.Errorf("capabilitySourceRank(%q) = %d, want %d (the same band as the other probe)", CapabilitySourceOllamaAPIShow, got, want)
+	}
+	if got := capabilitySourceRank(CapabilitySourceOllamaAPIShow); got >= capabilitySourceRank(CapabilitySourceVisionBenchmark) || got >= capabilitySourceRank(CapabilitySourceManual) {
+		t.Errorf("capabilitySourceRank(%q) = %d, want strictly below vision_benchmark (%d) and manual (%d)", CapabilitySourceOllamaAPIShow, got, capabilitySourceRank(CapabilitySourceVisionBenchmark), capabilitySourceRank(CapabilitySourceManual))
+	}
+
+	// (3) precedence through the rule itself. Every case reports a verdict
+	// DIFFERING from the stored one, so a permitted write is never confused
+	// with rule 2 (no-change) passing instead.
+	reported := []CapabilityRow{{Capability: CapabilityVision, Verdict: CapabilityYes, Source: CapabilitySourceOllamaAPIShow}}
+	for _, tc := range []struct {
+		name      string
+		current   string
+		wantWrite bool
+	}{
+		{"no stored row at all", "", true},
+		{"over an operator's manual verdict", CapabilitySourceManual, false},
+		{"over the vision benchmark's measurement", CapabilitySourceVisionBenchmark, false},
+		{"over the llama.cpp probe", CapabilitySourceLlamaCppProps, true},
+		{"over its own earlier verdict (drift repair)", CapabilitySourceOllamaAPIShow, true},
+		{"over a migrated guess", CapabilitySourceLegacy, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := map[string]CapabilityRow{}
+			if tc.current != "" {
+				stored[CapabilityVision] = CapabilityRow{Capability: CapabilityVision, Verdict: CapabilityNo, Source: tc.current}
+			}
+			if got := len(WritableCapabilityRows(reported, stored)) == 1; got != tc.wantWrite {
+				t.Fatalf("WritableCapabilityRows(incoming=%q, current=%q) wrote=%v, want %v", CapabilitySourceOllamaAPIShow, tc.current, got, tc.wantWrite)
+			}
+		})
+	}
+
+	// (4) validation -- nothing rejects the new source
+	for _, verdict := range []string{CapabilityYes, CapabilityNo} {
+		row := CapabilityRow{Capability: CapabilityVision, Verdict: verdict, Source: CapabilitySourceOllamaAPIShow}
+		if err := ValidateCapabilityRow(row); err != nil {
+			t.Errorf("ValidateCapabilityRow(%+v) = %v, want nil (the source vocabulary is open; only an EMPTY source is rejected)", row, err)
+		}
+	}
+}

@@ -1125,10 +1125,29 @@ const (
 // HEURISTIC or an operator; vision_capable's provenance was a mapping-wide
 // string every writer overwrote). It ranks alongside a probe, deliberately:
 // treating a guess as authoritative would freeze it in forever.
+//
+// CapabilitySourceOllamaAPIShow names the second probe in the vocabulary
+// (#54): the agent's POST /api/show read of what Ollama DECLARES about a
+// model, as opposed to the /props document a llama.cpp build serves. It is
+// named as a constant so a row's provenance is a distinguishable fact
+// rather than a plausible-looking lie -- an operator reading "llama_cpp_props"
+// on a verdict that came from Ollama's manifest would be reading a false
+// provenance, which is the one thing this column exists to prevent. It
+// ranks 1 through capabilitySourceRank's DEFAULT branch (no rank-table
+// entry, and none is wanted): a probe, never able to overwrite manual (3)
+// or vision_benchmark (2), always able to repair its own drift (1 vs 1).
+//
+// Its verdicts are additionally one-directional at the SOURCE, a property no
+// rank can express: Ollama's capability array is not exhaustive, so the
+// detector behind this source can only ever produce "yes" or nothing at all
+// (see server-agent's collector.detectOllamaCapabilities). A row with this
+// source and verdict CapabilityNo could therefore not have come from that
+// probe.
 const (
 	CapabilitySourceManual          = "manual"
 	CapabilitySourceVisionBenchmark = "vision_benchmark"
 	CapabilitySourceLlamaCppProps   = "llama_cpp_props"
+	CapabilitySourceOllamaAPIShow   = "ollama_api_show"
 	CapabilitySourceLegacy          = "legacy"
 )
 
@@ -1142,13 +1161,16 @@ const (
 //	2  CapabilitySourceVisionBenchmark a real measurement -- an actual image
 //	                                   sent to the actual upstream, an actual
 //	                                   answer read back.
-//	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same /props
-//	   CapabilitySourceLegacy,         document, or a migrated heuristic,
-//	   or any unrecognised source      every time. An unrecognised source
-//	                                   ranks here too -- fail SAFE toward
-//	                                   "treat it as a probe" rather than
-//	                                   silently handing an unknown writer
-//	                                   manual's immunity.
+//	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same document
+//	   CapabilitySourceOllamaAPIShow,  (llama.cpp's /props, Ollama's
+//	   CapabilitySourceLegacy,         /api/show), or a migrated heuristic,
+//	   or any unrecognised source      every time. Both probes and an
+//	                                   unrecognised source rank here -- fail
+//	                                   SAFE toward "treat it as a probe"
+//	                                   rather than silently handing an
+//	                                   unknown writer manual's immunity,
+//	                                   which is also why ollama_api_show
+//	                                   needs no case of its own below.
 //	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
 //
 // WritableCapabilityRows is the only caller: a write is permitted iff

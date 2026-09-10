@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1627,8 +1628,18 @@ func TestCollectOnceRuntimeContextCacheInvalidatesOnModelChange(t *testing.T) {
 	if got := first.Runtimes[0].ContextSize; got != 8192 {
 		t.Fatalf("ContextSize (cycle 1) = %d, want 8192", got)
 	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Fatalf("/api/show hits after cycle 1 = %d, want 1", got)
+	// TWO /api/show POSTs, not one, and both are this spec's own: the
+	// CONTEXT probe (this test's subject) and -- since task 5 branched
+	// probeRuntimeChildProps onto ProbeOllamaVerdicts for an ollama-typed
+	// child -- the CAPABILITY probe, which reads the same document to answer
+	// a different question. That is the same shape a llama_cpp child has
+	// always had (its context probe and its capability probe each GET
+	// /props once per lifetime); only the baseline this counter starts from
+	// moved. What the test pins is unchanged, and the guard below still
+	// holds: both probes are once-per-child-lifetime, so a model-blind
+	// context-cache key would leave the count at 2 after cycle 2.
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("/api/show hits after cycle 1 = %d, want 2 (one context probe + one capability probe)", got)
 	}
 
 	// The spec's MODEL changes (operator edit; runtime manager
@@ -1646,8 +1657,8 @@ func TestCollectOnceRuntimeContextCacheInvalidatesOnModelChange(t *testing.T) {
 	if got := last.Runtimes[0].ContextSize; got != 4096 {
 		t.Errorf("ContextSize (cycle 2) = %d, want 4096 (must re-probe with the NEW model, not serve the cached old-model value)", got)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Errorf("/api/show hits after cycle 2 = %d, want 2 (a model-blind cache key would never re-probe)", got)
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Errorf("/api/show hits after cycle 2 = %d, want 3 (the CONTEXT probe re-ran for the new model; the capability verdict set stayed cached for this unchanged pid) -- a model-blind cache key would never re-probe", got)
 	}
 }
 
@@ -2350,6 +2361,175 @@ func TestCollectOnceRuntimeCapabilitiesPidChangeRearms(t *testing.T) {
 	}
 	if rs := got.Runtimes[0]; rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
 		t.Errorf("Capabilities after restart = %+v, want %+v", rs.Capabilities, want)
+	}
+}
+
+// TestCollectOnceRuntimeCapabilitiesOllamaProbesAPIShow is task 5's wiring
+// proof: an "ollama"-typed running child has its capability verdict set read
+// from POST /api/show (collector.ProbeOllamaVerdicts), never from /props.
+//
+// The fake server ASSERTS the request it receives instead of discarding it,
+// the discipline #54 established -- a probe silently issuing the wrong
+// method or path is the exact class of bug that shipped while the request
+// was never asserted: path /api/show, method POST, body {"model": st.Model}
+// verbatim. /props is counted separately and must stay at ZERO. Ollama
+// serves no /props at all, so an unbranched probe would spend a round trip
+// to learn nothing and report no capability at all.
+//
+// The expected verdict set carries three of detectOllamaCapabilities' rules
+// through the whole wire path: "vision"/"tools" land on the STRUCTURED
+// fields (which capabilitiesSample emits first), an unrecognised "thinking"
+// lands in Extra as a "yes", and "completion" is dropped entirely --
+// upstream ASSUMES that one rather than detecting it, so it is not evidence
+// of anything. Nothing is ever "no", and there is deliberately no
+// video/audio entry: Ollama's array is not exhaustive, so an absent name
+// means "Ollama did not tell us", never a denial. LiveProgressSupport stays
+// "" for that same reason -- Ollama exposes no timings_per_token-style
+// surface, and an unknown must not become a permanent false "unsupported".
+func TestCollectOnceRuntimeCapabilitiesOllamaProbesAPIShow(t *testing.T) {
+	var showHits, propsHits int32
+	var mu sync.Mutex
+	var gotMethod, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/show" {
+			if r.URL.Path == "/props" {
+				atomic.AddInt32(&propsHits, 1)
+			}
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&showHits, 1)
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		gotMethod, gotBody = r.Method, string(body)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"capabilities":["completion","vision","tools","thinking"]}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_ollama_caps",
+			Model:  "llama3.2-vision:11b",
+			State:  runtimectl.StateRunning,
+			PID:    6030,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "ollama",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	want := &sample.Capabilities{Verdicts: []sample.CapabilityVerdict{
+		{Name: "vision", Verdict: "yes"},
+		{Name: "tools", Verdict: "yes"},
+		{Name: "thinking", Verdict: "yes"},
+	}}
+	const cycles = 3
+	for cycle := 1; cycle <= cycles; cycle++ {
+		a.collectOnce(context.Background())
+		got := poster.last()
+		if got == nil || len(got.Runtimes) != 1 {
+			t.Fatalf("cycle %d: Runtimes = %+v", cycle, got)
+		}
+		rs := got.Runtimes[0]
+		if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+			t.Fatalf("cycle %d: Capabilities = %+v, want %+v (Ollama's declared names, structured fields first, completion dropped)", cycle, rs.Capabilities, want)
+		}
+		if rs.LiveProgressSupport != "" {
+			t.Errorf("cycle %d: LiveProgressSupport = %q, want %q -- Ollama exposes no timings_per_token surface, and an unknown must never become a denial", cycle, rs.LiveProgressSupport, "")
+		}
+		if hits := atomic.LoadInt32(&showHits); hits != 1 {
+			t.Fatalf("cycle %d: /api/show hits = %d, want 1 (a determined verdict set must be cached for this pid)", cycle, hits)
+		}
+		if hits := atomic.LoadInt32(&propsHits); hits != 0 {
+			t.Fatalf("cycle %d: /props hits = %d, want 0 -- an ollama-typed child must never be asked for /props", cycle, hits)
+		}
+	}
+
+	mu.Lock()
+	method, body := gotMethod, gotBody
+	mu.Unlock()
+	if method != http.MethodPost {
+		t.Errorf("/api/show method = %q, want %q (upstream is POST-only: since v0.7.0 a GET answers 405)", method, http.MethodPost)
+	}
+	if want := `{"model":"llama3.2-vision:11b"}`; body != want {
+		t.Errorf("/api/show body = %q, want %q (the probed model is the spec's own)", body, want)
+	}
+}
+
+// TestCollectOnceRuntimeCapabilitiesLlamaCppStillProbesProps pins the OTHER
+// half of task 5's branch: "ollama" is the only type claimed by name, and
+// every other type -- "llama_cpp" here, "custom" in the tests above, which
+// matters most because "custom" is the type-detection FALLBACK and gets no
+// derived probe path at all -- still GETs /props and is byte-identical to
+// before the branch existed. /api/show is counted and must stay at zero.
+//
+// Inverting the branch's condition (probing /api/show for everything BUT
+// ollama) fails here on both counters at once.
+func TestCollectOnceRuntimeCapabilitiesLlamaCppStillProbesProps(t *testing.T) {
+	var showHits, propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			if r.URL.Path == "/api/show" {
+				atomic.AddInt32(&showHits, 1)
+			}
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&propsHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"params":{"timings_per_token":true}},
+		                        "modalities":{"vision":true,"video":false,"audio":false},
+		                        "chat_template_caps":{"supports_tools":true}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID: "rspec_llamacpp_caps_unchanged",
+			Model:  "qwen-coder",
+			State:  runtimectl.StateRunning,
+			PID:    6031,
+			Port:   portFromURL(t, srv.URL),
+			Type:   "llama_cpp",
+		},
+	})
+
+	poster := &capturePoster{}
+	cfg := config.Config{Interval: time.Hour}
+	a := NewFromDeps(cfg, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+	rs := got.Runtimes[0]
+	want := &sample.Capabilities{Verdicts: []sample.CapabilityVerdict{
+		{Name: "vision", Verdict: "yes"},
+		{Name: "video", Verdict: "no"},
+		{Name: "audio", Verdict: "no"},
+		{Name: "tools", Verdict: "yes"},
+	}}
+	if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities = %+v, want %+v (a llama.cpp /props document's own verdicts, including the \"no\"s only that document can justify)", rs.Capabilities, want)
+	}
+	if rs.LiveProgressSupport != "supported" {
+		t.Errorf("LiveProgressSupport = %q, want %q (the /props verdict, unaffected by the ollama branch)", rs.LiveProgressSupport, "supported")
+	}
+	if hits := atomic.LoadInt32(&propsHits); hits != 1 {
+		t.Errorf("/props hits = %d, want 1", hits)
+	}
+	if hits := atomic.LoadInt32(&showHits); hits != 0 {
+		t.Errorf("/api/show hits = %d, want 0 -- only an ollama-typed child may be asked for it", hits)
 	}
 }
 
