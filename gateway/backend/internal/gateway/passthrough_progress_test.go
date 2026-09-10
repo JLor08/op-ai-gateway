@@ -295,13 +295,23 @@ func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.
 }
 
 // TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate pins the
-// one cell of the `openai_responses` column that a CLIENT can fill: setting
-// llama.cpp's `timings_per_token` makes the upstream attach a `timings` object to
-// PARTIAL frames, and that rate is a real upstream measurement, so it is
+// one cell of the `openai_responses` column that a CLIENT can fill: a `timings`
+// object on a PARTIAL frame, which llama.cpp attaches once the client set
+// `timings_per_token`. Such a rate is a real upstream measurement, so it is
 // displayed and labelled "upstream" rather than "gateway" — the label is what
 // makes a client-dependent difference in completeness visible instead of
 // mysterious. The token count stays absent: `timings_per_token` buys a rate, not
 // a count this gateway may claim.
+//
+// What the FIXTURE pins is this gateway's HANDLING of a partial-frame `timings`
+// object — read it, label it "upstream", display the latest one — not a captured
+// llama.cpp behaviour. The flag's effect on partial frames is established for
+// llama.cpp's CHAT streams; nothing in this repo has captured a Responses partial
+// carrying `timings`, and the rate cell of the per-flavor table in
+// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3 states
+// that same caveat. The Responses frame shape anchored to a documented-real one is
+// the TERMINAL frame, pinned by
+// TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves below.
 //
 // The two frames report a DECREASING rate on purpose. llama.cpp's
 // predicted_per_second is a cumulative average over the generation, so it

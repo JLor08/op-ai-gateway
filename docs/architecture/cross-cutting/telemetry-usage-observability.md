@@ -716,7 +716,7 @@ feature:
 |---|---|---|
 | TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.function_call_arguments.delta` stamps it |
 | output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **no mid-stream source** — the `*.delta` partials carry no usage object at all, and counting deltas as tokens is the option this feature already rejected above |
-| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to the partial frames, and it is then labelled `upstream`. Without it, none mid-stream |
+| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, and then labelled `upstream`. There is no mid-stream count on this flavor, so the gateway derives nothing here: a `timings` object attached by the upstream to a PARTIAL frame is the only possible source, and the gateway reads one off whatever partial carries it. That the flag makes llama.cpp attach one is established for its **chat** streams; whether its Responses implementation does the same on partials is not something this repo has captured. Either way the flag is the only thing that can put a rate on this cell mid-stream — without it, none |
 
 **The Responses column's terminal frame is a different answer from its
 mid-stream one, and it is not suppressed for arriving late.**
@@ -730,13 +730,14 @@ therefore "nothing to show mid-stream unless the client asked for it", not
 "nothing to show". **Which label that rate carries is the upstream's choice,
 and on llama.cpp it is `upstream`, not `gateway`.** The terminal
 `response.completed` frame is one of the three shapes llama.cpp bolts a
-`timings` object onto, with no dependence on `timings_per_token` — that flag
-governs the PARTIAL frames (see "One verdict is OBSERVED off relayed traffic
-rather than fetched from a document" further down, which keeps the Responses
-stream/non-stream pair apart for exactly this reason). `mergeResponsesUsage`
-lifts that frame's `predicted_per_second`, `publishProgress` passes THIS
-frame's rate through, and `liveProgressDTO`'s `upstream` branch is checked
-before its window derivation, so it wins. A `gateway`-labelled rate on that
+`timings` object onto, with no dependence on `timings_per_token` — that flag's
+subject is the PARTIAL frames, under the caveat the rate cell above states (see
+also "One verdict is OBSERVED off relayed traffic rather than fetched from a
+document" further down, which keeps the Responses stream/non-stream pair apart
+for exactly this reason). `mergeResponsesUsage` lifts that frame's
+`predicted_per_second`, `publishProgress` passes THIS frame's rate through,
+and `liveProgressDTO`'s `upstream` branch is checked before its window
+derivation, so it wins. A `gateway`-labelled rate on that
 cell is what an upstream whose terminal frame carries no `timings` of its own
 produces instead. Either way there is no reason to hide the terminal figure for
 the seconds it is visible: the count is the upstream's own and the rate is a
@@ -1362,12 +1363,16 @@ decoding, but a completion the gateway has just relayed does: llama.cpp
 attaches `timings.draft_n` — the number of tokens a draft model proposed for
 that turn — to the non-streaming chat body, to the final frame of a
 chat-completions stream (the same chunk as the terminal `usage`), and to the
-terminal frame of a Responses-API stream. **Those three are the whole list,
-and the Responses pair must be kept apart:** the *stream's* terminal
-`response.completed` frame carries `timings`, while the **non-streaming**
-`/v1/responses` body carries no `timings` object at all — as no Anthropic
-shape and no ASR response does either, so `DraftTokens` stays 0 on all of
-them whatever the upstream is actually doing. The code has exactly three
+terminal frame of a Responses-API stream. **Those three are the whole list of
+shapes that carry a `timings` object with `timings_per_token` unset** — the
+flag adds one to a chat stream's PARTIAL chunks too, which is where the
+translate path's own mid-stream rate comes from (`openai_compatible.go`'s
+`CompleteStream`; the `upstream` bullet above) — **and the Responses pair must
+be kept apart:** the *stream's* terminal `response.completed` frame carries
+`timings`, while the **non-streaming** `/v1/responses` body carries no
+`timings` object at all — as no Anthropic shape and no ASR response does
+either, so `DraftTokens` stays 0 on all of them whatever the upstream is
+actually doing. The code has exactly three
 read sites for the counter, one per shape on that list and none on a
 non-streaming Responses body: two in `provider/openai_compatible.go` (the
 chat body and the chat stream's chunks) and `mergeResponsesUsage`
