@@ -253,7 +253,14 @@ func TestFeaturesDeclareRuntimeUpstreamProps(t *testing.T) {
 	if !found {
 		t.Fatal("Features does not declare runtime_upstream_props")
 	}
-	if Version != "0.7.0" {
-		t.Fatalf("Version = %q, want 0.7.0 (one bump per shipped change; 0.6.0 has shipped)", Version)
+	// The version assertion lives here, beside the newest feature, and it
+	// is the forcing function for the repository's bump rule: a change that
+	// moves Version has to come THROUGH this test and state which rule it
+	// followed. 0.7.1 is the ollama-capabilities branch's PATCH bump (issue
+	// #54, see the Version constant's own block) -- PATCH because Features
+	// gains no entry, which is also why runtime_upstream_props' Since above
+	// stays at the 0.7.0 it shipped in rather than following Version.
+	if Version != "0.7.1" {
+		t.Fatalf("Version = %q, want 0.7.1 (one bump per shipped change: 0.7.0 has shipped, and #54 adds no Features entry, so it is PATCH)", Version)
 	}
 }

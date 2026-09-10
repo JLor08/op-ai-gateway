@@ -119,7 +119,27 @@ import (
 // entire reason for existing is the gateway's fail-closed gate on this
 // probing (the PushRuntimeConfig precedent), so deploying this agent is
 // what turns the gateway-side probing on.
-const Version = "0.7.0"
+//
+// 0.7.0 -> 0.7.1 is the single bump for the ollama-capabilities branch
+// (issue #54): the context probe for an "ollama"-typed spec now POSTs
+// /api/show instead of GETting it (upstream answers a GET with a 405, so
+// that probe could never succeed), a second capability probe reads Ollama's
+// declared "capabilities" array from that same endpoint, both per-child
+// caches invalidate on a changed st.Model, and the capability sample names
+// the probe that produced it as sample.Capabilities.Source.
+//
+// PATCH, not MINOR, and the rule decides it rather than the size of the
+// change: agent.Features gains NO entry. A feature flag exists so a gateway
+// can tell "this binary will never answer" from "the answer is still
+// coming", and nothing waits on any of the above. The new Source field is
+// additive and its absence keeps the gateway's historical default; an older
+// agent asked to probe an Ollama child GETs /props, which that child
+// answers with a 404, so it reports no verdicts and the gateway writes no
+// rows at all -- there is nothing for a gateway to gate, and nothing for it
+// to wait for. Note the deliberate asymmetry with
+// runtime_upstream_props' own Since ("0.7.0", unchanged): a Since records
+// the version a feature SHIPPED in, and this bump ships no feature.
+const Version = "0.7.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
