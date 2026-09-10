@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -474,6 +475,56 @@ func detectCapabilities(body []byte) Capabilities {
 	return out
 }
 
+// maxOllamaExtraCapabilities bounds how many names detectOllamaCapabilities
+// carries into Capabilities.Extra out of ONE /api/show document, and
+// maxOllamaCapabilityNameBytes bounds how long one such name may be. Both
+// numbers are read off a ceiling the system actually has rather than picked
+// for looking reasonable, and both CLAMP rather than reject -- the same
+// discipline as maxRuntimeSamplesPerSample on the gateway's ingest side.
+//
+//   - THE FRAME, 1 MiB. Every carried name becomes one telemetry wire entry
+//     (`{"name":"...","verdict":"yes"}` -- ~34 bytes of scaffolding plus the
+//     name itself) inside the ONE agent->gateway WebSocket frame, whose cap
+//     is gwapi.MaxWSFrameBytes / the gateway's maxAgentFrameBytes. A frame
+//     one byte over that is not a dropped message: the read fails and the
+//     socket closes 1009, taking down the single connection telemetry, the
+//     system and runtime reports, the runtime_config push and the
+//     certificate doorbell all share -- and nothing on the write path sizes
+//     a telemetry frame against the cap. Measured before this bound
+//     existed: a 965,058-byte /api/show body (valid JSON, comfortably under
+//     fetchProbeBodyWith's own 1 MiB read cap) declared 107,615 short names
+//     and produced a 3,655,456-byte capabilities object -- 3.5x the frame
+//     cap, rebuilt every cycle, because a stable verdict set is CACHED for
+//     the whole pid generation. At 64 names of at most 128 bytes one child
+//     contributes at most ~10 KiB, so the frame's size now follows the
+//     number of children an OPERATOR configured and never what a
+//     third-party model manifest declares.
+//   - THE INDEX, 2704 bytes. A name is half of
+//     model_mapping_capabilities' primary key (mapping_id, capability), and
+//     a PostgreSQL btree index tuple may not exceed that. Since
+//     UpsertMappingCapabilities is atomic, ONE over-long name fails the
+//     whole statement and drops EVERY capability row for that mapping --
+//     silently, one function above a Debug-level log. 128 bytes sits a
+//     factor of 21 below the ceiling, with room for the mapping_id sharing
+//     the tuple.
+//
+// Both are orders of magnitude above the real vocabulary: Ollama's own
+// detection declares at most eight names, the longest of them "completion"
+// at ten bytes. They are also the pair this system already uses against
+// this same 1 MiB frame ceiling -- the runtime-log subscribe path bounds a
+// spec id at 128 bytes and one server's watched specs at 64 for the
+// identical reason. That path REJECTS where this one clamps, and the
+// difference is what the caller can express: a rejected subscription would
+// hand back a window guaranteed to stay empty, while a dropped capability
+// leaves a row absent, which this model already reads as "unknown".
+//
+// The input side is bounded too, by maxOllamaShowConclusiveBodyBytes on
+// ProbeOllamaVerdicts.
+const (
+	maxOllamaExtraCapabilities   = 64
+	maxOllamaCapabilityNameBytes = 128
+)
+
 // detectOllamaCapabilities is the Ollama sibling of detectCapabilities
 // (#54 project, task 1): it reads the "capabilities" array of a
 // POST /api/show response body and maps each declared name to a
@@ -516,6 +567,14 @@ func detectCapabilities(body []byte) Capabilities {
 //     lower-case, so this only ever normalises a publisher's string.
 //   - duplicates collapse to their first occurrence, in both the structured
 //     fields (idempotent by construction) and Extra (explicit dedup).
+//   - the carried names are BOUNDED, in count and in length
+//     (maxOllamaExtraCapabilities / maxOllamaCapabilityNameBytes, whose own
+//     doc records the two ceilings those numbers are read off). Past the
+//     count later names are dropped but the loop keeps SCANNING, so a tail
+//     of publisher strings can never displace a structured verdict; past
+//     the length a name is DROPPED rather than truncated, because a
+//     truncated name is a different capability. Either drop is reported
+//     once, at Warn.
 //
 // This function is AGENT-ONLY today: server-agent is the only module that
 // probes Ollama's /api/show, so unlike detectCapabilities and
@@ -532,7 +591,8 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 		return Capabilities{}
 	}
 	var caps Capabilities
-	seen := make(map[string]bool, len(doc.Capabilities))
+	var droppedOverLength, droppedOverLimit int
+	seen := make(map[string]bool, maxOllamaExtraCapabilities)
 	for _, raw := range doc.Capabilities {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		if name == "" || name == "completion" || seen[name] {
@@ -547,8 +607,46 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 		case "audio":
 			caps.Audio = "yes"
 		default:
-			caps.Extra = append(caps.Extra, name)
+			// The clamp stops APPENDING; it does not stop the loop. A
+			// break here would let a hostile tail of publisher strings
+			// displace the structured verdicts above -- 64 junk names
+			// followed by "vision" would lose the one verdict a consumer
+			// actually reasons about.
+			switch {
+			case len(name) > maxOllamaCapabilityNameBytes:
+				// DROPPED, deliberately not truncated: a truncated name
+				// is a DIFFERENT capability, and it would be written as a
+				// confident "yes" under a name nothing upstream ever
+				// declared.
+				droppedOverLength++
+			case len(caps.Extra) >= maxOllamaExtraCapabilities:
+				droppedOverLimit++
+			default:
+				caps.Extra = append(caps.Extra, name)
+			}
 		}
+	}
+	if dropped := droppedOverLength + droppedOverLimit; dropped > 0 {
+		// A clamp is a DEGRADE, so it is observable: one Warn at the site
+		// that drops, naming how many names went and why. Warn rather than
+		// Debug because the agent's own default level is info
+		// (main.newLogger takes Debug only under --verbose), so a Debug
+		// line is invisible in every default deployment -- the identical
+		// argument the gateway's ingest makes for its own drop warnings.
+		// Without it the clamp is silent by construction: the rows simply
+		// never appear, and a missing row is what this model already means
+		// by "unknown".
+		//
+		// It repeats once per pid generation, not once per cycle: a stable
+		// verdict set is cached by the caller (probeRuntimeChildProps).
+		slog.Warn("ollama capability names dropped from the /api/show array",
+			"declared", len(doc.Capabilities),
+			"dropped", dropped,
+			"dropped_over_length", droppedOverLength,
+			"dropped_over_limit", droppedOverLimit,
+			"kept", len(caps.Extra),
+			"max_names", maxOllamaExtraCapabilities,
+			"max_name_bytes", maxOllamaCapabilityNameBytes)
 	}
 	return caps
 }
@@ -559,6 +657,32 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 // this path, the same way LiveProgressProbePath is fixed for
 // ProbePropsVerdicts.
 const ollamaShowPath = "/api/show"
+
+// maxOllamaShowConclusiveBodyBytes bounds the INPUT side of Ollama's
+// capability detection, which detectOllamaCapabilities' own two clamps
+// cannot: a verdict set that comes back stable is cached for the whole pid
+// generation, so an implausible document must not get to freeze whichever
+// names the clamp happened to keep. Past this size the body is reported as
+// no verdicts at all, which leaves every capability UNKNOWN -- the state
+// this model expresses natively as the absence of a row.
+//
+// 256 KiB is a quarter of the 1 MiB ceiling that matters twice over
+// (fetchProbeBodyWith's read cap and the agent->gateway frame cap), and
+// roughly fifty times the largest real answer: this probe sends
+// {"model": "..."} with no "verbose" flag, so Ollama returns the compact
+// form of /api/show -- a few KB.
+//
+// The verdict is CONCLUSIVE (stable == true), which is the existing rule
+// applied rather than a new one: "any other well-formed body that simply is
+// not that document" has always been conclusive here, and a complete body
+// this far past any real /api/show is exactly that. The alternative --
+// treating it as transient -- would re-read and re-parse a quarter-megabyte
+// document once per collect cycle for the child's whole life and, since the
+// caller only logs a retry at Debug, do it invisibly; conclusive costs one
+// read and one Warn per pid generation. A body that is not complete keeps
+// its own answer: the json.Valid check below runs first and still says
+// "ask again".
+const maxOllamaShowConclusiveBodyBytes = 1 << 18
 
 // ProbeOllamaVerdicts is the Ollama sibling of ProbePropsVerdicts (issue
 // #54): it POSTs baseURL+ollamaShowPath ("/api/show") with body
@@ -610,8 +734,16 @@ func ProbeOllamaVerdicts(ctx context.Context, client *http.Client, baseURL, mode
 	}
 	if !json.Valid(body) {
 		// Syntactically invalid/truncated JSON reads as a child still
-		// mid-response, not a conclusive answer -- do not cache it.
+		// mid-response, not a conclusive answer -- do not cache it. This
+		// check stays FIRST so a body truncated by the 1 MiB read cap
+		// keeps its long-standing "ask again" answer rather than being
+		// re-classified by the size rule below.
 		return PropsVerdicts{}, false
+	}
+	if len(body) > maxOllamaShowConclusiveBodyBytes {
+		slog.Warn("ollama /api/show body implausibly large, reporting no capability verdicts",
+			"bytes", len(body), "max_bytes", maxOllamaShowConclusiveBodyBytes)
+		return PropsVerdicts{}, true
 	}
 	return PropsVerdicts{
 		LiveProgress: "",

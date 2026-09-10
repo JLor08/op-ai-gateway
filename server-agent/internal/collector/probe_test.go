@@ -4,8 +4,11 @@
 package collector
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -656,6 +659,187 @@ func TestDetectOllamaCapabilities(t *testing.T) {
 			}
 		})
 	}
+}
+
+// captureAtTheAgentsDefaultLevel redirects the default slog logger to a
+// buffer at INFO -- the level a real agent runs at (main.newLogger takes
+// Debug only under --verbose) -- for the duration of the test.
+//
+// It exists beside captureDebug (power_logging_test.go) rather than reusing
+// it, and the difference is the whole point of the tests below: a Debug
+// record never reaches this buffer, exactly as it never reaches a default
+// deployment's log, so a capture at Debug would pass whatever level the code
+// under test happened to choose.
+func captureAtTheAgentsDefaultLevel(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// ollamaCapabilitiesBody builds a valid /api/show body declaring exactly the
+// given capability names, in order.
+func ollamaCapabilitiesBody(names ...string) string {
+	quoted := make([]string, 0, len(names))
+	for _, n := range names {
+		quoted = append(quoted, `"`+n+`"`)
+	}
+	return `{"capabilities":[` + strings.Join(quoted, ",") + `]}`
+}
+
+// ollamaNames builds n distinct short publisher-style capability names.
+func ollamaNames(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("pub.cap%d", i))
+	}
+	return out
+}
+
+// TestDetectOllamaCapabilitiesCarriesTheBoundIntact is the AT-THE-BOUND half
+// of the clamp (I-1): a document declaring exactly maxOllamaExtraCapabilities
+// names, one of them exactly maxOllamaCapabilityNameBytes long, is carried
+// whole -- nothing dropped, nothing truncated, and no Warn, because nothing
+// degraded. Without it a clamp off by one in the strict direction would pass
+// the over-the-bound test below and quietly discard a legitimate name.
+func TestDetectOllamaCapabilitiesCarriesTheBoundIntact(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	atTheLimit := strings.Repeat("z", maxOllamaCapabilityNameBytes)
+	names := append(ollamaNames(maxOllamaExtraCapabilities-1), atTheLimit)
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(names...)))
+
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("len(Extra) = %d, want %d -- a document AT the bound must be carried whole", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	if caps.Extra[len(caps.Extra)-1] != atTheLimit {
+		t.Fatalf("the %d-byte name did not survive: last Extra entry = %q", maxOllamaCapabilityNameBytes, caps.Extra[len(caps.Extra)-1])
+	}
+	if out := buf.String(); strings.Contains(out, "level=WARN") {
+		t.Fatalf("a document at the bound warned about a drop; log =\n%s", out)
+	}
+}
+
+// TestDetectOllamaCapabilitiesClampsPastTheBound is the OVER-the-bound half,
+// and it carries the property that makes the clamp safe rather than merely
+// bounded: the three structured verdicts survive it.
+//
+// The document declares maxOllamaExtraCapabilities+16 publisher strings and
+// puts "vision", "tools" and "audio" LAST, which is exactly the arrangement a
+// `break` at the cap would lose -- the four names a consumer reasons about
+// displaced by junk that arrived first. The clamp therefore stops appending
+// and keeps scanning.
+//
+// The Warn is asserted at the agent's own default level, and it must say HOW
+// MANY names went: a clamp is otherwise silent by construction, since a
+// dropped verdict shows up as a missing row and a missing row is what this
+// whole model already means by "unknown".
+func TestDetectOllamaCapabilitiesClampsPastTheBound(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	const over = 16
+	names := append(ollamaNames(maxOllamaExtraCapabilities+over), "vision", "tools", "audio")
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(names...)))
+
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("len(Extra) = %d, want exactly %d -- the array must be clamped, not carried", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	if caps.Vision != "yes" || caps.Tools != "yes" || caps.Audio != "yes" {
+		t.Fatalf("the structured verdicts were displaced by the clamp: %+v -- a hostile tail must not be able to cost a consumer the verdicts it reasons about", caps)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "ollama capability names dropped") {
+		t.Fatalf("no WARN record about the clamp at the agent's default level (info); log =\n%s -- a silent clamp is indistinguishable from a probe that never ran", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("dropped=%d", over)) {
+		t.Fatalf("the WARN record does not say how many names were dropped (want dropped=%d); log =\n%s", over, out)
+	}
+}
+
+// TestDetectOllamaCapabilitiesDropsAnOverlongName pins the second bound and
+// the DIRECTION of its failure: a name past maxOllamaCapabilityNameBytes is
+// dropped, never truncated.
+//
+// Truncating would be worse than dropping rather than merely different: the
+// prefix is a DIFFERENT capability, and it would be stored as a confident
+// "yes" under a name nothing upstream ever declared -- while the real reason
+// the length is bounded at all is that one over-long name is half of
+// model_mapping_capabilities' primary key, and a btree index tuple past
+// PostgreSQL's 2704-byte maximum fails the whole atomic upsert, dropping
+// EVERY capability row for that mapping.
+//
+// The sibling name proves the drop is the long one and not the pass: "tools"
+// still lands.
+func TestDetectOllamaCapabilitiesDropsAnOverlongName(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	tooLong := strings.Repeat("q", maxOllamaCapabilityNameBytes+1)
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(tooLong, "tools")))
+
+	if len(caps.Extra) != 0 {
+		t.Fatalf("Extra = %q, want empty -- an over-long name must be dropped, and a TRUNCATED one would be a different capability written as a confident yes", caps.Extra)
+	}
+	if caps.Tools != "yes" {
+		t.Fatalf("Tools = %q, want \"yes\" -- the over-long name must cost only itself", caps.Tools)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "dropped_over_length=1") {
+		t.Fatalf("no WARN record naming the over-length drop; log =\n%s", out)
+	}
+}
+
+// TestProbeOllamaVerdictsRefusesAnImplausiblyLargeBody bounds the INPUT, not
+// just the output. Both cases send the SAME declaration ("vision"), so the
+// only difference between them is the document's size:
+//
+//   - at the bound the verdict is read normally -- Vision "yes";
+//   - one byte past it the probe reports NO verdicts at all, so the
+//     capability stays unknown rather than being answered out of a document
+//     that cannot be an /api/show reply.
+//
+// The refusal is CONCLUSIVE (stable == true) on purpose, and that is the
+// existing rule rather than a new one: a well-formed body that simply is not
+// the document asked for has always been conclusive here. Treating it as
+// transient would re-read and re-parse a quarter-megabyte body once per
+// collect cycle for the child's whole life, and do it invisibly, since the
+// caller only logs a retry at Debug.
+func TestProbeOllamaVerdictsRefusesAnImplausiblyLargeBody(t *testing.T) {
+	// A valid /api/show body of exactly n bytes that declares "vision".
+	body := func(n int) string {
+		head := `{"capabilities":["vision"],"license":"`
+		tail := `"}`
+		return head + strings.Repeat("a", n-len(head)-len(tail)) + tail
+	}
+
+	t.Run("at the bound the verdict is read", func(t *testing.T) {
+		at := body(maxOllamaShowConclusiveBodyBytes)
+		if len(at) != maxOllamaShowConclusiveBodyBytes {
+			t.Fatalf("test body is %d bytes, want %d", len(at), maxOllamaShowConclusiveBodyBytes)
+		}
+		ts := newProbeServer(t, at)
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+		if !stable || verdicts.Caps.Vision != "yes" {
+			t.Fatalf("ProbeOllamaVerdicts = (%+v, %v), want Vision \"yes\" and stable -- a body AT the bound is a real answer", verdicts, stable)
+		}
+	})
+
+	t.Run("one byte past the bound reports nothing", func(t *testing.T) {
+		buf := captureAtTheAgentsDefaultLevel(t)
+		ts := newProbeServer(t, body(maxOllamaShowConclusiveBodyBytes+1))
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Fatalf("ProbeOllamaVerdicts = %+v, want the zero verdict set -- an implausible document must leave every capability UNKNOWN, not answer one out of it", verdicts)
+		}
+		if !stable {
+			t.Fatalf("stable = false, want true -- a COMPLETE body that is not this document is conclusive here, so it costs one read per pid generation instead of one per cycle")
+		}
+		out := buf.String()
+		if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "implausibly large") {
+			t.Fatalf("no WARN record about the oversized body at the agent's default level (info); log =\n%s", out)
+		}
+	})
 }
 
 // TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this

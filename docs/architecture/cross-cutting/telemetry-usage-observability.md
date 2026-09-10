@@ -956,6 +956,63 @@ a cloud publisher wrote into its manifest — is a real assertion and is kept
 verbatim, which is what the open vocabulary exists for rather than an
 exception to it.
 
+**The open vocabulary is BOUNDED, because `/api/show` is the first document
+in this system that puts third-party strings of unbounded count and length
+onto the telemetry wire.** The detector clamps both: at most **64** names
+reach `Extra`, and a name longer than **128 bytes** is dropped. Neither
+number is a taste judgement — each is read off a ceiling this system
+actually has.
+
+- **The count answers the FRAME.** Every carried name becomes one wire entry
+  inside the single agent↔gateway WebSocket frame, whose cap is 1 MiB
+  (`gwapi.MaxWSFrameBytes` / the gateway's `maxAgentFrameBytes`), and a frame
+  one byte over it fails the read and closes 1009 — taking down the one
+  connection telemetry, the system and runtime reports, the
+  `runtime_config` push and the certificate doorbell all share. Nothing on
+  the write path sizes a telemetry frame against that cap. Measured before
+  the bound existed: a 965,058-byte `/api/show` body — valid JSON, and under
+  the probe's own 1 MiB read cap — declared 107,615 names and produced a
+  3,655,456-byte `capabilities` object, 3.5× the frame cap; and since a
+  stable verdict set is cached for the whole pid generation, every later
+  cycle would have rebuilt the same oversized frame. Clamped, one child
+  contributes at most ~10 KiB, so the frame's size follows the number of
+  children an operator configured and never what a model manifest declares.
+- **The length answers the INDEX.** A capability name is half of
+  `model_mapping_capabilities`' primary key `(mapping_id, capability)`, a
+  PostgreSQL btree index tuple may not exceed 2704 bytes, and
+  `UpsertMappingCapabilities` is atomic — so ONE over-long name would fail
+  the whole statement and drop **every** capability row for that mapping.
+
+The pair `64`/`128 bytes` is the same pair the runtime-log subscribe path
+already uses against the same frame ceiling
+([Agent-Managed Model Runtime
+§14.5](agent-runtime-manager.md#145-overflow-is-always-visible)),
+which **rejects** where this one **clamps** — the difference being what the
+caller can express: a rejected subscription hands back a window guaranteed
+to stay empty, while a dropped capability simply leaves a row absent, and an
+absent row is what this model already means by "unknown". Three properties
+make the clamp safe rather than merely bounded. It stops **appending** but
+keeps **scanning**, so a hostile tail of publisher strings can never
+displace `vision`/`tools`/`audio`. An over-long name is **dropped, never
+truncated**: a truncated name is a *different* capability, and it would be
+stored as a confident `yes` under a name nothing upstream ever declared. And
+every drop is reported **once, at `Warn`, with its count** — the agent's own
+default level is info, and a clamp is otherwise silent by construction,
+since a dropped verdict shows up only as a missing row.
+
+**The INPUT is bounded too, not just the output.** A *complete* body over
+**256 KiB** — a quarter of that same 1 MiB ceiling, and roughly fifty times
+the largest real answer, since this probe sends no `verbose` flag and gets
+the compact form — is reported as **no verdicts at all**, so every capability
+stays unknown instead of being answered out of whichever 64 names the clamp
+happened to keep. That refusal is *conclusive*, which is the existing rule
+applied rather than a new one ("any other well-formed body that simply is not
+that document" has always been conclusive here): it therefore costs one read
+and one `Warn` per pid generation instead of re-reading a quarter-megabyte
+document every collect cycle for the child's whole life, invisibly, since the
+caller logs only a Debug retry. A body that is *not* complete keeps its own
+answer — the truncated-JSON check runs first and still says "ask again".
+
 **The probe NAMES itself, and its name ranks with the other probe.** The
 agent reports `capabilities.source` on the wire — `llama_cpp_props` or
 `ollama_api_show` (`routing.CapabilitySourceOllamaAPIShow`) — and the gateway
