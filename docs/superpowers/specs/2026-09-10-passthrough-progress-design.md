@@ -41,14 +41,28 @@ self-correct if blended into a routing input. No write from this path.
 
 This asymmetry is the design, not a shortfall to be papered over.
 
+Every cell below is about the **mid-stream** row — what the panel shows while generation is still
+running, which is the whole point of the feature. That is a different question from what the
+upstream's **terminal** frame reports, and the Responses column is where the two answers differ, so
+the table names both.
+
 | | `anthropic_messages` | `openai_responses` |
 |---|---|---|
 | TTFT | yes — the first-content stamp exists | yes — same |
-| in-flight output tokens | yes — `message_delta` carries a cumulative `output_tokens`, already merged frame by frame | **no honest source**: the `*.delta` partials carry no usage, and counting deltas as tokens is rejected policy here ("no tokenizer to count with") |
-| in-flight rate | derived over the window from the first content frame — llama.cpp attaches no `timings` to any Anthropic frame, so this is the only source, exactly as for this flavor's end-of-request rate | only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to partial frames |
+| in-flight output tokens | yes, from the first `message_delta` on — it carries a cumulative `output_tokens`, already merged frame by frame | **no mid-stream source**: the `*.delta` partials carry no usage, and counting deltas as tokens is rejected policy here ("no tokenizer to count with"). The **terminal** `response.completed` does carry the upstream's own final `response.usage.output_tokens`, and it is published — so the count appears on the still-active row for the short window before that row leaves the panel |
+| in-flight rate | derived over the window from the first content frame — llama.cpp attaches no `timings` to any Anthropic frame, so this is the only source, exactly as for this flavor's end-of-request rate | mid-stream only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to partial frames (labelled `upstream`). Without it, no mid-stream rate — but once the terminal count above lands, the same window derivation applies to it (labelled `gateway`) for that same short window |
 
-A test must pin both rows, so that a later change cannot quietly satisfy the Responses column by
-counting deltas.
+So the honest one-line summary of the Responses column is *"nothing to show mid-stream unless the
+client asked for it"* — not *"nothing to show"*. The terminal-frame figure is the upstream's own
+count over the real generation window: the same quantity, the same arithmetic and the same
+`gateway` label the Anthropic column carries throughout its stream, so there is no reason to
+suppress it for the seconds it is visible.
+
+A test must pin both rows in both directions — the value where one exists and the explicit absence
+where none does — so that a later change cannot quietly satisfy the Responses column by counting
+deltas. Pinning the terminal cell is what makes "a delta is not a token" testable at its sharpest:
+with the upstream's exact count on the row, a delta-derived contribution added to it is visible as a
+wrong number rather than merely as a number where there should be none.
 
 ## 4. Out of scope
 

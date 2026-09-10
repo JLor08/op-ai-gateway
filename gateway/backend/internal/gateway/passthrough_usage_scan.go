@@ -339,10 +339,18 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 //     "terminal" alone is not the test — "terminal AND carries the total" is.
 //
 // Responses: `response.completed`, whose nested `response.usage` is the final
-// count and onto which llama.cpp bolts its `timings` object. Written down for
-// symmetry with isContentFrame; the Responses shape takes no derived rate at all
-// (see usage()), and a buffered Responses body carries no `type` discriminator to
-// match on, so this branch is inert either way today.
+// count and onto which llama.cpp bolts its `timings` object. This branch is
+// LOAD-BEARING for the LIVE column — do not delete it as unused: publishProgress
+// gates the live output-token count on this predicate, so `response.completed`
+// is the one frame that puts a Responses stream's own final count on the
+// still-active running-connections row (and liveProgressDTO then derives a
+// window rate from it), for the window between that frame and proxyNative's
+// deferred Active.Remove. Pinned by
+// TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves.
+//
+// For the RECORDED row it changes nothing: usage()'s derived rate is Anthropic-
+// only, so the Responses shape takes no derived rate there (see usage()), and a
+// buffered Responses body carries no `type` discriminator to match on.
 func isTerminalUsageFrame(apiFlavor string, payload []byte) bool {
 	var probe struct {
 		Type string `json:"type"`

@@ -454,3 +454,67 @@ func TestPassthroughLiveProgressWritesNoRoutingInput(t *testing.T) {
 		t.Fatalf("UpdateMappingOpportunisticMetrics calls = %d, want exactly 1 (the unchanged end-of-request write); anything more is an in-flight sample reaching a routing input", got)
 	}
 }
+
+// TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves pins the
+// `openai_responses` cell the other two Responses tests leave uncovered: the
+// flavor has no MID-STREAM source for a count, but the TERMINAL
+// response.completed frame carries the upstream's own final
+// `response.usage.output_tokens`, isTerminalUsageFrame accepts it, and
+// publishProgress therefore puts it on the row. For the brief window between
+// that frame and proxyNative's deferred Active.Remove, the still-active row
+// displays that count AND the window rate liveProgressDTO derives from it.
+//
+// That is deliberate, not a leak: the figure is the upstream's own count over
+// the real generation window — the same arithmetic and the same `gateway` label
+// the Anthropic column carries for its whole stream. Only the mid-stream cells
+// are empty here.
+//
+// It is also where "a delta is not a token" is pinned at its sharpest. The other
+// two Responses tests assert an ABSENT count, which an implementation could
+// satisfy by publishing nothing at all; this one asserts the displayed count is
+// EXACTLY the upstream's 40 while two content deltas went past, so any
+// gateway-counted contribution added to the upstream's figure shows up here as
+// 42.
+func TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves(t *testing.T) {
+	var got liveRow
+	prov := &progressObservingProxyProvider{
+		pieces: []string{
+			"event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n",
+			"event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":" there"}` + "\n\n",
+			"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_x","usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}}}` + "\n\n",
+		},
+		gap: framePacing,
+	}
+	srv := newNativeProxyTestServer(prov, true, false)
+	prov.observe = func() { got = snapshotLiveRow(t, srv) }
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !got.hasProgress {
+		t.Fatalf("in-flight row carried no Progress counter at all: a streaming passthrough request must get one")
+	}
+	if got.ttftMS <= 0 {
+		t.Fatalf("live ttft_ms = %d, want > 0 (the first response.output_text.delta arrived %v in)", got.ttftMS, framePacing)
+	}
+	if got.outputTokens != 40 {
+		t.Fatalf("live output_tokens = %d, want exactly 40 — response.completed's nested response.usage.output_tokens, the upstream's own count with no delta-derived contribution added to it", got.outputTokens)
+	}
+	if got.source != "gateway" {
+		t.Fatalf("live tokens_per_second_source = %q, want %q (the client set no timings_per_token, so the window derivation over the upstream's own count is the only source)", got.source, "gateway")
+	}
+	if got.tps <= 0 {
+		t.Fatalf("live tokens_per_second = %v, want > 0 (40 tokens over the generation window)", got.tps)
+	}
+	if strings.Contains(string(prov.gotBody), "timings_per_token") {
+		t.Fatalf("relayed body grew a timings_per_token flag the client never sent: %s", prov.gotBody)
+	}
+}
