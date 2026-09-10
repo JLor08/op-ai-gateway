@@ -134,6 +134,47 @@ describe('running-connections (active requests) i18n keys', () => {
   });
 });
 
+describe('live tokens/sec provenance strings claim only what the row can know', () => {
+  it('does not pin the missing rate on the upstream, because the absence is client-dependent', () => {
+    // The tooltip used to read "this upstream reports no exact token count
+    // mid-stream" — a CAUSE, and the wrong one for a native-passthrough
+    // openai_responses stream: llama.cpp attaches its own `timings` to the partial
+    // frames whenever the CLIENT set timings_per_token, so the very same upstream
+    // would have reported a rate had it been asked. Nothing on the active-request
+    // DTO separates that from a translated stream whose provider genuinely reports
+    // neither figure — api_flavor is identical for a translated and a
+    // passed-through /v1/responses request, and no field records what the client
+    // asked for — so the string must not assert either cause.
+    expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream reports/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream meldet/i);
+  });
+
+  it('keeps the not-measured framing and names the client as a factor, in both locales', () => {
+    // "Not measured" (never a zero) plus the two facts this surface can observe:
+    // no upstream rate, and no exact count to derive one from. The client is named
+    // as one of the two dependency axes, which is what stops the sentence reading
+    // as an upstream limitation.
+    expect(messages.en.activityLiveTpsNone).toMatch(/not measured/i);
+    expect(messages.en.activityLiveTpsNone).toMatch(/client/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/nicht gemessen/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/client/i);
+  });
+
+  it('leaves the upstream-reported string free of any token claim', () => {
+    // A native-passthrough openai_responses stream WITH timings_per_token produces
+    // the row shape "rate present, token count 0": the upstream's own rate arrives
+    // on the partial frames while those partials carry no usage. This is the string
+    // shown there, so interpolating a count into it (as activityLiveTpsGateway
+    // legitimately does) would make it claim "computed from 0 tokens".
+    expect(messages.en.activityLiveTpsUpstream).not.toMatch(/token/i);
+    expect(messages.de.activityLiveTpsUpstream).not.toMatch(/token/i);
+    for (const m of [messages.de, messages.en]) {
+      expect(m.activityLiveTpsUpstream).not.toContain('{n}');
+      expect(m.activityLiveTpsGateway).toContain('{n}');
+    }
+  });
+});
+
 describe('activity time-series i18n keys', () => {
   it('defines all time-series chart/control keys in de and en', () => {
     const keys = [

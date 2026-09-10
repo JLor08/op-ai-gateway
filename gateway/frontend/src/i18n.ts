@@ -1806,7 +1806,7 @@ const de = {
   activityLiveTpsUpstream: 'Vom Inferenzserver gemeldet',
   activityLiveTpsGateway: 'Vom Gateway berechnet aus {n} vom Server gemeldeten Tokens',
   activityLiveTpsNone:
-    'Nicht gemessen — dieser Upstream meldet mitten im Stream keine exakte Tokenzahl',
+    'Nicht gemessen — keine Rate vom Inferenzserver und keine exakte Tokenzahl, aus der eine berechnet werden könnte; ob eines von beiden mitten im Stream ankommt, hängt vom Upstream und von der Anfrage des Clients ab',
   activityColPath: 'Pfad',
   activityColContentType: 'Content-Type',
   activityColCached: 'Cached',
@@ -4023,7 +4023,8 @@ const en: PortalMessages = {
   activityColTTFT: 'TTFT',
   activityLiveTpsUpstream: 'Reported by the inference server',
   activityLiveTpsGateway: 'Computed by the gateway from {n} tokens the server reported',
-  activityLiveTpsNone: 'Not measured — this upstream reports no exact token count mid-stream',
+  activityLiveTpsNone:
+    'Not measured — no rate from the inference server, and no exact token count to derive one from; whether either arrives mid-stream depends on the upstream and on what the client requested',
   activityColPath: 'Path',
   activityColContentType: 'Content type',
   activityColCached: 'Cached',
