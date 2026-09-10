@@ -177,6 +177,7 @@ The portal ships German and English as first-class, always-shipped-together lang
 - The system-wide default is `OP_AI_GATEWAY_DEFAULT_LANGUAGE` (default `"de"`, see `gateway/backend/internal/config/config.go`), readable/writable through system settings.
 - A signed-in user can override it per-account (`User.PreferredLanguage`, `gateway/backend/internal/portal/service.go`) via `PUT /api/portal/language`; an anonymous/pre-auth viewer gets the system default.
 - `portal.KnownLanguages()` / `IsKnownLanguage()` (`gateway/backend/internal/portal/service_system_settings.go`) are the single source of truth for valid language ids on the backend, mirroring the frontend's `Locale` union.
+- **The compiler guarantees the key set, never the truth of the sentence.** A helper text or a tooltip is an assertion about behaviour, and nothing compares it against the behaviour: no gate can. So a change that removes or alters a behaviour has to sweep `i18n.ts` the way it sweeps comments — and this is the copy the operator actually reads, which makes it the worst place for a stale claim to survive. The scorer's flat MTP bonus outlived its own deletion here, in the German and English helper text under the operator's MTP control, which went on telling them that resetting the verdict would also drop the bonus in server selection ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
 
 ## 9. Status colours: there are exactly three
 

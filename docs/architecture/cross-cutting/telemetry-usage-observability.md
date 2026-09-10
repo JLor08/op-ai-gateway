@@ -1082,20 +1082,37 @@ rest of the pass still lands — a `vision` or `tools` verdict is something
 consequence follows: a `live_progress` row can now only ever carry
 `llama_cpp_props`.
 
-**Two names are RESERVED and may not arrive from a probe at all: `mtp` and
-`live_progress`.** The criterion is that this codebase *reasons about* both
-and neither detector can *observe* either, so a probe reporting one is
-reporting a publisher's string or a bug, never evidence. `mtp` is detected
-nowhere today — the row comes from the portal's operator checkbox (`manual`)
-or its model-name heuristic (`legacy`) — and it feeds the router's +30 MTP
-bonus through `MappingCandidate.IsMTP`; `live_progress` has a dedicated wire
-field of its own, and for an Ollama child that field is always `""`, so a
-manifest string would not merely collide with the dedicated answer, it would
-*be* the answer, and the router would then send `timings_per_token` to an
-upstream that does not understand it. Both were unreachable before this
-detector existed, because nothing produced the open `Extra` list at all.
-`vision`/`video`/`audio`/`tools` are deliberately **not** reserved: those
-four are exactly what the two detectors read out of their documents.
+**Three names are RESERVED and may not arrive from a probe at all: `mtp`,
+`live_progress` and `speculation_observed`.** The criterion is that this
+codebase *reasons about* all three and no detector can *observe* any of them,
+so a probe reporting one is reporting a publisher's string or a bug, never
+evidence. `mtp` is detected nowhere today — the row comes from the portal's
+operator checkbox (`manual`) or its model-name heuristic (`legacy`) — and it
+feeds nothing at all any more: the router's flat +30 MTP bonus that once read
+it through `MappingCandidate.IsMTP` is deleted, and the candidate carries no
+`mtp` verdict to read ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
+What a probe's `yes` would still do is overwrite that DISPLAY for every
+mapping neither the operator nor the heuristic ever touched, presenting an
+unvetted manifest string as an attested capability. `live_progress` has a
+dedicated wire field of its own, and for an Ollama child that field is always
+`""`, so a manifest string would not merely collide with the dedicated answer,
+it would *be* the answer, and the router would then send `timings_per_token`
+to an upstream that does not understand it. Those two were unreachable before
+this detector existed, because nothing produced the open `Extra` list at all.
+`speculation_observed` is the third, and it is the one where a probe's verdict
+would be **permanent**. Neither `/props` nor `/api/show` says anything about
+speculative decoding, so no honest agent has anything to report here in either
+direction; a `no` is a verdict the capability itself says cannot exist; and it
+would arrive at rank 1, which TIES the gateway's own `llama_cpp_timings` row —
+writable by design. What makes a tie safe everywhere else is that the losing
+writer repairs its row on the next cadence tick, and that repair is exactly
+what this one does not have: the gateway writes the row at most once per
+mapping per PROCESS lifetime, so it never rewrites what it wrote, and a false
+verdict would stand until a restart. No other rank-1 capability has that
+property, which is why the criterion above ("reasons about it, cannot observe
+it") is met here by the gateway's own observation rather than by a detector's
+silence. `vision`/`video`/`audio`/`tools` are deliberately **not** reserved:
+those four are exactly what the two detectors read out of their documents.
 
 The rule is enforced at the **ingest**, because that is the boundary in the
 path of a buggy or hostile agent putting the name straight into its verdict
@@ -1169,21 +1186,74 @@ the rules they share (`agent_ingest.go` names its sibling explicitly, and so
 does `probedCapabilityRows`).
 
 Their *differences* are what a rule has to be placed against. The
-reserved-name refusal — `mtp` and `live_progress` may not arrive from a probe
-— lives on the **agent-ingest path only**, deliberately: that is the boundary
-where an agent's bytes arrive, and it is the only path with an open
-vocabulary to police. The gateway path's `caps.Extra` is empty by
+reserved-name refusal — `mtp`, `live_progress` and `speculation_observed` may
+not arrive from a probe — lives on the **agent-ingest path only**,
+deliberately: that is the boundary where an agent's bytes arrive, and it is
+the only path with an open vocabulary to police. The gateway path's `caps.Extra` is empty by
 construction (its `detectCapabilities` writes only the four structured
 fields), so no unvetted name can reach `probedCapabilityRows` today. The day
 the gateway grows a detector that fills `Extra`, that path needs the same
 filter, and the reserved list has to become reachable from `cmd/gateway`.
 
-**Two more writers exist, and neither is a probe**: the portal (`manual` for
-an operator's statement, `legacy` for the model-name MTP heuristic) and the
-vision benchmark (`vision_benchmark`). So `model_mapping_capabilities` has
-**four production writers, two of them probes** — and none of the four
-consults `metrics_locked` or touches
+**Three more writers exist, and none of them is a probe**: the portal
+(`manual` for an operator's statement, `legacy` for the model-name MTP
+heuristic), the vision benchmark (`vision_benchmark`), and the request path
+itself (`llama_cpp_timings`, the observation below). So
+`model_mapping_capabilities` has **five production writers, two of them
+probes** — and none of the five consults `metrics_locked` or touches
 `metrics_source`/`metrics_updated_at`.
+
+**One verdict is OBSERVED off relayed traffic rather than fetched from a
+document: `speculation_observed`.** Neither `/props` nor `/api/show` says
+whether the endpoint behind a mapping is actually running speculative
+decoding, but a completion the gateway has just relayed does: llama.cpp
+attaches `timings.draft_n` — the number of tokens a draft model proposed for
+that turn — to the non-streaming chat body, to the final frame of a
+chat-completions stream (the same chunk as the terminal `usage`), and to the
+terminal frame of a Responses-API stream. `inference.Usage.DraftTokens`
+carries it, and `recordUsage` (`internal/gateway/inference_complete.go`)
+records one `speculation_observed` row, verdict `yes`, source
+`llama_cpp_timings`, when it is `> 0`. Four properties are the design:
+
+- **Information only.** Nothing routes, scores or filters on it — the scorer
+  never sees a capability verdict at all — and it is not `mtp`, which is a
+  claim about the model's architecture rather than about what this deployment
+  has been seen doing
+  ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
+- **Positive-only, structurally.** llama.cpp emits the counter only under
+  `if (n_draft_tokens > 0)`, so with speculation off the key is **absent, not
+  zero**; there is no wire state meaning "confirmed not speculating", so no
+  code path writes a `no`, and the absence of a chip is equally what a cache
+  hit, a short completion, a stream without its usage chunk, an error, a
+  non-llama.cpp upstream, or a model nobody has routed a request to yet all
+  produce. The portal's tooltip says so in both languages.
+- **Ranked 1 through `capabilitySourceRank`'s default branch**, with no case
+  of its own and no rank-table edit — the `ollama_api_show` precedent: it can
+  never overwrite `manual` (3) or `vision_benchmark` (2), and it repairs its
+  own drift at 1 against 1. The writer reads the stored rows and asks
+  `routing.WritableCapabilityRows` like every other writer here, so a failed
+  read writes nothing rather than writing blind — and unlike its siblings it
+  logs a `Debug` line when the row is dropped as outranked, because they
+  re-run on a cadence and it does not: for this writer the drop happens once
+  and is never revisited, so without the line an operator asking why the chip
+  never appeared would have nothing to read at any level. The name is also
+  **reserved** at the agent ingest (above), which is what keeps that
+  once-per-lifetime write from being overwritten by a probe's claim.
+- **At most one write per mapping per gateway lifetime.** An in-memory claim
+  keyed by the serving mapping id (`Target.RouteID`) is taken — test-and-set
+  in one critical section, pinned by a 64-goroutine test that calls it
+  directly — before the store is consulted at all, so a mapping already
+  recorded costs one map lookup and a mapping that never speculates is never
+  touched. The rank rule would drop a redundant write on its own, but asking
+  it requires a READ, and a writer that leaned on the rank rule alone would
+  query the database on every completion forever. The
+  claim is never released, not even when the write fails: the cost is one
+  lost observation until the next restart, which the next relayed completion
+  re-observes, and releasing it would restore exactly the per-request query
+  the claim exists to avoid. The write is best-effort throughout, following
+  the opportunistic-metrics update it sits beside — the completion has
+  already been delivered, and the row is information rather than part of the
+  answer.
 
 **An operator's verdict is permanent, and no probe can move it.** Every writer
 asks `routing.WritableCapabilityRows` before it writes, and that function

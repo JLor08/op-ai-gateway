@@ -3624,8 +3624,11 @@ within about a second of the next telemetry write-back or one app-health tick
 router-shaped body, or vLLM/Ollama, nothing re-detects them. Nothing re-probes
 `mtp` at all on an existing mapping (the legacy name heuristic writes its row
 only for a brand-new one, and a re-sync skips an existing mapping), so
-returning it to unknown discards the verdict and the scorer's +30 MTP bonus
-until a human sets it again. Do not replace those two captions with one shared
+returning it to unknown discards the verdict until a human sets it again —
+which costs this column's own `yes` and the operator's record of the guess,
+and nothing else: the scorer's flat MTP bonus that once read this verdict is
+deleted, and the caption says so
+([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)). Do not replace those two captions with one shared
 "let detection decide again"; an i18n test asserts they stay different in both
 languages. `metrics_locked` stays a **checkbox** — a policy flag over the
 numeric metrics, which ADR-039 is explicit does not guard the capability table
@@ -5022,11 +5025,15 @@ label choice, which depend solely on `live_progress_support`.
 is a chip too.** Each row also carries its mapping's whole capability row set
 (`capabilities`, one entry per determined `(mapping, capability)` — [API
 Surface](../reference/api-surface.md#models-servers-applications-mappings)),
-and `ModelServersSection.tsx` renders a chip for every `yes`: the four names
-the detector itself reasons about first, in a fixed order (`vision`, `video`,
-`audio`, `tools`) with translated labels, then any name this codebase does not
-know, **verbatim** and with the NEUTRAL `standby` badge — an upstream
-capability nobody here has heard of is information, not a warning, and
+and `ModelServersSection.tsx` renders a chip for every `yes`: the five names
+this codebase gives a translated label to first, in a fixed order — the four
+the detector itself reads (`vision`, `video`, `audio`, `tools`), then
+`speculation_observed` **last**, because unlike those four it is not a trait a
+build or a manifest declares but an observation of what this deployment has
+been seen doing ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)) — then any
+name this codebase does not know, **verbatim** and with the NEUTRAL `standby`
+badge — an upstream capability nobody here has heard of is information, not a
+warning, and
 dropping it would defeat the open vocabulary the rows exist to carry. `mtp`
 and `live_progress` are excluded from this column: both already have a column
 of their own (`is_mtp`'s is default-hidden, and so is the `vision` one that
@@ -5036,10 +5043,15 @@ nothing, and a row set with no `yes` at all renders the same `—` placeholder
 the columns above use, for the identical reason. The tooltip is per
 capability: the two caveats that travel with these verdicts (§8.4.3 of
 [Telemetry, Usage Analytics & Observability](telemetry-usage-observability.md#843-running-connections-active-requests)),
-followed by **that chip's own** `source` and `checked_at` — which is what
+followed by that capability's own extra caveat where it has one, and then by
+**that chip's own** `source` and `checked_at` — which is what
 makes an operator's own verdict visibly distinguishable from a probe's on the
 screen where they look at it, and the reason the row carries provenance per
-capability rather than per mapping. Neither value affects the chip's badge or
+capability rather than per mapping. `speculation_observed` is the one
+capability with an extra caveat today, and it needs one because the chip
+invites the wrong reading twice over: it means *observed*, never *supported*,
+and its absence is unknown rather than a negative — including for a model
+nobody has sent a request to yet. Neither value affects the chip's badge or
 label; a `checked_at` a row never carried is omitted rather than rendered as a
 year-0001 date.
 

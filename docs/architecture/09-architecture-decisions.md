@@ -952,10 +952,13 @@ accident from a form gone stale mid-edit
 ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open
 is the *vocabulary*, not the validation: no check compares a name against a
 known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
-`mtp` and `live_progress` while an unrecognised upstream name is accepted,
+`mtp`, `live_progress` and `speculation_observed` while an unrecognised
+upstream name is accepted,
 stored and shown verbatim — which is why the open vocabulary needs no escape
-hatch. The two verdicts the request path acts on reach it through the
-candidate query's own **filtered** LEFT JOINs and land on `MappingCandidate`,
+hatch. Two verdicts reached the request path through the candidate query's own
+**filtered** LEFT JOINs when this decision was taken; `mtp` and its join went
+with the scorer's flat bonus, so today there is one
+([ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)). It lands on `MappingCandidate`,
 deliberately **not** on `ModelMapping`: a mapping loaded through `MappingByID`
 joins nothing, and a struct with no capability field cannot present a
 plausible-looking but unpopulated verdict — anything holding only a mapping
@@ -998,10 +1001,13 @@ the models-list vision fold (and the portal chat's image gate behind it), the
 scorer's MTP bonus, and the portal DTOs and mapping form that display and edit
 these very verdicts, every one of which this change reroutes to the table in
 the same unit of work. A long-established column with consumers beyond its own
-feature still stays inert. **Consequence:** the two filtered joins keep one
+feature still stays inert. **Consequence:** a filtered join keeps one
 row per mapping — the `(mapping_id, capability)` primary key guarantees it —
-and measured ≈ +6 µs each against the query's ≈ 17 µs, where one *unfiltered*
-join costs ≈ +79 µs and multiplies rows. Two read paths cannot use them and
+and measured ≈ +6 µs against the query's ≈ 17 µs, where one *unfiltered*
+join costs ≈ +79 µs and multiplies rows. There were two of them here, and
+[ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one) later removed the `mtp` one;
+this measurement is what makes that deletion a saving on the request path
+rather than a wash. Two read paths cannot use them and
 read the row themselves instead: the affinity path (it resolves before the
 candidate query and returns its pin early, on a mapping that came from
 `MappingsByApplication`) and the benchmark runner (`benchmarkTargetFor`, whose
@@ -1018,9 +1024,10 @@ inserted between them; a fresh install replays both and must land on the same
 schema, with the same rows, as an upgraded database, which is pinned by its
 own test. **One discipline this design earned, for whoever adds the next
 capability: enumerate every writer and every reader before writing the rule.**
-These rows have five writers (two probe paths, the vision benchmark, the MTP
-name heuristic at *both* mapping-creation sites, and the operator's form) and
-six readers (the candidate query, the affinity path, the benchmark runner, the
+These rows have six writers (two probe paths, the vision benchmark, the MTP
+name heuristic at *both* mapping-creation sites, the operator's form, and —
+since [ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one) — the request
+path's own speculation observation) and six readers (the candidate query, the affinity path, the benchmark runner, the
 models-list vision fold, the portal's per-row chips, and the mapping DTO that
 seeds the operator's edit form and is compared against on save). Every rule
 here is a rule about a value all of them touch, and a rule written with only
@@ -1042,3 +1049,162 @@ class this shape removes).
 [Routing & Model Selection
 §7](cross-cutting/routing-and-model-selection.md#7-model-selection-metrics),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
+## ADR-040 — The flat MTP bonus is deleted; "MTP" splits into a declared trait and an observed one
+**Context:** `mtpBonus = 30.0` lived inside `metricTiebreak`
+(`internal/routing/scorer.go`), whose only other two terms are the *measured*
+generation and prompt throughput — a guess about speed sitting beside a
+measurement of the same thing, and its own comment justified it as exactly
+that: a false positive "would later bias server selection toward a model that
+is **not actually faster**". The guess came from a model NAME
+(`IsMTPModelName`'s substring match), was written into an `mtp` capability row
+at both mapping-creation sites, joined back onto the candidate, and read once —
+by the bonus. **And the repository meant two different things by "MTP", in the
+same comment block.** Every *definition* was about the model's architecture:
+`routing/mtp.go`'s own list says DeepSeek-V3 "ship an MTP head" and GLM-4.5 /
+4.6 "expose MTP", statements about weights. Every *justification* was about
+deployment speed. The *placement* sided with the justification, because a peer
+of two throughput terms is a speed claim whatever its comment says. The two
+readings come apart in practice: a GLM-4.6 GGUF whose weights carry MTP heads,
+served by a llama.cpp started without a draft model, drafts nothing at all —
+an MTP model that is not speculating, scored as though it were. And the
+repository had almost no words for the second reading. "Speculation" and
+"draft model" appeared nowhere in it; "speculative decoding" appeared exactly
+once, in [Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)'s
+aside on why counting SSE deltas as tokens undercounts — a property of a
+*stream* there, never of a model or of a deployment — and no identifier named
+it. Meanwhile the property the bonus was really claiming is **observable**:
+llama.cpp attaches drafted-token counters to the `timings` of a completion it
+has just served, on traffic this gateway already relays.
+**Decision: (a) delete the bonus.** `metricTiebreak`'s documented bound drops
+from `50 + 20 + 30` to `50 + 20`, and `Route` no longer carries the flag at
+all — after the deletion there is nothing left to assert at the scorer level,
+because the compiler enforces it, which is stronger than a test. What replaces
+it is the term that was already beside it: if a route is faster because its
+server speculates, `effectiveGenTPS`'s measured tokens per second says so from
+the effect rather than from a substring of a name. Because `scoringRoute`'s
+fill was the **only** reader of `MappingCandidate.IsMTP` in the repository, the
+whole chain went with it — the field, `MTPFromVerdict`, the `MemoryStore`
+mirror, and the filtered `mtp` LEFT JOIN in `ActiveMappingsForModel` with its
+bind argument, selected column and scan target.
+**(b) The two readings are named, and each keeps one.** `mtp` keeps the
+ARCHITECTURE reading its definitions always had — "this model ships an MTP
+head" — and becomes display and operator-seed only: the name heuristic still
+writes it at both creation sites, sourced `legacy`, which is what keeps a
+guess overwritable instead of freezing it in, and the operator's three-state
+control still overrules it. A false positive now costs a wrong verdict on the
+mapping — one an operator can flip — not a wrong route. The DEPLOYMENT
+reading, "the endpoint behind this mapping is actually drafting tokens", is a
+claim about a different subject, so it gets a name of its own
+rather than a redefinition of that one; and the deletion is what makes the two
+separable at all, since a single flag that scores cannot mean both.
+**(c) That name is `speculation_observed`, and it records an observation, not
+a property of the model.** Not `mtp` (a different proposition) and not
+`speculative`, which would read as a capability of the model rather than as
+something seen of a deployment. It is written from the request path
+(`recordUsage`, `internal/gateway/inference_complete.go`) when a relayed
+completion's own usage carried `timings.draft_n`. `inference.Usage.DraftTokens
+> 0` is the whole test, beyond a non-empty serving mapping id (which is the
+row's key): deliberately not the opportunistic-metrics opt-in
+beside it (that flag governs whether an application's traffic may move a
+mapping's metric NUMBERS, and a capability is not one of those) and
+deliberately not the request's status (a positive count can only have been
+decoded off a real upstream response, whatever the client-visible outcome).
+Source `llama_cpp_timings`, named for the document it read exactly as
+`llama_cpp_props` and `ollama_api_show` are and for the same reason, and
+ranked 1 through `capabilitySourceRank`'s **default** branch with no case of
+its own and no rank-table edit — the `ollama_api_show` precedent: never able
+to overwrite `manual` (3) or `vision_benchmark` (2), always able to repair its
+own drift at 1 against 1. **It is positive-only, and structurally so:**
+llama.cpp emits the counter under `if (n_draft_tokens > 0)`, so with
+speculation off the key is **absent, not zero**. There is no wire state that
+means "confirmed not speculating", so no code path writes a `no` for it, and
+absence proves nothing — a cache hit, a short completion, a stream without its
+usage chunk, an error, a non-llama.cpp upstream and a model nobody has yet
+routed a request to are all indistinguishable from it, because they are all
+the same thing: unknown. The portal carries that caveat on the chip's tooltip
+in both languages, and places the chip last, after the traits a build or a
+manifest declares. The write happens **at most once per mapping per gateway
+lifetime**: an in-memory claim keyed by the serving mapping id
+(`Target.RouteID`) is taken — test-and-set in one critical section — before
+the store is consulted at all, because the rank rule would drop a redundant
+write but asking it requires a READ, and a writer leaning on the rank rule
+alone would query the database on every completion, forever, for every
+speculating mapping in the fleet. That once-per-lifetime bound is also why the
+name is **reserved** at the agent ingest, alongside `mtp` and `live_progress`:
+a verdict arriving on an agent's open verdict list lands at rank 1, which TIES
+this source and is therefore writable, and the repair that makes a tie safe
+for every other rank-1 capability — the losing writer rewrites its row on the
+next cadence tick — is precisely what a writer that never runs twice does not
+have. An agent's `no` would otherwise stand until a restart.
+**Consequence: the deletion made the request path CHEAPER, and that is the
+opposite of the usual trade.** The candidate query keeps one filtered LEFT
+JOIN instead of two, and the join it lost measured ≈ 6 µs against that query's
+≈ 17 µs base ([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+recorded the measurement; the comment in `ActiveMappingsForModel` still
+carries it, for the one join that remains). Every resolution of every model
+pays that much less, permanently, because a feature was removed rather than
+added — worth recording precisely because the usual deletion is argued on
+clarity and buys no speed at all. Nothing the new verdict does gives it back:
+it is written after the response has already been delivered, best-effort, and
+behind the claim, so a speculating mapping costs one store round trip in the
+whole life of the process and every completion after that costs a map lookup.
+**No capability verdict influences model selection any more** — `scorer.go`
+names none, `live_progress` is the one verdict the candidate query still
+joins, and it decides what the gateway SENDS upstream rather than which
+upstream it picks.
+**One discipline this deletion earned, for whoever deletes the next behaviour:
+sweep the user-visible prose, not only the code.** Removing the bonus took
+three separate follow-up fixes, because its claim had been restated in three
+places nothing pointed at from the scorer: a comment on the name heuristic,
+the reserved-capability-name doc at the agent ingest, and — found only because
+a task was explicitly told to look for it — the **i18n copy under the
+operator's own MTP control**, which went on telling them in both languages
+that resetting the verdict to unknown would also drop "the MTP bonus in server
+selection". An i18n string is an assertion about behaviour, it is the one the
+operator actually reads, and nobody greps it ([Theming &
+i18n §8](cross-cutting/theming-and-i18n.md#8-internationalization)). Enumerate
+the places a behaviour was *explained* the way
+[ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+says to enumerate the writers and readers of a value.
+**Rejected:** **llama.cpp's `/slots`**, which cannot answer either reading,
+for four independent reasons. Its `speculative` bool is true for **every**
+drafting technique, plain n-gram lookup included, so it is neither an MTP
+signal nor evidence about MTP heads. The one field that names the technique —
+`params`' `speculative.types`, carrying `draft-mtp` — lives under a slot's
+`params`, which llama.cpp populates only once that slot has served a request,
+so it reads empty on a server idle since boot, which is exactly the moment a
+fresh mapping needs a verdict. The endpoint needs the child's own API key,
+which this codebase does not always hold (only `/health` is public). And it
+answers **501** when it is disabled. Its upstream README is stale about the
+response as well, so those four had to be read out of the server's source
+rather than its documentation — recorded here so the next reader does not
+re-derive them, and so the forward reference to a "`/slots`-based MTP probe"
+that once sat on `legacyMTPCapabilityRow` is not written again. — **A `no`
+verdict for speculation, in any form:** no observation would justify one
+(Decision (c)), and a `no` carried on a probe-ranked source would be a
+permanent false claim that only an operator could clear. — **`draft_n_accepted`**,
+llama.cpp's sibling counter: an acceptance *rate* is a performance measure
+and belongs with the metrics, not with a capability verdict. — **Extending
+[ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+in place instead of writing this entry.** That decision is about the SHAPE of
+a capability row — child rows, ranked provenance, the dropped columns — and
+nothing here reverses or amends it: the new source needs no rank-table entry
+(its own default branch was designed for this), and the deleted bonus is a
+*routing* term ADR-039 mentions only in passing, as one of the readers the
+dropped `is_mtp` column used to have. What this entry decides is a deletion, a
+vocabulary and a rejection, none of which is a statement about the table. The
+`ollama_api_show` extension of
+[ADR-038](#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)
+is the counter-precedent and it does not apply: that one added a second
+detector reading a second document — the same subject as the decision it
+extended — whereas this changes what the scorer reads and what the words mean.
+→ [Routing & Model Selection
+§3.1](cross-cutting/routing-and-model-selection.md#31-the-score-function),
+[§7](cross-cutting/routing-and-model-selection.md#7-model-selection-metrics),
+[Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
+[Data Model §1](reference/data-model.md#1-current-tables-by-area),
+[Agent-Managed Model Runtime
+§11.7](cross-cutting/agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog),
+[Glossary](12-glossary.md).
