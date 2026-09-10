@@ -6,11 +6,14 @@ package collector
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-server-agent/internal/gwapi"
+	"op-ai-server-agent/internal/sample"
 	"reflect"
 	"strings"
 	"sync"
@@ -696,6 +699,149 @@ func ollamaNames(n int) []string {
 		out = append(out, fmt.Sprintf("pub.cap%d", i))
 	}
 	return out
+}
+
+// ollamaNamesAtMaxLength builds n distinct capability names of EXACTLY
+// maxOllamaCapabilityNameBytes bytes each -- the clamp's worst case, and the
+// input the wire-cost assertion below has to be measured against. The index
+// suffix keeps them distinct (the detector dedups), padding fills the rest,
+// and the characters are deliberately varied rather than one repeated
+// character, because a run of one character compresses inside a PostgreSQL
+// index entry and would understate the real cost.
+func ollamaNamesAtMaxLength(n int) []string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		suffix := fmt.Sprintf(".%d", i)
+		var b strings.Builder
+		for j := 0; b.Len() < maxOllamaCapabilityNameBytes-len(suffix); j++ {
+			b.WriteByte(alphabet[(i+j)%len(alphabet)])
+		}
+		b.WriteString(suffix)
+		out = append(out, b.String())
+	}
+	return out
+}
+
+// TestOllamaCapabilityBoundsStayUnderTheirCeilings is the guard the two
+// bounds did not have: it asserts the PROPERTIES they exist to satisfy, not
+// their values.
+//
+// The distinction is the whole design of this test. `maxOllamaExtraCapabilities
+// != 64` would be a change detector -- it fails for a tightening as loudly as
+// for a loosening and teaches a reader nothing about why 64. What is not a
+// change detector is the CEILING each number was read off, because each is a
+// real property of a system outside this file:
+//
+//  1. THE INDEX. A capability name is half of model_mapping_capabilities'
+//     primary key (mapping_id, capability), and a PostgreSQL btree index
+//     tuple may not exceed 2704 bytes. Measured on real PostgreSQL with
+//     incompressible names: 2600 bytes upserts fine, 2704 bytes fails with
+//     "index row size 2720 exceeds btree version 4 maximum 2704" -- and
+//     since UpsertMappingCapabilities is atomic, that failure takes EVERY
+//     capability row of the pass with it, logged at Debug and invisible at
+//     the gateway's default level.
+//  2. THE FRAME. The whole verdict set travels inside one 1 MiB
+//     agent->gateway WebSocket frame (gwapi.MaxWSFrameBytes), and a frame one
+//     byte over it closes the connection 1009.
+//
+// Both assertions are one-directional by construction: TIGHTENING either
+// bound only increases the margin, so this test stays silent for it. That is
+// deliberate -- a test that fires when someone makes a bound safer is noise.
+//
+// It is the loosening direction that was completely unguarded, in a way the
+// suite could not show: raising maxOllamaExtraCapabilities to 4096, or
+// maxOllamaCapabilityNameBytes to 4096, passes every other test in both
+// modules. The second one re-opens the atomic-drop defect above outright.
+//
+// The wire cost is MEASURED off the real sample.Capabilities type rather than
+// estimated, so no scaffolding constant is restated here: marshalling the
+// object with one empty-name entry gives the envelope, and the difference
+// between one and two entries gives the exact marginal cost of a further one,
+// separator included. A final check marshals the detector's real worst-case
+// output and requires the decomposition to predict it to the byte, so the
+// arithmetic cannot drift from the type it prices.
+//
+// What the frame assertion does NOT claim: that the fleet-wide total is
+// bounded. It is not, and maxOllamaExtraCapabilities' own doc says so -- ~101
+// worst-case children overflow the frame, because the total is a product and
+// only the per-child factor is bounded here. The assertion is the floor that
+// factor must keep: one frame must still carry as many worst-case children as
+// this system's own per-server spec-count expectation, which is 64 in both
+// modules (runtime.maxWatchedSpecs here, runtimeLogMaxWatchedSpecs on the
+// gateway), argued there against this same 1 MiB ceiling.
+func TestOllamaCapabilityBoundsStayUnderTheirCeilings(t *testing.T) {
+	// (1) THE INDEX. Not merely "below 2704" -- comfortably below, because a
+	// name shares the index tuple with the mapping_id and the whole point of
+	// this bound is that no publisher string can ever approach the cliff. A
+	// factor of 8 leaves this assertion satisfied up to 338 bytes (today's
+	// 128 sits at a factor of 21) while still failing for any change that
+	// brings the bound within an order of magnitude of a defect that drops
+	// rows atomically. Measured: at today's count bound the FRAME assertion
+	// below binds first, at ~227 bytes -- so this one is the guard that
+	// survives a change to the count bound or to the frame arithmetic, not
+	// the one that usually fires.
+	const pgBtreeMaxIndexRowBytes = 2704
+	const indexSafetyFactor = 8
+	if got := maxOllamaCapabilityNameBytes * indexSafetyFactor; got > pgBtreeMaxIndexRowBytes {
+		t.Errorf("maxOllamaCapabilityNameBytes = %d, which is only a factor of %.1f under PostgreSQL's btree index-tuple maximum of %d bytes; want at least a factor of %d (%d bytes or fewer). "+
+			"A name at or near that ceiling fails UpsertMappingCapabilities ATOMICALLY, dropping every capability row of the pass, logged at Debug and invisible at the gateway's default level.",
+			maxOllamaCapabilityNameBytes, float64(pgBtreeMaxIndexRowBytes)/float64(maxOllamaCapabilityNameBytes),
+			pgBtreeMaxIndexRowBytes, indexSafetyFactor, pgBtreeMaxIndexRowBytes/indexSafetyFactor)
+	}
+
+	// (2) THE FRAME. Measure the wire envelope and the marginal per-entry cost
+	// off the real type, then price the clamp's worst case.
+	marshalLen := func(verdicts []sample.CapabilityVerdict) int {
+		b, err := json.Marshal(sample.Capabilities{Verdicts: verdicts, Source: sample.CapabilitySourceOllamaAPIShow})
+		if err != nil {
+			t.Fatalf("json.Marshal(sample.Capabilities): %v", err)
+		}
+		return len(b)
+	}
+	entry := sample.CapabilityVerdict{Name: "", Verdict: "yes"}
+	oneEntry := marshalLen([]sample.CapabilityVerdict{entry})
+	perEntry := marshalLen([]sample.CapabilityVerdict{entry, entry}) - oneEntry
+	if oneEntry <= 0 || perEntry <= 0 {
+		t.Fatalf("measured one-entry object = %d bytes and marginal per-entry cost = %d bytes; both must be positive or this assertion measures nothing", oneEntry, perEntry)
+	}
+
+	const worstCaseChildrenOneFrameMustCarry = 64
+	// oneEntry already carries the envelope and the first (empty-name) entry;
+	// perEntry is the marginal cost of each further one, separator included.
+	// The names themselves are then priced at the length bound.
+	perChild := oneEntry + (maxOllamaExtraCapabilities-1)*perEntry + maxOllamaExtraCapabilities*maxOllamaCapabilityNameBytes
+	if total := int64(perChild) * worstCaseChildrenOneFrameMustCarry; total > gwapi.MaxWSFrameBytes {
+		t.Errorf("at the bounds (%d names x %d bytes) one child's capability object costs %d bytes on the wire, so %d worst-case children cost %d bytes -- over the %d-byte frame cap (gwapi.MaxWSFrameBytes). "+
+			"A frame one byte over it fails the gateway's read and closes 1009, taking telemetry, the system and runtime reports, the runtime_config push and the certificate doorbell with it.",
+			maxOllamaExtraCapabilities, maxOllamaCapabilityNameBytes, perChild,
+			worstCaseChildrenOneFrameMustCarry, total, gwapi.MaxWSFrameBytes)
+	}
+
+	// Non-vacuity: the arithmetic above prices a hypothetical worst case, so
+	// prove the detector really does produce it. The real detector, fed a
+	// document at both bounds, must yield exactly maxOllamaExtraCapabilities
+	// names each exactly maxOllamaCapabilityNameBytes long -- otherwise
+	// perChild is priced against an input nothing can generate and both
+	// assertions above are decoration.
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(ollamaNamesAtMaxLength(maxOllamaExtraCapabilities)...)))
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("the detector carried %d names out of a document at the bound, want %d -- the worst case priced above is not the worst case the detector produces", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	for _, name := range caps.Extra {
+		if len(name) != maxOllamaCapabilityNameBytes {
+			t.Fatalf("a carried name is %d bytes, want exactly %d -- the worst case priced above assumes every carried name may be at the length bound", len(name), maxOllamaCapabilityNameBytes)
+		}
+	}
+	if got := marshalLen(func() []sample.CapabilityVerdict {
+		out := make([]sample.CapabilityVerdict, 0, len(caps.Extra))
+		for _, name := range caps.Extra {
+			out = append(out, sample.CapabilityVerdict{Name: name, Verdict: "yes"})
+		}
+		return out
+	}()); got != perChild {
+		t.Errorf("the real worst-case object marshals to %d bytes but the assertion above priced it at %d; the measured envelope/per-entry decomposition has drifted from the type", got, perChild)
+	}
 }
 
 // TestDetectOllamaCapabilitiesCarriesTheBoundIntact is the AT-THE-BOUND half
