@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"strings"
@@ -1740,6 +1743,70 @@ func TestIngestRejectsAnUnclaimableCapabilitySource(t *testing.T) {
 				t.Fatalf("a tools row exists (%+v), want none -- the whole pass is voided by an unattributable source", row)
 			}
 		})
+	}
+}
+
+// withCapturedSlogAtTheDefaultLevel swaps the process-global slog default
+// for a buffer at the level a real gateway runs at: INFO
+// (OP_AI_GATEWAY_LOG_LEVEL's own default, config.Load). That is the whole
+// point of not reusing withCapturedSlog beside it, which captures at Debug:
+// a record emitted at Debug never reaches this buffer, exactly as it never
+// reaches a default deployment's log, so a Debug-level capture would pass
+// whatever level the code under test chose.
+func withCapturedSlogAtTheDefaultLevel(t *testing.T) *logbuffer.Buffer {
+	t.Helper()
+	buf := logbuffer.NewBuffer(200, slog.LevelInfo)
+	prev := slog.Default()
+	slog.SetDefault(slog.New(buf.Handler(io.Discard)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf
+}
+
+// TestIngestWarnsWhenACapabilitySourceCannotBeAttributed pins that the drop
+// its sibling above proves is also VISIBLE. The two assertions are one
+// finding: an unattributable source voids every row of the pass, and the
+// rows' absence is how this model spells "unknown" -- indistinguishable
+// from a probe that never ran -- so a silent drop would leave a newer agent
+// losing its whole capability report with nothing anywhere to point at.
+//
+// The capture runs at INFO, the level a real gateway runs at, which is what
+// makes this a test rather than a restatement of the source: at Debug the
+// line is filtered out before it reaches any log a default deployment
+// keeps, so "it is logged" is only true at a level nobody runs.
+func TestIngestWarnsWhenACapabilitySourceCannotBeAttributed(t *testing.T) {
+	ctx := context.Background()
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_src_warn", false)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_src_warn",
+		`{"verdicts":[{"name":"vision","verdict":"yes"}],"source":"a_third_probe_this_gateway_never_heard_of"}`))
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want 0", got)
+	}
+
+	recs := buf.Snapshot()
+	if !findLogRecord(recs, "WARN", "unrecognised source") {
+		t.Fatalf("no WARN record naming an unrecognised source at the gateway's own default level (info); records = %+v -- a drop nobody can see is a fleet-wide capability blackout with no diagnostic", recs)
+	}
+	// The rejected source itself must be IN the record: "some sample was
+	// dropped" does not tell an operator which agent build to look at.
+	for _, r := range recs {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, "unrecognised source") {
+			continue
+		}
+		if got, _ := r.Attrs["source"].(string); got != "a_third_probe_this_gateway_never_heard_of" {
+			t.Fatalf("WARN record source attr = %q, want the source the agent actually reported", got)
+		}
+		if got, _ := r.Attrs["spec_id"].(string); got != "rspec_src_warn" {
+			t.Fatalf("WARN record spec_id attr = %q, want rspec_src_warn", got)
+		}
+		return
 	}
 }
 

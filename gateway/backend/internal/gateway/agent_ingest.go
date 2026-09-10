@@ -1032,9 +1032,30 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.CapabilityRow {
 	source, ok := rt.Capabilities.rowSource()
 	if !ok {
+		// WARN, and the level is load-bearing: this gateway's default log
+		// level is info (config.Load's OP_AI_GATEWAY_LOG_LEVEL default), so
+		// at Debug the drop is INVISIBLE in every default deployment. A
+		// newer agent reporting a third source would lose every capability
+		// row it ever sends, and lose it silently -- the rows' absence is
+		// how this model spells "unknown", indistinguishable from a probe
+		// that never ran, so there would be nothing anywhere to point at.
+		//
+		// Warn is this file's established level for a rejection that DROPS
+		// A WRITE: the three cross-server spec rejections (vram, context,
+		// and this very write-back's own, a screen above) and the two
+		// telemetry-envelope rejections all use it. Debug here is reserved
+		// for a TRANSIENT failure -- a store error, a lookup that failed
+		// this once -- which repeats and heals on its own. This one cannot
+		// heal: the source names the agent build that sent it, so every
+		// sample from that agent is dropped identically until a binary
+		// changes. It does repeat, once per sample per spec, and that is
+		// accepted on exactly the same footing as the ownership rejection
+		// above, which repeats per sample and warns anyway -- a fleet-wide
+		// capability blackout is worth a repeated line.
+		//
 		// Only a NON-nil sample can be rejected (rowSource defaults the nil
 		// receiver), so reading rt.Capabilities.Source here is safe.
-		slog.Debug("runtime capability sample names an unrecognised source, dropping its rows",
+		slog.Warn("runtime capability sample names an unrecognised source, dropping its rows",
 			"spec_id", rt.SpecID, "source", rt.Capabilities.Source)
 		return nil
 	}
