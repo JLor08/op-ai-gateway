@@ -1057,6 +1057,19 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	if got := len(counting.lastSent()); got != 2 {
 		t.Fatalf("the single write carried %d rows (%+v), want 2 -- the live-progress verdict must ride the SAME write as the capability verdicts, not a second one", got, counting.lastSent())
 	}
+	// The EMISSION ORDER, which runtimeSampleCapabilityRows' own comment calls
+	// load-bearing and which nothing pinned until now: the DEDICATED
+	// live-progress row is emitted first and the open Verdicts list after, so
+	// rule 0 of routing.WritableCapabilityRows (keep the first row for a name,
+	// drop every later one) resolves a collision in favour of the dedicated
+	// field. The reserved-name rule makes that collision unreachable today,
+	// which is why the collision OUTCOME is no longer observable -- but the
+	// order itself still is, right here, and reversing the two appends is
+	// otherwise a silent step of a two-step regression whose second step is a
+	// future narrowing of the reserved rule.
+	if sent := counting.lastSent(); sent[0].Capability != routing.CapabilityLiveProgress {
+		t.Fatalf("the write's first row is %q (%+v), want %q -- the dedicated live-progress row must be emitted BEFORE the open verdicts list, or a name collision would resolve to a publisher's string instead of to the field this codebase defined", sent[0].Capability, sent, routing.CapabilityLiveProgress)
+	}
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
@@ -1075,7 +1088,11 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 // runtimeSampleCapabilityRows still emits the dedicated row FIRST and rule 0
 // of routing.WritableCapabilityRows still keeps the first row for a name and
 // drops every later one, so even a narrowed reserved rule would leave the
-// explicit field in front of a publisher's string rather than behind it.
+// explicit field in front of a publisher's string rather than behind it. That
+// second mechanism is pinned in TestIngestLiveProgressLandsAsARow, which
+// asserts the order directly on the sent rows -- this test cannot see it,
+// because the reserved rule drops the colliding row before an order can
+// matter.
 //
 // The verdicts are opposite on purpose, so the assertion cannot pass because
 // both happen to agree. And the write carries ONE row, not two: a duplicated
