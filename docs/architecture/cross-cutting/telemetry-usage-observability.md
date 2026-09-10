@@ -1119,18 +1119,52 @@ more. A verdict of `""` produces **no row at
 all**, and the absence of a row is what UNKNOWN means — which is why a partial
 answer (an older llama.cpp reporting `modalities` but no
 `chat_template_caps`) cannot clear a `tools` verdict a previous probe
-established: there is no empty verdict for it to write. There is exactly
-**one probe write path, and it is the agent's**: the ingest stamps the row's
-`source` with whichever of `llama_cpp_props`/`ollama_api_show` the agent
-reported (above), plus the observation time as `checked_at`. The gateway's
-own `/props` read is **not** a second one — it produces
-`provider.ModelInfo.Caps`, which no production code consumes
-(`PickModelCapabilities` has no production caller at all), and it writes no
-capability row anywhere. The only other writers of
-`model_mapping_capabilities` are the portal (`manual` for an operator's
-statement, `legacy` for the model-name MTP heuristic) and the vision
-benchmark (`vision_benchmark`). None of the three consults `metrics_locked`
-or touches `metrics_source`/`metrics_updated_at`.
+established: there is no empty verdict for it to write. There are **two
+probe write paths**, each stamping the row's `source` with the probe that
+produced the document plus the observation time as `checked_at`, and naming
+them individually is the point — a rule about capability provenance has to be
+placed on both, or on the one that carries the risk, and that is a decision
+nobody can make from a count:
+
+- **The gateway's own `/props` pass** (`cmd/gateway/app_health.go`). The
+  app-health loop reads capability evidence off the *same* `ProbeModelInfo`
+  response it takes the context size from — `PickModelCapabilities` and
+  `PickModelLiveProgressSupport` on the `{model}` per-model branch,
+  `info.Caps`/`info.LiveProgressSupport` directly on the single-probe branch
+  — and hands both to `applyCapabilityWrite`, which goes
+  `probedCapabilityRows` → `routing.WritableCapabilityRows` →
+  `routing.MappingStore.UpsertMappingCapabilities`. `probedCapabilityRows`
+  **hard-codes** `source = llama_cpp_props`: this path can stamp nothing
+  else, because the gateway probes only llama.cpp's `/props`.
+- **The agent's telemetry ingest**
+  (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
+  `runtimeSampleCapabilityRows`). It stamps whichever of
+  `llama_cpp_props`/`ollama_api_show` the agent **reported** (above), because
+  the agent probes both kinds of child and only its report says which
+  document a verdict came off.
+
+Both translate a live-progress verdict through the one
+`routing.LiveProgressCapabilityVerdict`, and both ask the one
+`routing.WritableCapabilityRows` — which is how the two cannot drift apart on
+the rules they share (`agent_ingest.go` names its sibling explicitly, and so
+does `probedCapabilityRows`).
+
+Their *differences* are what a rule has to be placed against. The
+reserved-name refusal — `mtp` and `live_progress` may not arrive from a probe
+— lives on the **agent-ingest path only**, deliberately: that is the boundary
+where an agent's bytes arrive, and it is the only path with an open
+vocabulary to police. The gateway path's `caps.Extra` is empty by
+construction (its `detectCapabilities` writes only the four structured
+fields), so no unvetted name can reach `probedCapabilityRows` today. The day
+the gateway grows a detector that fills `Extra`, that path needs the same
+filter, and the reserved list has to become reachable from `cmd/gateway`.
+
+**Two more writers exist, and neither is a probe**: the portal (`manual` for
+an operator's statement, `legacy` for the model-name MTP heuristic) and the
+vision benchmark (`vision_benchmark`). So `model_mapping_capabilities` has
+**four production writers, two of them probes** — and none of the four
+consults `metrics_locked` or touches
+`metrics_source`/`metrics_updated_at`.
 
 **An operator's verdict is permanent, and no probe can move it.** Every writer
 asks `routing.WritableCapabilityRows` before it writes, and that function
