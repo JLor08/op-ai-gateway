@@ -279,6 +279,27 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		return
 	}
 
+	// The ONLY edit made to a relayed body, ever. Passthrough means the client's
+	// bytes reach the upstream as the client wrote them, apart from the mapped
+	// model name.
+	//
+	// In particular the gateway does NOT add llama.cpp's `timings_per_token`,
+	// however tempting that looks: a `timings` object on a PARTIAL frame is the
+	// only thing that can put a live tokens/sec figure on an /v1/responses
+	// passthrough row while generation is still running, and that flag is what
+	// makes llama.cpp attach one to a chat stream's partials. Whether its
+	// Responses implementation does the same on partials is not something this
+	// repo has captured — the gateway simply reads a `timings` object wherever
+	// one appears. Note "while still running": the terminal `response.completed`
+	// frame carries its own `timings`, so a rate does arrive at the end without
+	// any flag (see the per-flavor table under "Native passthrough is on this
+	// panel too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
+	// §8.4.3). The flag is READ when the client set it and never set here.
+	// Injecting it would change the upstream's response shape — new frames' worth
+	// of fields the client never asked for, flowing through to a client that must
+	// parse them — to improve a gateway display column. A missing live rate is
+	// rendered as "not measured" and is honest; a silently rewritten client
+	// request is not.
 	upstreamBody := rewriteModelField(raw, target.ProviderModel)
 
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
@@ -299,7 +320,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		defer tcancel()
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: serverName, ServerID: target.ServerID, Model: pfReq.Model, RequestedModel: pfReq.RequestedModel, APIFlavor: pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: pfReq.Stream, StartedAt: start})
+	// Live counters for the running-connections row, mirroring stream_session.go's
+	// shape on the translate path: allocated here, attached to the ActiveRequest
+	// by POINTER (the registry stores rows by value, so the copy shares the one
+	// counter), and written only by this request's own goroutine as the scanner
+	// sees frames.
+	//
+	// A BUFFERED passthrough response deliberately gets none. There are no frames
+	// to time: the whole body arrives as one payload, no first-content stamp can
+	// form, and a TTFT would be the total request duration — a different quantity
+	// wearing this one's label. An allocated-but-always-zero struct would say
+	// "measured 0" where nil says "nothing to measure", which is the distinction
+	// this whole feature is built on (see liveProgressDTO and formatLiveTps).
+	var progress *requestProgress
+	if pfReq.Stream {
+		progress = &requestProgress{}
+	}
+
+	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: serverName, ServerID: target.ServerID, Model: pfReq.Model, RequestedModel: pfReq.RequestedModel, APIFlavor: pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID)
@@ -340,9 +378,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// (independently of that cap), so a response larger than it still yields its
 	// real — and, for the terminal frame, its FINAL — token count. See
 	// usageScanner's doc comment (passthrough_usage_scan.go) for why the two must
-	// not share a budget.
+	// not share a budget. The same pass publishes this request's live progress
+	// (TTFT, and whatever count/rate the upstream itself reports) into `progress`
+	// when there is one — display only: nothing on this path writes a routing
+	// input, which stays where it was, on the end-of-request recordUsage below.
 	var respBuf bytes.Buffer
-	scanner := newUsageScanner(pfReq.APIFlavor, s.captureMaxBytes)
+	scanner := newUsageScanner(pfReq.APIFlavor, s.captureMaxBytes, progress)
 	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner}
 	copyErr := copier.run(resp.Body)
 

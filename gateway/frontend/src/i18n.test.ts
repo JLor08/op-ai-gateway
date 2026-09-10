@@ -134,6 +134,73 @@ describe('running-connections (active requests) i18n keys', () => {
   });
 });
 
+describe('live tokens/sec provenance strings claim only what the row can know', () => {
+  it('does not pin the missing rate on the upstream, because the absence is client-dependent', () => {
+    // The tooltip used to read "this upstream reports no exact token count
+    // mid-stream" — a CAUSE, and the wrong one for a native-passthrough
+    // openai_responses stream: llama.cpp attaches its own `timings` to the partial
+    // frames whenever the CLIENT set timings_per_token, so the very same upstream
+    // would have reported a rate had it been asked. Nothing on the active-request
+    // DTO separates that from a translated stream whose provider genuinely reports
+    // neither figure — api_flavor is identical for a translated and a
+    // passed-through /v1/responses request, and no field records what the client
+    // asked for — so the string must not assert either cause.
+    //
+    // Deliberately broader than the old literal: pinning the full phrase would let a
+    // reworded "the upstream does not report a count mid-stream" reintroduce the same
+    // false cause and still pass. The demonstrative is what does the blaming, so it is
+    // what is banned — the honest string names the server as one of two dependency
+    // axes ("the upstream" in en, "vom Inferenzserver" in de, which uses that one term
+    // throughout the sentence rather than mixing it with the anglicism), never "this
+    // upstream" / "dieser Inferenzserver" as the reason. The German term is banned in
+    // any declension, and the anglicism's ban stays so the guard does not go quiet if
+    // the wording is ever swapped back to "Upstream".
+    expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/dies\w* Inferenzserver/i);
+  });
+
+  it('keeps the not-measured framing and names the client as a factor, in both locales', () => {
+    // "Not measured" (never a zero) plus the two facts this surface can observe: the
+    // server reported no rate, and none could be DERIVED yet. The second clause is
+    // deliberately about the derivation and not about the count's existence — a row
+    // whose exact count has arrived inside the gateway's 50ms derivation floor
+    // reaches this same string with a positive count, so "no count to derive one
+    // from" would be false there. The client is named as one of the two dependency
+    // axes, which is what stops the sentence reading as an upstream limitation.
+    expect(messages.en.activityLiveTpsNone).toMatch(/not measured/i);
+    expect(messages.en.activityLiveTpsNone).toMatch(/client/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/nicht gemessen/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/client/i);
+  });
+
+  it('denies only the derivation, never the existence of an exact count', () => {
+    // The DTO reaches this string with a POSITIVE output_tokens whenever it is built
+    // inside the gateway's 50ms derivation floor of the first content frame
+    // (liveProgressDTO's final return). On that row an exact count exists, so a
+    // clause reading "no exact token count to derive one from" — which this string
+    // carried for one round — is false for a reachable state, the same class of
+    // defect as naming the wrong cause above. What is absent there is the
+    // derivation, not the count.
+    expect(messages.en.activityLiveTpsNone).not.toMatch(/no exact token count/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/keine exakte Tokenzahl/i);
+  });
+
+  it('leaves the upstream-reported string free of any token claim', () => {
+    // A native-passthrough openai_responses stream WITH timings_per_token produces
+    // the row shape "rate present, token count 0": the upstream's own rate arrives
+    // on the partial frames while those partials carry no usage. This is the string
+    // shown there, so interpolating a count into it (as activityLiveTpsGateway
+    // legitimately does) would make it claim "computed from 0 tokens".
+    expect(messages.en.activityLiveTpsUpstream).not.toMatch(/token/i);
+    expect(messages.de.activityLiveTpsUpstream).not.toMatch(/token/i);
+    for (const m of [messages.de, messages.en]) {
+      expect(m.activityLiveTpsUpstream).not.toContain('{n}');
+      expect(m.activityLiveTpsGateway).toContain('{n}');
+    }
+  });
+});
+
 describe('activity time-series i18n keys', () => {
   it('defines all time-series chart/control keys in de and en', () => {
     const keys = [

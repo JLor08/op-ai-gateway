@@ -38,6 +38,13 @@ type requestProgress struct {
 // observeDelta records the first content delta's timestamp (once) and any exact,
 // upstream-reported progress carried with it. Nil-safe: every non-streaming path
 // and every test literal has no progress struct at all.
+//
+// Two callers, both streaming, both feeding it FACTS rather than conclusions:
+// stream_session.go on the translate path (from the provider's chunkProgress)
+// and usageScanner.publishProgress on the native-passthrough path (from each
+// relayed SSE frame's own numbers). Neither derives a rate — liveProgressDTO
+// does that, once, from an exact count over the window, so there is exactly one
+// derivation in the feature and nothing for a second one to drift against.
 func (p *requestProgress) observeDelta(at time.Time, prog *inference.StreamProgress) {
 	if p == nil {
 		return
