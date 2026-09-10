@@ -578,12 +578,28 @@ plausible-looking validation rule would break the normal case:
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
   silently drop the very verdicts the open shape exists to keep. The two
-  rules that DO constrain names live at the agent ingest rather than in the
-  store, and they are about one producer instead of the vocabulary: that
-  producer's pass may report at most 64 names of at most 128 bytes each, and
-  it may not report `mtp` or `live_progress` at all — the two names this
-  codebase reasons about that no probe can observe ([Telemetry, Usage
-  Analytics & Observability
+  rules that DO constrain names are about one producer instead of the
+  vocabulary, and they sit at two DIFFERENT layers — neither of them the
+  store, and only one of them the gateway:
+  - The COUNT and LENGTH clamp is in the **agent's own detector**
+    (`server-agent/internal/collector/probe.go`,
+    `detectOllamaCapabilities`): one `/api/show` document contributes at most
+    64 open-vocabulary names of at most 128 bytes each. That is 68 names for
+    the pass in all — the four structured verdicts
+    (`vision`/`video`/`audio`/`tools`) have fields of their own and sit
+    outside the clamp.
+  - The RESERVED-name refusal is at the **gateway's agent ingest**
+    (`internal/gateway/agent_ingest.go`): no probe-sourced pass, under either
+    probe source, may report `mtp` or `live_progress` — the two names this
+    codebase reasons about that no probe can observe. The agent's detector
+    skips them too, as defence in depth; the gateway's is the load-bearing
+    one, because a buggy or hostile agent puts a name straight into the
+    verdicts it sends and no agent-side filter is in that path.
+
+  Where each rule is NOT matters as much: the ingest enforces **no** count or
+  length bound of its own, so what bounds an arriving pass is the honest
+  agent's clamp and, behind it, the 1 MiB telemetry frame — not anything the
+  gateway checks on receipt ([Telemetry, Usage Analytics & Observability
   §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 - **`source` is a precedence RANK, and it is what this table has instead of
   `metrics_locked`.** `manual` (3) outranks `vision_benchmark` (2), which
