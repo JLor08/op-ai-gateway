@@ -501,8 +501,12 @@ const de = {
   // Was "Unbekannt" für DIESE Capability konkret bedeutet -- bewusst
   // unterschiedlich, weil die Erkennung es ist: Vision kommt von selbst
   // zurück, MTP nicht.
+  // Task 6 (2026-09-10): Task 1 hat den festen MTP-Bonus des Scorers
+  // gestrichen; dieser Hinweis darf seither keine Wirkung auf die
+  // Server-Auswahl mehr behaupten. Der Chip ist reine Anzeige/
+  // Operator-Vorbelegung (siehe legacyMTPCapabilityRow, Backend).
   mappingIsMtpUnknownHint:
-    'Unbekannt = keine Festlegung. MTP wird nicht neu erkannt — an einer bestehenden Zuordnung prüft es nichts. Ohne Festlegung entfällt auch der MTP-Bonus bei der Server-Auswahl.',
+    'Unbekannt = keine Festlegung. MTP wird nicht neu erkannt — an einer bestehenden Zuordnung prüft es nichts. Dieser Chip ist rein informativ und hat keinen Einfluss auf die Server-Auswahl.',
   mappingVisionCapableUnknownHint:
     'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
   mappingMetricsLocked: 'Metriken gesperrt',
@@ -1132,11 +1136,30 @@ const de = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
-  // The two upstream caveats an operator must know before acting on a
-  // capability chip: Video is a build-plus-vision-encoder fact, not "the
-  // model understands video"; Tools is "the chat template natively supports
-  // tool calls", not "tool calls fail without it" (llama.cpp's default
-  // --jinja handler accepts tools for every model).
+  // "Beobachtet", nicht "Unterstützt": Diese Zeile entsteht ausschließlich
+  // aus echtem Traffic (llama.cpp hat mindestens einmal gedraftete Tokens
+  // gemeldet), niemals aus einer Fähigkeits-Erklärung von Build oder
+  // Modell -- siehe die Tooltip-Ergänzung unten für das, was das Fehlen des
+  // Chips NICHT bedeutet.
+  capabilitySpeculationObserved: 'Spekulation beobachtet',
+  // Ergänzt modelServerCapabilitiesTooltip unten NUR für diesen einen Chip
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx) -- die anderen drei
+  // Fähigkeiten brauchen diese Einschränkung nicht. Zwei Dinge, die ein
+  // Betreiber hier wissen muss: der Chip heißt "beobachtet", nicht
+  // "unterstützt oder garantiert", und sein FEHLEN heißt "unbekannt", nie
+  // "spekuliert nicht" -- das gilt für jedes Modell, das schlicht noch nie
+  // über diese Zuordnung bedient wurde, genauso wie für einen Cache-Treffer,
+  // eine zu kurze Antwort, einen Stream ohne Nutzungs-Chunk, eine
+  // Fehlerantwort oder einen Upstream, der überhaupt keine llama.cpp-Timings
+  // liefert.
+  capabilitySpeculationObservedTooltip:
+    'Beobachtet heißt: Mindestens eine Antwort dieser Zuordnung hat gedraftete Tokens gemeldet — nicht, dass dieses Modell oder dieser Build Spekulation generell unterstützt. Kein Chip heißt unbekannt, nicht "spekuliert nicht": Das Fehlen kommt genauso bei einem noch nie genutzten Modell, einem Cache-Treffer, einer zu kurzen Antwort, einem Stream ohne Nutzungs-Chunk, einer Fehlerantwort oder einem Nicht-llama.cpp-Upstream vor.',
+  // Die zwei Upstream-Einschränkungen, die ein Betreiber vor dem Handeln
+  // nach einem Fähigkeits-Chip kennen muss: Video ist eine
+  // Build-plus-Vision-Encoder-Tatsache, nicht "das Modell versteht Video";
+  // Tools heißt "die Chat-Vorlage unterstützt Tool-Aufrufe nativ", nicht
+  // "Tool-Aufrufe schlagen sonst fehl" (llama.cpps Standard-Handler --jinja
+  // akzeptiert Tools für jedes Modell).
   modelServerCapabilitiesTooltip:
     'Video bedeutet: Das Binary wurde mit Video-Unterstützung gebaut UND das Modell hat einen Vision-Encoder — nicht, dass das Modell Video versteht. Tools bedeutet: Die Chat-Vorlage unterstützt Tool-Aufrufe nativ — nicht, dass Tool-Aufrufe sonst fehlschlagen (llama.cpp akzeptiert mit --jinja Tools für jedes Modell).',
   modelServerCapabilitiesSource: (source: string) => `Quelle: ${source}.`,
@@ -2775,8 +2798,11 @@ const en: PortalMessages = {
   mappingCapabilityUnknown: 'Unknown',
   mappingCapabilityYes: 'Yes',
   mappingCapabilityNo: 'No',
+  // Task 6 (2026-09-10): task 1 deleted the scorer's flat MTP bonus, so this
+  // hint must no longer claim any effect on server selection. The chip is
+  // display and operator-seed only now (see legacyMTPCapabilityRow, backend).
   mappingIsMtpUnknownHint:
-    'Unknown = no verdict on file. MTP is never re-detected — nothing probes it on an existing mapping. With no verdict the MTP bonus in server selection is gone too.',
+    'Unknown = no verdict on file. MTP is never re-detected — nothing probes it on an existing mapping. This chip is informational only: it never affects server selection.',
   mappingVisionCapableUnknownHint:
     'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
   mappingMetricsLocked: 'Metrics locked',
@@ -3356,6 +3382,21 @@ const en: PortalMessages = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
+  // "Observed", not "supported": this row exists only because real traffic
+  // produced it (llama.cpp reported at least one completion with drafted
+  // tokens), never because a build or a model declared the trait -- see the
+  // tooltip addition below for what the chip's ABSENCE does not mean.
+  capabilitySpeculationObserved: 'Speculation observed',
+  // Appended to modelServerCapabilitiesTooltip below for this one chip only
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx) -- the other three
+  // known capabilities need no such caveat. Two things an operator must
+  // know here: the chip says "observed", not "supported or guaranteed", and
+  // its ABSENCE means "unknown", never "does not speculate" -- that covers a
+  // model simply never routed through this mapping yet just as much as a
+  // cache hit, too short a completion, a stream without a usage chunk, an
+  // error response, or an upstream that reports no llama.cpp timings at all.
+  capabilitySpeculationObservedTooltip:
+    'Observed means at least one completion on this mapping reported drafted tokens — not that this model or build supports speculation in general. No chip means unknown, not "does not speculate": the same absence covers a model nobody has used yet, a cache hit, too short a completion, a stream without a usage chunk, an error response, or a non-llama.cpp upstream.',
   modelServerCapabilitiesTooltip:
     'Video means the binary was built with video support AND the model has a vision encoder — not that the model understands video. Tools means the chat template natively supports tool calls — not that tool calls fail without it (llama.cpp with --jinja accepts tools for every model).',
   modelServerCapabilitiesSource: (source: string) => `Source: ${source}.`,

@@ -29,6 +29,10 @@ func TestOpenAICompatibleClientCompletesChat(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "openai compatible answer"}}},
 			"usage":   map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+			"timings": map[string]any{
+				"prompt_per_second":    123.4,
+				"predicted_per_second": 56.7,
+			},
 		})
 	}))
 	defer upstream.Close()
@@ -43,6 +47,38 @@ func TestOpenAICompatibleClientCompletesChat(t *testing.T) {
 	}
 	if resp.Usage.TotalTokens != 5 {
 		t.Fatalf("Usage = %#v", resp.Usage)
+	}
+	// `timings` IS present here (with its usual sibling fields), but with no
+	// `draft_n` key -- exactly what llama.cpp's server sends when speculation
+	// is off, since it only emits `draft_n` under `if (n_draft_tokens > 0)`
+	// while the rest of the timings object is unconditional. Absence must
+	// decode as 0, never as a guess that speculation happened.
+	if resp.Usage.DraftTokens != 0 {
+		t.Fatalf("Usage.DraftTokens = %v, want 0 (timings present, no draft_n key)", resp.Usage.DraftTokens)
+	}
+}
+
+// TestOpenAICompatibleClientCompletesChatNoTimingsObjectDraftTokensZero covers
+// the OTHER real negative shape: an upstream that doesn't speak llama.cpp's
+// timings extension at all (a stock OpenAI-compatible server) and so omits
+// the `timings` key entirely, not just its `draft_n` field. Both absences
+// must decode DraftTokens as 0.
+func TestOpenAICompatibleClientCompletesChatNoTimingsObjectDraftTokensZero(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "openai compatible answer"}}},
+			"usage":   map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+		})
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	resp, err := client.Complete(context.Background(), routing.Target{Endpoint: upstream.URL, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hello"}}}}})
+	if err != nil {
+		t.Fatalf("Complete returned %v", err)
+	}
+	if resp.Usage.DraftTokens != 0 {
+		t.Fatalf("Usage.DraftTokens = %v, want 0 (no timings object on the response)", resp.Usage.DraftTokens)
 	}
 }
 
@@ -119,6 +155,7 @@ func TestOpenAICompatibleClientCompletesChatWithCachedTokensAndTimings(t *testin
 			"timings": map[string]any{
 				"prompt_per_second":    123.4,
 				"predicted_per_second": 56.7,
+				"draft_n":              9,
 			},
 		})
 	}))
@@ -137,6 +174,12 @@ func TestOpenAICompatibleClientCompletesChatWithCachedTokensAndTimings(t *testin
 	}
 	if resp.Usage.TokensPerSecond != 56.7 {
 		t.Fatalf("Usage.TokensPerSecond = %v, want 56.7", resp.Usage.TokensPerSecond)
+	}
+	// llama.cpp's timings.draft_n -- the drafted-token counter from speculative
+	// decoding -- carried onto the buffered (non-streaming) response's Usage,
+	// same as its sibling timings fields above.
+	if resp.Usage.DraftTokens != 9 {
+		t.Fatalf("Usage.DraftTokens = %v, want 9", resp.Usage.DraftTokens)
 	}
 }
 
@@ -188,7 +231,7 @@ func TestOpenAICompatibleCompleteStreamParsesSSE(t *testing.T) {
 			`data: {"choices":[{"delta":{"reasoning_content":"th"}}]}`,
 			`data: {"choices":[{"delta":{"content":"Hel"}}]}`,
 			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
-			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7}}`,
 			`data: [DONE]`,
 		}
 		for _, line := range lines {
@@ -233,6 +276,53 @@ func TestOpenAICompatibleCompleteStreamParsesSSE(t *testing.T) {
 	if completed.Usage.TotalTokens != 5 || completed.Usage.InputTokens != 3 || completed.Usage.OutputTokens != 2 {
 		t.Fatalf("completed.Usage = %#v", completed.Usage)
 	}
+	// The terminal chunk's `timings` object IS present (with its usual sibling
+	// fields) but carries no `draft_n` key -- exactly what llama.cpp's server
+	// sends when speculation is off, since it only emits `draft_n` under
+	// `if (n_draft_tokens > 0)` while the rest of the timings object is
+	// unconditional. Absence must decode as 0, never a guess.
+	if completed.Usage.DraftTokens != 0 {
+		t.Fatalf("completed.Usage.DraftTokens = %v, want 0 (timings present, no draft_n key)", completed.Usage.DraftTokens)
+	}
+}
+
+// TestOpenAICompatibleCompleteStreamParsesSSENoTimingsDraftTokensZero covers
+// the OTHER real negative shape: an upstream that doesn't speak llama.cpp's
+// timings extension at all, so the terminal usage chunk carries no `timings`
+// key whatsoever, not just a missing `draft_n` field. Both absences must
+// decode DraftTokens as 0.
+func TestOpenAICompatibleCompleteStreamParsesSSENoTimingsDraftTokensZero(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+			`data: [DONE]`,
+		}
+		for _, line := range lines {
+			_, _ = io.WriteString(w, line+"\n\n")
+		}
+	}))
+	defer upstream.Close()
+	client := NewOpenAICompatibleClient(http.DefaultClient)
+
+	var completed *inference.StreamEvent
+	err := client.CompleteStream(context.Background(), routing.Target{Endpoint: upstream.URL, ProviderModel: "qwen-coder", Timeout: 5 * time.Second}, inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}, func(ev inference.StreamEvent) error {
+		if ev.Type == inference.StreamEventCompleted {
+			c := ev
+			completed = &c
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream returned %v", err)
+	}
+	if completed == nil || completed.Usage == nil {
+		t.Fatal("no usage in completed event")
+	}
+	if completed.Usage.DraftTokens != 0 {
+		t.Fatalf("completed.Usage.DraftTokens = %v, want 0 (no timings on the terminal chunk)", completed.Usage.DraftTokens)
+	}
 }
 
 func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *testing.T) {
@@ -240,7 +330,7 @@ func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *te
 		w.Header().Set("Content-Type", "text/event-stream")
 		lines := []string{
 			`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
-			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7}}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7,"draft_n":9}}`,
 			`data: [DONE]`,
 		}
 		for _, line := range lines {
@@ -272,6 +362,12 @@ func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *te
 	}
 	if completed.Usage.TokensPerSecond != 56.7 {
 		t.Fatalf("Usage.TokensPerSecond = %v, want 56.7", completed.Usage.TokensPerSecond)
+	}
+	// llama.cpp assigns `timings` to deltas.back() -- with include_usage always
+	// set here, that final delta IS the usage chunk, so draft_n arrives on the
+	// exact same chunk mergeChunkUsage reads Usage from.
+	if completed.Usage.DraftTokens != 9 {
+		t.Fatalf("Usage.DraftTokens = %v, want 9 (from the final chunk's timings)", completed.Usage.DraftTokens)
 	}
 }
 

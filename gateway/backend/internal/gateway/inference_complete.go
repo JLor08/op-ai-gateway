@@ -722,6 +722,30 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 			slog.Debug("opportunistic metrics update failed", "mapping", target.RouteID, "err", err)
 		}
 	}
+	// Speculation OBSERVED: this completion's own usage reported drafted tokens,
+	// which is evidence that the endpoint serving this mapping runs speculative
+	// decoding. Recorded as an informational capability row and nothing else --
+	// no scorer term, no routing filter, no Target field (see
+	// routing.CapabilitySpeculationObserved).
+	//
+	// The gate is DraftTokens > 0 and nothing more. It deliberately does NOT
+	// borrow the opportunistic-metrics opt-in above: that flag governs whether
+	// an application's traffic may move a mapping's metric NUMBERS, and a
+	// capability is not such a number -- the argument lives on
+	// routing.MappingStore.UpsertMappingCapabilities. Nor does it consult
+	// status: a positive DraftTokens can only have been decoded off a real
+	// upstream response, whatever the client-visible outcome. RouteID must be
+	// non-empty because it IS the row's key -- the error call sites pass a zero
+	// routing.Target, and a mapping id of "" identifies nothing to record.
+	//
+	// Zero is "no evidence", never "does not speculate" (see
+	// inference.Usage.DraftTokens: the upstream emits the key only when it is
+	// > 0), so this path has no negative branch at all: no code path writes a
+	// "no" verdict for this capability, because there is no observation that
+	// would justify one.
+	if resp.Usage.DraftTokens > 0 && target.RouteID != "" && s.claimSpeculationObserved(target.RouteID) {
+		s.writeSpeculationObserved(context.Background(), target.RouteID)
+	}
 	// Principal-limit accounting (design spec §6.2/§6.3), always LAST: bump the
 	// in-memory aggregate cache for whichever principal (service or user --
 	// never both, "kein Stacking", see principalFor) this request's token
@@ -748,6 +772,96 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// truth.
 	if p, ok := principalFor(token); ok {
 		s.Limiter.Record(p, int64(resp.Usage.TotalTokens), 0)
+	}
+}
+
+// claimSpeculationObserved answers "is this the FIRST completion in this
+// process to see drafted tokens from mappingID?" and, when it is, CLAIMS the
+// id in the same critical section so no later completion -- and no concurrent
+// sibling of this one -- asks again.
+//
+// This is the whole reason the write is not the naive shape. The rank rule
+// (routing.WritableCapabilityRows) would already drop a redundant write, but
+// asking it requires READING the mapping's stored rows, so a writer that
+// consulted only the rank rule would issue one query per completion, forever,
+// on every speculating mapping in the fleet. Claiming in memory first means a
+// recorded mapping costs one map lookup, and -- because the caller gates on
+// DraftTokens > 0 before reaching here -- a mapping that never speculates is
+// never touched at all.
+//
+// The claim is taken BEFORE the store round trip and is never released, not
+// even when that round trip fails: the bound is at most one write attempt per
+// mapping per process lifetime, and releasing on failure would turn a
+// persistently failing store into exactly the per-request query this design
+// exists to avoid. The cost of that choice is one lost observation until the
+// next restart, which is the right way round -- the verdict is information,
+// its absence is the model's native "unknown" (routing.CapabilityRow), and the
+// very next completion this process relays after a restart re-observes it.
+func (s *Server) claimSpeculationObserved(mappingID string) bool {
+	s.speculationSeenMu.Lock()
+	defer s.speculationSeenMu.Unlock()
+	if _, claimed := s.speculationSeen[mappingID]; claimed {
+		return false
+	}
+	if s.speculationSeen == nil {
+		s.speculationSeen = make(map[string]struct{})
+	}
+	s.speculationSeen[mappingID] = struct{}{}
+	return true
+}
+
+// writeSpeculationObserved records the observation on mappingID: one
+// routing.CapabilitySpeculationObserved row, verdict CapabilityYes, sourced
+// CapabilitySourceLlamaCppTimings and stamped now. Called only on a claimed
+// first sighting (claimSpeculationObserved above), so this is the one store
+// round trip that mapping ever costs in this process.
+//
+// It reads the mapping's current rows and asks routing.WritableCapabilityRows
+// which of them it may write, like every other capability writer (the
+// app-health probe pass, the telemetry write-back, the vision benchmark),
+// rather than writing blind: this source ranks 1, so an operator's manual
+// verdict (3) or the vision benchmark's (2) must survive it, and a read
+// failure therefore writes NOTHING -- writing blind would be exactly the
+// overwrite the rank rule forbids.
+//
+// Best-effort throughout, following the opportunistic-metrics update it sits
+// beside: a failure is Debug-logged and the function returns. The completion
+// has already been delivered to the client by the time recordUsage runs, and
+// the row is information rather than part of the answer.
+func (s *Server) writeSpeculationObserved(ctx context.Context, mappingID string) {
+	reported := []routing.CapabilityRow{{
+		Capability: routing.CapabilitySpeculationObserved,
+		Verdict:    routing.CapabilityYes,
+		Source:     routing.CapabilitySourceLlamaCppTimings,
+		CheckedAt:  time.Now().UTC(),
+	}}
+	stored, err := s.Routes.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		slog.Debug("speculation verdict: capability read failed", "mapping", mappingID, "err", err)
+		return
+	}
+	rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored))
+	if len(rows) == 0 {
+		// Debug, and the level is the argument: being outranked here is the
+		// NORMAL outcome the moment an operator has answered (manual, rank
+		// 3) or the vision benchmark measured (rank 2), so a Warn would cry
+		// wolf on a correctly configured fleet -- this is not a REJECTION of
+		// a producer's input, which is what this repo reserves Warn for.
+		//
+		// It is logged at all because of the one way this writer differs
+		// from every sibling that returns silently here (agent_ingest.go's
+		// write-back, app_health.go's probe pass): they re-run on a cadence,
+		// so a drop leaves the next tick's record and the state is
+		// re-derivable. This one holds its claim for the process's lifetime,
+		// so the drop happens ONCE and is never revisited -- without this
+		// line an operator asking why the chip never appeared for a mapping
+		// that demonstrably speculates has nothing to read at any level.
+		slog.Debug("speculation verdict: no writable row, dropping the observation",
+			"mapping", mappingID, "capability", routing.CapabilitySpeculationObserved)
+		return // already on file at this rank, or outranked by an operator / a measurement
+	}
+	if err := s.Routes.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
+		slog.Debug("speculation verdict: capability write failed", "mapping", mappingID, "err", err)
 	}
 }
 

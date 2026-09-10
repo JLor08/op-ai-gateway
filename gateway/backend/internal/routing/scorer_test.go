@@ -198,11 +198,14 @@ func TestSelectRoutePrefersHigherGenThroughput(t *testing.T) {
 	}
 }
 
-func TestSelectRoutePrefersMTP(t *testing.T) {
+// TestSelectRoutePrefersTheMeasurablyFasterRoute is the signal that replaces the
+// flat MTP bonus: MEASURED generation throughput, folded into the same bounded
+// tiebreak, still decides between two otherwise-identical routes.
+func TestSelectRoutePrefersTheMeasurablyFasterRoute(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	routes := []Route{
 		{ID: "plain", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now},
-		{ID: "mtp", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now, IsMTP: true},
+		{ID: "faster", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now, GenTokensPerSecond: 200, PromptTokensPerSecond: 2000},
 	}
 
 	selected, _, ok := Select(routes, "qwen-coder", now)
@@ -210,8 +213,8 @@ func TestSelectRoutePrefersMTP(t *testing.T) {
 	if !ok {
 		t.Fatalf("Select returned ok=false")
 	}
-	if selected.ID != "mtp" {
-		t.Fatalf("selected = %s, want mtp", selected.ID)
+	if selected.ID != "faster" {
+		t.Fatalf("selected = %s, want faster (measured throughput decides the tiebreak)", selected.ID)
 	}
 }
 
@@ -254,13 +257,13 @@ func TestScoreTiebreakDoesNotOverrideErrorPenalty(t *testing.T) {
 }
 
 // A server driven non-viable by load ALONE (before any metric term) must stay non-viable:
-// the tiebreak is applied only after the score<=0 gate, so a huge measured throughput +
-// MTP cannot rescue a dead server past the gate (which would defeat the prefer-loaded
+// the tiebreak is applied only after the score<=0 gate, so a huge measured throughput
+// cannot rescue a dead server past the gate (which would defeat the prefer-loaded
 // fail-open spillover in the resolver).
 func TestScoreTiebreakDoesNotRescueNonViable(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	// base 1000 + 10*20 + 50 - 60*25 = 1250 - 1500 = -250 <= 0 on load alone.
-	route := Route{ID: "overloaded-fast", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, ActiveRequests: 60, TelemetryAt: now, GenTokensPerSecond: 1e6, PromptTokensPerSecond: 1e6, IsMTP: true}
+	route := Route{ID: "overloaded-fast", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, ActiveRequests: 60, TelemetryAt: now, GenTokensPerSecond: 1e6, PromptTokensPerSecond: 1e6}
 
 	score, ok := Score(route, "qwen-coder", now)
 
@@ -269,16 +272,15 @@ func TestScoreTiebreakDoesNotRescueNonViable(t *testing.T) {
 	}
 }
 
-// The total tiebreak is capped: an implausibly large stored throughput (and MTP) can add
-// at most genThroughputBonusCap + promptThroughputBonusCap + mtpBonus over the same route
-// with all metrics zero.
+// The total tiebreak is capped: an implausibly large stored throughput can add at most
+// genThroughputBonusCap + promptThroughputBonusCap over the same route with all metrics
+// zero.
 func TestScoreTiebreakBounded(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	base := Route{ID: "r", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now}
 	maxed := base
 	maxed.GenTokensPerSecond = 1e9
 	maxed.PromptTokensPerSecond = 1e9
-	maxed.IsMTP = true
 
 	scoreBase, okBase := Score(base, "qwen-coder", now)
 	scoreMaxed, okMaxed := Score(maxed, "qwen-coder", now)
@@ -286,7 +288,7 @@ func TestScoreTiebreakBounded(t *testing.T) {
 	if !okBase || !okMaxed {
 		t.Fatalf("expected both viable, got okBase=%v okMaxed=%v", okBase, okMaxed)
 	}
-	want := genThroughputBonusCap + promptThroughputBonusCap + mtpBonus
+	want := genThroughputBonusCap + promptThroughputBonusCap
 	if got := scoreMaxed - scoreBase; got != want {
 		t.Fatalf("tiebreak delta = %f, want %f (total tiebreak must be capped)", got, want)
 	}
@@ -309,8 +311,9 @@ func TestScoreTiebreakBeatsSmallPriorityDelta(t *testing.T) {
 		t.Fatalf("selected = %s, want fast-low (fast beats a small priority delta)", selected.ID)
 	}
 
-	// Large delta: fast p=10 at the MAX +100 bonus vs idle p=16 (+120 priority). Priority wins.
-	fastMaxed := Route{ID: "fast-maxed", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now, GenTokensPerSecond: 1e9, PromptTokensPerSecond: 1e9, IsMTP: true}
+	// Large delta: fast p=10 at the MAX +70 bonus vs idle p=16 (+120 priority). Priority wins
+	// by a widened margin (100->70 max bonus widens 120-100=20 to 120-70=50).
+	fastMaxed := Route{ID: "fast-maxed", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now, GenTokensPerSecond: 1e9, PromptTokensPerSecond: 1e9}
 	idleFarHigher := Route{ID: "idle-far-higher", Model: "qwen-coder", Priority: 16, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now}
 	selected2, _, ok2 := Select([]Route{fastMaxed, idleFarHigher}, "qwen-coder", now)
 	if !ok2 {

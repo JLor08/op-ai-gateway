@@ -47,9 +47,9 @@ erDiagram
         bool metrics_locked
     }
     MODEL_MAPPING_CAPABILITY {
-        string capability "mtp | live_progress | vision | ..."
+        string capability "mtp | live_progress | vision | speculation_observed | ..."
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | legacy"
     }
     MODEL_GROUP {
         bool loaded_only
@@ -67,18 +67,22 @@ gatewayModel, apiFlavor)` returns every candidate whose mapping is
 server exists — health/enablement are filtered later, in the resolver, not the
 store query.
 
-The same query also carries the two capability verdicts the request path acts
-on — `IsMTP` and `LiveProgressSupport` — through **two LEFT JOINs on
-`model_mapping_capabilities`, each filtered to its own capability name** in
-the join condition. Filtering there rather than in the `WHERE` clause is what
-keeps one row per mapping (the table's primary key is `(mapping_id,
-capability)`) and what makes an absent row read as "never determined" instead
-of dropping the mapping from the result. The measured cost is ≈ 6 µs per join
-against a ≈ 17 µs query, where a single *unfiltered* join costs ≈ 79 µs and
-multiplies rows. The verdicts sit on the **candidate**, not on `ModelMapping`
-— which carries no capability field at all — so a mapping read through
-`MappingByID`, which joins nothing, cannot present an unpopulated verdict as a
-real one ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+The same query also carries the **one** capability verdict the request path
+acts on — `LiveProgressSupport` — through a **LEFT JOIN on
+`model_mapping_capabilities` filtered to that capability name** in the join
+condition. Filtering there rather than in the `WHERE` clause is what keeps one
+row per mapping (the table's primary key is `(mapping_id, capability)`) and
+what makes an absent row read as "never determined" instead of dropping the
+mapping from the result. The measured cost is ≈ 6 µs against a ≈ 17 µs query,
+where a single *unfiltered* join costs ≈ 79 µs and multiplies rows. There were
+**two** such joins until the flat MTP bonus was deleted: the second was
+filtered to `mtp`, it fed nothing but that bonus, and dropping it took its
+≈ 6 µs off every resolution — a deletion that made the request path cheaper
+([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)). The verdict sits on the
+**candidate**, not on `ModelMapping` — which carries no capability field at
+all — so a mapping read through `MappingByID`, which joins nothing, cannot
+present an unpopulated verdict as a real one
+([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
 
 `ApplicationEndpoint(server, app)` (`internal/routing/store.go`) composes the
 reachable base URL: `scheme://domain:port` plus the server's and application's
@@ -382,7 +386,7 @@ flowchart LR
     Base["base = 1000\n+ priority × 20\n+ weight"] --> Penalties["− activeRequests × 25\n− queueDepth × 20\n− latencyMS × 0.2\n− errorRate × 200\n− 500 if telemetry stale (> 2 min) / missing"]
     Penalties --> Gate{"score ≤ 0 ?"}
     Gate -->|yes| NonViable["non-viable — excluded\n(the viability gate)"]
-    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 100)"]
+    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 70)"]
     Tiebreak --> Final["final score"]
 ```
 
@@ -408,14 +412,19 @@ server-mates' idle counters. See [Agent-Managed Model Runtime
 §11.7](agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog).
 
 `metricTiebreak` (capped at `genThroughputBonusCap(50) +
-promptThroughputBonusCap(20) + mtpBonus(30) = 100`, well under the 200-point
-error-rate penalty and 500-point stale-telemetry penalty):
+promptThroughputBonusCap(20) = 70`, well under the 200-point error-rate
+penalty and 500-point stale-telemetry penalty):
 
 | Term | Formula | Cap |
 |---|---|---|
 | Generation throughput | `effectiveGenTPS(route) × 0.25` | 50 (at 200 tok/s) |
 | Prompt (prefill) throughput | `PromptTokensPerSecond × 0.01` | 20 (at 2000 tok/s) |
-| MTP flat bonus | `+30` if `IsMTP` (the candidate's joined `mtp` verdict, `yes` only) | — |
+
+Both terms are **measurements**. A third one was not: a flat `+30` for the
+mapping's `mtp` capability verdict, which guessed from a model *name* at the
+speed the two terms beside it measure. It is gone, and `Route` no longer
+carries the flag at all — nothing the scorer sees says anything about MTP
+([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
 
 `effectiveGenTPS` is the **load-aware effective-speed** term: it linearly
 interpolates a mapping's single-request `GenTokensPerSecond` (at concurrency 1)
@@ -760,12 +769,21 @@ source `legacy`. `legacy` is deliberately a *probe-ranked* source: a guess
 must stay beatable by real detection, where an operator's own checkbox writes
 a `manual` row that outranks every automated writer permanently and needs no
 `metrics_locked` ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
-A mapping created with no row at all simply has no MTP verdict, and the flat
-bonus in §3.1's tiebreak reads only a `yes`, so the heuristic has to write its
-row at every creation path or a new mapping silently loses a bonus every older
-one has. The match deliberately favors false negatives over false positives,
-since a wrong `+30` MTP bonus would bias selection toward a model that is not
-actually faster.
+A mapping created with no row at all simply has no MTP verdict. The heuristic
+still writes at both creation paths, but the reason is no longer routing:
+since the flat bonus in §3.1's tiebreak was deleted, nothing scores, filters
+or dispatches differently because of this verdict. What is left is DISPLAY and
+an OPERATOR SEED — the row is the only place the guess is recorded, so it is
+what the portal's own (default-hidden) MTP column shows and what the
+operator's three-state control has to confirm or overturn instead of an empty
+field. The match still favors false negatives over false positives: a wrong
+guess now costs a wrong verdict an operator can flip rather than a wrong
+route, but a wrong fact an operator never notices is still a wrong fact on the
+mapping. `mtp` keeps the ARCHITECTURE reading its name always had here ("this
+model ships an MTP head"); whether the endpoint serving it is actually
+drafting tokens is a different proposition, carried by the
+`speculation_observed` verdict instead
+([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
 
 **Hybrid swap protection** combines two independent, fail-open signals before a
 candidate is allowed to evict a resident model: the *loaded-state* partition

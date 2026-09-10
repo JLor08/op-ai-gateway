@@ -737,10 +737,6 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	// cost is that a transient store error can make one pinned request look
 	// like the verdict was never determined, which is strictly better than
 	// serving the wrong (frozen, possibly stale) column value.
-	//
-	// IsMTP is left at its zero value: targetFrom does not read it (only
-	// scoringRoute does, and this path never scores -- it returns a pin
-	// directly), so there is nothing to fill it from here.
 	liveProgressSupport := ""
 	if caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID); capErr == nil {
 		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {

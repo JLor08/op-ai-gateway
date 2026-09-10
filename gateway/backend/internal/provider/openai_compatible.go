@@ -103,6 +103,7 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 		Timings *struct {
 			PromptPerSecond    float64 `json:"prompt_per_second"`
 			PredictedPerSecond float64 `json:"predicted_per_second"`
+			DraftN             int     `json:"draft_n"`
 		} `json:"timings"`
 	}
 	if err := json.Unmarshal(respBytes, &decoded); err != nil {
@@ -137,6 +138,7 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 	if decoded.Timings != nil {
 		usage.PromptPerSecond = decoded.Timings.PromptPerSecond
 		usage.TokensPerSecond = decoded.Timings.PredictedPerSecond
+		usage.DraftTokens = decoded.Timings.DraftN
 	}
 	return Response{
 		Text:         choice.Message.Content,
@@ -652,6 +654,7 @@ type streamChunkTimings struct {
 	PromptPerSecond    float64 `json:"prompt_per_second"`
 	PredictedPerSecond float64 `json:"predicted_per_second"`
 	PredictedN         int     `json:"predicted_n"`
+	DraftN             int     `json:"draft_n"`
 }
 
 type streamChunkError struct {
@@ -713,6 +716,7 @@ func mergeChunkUsage(st *streamChunkState, chunk streamChunk) {
 		if chunk.Timings != nil {
 			st.usage.PromptPerSecond = chunk.Timings.PromptPerSecond
 			st.usage.TokensPerSecond = chunk.Timings.PredictedPerSecond
+			st.usage.DraftTokens = chunk.Timings.DraftN
 		}
 	}
 }

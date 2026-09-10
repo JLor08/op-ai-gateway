@@ -38,7 +38,7 @@ not route-based).
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, energy/token), concurrency-capacity metrics, and their `metrics_locked`/`metrics_source`/`metrics_updated_at` provenance. Carries **no capability column at all** since migration 79 dropped the eleven it used to have — every per-model capability verdict is a `model_mapping_capabilities` row instead ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). |
-| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
+| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`llama_cpp_timings`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -173,7 +173,7 @@ erDiagram
         string mapping_id FK "PK part, on delete cascade"
         string capability "PK part, open vocabulary"
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | legacy"
         datetime checked_at
     }
     AGENT_TOKENS {
@@ -204,9 +204,11 @@ erDiagram
 ```
 
 `MODEL_MAPPING_CAPABILITIES` is on the request path: the candidate query joins
-it **twice**, filtered to the `mtp` and `live_progress` capabilities, so one
-row per mapping still comes back. A mapping with no row for a capability is
-UNKNOWN for it, which is why both joins are LEFT joins.
+it **once**, filtered to the `live_progress` capability, so one row per
+mapping still comes back. A mapping with no row for that capability is UNKNOWN
+for it, which is why the join is a LEFT join. There was a second such join,
+filtered to `mtp`, until the scorer's flat MTP bonus — its only reader — was
+deleted ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
 
 `SERVER_OWNERS` is the `(server_id, user_id)` join table connecting `USERS`
 and `AI_SERVERS` many-to-many. `USAGE_EVENTS`'s links to `USERS` and
@@ -230,7 +232,7 @@ service, or project that produced it.
 | `routing.Application` | `internal/routing/store.go` | An upstream API surface on a server: scoring inputs, health-check config, probes, sealed upstream token. |
 | `routing.ModelMapping` | `internal/routing/store.go` | A gateway-model ↔ app-model binding with performance and capacity metrics. Deliberately carries **no** capability field: a mapping loaded through `MappingByID` never joins the capability rows, so it cannot present a plausible-looking but unpopulated verdict. |
 | `routing.CapabilityRow` | `internal/routing/store.go` | One `(capability, verdict, source, checked_at)` verdict for a mapping — the unit `model_mapping_capabilities` stores. `WritableCapabilityRows` (pure, no I/O) answers which of a writer's freshly-determined rows may actually be written, given what is on file. |
-| `routing.MappingCandidate` | `internal/routing/store.go` | One routable path for a gateway model — mapping + application + server — plus the two capability verdicts the candidate query joins (`IsMTP`, `LiveProgressSupport`). They sit on the candidate rather than on the mapping so "this came from the join" is a fact the type carries. |
+| `routing.MappingCandidate` | `internal/routing/store.go` | One routable path for a gateway model — mapping + application + server — plus the one capability verdict the candidate query joins (`LiveProgressSupport`). It sits on the candidate rather than on the mapping so "this came from the join" is a fact the type carries. There is deliberately no `IsMTP` beside it any more: the scorer's flat MTP bonus was its only reader, and both went ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)). |
 | `routing.ModelGroup` / `GroupMember` / `ModelSetting` | `internal/routing/store.go` | Priority-failover synthetic models, their ordered members, and per-model visibility. |
 | `routing.Service` / `ServiceDelegate` | `internal/routing/store.go` | A service account and its delegated managers. |
 | `routing.ResourceGroup` / `ResourceGroupProvision` | `internal/routing/store.go` | A server-management container and its polymorphic provisioning targets. |
@@ -571,9 +573,10 @@ plausible-looking validation rule would break the normal case:
   [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
   A capability NAME
   is not validated at all: the vocabulary is open on purpose (`vision`,
-  `video`, `audio`, `tools`, `mtp`, `live_progress` are the names the code
-  itself reasons about, while an upstream may report others — since #54 the
-  agent's Ollama probe actually produces such rows, carrying `insert`,
+  `video`, `audio`, `tools`, `mtp`, `live_progress` and
+  `speculation_observed` are the names the code itself reasons about, while an
+  upstream may report others — since #54 the agent's Ollama probe actually
+  produces such rows, carrying `insert`,
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
@@ -590,11 +593,12 @@ plausible-looking validation rule would break the normal case:
     outside the clamp.
   - The RESERVED-name refusal is at the **gateway's agent ingest**
     (`internal/gateway/agent_ingest.go`): no probe-sourced pass, under either
-    probe source, may report `mtp` or `live_progress` — the two names this
-    codebase reasons about that no probe can observe. The agent's detector
-    skips them too, as defence in depth; the gateway's is the load-bearing
-    one, because a buggy or hostile agent puts a name straight into the
-    verdicts it sends and no agent-side filter is in that path.
+    probe source, may report `mtp`, `live_progress` or
+    `speculation_observed` — the three names this codebase reasons about that
+    no probe can observe. The agent's detector skips the first two as defence
+    in depth; the gateway's list is the load-bearing one, because a buggy or
+    hostile agent puts a name straight into the verdicts it sends and no
+    agent-side filter is in that path.
 
   Where each rule is NOT matters as much: the ingest enforces **no** count or
   length bound of its own, so what bounds an arriving pass is the honest

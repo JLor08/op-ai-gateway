@@ -163,11 +163,21 @@ function liveProgressTooltip(
 // The known capability names this column gives a translated chip to, in the
 // FIXED display order every row uses regardless of which verdicts happen to
 // be set (PR #66's decision, carried over unchanged onto the rows array).
+//
+// "speculation_observed" (task 6 of the MTP-bonus removal) has no dedicated
+// column of its own the way "mtp"/"live_progress" do (CAPABILITIES_COLUMN_
+// EXCLUDED below), so it belongs here like vision/video/audio/tools -- placed
+// LAST because, unlike those four, it is not a build/manifest-declared trait
+// but a live-traffic OBSERVATION (routing.CapabilitySpeculationObserved on
+// the backend): grouping it after the declared capabilities keeps the fixed
+// order reading as "what this build/model declares" followed by "what this
+// deployment has actually been seen doing".
 const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => string }[] = [
   { capability: 'vision', label: (t) => t.capabilityVision },
   { capability: 'video', label: (t) => t.capabilityVideo },
   { capability: 'audio', label: (t) => t.capabilityAudio },
   { capability: 'tools', label: (t) => t.capabilityTools },
+  { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));
 
@@ -188,8 +198,9 @@ const CAPABILITIES_COLUMN_EXCLUDED = new Set(['mtp', 'live_progress']);
 type CapabilityChip = { status: 'success' | 'standby'; label: string; row: ModelServerCapability };
 
 // capabilityChips returns one chip per DETERMINED `yes` verdict, in a fixed
-// order (Vision, Video, Audio, Tools) so the column reads the same on every
-// row regardless of which verdicts happen to be set, followed by every OTHER
+// order (Vision, Video, Audio, Tools, Speculation observed) so the column
+// reads the same on every row regardless of which verdicts happen to be set,
+// followed by every OTHER
 // capability name this build has no dedicated column for, VERBATIM
 // (including a string this portal build doesn't recognize -- the vocabulary
 // is open-ended upstream, e.g. Ollama passes manifest-declared capabilities
@@ -228,14 +239,37 @@ function capabilityChips(capabilities: ModelServerCapability[], t: Translation):
   return chips;
 }
 
+// A capability-SPECIFIC caveat, appended after the shared video/tools text
+// every chip already carries (t.modelServerCapabilitiesTooltip below) -- for
+// capabilities whose caveat does not belong on every OTHER chip too. Kept as
+// a lookup rather than a field on KNOWN_CAPABILITY_ORDER because most known
+// capabilities have none; only capabilities that need one are listed here.
+//
+// "speculation_observed" is the first and, for now, only entry: its verdict
+// means "this endpoint was SEEN drafting tokens at least once" (see
+// routing.CapabilitySpeculationObserved), never "this model/build supports
+// speculation" -- llama.cpp exposes no static support flag, only a runtime
+// counter a completion either did or did not report -- and its own row is
+// structurally positive-only (see the checked_at/source paragraph on
+// CapabilityRow), so there is no companion "no" chip to contrast it with. An
+// operator seeing NO chip must not read that as "confirmed off": the same
+// blank also covers a model nobody has routed a real request to yet, a
+// stream without a usage chunk, a cache hit, too short a completion, or any
+// non-llama.cpp upstream -- every one of those looks identical to "never
+// checked", because that is exactly what they are.
+const CAPABILITY_TOOLTIP_EXTRAS: Record<string, (t: Translation) => string> = {
+  speculation_observed: (t) => t.capabilitySpeculationObservedTooltip,
+};
+
 // capabilityTooltip folds ONE capability row's own provenance (source) and
 // checked-at timestamp into the shared caveat text
 // (t.modelServerCapabilitiesTooltip -- the video-is-build-plus-vision-encoder
 // and tools-is-native-template-quality caveats every chip needs, regardless
-// of which capability it names). This is the gain the old shared, row-wide
-// capabilities_source/capabilities_checked_at pair could never give: which
-// verdict a given chip actually rests on, not just the most recent probe's
-// identity for the whole row -- source/checked_at exist ONLY for this
+// of which capability it names), plus that capability's own extra caveat, if
+// any (CAPABILITY_TOOLTIP_EXTRAS above). This is the gain the old shared,
+// row-wide capabilities_source/capabilities_checked_at pair could never give:
+// which verdict a given chip actually rests on, not just the most recent
+// probe's identity for the whole row -- source/checked_at exist ONLY for this
 // tooltip and for operator diagnostics, no rendering DECISION may branch on
 // them.
 //
@@ -248,6 +282,8 @@ function capabilityChips(capabilities: ModelServerCapability[], t: Translation):
 // it: every real checked_at is well after the Unix epoch.
 function capabilityTooltip(row: ModelServerCapability, t: Translation): string {
   const parts = [t.modelServerCapabilitiesTooltip];
+  const extra = CAPABILITY_TOOLTIP_EXTRAS[row.capability];
+  if (extra) parts.push(extra(t));
   if (row.source) parts.push(t.modelServerCapabilitiesSource(row.source));
   const checkedAt = row.checked_at ? new Date(row.checked_at) : null;
   if (checkedAt && !Number.isNaN(checkedAt.getTime()) && checkedAt.getTime() > 0) {

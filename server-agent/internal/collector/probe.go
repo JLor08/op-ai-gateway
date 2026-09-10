@@ -494,13 +494,24 @@ func detectCapabilities(body []byte) Capabilities {
 // Why exactly these two, when "vision"/"tools"/"audio" are claimed by the
 // switch above as real verdicts: Ollama's capability array says nothing
 // about either. "mtp" is not detected anywhere today -- the row comes from
-// the portal's operator checkbox or its model-name heuristic, and it feeds
-// the router's +30 MTP bonus. "live_progress" has a dedicated wire field of
-// its own, and for an Ollama child that field is always "" (Ollama exposes
-// no timings_per_token-style surface), so a publisher's string would not
-// merely collide with the dedicated answer -- it would BE the answer, and
-// the router would then send timings_per_token to an upstream that does not
-// understand it.
+// the portal's operator checkbox or its model-name heuristic -- and it no
+// longer feeds routing at all: the router's flat +30 MTP bonus that once
+// read it is deleted and the candidate carries no "mtp" verdict, so the row
+// is a display and operator-seed fact only. What a publisher's string would
+// still do is overwrite that DISPLAY for any mapping neither the operator
+// nor the heuristic ever touched. "live_progress" has a dedicated wire field
+// of its own, and for an Ollama child that field is always "" (Ollama
+// exposes no timings_per_token-style surface), so a publisher's string would
+// not merely collide with the dedicated answer -- it would BE the answer,
+// and the router would then send timings_per_token to an upstream that does
+// not understand it.
+//
+// Why the gateway's list is LONGER than this one: it carries a third name,
+// "speculation_observed", and this list deliberately does not mirror it.
+// That name appears in neither document either detector here reads, so an
+// honest agent has no path to it and a filter would only ever be dead code;
+// the gateway reserves it because it observes that capability itself, off
+// the drafted tokens a relayed completion reports.
 var reservedOllamaCapabilityNames = map[string]bool{
 	"mtp":           true,
 	"live_progress": true,

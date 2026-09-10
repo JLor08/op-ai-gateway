@@ -552,6 +552,25 @@ type Server struct {
 	// varies per call (GetTTL), shorter for an error-derived miss so a transient
 	// NetBird blip self-heals fast.
 	sourcePeerIP settingCache[string]
+	// speculationSeenMu guards speculationSeen: the set of mapping ids whose
+	// routing.CapabilitySpeculationObserved verdict this PROCESS has already
+	// claimed, consulted by claimSpeculationObserved (inference_complete.go) on
+	// every completion whose upstream reported drafted tokens.
+	//
+	// A plain mutex rather than a sync.Map (which this repository uses nowhere)
+	// because the operation is a single atomic CLAIM -- test-and-set in one
+	// critical section -- and that is exactly what makes concurrent first
+	// sightings of the same mapping produce ONE store write instead of several.
+	// Lazily created inside the claim so a Server built directly (bypassing New,
+	// as many tests do) works from its zero value, mirroring the nil-safe
+	// registries above.
+	//
+	// It needs no eviction and must not grow one: it is bounded by the number of
+	// model mappings that have ever served a speculating completion in this
+	// process, holds one map key each, and is deliberately forgotten on restart
+	// (a fresh process re-observes the fact from the next completion it relays).
+	speculationSeenMu sync.Mutex
+	speculationSeen   map[string]struct{}
 }
 
 // portalProvisioningGate adapts portal.API's AllowedServerIDs onto the

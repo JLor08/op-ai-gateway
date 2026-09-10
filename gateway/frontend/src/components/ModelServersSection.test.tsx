@@ -745,6 +745,88 @@ describe('ModelServersSection', () => {
     expect(within(cell).getByText(t.capabilityTools)).toHaveAttribute('data-status', 'active');
   });
 
+  // Task 6: "speculation_observed" got a translated label and a fixed slot
+  // in KNOWN_CAPABILITY_ORDER (after Tools -- see that array's own comment),
+  // instead of the verbatim "unrecognized name" chip it rendered before this
+  // task touched the frontend at all.
+  function makeToolsAndSpeculationRows(): ModelServerRow[] {
+    return makeRows().map((r) =>
+      r.mapping_id === 'map-a'
+        ? {
+            ...r,
+            capabilities: [
+              capRow('tools', 'yes'),
+              capRow('speculation_observed', 'yes', 'llama_cpp_timings', '2026-09-01T06:00:00Z'),
+            ],
+          }
+        : r,
+    );
+  }
+
+  it('renders speculation_observed as a translated chip after Tools', async () => {
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(makeToolsAndSpeculationRows()),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+    // Translated label, not the raw wire string.
+    expect(within(cell).getByText(t.capabilitySpeculationObserved)).toBeInTheDocument();
+    expect(within(cell).queryByText('speculation_observed')).not.toBeInTheDocument();
+    // Known-vocabulary chip: the vetted "active" key, same as any other
+    // fixed-order verdict chip -- not the neutral "standby" the unrecognized-
+    // name bucket uses.
+    expect(within(cell).getByText(t.capabilitySpeculationObserved)).toHaveAttribute(
+      'data-status',
+      'active',
+    );
+    // Fixed order: Tools precedes Speculation observed.
+    const labels = within(cell)
+      .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
+      .map((el) => el.textContent);
+    expect(labels).toEqual([t.capabilityTools, t.capabilitySpeculationObserved]);
+  });
+
+  // Two separate `it`s, each its own render + single hover -- following this
+  // file's own established pattern (see makeTwoCapabilityRows below) rather
+  // than hovering twice in one test: MUI keeps the first Popper mounted
+  // (display:none, still in the DOM) once a second tooltip opens, so
+  // `findByRole('tooltip')` after a second hover can resolve the stale node.
+  it('folds the speculation-observed caveat into its OWN chip’s tooltip, beside the shared caveat and provenance', async () => {
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(makeToolsAndSpeculationRows()),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+    fireEvent.mouseOver(within(cell).getByText(t.capabilitySpeculationObserved));
+    const tooltip = await screen.findByRole('tooltip');
+    // The capability-specific "observed, not supported" caveat is ADDED to,
+    // not swapped for, the shared video/tools text and this row's own
+    // source/checked-at.
+    expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesTooltip);
+    expect(tooltip).toHaveTextContent(t.capabilitySpeculationObservedTooltip);
+    expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesSource('llama_cpp_timings'));
+    expect(tooltip).toHaveTextContent(
+      t.modelServerCapabilitiesCheckedAt(new Date('2026-09-01T06:00:00Z').toLocaleString()),
+    );
+  });
+
+  it('does NOT leak the speculation-observed caveat into a different chip’s tooltip on the same row', async () => {
+    const { api } = makeApi({
+      modelServers: vi.fn().mockResolvedValue(makeToolsAndSpeculationRows()),
+    } as Partial<ModelServersSectionApi>);
+    renderSection(api);
+    await screen.findByText('GPU-Box-C');
+
+    const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+    fireEvent.mouseOver(within(cell).getByText(t.capabilityTools));
+    const tooltip = await screen.findByRole('tooltip');
+    expect(tooltip).not.toHaveTextContent(t.capabilitySpeculationObservedTooltip);
+  });
+
   it('renders the shared em-dash when the capabilities array is empty', async () => {
     const { api } = makeApi();
     renderSection(api);

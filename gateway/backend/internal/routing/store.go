@@ -813,11 +813,12 @@ type MappingCandidate struct {
 	Server      AIServer
 	Application Application
 	Mapping     ModelMapping
-	// IsMTP is the mapping's "mtp" capability verdict (model_mapping_capabilities,
-	// migration 78), filled by ActiveMappingsForModel's joined query (SQL) or its
-	// MemoryStore mirror from the same capability map, via MTPFromVerdict: true
-	// for a "yes" row, false for a "no" row, and false for no row at all (never
-	// determined). The scorer (scoringRoute) reads this field.
+	// LiveProgressSupport is the mapping's "live_progress" capability verdict
+	// (model_mapping_capabilities, migration 78), filled by
+	// ActiveMappingsForModel's joined query (SQL) or its MemoryStore mirror
+	// from the same capability map, via LiveProgressSupportFromVerdict: "" for
+	// no row (never determined), "supported" for a "yes" row, "unsupported"
+	// for a "no" row -- the same vocabulary Target.LiveProgressSupport speaks.
 	//
 	// It sits on the CANDIDATE rather than on Mapping because "this came from
 	// the join" is then a fact the TYPE carries instead of one a caller has to
@@ -828,17 +829,13 @@ type MappingCandidate struct {
 	// only a ModelMapping has to ask for the rows explicitly
 	// (MappingCapabilities), which is exactly the reminder the type is there
 	// to give.
-	IsMTP bool
-	// LiveProgressSupport is the mapping's "live_progress" capability verdict,
-	// filled the same way and for the same reason as IsMTP above, via
-	// LiveProgressSupportFromVerdict: "" for no row (never determined),
-	// "supported" for a "yes" row, "unsupported" for a "no" row -- the same
-	// vocabulary Target.LiveProgressSupport speaks. targetFrom reads THIS
-	// field when building a Target from a MappingCandidate, whether the
-	// candidate came from ActiveMappingsForModel's join or from
-	// resolveAffinity, which issues its own keyed MappingCapabilities read
-	// because its mapping comes from MappingsByApplication and is therefore
-	// unjoined (see resolveAffinity's comment).
+	//
+	// targetFrom reads THIS field when building a Target from a
+	// MappingCandidate, whether the candidate came from
+	// ActiveMappingsForModel's join or from resolveAffinity, which issues its
+	// own keyed MappingCapabilities read because its mapping comes from
+	// MappingsByApplication and is therefore unjoined (see resolveAffinity's
+	// comment).
 	//
 	// The benchmark path is the third producer of this verdict and does not
 	// go through a MappingCandidate at all: internal/gateway's
@@ -848,24 +845,6 @@ type MappingCandidate struct {
 	// LiveProgressSupportFromVerdict, so none of them can drift into its own
 	// spelling of "supported".
 	LiveProgressSupport string
-}
-
-// MTPFromVerdict maps a "mtp" capability verdict onto MappingCandidate.IsMTP:
-// CapabilityYes -> true, CapabilityNo -> false, and anything else -- in
-// practice only "", the value read back for a LEFT JOIN row that matched
-// nothing (absent = never determined) -- -> false. Written as an equality
-// check against CapabilityYes specifically (not "verdict != CapabilityNo" or
-// "verdict != \"\"") because those two alternatives are exactly the shape of
-// the classic three-state-to-bool bug this conversion has to avoid: either
-// would silently turn a "no" row -- an actual negative verdict -- into true.
-// TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts's "no" case
-// fails immediately if this ever regresses to one of them.
-//
-// Both ActiveMappingsForModel (SQL, from the joined mtp.verdict column) and
-// MemoryStore's mirror (from its capability map) call this SAME function, so
-// the two drivers cannot disagree about what a "no" row means.
-func MTPFromVerdict(verdict string) bool {
-	return verdict == CapabilityYes
 }
 
 // LiveProgressSupportFromVerdict translates the "live_progress" capability
@@ -1097,13 +1076,26 @@ type CapabilityRow struct {
 // manifest-declared names through verbatim), and those are stored and
 // displayed as-is rather than dropped. These constants exist only for the
 // capabilities the code itself reasons about.
+//
+// CapabilitySpeculationObserved is the odd one out, deliberately: every other
+// name above is something a build or a manifest DECLARES, while this one is an
+// OBSERVATION of a deployment that already served traffic -- a relayed
+// completion whose own usage reported drafted tokens
+// (inference.Usage.DraftTokens, llama.cpp's timings.draft_n), which is
+// evidence that the endpoint behind that mapping runs speculative decoding.
+// It is INFORMATION ONLY: nothing routes, scores or filters on it, and it is
+// not CapabilityMTP above (a different proposition -- "the model ships an MTP
+// head" -- which is display-only itself and no longer feeds routing either).
+// Its verdict is structurally positive-only; CapabilitySourceLlamaCppTimings
+// below carries the reason there is no honest "no" for it.
 const (
-	CapabilityVision       = "vision"
-	CapabilityVideo        = "video"
-	CapabilityAudio        = "audio"
-	CapabilityTools        = "tools"
-	CapabilityMTP          = "mtp"
-	CapabilityLiveProgress = "live_progress"
+	CapabilityVision              = "vision"
+	CapabilityVideo               = "video"
+	CapabilityAudio               = "audio"
+	CapabilityTools               = "tools"
+	CapabilityMTP                 = "mtp"
+	CapabilityLiveProgress        = "live_progress"
+	CapabilitySpeculationObserved = "speculation_observed"
 )
 
 // Capability verdicts.
@@ -1143,11 +1135,34 @@ const (
 // (see server-agent's collector.detectOllamaCapabilities). A row with this
 // source and verdict CapabilityNo could therefore not have come from that
 // probe.
+//
+// CapabilitySourceLlamaCppTimings names the third probe-rank source: the
+// `timings` object llama.cpp attaches to a completion it has just SERVED, read
+// off relayed traffic rather than fetched (inference.Usage.DraftTokens carries
+// timings.draft_n; the gateway writes the row from the request path). It is
+// named for the document it read, exactly as llama_cpp_props and
+// ollama_api_show are and for the same reason: an operator reading
+// "llama_cpp_props" on a verdict that came from a served response's timings
+// would be reading a false provenance. It too ranks 1 through
+// capabilitySourceRank's DEFAULT branch (no rank-table entry, and none is
+// wanted) -- never able to overwrite manual (3) or vision_benchmark (2),
+// always able to repair its own drift (1 vs 1).
+//
+// Its one-directionality is stronger than ollama_api_show's above: not a
+// detector's habit but the wire format itself. llama.cpp emits draft_n only
+// under `if (n_draft_tokens > 0)`, so when speculation is off the key is
+// ABSENT rather than 0 -- and absence is equally what a cache hit, a short
+// completion, a stream without its usage chunk, an error, or any non-llama.cpp
+// upstream produce. No wire state means "confirmed not speculating", so a row
+// with this source can only ever carry CapabilityYes: a CapabilityNo on it
+// could not have come from anywhere real, and would be a permanent false
+// claim ranked as a probe verdict.
 const (
 	CapabilitySourceManual          = "manual"
 	CapabilitySourceVisionBenchmark = "vision_benchmark"
 	CapabilitySourceLlamaCppProps   = "llama_cpp_props"
 	CapabilitySourceOllamaAPIShow   = "ollama_api_show"
+	CapabilitySourceLlamaCppTimings = "llama_cpp_timings"
 	CapabilitySourceLegacy          = "legacy"
 )
 
@@ -1163,14 +1178,17 @@ const (
 //	                                   answer read back.
 //	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same document
 //	   CapabilitySourceOllamaAPIShow,  (llama.cpp's /props, Ollama's
-//	   CapabilitySourceLegacy,         /api/show), or a migrated heuristic,
-//	   or any unrecognised source      every time. Both probes and an
-//	                                   unrecognised source rank here -- fail
-//	                                   SAFE toward "treat it as a probe"
-//	                                   rather than silently handing an
+//	   CapabilitySourceLegacy,         /api/show) every time, reads the
+//	   CapabilitySourceLlamaCppTimings timings llama.cpp put on a completion
+//	   or any unrecognised source      it just served, or replays a migrated
+//	                                   heuristic. EVERY probe source ranks
+//	                                   here, and so does an unrecognised one
+//	                                   -- fail SAFE toward "treat it as a
+//	                                   probe" rather than silently handing an
 //	                                   unknown writer manual's immunity,
-//	                                   which is also why ollama_api_show
-//	                                   needs no case of its own below.
+//	                                   which is also why neither
+//	                                   ollama_api_show nor llama_cpp_timings
+//	                                   needs a case of its own below.
 //	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
 //
 // WritableCapabilityRows is the only caller: a write is permitted iff

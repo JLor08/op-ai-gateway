@@ -1044,13 +1044,16 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 // NOT here: those four are what the two detectors read out of their
 // documents (llama.cpp's modalities + chat_template_caps, Ollama's
 // capabilities array), so a probe reporting one of them is reporting what it
-// saw. Neither document says anything about either name below:
+// saw. Neither document says anything about any name below:
 //
 //   - "mtp" is not detected anywhere today. The row comes from the portal --
 //     an operator's checkbox (manual) or the model-NAME heuristic
-//     (legacy, routing.IsMTPModelName) -- and it feeds scoringRoute's +30
-//     bonus through MappingCandidate.IsMTP. A "yes" from a probe would move
-//     real routing weight on the strength of a string in a model manifest.
+//     (legacy, routing.IsMTPModelName) -- and it no longer feeds routing at
+//     all (MappingCandidate carries no IsMTP field); it is a display and
+//     operator-seed fact only. A "yes" from a probe would still overwrite
+//     that display for any mapping the operator/heuristic never touched,
+//     presenting an unvetted manifest string to the operator as if it were
+//     an attested capability.
 //   - "live_progress" has a dedicated wire field of its own
 //     (RuntimeSample.LiveProgressSupport) and that field is the only channel
 //     an agent may report it on. Its verdict makes the router send
@@ -1058,21 +1061,64 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 //     understand at all, and for an Ollama child the dedicated field is
 //     ALWAYS "", so the "dedicated field wins" ordering below has nothing to
 //     win with and a publisher's string would take effect outright.
+//   - "speculation_observed" is observed by the GATEWAY, off the traffic it
+//     already relays: a completion whose usage reported drafted tokens
+//     (recordUsage -> writeSpeculationObserved, sourced
+//     routing.CapabilitySourceLlamaCppTimings). Neither probe reads a served
+//     completion's timings -- neither /props nor /api/show says anything
+//     about speculative decoding at all -- so no honest agent has anything
+//     to report here, in either direction. Two things make a verdict from
+//     the open list worse for this name than for "mtp". A "no" is a claim
+//     routing.CapabilitySpeculationObserved says cannot exist (the absence
+//     of drafted tokens is "no evidence", never "does not speculate"), and
+//     it arrives at rank 1, which TIES the gateway's own row -- and a tie is
+//     writable by design, so it OVERWRITES a real observation. And the
+//     repair that makes a tie safe for the CADENCE-driven rank-1 writers is
+//     missing here: the gateway writes this row at most once per mapping per
+//     PROCESS LIFETIME (claimSpeculationObserved), so it never rewrites what
+//     it wrote, and an agent's false verdict stands until a restart.
+//
+// Write-once-at-rank-1 is what "mtp" and "speculation_observed" above SHARE,
+// not what tells them apart -- do not restore an older wording claiming it
+// is unique to "speculation_observed". "mtp"'s rank-1 "legacy" row is written only for a
+// BRAND-NEW mapping (portal.legacyMTPCapabilityRow, from the portal's own
+// CreateMapping and from reconcileApplicationModels' newly-discovered-model
+// branch) and nothing re-derives it afterwards, so a tie-ranked write from
+// the open list is never repaired there either. That shared shape is why
+// both names are on this list.
+//
+// What differs is the repair left over, and it runs the OTHER way. "mtp" has
+// an operator control on the mapping form, whose rank-3 "manual" row
+// outranks every automated writer permanently -- and it has to, because no
+// writer re-derives "mtp" even across a restart. "speculation_observed" has
+// no control on that form at all (it submits "mtp" and "vision" only), and
+// its one routine repair is the process itself: the next speculating
+// completion after a restart re-observes the row and, rank 1 against rank 1
+// with a differing verdict, overwrites a false "no". A fabricated "yes"
+// survives that, because it is the verdict this writer would have written
+// (routing.WritableCapabilityRows rule 2 drops it as unchanged) -- which is
+// the "mtp" harm, and the second reason this name is reserved rather than
+// merely unlikely.
 //
 // This gateway-side rule is the load-bearing one, and the reason is the
-// threat model rather than tidiness: the agent's own detector skips these
-// names too (collector.detectOllamaCapabilities), but that filter protects
-// only against a publisher string reaching an HONEST agent's Extra list. A
-// buggy or hostile agent puts the name straight into the verdicts it sends,
-// where no agent-side filter is in the path at all. This boundary is.
+// threat model rather than tidiness: the agent's own detector skips the
+// first two names too (collector.detectOllamaCapabilities), but that filter
+// protects only against a publisher string reaching an HONEST agent's Extra
+// list. A buggy or hostile agent puts the name straight into the verdicts it
+// sends, where no agent-side filter is in the path at all. This boundary is.
+// It carries no entry for the third name and needs none, for the same reason
+// stated from the other side: "speculation_observed" appears in neither
+// document either agent detector reads, so an honest agent has no path to
+// it, and a dishonest one was never going to consult a filter.
 //
 // The day a real MTP detector exists it reports through a field this
 // codebase defined, the way live-progress support does, or this list changes
 // on both sides -- what it must not do is arrive on the OPEN list, whose
 // whole purpose is carrying strings no one here has vetted.
 var reservedAgentCapabilityNames = map[string]bool{
-	routing.CapabilityMTP:          true,
-	routing.CapabilityLiveProgress: true,
+	routing.CapabilityMTP:                 true,
+	routing.CapabilityLiveProgress:        true,
+	routing.CapabilitySpeculationObserved: true,
 }
 
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined
