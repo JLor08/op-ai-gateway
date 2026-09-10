@@ -7,9 +7,12 @@ import "strings"
 
 // mtpModelSubstrings are lowercased fragments whose presence marks a
 // Multi-Token-Prediction-capable model. BEST-EFFORT seed only: it sets the default
-// IsMTP at mapping-creation and is always overridable in the UI (and, from Phase 5,
-// protected by metrics_locked). Keep CONSERVATIVE — a false positive would later
-// bias server selection toward a model that is not actually faster. Extend as new
+// "mtp" capability row at mapping-creation (portal.legacyMTPCapabilityRow) and is
+// always overridable through the operator's own three-state control in the UI.
+// The row is DISPLAY and operator-seed only -- it does not feed routing or
+// scoring -- so a false positive now costs a wrong chip an operator can flip,
+// not a routing decision. Keep it conservative anyway: a wrong guess an
+// operator never notices is still a wrong fact on the mapping. Extend as new
 // MTP families appear.
 var mtpModelSubstrings = []string{
 	"deepseek-v3", // DeepSeek-V3 / V3.1 / V3.2 ship an MTP head

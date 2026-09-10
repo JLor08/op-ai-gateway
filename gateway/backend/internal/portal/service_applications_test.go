@@ -2117,25 +2117,21 @@ func TestListMappingsCapabilityReadFailureIsAnError(t *testing.T) {
 	}
 }
 
-// TestCreateMappingMTPHeuristicEarnsTheScorerBonus: a mapping created with an
-// MTP-suggesting name must write an "mtp" capability row, because the
-// scorer's +30 MTP bonus reads the JOINED row verdict
-// (MappingCandidate.IsMTP / routing.MTPFromVerdict) and nothing else.
-// Without the row, every mapping created after migration 78 silently lost a
-// bonus every pre-migration mapping kept --
-// a change in the scorer's behaviour this sub-project is not allowed to make.
+// TestCreateMappingMTPHeuristicWritesALegacyRowAProbeCanReplace: a mapping
+// created with an MTP-suggesting name must write an "mtp" capability row at
+// source LEGACY (rank 1) -- a GUESS, not an operator statement. The scorer no
+// longer reads this row at all (routing deleted the flat MTP bonus that once
+// did, since it duplicated the measured throughput term already in the same
+// tiebreak); what survives is that the row must stay beatable by a real
+// detector reporting at the same rank, which a manual row (rank 3) never
+// could be.
 //
-// Asserted THROUGH THE SCORER (Resolver.ScoreModelServers, the same
-// scoringRoute/Score path routing itself uses), not by reading the row back:
-// the row is the mechanism, the bonus is the requirement. The MTP-named and
-// plain mappings are identical in every scored respect and sit on the same
-// server, so the score difference IS the MTP bonus.
-//
-// The second half is why the heuristic writes source LEGACY rather than
-// manual: it is a guess, and a real detector (PR C's /slots-based detection,
-// at probe rank) must be able to correct it. A manual row could never be
-// corrected by anything.
-func TestCreateMappingMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
+// Proved by driving the exact sequence every capability writer makes --
+// WritableCapabilityRows(detected, stored) at equal rank, then the store
+// write -- and reading the row back afterward, so the assertion is that the
+// replacement actually reached the store, not merely that the precedence
+// function said it may.
+func TestCreateMappingMTPHeuristicWritesALegacyRowAProbeCanReplace(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newServerTestService(t, now)
@@ -2144,31 +2140,9 @@ func TestCreateMappingMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create app: %v", err)
 	}
-	// Identical in every scored respect except the NAME.
 	mtpMapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "deepseek-v3", AppModelName: "deepseek-v3"})
 	if err != nil {
 		t.Fatalf("CreateMapping (mtp name): %v", err)
-	}
-	if _, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen-coder", AppModelName: "qwen-coder"}); err != nil {
-		t.Fatalf("CreateMapping (plain name): %v", err)
-	}
-
-	resolver := routing.NewResolver(routeStore, func() time.Time { return now }, nil)
-	scoreOf := func(model string) float64 {
-		t.Helper()
-		scores, err := resolver.ScoreModelServers(ctx, model, now)
-		if err != nil {
-			t.Fatalf("ScoreModelServers(%s): %v", model, err)
-		}
-		if len(scores) != 1 {
-			t.Fatalf("ScoreModelServers(%s) = %+v, want exactly 1 candidate", model, scores)
-		}
-		return scores[0].Score
-	}
-
-	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
-	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
-		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- the name heuristic must write an \"mtp\" row, since the ROW's verdict is the only thing the scorer reads", delta, mtpBonusPoints)
 	}
 
 	// The heuristic's row is a GUESS at probe rank, so a real detector can
@@ -2188,10 +2162,12 @@ func TestCreateMappingMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
 	if err := routeStore.UpsertMappingCapabilities(ctx, mtpMapping.ID, writable); err != nil {
 		t.Fatalf("UpsertMappingCapabilities (detector): %v", err)
 	}
-	// Through the scorer again: the bonus is gone, so the replacement really
-	// reached the routing decision and not just the row.
-	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != 0 {
-		t.Fatalf("score delta after the detector overrode the name guess = %v, want 0", delta)
+
+	// The replacement must actually land in the store -- not just be
+	// permitted in the abstract by WritableCapabilityRows.
+	after := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, mtpMapping.ID))
+	if got := after[routing.CapabilityMTP]; got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceLlamaCppProps {
+		t.Fatalf("mtp row after detector write = %+v, want no/llama_cpp_props (the probe replaced the legacy guess)", got)
 	}
 }
 
@@ -2346,23 +2322,25 @@ func TestSyncApplicationModelsAddsFreshMappings(t *testing.T) {
 	}
 }
 
-// TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus mirrors
-// TestCreateMappingMTPHeuristicEarnsTheScorerBonus for the OTHER mapping
-// write path that applies routing.IsMTPModelName:
+// TestReconcileApplicationModelsMTPHeuristicWritesALegacyRowAProbeCanReplace
+// mirrors TestCreateMappingMTPHeuristicWritesALegacyRowAProbeCanReplace for
+// the OTHER mapping write path that applies routing.IsMTPModelName:
 // reconcileApplicationModels, i.e. the manual "Sync models" button and the
 // background model_sync probe loop -- the automatic path most mappings
 // arrive through (see that function's own "FOURTH mapping write path"
 // comment). It used to set the since-dropped ModelMapping.IsMTP column from
-// the heuristic and stop there, so a mapping discovered here silently lost
-// the scorer's +30 MTP bonus, which reads the JOINED "mtp" row
-// (routing.MTPFromVerdict).
+// the heuristic and stop there. The scorer no longer reads the "mtp" row at
+// all (the flat MTP bonus that once did is deleted); what survives is that
+// the row this write path leaves behind is source LEGACY (rank 1), so a real
+// detector reporting at the same rank can still replace it -- a manual row
+// (rank 3) never could.
 //
-// Asserted THROUGH THE SCORER (Resolver.ScoreModelServers), not by reading
-// the row back first: the row is the mechanism, the bonus is the
-// requirement. Both mappings are discovered through the same
-// SyncApplicationModels call, on the same server, identical in every scored
-// respect except the upstream model NAME.
-func TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus(t *testing.T) {
+// Proved, like its CreateMapping twin, by driving the actual
+// WritableCapabilityRows(detected, stored) call and the follow-up store
+// write, then reading the row back -- not by inspecting the stored source
+// alone, which would still pass even if WritableCapabilityRows had stopped
+// permitting the replacement.
+func TestReconcileApplicationModelsMTPHeuristicWritesALegacyRowAProbeCanReplace(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	lister := &fakeLister{models: []string{"deepseek-v3", "qwen-coder"}}
@@ -2381,27 +2359,6 @@ func TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus(t *testing.T)
 		t.Fatalf("result = %#v, want added=2", result)
 	}
 
-	resolver := routing.NewResolver(routeStore, func() time.Time { return now }, nil)
-	scoreOf := func(model string) float64 {
-		t.Helper()
-		scores, err := resolver.ScoreModelServers(ctx, model, now)
-		if err != nil {
-			t.Fatalf("ScoreModelServers(%s): %v", model, err)
-		}
-		if len(scores) != 1 {
-			t.Fatalf("ScoreModelServers(%s) = %+v, want exactly 1 candidate", model, scores)
-		}
-		return scores[0].Score
-	}
-
-	const mtpBonusPoints = 30.0 // routing's own flat MTP bonus (scorer.go)
-	if delta := scoreOf("deepseek-v3") - scoreOf("qwen-coder"); delta != mtpBonusPoints {
-		t.Fatalf("score(mtp-named) - score(plain) = %v, want exactly %v -- model discovery must write an \"mtp\" row for a name-heuristic match, since the ROW's verdict is the only thing the scorer reads", delta, mtpBonusPoints)
-	}
-
-	// The row landed at the same rank CreateMapping uses for the identical
-	// heuristic: legacy (rank 1), so a real detector (PR C's /slots probe,
-	// also rank 1) can still replace this guess -- a manual row never could.
 	mappings, err := routeStore.MappingsByApplication(ctx, app.ID)
 	if err != nil {
 		t.Fatalf("MappingsByApplication: %v", err)
@@ -2415,9 +2372,33 @@ func TestReconcileApplicationModelsMTPHeuristicEarnsTheScorerBonus(t *testing.T)
 	if mtpMappingID == "" {
 		t.Fatalf("no mapping found for deepseek-v3 among %#v", mappings)
 	}
+
+	// The row landed at the same rank CreateMapping uses for the identical
+	// heuristic: legacy (rank 1).
 	stored := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, mtpMappingID))
 	if got := stored[routing.CapabilityMTP]; got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceLegacy {
 		t.Fatalf("heuristic mtp row = %+v, want yes/legacy (beatable by a probe)", got)
+	}
+
+	// A real detector reporting at the same rank must be allowed to correct
+	// the name guess -- a manual row (rank 3) could never be touched this way.
+	detected := []routing.CapabilityRow{{
+		Capability: routing.CapabilityMTP, Verdict: routing.CapabilityNo,
+		Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now.Add(time.Hour),
+	}}
+	writable := routing.WritableCapabilityRows(detected, stored)
+	if len(writable) != 1 {
+		t.Fatalf("detector-vs-legacy writable rows = %+v, want 1 (a real detector must be able to correct a name guess)", writable)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, mtpMappingID, writable); err != nil {
+		t.Fatalf("UpsertMappingCapabilities (detector): %v", err)
+	}
+
+	// The replacement must actually land in the store -- not just be
+	// permitted in the abstract by WritableCapabilityRows.
+	after := routing.CapabilityRowsByName(mustMappingCapabilities(t, routeStore, mtpMappingID))
+	if got := after[routing.CapabilityMTP]; got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceLlamaCppProps {
+		t.Fatalf("mtp row after detector write = %+v, want no/llama_cpp_props (the probe replaced the legacy guess)", got)
 	}
 }
 

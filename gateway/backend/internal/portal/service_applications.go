@@ -1732,21 +1732,28 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 		// and with the same true-only asymmetry for the same reason.
 		capRows = append(capRows, manualCapabilityRow(routing.CapabilityMTP, true, now))
 	case isMTP:
-		// The NAME HEURISTIC said MTP. It still has to write a row: the
-		// scorer's +30 MTP bonus reads MappingCandidate.IsMTP, which is the
-		// JOINED "mtp" row's verdict (routing.MTPFromVerdict) and the only
-		// place the verdict lives at all now -- so a mapping created without
-		// a row would silently lose the bonus migration 78 gave every
-		// mapping that existed before it.
+		// The NAME HEURISTIC said MTP. It still writes a row, but the reason
+		// is no longer routing: the scorer's flat MTP bonus is gone (it
+		// duplicated, worse, the measured tokens-per-second term already
+		// sitting in the same tiebreak), so nothing downstream of this row
+		// scores a request differently because of it.
 		//
-		// Source LEGACY, not manual: a name heuristic is a GUESS, and it must
-		// stay beatable by the real detection PR C adds (a probe writes at
-		// rank 1, and the rule is rank(incoming) >= rank(current), so a
-		// probe can replace this row -- a manual one it could never touch).
-		// That is also exactly how migration 78 recorded the same guess when
-		// it lifted it off the column. See legacyMTPCapabilityRow --
-		// reconcileApplicationModels applies the identical heuristic on its
-		// own write path and shares this builder rather than re-deriving it.
+		// What is left is DISPLAY and an OPERATOR SEED. The row is the only
+		// place this guess is recorded, so the portal's mapping list can
+		// show an "mtp" chip with its source in the tooltip, and the
+		// operator's own three-state control (CapabilityVerdicts) has a
+		// starting value to confirm or overturn instead of an unlabelled
+		// blank. A false positive now costs a wrong chip an operator can
+		// flip in the UI -- not a wrong route.
+		//
+		// Source LEGACY, not manual: a name heuristic is still a GUESS, and
+		// it must stay beatable by anything that ranks alongside a probe
+		// (rank(incoming) >= rank(current) lets a same-rank write replace
+		// this row -- a manual one it could never touch). That is also
+		// exactly how migration 78 recorded the same guess when it lifted it
+		// off the column. See legacyMTPCapabilityRow -- reconcileApplicationModels
+		// applies the identical heuristic on its own write path and shares
+		// this builder rather than re-deriving it.
 		capRows = append(capRows, legacyMTPCapabilityRow(now))
 	}
 	// What mappingDTO reports back to the form: the rows that actually landed
@@ -2147,14 +2154,16 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		}
 		if isMTP {
 			// Same NAME HEURISTIC, same legacy-sourced row CreateMapping
-			// writes for it -- see legacyMTPCapabilityRow. This row is the
-			// ONLY place the heuristic's verdict lands now, so without it a
-			// mapping discovered here (the manual "Sync models" button and
-			// the background model_sync probe loop, i.e. the automatic path
-			// most mappings arrive through) would never earn the scorer's
-			// ROW-based +30 MTP bonus. Best-effort: this is a sync/reconcile
-			// loop, and a capability-write failure must not fail the
-			// reconcile whose primary effect (the mapping itself) already
+			// writes for it -- see legacyMTPCapabilityRow and its own comment on
+			// why the row is display/operator-seed, not a scoring input, now
+			// that the scorer's flat MTP bonus is gone. This row is still the
+			// ONLY place the heuristic's verdict lands, so without it a mapping
+			// discovered here (the manual "Sync models" button and the
+			// background model_sync probe loop, i.e. the automatic path most
+			// mappings arrive through) would show no "mtp" chip and give the
+			// operator nothing to correct. Best-effort: this is a
+			// sync/reconcile loop, and a capability-write failure must not fail
+			// the reconcile whose primary effect (the mapping itself) already
 			// landed.
 			s.writeOperatorCapabilities(ctx, mapping.ID, []routing.CapabilityRow{legacyMTPCapabilityRow(now)})
 		}
@@ -2251,11 +2260,25 @@ func manualCapabilityRow(capability string, capable bool, at time.Time) routing.
 }
 
 // legacyMTPCapabilityRow builds the "mtp" capability row for a NAME-HEURISTIC
-// match (routing.IsMTPModelName), source CapabilitySourceLegacy (rank 1) so a
-// real detector (PR C's /slots-based probe, also rank 1, "rank(incoming) >=
-// rank(current)") can still replace a guess -- see CreateMapping's isMTP case
-// for why this must never be manual (rank 3), which a probe could never
-// touch. Migration 78 recorded the same column-derived guess the same way.
+// match (routing.IsMTPModelName): a DISPLAY and OPERATOR-SEED fact now, not a
+// scoring input -- the scorer's flat MTP bonus that once read this verdict is
+// gone, so a wrong guess here costs a wrong chip in the portal, never a wrong
+// route. Source CapabilitySourceLegacy (rank 1), not manual (rank 3), so the
+// operator's own three-state control can still overwrite it at any time --
+// see CreateMapping's isMTP case for why that asymmetry matters. Migration 78
+// recorded the same column-derived guess the same way.
+//
+// No probe will ever outrank this row at rank 1 instead: llama.cpp's /slots
+// exposes a `speculative` bool, but it is true for EVERY drafting technique,
+// plain n-gram lookup included, so it says nothing about MTP specifically.
+// The one field that actually names the technique, params["speculative.types"]
+// containing "draft-mtp", lives under a slot's `params`, which llama.cpp only
+// populates after that slot has served a request -- so it reads empty on any
+// server idle since boot, the exact moment a fresh mapping needs a verdict.
+// (/slots also needs the child's own API key, which this codebase does not
+// always hold, and answers 501 when the endpoint is disabled.) There is no
+// forward reference to replace this with; the name heuristic is what this
+// capability has.
 //
 // Shared by CreateMapping and reconcileApplicationModels: both apply the
 // identical heuristic to a brand-new mapping, so both write the identical row
