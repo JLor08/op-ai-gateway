@@ -284,11 +284,16 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// model name.
 	//
 	// In particular the gateway does NOT add llama.cpp's `timings_per_token`,
-	// however tempting that looks: it is what makes the upstream attach a
-	// `timings` object to PARTIAL Responses frames, and therefore the only
-	// source of a live tokens/sec figure for an /v1/responses passthrough
-	// stream (see the per-flavor table under "Native passthrough is on this panel
-	// too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
+	// however tempting that looks: a `timings` object on a PARTIAL frame is the
+	// only thing that can put a live tokens/sec figure on an /v1/responses
+	// passthrough row while generation is still running, and that flag is what
+	// makes llama.cpp attach one to a chat stream's partials. Whether its
+	// Responses implementation does the same on partials is not something this
+	// repo has captured — the gateway simply reads a `timings` object wherever
+	// one appears. Note "while still running": the terminal `response.completed`
+	// frame carries its own `timings`, so a rate does arrive at the end without
+	// any flag (see the per-flavor table under "Native passthrough is on this
+	// panel too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
 	// §8.4.3). The flag is READ when the client set it and never set here.
 	// Injecting it would change the upstream's response shape — new frames' worth
 	// of fields the client never asked for, flowing through to a client that must
