@@ -1122,20 +1122,25 @@ func TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField(t *testing.T
 }
 
 // TestIngestDropsReservedCapabilityNamesFromAnAgentProbe pins the rule that
-// makes the OPEN capability vocabulary safe to feed from an upstream one:
-// "mtp" and "live_progress" may not arrive from an agent-reported probe
-// source, whichever of the two probes is claimed.
+// makes the OPEN capability vocabulary safe to feed from an upstream one,
+// for the two names it has covered from the start: "mtp" and "live_progress"
+// may not arrive from an agent-reported probe source, whichever of the two
+// probes is claimed. reservedAgentCapabilityNames holds a THIRD name,
+// "speculation_observed", whose own case turns on a different argument (a
+// tie the gateway never repairs) and is pinned separately by
+// TestIngestDropsAnAgentReportedSpeculationVerdict.
 //
-// Both names are ones this codebase reasons about and neither probe can
+// Both names here are ones this codebase reasons about and neither probe can
 // observe. Ollama's /api/show carries whatever a publisher wrote into a
 // model manifest, and since the agent's Ollama detector is the first
 // producer of the open Extra list anywhere, the literal string "mtp" in a
-// manifest would otherwise write a rank-1 "yes" that feeds the router's +30
-// MTP bonus, and "live_progress" would make the router send
+// manifest would otherwise write a rank-1 "yes" over the operator-facing
+// DISPLAY that row now is -- the router's flat +30 MTP bonus that once read
+// it is deleted -- and "live_progress" would make the router send
 // timings_per_token to an Ollama upstream that does not understand it. The
-// agent's detector skips both, but that filter only ever sees a publisher's
-// string: a buggy or hostile agent puts the name straight into the verdicts
-// it sends, and THIS is the boundary that is in that path.
+// agent's own detector skips these two, but that filter only ever sees a
+// publisher's string: a buggy or hostile agent puts the name straight into
+// the verdicts it sends, and THIS is the boundary that is in that path.
 //
 // Unfalsifiable rather than merely quiet, in both directions. The mapping
 // already holds an "mtp" row of the OPPOSITE verdict at EQUAL rank

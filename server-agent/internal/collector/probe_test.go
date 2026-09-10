@@ -948,7 +948,9 @@ func TestDetectOllamaCapabilitiesDropsAnOverlongName(t *testing.T) {
 //
 // Why these two and not vision/tools/audio: Ollama's array is real evidence
 // for those three and says nothing at all about either of these. "mtp" is
-// not detected anywhere and feeds the router's +30 bonus; "live_progress"
+// not detected anywhere and is a display and operator-seed fact only -- the
+// router's flat +30 bonus that once read it is deleted, so what a
+// publisher's string would still corrupt is that display; "live_progress"
 // has a dedicated wire field, and for an Ollama child that field is always
 // "", so a publisher's string would not collide with the dedicated answer --
 // it would BE the answer, and the router would send timings_per_token to an
