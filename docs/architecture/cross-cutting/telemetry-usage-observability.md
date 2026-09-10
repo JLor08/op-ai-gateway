@@ -1104,15 +1104,32 @@ would be **permanent**. Neither `/props` nor `/api/show` says anything about
 speculative decoding, so no honest agent has anything to report here in either
 direction; a `no` is a verdict the capability itself says cannot exist; and it
 would arrive at rank 1, which TIES the gateway's own `llama_cpp_timings` row —
-writable by design. What makes a tie safe everywhere else is that the losing
-writer repairs its row on the next cadence tick, and that repair is exactly
-what this one does not have: the gateway writes the row at most once per
-mapping per PROCESS lifetime, so it never rewrites what it wrote, and a false
-verdict would stand until a restart. No other rank-1 capability has that
-property, which is why the criterion above ("reasons about it, cannot observe
-it") is met here by the gateway's own observation rather than by a detector's
-silence. `vision`/`video`/`audio`/`tools` are deliberately **not** reserved:
-those four are exactly what the two detectors read out of their documents.
+writable by design. What makes a tie safe for the *cadence-driven* rank-1
+writers is that the losing writer repairs its row on the next tick, and that
+repair is exactly what this one does not have: the gateway writes the row at
+most once per mapping per PROCESS lifetime, so it never rewrites what it
+wrote, and a false verdict would stand until a restart. The criterion above
+("reasons about it, cannot observe it") is met here by the gateway's own
+observation rather than by a detector's silence.
+
+**Write-once-at-rank-1 is what `mtp` and `speculation_observed` share, not
+what distinguishes them — do not restore an older wording that called it
+unique to the observed one.** `mtp`'s rank-1 `legacy` row is written only for
+a brand-new mapping, at both creation sites, and nothing re-derives it
+afterwards
+([§11.1](../11-risks-and-technical-debt.md#111-operational-risks) records
+that nothing re-probes `mtp` on an existing mapping at all), so a tie-ranked
+write from an agent's open list would never be repaired there either. That
+shared shape is why both names are reserved. What differs is the repair left
+over, and it runs the other way: `mtp` has an operator control on the mapping
+form whose rank-3 `manual` row outranks every automated writer permanently —
+and it needs to, because nothing re-derives `mtp` even across a restart —
+while `speculation_observed` has no control on that form at all (it submits
+`mtp` and `vision` only) and is repaired only by the process itself, the next
+speculating completion after a restart overwriting a false `no` at rank 1
+against rank 1. `vision`/`video`/`audio`/`tools` are deliberately **not**
+reserved: those four are exactly what the two detectors read out of their
+documents.
 
 The rule is enforced at the **ingest**, because that is the boundary in the
 path of a buggy or hostile agent putting the name straight into its verdict
@@ -1217,10 +1234,20 @@ decoding, but a completion the gateway has just relayed does: llama.cpp
 attaches `timings.draft_n` — the number of tokens a draft model proposed for
 that turn — to the non-streaming chat body, to the final frame of a
 chat-completions stream (the same chunk as the terminal `usage`), and to the
-terminal frame of a Responses-API stream. `inference.Usage.DraftTokens`
-carries it, and `recordUsage` (`internal/gateway/inference_complete.go`)
-records one `speculation_observed` row, verdict `yes`, source
-`llama_cpp_timings`, when it is `> 0`. Four properties are the design:
+terminal frame of a Responses-API stream. **Those three are the whole list,
+and the Responses pair must be kept apart:** the *stream's* terminal
+`response.completed` frame carries `timings`, while the **non-streaming**
+`/v1/responses` body carries no `timings` object at all — as no Anthropic
+shape and no ASR response does either, so `DraftTokens` stays 0 on all of
+them whatever the upstream is actually doing. The code has exactly three
+read sites for the counter, one per shape on that list and none on a
+non-streaming Responses body: two in `provider/openai_compatible.go` (the
+chat body and the chat stream's chunks) and `mergeResponsesUsage`
+(`internal/gateway/native_passthrough.go`, the Responses stream's frames).
+`inference.Usage.DraftTokens` carries it, and `recordUsage`
+(`internal/gateway/inference_complete.go`) records one
+`speculation_observed` row, verdict `yes`, source `llama_cpp_timings`, when
+it is `> 0`. Four properties are the design:
 
 - **Information only.** Nothing routes, scores or filters on it — the scorer
   never sees a capability verdict at all — and it is not `mtp`, which is a

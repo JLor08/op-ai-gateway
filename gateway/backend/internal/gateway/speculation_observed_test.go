@@ -241,13 +241,21 @@ func TestRecordUsageWritesTheSpeculationVerdictOnceUnderConcurrentCompletions(t 
 //
 // A "no" from the open list ties the gateway's own row at rank 1 (both
 // llama_cpp_props and llama_cpp_timings take capabilitySourceRank's default),
-// and a tie is writable by design, because everywhere else the writer that
-// lost repairs its own row on the next cadence tick. This writer has no next
+// and a tie is writable by design, because for a CADENCE-driven writer the
+// one that lost repairs its own row on the next tick. This writer has no next
 // tick: claimSpeculationObserved holds the mapping for the whole process
 // lifetime, so once overwritten the false verdict stands until a restart.
-// That combination -- rank-1 writable, never rewritten -- is unique to this
-// capability, and it is why the name belongs on the list rather than merely
-// being unlikely to arrive.
+// That combination -- rank-1 writable, never rewritten -- is why the name
+// belongs on the list rather than merely being unlikely to arrive.
+//
+// It is NOT unique to this capability, and an earlier wording of this
+// comment said it was: "mtp"'s rank-1 "legacy" row is written only for a
+// brand-new mapping (portal.legacyMTPCapabilityRow, at both creation sites)
+// and nothing re-derives it afterwards, so it has the same shape -- which is
+// why that name is on the same list. What differs is the repair left over,
+// not the shape: an operator's rank-3 "manual" row is reachable from the
+// mapping form for "mtp" and not for this capability, whose only routine
+// repair is the next speculating completion after a restart.
 //
 // Both verdicts are refused, and each subtest is falsifiable in its own way,
 // because the two would-be harms are different:

@@ -1073,11 +1073,32 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 //     of drafted tokens is "no evidence", never "does not speculate"), and
 //     it arrives at rank 1, which TIES the gateway's own row -- and a tie is
 //     writable by design, so it OVERWRITES a real observation. And the
-//     repair that makes ties safe everywhere else is missing here: the
-//     gateway writes this row at most once per mapping per PROCESS LIFETIME
-//     (claimSpeculationObserved), so it never rewrites what it wrote, and an
-//     agent's false verdict stands until a restart. No other rank-1
-//     capability has that property.
+//     repair that makes a tie safe for the CADENCE-driven rank-1 writers is
+//     missing here: the gateway writes this row at most once per mapping per
+//     PROCESS LIFETIME (claimSpeculationObserved), so it never rewrites what
+//     it wrote, and an agent's false verdict stands until a restart.
+//
+// Write-once-at-rank-1 is what "mtp" and "speculation_observed" above SHARE,
+// not what tells them apart -- do not restore an older wording claiming it
+// is unique to "speculation_observed". "mtp"'s rank-1 "legacy" row is written only for a
+// BRAND-NEW mapping (portal.legacyMTPCapabilityRow, from the portal's own
+// CreateMapping and from reconcileApplicationModels' newly-discovered-model
+// branch) and nothing re-derives it afterwards, so a tie-ranked write from
+// the open list is never repaired there either. That shared shape is why
+// both names are on this list.
+//
+// What differs is the repair left over, and it runs the OTHER way. "mtp" has
+// an operator control on the mapping form, whose rank-3 "manual" row
+// outranks every automated writer permanently -- and it has to, because no
+// writer re-derives "mtp" even across a restart. "speculation_observed" has
+// no control on that form at all (it submits "mtp" and "vision" only), and
+// its one routine repair is the process itself: the next speculating
+// completion after a restart re-observes the row and, rank 1 against rank 1
+// with a differing verdict, overwrites a false "no". A fabricated "yes"
+// survives that, because it is the verdict this writer would have written
+// (routing.WritableCapabilityRows rule 2 drops it as unchanged) -- which is
+// the "mtp" harm, and the second reason this name is reserved rather than
+// merely unlikely.
 //
 // This gateway-side rule is the load-bearing one, and the reason is the
 // threat model rather than tidiness: the agent's own detector skips the

@@ -1139,9 +1139,21 @@ speculating mapping in the fleet. That once-per-lifetime bound is also why the
 name is **reserved** at the agent ingest, alongside `mtp` and `live_progress`:
 a verdict arriving on an agent's open verdict list lands at rank 1, which TIES
 this source and is therefore writable, and the repair that makes a tie safe
-for every other rank-1 capability — the losing writer rewrites its row on the
-next cadence tick — is precisely what a writer that never runs twice does not
-have. An agent's `no` would otherwise stand until a restart.
+for the *cadence-driven* rank-1 writers — the losing writer rewrites its row
+on the next tick — is precisely what a writer that never runs twice does not
+have. An agent's `no` would otherwise stand until a restart. **That shape is
+shared with `mtp`, not unique to this name, and an earlier wording of this
+paragraph claimed otherwise — do not restore it.** `mtp`'s rank-1 `legacy`
+row is written only for a brand-new mapping (the portal's own create path and
+model discovery's reconcile) and nothing re-derives it afterwards
+([§11.1](11-risks-and-technical-debt.md#111-operational-risks)), so a
+tie-ranked write would never be repaired there either — which is why *both*
+names are on the reserved list. The discriminator is the repair left over,
+and it runs the other way round: `mtp` has an operator control on the mapping
+form, whose rank-3 `manual` row outranks every automated writer permanently
+and has to, because nothing re-derives `mtp` even across a restart, while
+`speculation_observed` has no control on that form at all and is repaired
+only by the next speculating completion after a restart.
 **Consequence: the deletion made the request path CHEAPER, and that is the
 opposite of the usual trade.** The candidate query keeps one filtered LEFT
 JOIN instead of two, and the join it lost measured ≈ 6 µs against that query's
