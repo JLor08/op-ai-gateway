@@ -198,28 +198,6 @@ func TestSelectRoutePrefersHigherGenThroughput(t *testing.T) {
 	}
 }
 
-// TestSelectRouteNoLongerPrefersTheMTPVerdict replaces the deleted
-// TestSelectRoutePrefersMTP. Two candidates identical in everything the scorer
-// reads (there is no longer an MTP field at all) must tie, so Select's strict
-// > leaves the first route in place -- nothing quietly breaks the tie in the
-// bonus's absence.
-func TestSelectRouteNoLongerPrefersTheMTPVerdict(t *testing.T) {
-	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	routes := []Route{
-		{ID: "first", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now},
-		{ID: "second", Model: "qwen-coder", Priority: 10, Weight: 50, Healthy: true, LatencyMS: 100, TelemetryAt: now},
-	}
-
-	selected, _, ok := Select(routes, "qwen-coder", now)
-
-	if !ok {
-		t.Fatalf("Select returned ok=false")
-	}
-	if selected.ID != "first" {
-		t.Fatalf("selected = %s, want first (identical routes tie; nothing should break it)", selected.ID)
-	}
-}
-
 // TestSelectRoutePrefersTheMeasurablyFasterRoute is the signal that replaces the
 // flat MTP bonus: MEASURED generation throughput, folded into the same bounded
 // tiebreak, still decides between two otherwise-identical routes.

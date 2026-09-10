@@ -464,14 +464,14 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
 			m.created_at, m.updated_at,
-			mtp.verdict, lp.verdict
+			lp.verdict
 		from model_mappings m
 		join applications a on a.id = m.application_id
 		join ai_servers srv on srv.id = a.server_id
-		-- Two FILTERED joins (one row per mapping each), not one unfiltered join
-		-- on model_mapping_capabilities and a Go-side pick of the two rows this
-		-- decision path needs: measured at roughly +6 microseconds EACH against
-		-- this per-request query's existing ~17 microsecond cost, and each still
+		-- A FILTERED join (one row per mapping), not one unfiltered join on
+		-- model_mapping_capabilities and a Go-side pick of the one row this
+		-- decision path needs: measured at roughly +6 microseconds against this
+		-- per-request query's existing ~17 microsecond cost, and it still
 		-- returns AT MOST one row per mapping ((mapping_id, capability) is the
 		-- table's primary key), so the candidate result set's cardinality is
 		-- unchanged. An unfiltered join returns one row per (mapping,
@@ -479,13 +479,11 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 		-- capabilities a mapping has rows for -- which measured at roughly +79
 		-- microseconds and would need a Go-side collapse back to one candidate
 		-- per mapping to undo.
-		left join model_mapping_capabilities mtp
-		       on mtp.mapping_id = m.id and mtp.capability = ?
 		left join model_mapping_capabilities lp
 		       on lp.mapping_id = m.id and lp.capability = ?
 		where m.gateway_model_name = ? and m.status = ? and a.status = ?
 		order by m.id`,
-		routing.CapabilityMTP, routing.CapabilityLiveProgress,
+		routing.CapabilityLiveProgress,
 		gatewayModel, routing.ServerStatusActive, routing.ServerStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list active mappings: %w", err)
@@ -519,14 +517,12 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		proxyExcluded        int64
 		mapLocked            int64
 		mapUpdatedNil        sql.NullTime
-		// mtpVerdict/liveProgressVerdict are the two joined
-		// model_mapping_capabilities.verdict columns (nullable: a LEFT JOIN row
-		// with no match scans as NULL, i.e. Valid == false, String == "" -- the
-		// same "absent = never determined" reading routing.MTPFromVerdict /
-		// routing.LiveProgressSupportFromVerdict expect). The verdict column
-		// itself is NOT NULL when a row exists (migration78Up), so a valid,
-		// non-empty String is always exactly "yes" or "no".
-		mtpVerdict          sql.NullString
+		// liveProgressVerdict is the joined model_mapping_capabilities.verdict
+		// column (nullable: a LEFT JOIN row with no match scans as NULL, i.e.
+		// Valid == false, String == "" -- the same "absent = never determined"
+		// reading routing.LiveProgressSupportFromVerdict expects). The verdict
+		// column itself is NOT NULL when a row exists (migration78Up), so a
+		// valid, non-empty String is always exactly "yes" or "no".
 		liveProgressVerdict sql.NullString
 	)
 	err := row.Scan(
@@ -549,7 +545,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
 		&c.Mapping.MaxConcurrency, &c.Mapping.RecommendedConcurrency, &c.Mapping.GenTokensPerSecondAtCapacity,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
-		&mtpVerdict, &liveProgressVerdict,
+		&liveProgressVerdict,
 	)
 	if err != nil {
 		return routing.MappingCandidate{}, fmt.Errorf("scan mapping candidate: %w", err)
@@ -559,13 +555,12 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	c.Application.ProxyExcluded = proxyExcluded != 0
 	c.Mapping.MetricsLocked = mapLocked != 0
-	// The boundary conversion: c.IsMTP/c.LiveProgressSupport come from the
-	// JOINED capability rows, via the same routing.MTPFromVerdict /
-	// routing.LiveProgressSupportFromVerdict MemoryStore's mirror also calls.
-	// They live on the CANDIDATE, not on c.Mapping: routing.ModelMapping
-	// carries no capability field at all any more (migration 79 dropped the
-	// columns they were) -- see MappingCandidate's own doc.
-	c.IsMTP = routing.MTPFromVerdict(mtpVerdict.String)
+	// The boundary conversion: c.LiveProgressSupport comes from the JOINED
+	// capability row, via the same routing.LiveProgressSupportFromVerdict
+	// MemoryStore's mirror also calls. It lives on the CANDIDATE, not on
+	// c.Mapping: routing.ModelMapping carries no capability field at all any
+	// more (migration 79 dropped the columns they were) -- see
+	// MappingCandidate's own doc.
 	c.LiveProgressSupport = routing.LiveProgressSupportFromVerdict(liveProgressVerdict.String)
 	if mapUpdatedNil.Valid {
 		t := mapUpdatedNil.Time

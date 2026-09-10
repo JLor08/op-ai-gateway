@@ -2295,8 +2295,7 @@ func legacyMTPCapabilityRow(at time.Time) routing.CapabilityRow {
 // capabilityVerdictBool folds one stored capability row's THREE-state verdict
 // ("yes" / "no" / no row at all) onto the two-state boolean the mapping form
 // binds to: only CapabilityYes is true, so a "no" row and a MISSING row both
-// read as false (the same fail-closed reading routing.MTPFromVerdict and
-// ModelServerDTO.IsMtp use).
+// read as false (the same fail-closed reading ModelServerDTO.IsMtp uses).
 //
 // This is the fold mappingDTO ships beside the rows, and it is why
 // UpdateMapping compares a submitted LEGACY boolean against this value rather

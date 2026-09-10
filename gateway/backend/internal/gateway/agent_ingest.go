@@ -1048,9 +1048,12 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 //
 //   - "mtp" is not detected anywhere today. The row comes from the portal --
 //     an operator's checkbox (manual) or the model-NAME heuristic
-//     (legacy, routing.IsMTPModelName) -- and it feeds scoringRoute's +30
-//     bonus through MappingCandidate.IsMTP. A "yes" from a probe would move
-//     real routing weight on the strength of a string in a model manifest.
+//     (legacy, routing.IsMTPModelName) -- and it no longer feeds routing at
+//     all (MappingCandidate carries no IsMTP field); it is a display and
+//     operator-seed fact only. A "yes" from a probe would still overwrite
+//     that display for any mapping the operator/heuristic never touched,
+//     presenting an unvetted manifest string to the operator as if it were
+//     an attested capability.
 //   - "live_progress" has a dedicated wire field of its own
 //     (RuntimeSample.LiveProgressSupport) and that field is the only channel
 //     an agent may report it on. Its verdict makes the router send

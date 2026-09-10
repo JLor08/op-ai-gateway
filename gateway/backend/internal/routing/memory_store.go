@@ -1300,20 +1300,18 @@ func (m *MemoryStore) ActiveMappingsForModel(_ context.Context, gatewayModel str
 		if !ok {
 			continue
 		}
-		// mtpRow/liveProgressRow default to their zero CapabilityRow (Verdict ==
-		// "") when the mapping has no entry for that capability at all -- the
-		// same "absent = never determined" reading the SQL store's LEFT JOIN
-		// produces for scanMappingCandidate. MTPFromVerdict /
-		// LiveProgressSupportFromVerdict are the SAME functions the SQL store
-		// calls, so the two drivers cannot disagree about what a "no" row or an
-		// absent row means (see those functions' own docs).
-		mtpRow := m.mappingCapabilities[id][CapabilityMTP]
+		// liveProgressRow defaults to its zero CapabilityRow (Verdict == "")
+		// when the mapping has no entry for that capability at all -- the same
+		// "absent = never determined" reading the SQL store's LEFT JOIN
+		// produces for scanMappingCandidate. LiveProgressSupportFromVerdict is
+		// the SAME function the SQL store calls, so the two drivers cannot
+		// disagree about what a "no" row or an absent row means (see that
+		// function's own doc).
 		liveProgressRow := m.mappingCapabilities[id][CapabilityLiveProgress]
 		out = append(out, MappingCandidate{
 			Server:              copyAIServer(server),
 			Application:         copyApplication(app),
 			Mapping:             mapping,
-			IsMTP:               MTPFromVerdict(mtpRow.Verdict),
 			LiveProgressSupport: LiveProgressSupportFromVerdict(liveProgressRow.Verdict),
 		})
 	}

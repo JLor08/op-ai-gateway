@@ -813,11 +813,12 @@ type MappingCandidate struct {
 	Server      AIServer
 	Application Application
 	Mapping     ModelMapping
-	// IsMTP is the mapping's "mtp" capability verdict (model_mapping_capabilities,
-	// migration 78), filled by ActiveMappingsForModel's joined query (SQL) or its
-	// MemoryStore mirror from the same capability map, via MTPFromVerdict: true
-	// for a "yes" row, false for a "no" row, and false for no row at all (never
-	// determined). The scorer (scoringRoute) reads this field.
+	// LiveProgressSupport is the mapping's "live_progress" capability verdict
+	// (model_mapping_capabilities, migration 78), filled by
+	// ActiveMappingsForModel's joined query (SQL) or its MemoryStore mirror
+	// from the same capability map, via LiveProgressSupportFromVerdict: "" for
+	// no row (never determined), "supported" for a "yes" row, "unsupported"
+	// for a "no" row -- the same vocabulary Target.LiveProgressSupport speaks.
 	//
 	// It sits on the CANDIDATE rather than on Mapping because "this came from
 	// the join" is then a fact the TYPE carries instead of one a caller has to
@@ -828,17 +829,13 @@ type MappingCandidate struct {
 	// only a ModelMapping has to ask for the rows explicitly
 	// (MappingCapabilities), which is exactly the reminder the type is there
 	// to give.
-	IsMTP bool
-	// LiveProgressSupport is the mapping's "live_progress" capability verdict,
-	// filled the same way and for the same reason as IsMTP above, via
-	// LiveProgressSupportFromVerdict: "" for no row (never determined),
-	// "supported" for a "yes" row, "unsupported" for a "no" row -- the same
-	// vocabulary Target.LiveProgressSupport speaks. targetFrom reads THIS
-	// field when building a Target from a MappingCandidate, whether the
-	// candidate came from ActiveMappingsForModel's join or from
-	// resolveAffinity, which issues its own keyed MappingCapabilities read
-	// because its mapping comes from MappingsByApplication and is therefore
-	// unjoined (see resolveAffinity's comment).
+	//
+	// targetFrom reads THIS field when building a Target from a
+	// MappingCandidate, whether the candidate came from
+	// ActiveMappingsForModel's join or from resolveAffinity, which issues its
+	// own keyed MappingCapabilities read because its mapping comes from
+	// MappingsByApplication and is therefore unjoined (see resolveAffinity's
+	// comment).
 	//
 	// The benchmark path is the third producer of this verdict and does not
 	// go through a MappingCandidate at all: internal/gateway's
@@ -848,24 +845,6 @@ type MappingCandidate struct {
 	// LiveProgressSupportFromVerdict, so none of them can drift into its own
 	// spelling of "supported".
 	LiveProgressSupport string
-}
-
-// MTPFromVerdict maps a "mtp" capability verdict onto MappingCandidate.IsMTP:
-// CapabilityYes -> true, CapabilityNo -> false, and anything else -- in
-// practice only "", the value read back for a LEFT JOIN row that matched
-// nothing (absent = never determined) -- -> false. Written as an equality
-// check against CapabilityYes specifically (not "verdict != CapabilityNo" or
-// "verdict != \"\"") because those two alternatives are exactly the shape of
-// the classic three-state-to-bool bug this conversion has to avoid: either
-// would silently turn a "no" row -- an actual negative verdict -- into true.
-// TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts's "no" case
-// fails immediately if this ever regresses to one of them.
-//
-// Both ActiveMappingsForModel (SQL, from the joined mtp.verdict column) and
-// MemoryStore's mirror (from its capability map) call this SAME function, so
-// the two drivers cannot disagree about what a "no" row means.
-func MTPFromVerdict(verdict string) bool {
-	return verdict == CapabilityYes
 }
 
 // LiveProgressSupportFromVerdict translates the "live_progress" capability

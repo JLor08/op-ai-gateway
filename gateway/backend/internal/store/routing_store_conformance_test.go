@@ -195,15 +195,12 @@ func TestRoutingStoreActiveMappingsForModel(t *testing.T) {
 }
 
 // TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts (Task 4)
-// proves ActiveMappingsForModel's two filtered joins (SQL) and MemoryStore's
-// mirror apply the IDENTICAL three-state-to-bool/string boundary conversion
-// on every backend: an "mtp"/"yes" row -> IsMTP true, an "mtp"/"no" row ->
-// IsMTP false (the case a careless three-state-to-bool conversion gets
-// wrong -- mapping "no" to true), and no row at all -> IsMTP false; likewise
-// LiveProgressSupport is "supported"/"unsupported"/"" for a
+// proves ActiveMappingsForModel's filtered join (SQL) and MemoryStore's
+// mirror apply the IDENTICAL three-state-to-string boundary conversion on
+// every backend: LiveProgressSupport is "supported"/"unsupported"/"" for a
 // "live_progress" yes/no/absent row. Because forEachRoutingStore runs the
 // SAME assertions against MemoryStore, sqlite and postgres, a divergence in
-// either driver's join/mirror or in the shared MTPFromVerdict /
+// either driver's join/mirror or in the shared
 // LiveProgressSupportFromVerdict conversion surfaces here, not in
 // production.
 func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T) {
@@ -241,13 +238,11 @@ func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T)
 		}
 
 		if err := s.UpsertMappingCapabilities(ctx, "map_yes", []routing.CapabilityRow{
-			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 		}); err != nil {
 			t.Fatalf("upsert map_yes capabilities: %v", err)
 		}
 		if err := s.UpsertMappingCapabilities(ctx, "map_no", []routing.CapabilityRow{
-			{Capability: routing.CapabilityMTP, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 		}); err != nil {
 			t.Fatalf("upsert map_no capabilities: %v", err)
@@ -256,12 +251,11 @@ func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T)
 
 		for _, tc := range []struct {
 			model            string
-			wantIsMTP        bool
 			wantLiveProgress string
 		}{
-			{"model-map_yes", true, "supported"},
-			{"model-map_no", false, "unsupported"},
-			{"model-map_absent", false, ""},
+			{"model-map_yes", "supported"},
+			{"model-map_no", "unsupported"},
+			{"model-map_absent", ""},
 		} {
 			got, err := s.ActiveMappingsForModel(ctx, tc.model, routing.APIFlavorOpenAI)
 			if err != nil {
@@ -269,9 +263,6 @@ func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T)
 			}
 			if len(got) != 1 {
 				t.Fatalf("active mappings for %s: got %d candidates, want 1: %+v", tc.model, len(got), got)
-			}
-			if got[0].IsMTP != tc.wantIsMTP {
-				t.Fatalf("model %s: IsMTP = %v, want %v", tc.model, got[0].IsMTP, tc.wantIsMTP)
 			}
 			if got[0].LiveProgressSupport != tc.wantLiveProgress {
 				t.Fatalf("model %s: LiveProgressSupport = %q, want %q", tc.model, got[0].LiveProgressSupport, tc.wantLiveProgress)
