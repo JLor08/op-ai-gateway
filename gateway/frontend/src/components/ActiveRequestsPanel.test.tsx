@@ -261,12 +261,17 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   });
 
   it("shows the terminal frame's exact count and the rate derived from it before the row leaves the panel", () => {
-    // The same stream's response.completed carries the upstream's own final
-    // response.usage.output_tokens, which is published while the row is still
-    // active — so the count and a window-derived ("gateway") rate become visible
-    // for the short window before the row drops out. The tooltip is asserted
-    // WHOLE against the interpolated string: the count is the upstream's exact
-    // figure, and any delta-derived contribution added to it fails here.
+    // A `response.completed` frame carries the upstream's own final
+    // response.usage.output_tokens, published while the row is still active — so
+    // the count and a rate become visible for the short window before the row
+    // drops out. This fixture's `gateway` label is the shape an upstream whose
+    // terminal frame carries no `timings` of its own produces: real llama.cpp
+    // always attaches its own `timings` to that frame and would label the row
+    // `upstream` instead — both cases are pinned, in both directions, by
+    // TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves
+    // (passthrough_progress_test.go). Only the DTO shape is under test here: the
+    // tooltip is asserted WHOLE against the interpolated string, so any
+    // delta-derived contribution added to the upstream's exact count fails.
     render(
       <ActiveRequestsPanel
         t={t}
@@ -324,11 +329,13 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   });
 
   it('leaves both live cells as em-dashes for a buffered passthrough request', () => {
-    // Spec §4: a buffered passthrough response gets no progress struct at all —
-    // there are no frames to time and no first-content stamp can form, so a TTFT
-    // would be the total request duration wearing this column's label. The DTO
-    // therefore reports zeros with an empty source, and BOTH live cells must read
-    // as not-applicable rather than as a measured 0.
+    // docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3,
+    // under "Native passthrough is on this panel too": a buffered passthrough
+    // response gets no progress struct at all — there are no frames to time and
+    // no first-content stamp can form, so a TTFT would be the total request
+    // duration wearing this column's label. The DTO therefore reports zeros with
+    // an empty source, and BOTH live cells must read as not-applicable rather
+    // than as a measured 0.
     render(
       <ActiveRequestsPanel
         t={t}
