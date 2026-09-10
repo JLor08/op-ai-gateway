@@ -974,9 +974,23 @@ actually has.
   the probe's own 1 MiB read cap — declared 107,615 names and produced a
   3,655,456-byte `capabilities` object, 3.5× the frame cap; and since a
   stable verdict set is cached for the whole pid generation, every later
-  cycle would have rebuilt the same oversized frame. Clamped, one child
-  contributes at most ~10 KiB, so the frame's size follows the number of
-  children an operator configured and never what a model manifest declares.
+  cycle would have rebuilt the same oversized frame.
+
+  **What the bound closes, and what it leaves.** The **per-child** cost is
+  bounded: at most ~10 KiB (`64 × (34 + 128)` = 10,368 bytes), and it no
+  longer follows what a third-party model manifest declares. The
+  **fleet-wide** total is not bounded — it is the *product*, children ×
+  per-child cost — so what it now scales with is the number of children an
+  operator configured. Measured on real frames: 64 worst-case children →
+  668,033 bytes, 100 → 1,043,621, and **101 worst-case Ollama children still
+  overflow the 1 MiB frame**, against ~75 KiB for 256 children carrying no
+  capabilities object at all (and `maxRuntimeSamplesPerSample` = 256 shows
+  the ingest does contemplate that many runtime entries). That residual takes
+  far harder input than the defect the bound closes — 101+ concurrently
+  running Ollama children, each with a padded manifest, versus a single model
+  pull — and closing it is not a name bound at all: it needs the agent's
+  write path to size a telemetry frame against the cap, which nothing on that
+  path does today. Recorded as pre-existing, with its own change to make.
 - **The length answers the INDEX.** A capability name is half of
   `model_mapping_capabilities`' primary key `(mapping_id, capability)`, a
   PostgreSQL btree index tuple may not exceed 2704 bytes, and
@@ -990,7 +1004,12 @@ already uses against the same frame ceiling
 which **rejects** where this one **clamps** — the difference being what the
 caller can express: a rejected subscription hands back a window guaranteed
 to stay empty, while a dropped capability simply leaves a row absent, and an
-absent row is what this model already means by "unknown". Three properties
+absent row is what this model already means by "unknown". One further
+difference is worth naming rather than glossing: that precedent is a
+*complete* bound, and its own comment can therefore do the product ("~8 KiB
+at the ceiling"), because the number of watched specs is bounded per server
+too. This pair's multiplier — the child count — is not bounded anywhere, per
+the product above. Three properties
 make the clamp safe rather than merely bounded. It stops **appending** but
 keeps **scanning**, so a hostile tail of publisher strings can never
 displace `vision`/`tools`/`audio`. An over-long name is **dropped, never

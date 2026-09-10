@@ -526,10 +526,33 @@ var reservedOllamaCapabilityNames = map[string]bool{
 //     fetchProbeBodyWith's own 1 MiB read cap) declared 107,615 short names
 //     and produced a 3,655,456-byte capabilities object -- 3.5x the frame
 //     cap, rebuilt every cycle, because a stable verdict set is CACHED for
-//     the whole pid generation. At 64 names of at most 128 bytes one child
-//     contributes at most ~10 KiB, so the frame's size now follows the
-//     number of children an OPERATOR configured and never what a
-//     third-party model manifest declares.
+//     the whole pid generation.
+//
+//     What this bound buys, stated exactly, because the residual is a
+//     PRODUCT and it would be easy to overstate the closure: the PER-CHILD
+//     cost is bounded -- 64 names of at most 128 bytes is at most ~10 KiB
+//     (64 * (34 + 128) = 10,368 bytes) -- and it no longer follows what a
+//     third-party model manifest declares. The FLEET-WIDE total is NOT
+//     bounded here, and nothing else bounds it either: it is children x
+//     per-child cost, so what it now scales with is the number of children
+//     an OPERATOR configured. Measured on real frames: 64 worst-case
+//     children -> 668,033 bytes, 100 -> 1,043,621, and 101 worst-case
+//     ollama children overflow the 1 MiB frame -- against ~75 KiB for 256
+//     children carrying no capabilities object at all. The gateway's own
+//     maxRuntimeSamplesPerSample = 256 shows the system does contemplate
+//     that many runtime entries.
+//
+//     That residual needs far harder input than the defect this bound
+//     closes (101+ concurrently running ollama children, EACH with a padded
+//     manifest, versus one model pull), and closing it properly is not a
+//     name bound at all: it needs the agent's write path to size a
+//     telemetry frame against the cap, which neither client/ws.go nor
+//     WSSender.Post does today. That is pre-existing and belongs to its own
+//     change. The precedent this pair is read off does the product in its
+//     own comment (runtime_logs.go's ~8 KiB at the ceiling) because ITS
+//     count -- watched specs per server -- is bounded too; this one's is
+//     not, which is the one way the two are not alike.
+//
 //   - THE INDEX, 2704 bytes. A name is half of
 //     model_mapping_capabilities' primary key (mapping_id, capability), and
 //     a PostgreSQL btree index tuple may not exceed that. Since
