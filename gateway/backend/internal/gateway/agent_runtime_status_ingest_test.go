@@ -2010,6 +2010,69 @@ func TestIngestRefusesALiveProgressRowFromTheOllamaProbe(t *testing.T) {
 	}
 }
 
+// TestIngestRefusesANegativeVerdictFromTheOllamaProbe is the general half of
+// the refusal above: a "no" verdict attributed to ollama_api_show is dropped
+// for EVERY capability, not only for live_progress.
+//
+// routing.CapabilityRow's source doc states the claim generally -- "A row
+// with this source and verdict CapabilityNo could therefore not have come
+// from that probe" -- and it is grounded generally: Ollama's capability
+// array is not exhaustive, a name's absence means "Ollama did not tell us"
+// rather than "this model cannot", so collector.detectOllamaCapabilities
+// returns "yes" or nothing on every path and can never produce a "no" for
+// anything. Enforced only for live_progress, that sentence was true as a
+// statement about provenance (such a row is a lie by the sender) and false as
+// an invariant, which is the distinction that motivated the live-progress
+// refusal in the first place: an invariant a caller can violate is not one,
+// and this is where the agent's bytes arrive.
+//
+// Unfalsifiable in both directions, and the stored row is the point. The
+// mapping already holds vision="yes" from the OTHER probe at EQUAL rank
+// (llama_cpp_props, 1), which an incoming "no" would be permitted to
+// overwrite -- so a row that got through would flip an honest probe's verdict
+// and be visible. "thinking" carries a "no" with no stored row at all, so the
+// drop is not an artefact of the precedence rule. And the same document
+// carries tools="yes", which /api/show really can answer: exactly one write
+// must fire and carry exactly that row, so "nothing was written" cannot be
+// satisfied by a write path that had simply stopped working.
+//
+// The narrowness is pinned from the other side by tests that already exist:
+// TestIngestStampsTheSourceTheAgentReported's llama_cpp_props subtest lands a
+// vision="no" row, and the live-progress write-back tests persist "no" rows
+// under that source throughout. A refusal that forgot to check the source
+// would fail them.
+func TestIngestRefusesANegativeVerdictFromTheOllamaProbe(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ollama_no", false)
+	seedCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityVision,
+		routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_ollama_no",
+		`{"verdicts":[{"name":"vision","verdict":"no"},{"name":"thinking","verdict":"no"},`+
+			`{"name":"tools","verdict":"yes"}],"source":"ollama_api_show"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the tools row alone)", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityTools {
+		t.Fatalf("the write carried %+v, want exactly the tools row -- an /api/show document can assert a capability but never deny one, and only the rows it could not have produced may be dropped", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityVision,
+		routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityTools,
+		routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	if row, ok := capabilityRow(t, srv, "map_rspec_ollama_no", "thinking"); ok {
+		t.Fatalf(`a "thinking" row exists (%+v), want none -- the Ollama detector cannot produce a "no" for any capability, so the row's provenance would be false`, row)
+	}
+	if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "negative verdict") {
+		t.Fatalf("no WARN record about the dropped negative verdicts at the gateway's own default level (info); records = %+v", recs)
+	}
+}
+
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities
 // object -- detection ran and determined nothing -- leaves stored rows
 // untouched and calls the writer zero times: unknown must never overwrite a

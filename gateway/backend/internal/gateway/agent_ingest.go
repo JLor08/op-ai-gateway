@@ -1097,15 +1097,30 @@ var reservedAgentCapabilityNames = map[string]bool{
 // provenance is what was unrecognisable, and no part of it is more
 // attributable than the rest.
 //
-// ONE combination is refused rather than stamped: a live-progress verdict
-// attributed to ollama_api_show -- see the refusal below for why that is
-// wrong independent of what the sender intended. A consequence worth
-// stating, because it is a limit on what the tests here can show: the
-// live-progress row can now only ever carry llama_cpp_props, so reading the
-// source from the report rather than hard-coding llama.cpp's name -- still
-// the honest rule, and still the one the verdict rows follow -- is no
-// longer distinguishable from the hard-coded name by any input, and no test
-// pins it any more.
+// TWO shapes are refused rather than stamped, and both are refusals of a
+// FALSE PROVENANCE that the ollama_api_show source cannot carry, whatever
+// the sender intended -- see each refusal below for its own argument:
+//
+//  1. a live-progress verdict attributed to ollama_api_show, in either
+//     direction. Ollama exposes no timings_per_token-style surface at all,
+//     so its document is evidence for neither answer.
+//  2. ANY capability's "no" verdict attributed to ollama_api_show.
+//     Ollama's capability array is not exhaustive, so the detector behind
+//     that source can only ever produce "yes" or nothing -- which is the
+//     claim routing.CapabilityRow's own source doc makes about every row
+//     carrying it, not just about the live-progress one.
+//
+// Both are one-line rules for the same reason: an invariant a caller can
+// violate is not an invariant, and this is the boundary where the agent's
+// bytes arrive. Neither voids the pass -- the "yes" verdicts of the same
+// document are exactly what /api/show CAN answer, so they still ride it.
+//
+// A consequence worth stating, because it is a limit on what the tests here
+// can show: the live-progress row can now only ever carry llama_cpp_props,
+// so reading the source from the report rather than hard-coding llama.cpp's
+// name -- still the honest rule, and still the one the verdict rows follow
+// -- is no longer distinguishable from the hard-coded name by any input, and
+// no test pins it any more.
 func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.CapabilityRow {
 	source, ok := rt.Capabilities.rowSource()
 	if !ok {
@@ -1179,13 +1194,42 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	}
 	reported := rt.Capabilities.capabilityRows(source, at)
 	kept := make([]routing.CapabilityRow, 0, len(reported))
-	var dropped []string
+	var dropped, deniedNo []string
 	for _, row := range reported {
-		if reservedAgentCapabilityNames[row.Capability] {
+		switch {
+		case reservedAgentCapabilityNames[row.Capability]:
 			dropped = append(dropped, row.Capability)
-			continue
+		case source == routing.CapabilitySourceOllamaAPIShow && row.Verdict == routing.CapabilityNo:
+			// REFUSED, for the live-progress refusal's reason applied to
+			// the capability this source CAN speak about -- which is to say
+			// applied generally, because the reason was never specific to
+			// live progress.
+			//
+			// routing.CapabilityRow's source doc states it for every row
+			// carrying ollama_api_show, not for one name: "A row with this
+			// source and verdict CapabilityNo could therefore not have come
+			// from that probe." The ground is that Ollama's capability
+			// array is NOT exhaustive -- a name's absence means "Ollama did
+			// not tell us", never "this model cannot do that" -- so
+			// collector.detectOllamaCapabilities produces "yes" or nothing
+			// on every path and can never produce a "no" for anything.
+			//
+			// Left unenforced, that sentence was true only as a statement
+			// ABOUT provenance (such a row indeed did not come from the
+			// probe -- it is a lie by the sender) while being false as an
+			// invariant: a buggy or hostile agent put a rank-1 "no" in
+			// front of an operator under a provenance that cannot produce
+			// one, and at equal rank it overwrote the OTHER probe's honest
+			// verdict. That is the same reasoning as the live-progress
+			// refusal above, and it costs the honest path nothing.
+			//
+			// Only the "no" rows go. A "yes" is exactly what an /api/show
+			// document can answer, so the rest of the pass still lands,
+			// still sourced ollama_api_show.
+			deniedNo = append(deniedNo, row.Capability)
+		default:
+			kept = append(kept, row)
 		}
-		kept = append(kept, row)
 	}
 	if len(dropped) > 0 {
 		// Warn for this file's established reason: the drop is deterministic
@@ -1194,6 +1238,14 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 		// while the missing row reads as plain "unknown".
 		slog.Warn("runtime capability sample reports reserved internal capability names, dropping those rows",
 			"spec_id", rt.SpecID, "source", source, "capabilities", dropped)
+	}
+	if len(deniedNo) > 0 {
+		// Warn, same argument: a drop that cannot heal on its own (the
+		// source names the agent build that sent it) is otherwise invisible
+		// at the gateway's default info level, and the absent row reads as
+		// plain "unknown".
+		slog.Warn("runtime capability sample attributes a negative verdict to the ollama probe, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", deniedNo)
 	}
 	return append(rows, kept...)
 }
