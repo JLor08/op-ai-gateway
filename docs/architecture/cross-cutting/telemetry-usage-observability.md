@@ -1119,12 +1119,18 @@ more. A verdict of `""` produces **no row at
 all**, and the absence of a row is what UNKNOWN means — which is why a partial
 answer (an older llama.cpp reporting `modalities` but no
 `chat_template_caps`) cannot clear a `tools` verdict a previous probe
-established: there is no empty verdict for it to write. Each write path
-stamps the row's `source` with the probe that produced the document — the
-gateway's own `/props` pass always `llama_cpp_props`, the agent's whichever
-of `llama_cpp_props`/`ollama_api_show` it reported (above) — plus the
-observation time as `checked_at`; neither consults `metrics_locked` or
-touches `metrics_source`/`metrics_updated_at`.
+established: there is no empty verdict for it to write. There is exactly
+**one probe write path, and it is the agent's**: the ingest stamps the row's
+`source` with whichever of `llama_cpp_props`/`ollama_api_show` the agent
+reported (above), plus the observation time as `checked_at`. The gateway's
+own `/props` read is **not** a second one — it produces
+`provider.ModelInfo.Caps`, which no production code consumes
+(`PickModelCapabilities` has no production caller at all), and it writes no
+capability row anywhere. The only other writers of
+`model_mapping_capabilities` are the portal (`manual` for an operator's
+statement, `legacy` for the model-name MTP heuristic) and the vision
+benchmark (`vision_benchmark`). None of the three consults `metrics_locked`
+or touches `metrics_source`/`metrics_updated_at`.
 
 **An operator's verdict is permanent, and no probe can move it.** Every writer
 asks `routing.WritableCapabilityRows` before it writes, and that function
