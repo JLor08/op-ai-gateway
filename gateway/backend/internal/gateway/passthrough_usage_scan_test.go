@@ -146,7 +146,7 @@ func TestMergeResponsesUsageDraftTokensTakesRunningMax(t *testing.T) {
 // a whole-request window (or mistaking message_start for content) would yield.
 func TestPassthroughAnthropicRateUsesGenerationWindow(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base.Add(time.Second))
@@ -167,7 +167,7 @@ func TestPassthroughAnthropicRateUsesGenerationWindow(t *testing.T) {
 // token count and elapsed time both exist.
 func TestPassthroughAnthropicFallbackNeedsAContentFrame(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n"), base.Add(3*time.Second))
@@ -192,7 +192,7 @@ func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
 	messageDelta := []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n")
 
 	t.Run("just under the floor is suppressed", func(t *testing.T) {
-		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 		s.feed(messageStart, base)
 		s.feed(contentDelta, base) // first content frame at t+0
 		s.feed(messageDelta, base.Add(49*time.Millisecond))
@@ -207,7 +207,7 @@ func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
 	})
 
 	t.Run("just over the floor is honored exactly", func(t *testing.T) {
-		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 		s.feed(messageStart, base)
 		s.feed(contentDelta, base) // first content frame at t+0
 		s.feed(messageDelta, base.Add(51*time.Millisecond))
@@ -225,7 +225,7 @@ func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
 // rather than retained and grown further, so a pathological or hostile
 // upstream cannot make the gateway allocate without limit while scanning.
 func TestUsageScannerCarryBoundDropsOnPathologicalLine(t *testing.T) {
-	s := newUsageScanner("openai_responses", 16)
+	s := newUsageScanner("openai_responses", 16, nil)
 	s.feed([]byte("0123456789"), time.Now()) // 10 bytes, within bound
 	if len(s.carry) != 10 {
 		t.Fatalf("carry = %d bytes after first feed, want 10", len(s.carry))
@@ -241,7 +241,7 @@ func TestUsageScannerCarryBoundDropsOnPathologicalLine(t *testing.T) {
 // a body is typically ONE JSON object with no embedded newline, so feed alone
 // (which only acts on complete '\n'-terminated lines) would never see it.
 func TestUsageScannerFinishRecoversUnterminatedFinalLine(t *testing.T) {
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 	body := []byte(`{"id":"r","usage":{"input_tokens":5,"output_tokens":9}}`) // no trailing newline
 
 	s.feed(body, time.Now())
@@ -262,7 +262,7 @@ func TestUsageScannerFinishRecoversUnterminatedFinalLine(t *testing.T) {
 // each fragment in isolation, then max-merged across fragments) would yield
 // max(8+1, 0+40) = 40, not the true 48.
 func TestUsageScannerTotalTokensAcrossSplitFrames(t *testing.T) {
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 	now := time.Now()
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), now)
 	s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n"), now)
@@ -309,7 +309,7 @@ func TestIsContentFrame(t *testing.T) {
 // rate.
 func TestPassthroughAnthropicFallbackNeedsAnAuthoritativeTerminalUsageFrame(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base.Add(time.Second))

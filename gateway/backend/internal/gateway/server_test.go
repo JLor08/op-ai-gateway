@@ -1916,6 +1916,15 @@ func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target
 // "gw-model" -> upstream "upstream-model") with EXPLICIT per-endpoint modes, so a
 // test can drive disabled/translate/passthrough directly.
 func newNativeModeTestServer(prov provider.Client, responsesMode, messagesMode routing.EndpointMode) *Server {
+	return newNativeModeTestServerOn(prov, responsesMode, messagesMode, routing.NewMemoryStore(), false)
+}
+
+// newNativeModeTestServerOn is newNativeModeTestServer with the routing store and
+// the application's opportunistic-metrics opt-in supplied by the caller, so a test
+// can WRAP the store (to count a specific write) and switch on the one flag that
+// decides whether a completed request feeds the mapping's throughput EWMA at all.
+// Everything else is seeded identically, so the two helpers cannot drift.
+func newNativeModeTestServerOn(prov provider.Client, responsesMode, messagesMode routing.EndpointMode, routeStore routing.Store, opportunisticMetrics bool) *Server {
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
@@ -1924,7 +1933,6 @@ func newNativeModeTestServer(prov provider.Client, responsesMode, messagesMode r
 		panic(err)
 	}
 	recorder := usage.NewRecorder()
-	routeStore := routing.NewMemoryStore()
 	ctx := context.Background()
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native", Name: "Native Upstream", Domain: "native.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
@@ -1941,7 +1949,7 @@ func newNativeModeTestServer(prov provider.Client, responsesMode, messagesMode r
 	// back to exactly this application's own ResponsesMode/MessagesMode, which is
 	// what lets a disabled/translate/passthrough mode reach tryProxyNative's
 	// three-way decision directly, matching this helper's purpose.
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native", ServerID: "srv-native", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: responsesMode, MessagesMode: messagesMode, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native", ServerID: "srv-native", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: responsesMode, MessagesMode: messagesMode, OpportunisticMetricsEnabled: opportunisticMetrics, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native", ApplicationID: "app-native", GatewayModelName: "gw-model", AppModelName: "upstream-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

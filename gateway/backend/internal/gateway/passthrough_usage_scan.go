@@ -54,13 +54,31 @@ type usageScanner struct {
 	// available estimate of "generation completed" for the Anthropic fallback
 	// rate's generation-window end (see usage below).
 	lastAt time.Time
+
+	// progress is the live counter behind this request's running-connections row
+	// (ActiveRequest.Progress), or nil. The scanner holds the POINTER rather
+	// than a callback because requestProgress is not a collaborator to be
+	// faked: it is three atomics plus one nil-safe method in this same package
+	// (request_progress.go), so a scanner test allocates a real one and reads
+	// it -- a callback would add an indirection that buys no isolation.
+	//
+	// Non-nil only for a STREAMING passthrough request (proxyNative decides;
+	// see there for why a buffered one gets none). Everything written through
+	// it is a FACT the upstream itself reported -- a first-content timestamp,
+	// its own cumulative count, its own rate. No rate is derived here:
+	// liveProgressDTO already derives one over the window when no upstream rate
+	// is present, and a second derivation would let the two drift.
+	progress *requestProgress
 }
 
 // newUsageScanner returns a scanner for one native-passthrough response.
 // capBytes should be the same budget the capture tee uses (see usageScanner's
 // doc comment for why the two share a budget without being related features).
-func newUsageScanner(apiFlavor string, capBytes int) *usageScanner {
-	return &usageScanner{apiFlavor: apiFlavor, capBytes: capBytes}
+// progress is the live counter to publish per-frame facts into, or nil for a
+// response whose progress is not displayed (a buffered one, and every test that
+// only cares about the recorded totals).
+func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) *usageScanner {
+	return &usageScanner{apiFlavor: apiFlavor, capBytes: capBytes, progress: progress}
 }
 
 // feed appends chunk (one read from the upstream body) to the carry buffer,
@@ -130,21 +148,75 @@ func (s *usageScanner) finish(at time.Time) {
 
 // scan stamps the first-content-frame timestamp and the
 // authoritative-terminal-usage flag — each once, the first time such a frame is
-// seen — and merges payload's usage/timings fields into the running total. The
-// per-payload probe stops running as soon as both flags are set.
+// seen — publishes each frame's own reported facts to the live progress counter,
+// and merges payload's usage/timings fields into the running total.
+//
+// The per-payload probe stops running as soon as both flags are set, EXCEPT when
+// a progress counter is attached: the live column is fed from every frame, not
+// just the first of each kind, so for a displayed stream the loop keeps going.
 func (s *usageScanner) scan(payload []byte, at time.Time) {
-	if !s.haveFirstContent || !s.haveTerminalUsage {
+	if !s.haveFirstContent || !s.haveTerminalUsage || s.progress != nil {
 		for _, p := range jsonPayloads(payload) {
 			if !s.haveFirstContent && isContentFrame(s.apiFlavor, p) {
 				s.haveFirstContent = true
 				s.firstContentAt = at
 			}
-			if !s.haveTerminalUsage && isTerminalUsageFrame(s.apiFlavor, p) {
+			authoritative := isTerminalUsageFrame(s.apiFlavor, p)
+			if authoritative {
 				s.haveTerminalUsage = true
 			}
+			s.publishProgress(p, authoritative)
 		}
 	}
 	mergePassthroughUsage(&s.acc, s.apiFlavor, payload)
+}
+
+// publishProgress reports ONE frame's own upstream-reported facts to the live
+// progress counter, and nothing else — no gateway count, no gateway rate. It
+// reuses requestProgress.observeDelta, whose inference.StreamProgress argument
+// is already documented as "upstream-reported, never derived": the translate
+// path feeds the same struct from chunkProgress, so both paths populate the
+// running-connections row through one method with one contract.
+//
+// Three deliberate restrictions:
+//
+//   - Nothing is published before the first CONTENT frame. observeDelta's
+//     first-token stamp is a compare-and-swap, so the first call fixes the row's
+//     TTFT; publishing an earlier bookkeeping frame (Anthropic's message_start)
+//     would stamp it before any content existed.
+//
+//   - The output-token count is published only from an AUTHORITATIVE usage frame
+//     (isTerminalUsageFrame), never from any frame that merely carries a usage
+//     object. This is usage()'s placeholder gate applied to the live column, for
+//     a sharper reason: message_start's `output_tokens: 1` is indistinguishable
+//     from a real total, and liveProgressDTO would divide that 1 by the
+//     generation window and DISPLAY the result as a measured rate for the rest
+//     of the stream. The recorded row tolerates the placeholder count because it
+//     is presented as a count; a live rate derived from it would not be.
+//
+//   - The rate is read from THIS frame, not from the max-merged accumulator.
+//     llama.cpp's `predicted_per_second` is a cumulative average over the
+//     generation, so it commonly DROPS as the KV cache grows; a running max
+//     would pin the live column at whatever the stream's early peak was and
+//     never come down. observeDelta stores the value it is given, exactly as it
+//     does for a translated chunk.
+func (s *usageScanner) publishProgress(payload []byte, authoritativeUsage bool) {
+	if s.progress == nil || !s.haveFirstContent {
+		return
+	}
+	// One frame's own numbers, merged into a scratch Usage rather than read by a
+	// second parser: mergePassthroughUsage over a single payload is exactly
+	// "what did this frame report" (jsonPayloads passes a lone JSON object
+	// through untouched), so the live column reads the same fields under the
+	// same per-flavor rules as the recorded row -- and this file grows no
+	// FOURTH copy of the flavor switch to be forgotten when a flavor is added.
+	var frame inference.Usage
+	mergePassthroughUsage(&frame, s.apiFlavor, payload)
+	prog := inference.StreamProgress{TokensPerSecond: frame.TokensPerSecond}
+	if authoritativeUsage {
+		prog.OutputTokens = frame.OutputTokens
+	}
+	s.progress.observeDelta(s.firstContentAt, &prog)
 }
 
 // usage returns the accumulated usage for the recording path.
