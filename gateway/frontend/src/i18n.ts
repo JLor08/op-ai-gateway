@@ -1149,10 +1149,11 @@ const de = {
   // "unterstützt oder garantiert", und sein FEHLEN heißt "unbekannt", nie
   // "spekuliert nicht" -- das gilt für jedes Modell, das schlicht noch nie
   // über diese Zuordnung bedient wurde, genauso wie für einen Cache-Treffer,
-  // eine zu kurze Antwort, einen Stream ohne Nutzungs-Chunk oder einen
-  // Upstream, der überhaupt keine llama.cpp-Timings liefert.
+  // eine zu kurze Antwort, einen Stream ohne Nutzungs-Chunk, eine
+  // Fehlerantwort oder einen Upstream, der überhaupt keine llama.cpp-Timings
+  // liefert.
   capabilitySpeculationObservedTooltip:
-    'Beobachtet heißt: Mindestens eine Antwort dieser Zuordnung hat gedraftete Tokens gemeldet — nicht, dass dieses Modell oder dieser Build Spekulation generell unterstützt. Kein Chip heißt unbekannt, nicht "spekuliert nicht": Das Fehlen kommt genauso bei einem noch nie genutzten Modell, einem Cache-Treffer, einer zu kurzen Antwort, einem Stream ohne Nutzungs-Chunk oder einem Nicht-llama.cpp-Upstream vor.',
+    'Beobachtet heißt: Mindestens eine Antwort dieser Zuordnung hat gedraftete Tokens gemeldet — nicht, dass dieses Modell oder dieser Build Spekulation generell unterstützt. Kein Chip heißt unbekannt, nicht "spekuliert nicht": Das Fehlen kommt genauso bei einem noch nie genutzten Modell, einem Cache-Treffer, einer zu kurzen Antwort, einem Stream ohne Nutzungs-Chunk, einer Fehlerantwort oder einem Nicht-llama.cpp-Upstream vor.',
   // Die zwei Upstream-Einschränkungen, die ein Betreiber vor dem Handeln
   // nach einem Fähigkeits-Chip kennen muss: Video ist eine
   // Build-plus-Vision-Encoder-Tatsache, nicht "das Modell versteht Video";
@@ -3392,10 +3393,10 @@ const en: PortalMessages = {
   // know here: the chip says "observed", not "supported or guaranteed", and
   // its ABSENCE means "unknown", never "does not speculate" -- that covers a
   // model simply never routed through this mapping yet just as much as a
-  // cache hit, too short a completion, a stream without a usage chunk, or an
-  // upstream that reports no llama.cpp timings at all.
+  // cache hit, too short a completion, a stream without a usage chunk, an
+  // error response, or an upstream that reports no llama.cpp timings at all.
   capabilitySpeculationObservedTooltip:
-    'Observed means at least one completion on this mapping reported drafted tokens — not that this model or build supports speculation in general. No chip means unknown, not "does not speculate": the same absence covers a model nobody has used yet, a cache hit, too short a completion, a stream without a usage chunk, or a non-llama.cpp upstream.',
+    'Observed means at least one completion on this mapping reported drafted tokens — not that this model or build supports speculation in general. No chip means unknown, not "does not speculate": the same absence covers a model nobody has used yet, a cache hit, too short a completion, a stream without a usage chunk, an error response, or a non-llama.cpp upstream.',
   modelServerCapabilitiesTooltip:
     'Video means the binary was built with video support AND the model has a vision encoder — not that the model understands video. Tools means the chat template natively supports tool calls — not that tool calls fail without it (llama.cpp with --jinja accepts tools for every model).',
   modelServerCapabilitiesSource: (source: string) => `Source: ${source}.`,
