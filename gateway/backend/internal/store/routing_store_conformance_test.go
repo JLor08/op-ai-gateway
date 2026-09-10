@@ -203,6 +203,12 @@ func TestRoutingStoreActiveMappingsForModel(t *testing.T) {
 // either driver's join/mirror or in the shared
 // LiveProgressSupportFromVerdict conversion surfaces here, not in
 // production.
+//
+// It pins a SECOND property that is easy to lose by accident: that the SQL
+// join is FILTERED, not merely present. The map_yes fixture deliberately
+// holds TWO capability rows so the cardinality assertion below
+// (len(got) != 1) fails the moment `lp.capability = ?` is dropped -- see
+// that fixture's own note for why the row must stay.
 func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
@@ -237,7 +243,24 @@ func TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts(t *testing.T)
 			}
 		}
 
+		// The "vision" row is LOAD-BEARING, and not for anything this test
+		// asserts about it -- nothing here reads a vision verdict at all. It
+		// is what makes the len(got) != 1 assertion below able to FAIL.
+		// ActiveMappingsForModel's LEFT JOIN is filtered (`lp.capability =
+		// ?`, sqlite_applications.go), so a mapping holding two capability
+		// rows still yields exactly ONE candidate; remove the predicate and
+		// the same mapping yields one candidate PER ROW. With at most one row
+		// per mapping in the fixture, an unfiltered join is indistinguishable
+		// from a filtered one and the assertion cannot bite -- so a fixture
+		// narrowing that drops this row silently retires the only check in
+		// the repository on the predicate that
+		// sqlite_applications.go's cost comment and ADR-040's roughly
+		// 6-microsecond saving both rest on. Verified by mutation, in both
+		// directions:
+		// with the predicate removed this test fails "got 2 candidates,
+		// want 1", and with it in place it passes. DO NOT remove this row.
 		if err := s.UpsertMappingCapabilities(ctx, "map_yes", []routing.CapabilityRow{
+			{Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 			{Capability: routing.CapabilityLiveProgress, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: now},
 		}); err != nil {
 			t.Fatalf("upsert map_yes capabilities: %v", err)
