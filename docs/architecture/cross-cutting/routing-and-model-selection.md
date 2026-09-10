@@ -49,7 +49,7 @@ erDiagram
     MODEL_MAPPING_CAPABILITY {
         string capability "mtp | live_progress | vision | ..."
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
     }
     MODEL_GROUP {
         bool loaded_only

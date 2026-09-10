@@ -756,7 +756,10 @@ and then silently dropped from the live-progress figure by
 works and the shape clause already sends it the parameters today. So a TGI
 `/info` body, an Ollama `/api/show` body, and a vLLM `/v1/models` body all
 leave the stored verdict exactly as it was, indistinguishable from a probe
-that never got a response at all.
+that never got a response at all. That holds for the Ollama document even now
+that a probe reads it deliberately (below): `ProbeOllamaVerdicts` returns a
+live-progress verdict of `""` on every path, because Ollama exposes no
+`timings_per_token`-style surface to have an opinion about.
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
@@ -889,11 +892,125 @@ once per cache miss and hands the identical bytes to both detectors, returning
 once, period, regardless of how many verdicts the one document yields. The
 agent's own probe (`probeRuntimeChildProps`, [Agent-Managed Model Runtime
 §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time))
-caches that whole pair keyed by `(SpecID, PID)` — once per process generation,
-exactly like the context and live-progress caches beside it.
+caches that whole pair keyed by `(SpecID, PID, Model)` — once per process
+generation, exactly like the context cache beside it, with the model in the
+key since #54 because one `ollama serve` process serves many models and a
+spec repointed at another one keeps its PID.
+
+**A third document, read by a detector that can only ever answer `yes`:
+Ollama's `POST /api/show` (issue #54).** `detectOllamaCapabilities`
+(`server-agent/internal/collector/probe.go`) is a **sibling** of
+`detectCapabilities`, not a branch inside it — `/props` and `/api/show` share
+no field, so a single function over both would be two detectors sharing a
+name and a signature. It reads exactly one thing — the response's
+`capabilities` array — maps `vision`, `tools` and `audio` onto the structured
+fields, and carries every other name into `Extra` (trimmed and lower-cased,
+so `" Vision "` still matches the structured field and a publisher's
+`" Weather.V2 "` arrives as `weather.v2`). Unlike the two detectors above it exists in the **agent module
+only**, because only the agent probes `/api/show`: shipping an uncalled copy
+in the gateway would be dead code. It becomes a twin, under the same drift
+discipline, the day the gateway gains its own Ollama probe.
+
+**Its evidence rule is asymmetric with the `/props` rule, and deliberately
+so: this detector can never produce a `no`.** Ollama's capability array is
+**not exhaustive** — absence means *unknown*, never *denied* — and five
+independent facts in upstream's own Go source say so:
+
+1. `Capabilities()` logs `slog.Warn("unknown capabilities for model")` when
+   detection yields an empty result. Upstream's own word for it is *unknown*.
+2. The JSON field is `omitempty`, so a model it cannot determine emits no key
+   at all — byte-identical to a pre-v0.7.0 server that has no such field.
+3. `ggufCapabilities` returns early with none when the model file cannot be
+   opened (`slog.Error("couldn't open model file")`). A transient read
+   failure silently shortens the list and nothing marks the response
+   degraded.
+4. Detection is **substring heuristics over the chat template**: a
+   tool-capable model whose template lacks the literal `tools`/`tool_call`
+   reports no tools. Non-GGUF and remote models get capabilities only from
+   the manifest array.
+5. `filterUnsupportedCapabilities` deliberately strips real vision/audio for
+   some builds — the omission then describes the runner, not the model.
+
+So every verdict this detector writes is `"yes"`, and the rows it produces
+are only ever `yes` rows. Deriving a `no` from a missing name would encode
+read failures, template heuristics and runner quirks as operator-visible
+denials — permanent ones, since the no-rewrite rule would then keep them.
+
+Two names get specific treatment, both for the same reason (a name must carry
+evidence to become a row):
+
+- **`completion` is dropped**, not filed under `Extra` as unknown noise:
+  upstream *assumes* it whenever a model has no `pooling_type` rather than
+  detecting it, so its presence or absence asserts nothing.
+- **`image` is NOT vision and is never folded into it.** In Ollama's model
+  this name is image *generation* — it was introduced as
+  `CapabilityImageGeneration`, its error string reads "image generation", and
+  the only code path that ever required it guards
+  `/v1/images/generations`. It reaches `Extra` like any other unmapped name,
+  where an operator sees the name Ollama actually used. Upstream's own test
+  calls the pair `["image","vision"]` "image editing", which is exactly why
+  reading one as the other would be wrong rather than merely imprecise.
+
+Everything else — `insert`, `thinking`, `embedding`, `image`, and any string
+a cloud publisher wrote into its manifest — is a real assertion and is kept
+verbatim, which is what the open vocabulary exists for rather than an
+exception to it.
+
+**The probe NAMES itself, and its name ranks with the other probe.** The
+agent reports `capabilities.source` on the wire — `llama_cpp_props` or
+`ollama_api_show` (`routing.CapabilitySourceOllamaAPIShow`) — and the gateway
+stamps its rows with what was reported instead of re-deriving the provenance
+from the spec type it pushed itself. The sample carries a `spec_id` but no
+runtime type, so the gateway cannot tell the two documents apart on its own;
+two alternatives were refused, and for the same reason. Guessing the probe
+from row CONTENT (Ollama never reports a `no`, never a live-progress verdict)
+is a heuristic that an all-`yes` `/props` document defeats, and re-deriving
+`routing.EffectiveRuntimeSpecType` from the spec the ingest already loads
+would trade the reporter's report for an inference from configuration,
+duplicating the agent's branch condition in a second module where the two can
+drift. `ollama_api_show` ranks **1** through `capabilitySourceRank`'s default
+branch, with no case of its own and no rank-table edit: it can never
+overwrite `manual` (3) or `vision_benchmark` (2), and it repairs its own
+drift at 1 against 1.
+
+**The gateway's allowlist of claimable sources is a trust boundary, not a
+typo filter.** `rowSource` (`internal/gateway/agent_ingest.go`) accepts
+exactly the two PROBE names, plus an absent/empty field for an agent that
+predates the field (which keeps the historical `llama_cpp_props` default —
+safe rather than merely convenient, since such an agent probes `/props`, and
+an Ollama child answers that with a `404`, hence no verdicts and no rows).
+Anything else **voids the whole pass**, live-progress row included: an agent
+claiming `manual` or `vision_benchmark` writes nothing at all. Clamping an
+unrecognised name onto the default was rejected as worse than dropping —
+it would print a provenance nobody reported on the one column whose job is to
+say who said this — and dropping is the option that stays safe against the
+rank, since an unrecognised source ranks 1 and a blind write would let
+unknown provenance overwrite a real probe at equal rank. The drop is logged
+at **`Warn`**, not `Debug`: the gateway's default level is `info`, so at
+`Debug` a newer agent reporting a third source would lose every capability
+row it ever sent with nothing anywhere to say why, and the rows' absence
+reads as plain "unknown".
+
+**What this does NOT cover, and why each is its own change.** A *directly
+configured* Ollama application (no agent) still gets no capability
+detection: detection is agent-side, over loopback, and the gateway's own
+app-health probe issues `GET`s. Closing it needs a POST-capable
+`fetchModelInfo` **and** a fan-out decision, because one Ollama endpoint
+serves many models — a complete answer is one `/api/show` per mapping per
+probe cycle, not one per application. `GET /api/tags`, which would cover a
+whole server in one request, was rejected as the source: it needs Ollama
+v0.30.0 and under-reports `tools`/`thinking` for models whose template lives
+only in the GGUF. `/api/ps` is not read for the context size — its
+`context_length` is the loaded runner's effective `num_ctx` (and `0` when
+nothing is loaded), a different quantity from `/api/show`'s model maximum
+([Agent-Managed Model Runtime
+§3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+And the agent router's `GET`-only `/upstream/{model}/props` allowlist was
+**not** widened: it is a security boundary, and the loopback probe reaches an
+Ollama child without it.
 
 **Persistence is one row per capability, with a provenance rank where the
-columns had a lock.** Every verdict this detector yields is a
+columns had a lock.** Every verdict either capability detector yields is a
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
@@ -906,15 +1023,18 @@ more. A verdict of `""` produces **no row at
 all**, and the absence of a row is what UNKNOWN means — which is why a partial
 answer (an older llama.cpp reporting `modalities` but no
 `chat_template_caps`) cannot clear a `tools` verdict a previous probe
-established: there is no empty verdict for it to write. Both probe write paths
-stamp `source = "llama_cpp_props"` and the observation time as the row's
-`checked_at`; neither consults `metrics_locked` or touches
-`metrics_source`/`metrics_updated_at`.
+established: there is no empty verdict for it to write. Each write path
+stamps the row's `source` with the probe that produced the document — the
+gateway's own `/props` pass always `llama_cpp_props`, the agent's whichever
+of `llama_cpp_props`/`ollama_api_show` it reported (above) — plus the
+observation time as `checked_at`; neither consults `metrics_locked` or
+touches `metrics_source`/`metrics_updated_at`.
 
 **An operator's verdict is permanent, and no probe can move it.** Every writer
 asks `routing.WritableCapabilityRows` before it writes, and that function
 permits a write only when `rank(incoming) >= rank(current)`: `manual` 3 >
-`vision_benchmark` 2 > `llama_cpp_props`/`legacy`/any unrecognised source 1 >
+`vision_benchmark` 2 >
+`llama_cpp_props`/`ollama_api_show`/`legacy`/any unrecognised source 1 >
 no row 0. Three consequences matter operationally. The vision checkbox in
 `MappingForm.tsx` writes a `manual` row that neither probe path nor the
 benchmark can ever overwrite — with no `metrics_locked` in the story at all;

@@ -772,7 +772,7 @@ winning **per field** over the type's own default:
 | `vllm` | `/metrics` (Prometheus) | `/v1/models` | `data[].max_model_len` |
 | `llama_cpp` | `/metrics` (Prometheus) | `/props` | `default_generation_settings.n_ctx` (falls back to a top-level `n_ctx`) |
 | `tgi` | `/metrics` (Prometheus; `tgi_batch_current_size`=active, `tgi_queue_size`=queue) | `/info` | `max_total_tokens` |
-| `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
+| `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` — **POST**, body `{"model": "<the spec's model>"}` (see below) | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -782,6 +782,32 @@ best-effort scan is also what `custom` and any type this portal build does not
 yet recognize fall back to — never a hard failure, since a spec's real backend
 is exactly what an operator picking `custom` is telling the gateway it cannot
 assume.
+
+**`ollama` is the one row whose verb is not `GET`, and having it wrong made
+that probe unsatisfiable for as long as it existed (issue #54, fixed).**
+Ollama's `/api/show` is POST-only and takes the model in the body; since
+server v0.7.0 it answers a `GET` with `405` `text/plain` (a `404` before
+that), so the probe reported `context_probe = "unreachable"` on every cycle
+forever — indistinguishable, in the portal, from a genuinely misconfigured
+endpoint. Two consequences of the body carrying a model name, both
+load-bearing. A spec with no model resolved yet issues **no request at all**
+(`collector.ErrOllamaModelRequired`): Ollama answers a modelless POST with
+`400 model is required`, so sending it would spend a round trip to learn
+what the agent already knows. And the model joins the context cache's
+invalidation key beside the PID, `Type` and `ContextProbePath`
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), because
+**one `ollama serve` process serves many models**: repointing a running spec
+at a different model changes which model's context length `/api/show`
+reports, with the same PID throughout.
+
+**What the number means did not change, and that was a decision rather than
+an omission.** `/api/show`'s `model_info.<arch>.context_length` is the
+MODEL MAXIMUM and stays the reported figure. Ollama also exposes
+`/api/ps`, whose `context_length` is a different quantity — the loaded
+runner's effective `num_ctx`, and `0` when nothing is loaded — so switching
+to it would silently change what every operator reads off this column for
+every Ollama spec. That is its own change with its own migration story, and
+it is **out of scope** here.
 
 **Resolution happens gateway-side, and only the resolved values cross the
 wire.** `EffectiveRuntimeSpecType` + `DeriveProbePaths` run in
@@ -2241,6 +2267,22 @@ bugfix is **not** machine-detectable, because the guard has no external signal
 for what changed. That half stays a process rule in
 [`AGENTS.md`](../../../AGENTS.md).
 
+**A PATCH precedent worth naming, because the change was large and the bump
+was still PATCH: `0.7.0` → `0.7.1` for the Ollama probes (issue #54).** That
+change gave the agent a second capability probe (`POST /api/show`), fixed the
+`ollama` context probe's verb, put the model into both per-child cache keys
+and added a `source` field to the capability sample — and added **no**
+`Features` entry, so the rule makes it PATCH. The test asserts `Since ≤
+Version`, which cannot object; what decides it is what a flag is FOR. A
+feature name exists so a gateway can tell "this binary will never answer"
+from "the answer is still coming", and nothing waits on any of the above: the
+`source` field is additive and its absence keeps the gateway's historical
+default, while an older agent asked to probe an Ollama child GETs `/props`,
+receives a `404`, reports no verdicts and therefore writes no rows at all.
+There is nothing to gate and nothing to wait for. Note also that
+`runtime_upstream_props`' own `Since` stayed `"0.7.0"`: a `Since` records the
+version a feature SHIPPED in, and it does not follow `Version`.
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -2834,43 +2876,80 @@ mirror). Three different cadences share the one collect cycle:
   by `(SpecID, PID)` — the PID, not the spec id alone, so a restart (a new
   PID) forces a re-probe, since a new process generation may serve a
   different model or config — short-circuits every cycle after the first
-  success. A *failed* probe is never cached, so a child whose HTTP server is
-  still warming up is retried next cycle rather than sticking at `0` forever.
+  success. The entry also carries the `Type`, `ContextProbePath` and (since
+  #54) `Model` it was probed with, and a cache hit compares all three: the
+  config reconciliation edits a RUNNING spec in place, same PID, so a
+  spec repointed at a different model must not keep serving the previous
+  model's size. Nothing about a stale size looks invalid, which is why the
+  comparison is the only thing that catches it. A *failed* probe is never
+  cached, so a child whose HTTP server is still warming up is retried next
+  cycle rather than sticking at `0` forever.
 - **A fourth field, `LiveProgressSupport`, and a fifth, `Capabilities`, ride
-  the same fixed path and the same caching rule, from the same single fetch**
+  one fixed path per runtime kind and the same caching rule, from one single
+  fetch**
   (`probeRuntimeChildProps` — renamed from the narrower
   `probeRuntimeChildLiveProgress` when capability auto-detection (#49
   sub-project 2) widened it; the decisions these feed are [Telemetry, Usage
   Analytics &
   Observability §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
-  Unlike `ContextProbePath` above, this probe is **not** derived from `Type`
-  and does not depend on it at all: it always GETs the fixed path `/props`
-  (`collector.LiveProgressProbePath`), regardless of `st.Type` or whether
-  `st.ContextProbePath` is even set. That is deliberate — `DeriveProbePaths`
-  gives a `custom`-typed spec no context path at all
+  **`st.Type` decides WHICH document this probe reads, and nothing else
+  about it** (since #54 there are exactly two):
+
+  - `ollama` — `collector.ProbeOllamaVerdicts` **POSTs** `/api/show` with
+    `{"model": st.Model}` and reads the `capabilities` array out of the
+    reply. An Ollama child serves no `/props` at all, so asking for one
+    would spend a round trip to learn nothing; its declared capability
+    array is the only surface there is. That verdict set carries
+    capabilities **only** — its `LiveProgressSupport` is always `""`,
+    because Ollama exposes no `timings_per_token`-style surface to have an
+    opinion about and an unknown must never become a denial.
+  - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
+    GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
+    regardless of whether `st.ContextProbePath` is even set.
+
+  That second branch stays deliberately unconditional, and the ollama branch
+  above does not weaken the reason: `DeriveProbePaths` gives a
+  `custom`-typed spec no context path at all
   ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), so a
   *type-based* rule would never probe a `custom`-typed llama.cpp child for
-  either capability, which is exactly the case this unconditional probe
-  exists to recover: one extra loopback GET per child lifetime once a verdict
-  set is cached, on a path that is a package constant rather than
-  operator/config-supplied, so there is no SSRF surface to guard here the way
-  `MetricsPath`/`ContextProbePath` need one. **One fetch answers every
-  verdict this document can yield** — `collector.ProbePropsVerdicts` parses
-  the identical bytes for both `LiveProgressSupport` and `Capabilities`, so a
-  `llama_cpp` child that used to cost one `/props` GET per verdict kind now
-  costs one GET, period, per pid generation, however many verdicts the
-  document yields.
+  either capability, which is exactly the case this probe exists to recover.
+  Only `ollama` is claimed by name; nothing else may be, or that fallback
+  loses its probe. Either way it is one extra loopback request per child
+  lifetime once a verdict set is cached, on a path that is a package
+  constant rather than operator/config-supplied, so there is no SSRF surface
+  to guard here the way `MetricsPath`/`ContextProbePath` need one. **One
+  fetch answers every verdict its document can yield** — for `/props`,
+  `collector.ProbePropsVerdicts` parses the identical bytes for both
+  `LiveProgressSupport` and `Capabilities`, so a `llama_cpp` child that used
+  to cost one GET per verdict kind now costs one GET, period, per pid
+  generation, however many verdicts the document yields.
+
+  **The branch also NAMES the probe it took, and the name rides the wire**
+  as `capabilities.source` (`sample.Capabilities.Source`:
+  `llama_cpp_props` or `ollama_api_show`). The gateway stamps its capability
+  rows with what was reported rather than re-deriving the provenance from
+  the spec type it pushed itself — the wire carries a `spec_id` but no
+  runtime type, and an inferred provenance is the exact defect the row's
+  `source` column exists to prevent ([Telemetry, Usage Analytics &
+  Observability
+  §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+  The assignment sits INSIDE each branch, so the condition that picks the
+  endpoint is the same condition that knows its name and there is no second
+  copy to drift.
 
   The caching rule distinguishes **why** no verdict came back, not merely
-  whether one did. A cache keyed by `(SpecID, PID)`, like the context cache,
-  stores the whole verdict set (`collector.PropsVerdicts{LiveProgress, Caps}`
+  whether one did. A cache keyed by `(SpecID, PID, Model)`, like the context
+  cache, stores the whole verdict set
+  (`collector.PropsVerdicts{LiveProgress, Caps}`
   — `LiveProgress` one of `"supported"`/`"unsupported"`/a deliberate `""`;
-  `Caps` the four capability verdicts plus `Extra`) only once the probe's
-  answer is *stable*: a real `/props` document, any other well-formed body
+  `Caps` the four capability verdicts plus `Extra`) **and the source that
+  produced it** only once the probe's
+  answer is *stable*: a real `/props` or `/api/show` document, any other
+  well-formed body
   that simply is not that document, or one of exactly four conclusive
   refusals — **404** (no such route on this build), **401** or **403** (the
   route is behind an api key this probe cannot supply), **405** (the route
-  exists, but not for `GET`). None of those can change while this pid's
+  exists, but not for this verb). None of those can change while this pid's
   process keeps running: the binary behind it, and the credential it was
   launched with, are both fixed at exec time. A *transient* failure —
   connection refused, a timeout, any OTHER non-2xx status (a `5xx` above
@@ -2893,6 +2972,38 @@ mirror). Three different cadences share the one collect cycle:
   duplicates of the gateway's own copies — is [Telemetry, Usage Analytics &
   Observability
   §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
+
+  **`Model` joined this key for the same reason it joined the context
+  cache's, and it bites harder here.** One `ollama serve` process serves many
+  models, so the reconciliation repointing a running spec at a different
+  model — same PID, same `Type`, same everything about the process — changes
+  which model's declared capabilities `/api/show` reports. A
+  `(SpecID, PID)`-only key served the previous model's verdicts for that
+  PID's whole life, and nothing about them looked stale: a vision model's
+  verdict set read against a text-only model is a perfectly ordinary answer,
+  so the mistake surfaced as a wrong capability row rather than as an error.
+  The `/props` half does not depend on the model at all and the extra
+  comparison costs it nothing — a llama.cpp child's model cannot change
+  without a restart, which already re-arms the question through the PID.
+
+  **`Type` is deliberately NOT in this key, and the asymmetry with the
+  context cache is a decision rather than an oversight.** `Type` now decides
+  which document is read, so an edit to a RUNNING spec's `Type` does leave
+  this entry cached against the endpoint that was actually read. Adding
+  `Type` to the key would make that re-probe — and make things worse: the
+  running process is still the OLD binary until a restart, so re-probing a
+  spec whose type was corrected to `ollama` would POST `/api/show` at a
+  still-running `llama-server`, collect its `404`, and cache an EMPTY verdict
+  set over correct data. The stale-but-cached verdicts are the accurate ones
+  in the common direction, and they stay honestly attributed because the
+  source travels WITH them instead of being re-derived from the current
+  `Type`. The context cache can afford the opposite choice for a concrete
+  reason: it **never caches a failure**, so a re-probe that meets a `404`
+  leaves no entry and simply retries next cycle — the worst case is a
+  temporarily missing number. This cache caches a conclusive non-answer on
+  purpose, which is exactly what stops the per-cycle re-probing above, so
+  here the same re-probe would write an EMPTY verdict set over correct data
+  and keep it for the rest of the PID's life.
 
   **An api-key-protected child's verdict is recovered at the gateway edge,
   not by teaching this probe a credential (issue #58, closed).**
@@ -5149,11 +5260,28 @@ operator meets first:
   — `runtimes[].last_error` — is still visible only on the runtime admin
   screen (§11.5), which is the only place that also lets an operator act on
   it (force-start, inspect logs).
-- **Only reachability and the three probed numbers are surfaced today, not
-  the richer telemetry the same endpoints already carry.** Live tokens/sec,
-  prefix/KV-cache stats, and modality auto-detection (llama.cpp's
-  `modalities`, Ollama's `capabilities`) are deliberately out of scope for
-  this feature and tracked separately in issue #49.
+- **Capability auto-detection landed; the richer per-request telemetry the
+  same endpoints carry did not.** Modality/capability detection is no longer
+  out of scope — llama.cpp's `modalities`/`chat_template_caps` shipped with
+  #49 sub-project 2 and Ollama's `capabilities` array with #54
+  ([ADR-038](../09-architecture-decisions.md#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)) —
+  but prefix/KV-cache statistics and the other per-request figures these same
+  documents expose are still not read here.
+- **A *directly configured* Ollama application gets no capability detection at
+  all.** Detection is agent-side only: it reads `/api/show` over loopback for
+  a spec the agent manages. An ordinary (non-`server_agent`) application
+  pointed straight at an `ollama serve` endpoint is probed by the gateway's
+  own app-health pass, which issues `GET`s, so it never asks that endpoint
+  anything. Closing it needs two things rather than one — a POST-capable
+  `fetchModelInfo` on the gateway **and** a fan-out decision, because one
+  Ollama endpoint serves MANY models, so a complete answer is one
+  `/api/show` per mapping per probe cycle rather than one request per
+  application. That is its own change with its own cost, deliberately not a
+  footnote to this one. Nothing about the agent router's
+  `GET`-only `/upstream/{model}/props` allowlist
+  ([§4.1](#41-control-routes)) was widened either: that allowlist is a
+  security boundary, and the loopback probe already reaches an Ollama child
+  without it.
 - **Windows stop is kill-only.** Managed processes are started with
   `exec.Command` (never `CommandContext`) and, on unix, in their own process
   group so a stop signal reaches the whole tree; the platform-specific calls live

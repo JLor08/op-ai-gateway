@@ -38,7 +38,7 @@ not route-based).
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, energy/token), concurrency-capacity metrics, and their `metrics_locked`/`metrics_source`/`metrics_updated_at` provenance. Carries **no capability column at all** since migration 79 dropped the eleven it used to have — every per-model capability verdict is a `model_mapping_capabilities` row instead ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). |
-| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
+| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -173,7 +173,7 @@ erDiagram
         string mapping_id FK "PK part, on delete cascade"
         string capability "PK part, open vocabulary"
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
         datetime checked_at
     }
     AGENT_TOKENS {
@@ -572,13 +572,17 @@ plausible-looking validation rule would break the normal case:
   A capability NAME
   is not validated at all: the vocabulary is open on purpose (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress` are the names the code
-  itself reasons about, while an upstream may report others — Ollama passes
-  manifest-declared names through verbatim), so a name-checking validator
-  would silently drop the very verdicts the open shape exists to keep.
+  itself reasons about, while an upstream may report others — since #54 the
+  agent's Ollama probe actually produces such rows, carrying `insert`,
+  `thinking`, `embedding`, `image` and any manifest-declared publisher string
+  through verbatim, `image` deliberately as itself because in Ollama it means
+  image GENERATION rather than vision), so a name-checking validator would
+  silently drop the very verdicts the open shape exists to keep.
 - **`source` is a precedence RANK, and it is what this table has instead of
   `metrics_locked`.** `manual` (3) outranks `vision_benchmark` (2), which
-  outranks `llama_cpp_props`/`legacy`/**any unrecognised source** (1); no
-  stored row at all is rank 0. A write is permitted iff
+  outranks
+  `llama_cpp_props`/`ollama_api_show`/`legacy`/**any unrecognised source**
+  (1); no stored row at all is rank 0. A write is permitted iff
   `rank(incoming) >= rank(current)` — so an operator's verdict is permanent
   against both the benchmark and every probe with no lock involved, while an
   equal rank stays writable and a probe can still repair its own drift after
@@ -590,6 +594,16 @@ plausible-looking validation rule would break the normal case:
   lives in `WritableCapabilityRows`, applied by each writer rather than by the
   store, because only a writer knows what rank its own evidence carries
   ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+  The two PROBE sources are `llama_cpp_props` (a `GET` of llama.cpp's
+  `/props`) and, since #54, `ollama_api_show` (a `POST` of Ollama's
+  `/api/show`); the probing agent REPORTS which one produced a verdict set
+  rather than the gateway inferring it, and the ingest boundary accepts
+  exactly those two from an agent — a sample claiming `manual` or
+  `vision_benchmark` writes nothing at all, since an agent has no standing to
+  put "an operator said so" in front of an operator or to lock a real
+  benchmark out of its own row
+  ([Telemetry, Usage Analytics & Observability
+  §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 - **No capability writer consults `metrics_locked` or touches
   `metrics_source`/`metrics_updated_at`.** `metrics_locked` exists so an
   operator can pin a NUMBER they are answering for (throughput, context
