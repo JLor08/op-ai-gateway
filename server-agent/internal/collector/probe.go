@@ -475,6 +475,37 @@ func detectCapabilities(body []byte) Capabilities {
 	return out
 }
 
+// reservedOllamaCapabilityNames are the names detectOllamaCapabilities
+// refuses to carry into Extra no matter what /api/show declares, because the
+// consumer REASONS about them and this document cannot be evidence for
+// either one.
+//
+// DEFENCE IN DEPTH ONLY. The load-bearing rule is the gateway's, at the
+// ingest boundary where the agent's bytes arrive
+// (reservedAgentCapabilityNames in internal/gateway/agent_ingest.go, whose
+// doc carries the full argument): a filter here protects only against a
+// publisher string reaching an honest agent's Extra list, while the threat
+// that matters is a buggy or hostile agent putting the name straight into
+// the verdicts it sends, on a path this function is not on at all. Keeping
+// both means an honest agent never puts a name on the wire that the gateway
+// would only have to drop, and the drop stays visible on whichever side it
+// happens.
+//
+// Why exactly these two, when "vision"/"tools"/"audio" are claimed by the
+// switch above as real verdicts: Ollama's capability array says nothing
+// about either. "mtp" is not detected anywhere today -- the row comes from
+// the portal's operator checkbox or its model-name heuristic, and it feeds
+// the router's +30 MTP bonus. "live_progress" has a dedicated wire field of
+// its own, and for an Ollama child that field is always "" (Ollama exposes
+// no timings_per_token-style surface), so a publisher's string would not
+// merely collide with the dedicated answer -- it would BE the answer, and
+// the router would then send timings_per_token to an upstream that does not
+// understand it.
+var reservedOllamaCapabilityNames = map[string]bool{
+	"mtp":           true,
+	"live_progress": true,
+}
+
 // maxOllamaExtraCapabilities bounds how many names detectOllamaCapabilities
 // carries into Capabilities.Extra out of ONE /api/show document, and
 // maxOllamaCapabilityNameBytes bounds how long one such name may be. Both
@@ -567,6 +598,10 @@ const (
 //     lower-case, so this only ever normalises a publisher's string.
 //   - duplicates collapse to their first occurrence, in both the structured
 //     fields (idempotent by construction) and Extra (explicit dedup).
+//   - a RESERVED name (reservedOllamaCapabilityNames -- "mtp",
+//     "live_progress") is skipped: the consumer reasons about both and this
+//     document is evidence for neither. Defence in depth for the gateway's
+//     own rule, which is the load-bearing one.
 //   - the carried names are BOUNDED, in count and in length
 //     (maxOllamaExtraCapabilities / maxOllamaCapabilityNameBytes, whose own
 //     doc records the two ceilings those numbers are read off). Past the
@@ -591,7 +626,7 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 		return Capabilities{}
 	}
 	var caps Capabilities
-	var droppedOverLength, droppedOverLimit int
+	var droppedOverLength, droppedOverLimit, droppedReserved int
 	seen := make(map[string]bool, maxOllamaExtraCapabilities)
 	for _, raw := range doc.Capabilities {
 		name := strings.ToLower(strings.TrimSpace(raw))
@@ -613,6 +648,8 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 			// followed by "vision" would lose the one verdict a consumer
 			// actually reasons about.
 			switch {
+			case reservedOllamaCapabilityNames[name]:
+				droppedReserved++
 			case len(name) > maxOllamaCapabilityNameBytes:
 				// DROPPED, deliberately not truncated: a truncated name
 				// is a DIFFERENT capability, and it would be written as a
@@ -626,7 +663,7 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 			}
 		}
 	}
-	if dropped := droppedOverLength + droppedOverLimit; dropped > 0 {
+	if dropped := droppedOverLength + droppedOverLimit + droppedReserved; dropped > 0 {
 		// A clamp is a DEGRADE, so it is observable: one Warn at the site
 		// that drops, naming how many names went and why. Warn rather than
 		// Debug because the agent's own default level is info
@@ -644,6 +681,7 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 			"dropped", dropped,
 			"dropped_over_length", droppedOverLength,
 			"dropped_over_limit", droppedOverLimit,
+			"dropped_reserved", droppedReserved,
 			"kept", len(caps.Extra),
 			"max_names", maxOllamaExtraCapabilities,
 			"max_name_bytes", maxOllamaCapabilityNameBytes)

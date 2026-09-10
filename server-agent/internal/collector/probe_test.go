@@ -790,6 +790,52 @@ func TestDetectOllamaCapabilitiesDropsAnOverlongName(t *testing.T) {
 	}
 }
 
+// TestDetectOllamaCapabilitiesSkipsReservedNames pins the agent-side half of
+// the reserved-name rule: "mtp" and "live_progress" declared by an /api/show
+// document never reach Extra, however they are spelled.
+//
+// This layer is DEFENCE IN DEPTH and the test says so on purpose -- the
+// load-bearing rule is the gateway's ingest boundary, which is the only one
+// in the path of a buggy or hostile agent that puts the name straight into
+// the verdicts it sends. What this filter buys is that an honest agent never
+// puts a name on the wire the gateway would only have to drop.
+//
+// Why these two and not vision/tools/audio: Ollama's array is real evidence
+// for those three and says nothing at all about either of these. "mtp" is
+// not detected anywhere and feeds the router's +30 bonus; "live_progress"
+// has a dedicated wire field, and for an Ollama child that field is always
+// "", so a publisher's string would not collide with the dedicated answer --
+// it would BE the answer, and the router would send timings_per_token to an
+// upstream that does not understand it.
+//
+// The sibling names prove the skip costs only itself: "vision" still lands
+// as a structured verdict and "thinking" still reaches Extra.
+func TestDetectOllamaCapabilitiesSkipsReservedNames(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+	}{
+		{"as declared", []string{"mtp", "live_progress", "vision", "thinking"}},
+		{"case- and whitespace-normalised first", []string{" MTP ", "Live_Progress", "vision", "thinking"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureAtTheAgentsDefaultLevel(t)
+			caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(tc.names...)))
+
+			if !reflect.DeepEqual(caps.Extra, []string{"thinking"}) {
+				t.Fatalf("Extra = %q, want only [thinking] -- a reserved name must never be carried, and an unrelated one must still be", caps.Extra)
+			}
+			if caps.Vision != "yes" {
+				t.Fatalf("Vision = %q, want \"yes\" -- the reserved names must cost only themselves", caps.Vision)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "dropped_reserved=2") {
+				t.Fatalf("no WARN record naming the two reserved drops; log =\n%s", out)
+			}
+		})
+	}
+}
+
 // TestProbeOllamaVerdictsRefusesAnImplausiblyLargeBody bounds the INPUT, not
 // just the output. Both cases send the SAME declaration ("vision"), so the
 // only difference between them is the document's size:

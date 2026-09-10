@@ -286,6 +286,12 @@ func (c *agentRuntimeCapabilitiesSample) reportedSource() string {
 // its column-less Extra list and silently dropped an unknown "no" -- there
 // was nowhere to put it. With one row per capability there is.
 //
+// The one exception is applied by the CALLER, not here:
+// runtimeSampleCapabilityRows drops the reserved internal names
+// (reservedAgentCapabilityNames) out of this projection's output, because it
+// is the function holding the spec id that a drop has to be reported
+// against.
+//
 // A verdict that is neither "yes" nor "no" is dropped, and that is the whole
 // of this projection's filtering: "" is the wire's "nothing to say yet" (an
 // older agent, or a probe with no stable answer), and "unknown" is the
@@ -1029,19 +1035,59 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 	}
 }
 
+// reservedAgentCapabilityNames are the capability names this codebase
+// REASONS ABOUT and that neither capability probe can observe, so their
+// appearance in an agent's open verdict list is necessarily either an
+// upstream publisher's string or a bug -- never evidence.
+//
+// The criterion is exactly that, and it is why vision/video/audio/tools are
+// NOT here: those four are what the two detectors read out of their
+// documents (llama.cpp's modalities + chat_template_caps, Ollama's
+// capabilities array), so a probe reporting one of them is reporting what it
+// saw. Neither document says anything about either name below:
+//
+//   - "mtp" is not detected anywhere today. The row comes from the portal --
+//     an operator's checkbox (manual) or the model-NAME heuristic
+//     (legacy, routing.IsMTPModelName) -- and it feeds scoringRoute's +30
+//     bonus through MappingCandidate.IsMTP. A "yes" from a probe would move
+//     real routing weight on the strength of a string in a model manifest.
+//   - "live_progress" has a dedicated wire field of its own
+//     (RuntimeSample.LiveProgressSupport) and that field is the only channel
+//     an agent may report it on. Its verdict makes the router send
+//     timings_per_token upstream -- which an Ollama child does not
+//     understand at all, and for an Ollama child the dedicated field is
+//     ALWAYS "", so the "dedicated field wins" ordering below has nothing to
+//     win with and a publisher's string would take effect outright.
+//
+// This gateway-side rule is the load-bearing one, and the reason is the
+// threat model rather than tidiness: the agent's own detector skips these
+// names too (collector.detectOllamaCapabilities), but that filter protects
+// only against a publisher string reaching an HONEST agent's Extra list. A
+// buggy or hostile agent puts the name straight into the verdicts it sends,
+// where no agent-side filter is in the path at all. This boundary is.
+//
+// The day a real MTP detector exists it reports through a field this
+// codebase defined, the way live-progress support does, or this list changes
+// on both sides -- what it must not do is arrive on the OPEN list, whose
+// whole purpose is carrying strings no one here has vetted.
+var reservedAgentCapabilityNames = map[string]bool{
+	routing.CapabilityMTP:          true,
+	routing.CapabilityLiveProgress: true,
+}
+
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined
 // about its child's build, projected onto rows this probe may offer for
 // writing: the live-progress verdict, which is a capability like any other
 // and gets no writer of its own, plus the open Verdicts list.
 //
-// The live-progress row goes FIRST, so an agent that (absurdly) both
-// reported a "live_progress" verdict in its open list AND filled
-// live_progress_support gets the DEDICATED field's answer: rule 0 of
-// routing.WritableCapabilityRows keeps the first row for a capability name
-// and drops every later one. Nothing about the vocabulary makes that
-// collision impossible, and picking the explicit field is the less
-// surprising of the two. This order is the mechanism, not a formatting
-// choice -- reversing it silently hands the open list the last word.
+// The live-progress row goes FIRST, and the open list can no longer contest
+// it at all: "live_progress" is a RESERVED name (reservedAgentCapabilityNames
+// above), so a verdict carrying it never becomes a row. The order stays as
+// the second half of a belt-and-braces pair rather than as the mechanism it
+// used to be -- rule 0 of routing.WritableCapabilityRows keeps the first row
+// for a capability name and drops every later one, so were the reserved rule
+// ever narrowed, the DEDICATED field would still win instead of silently
+// losing to a publisher's string.
 //
 // BOTH row kinds are stamped with the ONE source resolved here, because the
 // agent derives both from the same probe pass over the same document
@@ -1131,7 +1177,25 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			})
 		}
 	}
-	return append(rows, rt.Capabilities.capabilityRows(source, at)...)
+	reported := rt.Capabilities.capabilityRows(source, at)
+	kept := make([]routing.CapabilityRow, 0, len(reported))
+	var dropped []string
+	for _, row := range reported {
+		if reservedAgentCapabilityNames[row.Capability] {
+			dropped = append(dropped, row.Capability)
+			continue
+		}
+		kept = append(kept, row)
+	}
+	if len(dropped) > 0 {
+		// Warn for this file's established reason: the drop is deterministic
+		// -- it repeats for every sample this agent build sends -- and at
+		// Debug it would be invisible at the gateway's default info level,
+		// while the missing row reads as plain "unknown".
+		slog.Warn("runtime capability sample reports reserved internal capability names, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", dropped)
+	}
+	return append(rows, kept...)
 }
 
 // resolvedCapabilities returns specID's memoized ownership resolution,

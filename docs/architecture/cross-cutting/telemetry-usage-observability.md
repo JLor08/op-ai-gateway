@@ -1063,6 +1063,30 @@ rest of the pass still lands — a `vision` or `tools` verdict is something
 consequence follows: a `live_progress` row can now only ever carry
 `llama_cpp_props`.
 
+**Two names are RESERVED and may not arrive from a probe at all: `mtp` and
+`live_progress`.** The criterion is that this codebase *reasons about* both
+and neither detector can *observe* either, so a probe reporting one is
+reporting a publisher's string or a bug, never evidence. `mtp` is detected
+nowhere today — the row comes from the portal's operator checkbox (`manual`)
+or its model-name heuristic (`legacy`) — and it feeds the router's +30 MTP
+bonus through `MappingCandidate.IsMTP`; `live_progress` has a dedicated wire
+field of its own, and for an Ollama child that field is always `""`, so a
+manifest string would not merely collide with the dedicated answer, it would
+*be* the answer, and the router would then send `timings_per_token` to an
+upstream that does not understand it. Both were unreachable before this
+detector existed, because nothing produced the open `Extra` list at all.
+`vision`/`video`/`audio`/`tools` are deliberately **not** reserved: those
+four are exactly what the two detectors read out of their documents.
+
+The rule is enforced at the **ingest**, because that is the boundary in the
+path of a buggy or hostile agent putting the name straight into its verdict
+list; the agent's own detector skips both as well, but that filter only ever
+meets a publisher's string. The drop is logged at `Warn` and the rest of the
+pass still lands. The day a real MTP detector exists it reports through a
+field this codebase defined — the way live-progress support does — or the
+reserved list changes on both sides; what it must not do is arrive on the
+open list, whose whole purpose is carrying strings nobody here has vetted.
+
 **What this does NOT cover, and why each is its own change.** A *directly
 configured* Ollama application (no agent) still gets no capability
 detection: detection is agent-side, over loopback, and the gateway's own

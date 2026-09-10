@@ -1061,31 +1061,32 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
-// TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList proves the
-// resolution of the one collision the OPEN capability vocabulary makes
-// possible on this path: an agent that both reports a "live_progress" verdict
-// in its open Verdicts list AND fills the dedicated live_progress_support
-// field. The dedicated field wins.
+// TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField is the
+// live-progress half of the reserved-name rule, read through the collision
+// the OPEN vocabulary used to make possible: an agent that both reports a
+// "live_progress" verdict in its open Verdicts list AND fills the dedicated
+// live_progress_support field.
 //
-// The mechanism is a pair, and neither half works alone:
-// runtimeSampleCapabilityRows emits the dedicated row FIRST, and rule 0 of
-// routing.WritableCapabilityRows keeps the first row for a capability name
-// and drops every later one. Before rule 0 the same outcome came out of the
-// upsert loop applying both rows in order and the last one winning -- which
-// is why the projection appended the dedicated row LAST. Keeping rule 0 and
-// that old order together would silently hand the open list the last word,
-// so the order is now load-bearing in the opposite direction.
+// The dedicated field wins, and it now wins TWICE OVER, which is what this
+// test distinguishes. The reserved rule drops the open list's row before it
+// can become a row at all (the WARN below is that drop, and it is the only
+// assertion here that a narrowing of the rule would break -- the row counts
+// alone cannot tell the two mechanisms apart). Underneath it, unchanged,
+// runtimeSampleCapabilityRows still emits the dedicated row FIRST and rule 0
+// of routing.WritableCapabilityRows still keeps the first row for a name and
+// drops every later one, so even a narrowed reserved rule would leave the
+// explicit field in front of a publisher's string rather than behind it.
 //
-// The write carries ONE row, not two: a duplicated name must never reach the
-// store twice, whatever the store would then do with it.
-func TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList(t *testing.T) {
+// The verdicts are opposite on purpose, so the assertion cannot pass because
+// both happen to agree. And the write carries ONE row, not two: a duplicated
+// name must never reach the store twice, whatever the store would then do
+// with it.
+func TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_dup", false)
 	counting := countingRowStore(srv)
 
-	// The dedicated field says unsupported; the open list claims the same
-	// capability is supported. The verdicts are opposite on purpose, so the
-	// assertion cannot pass because both happen to agree.
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
 		`"runtimes":[{"spec_id":"rspec_lp_dup","state":"running","live_progress_support":"unsupported",` +
 		`"capabilities":{"verdicts":[{"name":"live_progress","verdict":"yes"}]}}]}`
@@ -1098,6 +1099,70 @@ func TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList(t *testing.T) {
 	}
 	assertCapabilityRow(t, srv, "map_rspec_lp_dup", routing.CapabilityLiveProgress,
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "reserved internal capability names") {
+		t.Fatalf("no WARN record about the reserved name dropped from the open list; records = %+v -- without it this test cannot tell the reserved rule from the ordering rule underneath it", recs)
+	}
+}
+
+// TestIngestDropsReservedCapabilityNamesFromAnAgentProbe pins the rule that
+// makes the OPEN capability vocabulary safe to feed from an upstream one:
+// "mtp" and "live_progress" may not arrive from an agent-reported probe
+// source, whichever of the two probes is claimed.
+//
+// Both names are ones this codebase reasons about and neither probe can
+// observe. Ollama's /api/show carries whatever a publisher wrote into a
+// model manifest, and since the agent's Ollama detector is the first
+// producer of the open Extra list anywhere, the literal string "mtp" in a
+// manifest would otherwise write a rank-1 "yes" that feeds the router's +30
+// MTP bonus, and "live_progress" would make the router send
+// timings_per_token to an Ollama upstream that does not understand it. The
+// agent's detector skips both, but that filter only ever sees a publisher's
+// string: a buggy or hostile agent puts the name straight into the verdicts
+// it sends, and THIS is the boundary that is in that path.
+//
+// Unfalsifiable rather than merely quiet, in both directions. The mapping
+// already holds an "mtp" row of the OPPOSITE verdict at EQUAL rank
+// (legacy, 1), which the incoming "yes" would be permitted to overwrite --
+// so a row that got through would flip a stored verdict and be visible. And
+// the same sample carries a "vision" verdict with no stored row at all, so
+// "nothing was written" cannot be satisfied by a write path that had simply
+// stopped working.
+func TestIngestDropsReservedCapabilityNamesFromAnAgentProbe(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, source string
+	}{
+		{"the llama.cpp props probe", "rspec_res_props", routing.CapabilitySourceLlamaCppProps},
+		{"the ollama api/show probe", "rspec_res_ollama", routing.CapabilitySourceOllamaAPIShow},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			seedCapabilityRow(t, srv, mappingID, routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"mtp","verdict":"yes"},{"name":"live_progress","verdict":"yes"},`+
+					`{"name":"vision","verdict":"yes"}],"source":"`+tc.source+`"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityVision {
+				t.Fatalf("the write carried %+v, want exactly the vision row -- a reserved name must never reach the store, and the rest of the pass must still land", sent)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityYes, tc.source)
+			if row, ok := capabilityRow(t, srv, mappingID, routing.CapabilityLiveProgress); ok {
+				t.Fatalf("a live_progress row exists (%+v), want none -- the dedicated field is the only channel for it", row)
+			}
+			recs := buf.Snapshot()
+			if !findLogRecord(recs, "WARN", "reserved internal capability names") {
+				t.Fatalf("no WARN record naming the reserved drop at the gateway's own default level (info); records = %+v", recs)
+			}
+		})
+	}
 }
 
 // TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves an

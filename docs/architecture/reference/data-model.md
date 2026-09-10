@@ -577,7 +577,14 @@ plausible-looking validation rule would break the normal case:
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
-  silently drop the very verdicts the open shape exists to keep.
+  silently drop the very verdicts the open shape exists to keep. The two
+  rules that DO constrain names live at the agent ingest rather than in the
+  store, and they are about one producer instead of the vocabulary: that
+  producer's pass may report at most 64 names of at most 128 bytes each, and
+  it may not report `mtp` or `live_progress` at all — the two names this
+  codebase reasons about that no probe can observe ([Telemetry, Usage
+  Analytics & Observability
+  §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 - **`source` is a precedence RANK, and it is what this table has instead of
   `metrics_locked`.** `manual` (3) outranks `vision_benchmark` (2), which
   outranks
