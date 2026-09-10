@@ -627,6 +627,12 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 	}
 	var caps Capabilities
 	var droppedOverLength, droppedOverLimit, droppedReserved int
+	// The dedup hint is the BOUND, not len(doc.Capabilities): the array's
+	// length is upstream-controlled, and sizing a map from it would let a
+	// declaration this function is about to clamp anyway drive the one
+	// allocation made before the clamp can. The map still grows to however
+	// many distinct names actually arrive -- this only refuses to
+	// pre-reserve for them.
 	seen := make(map[string]bool, maxOllamaExtraCapabilities)
 	for _, raw := range doc.Capabilities {
 		name := strings.ToLower(strings.TrimSpace(raw))
@@ -642,8 +648,9 @@ func detectOllamaCapabilities(body []byte) Capabilities {
 		case "audio":
 			caps.Audio = "yes"
 		default:
-			// The clamp stops APPENDING; it does not stop the loop. A
-			// break here would let a hostile tail of publisher strings
+			// Three reasons a name goes no further, and one thing they
+			// have in common: none of them stops the LOOP. A break at the
+			// count clamp would let a hostile tail of publisher strings
 			// displace the structured verdicts above -- 64 junk names
 			// followed by "vision" would lose the one verdict a consumer
 			// actually reasons about.
