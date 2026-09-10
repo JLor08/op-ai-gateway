@@ -179,12 +179,103 @@ type agentRuntimeCapabilityVerdict struct {
 // capability is what makes the open vocabulary storable at all.
 type agentRuntimeCapabilitiesSample struct {
 	Verdicts []agentRuntimeCapabilityVerdict `json:"verdicts"`
+	// Source is the agent's own name for the PROBE that produced this
+	// verdict set (#54) -- the gateway-side mirror of
+	// sample.Capabilities.Source, whose doc carries the full reasoning. The
+	// producer reports its provenance; this module does NOT re-derive it
+	// from the spec type it pushed, even though it could: that would put
+	// the agent's branch condition in a second module where the two can
+	// drift, and this subsystem exists because a shared, inferred
+	// provenance was wrong.
+	//
+	// It is the WRAPPER's field, not each verdict's: one probe reads one
+	// document, so one source describes the whole set.
+	//
+	// Agent-supplied and therefore NOT trusted as written -- see rowSource,
+	// which is the only thing that may turn it into a row's Source.
+	Source string `json:"source,omitempty"`
+}
+
+// rowSource resolves the source EVERY row this runtime entry's probe pass
+// may offer is stamped with, and decides whether the pass may be written at
+// all. The bool is that decision: false means write nothing from this entry.
+//
+// A nil receiver or an EMPTY source keeps the historical default,
+// CapabilitySourceLlamaCppProps, and that default is SAFE rather than merely
+// convenient: the only producers that leave the field empty are agents that
+// predate it, and such an agent probes capabilities by GETting /props. An
+// Ollama child answers that with a 404 (it serves no /props at all), which
+// the agent treats as a conclusive nothing -- no verdicts, therefore no rows
+// at all. So the default can only ever apply to a document a llama.cpp
+// /props probe actually produced; there is no arrangement of old agent plus
+// new gateway in which it mislabels an Ollama-declared verdict.
+//
+// An UNRECOGNISED source REJECTS the rows instead of clamping them to the
+// default, and that is the ruling this function exists to make. Clamping
+// would print a provenance nobody reported on the operator-visible column --
+// a fabricated attribution, which is precisely the defect the source column
+// exists to prevent, and worse than the alternative: a dropped row leaves
+// the capability UNKNOWN, which this model expresses natively as the absence
+// of a row (see routing.CapabilityRow). Rejecting is also the only option
+// that stays safe against the rank: capabilitySourceRank's DEFAULT branch
+// ranks an unrecognised source at 1, so a blind write would let an
+// unknown-provenance verdict overwrite a real probe's row at equal rank.
+//
+// The allowlist is exactly the two PROBE sources, which is what makes this a
+// trust boundary and not a typo filter: the vocabulary also contains
+// CapabilitySourceManual (rank 3) and CapabilitySourceVisionBenchmark
+// (rank 2), and an agent has no standing to claim either. A sample that did
+// would put "an operator said so" in front of an operator and lock a real
+// benchmark out of its own row. Neither reaches a row from here.
+//
+// It lives in this package rather than in routing on purpose: routing owns
+// the store-side RANK, which is about how two sources compare; which sources
+// one PRODUCER may claim is a property of this ingest boundary, where the
+// agent's bytes arrive.
+func (c *agentRuntimeCapabilitiesSample) rowSource() (string, bool) {
+	if c == nil {
+		return routing.CapabilitySourceLlamaCppProps, true
+	}
+	switch strings.TrimSpace(c.Source) {
+	case "", routing.CapabilitySourceLlamaCppProps:
+		return routing.CapabilitySourceLlamaCppProps, true
+	case routing.CapabilitySourceOllamaAPIShow:
+		return routing.CapabilitySourceOllamaAPIShow, true
+	default:
+		return "", false
+	}
+}
+
+// reportedSource is c.Source as it ARRIVED -- untrimmed, unvalidated, and
+// safe on a nil receiver. It exists for one caller: the log line that
+// reports a source rowSource above refused
+// (runtimeSampleCapabilityRows). That line has to name the value the agent
+// actually sent, so it cannot use rowSource's return (which is "" for
+// exactly the case being logged) and must not trim, since a source that
+// differs from a valid one only in whitespace is worth seeing as it came.
+//
+// A METHOD rather than a field read at the call site, because the call site
+// was safe only by an invariant enforced one function away: rowSource
+// defaults the nil receiver to a VALID source, so a nil c can never reach
+// the rejection branch, so the deref there could never fire. That is true,
+// and it is true somewhere else -- a mutation to rowSource's first line
+// during review turned the branch into a SEGFAULT rather than a failed
+// assertion, which is the tell that nothing local protected it. This
+// accessor makes the branch correct on its own terms, at no behavioural
+// cost: for every input that reaches it today it returns exactly what
+// c.Source returned.
+func (c *agentRuntimeCapabilitiesSample) reportedSource() string {
+	if c == nil {
+		return ""
+	}
+	return c.Source
 }
 
 // capabilityRows projects c.Verdicts onto the store's row shape -- the rows
-// THIS probe determined, attributed to CapabilitySourceLlamaCppProps and
-// stamped at, ready for routing.WritableCapabilityRows to decide which
-// of them may actually be written. A nil receiver (no wire object at all --
+// THIS probe determined, attributed to source (the caller's already-resolved
+// rowSource, never c.Source as written) and stamped at, ready for
+// routing.WritableCapabilityRows to decide which of them may actually be
+// written. A nil receiver (no wire object at all --
 // an agent predating capability detection) yields nothing, as does a non-nil
 // but empty one (detection ran, determined nothing): two different facts that
 // both mean no rows, which is why the wire field is a pointer.
@@ -195,6 +286,12 @@ type agentRuntimeCapabilitiesSample struct {
 // its column-less Extra list and silently dropped an unknown "no" -- there
 // was nowhere to put it. With one row per capability there is.
 //
+// The one exception is applied by the CALLER, not here:
+// runtimeSampleCapabilityRows drops the reserved internal names
+// (reservedAgentCapabilityNames) out of this projection's output, because it
+// is the function holding the spec id that a drop has to be reported
+// against.
+//
 // A verdict that is neither "yes" nor "no" is dropped, and that is the whole
 // of this projection's filtering: "" is the wire's "nothing to say yet" (an
 // older agent, or a probe with no stable answer), and "unknown" is the
@@ -202,7 +299,21 @@ type agentRuntimeCapabilitiesSample struct {
 // for it. Dropping an unrecognised verdict string here rather than passing it
 // on matters: UpsertMappingCapabilities is atomic and strict, so one
 // malformed verdict handed to it would reject the whole sample's row set.
-func (c *agentRuntimeCapabilitiesSample) capabilityRows(at time.Time) []routing.CapabilityRow {
+//
+// The Source is REPORTED, not inferred, and that is the resolution of #54's
+// open question: since the agent runs TWO capability probes (llama.cpp's
+// /props and, for an "ollama"-typed spec, POST /api/show), and this wire
+// carries the spec id but no runtime type, the gateway cannot tell the two
+// documents apart from the sample alone -- so the producer names its own
+// provenance in Source and rowSource validates it. Two alternatives were
+// refused: guessing the probe from the row CONTENT (Ollama never reports a
+// "no", never a live_progress) is a heuristic a nothing-but-yes /props
+// document defeats, and re-deriving routing.EffectiveRuntimeSpecType from
+// the spec resolveRuntimeSpecCapabilities already loads would trade the
+// reporter's report for an inference from configuration this gateway pushed
+// itself, duplicating the agent's branch condition in a second module where
+// the two can silently drift.
+func (c *agentRuntimeCapabilitiesSample) capabilityRows(source string, at time.Time) []routing.CapabilityRow {
 	if c == nil {
 		return nil
 	}
@@ -215,7 +326,7 @@ func (c *agentRuntimeCapabilitiesSample) capabilityRows(at time.Time) []routing.
 		}
 		out = append(out, routing.CapabilityRow{
 			Capability: name, Verdict: verdict,
-			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: at,
+			Source: source, CheckedAt: at,
 		})
 	}
 	return out
@@ -258,8 +369,10 @@ type agentRuntimeSample struct {
 	// (see runtimeSampleCapabilityRows).
 	LiveProgressSupport string `json:"live_progress_support"`
 	// Capabilities is this child's auto-detected capability verdict set (#49
-	// sub-project 2), from the SAME /props probe pass that fills
-	// LiveProgressSupport above (server-agent's probeRuntimeChildProps). A
+	// sub-project 2), from the SAME probe pass that fills
+	// LiveProgressSupport above (server-agent's probeRuntimeChildProps --
+	// llama.cpp's /props, or Ollama's /api/show since #54, which is why the
+	// set names its own Source). A
 	// POINTER, mirroring the agent's own sample.RuntimeSample.Capabilities
 	// *sample.Capabilities field byte-for-byte on the wire: nil distinguishes
 	// "this agent predates capability detection" (an older build -- nothing
@@ -922,28 +1035,219 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 	}
 }
 
+// reservedAgentCapabilityNames are the capability names this codebase
+// REASONS ABOUT and that neither capability probe can observe, so their
+// appearance in an agent's open verdict list is necessarily either an
+// upstream publisher's string or a bug -- never evidence.
+//
+// The criterion is exactly that, and it is why vision/video/audio/tools are
+// NOT here: those four are what the two detectors read out of their
+// documents (llama.cpp's modalities + chat_template_caps, Ollama's
+// capabilities array), so a probe reporting one of them is reporting what it
+// saw. Neither document says anything about either name below:
+//
+//   - "mtp" is not detected anywhere today. The row comes from the portal --
+//     an operator's checkbox (manual) or the model-NAME heuristic
+//     (legacy, routing.IsMTPModelName) -- and it feeds scoringRoute's +30
+//     bonus through MappingCandidate.IsMTP. A "yes" from a probe would move
+//     real routing weight on the strength of a string in a model manifest.
+//   - "live_progress" has a dedicated wire field of its own
+//     (RuntimeSample.LiveProgressSupport) and that field is the only channel
+//     an agent may report it on. Its verdict makes the router send
+//     timings_per_token upstream -- which an Ollama child does not
+//     understand at all, and for an Ollama child the dedicated field is
+//     ALWAYS "", so the "dedicated field wins" ordering below has nothing to
+//     win with and a publisher's string would take effect outright.
+//
+// This gateway-side rule is the load-bearing one, and the reason is the
+// threat model rather than tidiness: the agent's own detector skips these
+// names too (collector.detectOllamaCapabilities), but that filter protects
+// only against a publisher string reaching an HONEST agent's Extra list. A
+// buggy or hostile agent puts the name straight into the verdicts it sends,
+// where no agent-side filter is in the path at all. This boundary is.
+//
+// The day a real MTP detector exists it reports through a field this
+// codebase defined, the way live-progress support does, or this list changes
+// on both sides -- what it must not do is arrive on the OPEN list, whose
+// whole purpose is carrying strings no one here has vetted.
+var reservedAgentCapabilityNames = map[string]bool{
+	routing.CapabilityMTP:          true,
+	routing.CapabilityLiveProgress: true,
+}
+
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined
 // about its child's build, projected onto rows this probe may offer for
 // writing: the live-progress verdict, which is a capability like any other
 // and gets no writer of its own, plus the open Verdicts list.
 //
-// The live-progress row goes FIRST, so an agent that (absurdly) both
-// reported a "live_progress" verdict in its open list AND filled
-// live_progress_support gets the DEDICATED field's answer: rule 0 of
-// routing.WritableCapabilityRows keeps the first row for a capability name
-// and drops every later one. Nothing about the vocabulary makes that
-// collision impossible, and picking the explicit field is the less
-// surprising of the two. This order is the mechanism, not a formatting
-// choice -- reversing it silently hands the open list the last word.
+// The live-progress row goes FIRST, and the open list can no longer contest
+// it at all: "live_progress" is a RESERVED name (reservedAgentCapabilityNames
+// above), so a verdict carrying it never becomes a row. The order stays as
+// the second half of a belt-and-braces pair rather than as the mechanism it
+// used to be -- rule 0 of routing.WritableCapabilityRows keeps the first row
+// for a capability name and drops every later one, so were the reserved rule
+// ever narrowed, the DEDICATED field would still win instead of silently
+// losing to a publisher's string.
+//
+// BOTH row kinds are stamped with the ONE source resolved here, because the
+// agent derives both from the same probe pass over the same document
+// (server-agent's probeRuntimeChildProps fills LiveProgressSupport and
+// Capabilities from a single fetch). A source this gateway does not
+// recognise voids the whole pass, live-progress row included: the pass's
+// provenance is what was unrecognisable, and no part of it is more
+// attributable than the rest.
+//
+// TWO shapes are refused rather than stamped, and both are refusals of a
+// FALSE PROVENANCE that the ollama_api_show source cannot carry, whatever
+// the sender intended -- see each refusal below for its own argument:
+//
+//  1. a live-progress verdict attributed to ollama_api_show, in either
+//     direction. Ollama exposes no timings_per_token-style surface at all,
+//     so its document is evidence for neither answer.
+//  2. ANY capability's "no" verdict attributed to ollama_api_show.
+//     Ollama's capability array is not exhaustive, so the detector behind
+//     that source can only ever produce "yes" or nothing -- which is the
+//     claim routing.CapabilityRow's own source doc makes about every row
+//     carrying it, not just about the live-progress one.
+//
+// Both are one-line rules for the same reason: an invariant a caller can
+// violate is not an invariant, and this is the boundary where the agent's
+// bytes arrive. Neither voids the pass -- the "yes" verdicts of the same
+// document are exactly what /api/show CAN answer, so they still ride it.
+//
+// A consequence worth stating, because it is a limit on what the tests here
+// can show: the live-progress row can now only ever carry llama_cpp_props,
+// so reading the source from the report rather than hard-coding llama.cpp's
+// name -- still the honest rule, and still the one the verdict rows follow
+// -- is no longer distinguishable from the hard-coded name by any input, and
+// no test pins it any more.
 func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.CapabilityRow {
+	source, ok := rt.Capabilities.rowSource()
+	if !ok {
+		// WARN, and the level is load-bearing: this gateway's default log
+		// level is info (config.Load's OP_AI_GATEWAY_LOG_LEVEL default), so
+		// at Debug the drop is INVISIBLE in every default deployment. A
+		// newer agent reporting a third source would lose every capability
+		// row it ever sends, and lose it silently -- the rows' absence is
+		// how this model spells "unknown", indistinguishable from a probe
+		// that never ran, so there would be nothing anywhere to point at.
+		//
+		// Warn is this file's established level for a rejection that DROPS
+		// A WRITE: the three cross-server spec rejections (vram, context,
+		// and this very write-back's own, a screen above) and the two
+		// telemetry-envelope rejections all use it. Debug here is reserved
+		// for a TRANSIENT failure -- a store error, a lookup that failed
+		// this once -- which repeats and heals on its own. This one cannot
+		// heal: the source names the agent build that sent it, so every
+		// sample from that agent is dropped identically until a binary
+		// changes. It does repeat, once per sample per spec, and that is
+		// accepted on exactly the same footing as the ownership rejection
+		// above, which repeats per sample and warns anyway -- a fleet-wide
+		// capability blackout is worth a repeated line.
+		//
+		// reportedSource, not rt.Capabilities.Source: a nil sample cannot
+		// reach this branch (rowSource defaults the nil receiver to a valid
+		// source), but that invariant lives one function away, so reading
+		// the field directly here would be safe only at a distance. The
+		// accessor is nil-safe on its own terms and returns the identical
+		// value for every input that does reach this branch.
+		slog.Warn("runtime capability sample names an unrecognised source, dropping its rows",
+			"spec_id", rt.SpecID, "source", rt.Capabilities.reportedSource())
+		return nil
+	}
 	var rows []routing.CapabilityRow
 	if verdict := routing.LiveProgressCapabilityVerdict(rt.LiveProgressSupport); verdict != "" {
-		rows = append(rows, routing.CapabilityRow{
-			Capability: routing.CapabilityLiveProgress, Verdict: verdict,
-			Source: routing.CapabilitySourceLlamaCppProps, CheckedAt: at,
-		})
+		if source == routing.CapabilitySourceOllamaAPIShow {
+			// REFUSED, not stamped. The combination is one no honest agent
+			// produces -- ProbeOllamaVerdicts leaves LiveProgress "" on
+			// every one of its return paths -- but a buggy or hostile one
+			// can send it, and this is the boundary where the agent's bytes
+			// arrive, so "no honest producer does this" is not an invariant
+			// here: it is a hope.
+			//
+			// The refusal is semantically right independent of anyone's
+			// intent, which is why it is a refusal and not a softened
+			// comment somewhere. Ollama exposes no timings_per_token-style
+			// surface at all, so its /api/show document cannot carry
+			// evidence about live progress in EITHER direction -- a
+			// live_progress row attributed to that probe is a false
+			// provenance whatever verdict it carries, and false provenance
+			// on this column is the one thing the column exists to
+			// prevent. routing.CapabilityRow's own source doc makes the
+			// strong claim ("a row with this source and verdict
+			// CapabilityNo could therefore not have come from that probe")
+			// -- this is what makes the claim true rather than aspirational.
+			//
+			// Only the live-progress row goes; the verdict rows below are
+			// exactly what an /api/show document CAN answer, so they still
+			// ride the same pass. Warn, not Debug, for this file's
+			// established reason: a drop that cannot heal on its own is
+			// invisible at the gateway's default info level otherwise.
+			slog.Warn("runtime capability sample attributes a live-progress verdict to the ollama probe, dropping that row",
+				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
+		} else {
+			rows = append(rows, routing.CapabilityRow{
+				Capability: routing.CapabilityLiveProgress, Verdict: verdict,
+				Source: source, CheckedAt: at,
+			})
+		}
 	}
-	return append(rows, rt.Capabilities.capabilityRows(at)...)
+	reported := rt.Capabilities.capabilityRows(source, at)
+	kept := make([]routing.CapabilityRow, 0, len(reported))
+	var dropped, deniedNo []string
+	for _, row := range reported {
+		switch {
+		case reservedAgentCapabilityNames[row.Capability]:
+			dropped = append(dropped, row.Capability)
+		case source == routing.CapabilitySourceOllamaAPIShow && row.Verdict == routing.CapabilityNo:
+			// REFUSED, for the live-progress refusal's reason applied to
+			// the capability this source CAN speak about -- which is to say
+			// applied generally, because the reason was never specific to
+			// live progress.
+			//
+			// routing.CapabilityRow's source doc states it for every row
+			// carrying ollama_api_show, not for one name: "A row with this
+			// source and verdict CapabilityNo could therefore not have come
+			// from that probe." The ground is that Ollama's capability
+			// array is NOT exhaustive -- a name's absence means "Ollama did
+			// not tell us", never "this model cannot do that" -- so
+			// collector.detectOllamaCapabilities produces "yes" or nothing
+			// on every path and can never produce a "no" for anything.
+			//
+			// Left unenforced, that sentence was true only as a statement
+			// ABOUT provenance (such a row indeed did not come from the
+			// probe -- it is a lie by the sender) while being false as an
+			// invariant: a buggy or hostile agent put a rank-1 "no" in
+			// front of an operator under a provenance that cannot produce
+			// one, and at equal rank it overwrote the OTHER probe's honest
+			// verdict. That is the same reasoning as the live-progress
+			// refusal above, and it costs the honest path nothing.
+			//
+			// Only the "no" rows go. A "yes" is exactly what an /api/show
+			// document can answer, so the rest of the pass still lands,
+			// still sourced ollama_api_show.
+			deniedNo = append(deniedNo, row.Capability)
+		default:
+			kept = append(kept, row)
+		}
+	}
+	if len(dropped) > 0 {
+		// Warn for this file's established reason: the drop is deterministic
+		// -- it repeats for every sample this agent build sends -- and at
+		// Debug it would be invisible at the gateway's default info level,
+		// while the missing row reads as plain "unknown".
+		slog.Warn("runtime capability sample reports reserved internal capability names, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", dropped)
+	}
+	if len(deniedNo) > 0 {
+		// Warn, same argument: a drop that cannot heal on its own (the
+		// source names the agent build that sent it) is otherwise invisible
+		// at the gateway's default info level, and the absent row reads as
+		// plain "unknown".
+		slog.Warn("runtime capability sample attributes a negative verdict to the ollama probe, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", deniedNo)
+	}
+	return append(rows, kept...)
 }
 
 // resolvedCapabilities returns specID's memoized ownership resolution,

@@ -119,7 +119,27 @@ import (
 // entire reason for existing is the gateway's fail-closed gate on this
 // probing (the PushRuntimeConfig precedent), so deploying this agent is
 // what turns the gateway-side probing on.
-const Version = "0.7.0"
+//
+// 0.7.0 -> 0.7.1 is the single bump for the ollama-capabilities branch
+// (issue #54): the context probe for an "ollama"-typed spec now POSTs
+// /api/show instead of GETting it (upstream answers a GET with a 405, so
+// that probe could never succeed), a second capability probe reads Ollama's
+// declared "capabilities" array from that same endpoint, both per-child
+// caches invalidate on a changed st.Model, and the capability sample names
+// the probe that produced it as sample.Capabilities.Source.
+//
+// PATCH, not MINOR, and the rule decides it rather than the size of the
+// change: agent.Features gains NO entry. A feature flag exists so a gateway
+// can tell "this binary will never answer" from "the answer is still
+// coming", and nothing waits on any of the above. The new Source field is
+// additive and its absence keeps the gateway's historical default; an older
+// agent asked to probe an Ollama child GETs /props, which that child
+// answers with a 404, so it reports no verdicts and the gateway writes no
+// rows at all -- there is nothing for a gateway to gate, and nothing for it
+// to wait for. Note the deliberate asymmetry with
+// runtime_upstream_props' own Since ("0.7.0", unchanged): a Since records
+// the version a feature SHIPPED in, and this bump ships no feature.
+const Version = "0.7.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1034,29 +1054,69 @@ func (a *Agent) appliedConfigETag() string {
 // runtimeCtxEntry is one cached context-probe result: the PID it was
 // measured against (so a restart -- a changed PID -- forces a re-probe,
 // since a new process generation may serve a different model/config), the
-// specType and contextProbePath it was probed with (so the runtime
-// manager's config reconciliation editing a RUNNING spec's Type or
-// ContextProbePath WITHOUT restarting the process -- same PID -- also
-// forces a re-probe instead of serving a stale size probed under the old
-// config forever), and the context size itself.
+// specType, contextProbePath, and model it was probed with (so the runtime
+// manager's config reconciliation editing a RUNNING spec's Type,
+// ContextProbePath, or Model WITHOUT restarting the process -- same PID --
+// also forces a re-probe instead of serving a stale size probed under the
+// old config forever), and the context size itself.
+//
+// model joins the invalidation key for the same reason Type and
+// ContextProbePath already did, plus one specific to Ollama (issue #54): an
+// ollama-typed spec's context probe now POSTs {"model": st.Model} (the model
+// determines WHICH model's context length /api/show reports, not just how
+// the body is shaped), so the runtime manager repointing a running
+// `ollama serve` instance at a different model -- same PID, same Type, same
+// ContextProbePath -- must still force a re-probe. Without comparing model, a
+// cache hit would silently keep serving the PREVIOUS model's context size
+// for the new one: nothing about the cached size or the request shape would
+// look invalid, so the mistake would never surface as an error.
 type runtimeCtxEntry struct {
 	pid              int
 	specType         string
 	contextProbePath string
+	model            string
 	size             int
 }
 
-// runtimeCapabilityEntry is one cached /props probe result: the PID it was
-// measured against (mirroring runtimeCtxEntry -- a restart, a changed PID,
-// forces a re-probe, since a new process generation may run a different
-// build) and the verdict set itself: collector.PropsVerdicts, carrying both
-// the live-progress verdict ("supported", "unsupported", or -- deliberately
-// -- "", see below) and, since #49-2, the llama.cpp capability verdicts
-// derived from that same document. There is no specType/path pair to
-// invalidate on, unlike runtimeCtxEntry: this probe always targets the same
-// fixed collector.LiveProgressProbePath regardless of st.Type, so a
-// config-only edit that changes Type or ContextProbePath (without a restart)
-// has no bearing on this cache's validity.
+// runtimeCapabilityEntry is one cached capability-probe result: the PID it
+// was measured against (mirroring runtimeCtxEntry -- a restart, a changed
+// PID, forces a re-probe, since a new process generation may run a different
+// build), the MODEL it was probed with, the SOURCE naming which probe
+// produced it, and the verdict set itself: collector.PropsVerdicts, carrying
+// both the live-progress verdict ("supported", "unsupported", or --
+// deliberately -- "", see below) and, since #49-2, the capability verdicts
+// derived from that same document.
+//
+// model joins the invalidation key for exactly the reason it joined
+// runtimeCtxEntry's in #54, and it bites HARDER here: ONE `ollama serve`
+// process serves MANY models, so the runtime manager repointing a running
+// spec at a different model -- same PID, same Type, same everything about
+// the process -- changes which model's declared capabilities /api/show
+// reports. A (SpecID, PID)-only key served the PREVIOUS model's verdicts for
+// the entire life of that PID, and nothing about them looked stale: a vision
+// model's verdict set read against a text-only model is a perfectly ordinary
+// answer, so the mistake surfaced as a wrong routing/capability decision
+// rather than as an error. The /props half of the branch does not depend on
+// st.Model at all, and the extra comparison costs it nothing -- a llama.cpp
+// child's model cannot change without a restart, which already re-arms the
+// question through pid.
+//
+// source is CACHED WITH the verdicts rather than re-derived from st.Type on
+// the hit path, and that is the whole point of naming it (#54): it records
+// which probe actually produced THESE bytes. Re-deriving it would let a
+// later Type edit relabel verdicts a different endpoint returned -- the
+// fabricated provenance the wire field exists to prevent.
+//
+// There is still no specType/path pair in the key, and the original reason
+// only half-survives task 5: collector.LiveProgressProbePath is a package
+// constant, so an edit to ContextProbePath genuinely has no bearing here,
+// but st.Type now DOES decide which document is read ("ollama" ->
+// /api/show, everything else -> /props). A Type edit on a RUNNING spec
+// therefore leaves this entry cached against the endpoint that was read --
+// stale, but still honestly attributed, because source travels with the
+// verdicts instead of being inferred from the new Type. Closing that too
+// means adding specType to the key; it is deliberately not part of this
+// change.
 //
 // verdicts == (collector.PropsVerdicts{}) is a valid, cached entry here, not
 // a zero-value placeholder: it means the probe got a CONCLUSIVE non-answer
@@ -1075,6 +1135,8 @@ type runtimeCtxEntry struct {
 // ever established -- see probeRuntimeChildProps.
 type runtimeCapabilityEntry struct {
 	pid      int
+	model    string
+	source   string
 	verdicts collector.PropsVerdicts
 }
 
@@ -1091,16 +1153,23 @@ type runtimeCapabilityEntry struct {
 // idle 0. client is shared across all children probed this cycle.
 //
 // Metrics are scraped every call. Context is probed at most once per child
-// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type, and
-// st.ContextProbePath reuses the stored size (and reports "ok" -- a cached
-// size means a prior probe on this exact generation already succeeded); a
-// PID mismatch (the child restarted), a Type/ContextProbePath mismatch (the
-// runtime manager's config reconciliation changed a RUNNING spec's probe
-// config without restarting the process), or a cache miss all re-probe. A
-// failed metrics or context probe is logged at debug and leaves the
-// corresponding numeric field(s) at zero -- it never fails the collect
-// cycle. A context-probe FAILURE, and a context-probe SUCCESS that returns
-// a non-positive size (effectively "unknown" -- a JSON field present but
+// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type,
+// st.ContextProbePath, and st.Model reuses the stored size (and reports
+// "ok" -- a cached size means a prior probe on this exact generation already
+// succeeded); a PID mismatch (the child restarted), a
+// Type/ContextProbePath/Model mismatch (the runtime manager's config
+// reconciliation changed a RUNNING spec's probe config, or repointed it at a
+// different model, without restarting the process), or a cache miss all
+// re-probe. Model joined the cache key in #54, alongside the fix that
+// finally lets an ollama-typed spec's context probe succeed at all: its
+// POST body carries st.Model, so a config edit that only changes the model
+// (same PID, same Type, same ContextProbePath -- e.g. `ollama serve`
+// repointed at a different model) must still force a re-probe, or the cache
+// would keep answering with the PREVIOUS model's context length. A failed
+// metrics or context probe is logged at debug and leaves the corresponding
+// numeric field(s) at zero -- it never fails the collect cycle. A
+// context-probe FAILURE, and a context-probe SUCCESS that returns a
+// non-positive size (effectively "unknown" -- a JSON field present but
 // literally 0, or smaller), are both deliberately never cached, so a
 // transient condition (e.g. the child's HTTP server still warming up) is
 // retried next cycle instead of sticking at 0 forever.
@@ -1148,9 +1217,10 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 // returns the reachability state to store on rs.ContextProbe. It also fills
 // rs.ContextSize on a cache hit or a successful (size>0) probe, exactly as
 // probeRuntimeChild did inline before this was split out for readability --
-// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path
-// change), the deliberate non-caching of a probe error or a non-positive
-// size, and the debug logging are all unchanged.
+// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path/
+// model change -- model joined the key in #54, see runtimeCtxEntry), the
+// deliberate non-caching of a probe error or a non-positive size, and the
+// debug logging are all unchanged.
 func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.ContextProbePath == "" {
 		return "na"
@@ -1160,14 +1230,15 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		return "unreachable"
 	}
 	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
-		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath {
-		// A cached size means a prior probe on this exact (pid, type, path)
-		// generation already succeeded.
+		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath &&
+		entry.model == st.Model {
+		// A cached size means a prior probe on this exact (pid, type, path,
+		// model) generation already succeeded.
 		rs.ContextSize = entry.size
 		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath)
+	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, st.Model)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
@@ -1189,6 +1260,7 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		pid:              st.PID,
 		specType:         st.Type,
 		contextProbePath: st.ContextProbePath,
+		model:            st.Model,
 		size:             size,
 	}
 	rs.ContextSize = size
@@ -1196,37 +1268,55 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 }
 
 // probeRuntimeChildProps fills rs.LiveProgressSupport and rs.Capabilities
-// with every verdict one /props document yields for st: the live-progress-
+// with every verdict ONE document yields for st: the live-progress-
 // capability verdict, task 4's agent-side half of issue #51 (the gateway's
 // half is detectLiveProgressSupport in
 // gateway/backend/internal/provider/model_info.go; collector.
 // detectLiveProgressSupport is a DELIBERATE duplicate of that exact rule --
 // see its doc comment -- and the two must never drift), and, since #49-2,
-// the llama.cpp capability verdict set (collector.detectCapabilities, the
-// same duplication precedent against gateway/backend's own copy). Both
-// verdict kinds ride the SAME single /props fetch
-// (collector.ProbePropsVerdicts) -- the whole point of widening the probe
-// was that a llama_cpp child is never asked for /props a second time just to
-// answer a second question.
+// the capability verdict set (collector.detectCapabilities, the same
+// duplication precedent against gateway/backend's own copy). Both verdict
+// kinds ride the SAME single fetch -- the whole point of widening the probe
+// was that a child is never asked a second time just to answer a second
+// question.
 //
-// Unlike probeRuntimeChildContext, this ALWAYS GETs
-// collector.LiveProgressProbePath ("/props"), regardless of st.Type or
-// whether st.ContextProbePath is even set: routing.DeriveProbePaths gives a
-// "custom"-typed spec no context path at all, so without this unconditional
-// probe a custom-typed llama.cpp child -- exactly the case a type-based
-// rule refuses -- would never be probed for this capability. One extra
-// loopback GET per child lifetime once a verdict set is cached; there is no
-// SSRF guard to apply here (unlike MetricsPath/ContextProbePath, this path
-// is a package constant, never operator/config-supplied).
+// WHICH document, and there are exactly two, is the only thing st.Type
+// decides here:
+//
+//   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
+//     {"model": st.Model} (#54). Ollama serves no /props at all, so probing
+//     it would spend a round trip to learn nothing; its capability array is
+//     the only surface there is. That verdict set carries capabilities only
+//     -- its LiveProgress is ALWAYS "", because Ollama exposes no
+//     timings_per_token-style surface and an unknown must never become a
+//     denial (see ProbeOllamaVerdicts' own doc).
+//   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
+//     GETs collector.LiveProgressProbePath ("/props").
+//
+// That second branch is deliberately unconditional -- it does not care what
+// st.Type is or whether st.ContextProbePath is even set -- and the reason it
+// must stay that way is unchanged by the ollama branch above:
+// routing.DeriveProbePaths gives a "custom"-typed spec no context path at
+// all, and "custom" is the type-detection FALLBACK, so a custom-typed
+// llama.cpp child -- exactly the case a type-based rule refuses -- would
+// never be probed for this capability if this half were type-gated too.
+// Only "ollama" is claimed by name; nothing else may be, or that fallback
+// loses its probe. One extra loopback request per child lifetime once a
+// verdict set is cached; there is no SSRF guard to apply to either path
+// (unlike MetricsPath/ContextProbePath, both are package constants, never
+// operator/config-supplied).
 //
 // Caching policy -- STABLE vs TRANSIENT, not "determined" vs "undetermined":
 //
 // A naive cache keyed only on whether a verdict was determined ("supported"/
-// "unsupported" cache, "" never caches) means every non-llama.cpp child
-// (vLLM/TGI/Ollama) re-GETs /props once per collect cycle, forever, for a
-// question whose answer cannot change while that pid lives -- a permanent
-// per-cycle cost, not a one-time one. The fix caches on WHY no verdict came
-// back, using collector.ProbePropsVerdicts's stable return:
+// "unsupported" cache, "" never caches) means every child whose document
+// yields nothing determinable (vLLM/TGI, or an Ollama build whose /api/show
+// declares no capability at all) re-asks for it once per collect cycle,
+// forever, for a question whose answer cannot change while that pid lives
+// -- a permanent per-cycle cost, not a one-time one. The fix caches on WHY
+// no verdict came back, using the probe's stable return (both
+// collector.ProbePropsVerdicts and collector.ProbeOllamaVerdicts answer to
+// one identical conclusive/transient contract):
 //
 //   - STABLE (a real "supported"/"unsupported" verdict and/or real
 //     capability verdicts, OR a zero-value collector.PropsVerdicts{} that is
@@ -1234,9 +1324,10 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 //     llama.cpp /props document): that fact cannot change while st.PID's
 //     process keeps running, because the binary behind it does not change.
 //     Cache it -- zero value included -- in runtimeCapabilityCache, keyed
-//     and invalidated exactly like runtimeCtxCache (a changed st.PID
-//     re-arms the question), so this pid's /props endpoint is asked at most
-//     once, not once per cycle.
+//     and invalidated exactly like runtimeCtxCache (a changed st.PID or
+//     st.Model re-arms the question -- see runtimeCapabilityEntry for why
+//     the model has to be in that key for an Ollama child), so this pid's
+//     endpoint is asked at most once per generation, not once per cycle.
 //   - TRANSIENT (a connection refused, a timeout, or an unparseable/
 //     truncated body): the child may still be warming up, so the SAME
 //     silence must not be cached -- retry next cycle, exactly as
@@ -1257,19 +1348,42 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // kept separate from runtimeCtxCache; a lookup here never consults it, and
 // vice versa).
 //
+// The branch also NAMES the probe it took, and that name is reported on the
+// wire as sample.Capabilities.Source (#54): the gateway stamps its capability
+// rows with it instead of re-deriving the provenance from the spec type it
+// pushed. The assignment sits INSIDE each branch on purpose -- the condition
+// that picks the endpoint is the same condition that knows its name, so
+// there is no second copy of it to drift, here or in the other module.
+//
 // This never overwrites an already-cached value with a fabricated one:
 // rs.LiveProgressSupport and rs.Capabilities are only ever set from a
-// verdict set collector.ProbePropsVerdicts (or a prior cache write) actually
-// produced, and an uncached probe leaves rs.LiveProgressSupport at its zero
-// value ("") and rs.Capabilities at its zero value (nil).
+// verdict set the probe (or a prior cache write) actually produced, and an
+// uncached probe leaves rs.LiveProgressSupport at its zero value ("") and
+// rs.Capabilities at its zero value (nil).
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
-	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID {
+	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID &&
+		entry.model == st.Model {
+		// A cached verdict set means a prior probe on this exact
+		// (pid, model) generation already answered conclusively -- and
+		// entry.source names the probe that answered, never a fresh
+		// inference from the current st.Type.
 		rs.LiveProgressSupport = entry.verdicts.LiveProgress
-		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps)
+		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps, entry.source)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	verdicts, stable := collector.ProbePropsVerdicts(cctx, client, base)
+	var (
+		verdicts collector.PropsVerdicts
+		stable   bool
+		source   string
+	)
+	if st.Type == "ollama" {
+		source = sample.CapabilitySourceOllamaAPIShow
+		verdicts, stable = collector.ProbeOllamaVerdicts(cctx, client, base, st.Model)
+	} else {
+		source = sample.CapabilitySourceLlamaCppProps
+		verdicts, stable = collector.ProbePropsVerdicts(cctx, client, base)
+	}
 	cancel()
 	if !stable {
 		// Transient: no conclusive answer yet. Do not cache; retry next
@@ -1280,9 +1394,14 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	if a.runtimeCapabilityCache == nil {
 		a.runtimeCapabilityCache = make(map[string]runtimeCapabilityEntry)
 	}
-	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{pid: st.PID, verdicts: verdicts}
+	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{
+		pid:      st.PID,
+		model:    st.Model,
+		source:   source,
+		verdicts: verdicts,
+	}
 	rs.LiveProgressSupport = verdicts.LiveProgress
-	rs.Capabilities = capabilitiesSample(verdicts.Caps)
+	rs.Capabilities = capabilitiesSample(verdicts.Caps, source)
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
@@ -1292,6 +1411,14 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 // assertion), and an empty ("" -- undetermined) field is skipped entirely
 // rather than carried as an entry, mirroring the store's
 // row-absence-means-unknown model.
+//
+// source is the caller's answer to "which probe produced this document" (a
+// sample.CapabilitySource* constant), carried onto the wrapper so the
+// gateway attributes its rows to the probe that ran rather than inferring
+// it -- see probeRuntimeChildProps. It is set even for an all-empty verdict
+// set: "this detector ran and determined nothing" is strictly more than
+// "something determined nothing", and it costs no row either way (the
+// gateway writes none for an empty set).
 //
 // THE EMISSION ORDER IS LOAD-BEARING, not a formatting choice: on the gateway
 // side the ingest folds this list into capability rows and keeps the FIRST
@@ -1306,7 +1433,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 // distinct from the nil probeRuntimeChildProps leaves in place for an
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
-func capabilitiesSample(c collector.Capabilities) *sample.Capabilities {
+func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
 	verdicts := make([]sample.CapabilityVerdict, 0, 4+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
@@ -1323,7 +1450,7 @@ func capabilitiesSample(c collector.Capabilities) *sample.Capabilities {
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})
 	}
-	return &sample.Capabilities{Verdicts: verdicts}
+	return &sample.Capabilities{Verdicts: verdicts, Source: source}
 }
 
 // collectOnce builds one sample from the host, GPU, and scrape collectors and

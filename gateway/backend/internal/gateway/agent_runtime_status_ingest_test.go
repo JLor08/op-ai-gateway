@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"strings"
@@ -1054,35 +1057,53 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	if got := len(counting.lastSent()); got != 2 {
 		t.Fatalf("the single write carried %d rows (%+v), want 2 -- the live-progress verdict must ride the SAME write as the capability verdicts, not a second one", got, counting.lastSent())
 	}
+	// The EMISSION ORDER, which runtimeSampleCapabilityRows' own comment calls
+	// load-bearing and which nothing pinned until now: the DEDICATED
+	// live-progress row is emitted first and the open Verdicts list after, so
+	// rule 0 of routing.WritableCapabilityRows (keep the first row for a name,
+	// drop every later one) resolves a collision in favour of the dedicated
+	// field. The reserved-name rule makes that collision unreachable today,
+	// which is why the collision OUTCOME is no longer observable -- but the
+	// order itself still is, right here, and reversing the two appends is
+	// otherwise a silent step of a two-step regression whose second step is a
+	// future narrowing of the reserved rule.
+	if sent := counting.lastSent(); sent[0].Capability != routing.CapabilityLiveProgress {
+		t.Fatalf("the write's first row is %q (%+v), want %q -- the dedicated live-progress row must be emitted BEFORE the open verdicts list, or a name collision would resolve to a publisher's string instead of to the field this codebase defined", sent[0].Capability, sent, routing.CapabilityLiveProgress)
+	}
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	assertCapabilityRow(t, srv, "map_rspec_lp_row", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
 
-// TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList proves the
-// resolution of the one collision the OPEN capability vocabulary makes
-// possible on this path: an agent that both reports a "live_progress" verdict
-// in its open Verdicts list AND fills the dedicated live_progress_support
-// field. The dedicated field wins.
+// TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField is the
+// live-progress half of the reserved-name rule, read through the collision
+// the OPEN vocabulary used to make possible: an agent that both reports a
+// "live_progress" verdict in its open Verdicts list AND fills the dedicated
+// live_progress_support field.
 //
-// The mechanism is a pair, and neither half works alone:
-// runtimeSampleCapabilityRows emits the dedicated row FIRST, and rule 0 of
-// routing.WritableCapabilityRows keeps the first row for a capability name
-// and drops every later one. Before rule 0 the same outcome came out of the
-// upsert loop applying both rows in order and the last one winning -- which
-// is why the projection appended the dedicated row LAST. Keeping rule 0 and
-// that old order together would silently hand the open list the last word,
-// so the order is now load-bearing in the opposite direction.
+// The dedicated field wins, and it now wins TWICE OVER, which is what this
+// test distinguishes. The reserved rule drops the open list's row before it
+// can become a row at all (the WARN below is that drop, and it is the only
+// assertion here that a narrowing of the rule would break -- the row counts
+// alone cannot tell the two mechanisms apart). Underneath it, unchanged,
+// runtimeSampleCapabilityRows still emits the dedicated row FIRST and rule 0
+// of routing.WritableCapabilityRows still keeps the first row for a name and
+// drops every later one, so even a narrowed reserved rule would leave the
+// explicit field in front of a publisher's string rather than behind it. That
+// second mechanism is pinned in TestIngestLiveProgressLandsAsARow, which
+// asserts the order directly on the sent rows -- this test cannot see it,
+// because the reserved rule drops the colliding row before an order can
+// matter.
 //
-// The write carries ONE row, not two: a duplicated name must never reach the
-// store twice, whatever the store would then do with it.
-func TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList(t *testing.T) {
+// The verdicts are opposite on purpose, so the assertion cannot pass because
+// both happen to agree. And the write carries ONE row, not two: a duplicated
+// name must never reach the store twice, whatever the store would then do
+// with it.
+func TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_dup", false)
 	counting := countingRowStore(srv)
 
-	// The dedicated field says unsupported; the open list claims the same
-	// capability is supported. The verdicts are opposite on purpose, so the
-	// assertion cannot pass because both happen to agree.
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
 		`"runtimes":[{"spec_id":"rspec_lp_dup","state":"running","live_progress_support":"unsupported",` +
 		`"capabilities":{"verdicts":[{"name":"live_progress","verdict":"yes"}]}}]}`
@@ -1095,6 +1116,70 @@ func TestIngestDedicatedLiveProgressFieldBeatsTheOpenVerdictList(t *testing.T) {
 	}
 	assertCapabilityRow(t, srv, "map_rspec_lp_dup", routing.CapabilityLiveProgress,
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "reserved internal capability names") {
+		t.Fatalf("no WARN record about the reserved name dropped from the open list; records = %+v -- without it this test cannot tell the reserved rule from the ordering rule underneath it", recs)
+	}
+}
+
+// TestIngestDropsReservedCapabilityNamesFromAnAgentProbe pins the rule that
+// makes the OPEN capability vocabulary safe to feed from an upstream one:
+// "mtp" and "live_progress" may not arrive from an agent-reported probe
+// source, whichever of the two probes is claimed.
+//
+// Both names are ones this codebase reasons about and neither probe can
+// observe. Ollama's /api/show carries whatever a publisher wrote into a
+// model manifest, and since the agent's Ollama detector is the first
+// producer of the open Extra list anywhere, the literal string "mtp" in a
+// manifest would otherwise write a rank-1 "yes" that feeds the router's +30
+// MTP bonus, and "live_progress" would make the router send
+// timings_per_token to an Ollama upstream that does not understand it. The
+// agent's detector skips both, but that filter only ever sees a publisher's
+// string: a buggy or hostile agent puts the name straight into the verdicts
+// it sends, and THIS is the boundary that is in that path.
+//
+// Unfalsifiable rather than merely quiet, in both directions. The mapping
+// already holds an "mtp" row of the OPPOSITE verdict at EQUAL rank
+// (legacy, 1), which the incoming "yes" would be permitted to overwrite --
+// so a row that got through would flip a stored verdict and be visible. And
+// the same sample carries a "vision" verdict with no stored row at all, so
+// "nothing was written" cannot be satisfied by a write path that had simply
+// stopped working.
+func TestIngestDropsReservedCapabilityNamesFromAnAgentProbe(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, source string
+	}{
+		{"the llama.cpp props probe", "rspec_res_props", routing.CapabilitySourceLlamaCppProps},
+		{"the ollama api/show probe", "rspec_res_ollama", routing.CapabilitySourceOllamaAPIShow},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			seedCapabilityRow(t, srv, mappingID, routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"mtp","verdict":"yes"},{"name":"live_progress","verdict":"yes"},`+
+					`{"name":"vision","verdict":"yes"}],"source":"`+tc.source+`"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityVision {
+				t.Fatalf("the write carried %+v, want exactly the vision row -- a reserved name must never reach the store, and the rest of the pass must still land", sent)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLegacy)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityYes, tc.source)
+			if row, ok := capabilityRow(t, srv, mappingID, routing.CapabilityLiveProgress); ok {
+				t.Fatalf("a live_progress row exists (%+v), want none -- the dedicated field is the only channel for it", row)
+			}
+			recs := buf.Snapshot()
+			if !findLogRecord(recs, "WARN", "reserved internal capability names") {
+				t.Fatalf("no WARN record naming the reserved drop at the gateway's own default level (info); records = %+v", recs)
+			}
+		})
+	}
 }
 
 // TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce proves an
@@ -1597,6 +1682,412 @@ func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
 		}
 		assertCapabilityRow(t, srv, "map_rspec_caps_agree", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	})
+}
+
+// TestIngestStampsTheSourceTheAgentReported is #54's fix round on the
+// gateway side: the PRODUCER names the provenance and this ingest uses what
+// it reported, because the wire carries no runtime type and an inferred
+// provenance is exactly what this column exists to prevent. Before the
+// source rode the wire, an Ollama-declared verdict reached the operator's
+// capability tooltip stamped "llama_cpp_props" -- a false attribution on the
+// one column whose whole job is to say who said this.
+//
+// The three accepted inputs and their rows, each on its own mapping so no
+// subtest can be satisfied by another's write:
+//
+//   - the reported ollama_api_show lands rows sourced ollama_api_show;
+//   - the reported llama_cpp_props lands rows sourced llama_cpp_props;
+//   - NO source key at all keeps today's default, llama_cpp_props -- safe
+//     rather than convenient, because the only agent that omits it probes
+//     /props, which an Ollama child answers with a 404 (no verdicts, hence
+//     no rows). See rowSource.
+func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("an ollama-probed sample lands ollama_api_show rows", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_src_ollama", false)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_src_ollama",
+			`{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"thinking","verdict":"yes"}],"source":"ollama_api_show"}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_src_ollama", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+		assertCapabilityRow(t, srv, "map_rspec_src_ollama", "thinking", routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	})
+
+	t.Run("a llama_cpp-probed sample lands llama_cpp_props rows", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_src_props", false)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_src_props",
+			`{"verdicts":[{"name":"vision","verdict":"no"}],"source":"llama_cpp_props"}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_src_props", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("no source key keeps the historical default", func(t *testing.T) {
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_src_absent", false)
+		counting := countingRowStore(srv)
+
+		req, raw := ingestReq(t, capabilitiesBody("rspec_src_absent",
+			`{"verdicts":[{"name":"vision","verdict":"yes"}]}`))
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- an agent predating the source field must keep working unchanged", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_src_absent", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	})
+
+	t.Run("no capabilities object at all still stamps the live-progress row", func(t *testing.T) {
+		// The nil-receiver half of the default: an agent old enough to
+		// predate capability DETECTION reports live_progress_support and no
+		// "capabilities" key whatsoever, and its one row must still be
+		// attributed exactly as before. Without this case the nil branch of
+		// rowSource was pinned only incidentally, by a routing e2e test.
+		srv := NewTestServer()
+		seedRuntimeIngestSpec(t, srv, "rspec_src_nilobj", false)
+		counting := countingRowStore(srv)
+
+		body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+			`"runtimes":[{"spec_id":"rspec_src_nilobj","state":"running","live_progress_support":"unsupported"}]}`
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if got := counting.upsertCalls.Load(); got != 1 {
+			t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- a sample with no capabilities object still carries a live-progress verdict", got)
+		}
+		assertCapabilityRow(t, srv, "map_rspec_src_nilobj", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	})
+}
+
+// TestIngestRejectsAnUnclaimableCapabilitySource is the ruling on a source
+// this gateway does not recognise: the rows are DROPPED, never clamped onto
+// the default. Clamping would print a provenance nobody reported on the
+// operator-visible column -- a fabricated attribution, the very defect the
+// column exists to prevent -- while dropping leaves the capability UNKNOWN,
+// which this model expresses natively as the absence of a row.
+//
+// Three inputs, and the last two are why the allowlist is exactly the two
+// PROBE sources rather than a typo filter: an agent has no standing to claim
+// "manual" (rank 3, "an operator said so") or "vision_benchmark" (rank 2, a
+// real image actually sent to the real upstream). A blind write would put
+// either lie in front of an operator AND, through
+// capabilitySourceRank's default branch ranking an unknown source at 1, let
+// an unknown-provenance verdict overwrite a real probe's row at equal rank.
+//
+// Each case is unfalsifiable rather than merely quiet: the mapping is seeded
+// through the store API with a DIFFERING stored verdict, so a write that got
+// through would flip it and be visible, and the sample also carries a second
+// capability with no stored row at all, so "nothing was written" cannot be
+// satisfied by a write path that had simply stopped working.
+func TestIngestRejectsAnUnclaimableCapabilitySource(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, source string
+	}{
+		{"an unrecognised source", "rspec_src_bogus", "totally_made_up_probe"},
+		{"an agent claiming manual", "rspec_src_manual", routing.CapabilitySourceManual},
+		{"an agent claiming vision_benchmark", "rspec_src_bench", routing.CapabilitySourceVisionBenchmark},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			seedCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"yes"}],"source":"`+tc.source+`"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 0 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d for source %q, want 0 -- a source this gateway cannot attribute must write nothing, not borrow another probe's name", got, tc.source)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+			if row, ok := capabilityRow(t, srv, mappingID, routing.CapabilityTools); ok {
+				t.Fatalf("a tools row exists (%+v), want none -- the whole pass is voided by an unattributable source", row)
+			}
+		})
+	}
+}
+
+// withCapturedSlogAtTheDefaultLevel swaps the process-global slog default
+// for a buffer at the level a real gateway runs at: INFO
+// (OP_AI_GATEWAY_LOG_LEVEL's own default, config.Load). That is the whole
+// point of not reusing withCapturedSlog beside it, which captures at Debug:
+// a record emitted at Debug never reaches this buffer, exactly as it never
+// reaches a default deployment's log, so a Debug-level capture would pass
+// whatever level the code under test chose.
+func withCapturedSlogAtTheDefaultLevel(t *testing.T) *logbuffer.Buffer {
+	t.Helper()
+	buf := logbuffer.NewBuffer(200, slog.LevelInfo)
+	prev := slog.Default()
+	slog.SetDefault(slog.New(buf.Handler(io.Discard)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf
+}
+
+// TestIngestWarnsWhenACapabilitySourceCannotBeAttributed pins that the drop
+// its sibling above proves is also VISIBLE. The two assertions are one
+// finding: an unattributable source voids every row of the pass, and the
+// rows' absence is how this model spells "unknown" -- indistinguishable
+// from a probe that never ran -- so a silent drop would leave a newer agent
+// losing its whole capability report with nothing anywhere to point at.
+//
+// The capture runs at INFO, the level a real gateway runs at, which is what
+// makes this a test rather than a restatement of the source: at Debug the
+// line is filtered out before it reaches any log a default deployment
+// keeps, so "it is logged" is only true at a level nobody runs.
+func TestIngestWarnsWhenACapabilitySourceCannotBeAttributed(t *testing.T) {
+	ctx := context.Background()
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_src_warn", false)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_src_warn",
+		`{"verdicts":[{"name":"vision","verdict":"yes"}],"source":"a_third_probe_this_gateway_never_heard_of"}`))
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want 0", got)
+	}
+
+	recs := buf.Snapshot()
+	if !findLogRecord(recs, "WARN", "unrecognised source") {
+		t.Fatalf("no WARN record naming an unrecognised source at the gateway's own default level (info); records = %+v -- a drop nobody can see is a fleet-wide capability blackout with no diagnostic", recs)
+	}
+	// The rejected source itself must be IN the record: "some sample was
+	// dropped" does not tell an operator which agent build to look at.
+	for _, r := range recs {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, "unrecognised source") {
+			continue
+		}
+		if got, _ := r.Attrs["source"].(string); got != "a_third_probe_this_gateway_never_heard_of" {
+			t.Fatalf("WARN record source attr = %q, want the source the agent actually reported", got)
+		}
+		if got, _ := r.Attrs["spec_id"].(string); got != "rspec_src_warn" {
+			t.Fatalf("WARN record spec_id attr = %q, want rspec_src_warn", got)
+		}
+		return
+	}
+}
+
+// TestReportedSourceIsSafeOnAMissingCapabilitiesObject pins the nil-safety
+// of the accessor the rejection branch above logs through. The branch used
+// to read rt.Capabilities.Source directly, and that was safe only by an
+// invariant enforced one function away -- rowSource defaults the nil
+// receiver to a VALID source, so a nil sample never reaches the branch. A
+// mutation to that first line during review turned the branch into a
+// SEGFAULT rather than a failed assertion, which is what says nothing local
+// was protecting it.
+//
+// So the nil case is pinned where it can be reached: on the accessor
+// itself. `var missing *agentRuntimeCapabilitiesSample; missing.Source` --
+// the expression the branch used to contain -- panics; missing.reportedSource()
+// must not. Deleting the accessor's nil guard makes this test panic with
+// exactly that nil-pointer dereference.
+//
+// The second half is the no-behaviour-change half: the value must arrive
+// RAW. The log has to name what the agent actually sent, and a source that
+// differs from a valid one only in whitespace or case is worth seeing as it
+// came -- trimming or folding it here would quietly answer a different
+// question than the one the operator is reading.
+func TestReportedSourceIsSafeOnAMissingCapabilitiesObject(t *testing.T) {
+	var missing *agentRuntimeCapabilitiesSample
+	if got := missing.reportedSource(); got != "" {
+		t.Fatalf("(*agentRuntimeCapabilitiesSample)(nil).reportedSource() = %q, want \"\"", got)
+	}
+
+	for _, raw := range []string{"", "  ", "llama_cpp_props", "  Manual  ", "totally_made_up_probe"} {
+		sample := &agentRuntimeCapabilitiesSample{Source: raw}
+		if got := sample.reportedSource(); got != raw {
+			t.Errorf("reportedSource() = %q, want the reported %q verbatim -- the log names what arrived, not a normalised form of it", got, raw)
+		}
+	}
+}
+
+// TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank proves the rank
+// rule did not move when the second probe source arrived: ollama_api_show is
+// a PROBE (rank 1 through capabilitySourceRank's default branch, with no
+// case of its own), so it can never overwrite a verdict a human established
+// (manual, 3) or one a real measurement established (vision_benchmark, 2).
+//
+// Unfalsifiable the same way as its llama_cpp_props siblings above: the
+// sample carries a second, unmanaged verdict, so exactly one write must fire
+// and must carry only that row. A test that merely counted zero writes could
+// be satisfied by a write path that had stopped working -- and this one has
+// a brand-new source string in it, which is exactly the kind of value a
+// silent typo would strand.
+func TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, storedSource string
+	}{
+		{"manual is not overwritten", "rspec_ollama_vs_manual", routing.CapabilitySourceManual},
+		{"vision_benchmark is not overwritten", "rspec_ollama_vs_bench", routing.CapabilitySourceVisionBenchmark},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			seedCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, tc.storedSource)
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"yes"}],"source":"ollama_api_show"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the unmanaged tools verdict)", got)
+			}
+			sent := counting.lastSent()
+			if len(sent) != 1 || sent[0].Capability != routing.CapabilityTools {
+				t.Fatalf("the write carried %+v, want exactly the tools row -- a probe must never send a capability %s established", sent, tc.storedSource)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, tc.storedSource)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityTools, routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+		})
+	}
+}
+
+// TestIngestRefusesALiveProgressRowFromTheOllamaProbe pins the ONE
+// combination this boundary refuses rather than stamps: a live-progress
+// verdict attributed to ollama_api_show.
+//
+// No honest agent produces it -- ProbeOllamaVerdicts leaves LiveProgress ""
+// on every one of its return paths -- and that is precisely why the refusal
+// has to live here rather than in a comment asserting it cannot happen.
+// This is where the agent's bytes arrive; an invariant a caller can violate
+// is not an invariant. The refusal is also right independent of what the
+// sender intended: Ollama exposes no timings_per_token-style surface, so
+// that document cannot carry evidence about live progress in EITHER
+// direction, which is the claim routing.CapabilityRow's own source doc
+// makes about rows carrying this source.
+//
+// The pass is NOT voided, and the difference matters: a vision verdict is
+// something /api/show really can answer, so it still lands, still sourced
+// ollama_api_show. Only the row that document could not have produced goes
+// -- and it goes visibly, at the level a real gateway runs at.
+//
+// Its predecessor asserted the opposite outcome (the live-progress row
+// stamped with the reported source), which is why the property that test
+// existed for is now unpinnable: the row can only ever carry
+// llama_cpp_props, so reading the reported source and hard-coding
+// llama.cpp's name are indistinguishable by any input. The scoping is
+// covered from the other side instead, by the llama_cpp_props live-progress
+// tests above, which this refusal must leave alone.
+func TestIngestRefusesALiveProgressRowFromTheOllamaProbe(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_src", false)
+	counting := countingRowStore(srv)
+
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"rspec_lp_src","state":"running","live_progress_support":"supported",` +
+		`"capabilities":{"verdicts":[{"name":"vision","verdict":"yes"}],"source":"ollama_api_show"}}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the vision row alone)", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityVision {
+		t.Fatalf("the write carried %+v, want exactly the vision row -- only the row /api/show could not have produced may be dropped", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_lp_src", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	if row, ok := capabilityRow(t, srv, "map_rspec_lp_src", routing.CapabilityLiveProgress); ok {
+		t.Fatalf("a live_progress row exists (%+v), want none -- an Ollama probe cannot observe live-progress support at all, in either direction", row)
+	}
+
+	recs := buf.Snapshot()
+	if !findLogRecord(recs, "WARN", "live-progress") {
+		t.Fatalf("no WARN record about the dropped live-progress row at the gateway's own default level (info); records = %+v", recs)
+	}
+}
+
+// TestIngestRefusesANegativeVerdictFromTheOllamaProbe is the general half of
+// the refusal above: a "no" verdict attributed to ollama_api_show is dropped
+// for EVERY capability, not only for live_progress.
+//
+// routing.CapabilityRow's source doc states the claim generally -- "A row
+// with this source and verdict CapabilityNo could therefore not have come
+// from that probe" -- and it is grounded generally: Ollama's capability
+// array is not exhaustive, a name's absence means "Ollama did not tell us"
+// rather than "this model cannot", so collector.detectOllamaCapabilities
+// returns "yes" or nothing on every path and can never produce a "no" for
+// anything. Enforced only for live_progress, that sentence was true as a
+// statement about provenance (such a row is a lie by the sender) and false as
+// an invariant, which is the distinction that motivated the live-progress
+// refusal in the first place: an invariant a caller can violate is not one,
+// and this is where the agent's bytes arrive.
+//
+// Unfalsifiable in both directions, and the stored row is the point. The
+// mapping already holds vision="yes" from the OTHER probe at EQUAL rank
+// (llama_cpp_props, 1), which an incoming "no" would be permitted to
+// overwrite -- so a row that got through would flip an honest probe's verdict
+// and be visible. "thinking" carries a "no" with no stored row at all, so the
+// drop is not an artefact of the precedence rule. And the same document
+// carries tools="yes", which /api/show really can answer: exactly one write
+// must fire and carry exactly that row, so "nothing was written" cannot be
+// satisfied by a write path that had simply stopped working.
+//
+// The narrowness is pinned from the other side by tests that already exist:
+// TestIngestStampsTheSourceTheAgentReported's llama_cpp_props subtest lands a
+// vision="no" row, and the live-progress write-back tests persist "no" rows
+// under that source throughout. A refusal that forgot to check the source
+// would fail them.
+func TestIngestRefusesANegativeVerdictFromTheOllamaProbe(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ollama_no", false)
+	seedCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityVision,
+		routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_ollama_no",
+		`{"verdicts":[{"name":"vision","verdict":"no"},{"name":"thinking","verdict":"no"},`+
+			`{"name":"tools","verdict":"yes"}],"source":"ollama_api_show"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the tools row alone)", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityTools {
+		t.Fatalf("the write carried %+v, want exactly the tools row -- an /api/show document can assert a capability but never deny one, and only the rows it could not have produced may be dropped", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityVision,
+		routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+	assertCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityTools,
+		routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	if row, ok := capabilityRow(t, srv, "map_rspec_ollama_no", "thinking"); ok {
+		t.Fatalf(`a "thinking" row exists (%+v), want none -- the Ollama detector cannot produce a "no" for any capability, so the row's provenance would be false`, row)
+	}
+	if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "negative verdict") {
+		t.Fatalf("no WARN record about the dropped negative verdicts at the gateway's own default level (info); records = %+v", recs)
+	}
 }
 
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities

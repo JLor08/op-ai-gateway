@@ -542,6 +542,28 @@ failures.**
   every such assertion, including ones whose current translation happens to
   contain no metacharacters.
 
+**A stub server that discards `*http.Request` cannot fail on the request
+being wrong — and that is how a probe that could never succeed shipped
+green.** The agent's probe test server declared its handler as
+`func(w, _ *http.Request)` (`server-agent/internal/collector/probe_test.go`),
+recording only the canned body it served back. So no test in that package had
+ever asserted a probe's method, path or body, and `ProbeContext` spent its
+whole existence sending a **`GET`** to Ollama's POST-only `/api/show` — which
+answers `405 text/plain` — while `TestProbeContext_Ollama` stayed green,
+because the stub answered the wrong verb with the right JSON (issue #54). The
+fix that prevents the CLASS rather than the instance is the helper: it now
+records the request it received (method, path, body, `Content-Type`) and a
+table test asserts the exact shape per spec type, including the assertion
+that the four bodiless `GET` rows carry **no** content type while the POST
+carries `application/json`. Two rules generalise from it. **A test double
+must assert the request it is asked for whenever the request shape is part of
+the contract** — an upstream's verb and body are contract, not plumbing. And
+**a header set behind a condition needs a test on both sides of the
+condition**: the `Content-Type` line was reachable from no test at all until
+the first caller passed a non-nil body, so a regression there would have
+passed the whole suite while breaking `ShouldBindJSON` dispatch against a
+real server.
+
 **An agent's runtime-config document is derived for the server that owns the
 agent token it authenticates with.** The development seed `dev-agent-secret`
 (`OP_AI_GATEWAY_DEV_AGENT_TOKEN`) belongs to the seeded mock AI server

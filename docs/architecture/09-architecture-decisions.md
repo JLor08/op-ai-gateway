@@ -826,6 +826,50 @@ encoder, not that the model understands video; `supports_tools: false` means
 the model has no native tool-call template, not that tool calls fail (with
 `--jinja` a generic handler accepts tools for every model), so it means
 degraded prompt quality, never a rejected request.
+
+**Extended by issue #54: this decision now covers TWO detectors over two
+documents, and the second one can only ever answer `yes`.**
+`detectOllamaCapabilities` (`server-agent/internal/collector/probe.go`) reads
+the `capabilities` array of a **`POST /api/show`** response — a SIBLING of
+`detectCapabilities`, not a branch inside it, since the two documents share
+no field — mapping `vision`/`tools`/`audio` onto the structured fields and
+carrying every other name verbatim into the open vocabulary. `POST /api/show`
+was chosen over `GET /api/tags`, which would cover a whole server in one
+request but needs Ollama v0.30.0 and under-reports `tools`/`thinking` for
+models whose template lives only in the GGUF. It lives in the **agent module
+alone**, because only the agent probes `/api/show` — a copy in the gateway
+would be dead code — and becomes a twin under the same drift discipline the
+day the gateway gains its own Ollama probe.
+**Only `yes` verdicts, and that asymmetry with the `/props` rule above is the
+decision.** Ollama's array is **not exhaustive**: upstream logs
+`"unknown capabilities for model"` for an empty result, the JSON field is
+`omitempty`, a failed model-file read silently shortens the list, detection
+is substring heuristics over the chat template, and one upstream filter
+deliberately strips real vision/audio for some builds. Absence therefore
+means "Ollama did not tell us", and deriving a `no` from it would encode read
+failures, template heuristics and runner quirks as operator-visible denials
+that the no-rewrite rule would then keep. Two names get specific treatment
+for the same underlying reason — a name must carry evidence to become a row:
+**`completion` is dropped**, because upstream *assumes* it whenever a model
+has no `pooling_type` rather than detecting it; and **`image` is not vision
+and is never folded into it**, because in Ollama's own model that name is
+image *generation* (born `CapabilityImageGeneration`, error string "image
+generation", required only by `/v1/images/generations`), so it reaches the
+open vocabulary under the name Ollama actually used. The probe reports its
+own provenance rather than letting the consumer infer it: the sample carries
+`source` (`llama_cpp_props` | `ollama_api_show`), which ranks 1 with the
+other probe through `capabilitySourceRank`'s default branch — no rank-table
+edit — and the ingest boundary accepts **exactly those two probe names**,
+voiding the whole pass for anything else, so an agent can never claim
+`manual` or `vision_benchmark`
+([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+owns the rank itself). Deliberately NOT decided here, each for a stated
+reason: capability detection for a **directly configured** Ollama
+application, which needs a POST-capable gateway probe *and* a fan-out
+decision (one endpoint, many models, so one `/api/show` per mapping per
+cycle); `/api/ps` as the context source, a different quantity from the model
+maximum; and any widening of the agent router's `GET`-only upstream
+allowlist.
 **Consequence:** the detector, its evidence rule and its refusals are what
 this decision durably records. **Where the verdicts LAND is no longer this
 decision's** — the first shape did not survive contact with the operator's
@@ -917,8 +961,8 @@ joins nothing, and a struct with no capability field cannot present a
 plausible-looking but unpopulated verdict — anything holding only a mapping
 has to ask for the rows. **(b) The precedence rule is a RANK,** not a
 probe/not-probe split: `manual` 3 > `vision_benchmark` 2 >
-`llama_cpp_props`/`legacy`/**any unrecognised source** 1 > no row 0, and a
-write is permitted **iff `rank(incoming) >= rank(current)`**
+`llama_cpp_props`/`ollama_api_show`/`legacy`/**any unrecognised source** 1 >
+no row 0, and a write is permitted **iff `rank(incoming) >= rank(current)`**
 (`WritableCapabilityRows` — pure, no I/O, applied by each writer rather than
 by the store, because only a writer knows what rank its own evidence carries).
 Four consequences are load-bearing: an operator's verdict is permanent against

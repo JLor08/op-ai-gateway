@@ -4,24 +4,94 @@
 package collector
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-server-agent/internal/gwapi"
+	"op-ai-server-agent/internal/sample"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
-func newProbeServer(t *testing.T, body string) *httptest.Server {
+// recordedProbeRequest is what newProbeServer captures about the single
+// request its canned handler received: method, path, raw body, and the
+// Content-Type header. It exists so a test can assert the SHAPE of the
+// request the code under test issued, not just the body newProbeServer
+// serves back -- see TestProbeContextRequestShapePerSpecType, which pins
+// exactly this for every spec type (#54: no test in this package had ever
+// asserted a probe's method, path, or body before that test existed).
+//
+// ContentType joined the recording in #54's fix round, and it is load-
+// bearing rather than thorough: ProbeOllamaVerdicts is the FIRST caller ever
+// to reach fetchProbeBodyWith's header-setting branch (every earlier caller
+// passes a nil body, so that branch was unreachable from any test), and a
+// real Ollama serves /api/show through gin's ShouldBindJSON, which
+// DISPATCHES on the header. A regression that dropped the Set would pass
+// every other assertion in this file -- method, path and body would all
+// still be right -- while breaking the probe against the only server it is
+// aimed at.
+//
+// The header is captured raw, and the assertions come in a pair: the POST
+// paths must carry "application/json", and the bodiless GET rows must carry
+// NOTHING. That symmetry is the point -- a mutation that set the header
+// unconditionally (dropping fetchProbeBodyWith's len(body) > 0 guard) would
+// satisfy a POST-only assertion, and it would put a content type on a
+// request that has no content.
+type recordedProbeRequest struct {
+	Method      string
+	Path        string
+	Body        []byte
+	ContentType string
+}
+
+// probeServer is a newProbeServer *httptest.Server with the last request it
+// received recorded alongside it. It embeds *httptest.Server so every
+// existing caller of newProbeServer keeps compiling unmodified -- ts.URL and
+// ts.Client() are unchanged; only a caller that wants the request calls
+// ts.lastRequest().
+type probeServer struct {
+	*httptest.Server
+
+	mu   sync.Mutex
+	last *recordedProbeRequest
+}
+
+// lastRequest returns the most recently recorded request, or nil if the
+// server has not been hit yet.
+func (p *probeServer) lastRequest() *recordedProbeRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.last
+}
+
+func newProbeServer(t *testing.T, body string) *probeServer {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	ps := &probeServer{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ := io.ReadAll(r.Body)
+		ps.mu.Lock()
+		ps.last = &recordedProbeRequest{
+			Method:      r.Method,
+			Path:        r.URL.Path,
+			Body:        reqBody,
+			ContentType: r.Header.Get("Content-Type"),
+		}
+		ps.mu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(ts.Close)
-	return ts
+	ps.Server = ts
+	return ps
 }
 
 func TestProbeContext_VLLM(t *testing.T) {
@@ -30,7 +100,7 @@ func TestProbeContext_VLLM(t *testing.T) {
 	body := `{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"vllm","max_model_len":4096}]}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -45,7 +115,7 @@ func TestProbeContext_LlamaCpp(t *testing.T) {
 	body := `{"default_generation_settings":{"id":0,"n_ctx":8192},"total_slots":1,"model_path":"/models/foo.gguf"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "llama_cpp", "/props")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "llama_cpp", "/props", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -60,7 +130,7 @@ func TestProbeContext_TGI(t *testing.T) {
 	body := `{"model_id":"foo","max_concurrent_requests":128,"max_input_tokens":4095,"max_total_tokens":4096,"version":"2.0.0"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "tgi", "/info")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "tgi", "/info", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -76,7 +146,7 @@ func TestProbeContext_Ollama(t *testing.T) {
 	body := `{"model_info":{"llama.context_length":8192,"llama.attention.head_count":32},"details":{"family":"llama"}}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "llama3")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -89,7 +159,7 @@ func TestProbeContext_CustomContextLength(t *testing.T) {
 	body := `{"context_length":32768,"other":"field"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -104,7 +174,7 @@ func TestProbeContext_CustomBestEffortNCtx(t *testing.T) {
 	body := `{"nested":{"n_ctx":2048}}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "", "/status", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -117,12 +187,77 @@ func TestProbeContext_NoMatch(t *testing.T) {
 	body := `{"foo":"bar"}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "custom", "/status", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for a body with no recognizable context field, got (%d, nil)", got)
 	}
 	if got != 0 {
 		t.Errorf("context = %d, want 0 on error", got)
+	}
+}
+
+// TestProbeContextRequestShapePerSpecType is the root-cause regression test
+// for #54: newProbeServer's handler used to be declared
+// func(w, _ *http.Request), so no test in this package had ever asserted a
+// probe's method, path, or body -- only the served response body. This pins
+// the request shape ProbeContext issues per spec type.
+//
+// The ollama row is the point of the whole exercise: /api/show is POST-only
+// upstream (issue #54: since server v0.7.0 it answers a GET with a 405
+// text/plain body carrying no context data at all; a 404 before that), so
+// ProbeContext POSTs {"model": "<model>"} for this one type and every other
+// type keeps the plain GET it always had. This row is the discriminator that
+// proves the fix actually changed something: reverting ONLY the POST branch
+// in ProbeContext (leaving every other type's GET path untouched) must make
+// this row -- and only this row -- fail again with the exact "method = GET,
+// want POST" mismatch this test caught the very first time it ran against
+// unpatched code.
+func TestProbeContextRequestShapePerSpecType(t *testing.T) {
+	for _, tc := range []struct {
+		specType        string
+		path            string
+		model           string
+		wantMethod      string
+		wantBody        string
+		wantContentType string
+	}{
+		{"llama_cpp", "/props", "", http.MethodGet, "", ""},
+		{"vllm", "/v1/models", "", http.MethodGet, "", ""},
+		{"tgi", "/info", "", http.MethodGet, "", ""},
+		{"custom", "/whatever", "", http.MethodGet, "", ""},
+		{"ollama", "/api/show", "probe-model", http.MethodPost, `{"model":"probe-model"}`, "application/json"}, // #54: Ollama's /api/show is POST-only; ProbeContext used to send a bodyless GET, which upstream answers with a 405 (text/plain, no context data at all) since server v0.7.0 (a 404 before that). Reverting the POST branch in ProbeContext makes this row -- and only this row -- fail again.
+	} {
+		t.Run(tc.specType, func(t *testing.T) {
+			// The response body is irrelevant here -- extraction correctness
+			// per spec type is already covered by TestProbeContext_VLLM and
+			// its siblings above. This test only cares about the request
+			// ProbeContext issues, so ProbeContext's own return values are
+			// deliberately ignored.
+			ts := newProbeServer(t, `{}`)
+
+			_, _ = ProbeContext(context.Background(), ts.Client(), ts.URL, tc.specType, tc.path, tc.model)
+
+			got := ts.lastRequest()
+			if got == nil {
+				t.Fatal("server never received a request")
+			}
+			if got.Method != tc.wantMethod {
+				t.Errorf("method = %q, want %q", got.Method, tc.wantMethod)
+			}
+			if got.Path != tc.path {
+				t.Errorf("path = %q, want %q", got.Path, tc.path)
+			}
+			if string(got.Body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", got.Body, tc.wantBody)
+			}
+			// The empty want on the four GET rows is an assertion, not a
+			// blank: a bodiless request must carry no content type at all
+			// (see recordedProbeRequest). Only the ollama row sends a body,
+			// and only it may declare one.
+			if got.ContentType != tc.wantContentType {
+				t.Errorf("Content-Type = %q, want %q", got.ContentType, tc.wantContentType)
+			}
+		})
 	}
 }
 
@@ -132,7 +267,7 @@ func TestProbeContext_NonOKStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "vllm", "/v1/models", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for a non-2xx upstream status, got (%d, nil)", got)
 	}
@@ -142,12 +277,72 @@ func TestProbeContext_NonOKStatus(t *testing.T) {
 }
 
 func TestProbeContext_EmptyContextPath(t *testing.T) {
-	got, err := ProbeContext(context.Background(), &http.Client{}, "http://127.0.0.1:1", "vllm", "")
+	got, err := ProbeContext(context.Background(), &http.Client{}, "http://127.0.0.1:1", "vllm", "", "")
 	if err == nil {
 		t.Fatalf("ProbeContext: want error for an empty context path, got (%d, nil)", got)
 	}
 	if got != 0 {
 		t.Errorf("context = %d, want 0 on error", got)
+	}
+}
+
+// TestProbeContext_OllamaEmptyModelNoRequest pins #54's other load-bearing
+// rule: an "ollama" probe with no model name issues NO request at all and
+// returns the distinct ErrOllamaModelRequired. Ollama's own /api/show
+// answers a modelless POST with 400 "model is required", so sending it would
+// only spend a round trip to learn nothing conclusive that this local check
+// does not already know -- mirroring ProbeOllamaVerdicts' identical
+// empty-model short-circuit (TestProbeOllamaVerdictsEmptyModel above). The
+// request-recording newProbeServer makes the "no request sent" half of this
+// assertion checkable, not just inferable from the error.
+func TestProbeContext_OllamaEmptyModelNoRequest(t *testing.T) {
+	ts := newProbeServer(t, `{"model_info":{"llama.context_length":8192}}`)
+
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "")
+	if err != ErrOllamaModelRequired {
+		t.Fatalf("ProbeContext err = %v, want ErrOllamaModelRequired", err)
+	}
+	if got != 0 {
+		t.Errorf("context = %d, want 0 on error", got)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: an empty model must never be sent", got)
+	}
+}
+
+// TestProbeContext_OllamaBlankModelNoRequest covers a whitespace-only model:
+// it must be treated the same as an empty one (TrimSpace first), not sent
+// upstream as a literal " " that Ollama would accept as SOME string but
+// almost certainly not resolve to a real model.
+func TestProbeContext_OllamaBlankModelNoRequest(t *testing.T) {
+	ts := newProbeServer(t, `{}`)
+
+	_, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", "   ")
+	if err != ErrOllamaModelRequired {
+		t.Fatalf("ProbeContext err = %v, want ErrOllamaModelRequired", err)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: a whitespace-only model must never be sent", got)
+	}
+}
+
+// TestProbeContext_OllamaModelNeedsEscaping proves the body is built with
+// json.Marshal, never string concatenation: a model name carrying a
+// character that needs JSON escaping (a literal '"' here) must come through
+// the wire correctly escaped, not corrupt the request body.
+func TestProbeContext_OllamaModelNeedsEscaping(t *testing.T) {
+	ts := newProbeServer(t, `{"model_info":{"llama.context_length":4096}}`)
+
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "ollama", "/api/show", `weird"model`)
+	if err != nil {
+		t.Fatalf("ProbeContext: %v", err)
+	}
+	if got != 4096 {
+		t.Errorf("context = %d, want 4096", got)
+	}
+	wantBody := `{"model":"weird\"model"}`
+	if gotReq := ts.lastRequest(); gotReq == nil || string(gotReq.Body) != wantBody {
+		t.Errorf("body = %q, want %q", gotReq.Body, wantBody)
 	}
 }
 
@@ -178,7 +373,7 @@ func TestProbeContext_UsesPassedClient(t *testing.T) {
 	rt := &recordingRoundTripper{body: `{"data":[{"id":"m1","max_model_len":4096}]}`}
 	client := &http.Client{Transport: rt}
 
-	got, err := ProbeContext(context.Background(), client, "http://probe-context-uses-passed-client.invalid", "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), client, "http://probe-context-uses-passed-client.invalid", "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -197,7 +392,7 @@ func TestProbeContext_NilClientFallsBackToDefault(t *testing.T) {
 	body := `{"data":[{"id":"m1","max_model_len":4096}]}`
 	ts := newProbeServer(t, body)
 
-	got, err := ProbeContext(context.Background(), nil, ts.URL, "vllm", "/v1/models")
+	got, err := ProbeContext(context.Background(), nil, ts.URL, "vllm", "/v1/models", "")
 	if err != nil {
 		t.Fatalf("ProbeContext: %v", err)
 	}
@@ -385,6 +580,458 @@ func TestDetectCapabilitiesRouterGateMatchesLiveProgressGate(t *testing.T) {
 	if got := detectLiveProgressSupport(body); got != "" {
 		t.Fatalf("sibling detector disagrees on the router gate: %q", got)
 	}
+}
+
+// TestDetectOllamaCapabilities is the decision-rule test for the Ollama
+// sibling of detectCapabilities (#54 project, task 1): it reads the
+// "capabilities" array of a POST /api/show response body, per
+// detectOllamaCapabilities's own doc comment.
+//
+// The load-bearing cases are the ones that look like they should assert "no"
+// and deliberately do not: Ollama's own capabilities array is NOT exhaustive
+// (upstream logs "unknown capabilities for model" for an empty result, the
+// field is `omitempty`, a failed model-file read silently shortens the list,
+// and detection is substring heuristics over the chat template), so a
+// missing name can only ever mean UNKNOWN, never a denial. This function
+// therefore has no way to produce "no" at all -- every field it ever writes
+// is "" or "yes".
+//
+//   - "completion" is dropped: upstream ASSUMES it whenever a model has no
+//     pooling_type, so its presence or absence carries no evidence either
+//     way.
+//   - "image" is Ollama's image-GENERATION capability (born as
+//     CapabilityImageGeneration, backing /v1/images/generations), not
+//     vision, so it must land in Extra and never touch the Vision field.
+func TestDetectOllamaCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want Capabilities
+	}{
+		{"absent field is undetermined, not denial", `{"model_info":{}}`, Capabilities{}},
+		{"empty array is undetermined", `{"capabilities":[]}`, Capabilities{}},
+		{
+			"structured names map to structured fields", `{"capabilities":["vision","tools","audio"]}`,
+			Capabilities{Vision: "yes", Tools: "yes", Audio: "yes"},
+		},
+		{"completion is dropped, it is an upstream assumption", `{"capabilities":["completion"]}`, Capabilities{}},
+		{"image is NOT vision", `{"capabilities":["image"]}`, Capabilities{Extra: []string{"image"}}},
+		{
+			"unknown publisher strings are kept verbatim", `{"capabilities":["thinking","weather.v2"]}`,
+			Capabilities{Extra: []string{"thinking", "weather.v2"}},
+		},
+		{
+			"duplicates collapse, first occurrence wins", `{"capabilities":["insert","insert"]}`,
+			Capabilities{Extra: []string{"insert"}},
+		},
+		{"a name is never a no", `{"capabilities":["tools"]}`, Capabilities{Tools: "yes"}},
+		{"malformed json yields nothing rather than panicking", `not json`, Capabilities{}},
+		// Each structured name gets its OWN case, so that swapping two switch
+		// arms breaks a test. Reviewed and found missing: with only the
+		// combined case above plus the isolated "tools" one, exchanging the
+		// vision and audio arms passed the whole suite.
+		{"vision alone lands in Vision", `{"capabilities":["vision"]}`, Capabilities{Vision: "yes"}},
+		{"audio alone lands in Audio", `{"capabilities":["audio"]}`, Capabilities{Audio: "yes"}},
+		// Video has no Ollama equivalent at all: no name maps to it, so the
+		// field stays unknown even when everything else is declared.
+		{
+			"video is never written, Ollama has no such name",
+			`{"capabilities":["vision","tools","audio","thinking"]}`,
+			Capabilities{Vision: "yes", Tools: "yes", Audio: "yes", Extra: []string{"thinking"}},
+		},
+		// Shapes a real server can send that must resolve to "unknown"
+		// rather than to a denial or a panic.
+		{"a null array is undetermined", `{"capabilities":null}`, Capabilities{}},
+		{"a non-array value is undetermined", `{"capabilities":"vision"}`, Capabilities{}},
+		{"a whitespace-only name is skipped", `{"capabilities":["   ","tools"]}`, Capabilities{Tools: "yes"}},
+		{
+			"names are matched case- and whitespace-insensitively",
+			`{"capabilities":[" Vision ","TOOLS"]}`,
+			Capabilities{Vision: "yes", Tools: "yes"},
+		},
+		{
+			"an unmapped name reaches Extra normalised, not byte-for-byte",
+			`{"capabilities":[" Weather.V2 "]}`,
+			Capabilities{Extra: []string{"weather.v2"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectOllamaCapabilities([]byte(tc.body))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("detectOllamaCapabilities(%s) = %+v, want %+v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// captureAtTheAgentsDefaultLevel redirects the default slog logger to a
+// buffer at INFO -- the level a real agent runs at (main.newLogger takes
+// Debug only under --verbose) -- for the duration of the test.
+//
+// It exists beside captureDebug (power_logging_test.go) rather than reusing
+// it, and the difference is the whole point of the tests below: a Debug
+// record never reaches this buffer, exactly as it never reaches a default
+// deployment's log, so a capture at Debug would pass whatever level the code
+// under test happened to choose.
+func captureAtTheAgentsDefaultLevel(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// ollamaCapabilitiesBody builds a valid /api/show body declaring exactly the
+// given capability names, in order.
+func ollamaCapabilitiesBody(names ...string) string {
+	quoted := make([]string, 0, len(names))
+	for _, n := range names {
+		quoted = append(quoted, `"`+n+`"`)
+	}
+	return `{"capabilities":[` + strings.Join(quoted, ",") + `]}`
+}
+
+// ollamaNames builds n distinct short publisher-style capability names.
+func ollamaNames(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("pub.cap%d", i))
+	}
+	return out
+}
+
+// ollamaNamesAtMaxLength builds n distinct capability names of EXACTLY
+// maxOllamaCapabilityNameBytes bytes each -- the clamp's worst case, and the
+// input the wire-cost assertion below has to be measured against. The index
+// suffix keeps them distinct (the detector dedups), padding fills the rest,
+// and the characters are deliberately varied rather than one repeated
+// character, because a run of one character compresses inside a PostgreSQL
+// index entry and would understate the real cost.
+func ollamaNamesAtMaxLength(n int) []string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		suffix := fmt.Sprintf(".%d", i)
+		var b strings.Builder
+		for j := 0; b.Len() < maxOllamaCapabilityNameBytes-len(suffix); j++ {
+			b.WriteByte(alphabet[(i+j)%len(alphabet)])
+		}
+		b.WriteString(suffix)
+		out = append(out, b.String())
+	}
+	return out
+}
+
+// TestOllamaCapabilityBoundsStayUnderTheirCeilings is the guard the two
+// bounds did not have: it asserts the PROPERTIES they exist to satisfy, not
+// their values.
+//
+// The distinction is the whole design of this test. `maxOllamaExtraCapabilities
+// != 64` would be a change detector -- it fails for a tightening as loudly as
+// for a loosening and teaches a reader nothing about why 64. What is not a
+// change detector is the CEILING each number was read off, because each is a
+// real property of a system outside this file:
+//
+//  1. THE INDEX. A capability name is half of model_mapping_capabilities'
+//     primary key (mapping_id, capability), and a PostgreSQL btree index
+//     tuple may not exceed 2704 bytes. Measured on real PostgreSQL with
+//     incompressible names: 2600 bytes upserts fine, 2704 bytes fails with
+//     "index row size 2720 exceeds btree version 4 maximum 2704" -- and
+//     since UpsertMappingCapabilities is atomic, that failure takes EVERY
+//     capability row of the pass with it, logged at Debug and invisible at
+//     the gateway's default level.
+//  2. THE FRAME. The whole verdict set travels inside one 1 MiB
+//     agent->gateway WebSocket frame (gwapi.MaxWSFrameBytes), and a frame one
+//     byte over it closes the connection 1009.
+//
+// Both assertions are one-directional by construction: TIGHTENING either
+// bound only increases the margin, so this test stays silent for it. That is
+// deliberate -- a test that fires when someone makes a bound safer is noise.
+//
+// It is the loosening direction that was completely unguarded, in a way the
+// suite could not show: raising maxOllamaExtraCapabilities to 4096, or
+// maxOllamaCapabilityNameBytes to 4096, passes every other test in both
+// modules. The second one re-opens the atomic-drop defect above outright.
+//
+// The wire cost is MEASURED off the real sample.Capabilities type rather than
+// estimated, so no scaffolding constant is restated here: marshalling the
+// object with one empty-name entry gives the envelope, and the difference
+// between one and two entries gives the exact marginal cost of a further one,
+// separator included. A final check marshals the detector's real worst-case
+// output and requires the decomposition to predict it to the byte, so the
+// arithmetic cannot drift from the type it prices.
+//
+// What the frame assertion does NOT claim: that the fleet-wide total is
+// bounded. It is not, and maxOllamaExtraCapabilities' own doc says so -- ~101
+// worst-case children overflow the frame, because the total is a product and
+// only the per-child factor is bounded here. The assertion is the floor that
+// factor must keep: one frame must still carry as many worst-case children as
+// this system's own per-server spec-count expectation, which is 64 in both
+// modules (runtime.maxWatchedSpecs here, runtimeLogMaxWatchedSpecs on the
+// gateway), argued there against this same 1 MiB ceiling.
+func TestOllamaCapabilityBoundsStayUnderTheirCeilings(t *testing.T) {
+	// (1) THE INDEX. Not merely "below 2704" -- comfortably below, because a
+	// name shares the index tuple with the mapping_id and the whole point of
+	// this bound is that no publisher string can ever approach the cliff. A
+	// factor of 8 leaves this assertion satisfied up to 338 bytes (today's
+	// 128 sits at a factor of 21) while still failing for any change that
+	// brings the bound within an order of magnitude of a defect that drops
+	// rows atomically. Measured: at today's count bound the FRAME assertion
+	// below binds first, at ~227 bytes -- so this one is the guard that
+	// survives a change to the count bound or to the frame arithmetic, not
+	// the one that usually fires.
+	const pgBtreeMaxIndexRowBytes = 2704
+	const indexSafetyFactor = 8
+	if got := maxOllamaCapabilityNameBytes * indexSafetyFactor; got > pgBtreeMaxIndexRowBytes {
+		t.Errorf("maxOllamaCapabilityNameBytes = %d, which is only a factor of %.1f under PostgreSQL's btree index-tuple maximum of %d bytes; want at least a factor of %d (%d bytes or fewer). "+
+			"A name at or near that ceiling fails UpsertMappingCapabilities ATOMICALLY, dropping every capability row of the pass, logged at Debug and invisible at the gateway's default level.",
+			maxOllamaCapabilityNameBytes, float64(pgBtreeMaxIndexRowBytes)/float64(maxOllamaCapabilityNameBytes),
+			pgBtreeMaxIndexRowBytes, indexSafetyFactor, pgBtreeMaxIndexRowBytes/indexSafetyFactor)
+	}
+
+	// (2) THE FRAME. Measure the wire envelope and the marginal per-entry cost
+	// off the real type, then price the clamp's worst case.
+	marshalLen := func(verdicts []sample.CapabilityVerdict) int {
+		b, err := json.Marshal(sample.Capabilities{Verdicts: verdicts, Source: sample.CapabilitySourceOllamaAPIShow})
+		if err != nil {
+			t.Fatalf("json.Marshal(sample.Capabilities): %v", err)
+		}
+		return len(b)
+	}
+	entry := sample.CapabilityVerdict{Name: "", Verdict: "yes"}
+	oneEntry := marshalLen([]sample.CapabilityVerdict{entry})
+	perEntry := marshalLen([]sample.CapabilityVerdict{entry, entry}) - oneEntry
+	if oneEntry <= 0 || perEntry <= 0 {
+		t.Fatalf("measured one-entry object = %d bytes and marginal per-entry cost = %d bytes; both must be positive or this assertion measures nothing", oneEntry, perEntry)
+	}
+
+	const worstCaseChildrenOneFrameMustCarry = 64
+	// oneEntry already carries the envelope and the first (empty-name) entry;
+	// perEntry is the marginal cost of each further one, separator included.
+	// The names themselves are then priced at the length bound.
+	perChild := oneEntry + (maxOllamaExtraCapabilities-1)*perEntry + maxOllamaExtraCapabilities*maxOllamaCapabilityNameBytes
+	if total := int64(perChild) * worstCaseChildrenOneFrameMustCarry; total > gwapi.MaxWSFrameBytes {
+		t.Errorf("at the bounds (%d names x %d bytes) one child's capability object costs %d bytes on the wire, so %d worst-case children cost %d bytes -- over the %d-byte frame cap (gwapi.MaxWSFrameBytes). "+
+			"A frame one byte over it fails the gateway's read and closes 1009, taking telemetry, the system and runtime reports, the runtime_config push and the certificate doorbell with it.",
+			maxOllamaExtraCapabilities, maxOllamaCapabilityNameBytes, perChild,
+			worstCaseChildrenOneFrameMustCarry, total, gwapi.MaxWSFrameBytes)
+	}
+
+	// Non-vacuity: the arithmetic above prices a hypothetical worst case, so
+	// prove the detector really does produce it. The real detector, fed a
+	// document at both bounds, must yield exactly maxOllamaExtraCapabilities
+	// names each exactly maxOllamaCapabilityNameBytes long -- otherwise
+	// perChild is priced against an input nothing can generate and both
+	// assertions above are decoration.
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(ollamaNamesAtMaxLength(maxOllamaExtraCapabilities)...)))
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("the detector carried %d names out of a document at the bound, want %d -- the worst case priced above is not the worst case the detector produces", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	for _, name := range caps.Extra {
+		if len(name) != maxOllamaCapabilityNameBytes {
+			t.Fatalf("a carried name is %d bytes, want exactly %d -- the worst case priced above assumes every carried name may be at the length bound", len(name), maxOllamaCapabilityNameBytes)
+		}
+	}
+	if got := marshalLen(func() []sample.CapabilityVerdict {
+		out := make([]sample.CapabilityVerdict, 0, len(caps.Extra))
+		for _, name := range caps.Extra {
+			out = append(out, sample.CapabilityVerdict{Name: name, Verdict: "yes"})
+		}
+		return out
+	}()); got != perChild {
+		t.Errorf("the real worst-case object marshals to %d bytes but the assertion above priced it at %d; the measured envelope/per-entry decomposition has drifted from the type", got, perChild)
+	}
+}
+
+// TestDetectOllamaCapabilitiesCarriesTheBoundIntact is the AT-THE-BOUND half
+// of the clamp (I-1): a document declaring exactly maxOllamaExtraCapabilities
+// names, one of them exactly maxOllamaCapabilityNameBytes long, is carried
+// whole -- nothing dropped, nothing truncated, and no Warn, because nothing
+// degraded. Without it a clamp off by one in the strict direction would pass
+// the over-the-bound test below and quietly discard a legitimate name.
+func TestDetectOllamaCapabilitiesCarriesTheBoundIntact(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	atTheLimit := strings.Repeat("z", maxOllamaCapabilityNameBytes)
+	names := append(ollamaNames(maxOllamaExtraCapabilities-1), atTheLimit)
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(names...)))
+
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("len(Extra) = %d, want %d -- a document AT the bound must be carried whole", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	if caps.Extra[len(caps.Extra)-1] != atTheLimit {
+		t.Fatalf("the %d-byte name did not survive: last Extra entry = %q", maxOllamaCapabilityNameBytes, caps.Extra[len(caps.Extra)-1])
+	}
+	if out := buf.String(); strings.Contains(out, "level=WARN") {
+		t.Fatalf("a document at the bound warned about a drop; log =\n%s", out)
+	}
+}
+
+// TestDetectOllamaCapabilitiesClampsPastTheBound is the OVER-the-bound half,
+// and it carries the property that makes the clamp safe rather than merely
+// bounded: the three structured verdicts survive it.
+//
+// The document declares maxOllamaExtraCapabilities+16 publisher strings and
+// puts "vision", "tools" and "audio" LAST, which is exactly the arrangement a
+// `break` at the cap would lose -- the four names a consumer reasons about
+// displaced by junk that arrived first. The clamp therefore stops appending
+// and keeps scanning.
+//
+// The Warn is asserted at the agent's own default level, and it must say HOW
+// MANY names went: a clamp is otherwise silent by construction, since a
+// dropped verdict shows up as a missing row and a missing row is what this
+// whole model already means by "unknown".
+func TestDetectOllamaCapabilitiesClampsPastTheBound(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	const over = 16
+	names := append(ollamaNames(maxOllamaExtraCapabilities+over), "vision", "tools", "audio")
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(names...)))
+
+	if len(caps.Extra) != maxOllamaExtraCapabilities {
+		t.Fatalf("len(Extra) = %d, want exactly %d -- the array must be clamped, not carried", len(caps.Extra), maxOllamaExtraCapabilities)
+	}
+	if caps.Vision != "yes" || caps.Tools != "yes" || caps.Audio != "yes" {
+		t.Fatalf("the structured verdicts were displaced by the clamp: %+v -- a hostile tail must not be able to cost a consumer the verdicts it reasons about", caps)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "ollama capability names dropped") {
+		t.Fatalf("no WARN record about the clamp at the agent's default level (info); log =\n%s -- a silent clamp is indistinguishable from a probe that never ran", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("dropped=%d", over)) {
+		t.Fatalf("the WARN record does not say how many names were dropped (want dropped=%d); log =\n%s", over, out)
+	}
+}
+
+// TestDetectOllamaCapabilitiesDropsAnOverlongName pins the second bound and
+// the DIRECTION of its failure: a name past maxOllamaCapabilityNameBytes is
+// dropped, never truncated.
+//
+// Truncating would be worse than dropping rather than merely different: the
+// prefix is a DIFFERENT capability, and it would be stored as a confident
+// "yes" under a name nothing upstream ever declared -- while the real reason
+// the length is bounded at all is that one over-long name is half of
+// model_mapping_capabilities' primary key, and a btree index tuple past
+// PostgreSQL's 2704-byte maximum fails the whole atomic upsert, dropping
+// EVERY capability row for that mapping.
+//
+// The sibling name proves the drop is the long one and not the pass: "tools"
+// still lands.
+func TestDetectOllamaCapabilitiesDropsAnOverlongName(t *testing.T) {
+	buf := captureAtTheAgentsDefaultLevel(t)
+
+	tooLong := strings.Repeat("q", maxOllamaCapabilityNameBytes+1)
+	caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(tooLong, "tools")))
+
+	if len(caps.Extra) != 0 {
+		t.Fatalf("Extra = %q, want empty -- an over-long name must be dropped, and a TRUNCATED one would be a different capability written as a confident yes", caps.Extra)
+	}
+	if caps.Tools != "yes" {
+		t.Fatalf("Tools = %q, want \"yes\" -- the over-long name must cost only itself", caps.Tools)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "dropped_over_length=1") {
+		t.Fatalf("no WARN record naming the over-length drop; log =\n%s", out)
+	}
+}
+
+// TestDetectOllamaCapabilitiesSkipsReservedNames pins the agent-side half of
+// the reserved-name rule: "mtp" and "live_progress" declared by an /api/show
+// document never reach Extra, however they are spelled.
+//
+// This layer is DEFENCE IN DEPTH and the test says so on purpose -- the
+// load-bearing rule is the gateway's ingest boundary, which is the only one
+// in the path of a buggy or hostile agent that puts the name straight into
+// the verdicts it sends. What this filter buys is that an honest agent never
+// puts a name on the wire the gateway would only have to drop.
+//
+// Why these two and not vision/tools/audio: Ollama's array is real evidence
+// for those three and says nothing at all about either of these. "mtp" is
+// not detected anywhere and feeds the router's +30 bonus; "live_progress"
+// has a dedicated wire field, and for an Ollama child that field is always
+// "", so a publisher's string would not collide with the dedicated answer --
+// it would BE the answer, and the router would send timings_per_token to an
+// upstream that does not understand it.
+//
+// The sibling names prove the skip costs only itself: "vision" still lands
+// as a structured verdict and "thinking" still reaches Extra.
+func TestDetectOllamaCapabilitiesSkipsReservedNames(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+	}{
+		{"as declared", []string{"mtp", "live_progress", "vision", "thinking"}},
+		{"case- and whitespace-normalised first", []string{" MTP ", "Live_Progress", "vision", "thinking"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureAtTheAgentsDefaultLevel(t)
+			caps := detectOllamaCapabilities([]byte(ollamaCapabilitiesBody(tc.names...)))
+
+			if !reflect.DeepEqual(caps.Extra, []string{"thinking"}) {
+				t.Fatalf("Extra = %q, want only [thinking] -- a reserved name must never be carried, and an unrelated one must still be", caps.Extra)
+			}
+			if caps.Vision != "yes" {
+				t.Fatalf("Vision = %q, want \"yes\" -- the reserved names must cost only themselves", caps.Vision)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "dropped_reserved=2") {
+				t.Fatalf("no WARN record naming the two reserved drops; log =\n%s", out)
+			}
+		})
+	}
+}
+
+// TestProbeOllamaVerdictsRefusesAnImplausiblyLargeBody bounds the INPUT, not
+// just the output. Both cases send the SAME declaration ("vision"), so the
+// only difference between them is the document's size:
+//
+//   - at the bound the verdict is read normally -- Vision "yes";
+//   - one byte past it the probe reports NO verdicts at all, so the
+//     capability stays unknown rather than being answered out of a document
+//     that cannot be an /api/show reply.
+//
+// The refusal is CONCLUSIVE (stable == true) on purpose, and that is the
+// existing rule rather than a new one: a well-formed body that simply is not
+// the document asked for has always been conclusive here. Treating it as
+// transient would re-read and re-parse a quarter-megabyte body once per
+// collect cycle for the child's whole life, and do it invisibly, since the
+// caller only logs a retry at Debug.
+func TestProbeOllamaVerdictsRefusesAnImplausiblyLargeBody(t *testing.T) {
+	// A valid /api/show body of exactly n bytes that declares "vision".
+	body := func(n int) string {
+		head := `{"capabilities":["vision"],"license":"`
+		tail := `"}`
+		return head + strings.Repeat("a", n-len(head)-len(tail)) + tail
+	}
+
+	t.Run("at the bound the verdict is read", func(t *testing.T) {
+		at := body(maxOllamaShowConclusiveBodyBytes)
+		if len(at) != maxOllamaShowConclusiveBodyBytes {
+			t.Fatalf("test body is %d bytes, want %d", len(at), maxOllamaShowConclusiveBodyBytes)
+		}
+		ts := newProbeServer(t, at)
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+		if !stable || verdicts.Caps.Vision != "yes" {
+			t.Fatalf("ProbeOllamaVerdicts = (%+v, %v), want Vision \"yes\" and stable -- a body AT the bound is a real answer", verdicts, stable)
+		}
+	})
+
+	t.Run("one byte past the bound reports nothing", func(t *testing.T) {
+		buf := captureAtTheAgentsDefaultLevel(t)
+		ts := newProbeServer(t, body(maxOllamaShowConclusiveBodyBytes+1))
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Fatalf("ProbeOllamaVerdicts = %+v, want the zero verdict set -- an implausible document must leave every capability UNKNOWN, not answer one out of it", verdicts)
+		}
+		if !stable {
+			t.Fatalf("stable = false, want true -- a COMPLETE body that is not this document is conclusive here, so it costs one read per pid generation instead of one per cycle")
+		}
+		out := buf.String()
+		if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "implausibly large") {
+			t.Fatalf("no WARN record about the oversized body at the agent's default level (info); log =\n%s", out)
+		}
+	})
 }
 
 // TestProbeLiveProgressSupport_Supported is the "custom"-recovery case: this
@@ -645,6 +1292,160 @@ func TestProbeLiveProgressSupport_UnparseableBody(t *testing.T) {
 	if stable {
 		t.Errorf("ProbeLiveProgressSupport stable = true, want false (invalid/truncated JSON is transient -- retry, do not cache)")
 	}
+}
+
+// TestProbeOllamaVerdictsCapabilities is ProbeOllamaVerdicts' happy path: a
+// 200 /api/show response carrying a capabilities array yields those
+// verdicts, and stable == true -- a real /api/show document is as
+// conclusive an answer as a real /props one. The point of this case is that
+// LiveProgress stays "" even though Caps is populated: the two verdicts
+// inside one PropsVerdicts must not be coupled to each other.
+func TestProbeOllamaVerdictsCapabilities(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["vision","tools"]}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+	if !stable {
+		t.Errorf("stable = false, want true (a real /api/show document is conclusive)")
+	}
+	if verdicts.LiveProgress != "" {
+		t.Errorf("LiveProgress = %q, want %q (Ollama has no live-progress surface)", verdicts.LiveProgress, "")
+	}
+	want := Capabilities{Vision: "yes", Tools: "yes"}
+	if !reflect.DeepEqual(verdicts.Caps, want) {
+		t.Errorf("Caps = %+v, want %+v", verdicts.Caps, want)
+	}
+}
+
+// TestProbeOllamaVerdictsLiveProgressNeverAVerdict pins the load-bearing rule
+// (#54, task 3): LiveProgress must stay "" even when the response body ALSO
+// happens to carry a key detectLiveProgressSupport would read as "supported"
+// on the llama.cpp side. If ProbeOllamaVerdicts ever routed its body through
+// detectLiveProgressSupport (a plausible but wrong copy from
+// ProbePropsVerdicts), this body would flip the verdict to "supported" -- an
+// unknown must never become ANY verdict here, because Ollama exposes no such
+// surface to have an opinion about, and "" is what tells the caller to write
+// no row rather than a permanent false claim.
+func TestProbeOllamaVerdictsLiveProgressNeverAVerdict(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["tools"],"default_generation_settings":{"params":{"timings_per_token":false}}}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+	if !stable {
+		t.Fatalf("stable = false, want true")
+	}
+	if verdicts.LiveProgress != "" {
+		t.Errorf("LiveProgress = %q, want %q even though the body carries a llama.cpp-shaped live-progress key", verdicts.LiveProgress, "")
+	}
+}
+
+// TestProbeOllamaVerdictsRequestShape pins the exact request
+// ProbeOllamaVerdicts issues: POST /api/show, body {"model":"<model>"},
+// Content-Type application/json, using the request-recording newProbeServer
+// gained for #54 (see recordedProbeRequest).
+//
+// The header is asserted here and not merely inherited from the plumbing:
+// this function is the first caller in the module's history to reach
+// fetchProbeBodyWith's header-setting branch at all, and a real Ollama
+// dispatches /api/show through gin's ShouldBindJSON, which reads it.
+func TestProbeOllamaVerdictsRequestShape(t *testing.T) {
+	ts := newProbeServer(t, `{}`)
+
+	_, _ = ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "llama3")
+
+	got := ts.lastRequest()
+	if got == nil {
+		t.Fatal("server never received a request")
+	}
+	if got.Method != http.MethodPost {
+		t.Errorf("method = %q, want %q", got.Method, http.MethodPost)
+	}
+	if got.Path != "/api/show" {
+		t.Errorf("path = %q, want %q", got.Path, "/api/show")
+	}
+	wantBody := `{"model":"llama3"}`
+	if string(got.Body) != wantBody {
+		t.Errorf("body = %q, want %q", got.Body, wantBody)
+	}
+	if got.ContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json -- Ollama's /api/show binds the body through gin's ShouldBindJSON, which dispatches on this header", got.ContentType)
+	}
+}
+
+// TestProbeOllamaVerdictsEmptyModel proves an empty model sends NO request at
+// all: Ollama's /api/show answers 400 "model is required" without one, so
+// sending it would only spend a round trip to learn nothing conclusive.
+func TestProbeOllamaVerdictsEmptyModel(t *testing.T) {
+	ts := newProbeServer(t, `{"capabilities":["vision"]}`)
+
+	verdicts, stable := ProbeOllamaVerdicts(context.Background(), ts.Client(), ts.URL, "")
+	if stable {
+		t.Errorf("stable = true, want false (no model name -> no conclusive answer)")
+	}
+	if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+		t.Errorf("verdicts = %+v, want zero value", verdicts)
+	}
+	if got := ts.lastRequest(); got != nil {
+		t.Errorf("server received a request %+v, want none: an empty model must never be sent", got)
+	}
+}
+
+// TestProbeOllamaVerdictsConclusiveRefusals mirrors
+// TestProbeLiveProgressSupport_ConclusiveRefusals on the Ollama sibling:
+// ProbeOllamaVerdicts reuses ProbePropsVerdicts' conclusive-status set
+// verbatim, for the identical reason documented there -- 404/401/403/405 are
+// fixed properties of the binary's routing table and the credential it was
+// started with, both fixed at exec time.
+func TestProbeOllamaVerdictsConclusiveRefusals(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+			defer srv.Close()
+
+			verdicts, stable := ProbeOllamaVerdicts(context.Background(), srv.Client(), srv.URL, "llama3")
+			if !stable {
+				t.Errorf("status %d: stable = false, want true", status)
+			}
+			if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+				t.Errorf("status %d: verdicts = %+v, want zero value", status, verdicts)
+			}
+		})
+	}
+}
+
+// TestProbeOllamaVerdictsTransient covers the two transient cases: a 500 (the
+// child may still be starting up) and a fully refused connection (status 0,
+// no HTTP response at all). Neither is conclusive, so both must report
+// stable == false.
+func TestProbeOllamaVerdictsTransient(t *testing.T) {
+	t.Run("500", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), srv.Client(), srv.URL, "llama3")
+		if stable {
+			t.Errorf("stable = true, want false (a 500 may just mean the child is still starting up)")
+		}
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Errorf("verdicts = %+v, want zero value", verdicts)
+		}
+	})
+
+	t.Run("connection refused", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		addr := srv.URL
+		srv.Close() // closed: nothing is listening on addr anymore
+
+		verdicts, stable := ProbeOllamaVerdicts(context.Background(), http.DefaultClient, addr, "llama3")
+		if stable {
+			t.Errorf("stable = true, want false (a refused connection is transient -- retry, do not cache)")
+		}
+		if !reflect.DeepEqual(verdicts, PropsVerdicts{}) {
+			t.Errorf("verdicts = %+v, want zero value", verdicts)
+		}
+	})
 }
 
 // TestSafeProbePath is the agent's defense-in-depth SSRF guard: only an empty
