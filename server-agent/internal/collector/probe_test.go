@@ -16,16 +16,34 @@ import (
 )
 
 // recordedProbeRequest is what newProbeServer captures about the single
-// request its canned handler received: method, path, and raw body. It exists
-// so a test can assert the SHAPE of the request the code under test issued,
-// not just the body newProbeServer serves back -- see
-// TestProbeContextRequestShapePerSpecType, which pins exactly this for every
-// spec type (#54: no test in this package had ever asserted a probe's
-// method, path, or body before that test existed).
+// request its canned handler received: method, path, raw body, and the
+// Content-Type header. It exists so a test can assert the SHAPE of the
+// request the code under test issued, not just the body newProbeServer
+// serves back -- see TestProbeContextRequestShapePerSpecType, which pins
+// exactly this for every spec type (#54: no test in this package had ever
+// asserted a probe's method, path, or body before that test existed).
+//
+// ContentType joined the recording in #54's fix round, and it is load-
+// bearing rather than thorough: ProbeOllamaVerdicts is the FIRST caller ever
+// to reach fetchProbeBodyWith's header-setting branch (every earlier caller
+// passes a nil body, so that branch was unreachable from any test), and a
+// real Ollama serves /api/show through gin's ShouldBindJSON, which
+// DISPATCHES on the header. A regression that dropped the Set would pass
+// every other assertion in this file -- method, path and body would all
+// still be right -- while breaking the probe against the only server it is
+// aimed at.
+//
+// The header is captured raw, and the assertions come in a pair: the POST
+// paths must carry "application/json", and the bodiless GET rows must carry
+// NOTHING. That symmetry is the point -- a mutation that set the header
+// unconditionally (dropping fetchProbeBodyWith's len(body) > 0 guard) would
+// satisfy a POST-only assertion, and it would put a content type on a
+// request that has no content.
 type recordedProbeRequest struct {
-	Method string
-	Path   string
-	Body   []byte
+	Method      string
+	Path        string
+	Body        []byte
+	ContentType string
 }
 
 // probeServer is a newProbeServer *httptest.Server with the last request it
@@ -54,7 +72,12 @@ func newProbeServer(t *testing.T, body string) *probeServer {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqBody, _ := io.ReadAll(r.Body)
 		ps.mu.Lock()
-		ps.last = &recordedProbeRequest{Method: r.Method, Path: r.URL.Path, Body: reqBody}
+		ps.last = &recordedProbeRequest{
+			Method:      r.Method,
+			Path:        r.URL.Path,
+			Body:        reqBody,
+			ContentType: r.Header.Get("Content-Type"),
+		}
 		ps.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -185,17 +208,18 @@ func TestProbeContext_NoMatch(t *testing.T) {
 // unpatched code.
 func TestProbeContextRequestShapePerSpecType(t *testing.T) {
 	for _, tc := range []struct {
-		specType   string
-		path       string
-		model      string
-		wantMethod string
-		wantBody   string
+		specType        string
+		path            string
+		model           string
+		wantMethod      string
+		wantBody        string
+		wantContentType string
 	}{
-		{"llama_cpp", "/props", "", http.MethodGet, ""},
-		{"vllm", "/v1/models", "", http.MethodGet, ""},
-		{"tgi", "/info", "", http.MethodGet, ""},
-		{"custom", "/whatever", "", http.MethodGet, ""},
-		{"ollama", "/api/show", "probe-model", http.MethodPost, `{"model":"probe-model"}`}, // #54: Ollama's /api/show is POST-only; ProbeContext used to send a bodyless GET, which upstream answers with a 405 (text/plain, no context data at all) since server v0.7.0 (a 404 before that). Reverting the POST branch in ProbeContext makes this row -- and only this row -- fail again.
+		{"llama_cpp", "/props", "", http.MethodGet, "", ""},
+		{"vllm", "/v1/models", "", http.MethodGet, "", ""},
+		{"tgi", "/info", "", http.MethodGet, "", ""},
+		{"custom", "/whatever", "", http.MethodGet, "", ""},
+		{"ollama", "/api/show", "probe-model", http.MethodPost, `{"model":"probe-model"}`, "application/json"}, // #54: Ollama's /api/show is POST-only; ProbeContext used to send a bodyless GET, which upstream answers with a 405 (text/plain, no context data at all) since server v0.7.0 (a 404 before that). Reverting the POST branch in ProbeContext makes this row -- and only this row -- fail again.
 	} {
 		t.Run(tc.specType, func(t *testing.T) {
 			// The response body is irrelevant here -- extraction correctness
@@ -219,6 +243,13 @@ func TestProbeContextRequestShapePerSpecType(t *testing.T) {
 			}
 			if string(got.Body) != tc.wantBody {
 				t.Errorf("body = %q, want %q", got.Body, tc.wantBody)
+			}
+			// The empty want on the four GET rows is an assertion, not a
+			// blank: a bodiless request must carry no content type at all
+			// (see recordedProbeRequest). Only the ollama row sends a body,
+			// and only it may declare one.
+			if got.ContentType != tc.wantContentType {
+				t.Errorf("Content-Type = %q, want %q", got.ContentType, tc.wantContentType)
 			}
 		})
 	}
@@ -932,8 +963,13 @@ func TestProbeOllamaVerdictsLiveProgressNeverAVerdict(t *testing.T) {
 
 // TestProbeOllamaVerdictsRequestShape pins the exact request
 // ProbeOllamaVerdicts issues: POST /api/show, body {"model":"<model>"},
-// using the request-recording newProbeServer gained for #54 (see
-// recordedProbeRequest).
+// Content-Type application/json, using the request-recording newProbeServer
+// gained for #54 (see recordedProbeRequest).
+//
+// The header is asserted here and not merely inherited from the plumbing:
+// this function is the first caller in the module's history to reach
+// fetchProbeBodyWith's header-setting branch at all, and a real Ollama
+// dispatches /api/show through gin's ShouldBindJSON, which reads it.
 func TestProbeOllamaVerdictsRequestShape(t *testing.T) {
 	ts := newProbeServer(t, `{}`)
 
@@ -952,6 +988,9 @@ func TestProbeOllamaVerdictsRequestShape(t *testing.T) {
 	wantBody := `{"model":"llama3"}`
 	if string(got.Body) != wantBody {
 		t.Errorf("body = %q, want %q", got.Body, wantBody)
+	}
+	if got.ContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json -- Ollama's /api/show binds the body through gin's ShouldBindJSON, which dispatches on this header", got.ContentType)
 	}
 }
 
