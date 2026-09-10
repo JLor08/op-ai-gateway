@@ -114,9 +114,12 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	// Register ONLY on the real streaming path (after the flusher check). The early
 	// resolve-error and no-streamer branches above return before this and are
 	// intentionally not tracked as active (they still record to the completed list).
-	// progress is allocated here (the only Add site with anything to count) and the
-	// same pointer is threaded into the streamSession below, so both the registry's
-	// copy and this goroutine's writes share one live counter.
+	// progress is allocated here (the TRANSLATE path's only such site: of the three
+	// production Add sites, inference_complete.go's buffered one has no frames to
+	// count, and proxyNative allocates the other counter — for a STREAMING native
+	// passthrough request — in native_passthrough.go) and the same pointer is
+	// threaded into the streamSession below, so both the registry's copy and this
+	// goroutine's writes share one live counter.
 	progress := &requestProgress{}
 	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start, Progress: progress})
 
