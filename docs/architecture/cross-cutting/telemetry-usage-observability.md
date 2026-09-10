@@ -656,6 +656,121 @@ one-decimal resolution instead of `0.0` (a real 1-token/25s sample). That is a
 rendering local to this column, not a change to the shared `formatMetric`
 contract, whose fixed decimals other columns parse back as numbers to sort.
 
+**Exactly four states produce an empty `tokens_per_second_source`**, and no
+single cause is shared by all of them — which is why the portal's tooltip for
+that cell (`activityLiveTpsNone`, `i18n.ts`) names none:
+
+1. the request carries no `requestProgress` at all — every non-streaming call
+   and every *buffered* native-passthrough one (below) reach this through the
+   same nil branch, not through two;
+2. a counter exists but no content frame has landed yet, so there is no
+   generation window to measure over and no TTFT either;
+3. the first-content stamp exists and no frame has reported a figure of any
+   kind yet;
+4. the first-content stamp exists and an **exact count has already arrived**,
+   but the window since that stamp is still under the 50 ms floor.
+
+State 4 is why the tooltip's second clause denies the *derivation* rather than
+the count's existence: on that row an exact count really is present, so a
+sentence saying there is none would be false there. `i18n.test.ts` pins this by
+banning the phrase in both locales — and **that ban is honest only because
+`minGatewayRateWindow` exists.** Remove the floor and state 4 disappears, every
+remaining empty-source row carries a zero count, and the banned phrase becomes
+true. The constant is Go and the assertion is TypeScript, so nothing structural
+can couple them across that boundary; this paragraph is the coupling. Anyone
+deleting or lowering the floor must revisit that test and both locales of the
+string with it.
+
+**The panel's "an absent cell is an em dash, a measured zero reads as `0`" rule
+is trivially satisfied for these two cells, because the wire cannot express a
+measured zero for either.** `liveProgressDTO` never returns a rate of 0
+alongside a non-empty source: the `upstream` branch is taken only for a
+positive reported figure, and the `gateway` branch only for a positive count
+over a window at or above the floor. So a rate of 0 always means "not measured"
+and always arrives with the empty source that says so. A TTFT is clamped at 0
+when the first-content stamp precedes `StartedAt`, which collapses into the
+same 0 the absent case uses — there is nothing downstream that distinguishes
+them, and nothing to distinguish. This is a property of the two quantities, not
+a gap left open.
+
+**Native passthrough is on this panel too, and what it can honestly show is
+per-flavor.** A **streaming** `proxyNative` request allocates its own
+`requestProgress` and hands the pointer to both the `ActiveRequest` and the
+response's `usageScanner` (`native_passthrough.go`,
+`passthrough_usage_scan.go`). The scanner publishes each relayed frame's OWN
+reported facts through the same `observeDelta` the translate path uses — a
+first-content timestamp, the upstream's own cumulative count, the upstream's own
+rate — and derives nothing itself, so `liveProgressDTO` stays the feature's
+single derivation and there is no second one to drift against. A **buffered**
+passthrough response deliberately gets no counter (state 1 above: nil, not an
+allocated permanently-zero struct), because the whole body arrives as one
+payload, no first-content stamp can form, and a "TTFT" measured off it would be
+the total request duration wearing another quantity's name.
+
+Every cell below is about the **mid-stream** row, which is the point of the
+feature:
+
+| | `anthropic_messages` | `openai_responses` |
+|---|---|---|
+| TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.function_call_arguments.delta` stamps it |
+| output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **no mid-stream source** — the `*.delta` partials carry no usage object at all, and counting deltas as tokens is the option this feature already rejected above |
+| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to the partial frames, and it is then labelled `upstream`. Without it, none mid-stream |
+
+**The Responses column's terminal frame is a different answer from its
+mid-stream one, and it is not suppressed for arriving late.**
+`response.completed` carries the upstream's own final
+`response.usage.output_tokens`, and that count IS published — the Responses
+branch of `isTerminalUsageFrame` is load-bearing for the live column, not only
+for the recorded row — so the count, and a `gateway`-labelled rate derived from
+it, appear on the still-active row for the short window between that frame and
+`proxyNative`'s deferred `Active.Remove`. The honest one-line reading of the
+column is therefore "nothing to show mid-stream unless the client asked for it",
+not "nothing to show". There is no reason to hide the terminal figure for the
+seconds it is visible: it is the upstream's own count over the real generation
+window — the same quantity, the same arithmetic and the same `gateway` label the
+Anthropic column carries throughout its stream. The asymmetry between the two
+columns is the design, not a shortfall to be papered over, and both rows are
+pinned in both directions (`passthrough_progress_test.go`) — the value where one
+exists and the explicit absence where none does — so a later change cannot
+quietly satisfy the Responses column by counting deltas. Pinning the terminal
+cell is what makes "a delta is not a token" testable at its sharpest: with the
+upstream's exact count on the row, a delta-derived contribution added to it
+shows up as a wrong number rather than merely as a number where there should be
+none.
+
+**Two rules on this path must survive any later change.** Neither is enforceable
+by shape, so tests pin both:
+
+- **`timings_per_token` is READ when the client set it, and never injected.**
+  Injecting it is what would complete the Responses column mid-stream for every
+  client, which is exactly why the temptation is worth naming at the one place
+  someone would act on it: `rewriteModelField` is the only edit ever made to a
+  relayed body, and adding the flag would change the upstream's *response*
+  shape — frames' worth of fields the client never asked for, flowing through to
+  a client that must parse them — in order to improve a gateway display column.
+  A missing live rate renders as "not measured" and is honest; a silently
+  rewritten client request is not.
+- **The in-flight figure is display only.** The END-of-request rate still feeds
+  an opted-in mapping's throughput EWMA (`UpdateMappingOpportunisticMetrics`,
+  read back by the scorer and by a model group's `MinTokensPerSecond` gate —
+  see "a recorded rate is a routing input" further down), but an in-flight
+  sample is measured over a shorter, mid-generation window and would not
+  self-correct once blended there. No routing or EWMA write originates from this
+  path, and the test asserts that on the CALL COUNT with the opt-in switched on,
+  because an extra write carrying an identical-looking value would otherwise
+  hide.
+
+**What this surface does and does not distinguish**, since the tooltip's refusal
+to name a cause is easy to mistake for a missing field. `provider_path` **does**
+separate native passthrough from translation: it rides the same DTO and differs
+from `req_path` exactly when translation is happening (`ActiveRequest`,
+`active_requests.go`), and the panel offers it as an opt-in column. What nothing
+on the DTO records is whether the **client** asked for mid-stream timings — and
+on the passthrough Responses path that is precisely the axis an absent rate
+turns on. So the tooltip is not claiming that passthrough and translation are
+indistinguishable here; it is that no flavor-plus-mode combination narrows the
+absence to a single cause.
+
 **Whether the two parameters are sent is a three-layer rule, ordered by the
 quality of the evidence: observation beats prediction, prediction beats
 guessing.** Getting an exact mid-stream count at all needs two extra
@@ -1396,15 +1511,22 @@ stale *positive* would send the parameters to an upstream that answers 400 —
 the dead stream this design exists to eliminate. There is therefore no
 positive entry that could go stale.
 
-**Native passthrough gets neither the parameter nor the live figures.**
-`proxyNative` forwards the client's own body unmodified (only the `model`
-field is ever rewritten, and losslessly) and never allocates a `Progress`
-counter for that path's `ActiveRequest` — `liveProgressDTO` then resolves it
-to "not measured" for every in-flight `/v1/responses` and `/v1/messages`
-request, the same as a non-streaming call. Everything native passthrough
-reports instead comes from reading the *response*: `mergePassthroughUsage` now
-also reads llama.cpp's `timings` object off the Responses shape, and — for the
-Anthropic shape, which carries no timings on any frame — `usageScanner`
+**Native passthrough gets neither parameter — and gets the live figures its own
+relayed frames can support, which is not the same statement.** `proxyNative`
+forwards the client's own body unmodified (only the `model` field is ever
+rewritten, and losslessly), so neither parameter is ever added on this path;
+`timings_per_token` is read when the client set it and never injected, which is
+a decision with its own reasons rather than an omission (see "Two rules on this
+path must survive any later change" above). A **buffered** passthrough request
+allocates no `Progress` counter for its `ActiveRequest`, and `liveProgressDTO`
+resolves it to "not measured" exactly as it does a non-streaming translated
+call — nil deliberately, not an allocated permanently-zero struct. A
+**streaming** one does allocate a counter, and what it can then honestly report
+is the per-flavor table above. Everything native passthrough reports comes from
+reading the *response* rather than from asking for anything extra in the
+request: `mergePassthroughUsage` now also reads llama.cpp's `timings` object off
+the Responses shape, and — for the Anthropic shape, which carries no timings on
+any frame — `usageScanner`
 derives a rate from the exact output-token count over the generation window
 (first content frame → last observed byte), mirroring the benchmark runner's
 own arithmetic — literally the same `minGatewayRateWindow` floor, not merely
@@ -1424,6 +1546,16 @@ count at all. Without that gate, a stream that closed cleanly but reported
 only `message_start` would derive `1 / 20s` and present it as measured. This
 is the same "only from an exact count" rule the rest of the feature applies,
 aimed at *which* count is authoritative.
+
+**The same gate now governs both columns.** `usageScanner.publishProgress`
+publishes an output-token count to the live counter only from an authoritative
+frame, for a sharper version of the identical reason: the recorded row can
+tolerate a placeholder because it is presented as a *count*, whereas
+`liveProgressDTO` would divide that `1` by the generation window and DISPLAY the
+quotient as a measured *rate* for the rest of the stream. One predicate, one
+definition per flavor, two consumers — which is also why the predicate's
+Responses branch must not be deleted as unused: the recorded rate is
+Anthropic-only, so the live column is that branch's only reader.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds

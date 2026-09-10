@@ -357,13 +357,30 @@ dispatch-time decision:
 The client's own bearer token is **never** forwarded upstream; only
 `Content-Type` and — via `provider.WithUpstreamAuth` — the resolved
 application's own per-app upstream credential (if configured) are set on the
-outbound request. Usage accounting on this path is best-effort:
-`parsePassthroughUsage` (`internal/gateway/native_passthrough.go`) scrapes
-token counts out of the (possibly truncated, capped at `captureMaxBytes`) tee'd
-response body, per-flavor (`response.usage`/`input_tokens_details.cached_tokens`
-for Responses; `message.usage`/`cache_read_input_tokens`/
-`cache_creation_input_tokens` for Anthropic, folded back into the
-OpenAI-canonical `InputTokens`).
+outbound request. Usage accounting on this path is best-effort: a
+`usageScanner` (`internal/gateway/passthrough_usage_scan.go`) merges token
+counts out of the response's bytes as they are copied to the client, per-flavor
+(`response.usage`/`input_tokens_details.cached_tokens` for Responses;
+`message.usage`/`cache_read_input_tokens`/`cache_creation_input_tokens` for
+Anthropic, folded back into the OpenAI-canonical `InputTokens`). That is its own
+incremental scan rather than a single pass over the capture tee's capped buffer,
+which used to drop even the terminal count on a response longer than
+`captureMaxBytes`.
+
+**The panel's live figures are no longer part of the trade-off — except where
+the wire cannot honestly supply them.** Choosing `passthrough` used to cost the
+running-connections panel's live TTFT and tokens/sec entirely: the per-request
+counter was allocated only on the translate path, so every in-flight
+`/v1/responses` and `/v1/messages` row read "not measured". A **streaming**
+passthrough request now carries that counter, fed from the frames the usage
+scanner is already parsing, so what `passthrough` costs is only what its own
+wire cannot supply: no mid-stream token count on the Responses shape unless the
+client itself asked llama.cpp for `timings_per_token`, and nothing at all on a
+**buffered** response, which has no frames to time. The per-flavor detail, and
+the two rules that keep it honest — the relayed body is never augmented to
+improve a display column, and no in-flight figure ever becomes a routing
+input — are in [Telemetry, Usage Analytics & Observability
+§8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
 
 ## 7. Streaming lifecycle
 

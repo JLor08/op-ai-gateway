@@ -287,13 +287,14 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// however tempting that looks: it is what makes the upstream attach a
 	// `timings` object to PARTIAL Responses frames, and therefore the only
 	// source of a live tokens/sec figure for an /v1/responses passthrough
-	// stream (see the per-flavor table in
-	// docs/superpowers/specs/2026-09-10-passthrough-progress-design.md). The
-	// flag is READ when the client set it and never set here. Injecting it would
-	// change the upstream's response shape — new frames' worth of fields the
-	// client never asked for, flowing through to a client that must parse them —
-	// to improve a gateway display column. A missing live rate is rendered as
-	// "not measured" and is honest; a silently rewritten client request is not.
+	// stream (see the per-flavor table under "Native passthrough is on this panel
+	// too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
+	// §8.4.3). The flag is READ when the client set it and never set here.
+	// Injecting it would change the upstream's response shape — new frames' worth
+	// of fields the client never asked for, flowing through to a client that must
+	// parse them — to improve a gateway display column. A missing live rate is
+	// rendered as "not measured" and is honest; a silently rewritten client
+	// request is not.
 	upstreamBody := rewriteModelField(raw, target.ProviderModel)
 
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream

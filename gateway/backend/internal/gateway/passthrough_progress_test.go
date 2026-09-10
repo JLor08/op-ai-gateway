@@ -18,9 +18,10 @@ import (
 )
 
 // The tests in this file pin the per-flavor completeness table in
-// docs/superpowers/specs/2026-09-10-passthrough-progress-design.md §3 — the one
-// that says what a NATIVE-PASSTHROUGH streaming request can honestly report on
-// the running-connections panel, per API flavor. The asymmetry between the two
+// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3, under
+// "Native passthrough is on this panel too" — the one that says what a
+// NATIVE-PASSTHROUGH streaming request can honestly report on the
+// running-connections panel, per API flavor. The asymmetry between the two
 // columns is the design, so each row is asserted in BOTH directions: a value
 // where one exists, and an explicit absence where none does. A later change that
 // satisfied the Responses column by counting delta frames as tokens, or by
