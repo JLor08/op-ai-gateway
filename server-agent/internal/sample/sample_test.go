@@ -636,6 +636,72 @@ func TestNormalizeForcesVerdictsNonNil(t *testing.T) {
 	}
 }
 
+// TestCapabilitiesSourceRidesTheWireWithoutCollapsingNilVsEmpty pins the
+// three properties Capabilities.Source has to have at once (#54):
+//
+//  1. a reported source rides the wire under the key "source", verbatim --
+//     the gateway attributes its capability rows to it, and the two modules
+//     share no code, so the STRING is the whole contract;
+//  2. an UNREPORTED source omits the key (omitempty) while "verdicts" stays
+//     present, so a non-nil-but-empty Capabilities still says "detection ran
+//     and determined nothing" rather than decoding as the nil an agent that
+//     predates capability detection sends. That nil-vs-empty distinction is
+//     what RuntimeSample.Capabilities is a POINTER for, and a new field must
+//     not be able to erase it;
+//  3. Normalize invents nothing here. An empty Source carries the fact that
+//     the producer never named one, which is the cue the gateway's default
+//     reads; defaulting it agent-side would destroy that.
+func TestCapabilitiesSourceRidesTheWireWithoutCollapsingNilVsEmpty(t *testing.T) {
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{SpecID: "rspec_sourced", Capabilities: &Capabilities{Source: CapabilitySourceOllamaAPIShow}},
+			{SpecID: "rspec_unsourced", Capabilities: &Capabilities{}},
+			{SpecID: "rspec_no_detection"},
+		},
+	}
+	s.Normalize()
+
+	if got := s.Runtimes[1].Capabilities.Source; got != "" {
+		t.Errorf("Normalize set an unreported Source to %q, want it left empty -- the gateway's own default reads that emptiness", got)
+	}
+
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var probe struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 3 {
+		t.Fatalf("probe runtimes len = %d, want 3", len(probe.Runtimes))
+	}
+
+	sourced := map[string]json.RawMessage{}
+	if err := json.Unmarshal(probe.Runtimes[0]["capabilities"], &sourced); err != nil {
+		t.Fatalf("unmarshal sourced capabilities: %v", err)
+	}
+	if got := string(sourced["source"]); got != `"ollama_api_show"` {
+		t.Errorf("runtimes[0].capabilities.source = %s, want \"ollama_api_show\" (the literal the gateway matches on)", got)
+	}
+
+	unsourced := map[string]json.RawMessage{}
+	if err := json.Unmarshal(probe.Runtimes[1]["capabilities"], &unsourced); err != nil {
+		t.Fatalf("unmarshal unsourced capabilities: %v", err)
+	}
+	if _, ok := unsourced["source"]; ok {
+		t.Errorf("runtimes[1].capabilities carries a \"source\" key (%s), want it omitted", probe.Runtimes[1]["capabilities"])
+	}
+	if _, ok := unsourced["verdicts"]; !ok {
+		t.Errorf("runtimes[1].capabilities = %s, want a present \"verdicts\" key -- without it a non-nil-but-empty Capabilities would be indistinguishable from an absent one", probe.Runtimes[1]["capabilities"])
+	}
+	if _, ok := probe.Runtimes[2]["capabilities"]; ok {
+		t.Errorf("runtimes[2] carries a \"capabilities\" key (%s), want it omitted entirely -- that absence is how an agent predating capability detection is told apart from one that detected nothing", probe.Runtimes[2]["capabilities"])
+	}
+}
+
 func TestNormalizeDefaultsEmpty(t *testing.T) {
 	var s Sample
 	s.Normalize()

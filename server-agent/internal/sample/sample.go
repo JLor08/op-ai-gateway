@@ -187,6 +187,45 @@ type RuntimeSample struct {
 // entries are derived from (agent.go's capabilitiesSample).
 type Capabilities struct {
 	Verdicts []CapabilityVerdict `json:"verdicts"`
+	// Source names the PROBE that produced this verdict set -- one of the
+	// CapabilitySource* constants below -- so the gateway ATTRIBUTES the
+	// capability rows it writes to the probe that actually ran instead of
+	// re-deriving the provenance from the spec type it pushed itself (#54).
+	// The agent knows which endpoint it read; the gateway cannot, and a
+	// second copy of that branch condition in a second module is exactly
+	// the drift this field exists to avoid. What is at stake is not
+	// cosmetic: the source is the operator-visible provenance column and
+	// the input to the store's precedence rank, so an Ollama-declared
+	// verdict stamped "llama_cpp_props" is a false attribution on the one
+	// column that exists to say who said this.
+	//
+	// On the WRAPPER, not on each CapabilityVerdict: one probe reads ONE
+	// document and every verdict in the set is derived from those same
+	// bytes, so one source describes the whole set. A per-verdict source
+	// could express a mixed-provenance set no probe can produce.
+	//
+	// omitempty, and it CANNOT collapse the nil-vs-non-nil-but-empty
+	// distinction RuntimeSample.Capabilities' pointer exists for: Verdicts
+	// carries no omitempty and Normalize forces it non-nil, so a non-nil
+	// Capabilities always marshals as at least {"verdicts":[]} ("detection
+	// ran, determined nothing") while a nil pointer omits the key entirely
+	// ("this agent predates capability detection"). Only making Source the
+	// sole field, or giving Verdicts an omitempty of its own, could merge
+	// those two facts.
+	//
+	// Normalize deliberately does NOTHING to this field. Its rules exist to
+	// stop a nil SLICE marshalling as JSON null, which a string cannot do;
+	// and defaulting an empty Source to a probe name here would destroy the
+	// one fact an empty Source carries -- "the producer never reported a
+	// source" -- which is precisely the cue the gateway's own documented
+	// default reads.
+	//
+	// The vocabulary is CLOSED, unlike the capability NAMES above: the
+	// gateway accepts only the sources a probe may legitimately claim and
+	// drops the rows otherwise (see the gateway's rowSource), because a
+	// fabricated provenance is worse than no row at all. A future probe
+	// therefore adds its constant on BOTH sides.
+	Source string `json:"source,omitempty"`
 }
 
 // CapabilityVerdict is one capability's answer: Verdict is "yes" or "no" and
@@ -196,6 +235,24 @@ type CapabilityVerdict struct {
 	Name    string `json:"name"`
 	Verdict string `json:"verdict"`
 }
+
+// Capability verdict SOURCES: the closed vocabulary Capabilities.Source
+// draws from, one name per probe the agent can run. Mirrors the gateway's
+// routing.CapabilitySourceLlamaCppProps / CapabilitySourceOllamaAPIShow
+// byte-for-byte -- the two modules cannot share code, so the STRINGS are
+// the contract, and a rename on one side silently voids every row the other
+// side would have written. Their gateway-side doc carries the precedence
+// rank these names feed; nothing here ranks anything.
+const (
+	// CapabilitySourceLlamaCppProps is a GET of a llama.cpp /props document
+	// (collector.ProbePropsVerdicts) -- every spec type except "ollama",
+	// "custom" included, since "custom" is the type-detection fallback.
+	CapabilitySourceLlamaCppProps = "llama_cpp_props"
+	// CapabilitySourceOllamaAPIShow is a POST of Ollama's /api/show
+	// (collector.ProbeOllamaVerdicts): what Ollama DECLARES about a model,
+	// a different document answering the same question.
+	CapabilitySourceOllamaAPIShow = "ollama_api_show"
+)
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring
 // proxy.RouteStatus (Listen, TLSActive, State) for the wire. Carries no
