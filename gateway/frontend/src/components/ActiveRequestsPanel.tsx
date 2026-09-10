@@ -42,19 +42,23 @@ function formatLiveTps(value: number): string {
 // upstream-reported rate and a gateway-computed one are different measurements of
 // the same thing and must not be silently mixed.
 //
-// The EMPTY source is the one branch that must not name a cause. The same absence
-// arises from two unrelated situations and nothing on this DTO separates them: a
-// translated stream whose provider reports neither an exact count nor a rate, and a
-// native-passthrough openai_responses stream whose CLIENT did not set
-// `timings_per_token` — where the very same llama.cpp upstream would have attached
-// its own `timings` to the partial frames had it been asked (the per-flavor table in
-// the passthrough-progress spec spells this out). `api_flavor` cannot tell the two
-// apart, because a translated /v1/responses request carries the same string, and no
-// field records what the client asked for. So activityLiveTpsNone states the two
-// facts this surface can actually observe — no upstream rate, and no exact count to
-// derive one from — and names both dependency axes without asserting which applies.
-// That also keeps it true for a row that is merely EARLY: the first content frame
-// has landed (so there is a TTFT) but no frame carrying a figure has.
+// The EMPTY source is the one branch that must not name a cause. `provider_path`
+// DOES distinguish native passthrough from translation — it differs from `req_path`
+// exactly when translation is happening — but that is not the axis this absence
+// turns on: nothing on this DTO records whether the client set `timings_per_token`,
+// and no flavor-plus-mode combination narrows the absence to a single cause. The
+// same empty source arises from a translated stream whose provider reports neither
+// an exact count nor a rate; from a native-passthrough openai_responses stream whose
+// CLIENT did not ask for timings, where the very same llama.cpp upstream would have
+// attached its own `timings` to the partial frames had it been asked (the per-flavor
+// table in the passthrough-progress spec spells this out); from a row that is merely
+// EARLY, the first content frame having landed (so there is a TTFT) with no figure
+// yet; and from a row whose exact count HAS arrived but whose generation window is
+// still under the gateway's derivation floor. So activityLiveTpsNone claims only
+// what holds across all of them — no rate reported, none derivable yet — and names
+// both dependency axes without asserting which applies. Note the second clause is
+// about the DERIVATION, not about the count: on that last row an exact count exists,
+// so a sentence denying one would be false there.
 function liveTpsTitle(t: Translation, a: ActiveRequest): string {
   if (a.tokens_per_second_source === 'upstream') return t.activityLiveTpsUpstream;
   if (a.tokens_per_second_source === 'gateway') {

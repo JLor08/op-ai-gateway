@@ -145,19 +145,40 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // neither figure — api_flavor is identical for a translated and a
     // passed-through /v1/responses request, and no field records what the client
     // asked for — so the string must not assert either cause.
-    expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream reports/i);
-    expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream meldet/i);
+    //
+    // Deliberately broader than the old literal: pinning the full phrase would let a
+    // reworded "the upstream does not report a count mid-stream" reintroduce the same
+    // false cause and still pass. The demonstrative is what does the blaming, so it is
+    // what is banned — the honest string says "the upstream" / "vom Upstream" as one of
+    // two dependency axes, never "this upstream" / "dieser Upstream" as the reason.
+    expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream/i);
   });
 
   it('keeps the not-measured framing and names the client as a factor, in both locales', () => {
-    // "Not measured" (never a zero) plus the two facts this surface can observe:
-    // no upstream rate, and no exact count to derive one from. The client is named
-    // as one of the two dependency axes, which is what stops the sentence reading
-    // as an upstream limitation.
+    // "Not measured" (never a zero) plus the two facts this surface can observe: the
+    // server reported no rate, and none could be DERIVED yet. The second clause is
+    // deliberately about the derivation and not about the count's existence — a row
+    // whose exact count has arrived inside the gateway's 50ms derivation floor
+    // reaches this same string with a positive count, so "no count to derive one
+    // from" would be false there. The client is named as one of the two dependency
+    // axes, which is what stops the sentence reading as an upstream limitation.
     expect(messages.en.activityLiveTpsNone).toMatch(/not measured/i);
     expect(messages.en.activityLiveTpsNone).toMatch(/client/i);
     expect(messages.de.activityLiveTpsNone).toMatch(/nicht gemessen/i);
     expect(messages.de.activityLiveTpsNone).toMatch(/client/i);
+  });
+
+  it('denies only the derivation, never the existence of an exact count', () => {
+    // The DTO reaches this string with a POSITIVE output_tokens whenever it is built
+    // inside the gateway's 50ms derivation floor of the first content frame
+    // (liveProgressDTO's final return). On that row an exact count exists, so a
+    // clause reading "no exact token count to derive one from" — which this string
+    // carried for one round — is false for a reachable state, the same class of
+    // defect as naming the wrong cause above. What is absent there is the
+    // derivation, not the count.
+    expect(messages.en.activityLiveTpsNone).not.toMatch(/no exact token count/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/keine exakte Tokenzahl/i);
   });
 
   it('leaves the upstream-reported string free of any token claim', () => {

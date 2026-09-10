@@ -187,6 +187,11 @@ describe('ActiveRequestsPanel live metrics columns', () => {
 // change can satisfy a cell by counting SSE deltas as tokens: with the upstream's
 // exact count asserted on the row, a delta-derived contribution shows up as a
 // wrong number rather than merely as a number where there should be none.
+//
+// The api_flavor / req_path / provider_path / output_tokens fields in these fixtures
+// document which real row each case IS; they are not flavor coverage, because the
+// asserted cells do not read them — the panel renders the live cells from
+// tokens_per_second, its source and ttft_ms alone.
 describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   it('shows a TTFT beside an em-dash rate when the stream has a first-content stamp and nothing else', () => {
     // openai_responses passthrough, mid-generation, client did NOT set
@@ -340,7 +345,18 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
     );
 
     const row = screen.getByRole('cell', { name: 'live-model' }).closest('tr')!;
-    expect(within(row).getAllByRole('cell', { name: '—' })).toHaveLength(2);
+    // Both cells are addressed individually rather than by counting em-dashes in the
+    // row: the stream column renders an EN dash for `stream: false`, so a count would
+    // hold only while two visually near-identical glyphs stay distinct — normalising
+    // them, a plausible cosmetic edit, would fail here as a phantom live-cell
+    // regression. The live_tps cell is the one carrying the provenance tooltip; the
+    // ttft cell carries none, so it is taken positionally off its own column header
+    // (ListTable renders header and body cells from the same visible-column list).
+    expect(within(row).getByTitle(t.activityLiveTpsNone).textContent).toBe('—');
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+    const ttftIndex = headers.findIndex((h) => h.includes(t.activityColTTFT));
+    expect(ttftIndex).toBeGreaterThanOrEqual(0);
+    expect(within(row).getAllByRole('cell')[ttftIndex].textContent).toBe('—');
     expect(within(row).queryByRole('cell', { name: '0' })).not.toBeInTheDocument();
     expect(within(row).queryByRole('cell', { name: '0 ms' })).not.toBeInTheDocument();
   });
