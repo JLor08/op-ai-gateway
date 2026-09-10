@@ -1076,13 +1076,26 @@ type CapabilityRow struct {
 // manifest-declared names through verbatim), and those are stored and
 // displayed as-is rather than dropped. These constants exist only for the
 // capabilities the code itself reasons about.
+//
+// CapabilitySpeculationObserved is the odd one out, deliberately: every other
+// name above is something a build or a manifest DECLARES, while this one is an
+// OBSERVATION of a deployment that already served traffic -- a relayed
+// completion whose own usage reported drafted tokens
+// (inference.Usage.DraftTokens, llama.cpp's timings.draft_n), which is
+// evidence that the endpoint behind that mapping runs speculative decoding.
+// It is INFORMATION ONLY: nothing routes, scores or filters on it, and it is
+// not CapabilityMTP above (a different proposition -- "the model ships an MTP
+// head" -- which is display-only itself and no longer feeds routing either).
+// Its verdict is structurally positive-only; CapabilitySourceLlamaCppTimings
+// below carries the reason there is no honest "no" for it.
 const (
-	CapabilityVision       = "vision"
-	CapabilityVideo        = "video"
-	CapabilityAudio        = "audio"
-	CapabilityTools        = "tools"
-	CapabilityMTP          = "mtp"
-	CapabilityLiveProgress = "live_progress"
+	CapabilityVision              = "vision"
+	CapabilityVideo               = "video"
+	CapabilityAudio               = "audio"
+	CapabilityTools               = "tools"
+	CapabilityMTP                 = "mtp"
+	CapabilityLiveProgress        = "live_progress"
+	CapabilitySpeculationObserved = "speculation_observed"
 )
 
 // Capability verdicts.
@@ -1122,11 +1135,34 @@ const (
 // (see server-agent's collector.detectOllamaCapabilities). A row with this
 // source and verdict CapabilityNo could therefore not have come from that
 // probe.
+//
+// CapabilitySourceLlamaCppTimings names the third probe-rank source: the
+// `timings` object llama.cpp attaches to a completion it has just SERVED, read
+// off relayed traffic rather than fetched (inference.Usage.DraftTokens carries
+// timings.draft_n; the gateway writes the row from the request path). It is
+// named for the document it read, exactly as llama_cpp_props and
+// ollama_api_show are and for the same reason: an operator reading
+// "llama_cpp_props" on a verdict that came from a served response's timings
+// would be reading a false provenance. It too ranks 1 through
+// capabilitySourceRank's DEFAULT branch (no rank-table entry, and none is
+// wanted) -- never able to overwrite manual (3) or vision_benchmark (2),
+// always able to repair its own drift (1 vs 1).
+//
+// Its one-directionality is stronger than ollama_api_show's above: not a
+// detector's habit but the wire format itself. llama.cpp emits draft_n only
+// under `if (n_draft_tokens > 0)`, so when speculation is off the key is
+// ABSENT rather than 0 -- and absence is equally what a cache hit, a short
+// completion, a stream without its usage chunk, an error, or any non-llama.cpp
+// upstream produce. No wire state means "confirmed not speculating", so a row
+// with this source can only ever carry CapabilityYes: a CapabilityNo on it
+// could not have come from anywhere real, and would be a permanent false
+// claim ranked as a probe verdict.
 const (
 	CapabilitySourceManual          = "manual"
 	CapabilitySourceVisionBenchmark = "vision_benchmark"
 	CapabilitySourceLlamaCppProps   = "llama_cpp_props"
 	CapabilitySourceOllamaAPIShow   = "ollama_api_show"
+	CapabilitySourceLlamaCppTimings = "llama_cpp_timings"
 	CapabilitySourceLegacy          = "legacy"
 )
 
@@ -1142,14 +1178,17 @@ const (
 //	                                   answer read back.
 //	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same document
 //	   CapabilitySourceOllamaAPIShow,  (llama.cpp's /props, Ollama's
-//	   CapabilitySourceLegacy,         /api/show), or a migrated heuristic,
-//	   or any unrecognised source      every time. Both probes and an
-//	                                   unrecognised source rank here -- fail
-//	                                   SAFE toward "treat it as a probe"
-//	                                   rather than silently handing an
+//	   CapabilitySourceLegacy,         /api/show) every time, reads the
+//	   CapabilitySourceLlamaCppTimings timings llama.cpp put on a completion
+//	   or any unrecognised source      it just served, or replays a migrated
+//	                                   heuristic. EVERY probe source ranks
+//	                                   here, and so does an unrecognised one
+//	                                   -- fail SAFE toward "treat it as a
+//	                                   probe" rather than silently handing an
 //	                                   unknown writer manual's immunity,
-//	                                   which is also why ollama_api_show
-//	                                   needs no case of its own below.
+//	                                   which is also why neither
+//	                                   ollama_api_show nor llama_cpp_timings
+//	                                   needs a case of its own below.
 //	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
 //
 // WritableCapabilityRows is the only caller: a write is permitted iff
