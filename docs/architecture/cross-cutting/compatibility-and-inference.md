@@ -384,7 +384,6 @@ never augmented to improve a display column, and no in-flight figure ever
 becomes a routing input — are in [Telemetry, Usage Analytics & Observability
 §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
 
-
 ## 7. Streaming lifecycle
 
 ```mermaid

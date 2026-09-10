@@ -115,7 +115,6 @@ differs, and `openai_responses` differs again on its terminal frame — see the
 per-flavor table in
 [§8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests).
 
-
 #### Token model settings
 
 User tokens and service tokens carry the same per-token model-settings **fields**,
