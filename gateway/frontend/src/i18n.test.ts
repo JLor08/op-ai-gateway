@@ -149,10 +149,15 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // Deliberately broader than the old literal: pinning the full phrase would let a
     // reworded "the upstream does not report a count mid-stream" reintroduce the same
     // false cause and still pass. The demonstrative is what does the blaming, so it is
-    // what is banned — the honest string says "the upstream" / "vom Upstream" as one of
-    // two dependency axes, never "this upstream" / "dieser Upstream" as the reason.
+    // what is banned — the honest string names the server as one of two dependency
+    // axes ("the upstream" in en, "vom Inferenzserver" in de, which uses that one term
+    // throughout the sentence rather than mixing it with the anglicism), never "this
+    // upstream" / "dieser Inferenzserver" as the reason. The German term is banned in
+    // any declension, and the anglicism's ban stays so the guard does not go quiet if
+    // the wording is ever swapped back to "Upstream".
     expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream/i);
     expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream/i);
+    expect(messages.de.activityLiveTpsNone).not.toMatch(/dies\w* Inferenzserver/i);
   });
 
   it('keeps the not-measured framing and names the client as a factor, in both locales', () => {

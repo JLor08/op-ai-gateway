@@ -1806,7 +1806,7 @@ const de = {
   activityLiveTpsUpstream: 'Vom Inferenzserver gemeldet',
   activityLiveTpsGateway: 'Vom Gateway berechnet aus {n} vom Server gemeldeten Tokens',
   activityLiveTpsNone:
-    'Nicht gemessen — der Inferenzserver hat keine Rate gemeldet, und es konnte noch keine berechnet werden; beides hängt vom Upstream und von der Anfrage des Clients ab',
+    'Nicht gemessen — der Inferenzserver hat keine Rate gemeldet, und es konnte noch keine berechnet werden; beides hängt vom Inferenzserver und von der Anfrage des Clients ab',
   activityColPath: 'Pfad',
   activityColContentType: 'Content-Type',
   activityColCached: 'Cached',
