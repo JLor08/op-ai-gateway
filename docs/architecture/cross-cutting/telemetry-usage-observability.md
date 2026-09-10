@@ -1372,10 +1372,10 @@ be kept apart:** the *stream's* terminal `response.completed` frame carries
 `timings`, while the **non-streaming** `/v1/responses` body carries no
 `timings` object at all — as no Anthropic shape and no ASR response does
 either, so `DraftTokens` stays 0 on all of them whatever the upstream is
-actually doing. The code has exactly three
-read sites for the counter, one per shape on that list and none on a
-non-streaming Responses body: two in `provider/openai_compatible.go` (the
-chat body and the chat stream's chunks) and `mergeResponsesUsage`
+actually doing. The code has exactly three read sites for the counter, one per
+shape on that list and none on a non-streaming Responses body: two in
+`provider/openai_compatible.go` (the chat body and the chat stream's chunks)
+and `mergeResponsesUsage`
 (`internal/gateway/native_passthrough.go`, the Responses stream's frames).
 `inference.Usage.DraftTokens` carries it, and `recordUsage`
 (`internal/gateway/inference_complete.go`) records one
