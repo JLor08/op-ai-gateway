@@ -179,9 +179,10 @@ describe('ActiveRequestsPanel live metrics columns', () => {
 
 // The row shapes a NATIVE-PASSTHROUGH stream puts on this panel, one test per
 // cell of the per-flavor table in
-// docs/superpowers/specs/2026-09-10-passthrough-progress-design.md §3. Three of
-// them reach the panel for the first time with the passthrough bridge: the DTO's
-// keys did not change, but these COMBINATIONS of them did not previously occur.
+// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3, under
+// "Native passthrough is on this panel too". Three of them reach the panel for the
+// first time with the passthrough bridge: the DTO's keys did not change, but these
+// COMBINATIONS of them did not previously occur.
 //
 // Each pins the absence as hard as the value, in both directions, so no later
 // change can satisfy a cell by counting SSE deltas as tokens: with the upstream's

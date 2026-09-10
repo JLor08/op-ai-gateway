@@ -668,7 +668,9 @@ that cell (`activityLiveTpsNone`, `i18n.ts`) names none:
 3. the first-content stamp exists and no frame has reported a figure of any
    kind yet;
 4. the first-content stamp exists and an **exact count has already arrived**,
-   but the window since that stamp is still under the 50 ms floor.
+   no upstream rate arrived with it (an upstream-reported figure is checked
+   first and would win), and the window since that stamp is still under the
+   50 ms floor.
 
 State 4 is why the tooltip's second clause denies the *derivation* rather than
 the count's existence: on that row an exact count really is present, so a
@@ -721,22 +723,33 @@ mid-stream one, and it is not suppressed for arriving late.**
 `response.completed` carries the upstream's own final
 `response.usage.output_tokens`, and that count IS published — the Responses
 branch of `isTerminalUsageFrame` is load-bearing for the live column, not only
-for the recorded row — so the count, and a `gateway`-labelled rate derived from
-it, appear on the still-active row for the short window between that frame and
-`proxyNative`'s deferred `Active.Remove`. The honest one-line reading of the
-column is therefore "nothing to show mid-stream unless the client asked for it",
-not "nothing to show". There is no reason to hide the terminal figure for the
-seconds it is visible: it is the upstream's own count over the real generation
-window — the same quantity, the same arithmetic and the same `gateway` label the
-Anthropic column carries throughout its stream. The asymmetry between the two
-columns is the design, not a shortfall to be papered over, and both rows are
-pinned in both directions (`passthrough_progress_test.go`) — the value where one
-exists and the explicit absence where none does — so a later change cannot
-quietly satisfy the Responses column by counting deltas. Pinning the terminal
-cell is what makes "a delta is not a token" testable at its sharpest: with the
-upstream's exact count on the row, a delta-derived contribution added to it
-shows up as a wrong number rather than merely as a number where there should be
-none.
+for the recorded row — so the count, and a rate alongside it, appear on the
+still-active row for the short window between that frame and `proxyNative`'s
+deferred `Active.Remove`. The honest one-line reading of the column is
+therefore "nothing to show mid-stream unless the client asked for it", not
+"nothing to show". **Which label that rate carries is the upstream's choice,
+and on llama.cpp it is `upstream`, not `gateway`.** The terminal
+`response.completed` frame is one of the three shapes llama.cpp bolts a
+`timings` object onto, with no dependence on `timings_per_token` — that flag
+governs the PARTIAL frames (see "One verdict is OBSERVED off relayed traffic
+rather than fetched from a document" further down, which keeps the Responses
+stream/non-stream pair apart for exactly this reason). `mergeResponsesUsage`
+lifts that frame's `predicted_per_second`, `publishProgress` passes THIS
+frame's rate through, and `liveProgressDTO`'s `upstream` branch is checked
+before its window derivation, so it wins. A `gateway`-labelled rate on that
+cell is what an upstream whose terminal frame carries no `timings` of its own
+produces instead. Either way there is no reason to hide the terminal figure for
+the seconds it is visible: the count is the upstream's own and the rate is a
+real measurement over the real generation window, which is the same argument
+the Anthropic column rests on throughout its stream. The asymmetry between the
+two columns is the design, not a shortfall to be papered over, and both rows
+are pinned in both directions (`passthrough_progress_test.go`) — the value
+where one exists and the explicit absence where none does — so a later change
+cannot quietly satisfy the Responses column by counting deltas. The terminal
+cell is pinned for both upstreams, and pinning it is also what makes "a delta
+is not a token" testable at its sharpest: with the upstream's exact count on
+the row, a delta-derived contribution added to it shows up as a wrong number
+rather than merely as a number where there should be none.
 
 **Two rules on this path must survive any later change.** Neither is enforceable
 by shape, so tests pin both:

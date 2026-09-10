@@ -51,12 +51,23 @@ function formatLiveTps(value: number): string {
 // an exact count nor a rate; from a native-passthrough openai_responses stream whose
 // CLIENT did not ask for timings, where the very same llama.cpp upstream would have
 // attached its own `timings` to the partial frames had it been asked (the per-flavor
-// table in the passthrough-progress spec spells this out); from a row that is merely
-// EARLY, the first content frame having landed (so there is a TTFT) with no figure
-// yet; and from a row whose exact count HAS arrived but whose generation window is
-// still under the gateway's derivation floor. So activityLiveTpsNone claims only
-// what holds across all of them — no rate reported, none derivable yet — and names
-// both dependency axes without asserting which applies. Note the second clause is
+// table in docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3,
+// under "Native passthrough is on this panel too", spells this out); from a row that
+// is merely EARLY, the first content frame having landed (so there is a TTFT) with no
+// figure yet; and from a row whose exact count HAS arrived but whose generation window
+// is still under the gateway's derivation floor.
+//
+// Those four are CAUSES, not the four STATES the same section enumerates under
+// "Exactly four states produce an empty `tokens_per_second_source`" — that list
+// partitions the same emptiness by liveProgressDTO's BRANCHES, so the first three
+// causes here all land in its state 3 (a stamped row with nothing reported — before
+// the stamp the same row is its state 2) and only the last is its state 4. The two
+// lists are cross-referenced on purpose: two independent enumerations of one absence
+// would drift.
+//
+// So activityLiveTpsNone claims only what holds across all of them — no rate
+// reported, none derivable yet — and names both dependency axes without asserting
+// which applies. Note the second clause is
 // about the DERIVATION, not about the count: on that last row an exact count exists,
 // so a sentence denying one would be false there.
 function liveTpsTitle(t: Translation, a: ActiveRequest): string {

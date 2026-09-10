@@ -107,12 +107,14 @@ for the provenance rule and why some paths never populate them):
 | `tokens_per_second_source` | string | `""` | How the rate was obtained: `upstream` (the inference server reported it), `gateway` (computed here from the upstream's exact token count), or `""` (not measured). Always present, never omitted. |
 | `ttft_ms` | int | `0` | Milliseconds from request start to the first content delta. |
 
-All four are populated for a **streaming native-passthrough** request as well as
-a translated one, read out of the relayed response's own frames. A **buffered**
-passthrough request carries no progress at all and reports the "not measured"
-column above. What each API flavor can supply *mid-stream* differs, and
-`openai_responses` differs again on its terminal frame — see the per-flavor
-table in [§8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests).
+All four are **reachable** for a **streaming native-passthrough** request as
+well as a translated one, read out of the relayed response's own frames. A
+**buffered** passthrough request carries no progress at all and reports the
+"not measured" column above. What each API flavor can supply *mid-stream*
+differs, and `openai_responses` differs again on its terminal frame — see the
+per-flavor table in
+[§8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests).
+
 
 #### Token model settings
 

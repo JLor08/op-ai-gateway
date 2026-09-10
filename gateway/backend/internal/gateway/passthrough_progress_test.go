@@ -463,59 +463,102 @@ func TestPassthroughLiveProgressWritesNoRoutingInput(t *testing.T) {
 // `response.usage.output_tokens`, isTerminalUsageFrame accepts it, and
 // publishProgress therefore puts it on the row. For the brief window between
 // that frame and proxyNative's deferred Active.Remove, the still-active row
-// displays that count AND the window rate liveProgressDTO derives from it.
+// displays that count AND a rate.
 //
-// That is deliberate, not a leak: the figure is the upstream's own count over
-// the real generation window — the same arithmetic and the same `gateway` label
-// the Anthropic column carries for its whole stream. Only the mid-stream cells
-// are empty here.
+// WHICH rate — and so which label — is the upstream's choice, and both cases
+// below are real upstreams rather than one real and one hypothetical:
+//
+//   - llama.cpp, the upstream this gateway is built for, attaches its own
+//     `timings` object to the terminal `response.completed` frame with NO
+//     dependence on the client's `timings_per_token`; that flag governs the
+//     PARTIAL frames. (It is one of the three shapes llama.cpp attaches
+//     `timings` to — see "One verdict is OBSERVED off relayed traffic rather
+//     than fetched from a document" in telemetry-usage-observability.md §8.4.3,
+//     which keeps the Responses stream/non-stream pair apart for exactly this
+//     reason.) mergeResponsesUsage lifts `predicted_per_second` off that frame,
+//     publishProgress passes THIS frame's rate through, and the row therefore
+//     shows the upstream's own measurement, labelled "upstream".
+//   - An upstream whose terminal frame carries no `timings` of its own leaves
+//     upstreamTPSMilli at 0, so liveProgressDTO's window derivation over the
+//     upstream's exact count is the only source and the label is "gateway".
+//
+// Either way the COUNT is the upstream's own 40, and the rate is a real
+// measurement over the real generation window — which is why the figure is not
+// suppressed for arriving late. Only the mid-stream cells are empty here.
 //
 // It is also where "a delta is not a token" is pinned at its sharpest. The other
 // two Responses tests assert an ABSENT count, which an implementation could
-// satisfy by publishing nothing at all; this one asserts the displayed count is
-// EXACTLY the upstream's 40 while two content deltas went past, so any
-// gateway-counted contribution added to the upstream's figure shows up here as
-// 42.
+// satisfy by publishing nothing at all; both cases here assert the displayed
+// count is EXACTLY the upstream's 40 while two content deltas went past, so any
+// gateway-counted contribution added to the upstream's figure shows up as 42.
 func TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves(t *testing.T) {
-	var got liveRow
-	prov := &progressObservingProxyProvider{
-		pieces: []string{
-			"event: response.output_text.delta\n" +
-				`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n",
-			"event: response.output_text.delta\n" +
-				`data: {"type":"response.output_text.delta","delta":" there"}` + "\n\n",
-			"event: response.completed\n" +
-				`data: {"type":"response.completed","response":{"id":"resp_x","usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}}}` + "\n\n",
+	const terminalUsage = `"response":{"id":"resp_x","usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}}`
+	for _, tc := range []struct {
+		name string
+		// terminalFrame is the whole response.completed payload, the two cases
+		// differing ONLY in whether it carries a `timings` object of its own.
+		terminalFrame string
+		wantSource    string
+		// wantTPS is the exact rate expected, or 0 for "any positive rate" —
+		// the gateway derivation's value depends on wall-clock pacing.
+		wantTPS float64
+	}{
+		{
+			name:          "llama.cpp: the terminal frame carries its own timings",
+			terminalFrame: `{"type":"response.completed",` + terminalUsage + `,"timings":{"prompt_per_second":120.5,"predicted_per_second":38.25}}`,
+			wantSource:    "upstream",
+			wantTPS:       38.25,
 		},
-		gap: framePacing,
-	}
-	srv := newNativeProxyTestServer(prov, true, false)
-	prov.observe = func() { got = snapshotLiveRow(t, srv) }
+		{
+			name:          "an upstream whose terminal frame carries no timings",
+			terminalFrame: `{"type":"response.completed",` + terminalUsage + `}`,
+			wantSource:    "gateway",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got liveRow
+			prov := &progressObservingProxyProvider{
+				pieces: []string{
+					"event: response.output_text.delta\n" +
+						`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n",
+					"event: response.output_text.delta\n" +
+						`data: {"type":"response.output_text.delta","delta":" there"}` + "\n\n",
+					"event: response.completed\ndata: " + tc.terminalFrame + "\n\n",
+				},
+				gap: framePacing,
+			}
+			srv := newNativeProxyTestServer(prov, true, false)
+			prov.observe = func() { got = snapshotLiveRow(t, srv) }
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi"}`))
-	req.Header.Set("Authorization", "Bearer dev-secret")
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi"}`))
+			req.Header.Set("Authorization", "Bearer dev-secret")
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	if !got.hasProgress {
-		t.Fatalf("in-flight row carried no Progress counter at all: a streaming passthrough request must get one")
-	}
-	if got.ttftMS <= 0 {
-		t.Fatalf("live ttft_ms = %d, want > 0 (the first response.output_text.delta arrived %v in)", got.ttftMS, framePacing)
-	}
-	if got.outputTokens != 40 {
-		t.Fatalf("live output_tokens = %d, want exactly 40 — response.completed's nested response.usage.output_tokens, the upstream's own count with no delta-derived contribution added to it", got.outputTokens)
-	}
-	if got.source != "gateway" {
-		t.Fatalf("live tokens_per_second_source = %q, want %q (the client set no timings_per_token, so the window derivation over the upstream's own count is the only source)", got.source, "gateway")
-	}
-	if got.tps <= 0 {
-		t.Fatalf("live tokens_per_second = %v, want > 0 (40 tokens over the generation window)", got.tps)
-	}
-	if strings.Contains(string(prov.gotBody), "timings_per_token") {
-		t.Fatalf("relayed body grew a timings_per_token flag the client never sent: %s", prov.gotBody)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if !got.hasProgress {
+				t.Fatalf("in-flight row carried no Progress counter at all: a streaming passthrough request must get one")
+			}
+			if got.ttftMS <= 0 {
+				t.Fatalf("live ttft_ms = %d, want > 0 (the first response.output_text.delta arrived %v in)", got.ttftMS, framePacing)
+			}
+			if got.outputTokens != 40 {
+				t.Fatalf("live output_tokens = %d, want exactly 40 — response.completed's nested response.usage.output_tokens, the upstream's own count with no delta-derived contribution added to it", got.outputTokens)
+			}
+			if got.source != tc.wantSource {
+				t.Fatalf("live tokens_per_second_source = %q, want %q (the client set no timings_per_token, so this label is decided by whether the terminal frame carried a `timings` object of its own)", got.source, tc.wantSource)
+			}
+			switch {
+			case tc.wantTPS > 0 && got.tps != tc.wantTPS:
+				t.Fatalf("live tokens_per_second = %v, want %v — the terminal frame's OWN predicted_per_second, not a window derivation over its count", got.tps, tc.wantTPS)
+			case tc.wantTPS == 0 && got.tps <= 0:
+				t.Fatalf("live tokens_per_second = %v, want > 0 (40 tokens over the generation window)", got.tps)
+			}
+			if strings.Contains(string(prov.gotBody), "timings_per_token") {
+				t.Fatalf("relayed body grew a timings_per_token flag the client never sent: %s", prov.gotBody)
+			}
+		})
 	}
 }

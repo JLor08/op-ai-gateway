@@ -374,13 +374,16 @@ counter was allocated only on the translate path, so every in-flight
 `/v1/responses` and `/v1/messages` row read "not measured". A **streaming**
 passthrough request now carries that counter, fed from the frames the usage
 scanner is already parsing, so what `passthrough` costs is only what its own
-wire cannot supply: no mid-stream token count on the Responses shape unless the
-client itself asked llama.cpp for `timings_per_token`, and nothing at all on a
-**buffered** response, which has no frames to time. The per-flavor detail, and
-the two rules that keep it honest — the relayed body is never augmented to
-improve a display column, and no in-flight figure ever becomes a routing
-input — are in [Telemetry, Usage Analytics & Observability
+wire cannot supply: on the Responses shape **no** mid-stream token count at all
+(the `*.delta` partials carry no usage object, and the terminal
+`response.completed` frame is what finally lands one), a mid-stream **rate**
+only when the client itself asked llama.cpp for `timings_per_token`, and
+nothing at all on a **buffered** response, which has no frames to time. The
+per-flavor detail, and the two rules that keep it honest — the relayed body is
+never augmented to improve a display column, and no in-flight figure ever
+becomes a routing input — are in [Telemetry, Usage Analytics & Observability
 §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
+
 
 ## 7. Streaming lifecycle
 

@@ -50,17 +50,22 @@ the table names both.
 |---|---|---|
 | TTFT | yes — the first-content stamp exists | yes — same |
 | in-flight output tokens | yes, from the first `message_delta` on — it carries a cumulative `output_tokens`, already merged frame by frame | **no mid-stream source**: the `*.delta` partials carry no usage, and counting deltas as tokens is rejected policy here ("no tokenizer to count with"). The **terminal** `response.completed` does carry the upstream's own final `response.usage.output_tokens`, and it is published — so the count appears on the still-active row for the short window before that row leaves the panel |
-| in-flight rate | derived over the window from the first content frame — llama.cpp attaches no `timings` to any Anthropic frame, so this is the only source, exactly as for this flavor's end-of-request rate | mid-stream only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to partial frames (labelled `upstream`). Without it, no mid-stream rate — but once the terminal count above lands, the same window derivation applies to it (labelled `gateway`) for that same short window |
+| in-flight rate | derived over the window from the first content frame — llama.cpp attaches no `timings` to any Anthropic frame, so this is the only source, exactly as for this flavor's end-of-request rate | mid-stream only when the **client** set `timings_per_token`, which makes llama.cpp attach `timings` to partial frames (labelled `upstream`). Without it, no mid-stream rate — but a rate does land WITH the terminal count above, and its label is the upstream's choice: llama.cpp bolts its own `timings` onto that `response.completed` frame regardless of `timings_per_token`, so the rate there is `upstream`; an upstream whose terminal frame carries no `timings` gets the window derivation over that exact count instead, labelled `gateway` |
 
 So the honest one-line summary of the Responses column is *"nothing to show mid-stream unless the
-client asked for it"* — not *"nothing to show"*. The terminal-frame figure is the upstream's own
-count over the real generation window: the same quantity, the same arithmetic and the same
-`gateway` label the Anthropic column carries throughout its stream, so there is no reason to
-suppress it for the seconds it is visible.
+client asked for it"* — not *"nothing to show"*. The terminal count is the upstream's own, and the
+rate beside it is a real measurement over the real generation window — the same argument the
+Anthropic column rests on throughout its stream — so there is no reason to suppress either for the
+seconds they are visible. Only the LABEL differs from the Anthropic column: llama.cpp attaches its
+own `timings` to that terminal frame, so the rate reads `upstream` there, and `gateway` is what an
+upstream whose terminal frame carries no `timings` produces instead.
 
 A test must pin both rows in both directions — the value where one exists and the explicit absence
 where none does — so that a later change cannot quietly satisfy the Responses column by counting
-deltas. Pinning the terminal cell is what makes "a delta is not a token" testable at its sharpest:
+deltas. The terminal Responses cell must be pinned for BOTH upstreams above (a `response.completed`
+frame with its own `timings` and one without), because those two produce different labels from the
+same count and a fixture carrying only one of them would pin a wire shape real llama.cpp does not
+emit. Pinning the terminal cell is what makes "a delta is not a token" testable at its sharpest:
 with the upstream's exact count on the row, a delta-derived contribution added to it is visible as a
 wrong number rather than merely as a number where there should be none.
 
