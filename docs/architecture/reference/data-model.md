@@ -173,7 +173,7 @@ erDiagram
         string mapping_id FK "PK part, on delete cascade"
         string capability "PK part, open vocabulary"
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | legacy"
         datetime checked_at
     }
     AGENT_TOKENS {

@@ -47,9 +47,9 @@ erDiagram
         bool metrics_locked
     }
     MODEL_MAPPING_CAPABILITY {
-        string capability "mtp | live_progress | vision | ..."
+        string capability "mtp | live_progress | vision | speculation_observed | ..."
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | legacy"
     }
     MODEL_GROUP {
         bool loaded_only
@@ -386,7 +386,7 @@ flowchart LR
     Base["base = 1000\n+ priority × 20\n+ weight"] --> Penalties["− activeRequests × 25\n− queueDepth × 20\n− latencyMS × 0.2\n− errorRate × 200\n− 500 if telemetry stale (> 2 min) / missing"]
     Penalties --> Gate{"score ≤ 0 ?"}
     Gate -->|yes| NonViable["non-viable — excluded\n(the viability gate)"]
-    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 100)"]
+    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 70)"]
     Tiebreak --> Final["final score"]
 ```
 
@@ -779,10 +779,10 @@ operator's three-state control has to confirm or overturn instead of an empty
 field. The match still favors false negatives over false positives: a wrong
 guess now costs a wrong verdict an operator can flip rather than a wrong
 route, but a wrong fact an operator never notices is still a wrong fact on the
-mapping. `mtp` keeps the ARCHITECTURE reading its
-name always had here ("this model ships an MTP head"); whether the endpoint
-serving it is actually drafting tokens is a different proposition, carried by
-the `speculation_observed` verdict instead
+mapping. `mtp` keeps the ARCHITECTURE reading its name always had here ("this
+model ships an MTP head"); whether the endpoint serving it is actually
+drafting tokens is a different proposition, carried by the
+`speculation_observed` verdict instead
 ([ADR-040](../09-architecture-decisions.md#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)).
 
 **Hybrid swap protection** combines two independent, fail-open signals before a

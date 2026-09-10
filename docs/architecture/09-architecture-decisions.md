@@ -953,11 +953,11 @@ accident from a form gone stale mid-edit
 is the *vocabulary*, not the validation: no check compares a name against a
 known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
 `mtp`, `live_progress` and `speculation_observed` while an unrecognised
-upstream name is accepted,
-stored and shown verbatim — which is why the open vocabulary needs no escape
-hatch. Two verdicts reached the request path through the candidate query's own
-**filtered** LEFT JOINs when this decision was taken; `mtp` and its join went
-with the scorer's flat bonus, so today there is one
+upstream name is accepted, stored and shown verbatim — which is why the open
+vocabulary needs no escape hatch. Two verdicts reached the request path
+through the candidate query's own **filtered** LEFT JOINs when this decision
+was taken; `mtp` and its join went with the scorer's flat bonus, so today
+there is one
 ([ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one)). It lands on `MappingCandidate`,
 deliberately **not** on `ModelMapping`: a mapping loaded through `MappingByID`
 joins nothing, and a struct with no capability field cannot present a
@@ -1001,15 +1001,15 @@ the models-list vision fold (and the portal chat's image gate behind it), the
 scorer's MTP bonus, and the portal DTOs and mapping form that display and edit
 these very verdicts, every one of which this change reroutes to the table in
 the same unit of work. A long-established column with consumers beyond its own
-feature still stays inert. **Consequence:** a filtered join keeps one
-row per mapping — the `(mapping_id, capability)` primary key guarantees it —
-and measured ≈ +6 µs against the query's ≈ 17 µs, where one *unfiltered*
-join costs ≈ +79 µs and multiplies rows. There were two of them here, and
+feature still stays inert. **Consequence:** a filtered join keeps one row per
+mapping — the `(mapping_id, capability)` primary key guarantees it — and
+measured ≈ +6 µs against the query's ≈ 17 µs, where one *unfiltered* join
+costs ≈ +79 µs and multiplies rows. There were two of them here, and
 [ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one) later removed the `mtp` one;
 this measurement is what makes that deletion a saving on the request path
-rather than a wash. Two read paths cannot use them and
-read the row themselves instead: the affinity path (it resolves before the
-candidate query and returns its pin early, on a mapping that came from
+rather than a wash. Two read paths cannot use them and read the row
+themselves instead: the affinity path (it resolves before the candidate query
+and returns its pin early, on a mapping that came from
 `MappingsByApplication`) and the benchmark runner (`benchmarkTargetFor`, whose
 one read serves a capacity run's whole stream fan-out); all three producers
 translate the same row through the same conversion, so none can drift into its
@@ -1027,13 +1027,18 @@ capability: enumerate every writer and every reader before writing the rule.**
 These rows have six writers (two probe paths, the vision benchmark, the MTP
 name heuristic at *both* mapping-creation sites, the operator's form, and —
 since [ADR-040](#adr-040--the-flat-mtp-bonus-is-deleted-mtp-splits-into-a-declared-trait-and-an-observed-one) — the request
-path's own speculation observation) and six readers (the candidate query, the affinity path, the benchmark runner, the
-models-list vision fold, the portal's per-row chips, and the mapping DTO that
-seeds the operator's edit form and is compared against on save). Every rule
-here is a rule about a value all of them touch, and a rule written with only
-its own writer in mind is what repeatedly failed: a probe outranking a human,
-a form save laundering an unchanged submission into a permanent `manual`
-verdict, a heuristic wired at one of its two creation sites. The rank a new
+path's own speculation observation) and six readers (the candidate query, the
+affinity path, the benchmark runner, the models-list vision fold, the
+portal's per-row chips, and the mapping DTO that seeds the operator's edit
+form and is compared against on save). Both counts are one per writer or
+reader that has a rule of its own, which is deliberately *not* the call-site
+count: the six writers are five `UpsertMappingCapabilities` call sites,
+because the operator's form and the name heuristic share the portal's single
+helper. Enumerate the rules, not the lines. Every rule here is a rule about a
+value all of them touch, and a rule written with only its own writer in mind
+is what repeatedly failed: a probe outranking a human, a form save laundering
+an unchanged submission into a permanent `manual` verdict, a heuristic wired
+at one of its two creation sites. The rank a new
 writer may claim, and what it must never overwrite, follow from that
 enumeration — not from the writer's own point of view.
 **Rejected:** keeping the columns and adding a `capabilities_locked` flag (a
@@ -1147,24 +1152,37 @@ pays that much less, permanently, because a feature was removed rather than
 added — worth recording precisely because the usual deletion is argued on
 clarity and buys no speed at all. Nothing the new verdict does gives it back:
 it is written after the response has already been delivered, best-effort, and
-behind the claim, so a speculating mapping costs one store round trip in the
-whole life of the process and every completion after that costs a map lookup.
+behind the claim, so a speculating mapping costs one capability read and one
+write in the whole life of the process — the read is what lets the rank rule
+protect an operator's verdict, so it is not optional — and every completion
+after that costs a map lookup.
 **No capability verdict influences model selection any more** — `scorer.go`
 names none, `live_progress` is the one verdict the candidate query still
 joins, and it decides what the gateway SENDS upstream rather than which
 upstream it picks.
 **One discipline this deletion earned, for whoever deletes the next behaviour:
-sweep the user-visible prose, not only the code.** Removing the bonus took
-three separate follow-up fixes, because its claim had been restated in three
-places nothing pointed at from the scorer: a comment on the name heuristic,
-the reserved-capability-name doc at the agent ingest, and — found only because
-a task was explicitly told to look for it — the **i18n copy under the
-operator's own MTP control**, which went on telling them in both languages
-that resetting the verdict to unknown would also drop "the MTP bonus in server
-selection". An i18n string is an assertion about behaviour, it is the one the
-operator actually reads, and nobody greps it ([Theming &
-i18n §8](cross-cutting/theming-and-i18n.md#8-internationalization)). Enumerate
-the places a behaviour was *explained* the way
+sweep the user-visible prose, not only the code — and sweep every module and
+every test, not only the one the deletion lived in.** Removing the bonus took
+four separate follow-up fixes, because its claim had been restated in six
+places nothing pointed at from the scorer: the comments on the name
+heuristic; the reserved-capability-name doc at the **gateway's** agent ingest
+**and the mirror of it in the agent's own detector**, plus the test that pins
+each of those two; and — found only because a task was explicitly told to
+look for it — the **i18n copy under the operator's own MTP control**, which
+went on telling them in both languages that resetting the verdict to unknown
+would also drop "the MTP bonus in server selection". An i18n string is an
+assertion about behaviour, it is the one the operator actually reads, and
+nobody greps it ([Theming &
+i18n §8](cross-cutting/theming-and-i18n.md#8-internationalization)).
+The last three outlived every earlier sweep for two duller reasons, and they
+generalise better than the i18n one. **Two live in `server-agent`**, a
+separate Go module that imports nothing from the gateway: neither the
+compiler nor a sweep run from `gateway/backend` reaches them, so a
+cross-module claim has to be swept from the repository root or not at all.
+**And two are *test* comments** (one of them is both), which a sweep aimed at
+shipped code never opens — yet a test's doc comment is the place a reader
+goes to learn *why* a rule exists. Enumerate the places a behaviour was
+*explained* the way
 [ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
 says to enumerate the writers and readers of a value.
 **Rejected:** **llama.cpp's `/slots`**, which cannot answer either reading,

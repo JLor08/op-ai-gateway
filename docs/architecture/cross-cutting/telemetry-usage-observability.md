@@ -1116,12 +1116,14 @@ those four are exactly what the two detectors read out of their documents.
 
 The rule is enforced at the **ingest**, because that is the boundary in the
 path of a buggy or hostile agent putting the name straight into its verdict
-list; the agent's own detector skips both as well, but that filter only ever
-meets a publisher's string. The drop is logged at `Warn` and the rest of the
-pass still lands. The day a real MTP detector exists it reports through a
-field this codebase defined — the way live-progress support does — or the
-reserved list changes on both sides; what it must not do is arrive on the
-open list, whose whole purpose is carrying strings nobody here has vetted.
+list; the agent's own detector skips the **first two** as well, but that
+filter only ever meets a publisher's string, and it carries no entry for
+`speculation_observed` because that name appears in neither document either
+agent detector reads. The drop is logged at `Warn` and the rest of the pass
+still lands. The day a real MTP detector exists it reports through a field
+this codebase defined — the way live-progress support does — or the reserved
+list changes on both sides; what it must not do is arrive on the open list,
+whose whole purpose is carrying strings nobody here has vetted.
 
 **What this does NOT cover, and why each is its own change.** A *directly
 configured* Ollama application (no agent) still gets no capability
@@ -1189,19 +1191,24 @@ Their *differences* are what a rule has to be placed against. The
 reserved-name refusal — `mtp`, `live_progress` and `speculation_observed` may
 not arrive from a probe — lives on the **agent-ingest path only**,
 deliberately: that is the boundary where an agent's bytes arrive, and it is
-the only path with an open vocabulary to police. The gateway path's `caps.Extra` is empty by
-construction (its `detectCapabilities` writes only the four structured
-fields), so no unvetted name can reach `probedCapabilityRows` today. The day
-the gateway grows a detector that fills `Extra`, that path needs the same
-filter, and the reserved list has to become reachable from `cmd/gateway`.
+the only path with an open vocabulary to police. The gateway path's
+`caps.Extra` is empty by construction (its `detectCapabilities` writes only
+the four structured fields), so no unvetted name can reach
+`probedCapabilityRows` today. The day the gateway grows a detector that fills
+`Extra`, that path needs the same filter, and the reserved list has to become
+reachable from `cmd/gateway`.
 
-**Three more writers exist, and none of them is a probe**: the portal
-(`manual` for an operator's statement, `legacy` for the model-name MTP
-heuristic), the vision benchmark (`vision_benchmark`), and the request path
-itself (`llama_cpp_timings`, the observation below). So
-`model_mapping_capabilities` has **five production writers, two of them
-probes** — and none of the five consults `metrics_locked` or touches
-`metrics_source`/`metrics_updated_at`.
+**Four more writers exist, and none of them is a probe**: the operator's own
+form (`manual`), the portal's model-name MTP heuristic at *both*
+mapping-creation sites (`legacy`), the vision benchmark (`vision_benchmark`),
+and the request path itself (`llama_cpp_timings`, the observation below). So
+`model_mapping_capabilities` has **six production writers, two of them
+probes**, counted the way
+[ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)
+counts them — one per writer that has a rule of its own, which is *five*
+`UpsertMappingCapabilities` call sites, because the operator's form and the
+heuristic share the portal's single helper. None of the six consults
+`metrics_locked` or touches `metrics_source`/`metrics_updated_at`.
 
 **One verdict is OBSERVED off relayed traffic rather than fetched from a
 document: `speculation_observed`.** Neither `/props` nor `/api/show` says
@@ -1246,14 +1253,13 @@ records one `speculation_observed` row, verdict `yes`, source
   recorded costs one map lookup and a mapping that never speculates is never
   touched. The rank rule would drop a redundant write on its own, but asking
   it requires a READ, and a writer that leaned on the rank rule alone would
-  query the database on every completion forever. The
-  claim is never released, not even when the write fails: the cost is one
-  lost observation until the next restart, which the next relayed completion
-  re-observes, and releasing it would restore exactly the per-request query
-  the claim exists to avoid. The write is best-effort throughout, following
-  the opportunistic-metrics update it sits beside — the completion has
-  already been delivered, and the row is information rather than part of the
-  answer.
+  query the database on every completion forever. The claim is never released,
+  not even when the write fails: the cost is one lost observation until the
+  next restart, which the next relayed completion re-observes, and releasing
+  it would restore exactly the per-request query the claim exists to avoid.
+  The write is best-effort throughout, following the opportunistic-metrics
+  update it sits beside — the completion has already been delivered, and the
+  row is information rather than part of the answer.
 
 **An operator's verdict is permanent, and no probe can move it.** Every writer
 asks `routing.WritableCapabilityRows` before it writes, and that function
