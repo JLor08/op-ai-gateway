@@ -50,10 +50,10 @@
 
 - [ ] **Step 1: Re-baseline the bound test first, and watch it fail**
 
-In `TestScoreTiebreakBounded`, change `want` to `genThroughputBonusCap + promptThroughputBonusCap` and drop `maxed.IsMTP = true`.
+In `TestScoreTiebreakBounded`, change `want` to `genThroughputBonusCap + promptThroughputBonusCap` and **keep `maxed.IsMTP = true` for this run** — dropping it in the same motion removes the bonus from the score too, so the test would pass against the unmodified production code and prove nothing. Drop the `IsMTP` line only after the bonus itself is gone, in Step 2.
 
 Run: `cd gateway/backend && go test ./internal/routing/ -run TestScoreTiebreakBounded`
-Expected: FAIL — the bonus is still applied, so the score is 30 above the new want. That failure is the bonus, observed.
+Expected: FAIL with `tiebreak delta = 100, want 70` — the bonus is still applied, so the score is exactly 30 above the new want. That failure is the bonus, observed.
 
 - [ ] **Step 2: Delete the bonus**
 
