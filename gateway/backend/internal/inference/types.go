@@ -91,6 +91,30 @@ type Usage struct {
 	CacheWriteTokens int     `json:"cache_write_tokens,omitempty"`
 	PromptPerSecond  float64 `json:"prompt_per_second,omitempty"`
 	TokensPerSecond  float64 `json:"tokens_per_second,omitempty"`
+	// DraftTokens is llama.cpp's own `timings.draft_n`: the number of tokens a
+	// speculative-decoding draft model proposed for this turn. It is carried as
+	// INFORMATION ONLY, so a later stage can record that an endpoint was
+	// OBSERVED speculating -- it must never itself be treated as a routing
+	// input or a capability verdict.
+	//
+	// Zero means "no evidence", never "does not speculate". llama.cpp's server
+	// only emits `draft_n` when it is > 0 (the timings serialiser guards with
+	// `if (n_draft_tokens > 0)`), so when speculation is off -- or was never
+	// attempted -- the key is ABSENT from the response, not present as 0.
+	// There is no wire state that means "confirmed not speculating".
+	//
+	// Present on: the non-streaming OpenAI-compatible/chat-completions
+	// response; the FINAL frame of a chat-completions stream (llama.cpp
+	// assigns `timings` to `deltas.back()`, which -- with `include_usage` set,
+	// always true here -- is the same chunk that carries the terminal
+	// `usage`); and the terminal frame of a Responses-API stream.
+	// Absent (always 0) from: the non-streaming `/v1/responses` body, every
+	// Anthropic shape, and ASR.
+	//
+	// Deliberately excludes llama.cpp's sibling `draft_n_accepted`: an
+	// acceptance RATE is a performance measure, not a capability signal, and
+	// belongs with metrics rather than this field.
+	DraftTokens int `json:"draft_tokens,omitempty"`
 }
 
 type Error struct {

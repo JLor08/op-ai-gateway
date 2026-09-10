@@ -547,6 +547,7 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 		Timings *struct {
 			PromptPerSecond    float64 `json:"prompt_per_second"`
 			PredictedPerSecond float64 `json:"predicted_per_second"`
+			DraftN             int     `json:"draft_n"`
 		} `json:"timings"`
 	}
 	if json.Unmarshal(payload, &m) != nil {
@@ -567,6 +568,7 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 	if m.Timings != nil {
 		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
 		takeMaxF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
+		takeMax(&dst.DraftTokens, m.Timings.DraftN)
 	}
 }
 

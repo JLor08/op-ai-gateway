@@ -88,6 +88,55 @@ func TestParsePassthroughUsageReadsResponsesTimings(t *testing.T) {
 	}
 }
 
+// TestParsePassthroughUsageReadsResponsesDraftTokens carries Task 4's
+// drafted-token counter (llama.cpp's `timings.draft_n`) through the same
+// Responses-stream merge path TestParsePassthroughUsageReadsResponsesTimings
+// proves above for prompt_per_second/predicted_per_second -- this is the
+// Responses-API stream's terminal frame, the only Responses shape that
+// carries `timings` at all.
+func TestParsePassthroughUsageReadsResponsesDraftTokens(t *testing.T) {
+	body := "event: response.completed\ndata: " +
+		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}},"timings":{"prompt_per_second":120.5,"predicted_per_second":38.25,"draft_n":9}}` +
+		"\n\n"
+	u := parsePassthroughUsage("openai_responses", []byte(body))
+	if u.DraftTokens != 9 {
+		t.Fatalf("DraftTokens = %v, want 9", u.DraftTokens)
+	}
+}
+
+// TestParsePassthroughUsageResponsesDraftTokensAbsentIsZero pins the negative
+// that matters: llama.cpp's server only emits `draft_n` under
+// `if (n_draft_tokens > 0)`, so a `timings` object that carries its OTHER
+// fields but no `draft_n` key -- exactly what a non-speculating endpoint
+// sends -- must decode DraftTokens as 0, never infer a count from the
+// sibling fields that ARE present.
+func TestParsePassthroughUsageResponsesDraftTokensAbsentIsZero(t *testing.T) {
+	body := "event: response.completed\ndata: " +
+		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}},"timings":{"prompt_per_second":120.5,"predicted_per_second":38.25}}` +
+		"\n\n"
+	u := parsePassthroughUsage("openai_responses", []byte(body))
+	if u.DraftTokens != 0 {
+		t.Fatalf("DraftTokens = %v, want 0 (no draft_n key on the timings object)", u.DraftTokens)
+	}
+}
+
+// TestMergeResponsesUsageDraftTokensTakesRunningMax proves DraftTokens gets
+// the SAME running-max treatment (takeMax) as its timings siblings above --
+// never a plain overwrite, never a sum -- across repeated merges of the same
+// stream, exactly as mergeResponsesUsage is called once per SSE frame.
+func TestMergeResponsesUsageDraftTokensTakesRunningMax(t *testing.T) {
+	var u inference.Usage
+	mergeResponsesUsage(&u, []byte(`{"timings":{"draft_n":9}}`))
+	mergeResponsesUsage(&u, []byte(`{"timings":{"draft_n":3}}`))
+	if u.DraftTokens != 9 {
+		t.Fatalf("DraftTokens = %v, want 9 (a later, smaller draft_n must not overwrite the running max)", u.DraftTokens)
+	}
+	mergeResponsesUsage(&u, []byte(`{"timings":{"draft_n":12}}`))
+	if u.DraftTokens != 12 {
+		t.Fatalf("DraftTokens = %v, want 12 (a later, larger draft_n must raise the running max)", u.DraftTokens)
+	}
+}
+
 // TestPassthroughAnthropicRateUsesGenerationWindow pins step 7's ambiguity
 // resolution #4: the Anthropic fallback rate is computed over the GENERATION
 // WINDOW (first content frame -> completion), never the whole request. Here

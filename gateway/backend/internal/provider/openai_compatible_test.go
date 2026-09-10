@@ -44,6 +44,13 @@ func TestOpenAICompatibleClientCompletesChat(t *testing.T) {
 	if resp.Usage.TotalTokens != 5 {
 		t.Fatalf("Usage = %#v", resp.Usage)
 	}
+	// No `timings` object at all on this response (speculation off, or the
+	// upstream simply omitted it) -- llama.cpp's server only emits `draft_n`
+	// under `if (n_draft_tokens > 0)`, so absence must decode as 0, never as a
+	// guess that speculation happened.
+	if resp.Usage.DraftTokens != 0 {
+		t.Fatalf("Usage.DraftTokens = %v, want 0 (no timings object on the response)", resp.Usage.DraftTokens)
+	}
 }
 
 func TestOpenAICompatibleClientCompletesReasoningOnly(t *testing.T) {
@@ -119,6 +126,7 @@ func TestOpenAICompatibleClientCompletesChatWithCachedTokensAndTimings(t *testin
 			"timings": map[string]any{
 				"prompt_per_second":    123.4,
 				"predicted_per_second": 56.7,
+				"draft_n":              9,
 			},
 		})
 	}))
@@ -137,6 +145,12 @@ func TestOpenAICompatibleClientCompletesChatWithCachedTokensAndTimings(t *testin
 	}
 	if resp.Usage.TokensPerSecond != 56.7 {
 		t.Fatalf("Usage.TokensPerSecond = %v, want 56.7", resp.Usage.TokensPerSecond)
+	}
+	// llama.cpp's timings.draft_n -- the drafted-token counter from speculative
+	// decoding -- carried onto the buffered (non-streaming) response's Usage,
+	// same as its sibling timings fields above.
+	if resp.Usage.DraftTokens != 9 {
+		t.Fatalf("Usage.DraftTokens = %v, want 9", resp.Usage.DraftTokens)
 	}
 }
 
@@ -233,6 +247,11 @@ func TestOpenAICompatibleCompleteStreamParsesSSE(t *testing.T) {
 	if completed.Usage.TotalTokens != 5 || completed.Usage.InputTokens != 3 || completed.Usage.OutputTokens != 2 {
 		t.Fatalf("completed.Usage = %#v", completed.Usage)
 	}
+	// The terminal chunk's usage object carries no `timings` at all here
+	// (speculation off/not attempted) -- must decode as 0, never a guess.
+	if completed.Usage.DraftTokens != 0 {
+		t.Fatalf("completed.Usage.DraftTokens = %v, want 0 (no timings on the terminal chunk)", completed.Usage.DraftTokens)
+	}
 }
 
 func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *testing.T) {
@@ -240,7 +259,7 @@ func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *te
 		w.Header().Set("Content-Type", "text/event-stream")
 		lines := []string{
 			`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
-			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7}}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prompt_per_second":123.4,"predicted_per_second":56.7,"draft_n":9}}`,
 			`data: [DONE]`,
 		}
 		for _, line := range lines {
@@ -272,6 +291,12 @@ func TestOpenAICompatibleCompleteStreamParsesSSEWithCachedTokensAndTimings(t *te
 	}
 	if completed.Usage.TokensPerSecond != 56.7 {
 		t.Fatalf("Usage.TokensPerSecond = %v, want 56.7", completed.Usage.TokensPerSecond)
+	}
+	// llama.cpp assigns `timings` to deltas.back() -- with include_usage always
+	// set here, that final delta IS the usage chunk, so draft_n arrives on the
+	// exact same chunk mergeChunkUsage reads Usage from.
+	if completed.Usage.DraftTokens != 9 {
+		t.Fatalf("Usage.DraftTokens = %v, want 9 (from the final chunk's timings)", completed.Usage.DraftTokens)
 	}
 }
 
