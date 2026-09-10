@@ -590,3 +590,377 @@ func TestPublishProgressStampsOnlyTheFirstContentFrame(t *testing.T) {
 		t.Fatalf("first-token stamp = %d, want %d unchanged (the first content frame fixes it once)", got, contentAt.UnixNano())
 	}
 }
+
+// TestScanKeepsEachFrameSeparateWithinOnePayload pins the per-frame reset of the
+// scratch Usage that scan now owns, which is the only thing keeping BOTH
+// surfaces per-frame rather than per-payload.
+//
+// One payload carrying several SSE frames is the NORMAL case, not a corner:
+// nativeCopier.run reads the upstream in 32 KiB chunks, so a fast generation
+// puts many frames in one feed. mergePassthroughUsage max-merges into whatever
+// destination it is handed, so if `var frame inference.Usage` were declared
+// OUTSIDE scan's loop -- the textbook "allocate once, reuse" edit that hoisting
+// the merge out of publishProgress invites -- the second frame's merge would
+// still see the first frame's 42.5 and yield max(42.5, 38.25) = 42.5. The live
+// column AND the recorded rate would both become a per-payload PEAK: exactly
+// the defect this change removes, relocated one level down. That mutation is
+// why this test exists; without it the whole package passes under it.
+//
+// The fixture descends because llama.cpp's predicted_per_second is a cumulative
+// average that FALLS as the KV cache grows, which is what makes the LATER frame
+// the honest answer for both surfaces. Deliberately no terminal frame here: the
+// freeze is pinned separately, so this test's claim stays narrowly "frames in
+// one payload do not bleed into each other".
+func TestScanKeepsEachFrameSeparateWithinOnePayload(t *testing.T) {
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	payload := []byte(
+		"event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","delta":"hi","timings":{"prompt_per_second":150.0,"predicted_per_second":42.5}}` + "\n\n" +
+			"event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","delta":" there","timings":{"prompt_per_second":140.0,"predicted_per_second":38.25}}` + "\n\n")
+
+	prog := &requestProgress{}
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, prog)
+	s.feed(payload, at)
+
+	if got := prog.upstreamTPSMilli.Load(); got != 38250 {
+		t.Fatalf("live upstreamTPSMilli = %d, want 38250 — the SECOND frame's own 38.25; 42500 means the scratch Usage leaked across frames inside one payload and the live column became a per-payload max", got)
+	}
+	if got := s.usage().TokensPerSecond; got != 38.25 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 38.25 — the last rate a frame reported; 42.5 means the same leak reached the routing input", got)
+	}
+	if got := s.usage().PromptPerSecond; got != 140.0 {
+		t.Fatalf("recorded PromptPerSecond = %v, want 140.0 — the second frame's own figure, not the 150.0 peak", got)
+	}
+}
+
+// TestPassthroughResponsesRecordsTheTerminalRateNotThePeak is the defect this
+// change fixes, asserted where the defect does its damage: the RECORDED
+// end-of-request rate of a native-passthrough `openai_responses` stream.
+//
+// mergeResponsesUsage max-merges every field it sees, which is correct for every
+// COUNT (all monotone over a turn, so the max is the final value) and wrong for
+// the two RATES: llama.cpp's prompt_per_second/predicted_per_second are
+// cumulative averages over the generation, so predicted_per_second FALLS as the
+// KV cache grows while swinging frame to frame, and its running max is a
+// mid-stream PEAK. The fixture's three frames report 42.5 -> 38.25 -> 30.0 for
+// exactly that reason; before this change the row recorded 42.5.
+//
+// It was reachable with no gateway change at all, and has been MEASURED end to
+// end on the operator's deployment (llama.cpp build b10448-ad1de39e0 serving an
+// MTP model, through the server-agent's runtime router). A client that sets
+// `timings_per_token` itself has the flag relayed untouched, and llama.cpp then
+// attaches `timings` to the partials — 39 of a 48-frame Responses stream's
+// frames on the run measured DIRECT to the runtime router. The defect figures
+// come from a SECOND, SEPARATE request measured THROUGH this gateway: 41
+// timings-bearing frames, whose terminal frame reported
+// predicted_per_second = 47.389 while the maximum over them was 52.200 — and
+// 52.200240121104564 is what the gateway recorded, the peak, +10.2%. (Two runs,
+// so neither frame count describes the other's stream.) And it is not a
+// cosmetic misreport: a recorded rate is a ROUTING input (recordUsage ->
+// UpdateMappingOpportunisticMetrics), blended into the throughput EWMA the
+// scorer and a group's MinTokensPerSecond gate read back, so a peak recorded as
+// the final figure steers routing.
+//
+// The same fixture pins the LIVE column in the same request, which is the point
+// of using the progress-observing harness here rather than a plain recording
+// provider: the panel's figure is deliberately per-frame (publishProgress reads
+// THIS frame's rate, never the accumulator), so at the terminal frame it shows
+// 30.0. An implementation that fed the live column from the accumulator would
+// show the 42.5 peak and fail below. What the two surfaces must NOT become is
+// one shared value — see
+// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate, whose
+// stream has no terminal frame and where they therefore disagree outright.
+//
+// `draft_n` rides along on the `timings` objects because that is the shape the
+// upstream sends (the measured run carried draft_n = 28 on its terminal frame
+// with the flag set, so nothing about `speculation_observed` changes here).
+// Nothing about it is asserted at THIS level — a recorded usage.Event carries no
+// draft count at all, only the `speculation_observed` capability row does — and
+// the field's behaviour under this gate is pinned where it can be:
+// TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax
+// below, on the scanner, including the terminal-frame-omits-the-key case.
+//
+// What the FIXTURE pins is this gateway's HANDLING of partial-frame `timings`.
+// Those partials are measured, not assumed — see
+// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate
+// (passthrough_progress_test.go) for the deployment, the build and the 39-of-48
+// frame count, and for the caveat that it is one build on one deployment.
+func TestPassthroughResponsesRecordsTheTerminalRateNotThePeak(t *testing.T) {
+	var got liveRow
+	prov := &progressObservingProxyProvider{
+		pieces: []string{
+			"event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":"hi","timings":{"prompt_per_second":150.0,"predicted_per_second":42.5,"draft_n":9}}` + "\n\n",
+			"event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":" there","timings":{"prompt_per_second":140.0,"predicted_per_second":38.25,"draft_n":12}}` + "\n\n",
+			"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_x","usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}},"timings":{"prompt_per_second":120.5,"predicted_per_second":30.0}}` + "\n\n",
+		},
+		gap: framePacing,
+	}
+	srv := newNativeProxyTestServer(prov, true, false)
+	prov.observe = func() { got = snapshotLiveRow(t, srv) }
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi","timings_per_token":true}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].TokensPerSecond != 30.0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 30.0 — response.completed's own predicted_per_second, the generation's FINAL cumulative average, not the 42.5 peak an earlier frame reported", events[0].TokensPerSecond)
+	}
+	if events[0].PromptPerSecond != 120.5 {
+		t.Fatalf("recorded PromptPerSecond = %v, want 120.5 — the terminal frame's own prompt_per_second, not the 150.0 max across the stream", events[0].PromptPerSecond)
+	}
+	// The counts are untouched by the rate gate: they arrive on the terminal
+	// frame and are the upstream's own.
+	if events[0].OutputTokens != 40 || events[0].InputTokens != 8 || events[0].TotalTokens != 48 {
+		t.Fatalf("recorded counts = in %d / out %d / total %d, want 8/40/48 (the rate gate must not disturb them)", events[0].InputTokens, events[0].OutputTokens, events[0].TotalTokens)
+	}
+	if got.tps != 30.0 {
+		t.Fatalf("live tokens_per_second = %v, want 30.0 — the terminal frame's OWN rate, read per-frame; 42.5 would mean the live column started reading the max-merged accumulator", got.tps)
+	}
+	if got.source != "upstream" {
+		t.Fatalf("live tokens_per_second_source = %q, want %q (llama.cpp's own measurement off the terminal frame)", got.source, "upstream")
+	}
+	if got.outputTokens != 40 {
+		t.Fatalf("live output_tokens = %d, want 40 (response.completed's own count, with no delta-derived contribution)", got.outputTokens)
+	}
+}
+
+// TestUsageScannerResponsesTerminalRateSurvivesLaterFramesAndTheLoopsFrequency
+// pins the STRUCTURAL half of the fix, which the end-to-end test above cannot
+// see: scan's per-payload loop is CONDITIONAL
+// (`!haveFirstContent || !haveTerminalUsage || progress != nil`) while the
+// accumulator merge below it is not, so with no live counter attached the loop
+// stops the moment both flags are set and the merge goes on for every remaining
+// chunk.
+//
+// Two consequences are asserted, in both loop regimes:
+//
+//   - A frame arriving AFTER the terminal one cannot raise the recorded rate.
+//     The trailing frame here reports a 50.0 that still reaches the accumulator
+//     through the unconditional merge, so an implementation that read the
+//     accumulator's rate records 50.0 (or the 42.5 peak) instead of 30.0.
+//
+//   - The recorded rate is the SAME whether or not a live progress counter is
+//     attached. The capture is FROZEN by the first authoritative frame, which
+//     scan's own condition guarantees is inside the loop (`!haveTerminalUsage`
+//     cannot be false while the flag is unset); nothing later has that
+//     guarantee. This is what the trailing frame being a SECOND
+//     `response.completed` pins: a capture left open past the first
+//     authoritative frame reads that trailing frame only in the
+//     attached-counter regime — where the loop is still running — so the two
+//     subtests below would disagree, and the recorded rate would silently
+//     depend on whether the row happened to be displayed. (Before that frame
+//     the capture IS open, deliberately, and the same condition keeps the loop
+//     running for every frame there — see
+//     TestUsageScannerResponsesCutOffStreamRecordsTheLastRateNotThePeak.)
+//
+// The trailing frame's ordering is deliberately adversarial: no llama.cpp
+// stream sends two `response.completed` frames, and the point is that both
+// rules hold STRUCTURALLY rather than by accident of arrival order.
+//
+// The attached-counter case also shows the two surfaces are genuinely separate:
+// the live counter ends at the trailing frame's 50.0 (per-frame, by design)
+// while the recorded row keeps the first terminal frame's 30.0.
+func TestUsageScannerResponsesTerminalRateSurvivesLaterFramesAndTheLoopsFrequency(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	partialPeak := []byte("event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hi","timings":{"prompt_per_second":150.0,"predicted_per_second":42.5}}` + "\n\n")
+	terminal := []byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}},"timings":{"prompt_per_second":120.5,"predicted_per_second":30.0}}` + "\n\n")
+	trailing := []byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}},"timings":{"prompt_per_second":900.0,"predicted_per_second":50.0}}` + "\n\n")
+
+	for _, tc := range []struct {
+		name string
+		prog *requestProgress
+	}{
+		{"no live counter: scan's loop stops after the terminal frame", nil},
+		{"a live counter attached: scan's loop keeps running for every frame", &requestProgress{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, tc.prog)
+			s.feed(partialPeak, base)
+			s.feed(terminal, base.Add(time.Second))
+			s.feed(trailing, base.Add(2*time.Second))
+
+			u := s.usage()
+			if u.TokensPerSecond != 30.0 {
+				t.Fatalf("TokensPerSecond = %v, want 30.0 (response.completed's own rate; 42.5 is the earlier peak and 50.0 arrived after the authoritative frame)", u.TokensPerSecond)
+			}
+			if u.PromptPerSecond != 120.5 {
+				t.Fatalf("PromptPerSecond = %v, want 120.5 (the terminal frame's own; 150.0/900.0 are the other frames')", u.PromptPerSecond)
+			}
+			if u.OutputTokens != 40 || u.InputTokens != 8 || u.TotalTokens != 48 {
+				t.Fatalf("counts = in %d / out %d / total %d, want 8/40/48", u.InputTokens, u.OutputTokens, u.TotalTokens)
+			}
+			if tc.prog != nil {
+				if got := tc.prog.upstreamTPSMilli.Load(); got != 50000 {
+					t.Fatalf("live upstreamTPSMilli = %d, want 50000 — the LAST frame's own rate: the live column is per-frame by design, and it must not have been pulled onto the recorded row's terminal-frame value", got)
+				}
+			}
+		})
+	}
+}
+
+// TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax is
+// the boundary of the gate, pinned so a later reader cannot "simplify" it into
+// covering the fields where the running MAX is the correct merge.
+//
+// Both subtests are cases where taking a COUNT from the authoritative frame
+// would lose data, which is precisely why only the two rates are taken:
+//
+//   - Responses: `timings.draft_n` sits on the same object as the rates but is
+//     monotone, and llama.cpp emits the key only when it drafted — so a terminal
+//     frame that omits it must leave the partials' max standing, not zero it.
+//
+//   - Anthropic: isTerminalUsageFrame accepts EVERY `message_delta`, not just
+//     the last, and the capture reads the FIRST authoritative frame. A count
+//     taken from that frame would therefore freeze at an intermediate
+//     `output_tokens` — 20 here instead of 40 — and the derived rate would
+//     halve with it. (The input side is the same argument one frame earlier:
+//     message_start carries input_tokens and message_delta does not, pinned by
+//     TestUsageScannerTotalTokensAcrossSplitFrames.)
+func TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("responses: draft_n keeps its max when the terminal frame omits it", func(t *testing.T) {
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
+		s.feed([]byte("event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":"hi","timings":{"predicted_per_second":42.5,"draft_n":9}}`+"\n\n"), base)
+		s.feed([]byte("event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":" there","timings":{"predicted_per_second":38.25,"draft_n":12}}`+"\n\n"), base.Add(time.Second))
+		s.feed([]byte("event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}},"timings":{"predicted_per_second":30.0}}`+"\n\n"), base.Add(2*time.Second))
+
+		u := s.usage()
+		if u.DraftTokens != 12 {
+			t.Fatalf("DraftTokens = %d, want 12 (monotone, so the running max IS the final value; the terminal frame carries no draft_n to take it from)", u.DraftTokens)
+		}
+		if u.TokensPerSecond != 30.0 {
+			t.Fatalf("TokensPerSecond = %v, want 30.0 (the rate, unlike draft_n, comes from the terminal frame)", u.TokensPerSecond)
+		}
+	})
+
+	t.Run("anthropic: a second message_delta still raises the count and the derived rate", func(t *testing.T) {
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
+		s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
+		s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base)
+		s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n"), base.Add(time.Second))
+		s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n"), base.Add(2*time.Second))
+
+		u := s.usage()
+		if u.InputTokens != 8 || u.OutputTokens != 40 || u.TotalTokens != 48 {
+			t.Fatalf("counts = in %d / out %d / total %d, want 8/40/48 (the FIRST message_delta is authoritative too, so a count taken from it would freeze at 20)", u.InputTokens, u.OutputTokens, u.TotalTokens)
+		}
+		if u.TokensPerSecond != 20.0 {
+			t.Fatalf("TokensPerSecond = %v, want 20.0 (40 tokens over the 2s generation window; a count frozen at 20 would derive 10.0)", u.TokensPerSecond)
+		}
+	})
+}
+
+// TestUsageScannerResponsesCutOffStreamRecordsTheLastRateNotThePeak is the case
+// a terminal-frame-only capture cannot reach: a Responses stream with partial
+// `timings` and NO `response.completed`. There is no final frame to read, but
+// there IS a last real measurement, and recording the accumulator's mid-stream
+// PEAK instead of it is the same defect this change removes for the complete
+// stream.
+//
+// Two truncated shapes exist and they land on DIFFERENT surfaces — the
+// distinction matters, because getting it backwards makes this test look
+// display-only and therefore droppable:
+//
+//   - Ends CLEANLY at 200 with no `response.completed` — a `response.failed` or
+//     `response.incomplete` terminal event (this repo's own translate path
+//     emits `response.failed`, inference_complete.go), or an upstream that
+//     simply stops. nativeTerminalStatus records that status "success", and
+//     recordUsage's EWMA feed is gated on success, so the rate IS a ROUTING
+//     input (UpdateMappingOpportunisticMetrics) exactly as a complete stream's
+//     is. That is the shape this fixture models: three partials and then
+//     nothing.
+//   - A client disconnect, a copy error or an idle timeout is recorded status
+//     "error" by that same function, so its rate reaches only the Activity row.
+//     A peak there is still a misreport of what the upstream measured, just not
+//     a routing one.
+//
+// Either way a truncated generation is a reason to record its last measured
+// value, not a licence to record its best moment.
+//
+// Nothing about the per-payload loop's frequency is traded away to get it, which
+// is the structural point: scan's loop condition includes `!haveTerminalUsage`,
+// so for a response that never produces an authoritative frame the loop is
+// ALREADY running for every payload — precisely in this case. The regime the
+// sibling test above contrasts (loop stops early) cannot arise here at all, so
+// this test needs no table over it.
+//
+// The trailing frame reports a `timings` object whose rates are 0.0, which is a
+// measured shape rather than an invented one: on the operator's deployment the
+// per-frame predicted_per_second series opens at exactly 0.0 (0.0, 16.62, 33.24,
+// 49.86, 34.06, …). "This frame has nothing to report yet" must therefore leave
+// the last real figure standing — takeLastNonZeroF — instead of erasing it.
+func TestUsageScannerResponsesCutOffStreamRecordsTheLastRateNotThePeak(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
+	s.feed([]byte("event: response.output_text.delta\n"+
+		`data: {"type":"response.output_text.delta","delta":"hi","timings":{"prompt_per_second":150.0,"predicted_per_second":50.0}}`+"\n\n"), base)
+	s.feed([]byte("event: response.output_text.delta\n"+
+		`data: {"type":"response.output_text.delta","delta":" there","timings":{"prompt_per_second":120.5,"predicted_per_second":30.0}}`+"\n\n"), base.Add(time.Second))
+	s.feed([]byte("event: response.output_text.delta\n"+
+		`data: {"type":"response.output_text.delta","delta":"!","timings":{"prompt_per_second":0.0,"predicted_per_second":0.0}}`+"\n\n"), base.Add(2*time.Second))
+
+	u := s.usage()
+	if u.TokensPerSecond != 30.0 {
+		t.Fatalf("TokensPerSecond = %v, want 30.0 — the LAST rate this cut-off stream actually reported; 50.0 is the accumulator's mid-stream peak and 0 is the trailing frame reporting nothing yet", u.TokensPerSecond)
+	}
+	if u.PromptPerSecond != 120.5 {
+		t.Fatalf("PromptPerSecond = %v, want 120.5 (same rule; 150.0 is the peak)", u.PromptPerSecond)
+	}
+}
+
+// TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure pins the
+// boundary that keeps the substitution's flavor-agnostic form a no-op for
+// `anthropic_messages` by CONSTRUCTION rather than by an assumption a later
+// reader has to re-derive: a rate the capture never saw is left alone, never
+// overwritten with a 0.
+//
+// The shape this defends is not the fixture. It is a flavor whose merge one day
+// reads a rate from frames the capture is frozen before — and Anthropic is
+// already one bad commit away from being it, because isTerminalUsageFrame
+// accepts EVERY `message_delta`, so the capture freezes at the first. Today
+// mergeAnthropicUsage writes no rate field at all (its anthropicUsage struct has
+// none, llama.cpp attaching no `timings` to any Anthropic frame), so both sides
+// are 0 there and the branch is unreachable through that flavor; a Responses
+// stream whose authoritative frame carries no `timings` while a LATER frame does
+// is the only way to reach it with today's merges. The ordering is deliberately
+// adversarial, exactly as the trailing frame in
+// TestUsageScannerResponsesTerminalRateSurvivesLaterFramesAndTheLoopsFrequency
+// is: the rule has to hold structurally, not by luck of arrival order.
+func TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
+	s.feed([]byte("event: response.completed\n"+
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}}}`+"\n\n"), base)
+	s.feed([]byte("event: response.output_text.delta\n"+
+		`data: {"type":"response.output_text.delta","delta":"late","timings":{"prompt_per_second":900.0,"predicted_per_second":50.0}}`+"\n\n"), base.Add(time.Second))
+
+	u := s.usage()
+	if u.TokensPerSecond != 50.0 {
+		t.Fatalf("TokensPerSecond = %v, want 50.0 — the authoritative frame reported NO rate, so the accumulator's figure must stand; substituting the captured 0 would overwrite a real measurement with nothing", u.TokensPerSecond)
+	}
+	if u.PromptPerSecond != 900.0 {
+		t.Fatalf("PromptPerSecond = %v, want 900.0 (same rule)", u.PromptPerSecond)
+	}
+	if u.OutputTokens != 40 || u.InputTokens != 8 || u.TotalTokens != 48 {
+		t.Fatalf("counts = in %d / out %d / total %d, want 8/40/48 (the rate rules must not disturb them)", u.InputTokens, u.OutputTokens, u.TotalTokens)
+	}
+}

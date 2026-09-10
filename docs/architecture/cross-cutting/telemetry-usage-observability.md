@@ -716,7 +716,7 @@ feature:
 |---|---|---|
 | TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.function_call_arguments.delta` stamps it |
 | output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **no mid-stream source** — the `*.delta` partials carry no usage object at all, and counting deltas as tokens is the option this feature already rejected above |
-| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, and then labelled `upstream`. There is no mid-stream count on this flavor, so the gateway derives nothing here: a `timings` object attached by the upstream to a PARTIAL frame is the only possible source, and the gateway reads one off whatever partial carries it. That the flag makes llama.cpp attach one is established for its **chat** streams; whether its Responses implementation does the same on partials is not something this repo has captured. Either way the flag is the only thing that can put a rate on this cell mid-stream — without it, none |
+| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, and then labelled `upstream`. There is no mid-stream count on this flavor, so the gateway derives nothing here: a `timings` object attached by the upstream to a PARTIAL frame is the only possible source, and the gateway reads one off whatever partial carries it. That llama.cpp's Responses implementation does attach one is now MEASURED, not carried over from its chat streams: on the operator's deployment (build `b10448-ad1de39e0`, § "the bias … are measured" below) a flagged request measured DIRECT to the runtime router had 39 of its 48 frames carry a top-level `timings` object, on `response.reasoning_text.delta` and `response.output_text.delta` alike — one build on one deployment, not a general guarantee. Either way the flag is the only thing that can put a rate on this cell mid-stream: **the same prompt replayed WITHOUT the flag produced exactly one timings-bearing frame** — the terminal one, which is the next paragraph's subject, not this cell's. (A replay, not the same request: a request either carried the flag or it did not.) |
 
 **The Responses column's terminal frame is a different answer from its
 mid-stream one, and it is not suppressed for arriving late.**
@@ -1364,11 +1364,15 @@ attaches `timings.draft_n` — the number of tokens a draft model proposed for
 that turn — to the non-streaming chat body, to the final frame of a
 chat-completions stream (the same chunk as the terminal `usage`), and to the
 terminal frame of a Responses-API stream. **Those three are the whole list of
-shapes that carry a `timings` object with `timings_per_token` unset** — the
-flag adds one to a chat stream's PARTIAL chunks too, which is where the
-translate path's own mid-stream rate comes from (`openai_compatible.go`'s
-`CompleteStream`; the `upstream` bullet above) — **and the Responses pair must
-be kept apart:** the *stream's* terminal `response.completed` frame carries
+shapes that carry a `timings` object with `timings_per_token` unset** — measured
+for the Responses stream: with the flag unset, exactly ONE frame of a 48-frame
+request carried `timings`, the terminal one (§8.4.3's measurement). The flag
+adds one to a chat stream's PARTIAL chunks, which is where the translate path's
+own mid-stream rate comes from (`openai_compatible.go`'s `CompleteStream`; the
+`upstream` bullet above), and — measured on the same deployment — to a
+**Responses** stream's partials as well, 39 of those 48 frames; `draft_n` itself
+still arrives on the terminal frame with the flag set, so nothing below changes
+either way. **The Responses pair must be kept apart:** the *stream's* terminal `response.completed` frame carries
 `timings`, while the **non-streaming** `/v1/responses` body carries no
 `timings` object at all — as no Anthropic shape and no ASR response does
 either, so `DraftTokens` stays 0 on all of them whatever the upstream is
@@ -1565,15 +1569,128 @@ only `message_start` would derive `1 / 20s` and present it as measured. This
 is the same "only from an exact count" rule the rest of the feature applies,
 aimed at *which* count is authoritative.
 
-**The same gate now governs both columns.** `usageScanner.publishProgress`
+**A recorded RATE also comes from that authoritative frame, never from the
+running max.** The max is the correct merge for every *count*
+`mergePassthroughUsage` holds — input/output/total/cached tokens and
+`timings.draft_n` are monotone over a turn, so the max IS the final value, which
+is what lets the scan work fragment by fragment — and the wrong merge for the
+two *rates*: llama.cpp's `prompt_per_second`/`predicted_per_second` are
+cumulative averages over the generation, so `predicted_per_second` falls as the
+KV cache grows while swinging frame to frame, and the max of such a series is a
+mid-stream PEAK. `usageScanner` therefore keeps the rate the frames report for
+*themselves* (`takeFinalRates`) beside the accumulator and hands that to the
+recording path: the authoritative frame's own figure where one arrived, and the
+last rate the stream reported where none did.
+
+**The bias, and the flag that exposes it, are measured rather than inferred** —
+on the operator's deployment, llama.cpp build `b10448-ad1de39e0` serving an MTP
+model, reached through the server-agent's runtime router. Figures from that
+build on that deployment; not a general guarantee about every llama.cpp build,
+and the emit side is one deployment. The figures below come from SEPARATE
+requests, so each bullet says which run it belongs to.
+
+- **The precondition needed no gateway change.** A client that sets
+  `timings_per_token` itself has the flag relayed untouched (the non-injection
+  rule above). Measured **direct to the runtime router**, with the flag set:
+  **39 of one 48-frame Responses stream's frames carried a top-level `timings`
+  object** — on `response.reasoning_text.delta` and
+  `response.output_text.delta` alike. The **same prompt replayed without the
+  flag** produced **exactly one** timings-bearing frame: the terminal
+  `response.completed`. (A replay, not the same request — a request either
+  carried the flag or it did not.) So the peak is reachable for any client that
+  asks for mid-stream timings, and this substitution is a measured no-op for
+  traffic that does not.
+- **The defect, end to end through this gateway.** A **second, separate
+  request**, this one relayed **through the gateway**: 41 timings-bearing
+  frames, whose terminal frame reported `predicted_per_second = 47.389` while
+  the maximum over them was `52.200` — and the gateway recorded
+  **52.200240121104564**, the peak, **+10.2 %**, into the routing EWMA below.
+- **The series is a sawtooth, not a monotone decay:** `0.0, 16.62, 33.24,
+  49.86, 34.06, 42.57, 51.09, …`, so the max can sit anywhere in the stream.
+  Another run peaked at `53.222` mid-stream against a terminal `48.490`.
+- **`prompt_per_second`'s max EQUALLED its terminal value in both runs that
+  reported a terminal figure**, which is why only one of the two fields shows a
+  measurable bias: taking `prompt_per_second` from the same frame is defensive,
+  not corrective.
+- **`draft_n` survives on the terminal frame with the flag set** (28 on the
+  measured run), so nothing about `speculation_observed` (§ above) changes.
+
+Four properties of the substitution are deliberate, and pinned:
+
+- **Only the rates are taken.** A *count* taken from the authoritative frame
+  would lose Anthropic's input tokens outright (`message_start` carries them,
+  `message_delta` does not) and would zero a Responses stream's `draft_n`
+  whenever the terminal frame omits the key, which llama.cpp does unless it
+  drafted.
+- **The capture is FROZEN by the FIRST authoritative frame** — the only one
+  `scan`'s per-payload loop is guaranteed to reach, since the loop's own
+  condition includes `!haveTerminalUsage`. No *later* frame has that guarantee:
+  with no live counter attached the loop stops as soon as both flags are set
+  while the accumulator merge continues for every remaining chunk, so a capture
+  left open past that frame would make the recorded rate depend on whether the
+  row happened to be displayed. For `openai_responses` first and last coincide
+  (`response.completed` occurs once per response); for `anthropic_messages`
+  EVERY `message_delta` is authoritative, and freezing at the first is what
+  keeps that difference from mattering. *Before* that frame the capture is open
+  by design, and the same condition is what makes that free: while no
+  authoritative frame has arrived, `!haveTerminalUsage` keeps the loop running
+  for every payload anyway — so the case where the latest rate decides the
+  recorded figure is exactly the case where the loop already runs throughout,
+  counter or no counter.
+- **The choice deliberately does not live inside `mergeResponsesUsage`.** That
+  function is also `publishProgress`'s per-frame reader, and per-frame is the
+  live column's *feature* for the very same falling-average reason — a running
+  max would pin the panel at the stream's peak and never let it come down. A
+  max-versus-latest decision baked into the merge would silently take that
+  away and blank the live rate cell for a client-timings stream. The
+  substitution is likewise a no-op for `anthropic_messages` by construction:
+  `mergeAnthropicUsage` writes no rate field at all (its `anthropicUsage`
+  struct has none, because llama.cpp attaches no `timings` to any Anthropic
+  frame), so the derived-rate gate above opens in exactly the same cases as
+  before.
+- **A response with no authoritative frame records the LAST rate its own frames
+  reported**, never the accumulator's max. What that governs is the **truncated
+  flagged stream**: partial `timings` and no `response.completed`. Such a
+  response has no final figure, but it does have a last measured one, and a
+  peak is no more acceptable there than on a complete stream. **Which surface
+  that reaches depends on the recorded status, and the two shapes must not be
+  conflated.** A truncated stream reaches routing when it ends **cleanly at
+  200 without a `response.completed`** — a `response.failed` or
+  `response.incomplete` terminal event (this repo's own translate path emits
+  `response.failed`, `inference_complete.go`), or an upstream that simply
+  stops: `nativeTerminalStatus` records those `status = "success"`, and the
+  EWMA feed below is gated on success, so their rate is a routing input like
+  any complete stream's. A **client disconnect, a copy error or an idle
+  timeout** is recorded `status = "error"` by that same function, so its rate
+  reaches only the **Activity row** — where a peak is still a misreport, just
+  not a routing one. The `…ShowsTheUpstreamRate` fixture models the clean-close
+  shape, which is the one this rule earns its routing justification from.
+  **The residual is that this value is
+  the generation's last measurement, not its completed average:** a stream cut
+  off early reports the rate as of the moment it stopped, which is the most the
+  wire ever said. A **buffered** body needs no rule of its own — one payload
+  makes its own figure trivially the latest — and would not need protecting even
+  if it did: on this repo's own account of which shapes carry `timings`
+  (`parsePassthroughUsage`, and the `speculation_observed` paragraph above), the
+  non-streaming `/v1/responses` body carries no `timings` object at all, so
+  there is no buffered Responses rate to lose. A **zero** never overwrites a
+  rate already held, in either direction (`takeLastNonZeroF`): the measured
+  per-frame series above opens at exactly `0.0`, so "this frame reported nothing
+  yet" must not erase what the stream did report, and a captured 0 must not
+  overwrite a figure the capture never saw — which is what keeps the
+  flavor-agnostic substitution a no-op for `anthropic_messages` by construction
+  rather than by assumption.
+
+**The same gate governs both columns.** `usageScanner.publishProgress`
 publishes an output-token count to the live counter only from an authoritative
 frame, for a sharper version of the identical reason: the recorded row can
 tolerate a placeholder because it is presented as a *count*, whereas
 `liveProgressDTO` would divide that `1` by the generation window and DISPLAY the
 quotient as a measured *rate* for the rest of the stream. One predicate, one
-definition per flavor, two consumers — which is also why the predicate's
-Responses branch must not be deleted as unused: the recorded rate is
-Anthropic-only, so the live column is that branch's only reader.
+definition per flavor, three consumers — the derived rate, the frame that
+freezes the recorded rate's capture, and the live count — so the predicate's
+Responses branch now has two readers of its own (the live count, and the rate
+capture above) where the Anthropic-only derived rate gives it none.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds
