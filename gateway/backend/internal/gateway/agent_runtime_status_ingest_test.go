@@ -1810,6 +1810,40 @@ func TestIngestWarnsWhenACapabilitySourceCannotBeAttributed(t *testing.T) {
 	}
 }
 
+// TestReportedSourceIsSafeOnAMissingCapabilitiesObject pins the nil-safety
+// of the accessor the rejection branch above logs through. The branch used
+// to read rt.Capabilities.Source directly, and that was safe only by an
+// invariant enforced one function away -- rowSource defaults the nil
+// receiver to a VALID source, so a nil sample never reaches the branch. A
+// mutation to that first line during review turned the branch into a
+// SEGFAULT rather than a failed assertion, which is what says nothing local
+// was protecting it.
+//
+// So the nil case is pinned where it can be reached: on the accessor
+// itself. `var missing *agentRuntimeCapabilitiesSample; missing.Source` --
+// the expression the branch used to contain -- panics; missing.reportedSource()
+// must not. Deleting the accessor's nil guard makes this test panic with
+// exactly that nil-pointer dereference.
+//
+// The second half is the no-behaviour-change half: the value must arrive
+// RAW. The log has to name what the agent actually sent, and a source that
+// differs from a valid one only in whitespace or case is worth seeing as it
+// came -- trimming or folding it here would quietly answer a different
+// question than the one the operator is reading.
+func TestReportedSourceIsSafeOnAMissingCapabilitiesObject(t *testing.T) {
+	var missing *agentRuntimeCapabilitiesSample
+	if got := missing.reportedSource(); got != "" {
+		t.Fatalf("(*agentRuntimeCapabilitiesSample)(nil).reportedSource() = %q, want \"\"", got)
+	}
+
+	for _, raw := range []string{"", "  ", "llama_cpp_props", "  Manual  ", "totally_made_up_probe"} {
+		sample := &agentRuntimeCapabilitiesSample{Source: raw}
+		if got := sample.reportedSource(); got != raw {
+			t.Errorf("reportedSource() = %q, want the reported %q verbatim -- the log names what arrived, not a normalised form of it", got, raw)
+		}
+	}
+}
+
 // TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank proves the rank
 // rule did not move when the second probe source arrived: ollama_api_show is
 // a PROBE (rank 1 through capabilitySourceRank's default branch, with no

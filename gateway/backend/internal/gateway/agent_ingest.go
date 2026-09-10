@@ -246,6 +246,31 @@ func (c *agentRuntimeCapabilitiesSample) rowSource() (string, bool) {
 	}
 }
 
+// reportedSource is c.Source as it ARRIVED -- untrimmed, unvalidated, and
+// safe on a nil receiver. It exists for one caller: the log line that
+// reports a source rowSource above refused
+// (runtimeSampleCapabilityRows). That line has to name the value the agent
+// actually sent, so it cannot use rowSource's return (which is "" for
+// exactly the case being logged) and must not trim, since a source that
+// differs from a valid one only in whitespace is worth seeing as it came.
+//
+// A METHOD rather than a field read at the call site, because the call site
+// was safe only by an invariant enforced one function away: rowSource
+// defaults the nil receiver to a VALID source, so a nil c can never reach
+// the rejection branch, so the deref there could never fire. That is true,
+// and it is true somewhere else -- a mutation to rowSource's first line
+// during review turned the branch into a SEGFAULT rather than a failed
+// assertion, which is the tell that nothing local protected it. This
+// accessor makes the branch correct on its own terms, at no behavioural
+// cost: for every input that reaches it today it returns exactly what
+// c.Source returned.
+func (c *agentRuntimeCapabilitiesSample) reportedSource() string {
+	if c == nil {
+		return ""
+	}
+	return c.Source
+}
+
 // capabilityRows projects c.Verdicts onto the store's row shape -- the rows
 // THIS probe determined, attributed to source (the caller's already-resolved
 // rowSource, never c.Source as written) and stamped at, ready for
@@ -1053,10 +1078,14 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 		// above, which repeats per sample and warns anyway -- a fleet-wide
 		// capability blackout is worth a repeated line.
 		//
-		// Only a NON-nil sample can be rejected (rowSource defaults the nil
-		// receiver), so reading rt.Capabilities.Source here is safe.
+		// reportedSource, not rt.Capabilities.Source: a nil sample cannot
+		// reach this branch (rowSource defaults the nil receiver to a valid
+		// source), but that invariant lives one function away, so reading
+		// the field directly here would be safe only at a distance. The
+		// accessor is nil-safe on its own terms and returns the identical
+		// value for every input that does reach this branch.
 		slog.Warn("runtime capability sample names an unrecognised source, dropping its rows",
-			"spec_id", rt.SpecID, "source", rt.Capabilities.Source)
+			"spec_id", rt.SpecID, "source", rt.Capabilities.reportedSource())
 		return nil
 	}
 	var rows []routing.CapabilityRow
