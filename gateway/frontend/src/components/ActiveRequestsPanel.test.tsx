@@ -222,9 +222,15 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
     const row = screen.getByRole('cell', { name: 'live-model' }).closest('tr')!;
     expect(within(row).getByRole('cell', { name: '640 ms' })).toBeInTheDocument();
     expect(within(row).getByRole('cell', { name: '—' })).toBeInTheDocument();
-    // Neither shape of a zero — the absence is not a measurement of nothing.
-    expect(within(row).queryByRole('cell', { name: '0.0' })).not.toBeInTheDocument();
-    expect(within(row).queryByRole('cell', { name: '0' })).not.toBeInTheDocument();
+    // The live-rate cell itself, addressed by its provenance tooltip rather than by
+    // its text — the absence must not read as a measurement of nothing. A query for
+    // '0' or '0.0' could not fail here (no visible column of this panel renders
+    // either string in any state), whereas this pins that ONE cell's own text: it is
+    // violated by any mutation that renders a zero rate as a number (formatMetric's
+    // falsy guard no longer mapping 0 to the shared em-dash yields '0.0') and,
+    // unlike the row-wide query above, it cannot be satisfied by some OTHER cell
+    // holding the dash.
+    expect(within(row).getByTitle(t.activityLiveTpsNone).textContent).toBe('—');
     expect(screen.getByText('—')).toHaveAttribute('title', t.activityLiveTpsNone);
   });
 
@@ -365,7 +371,10 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
     const ttftIndex = headers.findIndex((h) => h.includes(t.activityColTTFT));
     expect(ttftIndex).toBeGreaterThanOrEqual(0);
     expect(within(row).getAllByRole('cell')[ttftIndex].textContent).toBe('—');
-    expect(within(row).queryByRole('cell', { name: '0' })).not.toBeInTheDocument();
+    // '0 ms' is the one shape of a zero this row can actually produce: it is what the
+    // ttft cell renders if its `> 0` guard is dropped, since the DTO's ttft_ms here is
+    // 0. A bare '0' is not — no visible column of this panel renders it in any state —
+    // so the two em-dash assertions above are what pin the live cells.
     expect(within(row).queryByRole('cell', { name: '0 ms' })).not.toBeInTheDocument();
   });
 });
