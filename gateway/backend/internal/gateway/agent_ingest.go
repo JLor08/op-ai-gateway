@@ -1044,7 +1044,7 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 // NOT here: those four are what the two detectors read out of their
 // documents (llama.cpp's modalities + chat_template_caps, Ollama's
 // capabilities array), so a probe reporting one of them is reporting what it
-// saw. Neither document says anything about either name below:
+// saw. Neither document says anything about any name below:
 //
 //   - "mtp" is not detected anywhere today. The row comes from the portal --
 //     an operator's checkbox (manual) or the model-NAME heuristic
@@ -1061,21 +1061,43 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 //     understand at all, and for an Ollama child the dedicated field is
 //     ALWAYS "", so the "dedicated field wins" ordering below has nothing to
 //     win with and a publisher's string would take effect outright.
+//   - "speculation_observed" is observed by the GATEWAY, off the traffic it
+//     already relays: a completion whose usage reported drafted tokens
+//     (recordUsage -> writeSpeculationObserved, sourced
+//     routing.CapabilitySourceLlamaCppTimings). Neither probe reads a served
+//     completion's timings -- neither /props nor /api/show says anything
+//     about speculative decoding at all -- so no honest agent has anything
+//     to report here, in either direction. Two things make a verdict from
+//     the open list worse for this name than for "mtp". A "no" is a claim
+//     routing.CapabilitySpeculationObserved says cannot exist (the absence
+//     of drafted tokens is "no evidence", never "does not speculate"), and
+//     it arrives at rank 1, which TIES the gateway's own row -- and a tie is
+//     writable by design, so it OVERWRITES a real observation. And the
+//     repair that makes ties safe everywhere else is missing here: the
+//     gateway writes this row at most once per mapping per PROCESS LIFETIME
+//     (claimSpeculationObserved), so it never rewrites what it wrote, and an
+//     agent's false verdict stands until a restart. No other rank-1
+//     capability has that property.
 //
 // This gateway-side rule is the load-bearing one, and the reason is the
-// threat model rather than tidiness: the agent's own detector skips these
-// names too (collector.detectOllamaCapabilities), but that filter protects
-// only against a publisher string reaching an HONEST agent's Extra list. A
-// buggy or hostile agent puts the name straight into the verdicts it sends,
-// where no agent-side filter is in the path at all. This boundary is.
+// threat model rather than tidiness: the agent's own detector skips the
+// first two names too (collector.detectOllamaCapabilities), but that filter
+// protects only against a publisher string reaching an HONEST agent's Extra
+// list. A buggy or hostile agent puts the name straight into the verdicts it
+// sends, where no agent-side filter is in the path at all. This boundary is.
+// It carries no entry for the third name and needs none, for the same reason
+// stated from the other side: "speculation_observed" appears in neither
+// document either agent detector reads, so an honest agent has no path to
+// it, and a dishonest one was never going to consult a filter.
 //
 // The day a real MTP detector exists it reports through a field this
 // codebase defined, the way live-progress support does, or this list changes
 // on both sides -- what it must not do is arrive on the OPEN list, whose
 // whole purpose is carrying strings no one here has vetted.
 var reservedAgentCapabilityNames = map[string]bool{
-	routing.CapabilityMTP:          true,
-	routing.CapabilityLiveProgress: true,
+	routing.CapabilityMTP:                 true,
+	routing.CapabilityLiveProgress:        true,
+	routing.CapabilitySpeculationObserved: true,
 }
 
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined

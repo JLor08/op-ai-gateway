@@ -842,6 +842,22 @@ func (s *Server) writeSpeculationObserved(ctx context.Context, mappingID string)
 	}
 	rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored))
 	if len(rows) == 0 {
+		// Debug, and the level is the argument: being outranked here is the
+		// NORMAL outcome the moment an operator has answered (manual, rank
+		// 3) or the vision benchmark measured (rank 2), so a Warn would cry
+		// wolf on a correctly configured fleet -- this is not a REJECTION of
+		// a producer's input, which is what this repo reserves Warn for.
+		//
+		// It is logged at all because of the one way this writer differs
+		// from every sibling that returns silently here (agent_ingest.go's
+		// write-back, app_health.go's probe pass): they re-run on a cadence,
+		// so a drop leaves the next tick's record and the state is
+		// re-derivable. This one holds its claim for the process's lifetime,
+		// so the drop happens ONCE and is never revisited -- without this
+		// line an operator asking why the chip never appeared for a mapping
+		// that demonstrably speculates has nothing to read at any level.
+		slog.Debug("speculation verdict: no writable row, dropping the observation",
+			"mapping", mappingID, "capability", routing.CapabilitySpeculationObserved)
 		return // already on file at this rank, or outranked by an operator / a measurement
 	}
 	if err := s.Routes.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {

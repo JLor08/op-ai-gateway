@@ -10,7 +10,9 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -229,4 +231,169 @@ func TestRecordUsageWritesTheSpeculationVerdictOnceUnderConcurrentCompletions(t 
 	if row, ok := speculationRow(t, calls.Store); !ok || row.Source != routing.CapabilitySourceLlamaCppTimings {
 		t.Fatalf("row = %+v (present=%v), want one %q verdict", row, ok, routing.CapabilitySourceLlamaCppTimings)
 	}
+}
+
+// The agent trust boundary, for the one capability this gateway observes
+// ITSELF. reservedAgentCapabilityNames must contain
+// routing.CapabilitySpeculationObserved, so a verdict carrying that name in
+// an agent's OPEN verdict list never becomes a row -- and the direction that
+// matters is not the obvious one.
+//
+// A "no" from the open list ties the gateway's own row at rank 1 (both
+// llama_cpp_props and llama_cpp_timings take capabilitySourceRank's default),
+// and a tie is writable by design, because everywhere else the writer that
+// lost repairs its own row on the next cadence tick. This writer has no next
+// tick: claimSpeculationObserved holds the mapping for the whole process
+// lifetime, so once overwritten the false verdict stands until a restart.
+// That combination -- rank-1 writable, never rewritten -- is unique to this
+// capability, and it is why the name belongs on the list rather than merely
+// being unlikely to arrive.
+//
+// Both verdicts are refused, and each subtest is falsifiable in its own way,
+// because the two would-be harms are different:
+//
+//   - "no" over a real observation is the OVERWRITE. The mapping is seeded
+//     with exactly the row the gateway writes (yes/llama_cpp_timings), so a
+//     row that got through would flip a stored verdict and be visible.
+//   - "yes" with nothing on file is the FABRICATION -- the "mtp" harm
+//     verbatim, an unvetted publisher string presented to the operator as an
+//     attested capability. Nothing is seeded, so a row that got through
+//     would appear from nowhere and be visible. (Seeding here would hide it:
+//     rule 2 of routing.WritableCapabilityRows compares verdict and rank
+//     only, so an agent "yes" over the gateway's "yes" is dropped as
+//     unchanged whatever this list says.)
+//
+// And "nothing was written" cannot pass vacuously in either subtest: the
+// same sample carries a "vision" verdict, which must still land -- the
+// reserved rule drops rows, never the pass.
+func TestIngestDropsAnAgentReportedSpeculationVerdict(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, verdict string
+		seedObservation     bool
+	}{
+		{"a false negative would overwrite the gateway's own observation, permanently", "rspec_spec_no", routing.CapabilityNo, true},
+		{"an unvetted positive would fabricate one out of a publisher's string", "rspec_spec_yes", routing.CapabilityYes, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			if tc.seedObservation {
+				seedCapabilityRow(t, srv, mappingID, routing.CapabilitySpeculationObserved,
+					routing.CapabilityYes, routing.CapabilitySourceLlamaCppTimings)
+			}
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"`+routing.CapabilitySpeculationObserved+`","verdict":"`+tc.verdict+`"},`+
+					`{"name":"vision","verdict":"yes"}],"source":"`+routing.CapabilitySourceLlamaCppProps+`"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityVision {
+				t.Fatalf("the write carried %+v, want exactly the vision row -- an agent-reported %q must never reach the store, and the rest of the pass must still land", sent, routing.CapabilitySpeculationObserved)
+			}
+			if tc.seedObservation {
+				assertCapabilityRow(t, srv, mappingID, routing.CapabilitySpeculationObserved,
+					routing.CapabilityYes, routing.CapabilitySourceLlamaCppTimings)
+			} else if row, ok := capabilityRow(t, srv, mappingID, routing.CapabilitySpeculationObserved); ok {
+				t.Fatalf("a %q row exists (%+v), want none -- only a relayed completion's own drafted tokens may create one", routing.CapabilitySpeculationObserved, row)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityVision,
+				routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+			if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "reserved internal capability names") {
+				t.Fatalf("no WARN record naming the reserved drop at the gateway's own default level (info); records = %+v -- a dropped write that cannot heal on its own must be readable in a default deployment", recs)
+			}
+		})
+	}
+}
+
+// The claim's ATOMICITY, which is a different property from the claim's
+// existence: TestRecordUsage...OnceUnderConcurrentCompletions pins that the
+// set is consulted at all (remove the guard and its read count goes to 8),
+// but it cannot see a claim split into a non-atomic check-then-set, because
+// recordUsage puts several serializing mutexes in front of the window and
+// two completions effectively never land inside it.
+//
+// So this test does not go through recordUsage. It calls the unexported
+// claimSpeculationObserved directly -- 64 goroutines released at once by
+// close(start), against a fresh zero-valued Server per iteration, which is
+// also what pins that the lazily created map is nil-safe from &Server{}.
+//
+// It cannot false-FAIL: one critical section makes a second "true" for the
+// same id impossible regardless of timing or machine, so a correct
+// implementation passes at any iteration count. Its weakness is the
+// false-PASS direction, which is the acceptable one and is what the
+// iteration count buys down -- measured against a split claim, this
+// configuration detects it in 5 runs out of 6, typically within the first
+// dozen iterations, for about half a second.
+func TestClaimSpeculationObservedIsAtomicUnderConcurrentFirstSightings(t *testing.T) {
+	const goroutines, iterations = 64, 3000
+	for i := range iterations {
+		srv := &Server{}
+		var claims atomic.Int32
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if srv.claimSpeculationObserved(seedMappingID) {
+					claims.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := claims.Load(); got != 1 {
+			t.Fatalf("iteration %d: %d of %d goroutines claimed the SAME unclaimed mapping, want exactly 1 -- the lookup and the insert must happen in ONE critical section, or the first sighting costs one store read per goroutine that got through", i, got, goroutines)
+		}
+	}
+}
+
+// An observation dropped because it was outranked leaves a record. Being
+// outranked is the normal outcome once an operator has answered, so this is
+// Debug rather than Warn -- but it must exist at some level, because this
+// writer holds its claim for the process's lifetime and therefore never
+// re-derives what it dropped. Without the line, an operator asking why the
+// chip never appeared for a mapping that demonstrably speculates has nothing
+// anywhere to read.
+//
+// The capture is at Debug on purpose here, unlike the reserved-name test
+// above: Debug is the RIGHT level for this drop, so a test capturing at info
+// would be asserting the wrong thing.
+func TestRecordUsageLogsASpeculationObservationItCannotWrite(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+	srv, calls := speculationTestServer(t)
+	manual := routing.CapabilityRow{
+		Capability: routing.CapabilitySpeculationObserved,
+		Verdict:    routing.CapabilityNo,
+		Source:     routing.CapabilitySourceManual,
+		CheckedAt:  time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC),
+	}
+	if err := calls.Store.UpsertMappingCapabilities(context.Background(), seedMappingID, []routing.CapabilityRow{manual}); err != nil {
+		t.Fatalf("seed manual row: %v", err)
+	}
+
+	speculatingCompletion(t, srv, 7, "req_spec_outranked_log")
+
+	recs := buf.Snapshot()
+	for _, r := range recs {
+		if r.Level != "DEBUG" || !strings.Contains(r.Msg, "no writable row") {
+			continue
+		}
+		if r.Attrs["mapping"] != seedMappingID {
+			t.Fatalf("the record names mapping %v, want %q -- a line an operator cannot attribute to a mapping is not a diagnostic", r.Attrs["mapping"], seedMappingID)
+		}
+		if r.Attrs["capability"] != routing.CapabilitySpeculationObserved {
+			t.Fatalf("the record names capability %v, want %q", r.Attrs["capability"], routing.CapabilitySpeculationObserved)
+		}
+		return
+	}
+	t.Fatalf("no DEBUG record about the dropped observation; records = %+v", recs)
 }
