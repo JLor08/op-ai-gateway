@@ -1048,6 +1048,21 @@ at **`Warn`**, not `Debug`: the gateway's default level is `info`, so at
 row it ever sent with nothing anywhere to say why, and the rows' absence
 reads as plain "unknown".
 
+**One combination is refused outright rather than attributed: a live-progress
+verdict sourced `ollama_api_show`.** Such a sample writes no `live_progress`
+row at all. Ollama exposes no `timings_per_token`-style surface, so its
+`/api/show` document cannot carry evidence about live progress in *either*
+direction, and a row attributed to that probe would be a false provenance
+whatever verdict it held — which is exactly the claim
+`routing.CapabilityRow`'s own source documentation makes. No honest agent
+sends the combination (`ProbeOllamaVerdicts` leaves the field `""` on every
+return path), and that is *why* the ingest enforces it rather than
+documenting it: an invariant a caller can violate is not an invariant. The
+rest of the pass still lands — a `vision` or `tools` verdict is something
+`/api/show` really can answer — and the dropped row is logged at `Warn`. One
+consequence follows: a `live_progress` row can now only ever carry
+`llama_cpp_props`.
+
 **What this does NOT cover, and why each is its own change.** A *directly
 configured* Ollama application (no agent) still gets no capability
 detection: detection is agent-side, over loopback, and the gateway's own

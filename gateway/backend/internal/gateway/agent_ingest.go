@@ -1046,14 +1046,20 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 // BOTH row kinds are stamped with the ONE source resolved here, because the
 // agent derives both from the same probe pass over the same document
 // (server-agent's probeRuntimeChildProps fills LiveProgressSupport and
-// Capabilities from a single fetch). Today only a /props document can yield
-// a live-progress verdict, so in practice that source is llama_cpp_props --
-// but reading it from the report rather than hard-coding llama.cpp's name is
-// what keeps the attribution true if that ever stops being so, and it is the
-// same rule the verdict rows follow. A source this gateway does not
+// Capabilities from a single fetch). A source this gateway does not
 // recognise voids the whole pass, live-progress row included: the pass's
 // provenance is what was unrecognisable, and no part of it is more
 // attributable than the rest.
+//
+// ONE combination is refused rather than stamped: a live-progress verdict
+// attributed to ollama_api_show -- see the refusal below for why that is
+// wrong independent of what the sender intended. A consequence worth
+// stating, because it is a limit on what the tests here can show: the
+// live-progress row can now only ever carry llama_cpp_props, so reading the
+// source from the report rather than hard-coding llama.cpp's name -- still
+// the honest rule, and still the one the verdict rows follow -- is no
+// longer distinguishable from the hard-coded name by any input, and no test
+// pins it any more.
 func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.CapabilityRow {
 	source, ok := rt.Capabilities.rowSource()
 	if !ok {
@@ -1090,10 +1096,40 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	}
 	var rows []routing.CapabilityRow
 	if verdict := routing.LiveProgressCapabilityVerdict(rt.LiveProgressSupport); verdict != "" {
-		rows = append(rows, routing.CapabilityRow{
-			Capability: routing.CapabilityLiveProgress, Verdict: verdict,
-			Source: source, CheckedAt: at,
-		})
+		if source == routing.CapabilitySourceOllamaAPIShow {
+			// REFUSED, not stamped. The combination is one no honest agent
+			// produces -- ProbeOllamaVerdicts leaves LiveProgress "" on
+			// every one of its return paths -- but a buggy or hostile one
+			// can send it, and this is the boundary where the agent's bytes
+			// arrive, so "no honest producer does this" is not an invariant
+			// here: it is a hope.
+			//
+			// The refusal is semantically right independent of anyone's
+			// intent, which is why it is a refusal and not a softened
+			// comment somewhere. Ollama exposes no timings_per_token-style
+			// surface at all, so its /api/show document cannot carry
+			// evidence about live progress in EITHER direction -- a
+			// live_progress row attributed to that probe is a false
+			// provenance whatever verdict it carries, and false provenance
+			// on this column is the one thing the column exists to
+			// prevent. routing.CapabilityRow's own source doc makes the
+			// strong claim ("a row with this source and verdict
+			// CapabilityNo could therefore not have come from that probe")
+			// -- this is what makes the claim true rather than aspirational.
+			//
+			// Only the live-progress row goes; the verdict rows below are
+			// exactly what an /api/show document CAN answer, so they still
+			// ride the same pass. Warn, not Debug, for this file's
+			// established reason: a drop that cannot heal on its own is
+			// invisible at the gateway's default info level otherwise.
+			slog.Warn("runtime capability sample attributes a live-progress verdict to the ollama probe, dropping that row",
+				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
+		} else {
+			rows = append(rows, routing.CapabilityRow{
+				Capability: routing.CapabilityLiveProgress, Verdict: verdict,
+				Source: source, CheckedAt: at,
+			})
+		}
 	}
 	return append(rows, rt.Capabilities.capabilityRows(source, at)...)
 }

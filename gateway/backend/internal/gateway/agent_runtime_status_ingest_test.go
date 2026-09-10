@@ -1889,20 +1889,34 @@ func TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank(t *testing.T) {
 	}
 }
 
-// TestIngestLiveProgressRowCarriesTheReportedSource pins that the reported
-// source governs EVERY row one probe pass produces, the live-progress row
-// included. The agent fills LiveProgressSupport and Capabilities from a
-// SINGLE fetch of a SINGLE document (probeRuntimeChildProps), so one source
-// describes both; hard-coding llama.cpp's name on the live-progress row
-// while reading the reported one for its siblings would attribute two halves
-// of one document to two different probes.
+// TestIngestRefusesALiveProgressRowFromTheOllamaProbe pins the ONE
+// combination this boundary refuses rather than stamps: a live-progress
+// verdict attributed to ollama_api_show.
 //
-// The sample here is one today's agent cannot produce -- Ollama exposes no
-// timings_per_token surface, so ProbeOllamaVerdicts always leaves
-// LiveProgress "" -- and that is the point: if the wire ever does carry that
-// combination, the row must say where it came from rather than borrowing a
-// name the document never had.
-func TestIngestLiveProgressRowCarriesTheReportedSource(t *testing.T) {
+// No honest agent produces it -- ProbeOllamaVerdicts leaves LiveProgress ""
+// on every one of its return paths -- and that is precisely why the refusal
+// has to live here rather than in a comment asserting it cannot happen.
+// This is where the agent's bytes arrive; an invariant a caller can violate
+// is not an invariant. The refusal is also right independent of what the
+// sender intended: Ollama exposes no timings_per_token-style surface, so
+// that document cannot carry evidence about live progress in EITHER
+// direction, which is the claim routing.CapabilityRow's own source doc
+// makes about rows carrying this source.
+//
+// The pass is NOT voided, and the difference matters: a vision verdict is
+// something /api/show really can answer, so it still lands, still sourced
+// ollama_api_show. Only the row that document could not have produced goes
+// -- and it goes visibly, at the level a real gateway runs at.
+//
+// Its predecessor asserted the opposite outcome (the live-progress row
+// stamped with the reported source), which is why the property that test
+// existed for is now unpinnable: the row can only ever carry
+// llama_cpp_props, so reading the reported source and hard-coding
+// llama.cpp's name are indistinguishable by any input. The scoping is
+// covered from the other side instead, by the llama_cpp_props live-progress
+// tests above, which this refusal must leave alone.
+func TestIngestRefusesALiveProgressRowFromTheOllamaProbe(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_lp_src", false)
 	counting := countingRowStore(srv)
@@ -1915,10 +1929,20 @@ func TestIngestLiveProgressRowCarriesTheReportedSource(t *testing.T) {
 		t.Fatalf("ingest: %v", err)
 	}
 	if got := counting.upsertCalls.Load(); got != 1 {
-		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (both rows ride one write)", got)
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the vision row alone)", got)
 	}
-	assertCapabilityRow(t, srv, "map_rspec_lp_src", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityVision {
+		t.Fatalf("the write carried %+v, want exactly the vision row -- only the row /api/show could not have produced may be dropped", sent)
+	}
 	assertCapabilityRow(t, srv, "map_rspec_lp_src", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceOllamaAPIShow)
+	if row, ok := capabilityRow(t, srv, "map_rspec_lp_src", routing.CapabilityLiveProgress); ok {
+		t.Fatalf("a live_progress row exists (%+v), want none -- an Ollama probe cannot observe live-progress support at all, in either direction", row)
+	}
+
+	recs := buf.Snapshot()
+	if !findLogRecord(recs, "WARN", "live-progress") {
+		t.Fatalf("no WARN record about the dropped live-progress row at the gateway's own default level (info); records = %+v", recs)
+	}
 }
 
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities
