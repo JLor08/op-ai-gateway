@@ -129,9 +129,10 @@ describe('MappingForm capability controls', () => {
   it('says what UNKNOWN means PER capability, and only while unknown is selected', async () => {
     // The copy must not promise uniform re-detection. `vision` really does
     // come back from a llama.cpp /props upstream; `mtp` is never re-probed on
-    // an existing mapping, so resetting it discards the verdict (and the
-    // scorer's MTP bonus) until a human sets it again. One shared "let
-    // detection decide again" would be a promise the gateway does not keep.
+    // an existing mapping, so resetting it discards the (display-only, since
+    // task 1 deleted the scorer's flat MTP bonus) verdict until a human sets
+    // it again. One shared "let detection decide again" would be a promise
+    // the gateway does not keep.
     renderForm({ row: makeMapping({ capabilities: [capRow('vision', 'yes')] }) });
 
     // mtp has no row -> unknown -> its own hint is on screen. vision is "yes",
