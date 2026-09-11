@@ -234,6 +234,13 @@ func TestApplicationParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
 		"benchmark_schedule_enabled", "opportunistic_metrics_enabled", "proxy_excluded",
 		"responses_live_timings_enabled",
 	}
+	// Without this, the guard degrades exactly the way it exists to prevent: a
+	// sixth pattern row with no names entry either reports the wrong column's
+	// name (if it happens to be distinct) or panics with index-out-of-range
+	// instead of printing the duplicate-pattern message below.
+	if len(names) != len(applicationParityBools) {
+		t.Fatalf("names has %d entries for %d bit-pattern rows: widen both together", len(names), len(applicationParityBools))
+	}
 	for i := range applicationParityBools {
 		trueSomewhere := false
 		for _, v := range applicationParityBools[i] {

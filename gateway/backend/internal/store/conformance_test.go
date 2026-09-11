@@ -945,18 +945,43 @@ func TestConformanceApplicationResponsesLiveTimings(t *testing.T) {
 			}
 		}
 
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
-			ID: "map_lt", ApplicationID: "app_lt", GatewayModelName: "lt-model", AppModelName: "up-lt",
-			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping: %v", err)
+		// BOTH applications map the same gateway model, so a single
+		// ActiveMappingsForModel call has to report a different value per row.
+		// The true row catches a column dropped from (or swapped inside) the
+		// join's select list; the false row catches one read as a constant.
+		// Checking only the true direction here would leave this test leaning
+		// on TestConformanceApplicationReadersAgreeOnEveryColumn's
+		// cross-reader comparison for half its coverage.
+		for _, m := range []routing.ModelMapping{
+			{
+				ID: "map_lt", ApplicationID: "app_lt", GatewayModelName: "lt-model", AppModelName: "up-lt",
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			},
+			{
+				ID: "map_def", ApplicationID: "app_def", GatewayModelName: "lt-model", AppModelName: "up-def",
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			},
+		} {
+			if err := s.CreateMapping(ctx, m); err != nil {
+				t.Fatalf("create mapping %s: %v", m.ID, err)
+			}
 		}
 		candidates, err := s.ActiveMappingsForModel(ctx, "lt-model", routing.APIFlavorOpenAI)
-		if err != nil || len(candidates) != 1 {
+		if err != nil || len(candidates) != 2 {
 			t.Fatalf("active mappings: err=%v n=%d", err, len(candidates))
 		}
-		if !candidates[0].Application.ResponsesLiveTimingsEnabled {
+		joined := map[string]bool{}
+		for _, c := range candidates {
+			joined[c.Application.ID] = c.Application.ResponsesLiveTimingsEnabled
+		}
+		if len(joined) != 2 {
+			t.Fatalf("the routing join returned %d candidates over %d distinct applications: %v", len(candidates), len(joined), joined)
+		}
+		if !joined["app_lt"] {
 			t.Fatalf("the ROUTING join lost responses_live_timings_enabled: a column missed in ActiveMappingsForModel reads back as a clean zero while every memory-backed portal test still passes")
+		}
+		if joined["app_def"] {
+			t.Fatalf("the ROUTING join reported responses_live_timings_enabled = true for app_def, whose stored value is false: it is reading a constant or a neighbouring column, not this one")
 		}
 	})
 }
