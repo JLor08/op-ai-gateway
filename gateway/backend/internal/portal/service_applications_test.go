@@ -3532,6 +3532,24 @@ func TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 	if !errors.Is(err, ErrApplicationTuningInvalid) {
 		t.Errorf("err = %v, want ErrApplicationTuningInvalid: the live-timings refusal must not pre-empt a shipped 400", err)
 	}
+
+	// Leg 3: applyProxyExclusion's own 409, and the reason this leg exists at
+	// all. That function is called on the routing.Application literal, so for
+	// as long as the opt-in was a FIELD of that literal the refusal was pinned
+	// above it and this body reported the live-timings 400. Writing the value
+	// as a statement after the call moved the refusal below it. Nothing but
+	// this leg holds that shape in place.
+	_, err = svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLiteLLM, Port: 8332, Scheme: "http",
+		ProxyExcluded: boolPtr(true), ProxyListenPort: 9000,
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationProxyExcludedPortConflict) {
+		t.Errorf("err = %v, want ErrApplicationProxyExcludedPortConflict: the live-timings refusal must not pre-empt applyProxyExclusion's 409", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v: the refusal is still pinned above applyProxyExclusion (is the value back in the struct literal?)", err)
+	}
 }
 
 // TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations is
@@ -3585,8 +3603,27 @@ func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 		t.Errorf("err = %v: a PATCH invalid for a PRE-EXISTING reason reported the brand-new live-timings 409 instead", err)
 	}
 
-	// Neither refused PATCH may have written anything: both are refused inside
-	// the validate-before-mutate block, ahead of the first mutation.
+	// Leg 3: checkPathSuffix, which validates from INSIDE the mutation block
+	// and so could not be outrun from outside it. The same body without the
+	// flag answers application.path_suffix_invalid; with the flag it used to
+	// answer application.responses_live_timings_conflict. checkHeaderName and
+	// the token seal sit in the same position and are covered by the same
+	// move.
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		AppPathSuffix:               strPtr("http://evil"),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrPathSuffixInvalid) {
+		t.Errorf("err = %v, want ErrPathSuffixInvalid: the live-timings refusal must not pre-empt a validation that runs inside the mutation block", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v: the refusal still runs ahead of checkPathSuffix", err)
+	}
+
+	// No refused PATCH may have written anything. The refusal now sits INSIDE
+	// the mutation block, so this is the assertion that the block's writes
+	// land on a local copy and never reach the store without
+	// s.routes.UpdateApplication.
 	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
@@ -3596,6 +3633,9 @@ func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 	}
 	if reloaded.BenchmarkScheduleIntervalSeconds != 0 {
 		t.Errorf("a refused PATCH wrote the invalid interval: %d", reloaded.BenchmarkScheduleIntervalSeconds)
+	}
+	if reloaded.AppPathSuffix != "" {
+		t.Errorf("a refused PATCH wrote the invalid path suffix: %q", reloaded.AppPathSuffix)
 	}
 }
 
