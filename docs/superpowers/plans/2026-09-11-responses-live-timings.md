@@ -1356,13 +1356,13 @@ Record which mutation broke which test.
 ### Task 7: The portal's runtime-spec surface, the spread, and the wire docs
 
 **Files:**
-- Modify: `gateway/backend/internal/portal/service_runtime.go` (the `"fmt"` import; the new sentinel after `ErrRuntimeSpecContextProbePathInvalid` at `:119`; `RuntimeSpecDTO` field after `:392`; `PutRuntimeSpecRequest` field after `:459`; the effective-kind refusal in the validate-before-mutate block after the `validRuntimeSpecType` check at `:634`; the value resolution after the `existing, hadExisting` read at `:711`; the `routing.RuntimeSpec` literal after `:801`; the `runtimeSpecDTO` mapper line after `:1180`)
-- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints.go` (one `errRow` in `portalRuntimeSpecErrRows`, after `:84` — **one**, at 400; this task adds no 409)
+- Modify: `gateway/backend/internal/portal/service_runtime.go` (the `"fmt"` import; the new sentinel after `ErrRuntimeSpecContextProbePathInvalid` at `:119`; `RuntimeSpecDTO` field after `:392`; `PutRuntimeSpecRequest` field after `:459`; the effective-kind refusal LAST in the validate-before-mutate block, after `normalizeRuntimeSpecFlavors`' error return at `:669-672`; the value resolution after the `existing, hadExisting` read at `:711`; the `routing.RuntimeSpec` literal after `:801`; the `runtimeSpecDTO` mapper line after `:1180`)
+- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints.go` (one `errRow` in `portalRuntimeSpecErrRows`, inserted immediately after `:84` — **one**, at 400; this task adds no 409)
 - Modify: `gateway/backend/internal/portal/service_runtime_benchmark.go` (`putRequestFromDTO`, after `MessagesMode: dto.MessagesMode,` at `:51`)
-- Modify: `gateway/backend/internal/portal/service_runtime_benchmark_test.go` (the fully-populated DTO at `:138-175` and the `want` literal at `:174-201`)
+- Modify: `gateway/backend/internal/portal/service_runtime_benchmark_test.go` (the fully-populated DTO at `:138-172` and the `want` literal at `:174-201`)
 - Modify: `gateway/backend/internal/portal/service_runtime_test.go` (new tests)
-- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints_test.go` (one wire test, beside `TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400` at `:148`)
-- Modify: `docs/architecture/reference/api-surface.md` (`:494-538`), `docs/architecture/cross-cutting/agent-runtime-manager.md` (`:3738-3748`)
+- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints_test.go` (**two** wire tests, beside `TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400` at `:148`)
+- Modify: `docs/architecture/reference/api-surface.md` (`:494-555`), `docs/architecture/cross-cutting/agent-runtime-manager.md` (`:3733-3759`)
 
 **Interfaces:**
 - Consumes: `routing.LiveTimingsCapableKind(kind string) bool` (Task 5); `routing.RuntimeSpec.ResponsesLiveTimingsEnabled bool` (Task 3); `routing.EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType` (`internal/routing/runtime_spec_type.go:56`); `routing.DetectRuntimeSpecType(binary string) RuntimeSpecType` (`:36`, what the former falls back to); `binary := strings.TrimSpace(req.Binary)` (`service_runtime.go:600`); `specType := strings.TrimSpace(req.Type)` (`:631`); `validRuntimeSpecType(s string) bool` (`:997`, doc `:990-996`) — which **accepts `""` as a first-class value**, meaning "auto-detect from `Binary`", not a default that has already collapsed into one of the five kinds; `existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)` (`:711`).
@@ -1389,24 +1389,33 @@ What changed since the first draft of this plan: a `true` that cannot hold is no
 
 In `service_runtime_test.go`, following the shape of the existing `PutRuntimeSpec` tests (`svc, routeStore := newServerTestService(t, now)`, `createTestServer`, `seedServerAgentApplication(t, routeStore, server.ID, now)`, `svc.CreateMapping(…)`, then `svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{…})`):
 
+**Assertion style, before test 1.** House style in both files this task touches is `t.Fatalf`, and it stays that way for every single-fact assertion. But a test that must report **two** independent facts about one call — the error shape *and* what was (not) written — uses `t.Errorf` for the error-shape legs, and guards every `err.Error()` with `err == nil ||`. With `t.Fatalf` the first failing leg aborts and the state assertion goes unverified in exactly the run that needs it, and a `nil` `err` **panics** on `err.Error()` instead of failing. This is not a preference: Task 6 measured it and shipped that shape (`service_applications_test.go:3126-3138` and `:3302-3322` are the two models to copy). It applies to test 6's two legs and test 9's three. Mutation 13(c) is the run that proves it.
+
 1. `TestPutRuntimeSpecResponsesLiveTimingsDefaultsFromTheSpecsOwnKind` — first write (no existing spec), key absent, three cases, each on its own mapping: `Type: string(routing.RuntimeSpecTypeLlamaCpp)` → `true`; `Type: ""` with `Binary: "/usr/bin/llama-server"` (so `routing.DetectRuntimeSpecType` resolves `llama_cpp`) → `true`; `Type: string(routing.RuntimeSpecTypeOllama)` → `false`. The second case is the one that pins *which* resolver decides.
-2. `TestPutRuntimeSpecResponsesLiveTimingsDoesNotInheritTheParentApplication` — a `server_agent` parent application whose own flag is `true`, written through the routes store directly (`seedServerAgentApplication` then a `routeStore.UpdateApplication` with the field set, or a hand-built `routing.Application` literal), then a first spec write with `Type: string(routing.RuntimeSpecTypeOllama)` and the key absent → `false`. The comment must name the no-inheritance contract **and** say why the seed has to bypass the service: `CreateApplication`/`UpdateApplication` now refuse to store `true` on a `server_agent` application at all, so this fixture state is unreachable through the API — which is itself the invariant this task establishes, not a gap in the test.
+2. `TestPutRuntimeSpecResponsesLiveTimingsDoesNotInheritTheParentApplication` — the pin is a **capable** spec kind under a parent whose flag differs from the kind default, and that is the only direction that can fail. A `server_agent` parent whose own flag is **`false`** — its only reachable value, and what `seedServerAgentApplication` already writes — then a first spec write with `Type: string(routing.RuntimeSpecTypeLlamaCpp)` and the key absent → **`true`**, the spec's own kind default. An implementation seeding from `app.ResponsesLiveTimingsEnabled` (`app` is a `putRuntimeSpec` parameter, `:595`, so it is right there to be misused) answers `false` here and the test fails.
+
+   Add the incapable leg too — `Type: string(routing.RuntimeSpecTypeOllama)` under a parent whose flag is `true`, written with `routeStore.UpdateApplication` (`routing/memory_store.go:818`) because the API refuses that state — but the doc comment must call it a **coherence** leg, not the pin: on an incapable kind Step 8's `case !liveTimingsCapable:` arm forces `false` whatever the seed was, so `false` there is satisfied by the kind default, by the clear, *and* by a complete inheritance defect alike. Do not write the incapable leg as if it proved the contract; it cannot.
+
+   The comment must also name the no-inheritance contract (`:648-652`, `TestPutRuntimeSpecDoesNotInheritAppModes`) and say why the `true` seed has to bypass the service: `CreateApplication`/`UpdateApplication` refuse to store `true` on a `server_agent` application at all, so that fixture state is unreachable through the API — which is itself the invariant this task establishes, not a gap in the test.
 3. `TestPutRuntimeSpecResponsesLiveTimingsPreservesAnExistingValueWhenAbsent` — first write with `boolPtr(false)` on a `llama_cpp` spec; second write with the key absent → still `false`. Then the same spec written with `boolPtr(true)` and saved again with the key absent → still `true`. The defect this pins, in both directions: the kind-dependent default firing on every save would re-enable a flag the operator turned off, and an over-eager clear would drop one they turned on.
-4. `TestPutRuntimeSpecResponsesLiveTimingsAbsentIsNotFalseOnAFirstWrite` — two fresh mappings, both first writes on `Type: string(routing.RuntimeSpecTypeLlamaCpp)`: one with the key absent → `true`, one with `boolPtr(false)` → `false`. With a plain `bool` on the request these are the same call and one assertion must fail; say so in the doc comment. This is the pointer's whole purpose on the spec side.
+4. `TestPutRuntimeSpecResponsesLiveTimingsAbsentIsNotFalseOnAFirstWrite` — two fresh mappings, both first writes on `Type: string(routing.RuntimeSpecTypeLlamaCpp)`: one with the key absent → `true`, one with `boolPtr(false)` → `false`. With a plain `bool` on the request these would be the same call: the absent-key leg would arrive as `false` and the kind-dependent default could never fire. Say **that** in the doc comment — do not predict an assertion failure from swapping the field's type, because that swap is a compile failure in this very test file (`boolPtr(...)` into a `bool` field) and the discipline forbids editing tests to measure a mutation. Task 6 hit exactly this and had to measure the behavioural equivalent instead; mutation 13(i) is that equivalent, written as a production-only edit. This is the pointer's whole purpose on the spec side.
 5. `TestPutRuntimeSpecResponsesLiveTimingsHonoursAnExplicitValue` — `boolPtr(true)` then `boolPtr(false)` on a `llama_cpp` spec; each is stored and echoed by the returned DTO. Add a third leg on its own mapping: `Type: ""` with `Binary: "/usr/bin/llama-server"` and `boolPtr(true)` → **accepted** and stored `true`. That leg is the accepting direction of the effective-kind resolution: a refusal written against the raw `req.Type` would reject it, because `routing.LiveTimingsCapableKind("")` is false, and nothing else in this list would notice.
-6. `TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind` — two legs, each asserting `errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported)`, the effective kind named in `err.Error()`, and that **nothing was written**:
-   - an existing `llama_cpp` spec with the flag on, PUT with `Type: string(routing.RuntimeSpecTypeOllama)` **and** `boolPtr(true)` → refused naming `ollama`; then `svc.GetRuntimeSpec` must still report `Type == "llama_cpp"` **and** the flag still `true`. A refused PUT writes nothing, not even the type.
+6. `TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind` — two legs, each asserting `errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported)`, the effective kind named in `err.Error()`, and that **nothing was written**. The two error-shape assertions in each leg are `t.Errorf` with an `err == nil ||` guard before the `err.Error()`, per the assertion-style note above: mutation 13(c) makes `err` nil, and with `t.Fatalf` the "nothing was written" leg would never run in the one run that needs it (and the unguarded `err.Error()` would panic).
+   - an existing `llama_cpp` spec with the flag on — seeded with an **explicit** `Type: string(routing.RuntimeSpecTypeLlamaCpp)`, *not* by auto-detect, because the assertion below reads the DTO's raw stored `Type`: `runtimeSpecDTO` echoes `spec.Type` (`:1188`) and reports the resolved kind separately as `EffectiveType` (`:1191`), so a `Type: ""` + `llama-server` seed stores `""` and `Type == "llama_cpp"` would fail for a reason with nothing to do with this feature — PUT with `Type: string(routing.RuntimeSpecTypeOllama)` **and** `boolPtr(true)` → refused naming `ollama`; then `svc.GetRuntimeSpec` must still report `Type == "llama_cpp"` **and** the flag still `true`. A refused PUT writes nothing, not even the type.
    - a *first* write with `Type: ""` and `Binary: "/usr/local/bin/ollama"` plus `boolPtr(true)` → refused naming `ollama`, the kind the caller never typed. Then `GetRuntimeSpec` must still report the unconfigured DTO (`Configured == false`), proving no row was created. The comment must say that the message names the **effective** kind precisely because an empty `Type` means the binary decided.
 
    The doc comment must also say what these two legs are jointly evidence for, because it is the reason this task has no second sentinel: the first leg has a stored row and the second has none, and **both** are the same refusal, because in both the caller supplied the offending kind in this very body. There is no spec shape where the refused kind comes from state the request left alone, which is the shape the application surface answers 409 on (Task 6).
 7. `TestPutRuntimeSpecResponsesLiveTimingsClearsAStoredTrueWhenTheDocumentsKindCannotHonourIt` — an existing `llama_cpp` spec with the flag on (assert `true` first, so the change is visible), then a PUT with `Type: string(routing.RuntimeSpecTypeOllama)` and the key **absent** → the DTO and a `GetRuntimeSpec` reload both report `false`. This is the clear, and the assertion that it *changed* from `true` is what makes the test mean anything.
-8. `TestRuntimeSpecDTOCarriesResponsesLiveTimings` — upsert a spec with the flag on through the routes store (`routeStore.UpsertRuntimeSpec`), read it through `GetRuntimeSpec`; assert `true`. Guards the hand-written `runtimeSpecDTO` mapper, which has no compile-time link to the DTO.
+8. `TestRuntimeSpecDTOCarriesResponsesLiveTimings` — upsert a spec with the flag on through the routes store (`routeStore.UpsertRuntimeSpec`), read it through `GetRuntimeSpec`; assert `true`. What it is *for*: it is the only test in this list that reads a spec written **outside** the service, with no `putRuntimeSpec` in the path, so it still speaks if the whole resolution in Step 8 is gone. It is **not** the only guard on the hand-written `runtimeSpecDTO` mapper, and its doc comment must not claim to be — `putRuntimeSpec` returns `runtimeSpecDTO(spec, storedGPUs, app)` (`:833`), so every test above reads that mapper too, which is why mutation 13(f) breaks all eight and not only this one.
+9. `TestPutRuntimeSpecResponsesLiveTimingsRefusalRunsAfterThePreExistingValidations` — three legs, each a body that is invalid for a **shipped** reason *and* carries an impossible `boolPtr(true)`, each asserting that the shipped sentinel came back and that the new one did **not** (both halves `t.Errorf`, per the note above, so one leg reports both facts). All three on `Binary: "/usr/local/bin/ollama"` with `Type: string(routing.RuntimeSpecTypeOllama)`, so the live-timings refusal really is armed: `MetricsPath: "//evil"` → `ErrRuntimeSpecMetricsPathInvalid`; `ResponsesMode: "bogus"` → `ErrRuntimeSpecEndpointModeInvalid`; `APIFlavors: []string{"nope"}` → `ErrRuntimeSpecFlavorInvalid`. This is the test that pins Step 7's POSITION and the only one that can — every other test in this list passes wherever in the validate block the refusal sits. Mutation 13(j) is the run that proves it. Modelled on Task 6's `TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations` (`service_applications_test.go:3521`), which exists because Task 6 shipped this defect once and had to repair it.
 
-Also extend `TestPutRequestFromDTOCoversEveryWritableField` in `service_runtime_benchmark_test.go`: add `ResponsesLiveTimingsEnabled: true,` to the fully-populated `dto` literal and `ResponsesLiveTimingsEnabled: &dto.ResponsesLiveTimingsEnabled,` to the `want` literal. `reflect.DeepEqual` compares pointers by pointee, so a pointer to an equal value passes; a `nil` from a forgotten spread line does not. (That DTO's `Type` is already `string(routing.RuntimeSpecTypeVLLM)` — a capable kind — so `true` is a coherent value for it; leave the `Type` alone.)
+Also extend `TestPutRequestFromDTOCoversEveryWritableField` in `service_runtime_benchmark_test.go`: add `ResponsesLiveTimingsEnabled: true,` to the fully-populated `dto` literal and `ResponsesLiveTimingsEnabled: &dto.ResponsesLiveTimingsEnabled,` to the `want` literal. `reflect.DeepEqual` compares pointers by pointee, so a pointer to an equal value passes; a `nil` from a forgotten spread line does not. The two tag-name loops at `:126-135` stay **green** through all of this and must not be predicted to fire: they compare the *struct field sets* of `RuntimeSpecDTO` and `PutRuntimeSpecRequest` by reflection (`:108-124`) and never look at `putRequestFromDTO` at all. What they guard is Step 4 without Step 5 or the reverse — which in this task is not reachable by a production-only mutation, because both fields have production consumers (Steps 7, 8, 9, 11) and deleting either is a compile failure rather than a test failure. The `DeepEqual` (`:202-204`) is therefore the whole measurable guard on the spread, and 13(a) is how it is measured. (That DTO's `Type` is already `string(routing.RuntimeSpecTypeVLLM)` — a capable kind — so `true` is a coherent value for it; leave the `Type` alone.)
 
-- [ ] **Step 2: Write the failing wire test.**
+- [ ] **Step 2: Write the two failing wire tests.**
 
-In `internal/gateway/portal_runtime_endpoints_test.go`, after `TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400` (`:148-161`), add its sibling. `seedRuntimeSpecMapping(t, srv)` (`:22`) already builds the server → `server_agent` application → mapping chain over HTTP and returns the mapping id.
+In `internal/gateway/portal_runtime_endpoints_test.go`, after `TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400` (`:148-161`), add its two siblings. `seedRuntimeSpecMapping(t, srv)` (`:22`) already builds the server → `server_agent` application → mapping chain, through `srv.Routes.CreateAIServer`/`CreateApplication`/`CreateMapping` **directly** (`:29-40`) rather than over HTTP; the mapping id it returns is all these tests need, so do not go looking for HTTP seeding that is not there.
+
+Read this before writing the second test, because it decides its shape: **this endpoint drops unknown JSON keys silently.** The PUT handler decodes with a plain `json.Unmarshal` (`portal_runtime_endpoints.go:41-45`) and `DisallowUnknownFields` appears nowhere in this module, so before Step 5 lands the request field a body carrying `responses_live_timings_enabled` is accepted exactly as if the key were absent. A test that asserts only "200" therefore passes before the production change **and** after it, and earns nothing. The second test must assert the **effect** — the value echoed in the response DTO — which is also what makes it a real red at Step 3.
 
 ```go
 // TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400
@@ -1447,7 +1456,8 @@ Then add its auto-detect sibling in the same file, because the wire is where an 
 ```go
 // TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted
 // is the accepting direction of the same resolution, over HTTP: no "type" at
-// all, a llama-server binary, and the flag asserted true. It must be a 200.
+// all, a llama-server binary, and the flag asserted true. It must be a 200
+// whose BODY says true.
 //
 // The service asks routing.LiveTimingsCapableKind about the spec's EFFECTIVE
 // type (the explicit one when set, else detected from the binary), and this
@@ -1455,6 +1465,15 @@ Then add its auto-detect sibling in the same file, because the wire is where an 
 // and LiveTimingsCapableKind("") is FALSE, so a refusal written against the
 // raw req.Type would answer 400 here -- to the single most common managed
 // llama.cpp configuration there is.
+//
+// The echo assertion, not the status, is this test's whole content. This
+// endpoint decodes with a plain json.Unmarshal and nothing in this module
+// sets DisallowUnknownFields, so 200 is what it already answered to this body
+// before responses_live_timings_enabled existed as a field at all -- the key
+// was simply discarded. Reading the value back out of the response is the
+// only way the test can tell "accepted and stored" from "ignored", and it
+// doubles as the spec side's JSON-tag pin: the key is decoded BY NAME out of
+// a real success body, which is the one thing no internal/portal test can do.
 func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)
@@ -1464,10 +1483,17 @@ func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIs
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
 	}
+	var dto portal.RuntimeSpecDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+		t.Fatalf("unmarshal: %v, body = %s", err, rec.Body.String())
+	}
+	if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = false, want true: a 200 that did not store what it was asked to store, body = %s", rec.Body.String())
+	}
 }
 ```
 
-One import to add: the file's block (`:6-16`) has `context`, `encoding/json`, `net/http`, `net/http/httptest`, `op-ai-gateway/internal/portal`, `op-ai-gateway/internal/routing`, `strconv`, `testing`, `time` — but **not `strings`**, which the message assertion needs. Add it between `strconv` and `testing` (one alphabetically sorted list; gofumpt will reject any other position). The `http.StatusOK` in the second test is this endpoint's own happy-path status, not a guess: the existing PUT tests assert it, including one whose whole body is `{"binary":"/usr/local/bin/llama-server"}` (`:286-287`).
+One import to add: the file's block (`:6-16`) has `context`, `encoding/json`, `net/http`, `net/http/httptest`, `op-ai-gateway/internal/portal`, `op-ai-gateway/internal/routing`, `strconv`, `testing`, `time` — but **not `strings`**, which the message assertion needs. Add it between `strconv` and `testing` (one alphabetically sorted list; gofumpt will reject any other position). `encoding/json` (`:8`) and `op-ai-gateway/internal/portal` (`:11`) the second test needs are already there, and the decode-the-DTO pattern to copy is `TestHandlePortalMappingRuntimeSpecGetUnconfigured` (`:52-58`). The `http.StatusOK` in the second test is this endpoint's own happy-path status, not a guess: the existing PUT tests assert it, including one whose whole body is `{"binary":"/usr/local/bin/llama-server"}` (`:286-287`).
 
 - [ ] **Step 3: Run them and watch them fail.**
 
@@ -1476,7 +1502,11 @@ cd /Users/jlor08/Developer/codex/op-ai-gateway/.worktrees/responses-live-timings
 go test ./internal/portal/ -run 'RuntimeSpecResponsesLiveTimings|RuntimeSpecDTOCarriesResponsesLiveTimings|PutRequestFromDTO' -count=1
 go test ./internal/gateway/ -run 'RuntimeSpecPutLiveTimings' -count=1
 ```
-Expected: compile failures on the unknown DTO/request fields and the unknown sentinel.
+
+Expected, per package, and they are **not** the same failure:
+
+- `./internal/portal/` — compile failures on the unknown `RuntimeSpecDTO` field, the unknown `PutRuntimeSpecRequest` field and the unknown sentinel.
+- `./internal/gateway/` — a compile failure too, but on exactly **one** line: `dto.ResponsesLiveTimingsEnabled` in the auto-detect test. Note what that means, because it is easy to misread as coverage: Go builds the test package as a whole, so neither wire test runs, and the incapable-kind test's own red is not yet visible. That test names no new Go symbol at all — only string literals, `errorBodyOf`, `seedRuntimeSpecMapping` and `http.Status*` — so it would compile on its own and answer **200**, the unknown key having been discarded by the plain `json.Unmarshal`. To see it go red, re-run this one command after Step 4 lands the DTO field (which is all the gateway package needs to build) and before Step 7 lands the refusal. **Both** wire tests are red at that point, each on its own line: `status = 200, want 400` for the incapable-kind one, and `responses_live_timings_enabled = false, want true` for the auto-detect one (Step 9's mapper line is not in yet either). Record that intermediate run — it is the only point at which the incapable-kind test's own failure mode is observable.
 
 - [ ] **Step 4: The DTO field.**
 
@@ -1499,16 +1529,16 @@ In `PutRuntimeSpecRequest`, after `MessagesMode  string \`json:"messages_mode"\`
 
 ```go
 	// ResponsesLiveTimingsEnabled: a POINTER inside an otherwise
-	// apply-verbatim full-document request, the same exception APIToken above
-	// already makes, and it carries two loads. nil must mean "no opinion", so
-	// that a FIRST write can get the kind-dependent default (ON for a
-	// llama_cpp/vllm spec) while a later save of an existing spec keeps
-	// whatever the operator last stored; a plain bool would arrive as false on
-	// every full-document PUT and the default could never fire. And nil is
-	// what separates a NON-MENTION from an ASSERTION: an explicit true on an
-	// effective kind that cannot honour it is refused
-	// (ErrRuntimeSpecResponsesLiveTimingsUnsupported), while an absent field
-	// on such a kind is simply cleared.
+	// apply-verbatim full-document request, the same exception APIToken below
+	// already makes (nil = keep the stored value), and it carries two loads.
+	// nil must mean "no opinion", so that a FIRST write can get the
+	// kind-dependent default (ON for a llama_cpp/vllm spec) while a later save
+	// of an existing spec keeps whatever the operator last stored; a plain
+	// bool would arrive as false on every full-document PUT and the default
+	// could never fire. And nil is what separates a NON-MENTION from an
+	// ASSERTION: an explicit true on an effective kind that cannot honour it
+	// is refused (ErrRuntimeSpecResponsesLiveTimingsUnsupported), while an
+	// absent field on such a kind is simply cleared.
 	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 ```
 
@@ -1543,11 +1573,15 @@ In the `var (…)` block, after `ErrRuntimeSpecContextProbePathInvalid` (`:119`)
 
 The error text is the API code, the convention every sentinel in this block follows; the detail is wrapped on at the call site with `fmt.Errorf("%w: …", …)`. **Add `"fmt"` to this file's import block**, between `"errors"` and `"op-ai-gateway/internal/auth"` (one alphabetically sorted list; gofumpt will reject any other position).
 
-- [ ] **Step 7: Refuse an impossible `true`, in the validate-before-mutate block — asking the EFFECTIVE kind, not `req.Type`.**
+- [ ] **Step 7: Refuse an impossible `true` — LAST in the validate-before-mutate block, asking the EFFECTIVE kind, not `req.Type`.**
 
-Read this before writing the condition, because it is the one line in the task that has a silent-wrong version. **Ask `routing.LiveTimingsCapableKind` about `routing.EffectiveRuntimeSpecType(...)`, never about `req.Type` or `specType`.** `validRuntimeSpecType` (`:997`, doc `:990-996`) accepts `""` as a legitimate value meaning "auto-detect from `Binary`" — "not a default that collapses into one of the five kinds" — and `routing.LiveTimingsCapableKind("")` is **false**. A condition written against the raw type therefore refuses an explicit `true` on `{"binary":"/usr/bin/llama-server"}`, and Step 8's default written the same way stores `false` for it: the single most common managed llama.cpp spec there is, silently defaulted off, with every incapable-kind test in this task still green. Step 1's test 1 second case, test 5's third leg and Step 2's auto-detect wire test are the three that fail if this is got wrong; mutation 13(e) is where that is demonstrated.
+Read this before writing the condition, because it is the one line in the task that has a silent-wrong version. **Ask `routing.LiveTimingsCapableKind` about `routing.EffectiveRuntimeSpecType(...)`, never about `req.Type` or `specType`.** `validRuntimeSpecType` (`:997`, doc `:990-996`) accepts `""` as a legitimate value meaning "auto-detect from `Binary`" — "not a default that collapses into one of the five kinds" — and `routing.LiveTimingsCapableKind("")` is **false**. A condition written against the raw type therefore refuses an explicit `true` on `{"binary":"/usr/bin/llama-server"}`, and Step 8's default written the same way stores `false` for it: the single most common managed llama.cpp spec there is, silently defaulted off, with every incapable-kind test in this task still green. Step 1's test 1 second case, test 5's third leg and Step 2's auto-detect wire test are the three that fail if this is got wrong — and so are five benchmark tests and two reserved-path tests, for the reason Step 12 spells out. Mutation 13(e) is where that is demonstrated.
 
-`putRuntimeSpec` opens with "Validate everything that can fail BEFORE mutating/persisting anything" (`:599`). The refusal belongs there, not beside the value resolution in Step 8 — insert it immediately after the `validRuntimeSpecType` check (`:631-634`), where `specType` and `binary` (`:600`) are both in scope and nothing has been read from or written to the store yet:
+**WHERE it goes, and that is a decision rather than a detail.** `putRuntimeSpec` opens with "Validate everything that can fail BEFORE mutating/persisting anything" (`:599`), and the refusal belongs in that block rather than beside the value resolution in Step 8. But it goes at the **end** of the block, not beside the type check: insert it immediately after `normalizeRuntimeSpecFlavors`' error return (`:669-672`). `specType` (`:631`) and `binary` (`:600`) are both still in scope there, nothing has been read from or written to the store yet (the first store touch is the read at `:711`), and every check a body could already fail on for a **shipped** reason now runs first.
+
+Placed where the first draft of this plan put it — after `:634` — the refusal sits ahead of `safeRelativeProbePath`'s two checks (`:642-646`), both endpoint-mode checks (`:653-668`) and `normalizeRuntimeSpecFlavors` (`:669`), so a body invalid in two ways answers `runtime_spec.responses_live_timings_unsupported` where it used to answer `runtime_spec.metrics_path_invalid`, `runtime_spec.endpoint_mode_invalid` or `runtime_spec.flavor_invalid`. That is a behaviour change to three shipped codes dressed up as an addition. Task 6 shipped exactly that defect on both application paths and its fix round had to move both blocks to be "LAST of the request validations", with a `POSITION, deliberately:` paragraph in each comment saying so; Task 6's report handed this decision to Task 7 explicitly. Step 1's test 9 pins the position and mutation 13(j) measures it.
+
+**One residue, and the comment must state it** — the same one Task 6 accepted. The refusal still precedes `capture.SealSecret`, whose keyless-disk-store rejection (`capture.ErrKeyRequired` → 400 `runtime_spec.api_token_key_required`) is fifty lines of write-path preparation rather than a request validation; Task 6's create refusal sits immediately before its own `capture.SealSecret` call for the same reason. So a body pairing an impossible `true` with an `api_token` on a keyless store reports the live-timings 400. Say so and do not chase it — the request-shape validation of the token pair, `validateRuntimeSpecAPIToken` (`:628`), already runs above.
 
 ```go
 	// The spec's OWN effective kind decides whether the live-timings opt-in
@@ -1561,7 +1595,9 @@ Read this before writing the condition, because it is the one line in the task t
 	// LiveTimingsCapableKind("") is false, so asking about the raw type would
 	// refuse an explicit true on a {"binary": ".../llama-server"} spec -- the
 	// commonest managed configuration there is -- and, in the resolution
-	// below, silently default it OFF.
+	// below, silently default it OFF. It would also refuse the VRAM
+	// benchmark's own deferred restore, which replays a stored Type of ""
+	// verbatim through putRequestFromDTO alongside an explicit true.
 	//
 	// An EXPLICIT true on a kind that cannot honour it is refused, naming that
 	// kind. Judged over THIS document's kind rather than over a type change:
@@ -1569,6 +1605,20 @@ Read this before writing the condition, because it is the one line in the task t
 	// says a row was there, never that its kind changed -- and a first write
 	// asserting true on an incapable kind has to be refused too, though no
 	// transition is involved in it at all.
+	//
+	// POSITION, deliberately: LAST of the request validations. Every check a
+	// body could already fail on -- the binary, the tuning values,
+	// admin_state, the GPU rows, the env keys, the visible-devices pair, the
+	// four api_token shapes, validRuntimeSpecType, both probe paths, both
+	// endpoint modes and the flavors -- runs above this and RETURNS rather
+	// than falling through, so this brand-new check can never rewrite the
+	// answer to a body that was already invalid for a SHIPPED reason. Placed
+	// beside the type check instead, a doubly-invalid body reported this 400
+	// where it used to report runtime_spec.metrics_path_invalid,
+	// runtime_spec.endpoint_mode_invalid or runtime_spec.flavor_invalid. The
+	// one check it still precedes is capture.SealSecret's keyless-store
+	// rejection, which is write-path preparation rather than a request
+	// validation -- the same line the application write paths draw.
 	//
 	// One sentinel, 400 in every shape. Because the document always carries
 	// the Type/Binary the kind is resolved from, the refused kind is always one
@@ -1632,11 +1682,11 @@ In `runtimeSpecDTO`, after `MessagesMode: string(spec.MessagesMode),` (`:1180`):
 		ResponsesLiveTimingsEnabled: spec.ResponsesLiveTimingsEnabled,
 ```
 
-`GetRuntimeSpec`'s not-yet-configured DTO (`:508-530`) needs **no** entry: it sets neither `ResponsesMode` nor `MessagesMode` either, and the new boolean's zero value there is the honest answer for a spec that does not exist yet.
+`GetRuntimeSpec`'s not-yet-configured DTO literal (`:511-525`) needs **no** entry: it sets neither `ResponsesMode` nor `MessagesMode` either, and the new boolean's zero value there is the honest answer for a spec that does not exist yet.
 
 - [ ] **Step 10: The status mapping — ONE row, at 400.**
 
-In `internal/gateway/portal_runtime_endpoints.go`, append one row to `portalRuntimeSpecErrRows` after `ErrRuntimeSpecTypeInvalid`'s (`:84`). One row, because this side has one sentinel: unlike Task 6's table this one gets **no** 409 entry, since no spec write can reach the stored-state shape. (There is already an unrelated 409 in this table — `ErrRuntimeSpecServerBenchmarking` at `:105`, refused because a benchmark run is holding the server — so a 409 here is not novel; it is simply not this sentinel's answer.)
+In `internal/gateway/portal_runtime_endpoints.go`, insert one row into `portalRuntimeSpecErrRows` **immediately after** `ErrRuntimeSpecTypeInvalid`'s (`:84`) — not appended at the table's end (`:105`, the `ErrRuntimeSpecServerBenchmarking` row, with `:106` its closing `}`). The table is not sorted, so either position works mechanically; pick this one so the row sits beside the other type-shaped refusal. One row, because this side has one sentinel: unlike Task 6's table this one gets **no** 409 entry, since no spec write can reach the stored-state shape. (There is already an unrelated 409 in this table — `ErrRuntimeSpecServerBenchmarking` at `:105`, refused because a benchmark run is holding the server — so a 409 here is not novel; it is simply not this sentinel's answer.)
 
 ```go
 	// The one row in this table with a dynamic message. The service wraps the
@@ -1663,7 +1713,7 @@ In `internal/gateway/portal_runtime_endpoints.go`, append one row to `portalRunt
 	},
 ```
 
-`strings` and `net/http` are already imported by this file; `errRow`'s `msgFn` field is at `error_map.go:24` and is honoured at `:71-74`. Without this row the sentinel falls through to the 500 `runtime_spec.request_failed` fallback.
+`strings` (`:14`) and `net/http` (`:9`) are already imported by this file; `errRow`'s `msgFn` field is at `error_map.go:24` and is honoured at `:72-74` (`:71` is the static-`msg` default it displaces). Without this row the sentinel falls through to the 500 `runtime_spec.request_failed` fallback.
 
 - [ ] **Step 11: `putRequestFromDTO` — the spread.**
 
@@ -1673,17 +1723,28 @@ In `service_runtime_benchmark.go`, after `MessagesMode: dto.MessagesMode,` (`:51
 		// A *bool on the request against a bool on the DTO, so this is a
 		// conversion rather than a copy -- the one line in this spread that is
 		// not a straight assignment. A loaded document always HAS an opinion,
-		// so the pointer is never nil here: the benchmark's deferred restore
-		// must put back exactly what it read, not fall through to the
-		// create-time default.
+		// so an explicit pointer is the honest spread of it; a nil would be
+		// this mapper inventing a non-mention the document does not contain.
 		//
-		// It restates the value as an ASSERTION, which is safe because the
-		// spread restates Type and Binary from the same document (only
-		// AdminState is replaced, SetBenchmarkRuntimeSpecAdminState:134-135),
-		// so the kind the value was stored under is the kind it is re-asserted
-		// against. A 400 out of the restore would therefore mean the STORED
-		// row already violated the invariant -- which is a failure worth
-		// hearing about rather than papering over with a nil.
+		// In the ORDINARY case the pointer changes nothing, and the comment
+		// says so rather than claiming a danger it averts: this mapper's only
+		// caller resolved the spec by id before calling it
+		// (SetBenchmarkRuntimeSpecAdminState, which returns
+		// ErrRuntimeSpecNotFound when there is no such row), so putRuntimeSpec
+		// always finds an existing spec and a nil would take the PRESERVE
+		// branch -- putting back exactly what was read. The create-time default
+		// is unreachable from here.
+		//
+		// What the pointer changes is the ONE pathological case: a stored true
+		// on a kind that cannot honour it. A nil would let the clear arm wipe
+		// it silently; the explicit pointer re-ASSERTS it and earns the 400
+		// instead -- a failure worth hearing about rather than papering over.
+		// Re-asserting is safe because the spread restates Type and Binary
+		// from the same document (SetBenchmarkRuntimeSpecAdminState re-reads
+		// the whole document through this spread and then replaces
+		// AdminState alone), so the kind the value was stored under is the
+		// kind it is re-asserted against, and a 400 out of the restore means
+		// the STORED row already violated the invariant.
 		ResponsesLiveTimingsEnabled: &liveTimings,
 ```
 
@@ -1702,35 +1763,50 @@ cd /Users/jlor08/Developer/codex/op-ai-gateway/.worktrees/responses-live-timings
 go test ./internal/portal/ -run 'RuntimeSpec|PutRequestFromDTO' -count=1 -v
 go test ./internal/portal/ ./internal/gateway/ -count=1
 ```
-`TestPutRuntimeSpecDoesNotInheritAppModes` and the VRAM-benchmark restore tests must be green — the restore path now sends an explicit pointer through `putRequestFromDTO`, so a broken refusal rule shows up there as a failing benchmark restore, not only in this task's own tests.
+The first command's `-run` filter is what makes this step mean something: besides this task's nine new tests and `TestPutRuntimeSpecDoesNotInheritAppModes` (`service_runtime_test.go:344`) it also runs, by name, the eight tests that drive `putRequestFromDTO` — the five `TestSetBenchmarkRuntimeSpecAdminState*` (`service_runtime_benchmark_test.go:229`, `:273`, `:306`, `:321`, `:364`) and the three `TestPutRuntimeSpec*` in `service_runtime_reserved_test.go` (`:32`, `:67`, `:81`). All must be green, and two of them are load-bearing rather than incidental:
+
+- `TestSetBenchmarkRuntimeSpecAdminStateIsAFullDocumentWriteThatNotifies` `reflect.DeepEqual`s the **whole** returned DTO against the stored one (`service_runtime_benchmark_test.go:249`), so it is the test that reports a restore which *changes* the flag — an `&false` out of Step 11's conversion, say. It does **not** report a `nil`: `benchmarkSpecFixture` (`:18-58`) writes its spec with `Binary: "/usr/local/bin/llama-server"` and no `Type`, so the stored value is `true` (capable kind, create default), `hadExisting` is true on the restore, and Step 8's preserve branch answers the same `true` that a `nil` and an explicit `&true` both produce. That is precisely why 13(a) has to be measured through `TestPutRequestFromDTOCoversEveryWritableField`'s `DeepEqual` and not here.
+- `TestPutRuntimeSpecIsUngatedOnAnotherServersRun` and `…IsUngatedWithNoHook` PUT that same spread back and require **no error at all**, so they are where a refusal asked about the raw `req.Type` announces itself: the fixture's stored `Type` is `""`, `putRequestFromDTO` restates it verbatim alongside the `&true`, and `LiveTimingsCapableKind("")` is false. (`TestPutRuntimeSpecRefusesWhileABenchmarkHoldsTheServer` is *not* in this group — its reservation gate lives in `PutRuntimeSpec`, above the shared body, so it never reaches the refusal.) Mutation 13(e) fails these two plus all five benchmark tests, which is a far louder signal than the three auto-detect tests alone.
 
 - [ ] **Step 13: Mutations.**
 
-(a) Delete the `ResponsesLiveTimingsEnabled: &liveTimings,` line from `putRequestFromDTO` — `TestPutRequestFromDTOCoversEveryWritableField` must fail **twice over**: once on the tag-name comparison (`:128`/`:133`) and once on the `DeepEqual`. That is the guard the applications side does not have, so prove it fires.
-(b) Delete the `if hadExisting { liveTimings = existing.… }` branch — test 3 fails. Restore.
-(c) Delete the refusal from Step 7 and let the `case !liveTimingsCapable:` arm swallow the explicit `true` instead (the silent normalisation this task replaced) — test 6 must fail on the error assertion **and** on "nothing was written", since the PUT then succeeds. Restore. This mutation is the decision itself; record its output verbatim in the commit body.
-(d) Delete the `case !liveTimingsCapable:` arm — test 7 fails and only test 7. Restore. With (c) this is a pair proving the two halves are independent: (c) shows the assertion must be refused, (d) shows the non-mention must still be cleared.
-(e) **The resolver mutation, and the one most worth recording.** Replace both uses of the effective kind with the raw `specType` — `routing.LiveTimingsCapableKind(specType)` in Step 7's condition and in Step 8's `liveTimings := …` seed. Test 5's third leg fails (an explicit `true` on a `Type: ""` llama-server spec is wrongly refused, since `LiveTimingsCapableKind("")` is false), test 1's second case fails (the same spec's absent-key default comes out `false`), and Step 2's `…OnAnAutoDetectCapableKindIsAccepted` wire test fails with a 400 where a 200 belongs. Note what does **not** fail: every explicitly-typed case, capable and incapable alike, and every refusal test — which is exactly why this needs a mutation rather than a code review. Restore.
-(f) Delete the `runtimeSpecDTO` line — test 8 fails. Restore.
-(g) Delete the `errRow` from Step 10 — the wire test's code assertion fails with `runtime_spec.request_failed` and a 500. Restore.
-(h) Change Step 10's row from `http.StatusBadRequest` to `http.StatusConflict` — the wire test's exact status assertion must fail. Restore. This is the pin on "a spec refusal is 400, not 409": the codes would still match, so only the status assertion catches it.
+(a) Delete **both** of Step 11's lines — the `ResponsesLiveTimingsEnabled: &liveTimings,` entry *and* the `liveTimings := dto.ResponsesLiveTimingsEnabled` local above it. Dropping only the entry leaves the local unused, which is a compile error and not a test failure. Expected: `TestPutRequestFromDTOCoversEveryWritableField` fails **once**, on the `reflect.DeepEqual` (`service_runtime_benchmark_test.go:202-204`), `nil` against `&true`. Not twice: the two tag-name loops (`:126-135`) compare the two structs' field sets by reflection and a missing mapper line changes neither struct, so they stay green. Nothing else in the suite fails either — the benchmark restore's `hadExisting` preserve branch answers the same value a `nil` produces (Step 12) — which is exactly why this `DeepEqual` is the guard the applications side does not have. Restore.
+(b) Delete the `if hadExisting { liveTimings = existing.… }` branch — test 3 fails, and only test 3 (its first leg: an absent key after an explicit `false` on a capable kind re-reads the `true` default). Restore.
+(c) Delete the refusal from Step 7 **and reorder Step 8's two switch arms** so `case !liveTimingsCapable:` runs ahead of `case req.ResponsesLiveTimingsEnabled != nil:` — the silent normalisation this task replaced. Without the reorder the value arm wins and the explicit `true` is *stored as `true`*, which is a third, different wrong behaviour rather than the one being ruled out; Task 6's implementer had to make exactly this reorder to measure its own equivalent. Expected either way: test 6 reports **two** failures per leg in one run — the error assertion (`err = <nil>`) and the state assertion (leg 1's reload says `Type == "ollama"` and the flag was overwritten; leg 2's says `Configured == true`) — which is what the `t.Errorf` shape mandated in Step 1 buys, and the reason it is mandated. Restore. This mutation is the decision itself; record its output verbatim in the commit body.
+(d) Delete the `case !liveTimingsCapable:` arm — test 7 fails and only test 7 (test 1's `ollama` case and test 2's coherence leg still answer `false` from the seed). Restore. With (c) this is a pair proving the two halves are independent: (c) shows the assertion must be refused, (d) shows the non-mention must still be cleared.
+(e) **The resolver mutation, and the one most worth recording.** Replace both uses of the effective kind with the raw `specType` — `routing.LiveTimingsCapableKind(specType)` in Step 7's condition and in Step 8's `liveTimings := …` seed. Test 5's third leg fails (an explicit `true` on a `Type: ""` llama-server spec is wrongly refused, since `LiveTimingsCapableKind("")` is false), test 1's second case fails (the same spec's absent-key default comes out `false`), and Step 2's `…OnAnAutoDetectCapableKindIsAccepted` wire test answers a 400 where a 200 belongs. **And seven tests this task did not write fail with them**, which is the loudest half of the signal: all five `TestSetBenchmarkRuntimeSpecAdminState*` plus `TestPutRuntimeSpecIsUngatedOnAnotherServersRun` and `…IsUngatedWithNoHook`, because `benchmarkSpecFixture`'s stored `Type` is `""` and `putRequestFromDTO` replays it alongside an explicit `true` (Step 12). Note what does **not** fail: every explicitly-typed case, capable and incapable alike, and every refusal test — which is exactly why this needs a mutation rather than a code review. Restore.
+(f) Delete the `runtimeSpecDTO` line — **all eight** of Step 1's DTO-reading tests fail (1 through 8). The mapper is on every DTO echo *and* on every `GetRuntimeSpec` reload, because `putRuntimeSpec` returns `runtimeSpecDTO(spec, storedGPUs, app)` (`:833`), so every assertion of `true` in the list goes `false` — including test 7's and test 6's preconditions. Restore. This is deliberately a broad signal, unlike (d); test 8's own claim is only that it is the one test reading a spec written outside the service.
+(g) Delete the `errRow` from Step 10 — the incapable-kind wire test fails on its **status** assertion: `status = 500, want 400, body = {"error":{"code":"runtime_spec.request_failed",…}}`. Not on the code assertion — `rec.Code` is checked two lines above it with `t.Fatalf`, so the test aborts before the code is ever read; the code is visible only in the body dump that status line prints. Restore.
+(h) Change Step 10's row from `http.StatusBadRequest` to `http.StatusConflict` — that same status assertion fails, `status = 409, want 400`. Restore. This is the pin on "a spec refusal is 400, not 409": the code would still match, so only the status catches it.
+(i) **The pointer's semantics, measured with a production-only edit.** Swapping `*bool` for `bool` on `PutRuntimeSpecRequest` is a compile failure *in the test file* (`boolPtr(...)` into a `bool` field), which the discipline forbids — Task 6 measured that and recorded it. Replace Step 8's whole resolution with the plain-`bool` equivalent instead: `liveTimings := req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled`, dropping the `hadExisting` branch and both switch arms, so absent ⇒ `false` and neither the default nor the preserve can ever fire. Expected: test 1's `llama_cpp` and auto-detect cases, test 2's pin leg, test 3's second preserve leg and test 4's absent leg fail; tests 5, 6, 7, 8 and 9 and every explicit-`false` assertion stay green — which is the point, because absent and `false` have become the same request. (`liveTimingsCapable` stays used by Step 7's condition, so this compiles.) Restore.
+(j) **The position.** Move Step 7's block back to immediately after the `validRuntimeSpecType` check (`:634`) — test 9 fails on all three legs, and only test 9; every other test in the suite stays green, which is what makes the position invisible to a code review. Task 6 measured the same shape on the application paths: "only the two new precedence tests; everything else green". Restore.
+(k) Drop one character from `RuntimeSpecDTO`'s `json:"responses_live_timings_enabled"` tag — only Step 2's auto-detect wire test fails, on its echo assertion, because it is the only test that decodes the key **by name** out of a real response body. The whole `internal/portal` package still prints `ok`: those tests read the Go field, which the typo does not touch. Restore. (Task 6's fix round added the application-side equivalent for exactly this reason.)
 Record each.
 
 - [ ] **Step 14: The wire contract in `api-surface.md`.**
 
-Under `#### API-variant endpoint modes (responses_mode / messages_mode)` (`:494`), after the three existing "Wire notes a client must know" bullets (`:510-529`), add one bullet block for the new field. It must state: the JSON key and that it appears on `ApplicationDTO`/`CreateApplicationRequest`/`UpdateApplicationRequest` **and** `RuntimeSpecDTO`/`PutRuntimeSpecRequest`; that it is a `*bool` on all three request shapes, where **absent is not the same as false** — absent on a create (or a first spec write) gets the kind-dependent default, `true` for `llama_cpp`/`vllm` and `false` for every other kind, while an explicit `false` is a deliberate off; that absent on an update keeps the stored value, except that it is **cleared** when the resulting type cannot honour the flag (an application retyped away from a capable kind, or a spec PUT whose effective type is not capable); that an explicit `true` against such a resulting type is **refused**, not stored as `false`, so a caller always ends up with the value it asked for or an error saying which kind refused it; that the refusal's status depends on where the offending type came from — **400** when the request supplied it (every create, an application PATCH that also sends `type`, and every runtime-spec PUT, which always restates its own `type`/`binary`) and **409** on the one shape where it did not, an application PATCH that asserts the flag while sending no `type`; that it is **orthogonal** to `responses_mode` rather than a fourth value of it; and that it is offered on the Responses side only and never for `/v1/messages`.
+Under `#### API-variant endpoint modes (responses_mode / messages_mode)` (`:494`), after the three existing "Wire notes a client must know" bullets (`:510-529`), add one bullet block for the new field. It must state: the JSON key and that it appears on `ApplicationDTO`/`CreateApplicationRequest`/`UpdateApplicationRequest` **and** `RuntimeSpecDTO`/`PutRuntimeSpecRequest`; that it is a `*bool` on all three request shapes, where **absent is not the same as false** — absent on a create (or a first spec write) gets the kind-dependent default, `true` for `llama_cpp`/`vllm` and `false` for every other kind, while an explicit `false` is a deliberate off; that absent on an update keeps the stored value, except that it is **cleared** whenever the *resulting* type cannot honour the flag — which is a property of the row the write leaves behind, not of a retype: an application PATCH that sends no `type` at all still clears a stored `true` when the application's own type is incapable (Task 6's clear arm reads the post-mutation `app.Type`, unguarded by `req.Type != nil`, and `TestUpdateApplicationLiveTimingsClearIsAPropertyOfTheStoredRowNotTheRequest` pins exactly that), and a spec PUT clears one whenever its effective type is not capable; that an explicit `true` against such a resulting type is **refused**, not stored as `false`, so a caller always ends up with the value it asked for or an error saying which kind refused it; that the refusal's status depends on where the offending type came from — **400** when the request supplied it (every create, an application PATCH that also sends `type`, and every runtime-spec PUT, which always restates its own `type`/`binary`) and **409** on the one shape where it did not, an application PATCH that asserts the flag while sending no `type`; that it is **orthogonal** to `responses_mode` rather than a fourth value of it; and that it is offered on the Responses side only and never for `/v1/messages`.
 
-Then add **three** new rows to the "New stable error codes" table at `:533-538`, which is a `| Code | Status | Source |` table — keep that column shape and that one-sentence-in-the-Source-cell style:
+Then add **three** new rows to the "New stable error codes" table (`:533-539`: header `:533`, separator `:534`, and **five** existing rows at `:535-539`), appending **after** the `runtime_spec.flavor_invalid` row at `:539`. "After `:538`" would split the existing rows and land the new three between `runtime_spec.endpoint_mode_invalid` and `runtime_spec.flavor_invalid`. It is a `| Code | Status | Source |` table — keep that column shape and that one-sentence-in-the-Source-cell style:
 
 - `application.responses_live_timings_unsupported` — **400** — the request sent an incapable `type` alongside `responses_live_timings_enabled: true` (every create, whose `type` is always the request's own; a PATCH that sends both). The message names the type.
 - `application.responses_live_timings_conflict` — **409** — a PATCH asserts `responses_live_timings_enabled: true`, sends no `type`, and the application's **stored** type cannot honour it: the request is well-formed and conflicts with the application's own state. The message names that stored type.
 - `runtime_spec.responses_live_timings_unsupported` — **400** — a spec PUT asserts `true` and its **effective** type — the explicit `type` when set, else detected from `binary` — cannot honour it. The message names the effective type, which may be one the caller never typed. There is no 409 on this surface: a spec PUT is a full document and always carries the type it is judged against.
 
+Then fix the two sentences the new rows falsify — this is not optional tidying, it is the same hazard as `data-model.md`'s "(79 migrations)" heading in Task 1, a number in prose that a change silently turns false:
+
+- `:541` reads "All five codes above are wired end to end and answer the listed status." Three new rows make that eight; make it "All eight codes above".
+- `:542-546` names the three validation sentinels (`ErrApplicationEndpointModeInvalid`, `ErrRuntimeSpecEndpointModeInvalid`, `ErrRuntimeSpecFlavorInvalid`) and says where each is mapped — a passage whose subject is the original five. Add one sentence after `:546` for the new three: `internal/portal.Service` returns `ErrApplicationResponsesLiveTimingsUnsupported` and `ErrApplicationResponsesLiveTimingsConflict` (Task 6) and `ErrRuntimeSpecResponsesLiveTimingsUnsupported`, mapped in `portalApplicationErrRows` (400 and 409) and `portalRuntimeSpecErrRows` (400) — each with `msgFn`, so the message names the offending type rather than a static string.
+
+`./scripts/check-docs.sh` checks no counts and no completeness (its own header puts prose style out of scope), so nothing but a reader catches "five".
+
+**Anchors.** `check-docs.sh`'s check 1 resolves every intra-repo markdown link **including its `#anchor`**, slugged from the target document's own headings. This passage is dense with exactly that kind of link (`:504-507`, `:527-528`), so prose written in the surrounding style will very likely contain one — and a mis-slugged anchor fails the gate. Any cross-reference the new text adds must resolve file **and** anchor.
+
 (An earlier draft of this plan said no error code was needed at all — that was the silent-normalisation variant — and the draft after it put both application rows at 400; both are superseded.)
 
 - [ ] **Step 15: The spec-snapshot note in `agent-runtime-manager.md`.**
 
-At `:3738-3748`, where the `api_flavors`/`responses_mode`/`messages_mode` spec snapshot is described, add one sentence: `responses_live_timings_enabled` joins that per-spec set (migration 80), and for a `server_agent` model the resolved spec's copy is what the request path reads — with the reason: the flag qualifies `responses_mode`, which for a managed model comes from the spec, so reading the parent application's copy would attach the flag to a decision the application never made. Add a second sentence for the write rule, because this is the page an operator-facing reader lands on: a PUT that sets it `true` on a spec whose **effective** type (the explicit `type`, else detected from `binary`) is not `llama_cpp`/`vllm` is refused with **400** — never 409, because the document always carries the type it is judged against — and a PUT that omits it on such a type clears any stored `true`. State also that no operator control for it ships in this cut.
+The passage runs `:3733-3759` and has two natural seams: `:3737-3744` is where `RuntimeAdminSection` is said to render `spec.api_flavors`/`responses_mode`/`messages_mode` as the **sole** authority for that model's Codex/Claude Code endpoints, and `:3745-3759` is the "**Snapshot, not inheritance**" paragraph. The first sentence belongs at the end of the first; the write-rule sentence after it. Add one sentence: `responses_live_timings_enabled` joins that per-spec set (migration 80), and for a `server_agent` model the resolved spec's copy is what the request path reads — with the reason: the flag qualifies `responses_mode`, which for a managed model comes from the spec, so reading the parent application's copy would attach the flag to a decision the application never made. Add a second sentence for the write rule, because this is the page an operator-facing reader lands on: a PUT that sets it `true` on a spec whose **effective** type (the explicit `type`, else detected from `binary`) is not `llama_cpp`/`vllm` is refused with **400** — never 409, because the document always carries the type it is judged against — and a PUT that omits it on such a type clears any stored `true`. State also that no operator control for it ships in this cut. Same anchor rule as Step 14 — this passage's own links (`:3743-3744`, `:3746-3747`) show the style, and a mis-slugged `#anchor` fails `check-docs.sh`'s check 1.
 
 - [ ] **Step 16: Docs and Go gates, then commit.**
 
@@ -1747,7 +1823,7 @@ git diff --name-only main... -- gateway/frontend/                               
 ```
 (The first grep excludes `_test.go`, so this task's own wire test does not trip it; the three `errRow`s added across Tasks 6 and 7 name the **sentinel**, not the field, so they do not either. Nothing in `internal/gateway` reads the boolean for a request decision, which is what the check is for.)
 
-Commit body: the four-way resolution, why `!hadExisting` is what "create" means here, why the rule is judged over the resulting document rather than a transition, why that same property makes every spec refusal a 400 and leaves this side with one sentinel where the application side has two, why the predicate is asked about the effective type and not `req.Type`, the no-inheritance contract, the pointer conversion in the spread and the two ways its guard fires, the eight mutations, and the two doc files.
+Commit body: the four-way resolution, why `!hadExisting` is what "create" means here, why the rule is judged over the resulting document rather than a transition, why that same property makes every spec refusal a 400 and leaves this side with one sentinel where the application side has two, why the predicate is asked about the effective type and not `req.Type`, the no-inheritance contract, why the refusal is LAST in the validate block and what that costs (the one residue above `capture.SealSecret`), the pointer conversion in the spread and the one pathological case it earns its place on, the eleven mutations, and the two doc files.
 
 ---
 
@@ -1766,7 +1842,7 @@ Commit body: the four-way resolution, why `!hadExisting` is what "create" means 
 | Placeholder rows counted by hand (32→33, 30→31) | Task 2 Step 6; Task 3 Step 5 |
 | Spec-vs-app authority split for a `server_agent` mapping | Task 3 Step 3 (the field); Task 4 Steps 1, 4, 7 |
 | Not on `routing.ModelMapping`; no `MappingCandidate` field | Global Constraints; Task 2 Interfaces |
-| A plain `bool` kills the kind-dependent create default AND the assertion-vs-non-mention rule | Task 6 Steps 5, 12(b); Task 7 Steps 5, 13 |
+| A plain `bool` kills the kind-dependent create default AND the assertion-vs-non-mention rule | Task 6 Steps 5, 12(b′); Task 7 Steps 1(test 4), 5, 13(i) — a type swap is a compile failure in the test file, so both tasks measure the behavioural equivalent with a production-only edit |
 | `putRequestFromDTO` compiles without the new field | Task 7 Steps 1, 11, 13(a) |
 | Hand-written DTO mappers, no coverage test on the application side | Task 6 Steps 1(test 12), 9, 12(a); Task 7 Steps 1(test 8), 9, 13(f) |
 | A `server_agent` application's create-time default can only be `false` | Task 5 Step 1 (the predicate row); Task 6 Step 1(test 1), 7; Task 7 Step 1(test 2) |
