@@ -3620,10 +3620,25 @@ func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 		t.Errorf("err = %v: the refusal still runs ahead of checkPathSuffix", err)
 	}
 
+	// Leg 4: applyProxyExclusion's RULE 1, which runs BELOW the two-arm clear
+	// -- the last thing on this path that can refuse a body, and the last one
+	// this refusal masked. Reaching it means the refusal sits after the clear,
+	// not merely after the pre-mutation block.
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		ProxyExcluded: boolPtr(true), ProxyListenPort: intPtr(9000),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationProxyExcludedPortConflict) {
+		t.Errorf("err = %v, want ErrApplicationProxyExcludedPortConflict: the live-timings refusal must not pre-empt applyProxyExclusion's 409 on the update path either", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v: the refusal still runs ahead of applyProxyExclusion", err)
+	}
+
 	// No refused PATCH may have written anything. The refusal now sits INSIDE
-	// the mutation block, so this is the assertion that the block's writes
-	// land on a local copy and never reach the store without
-	// s.routes.UpdateApplication.
+	// the mutation block and BELOW the clear, so this is the assertion that
+	// the block's writes land on a local copy and never reach the store
+	// without s.routes.UpdateApplication.
 	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
