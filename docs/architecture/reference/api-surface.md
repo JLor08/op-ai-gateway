@@ -533,6 +533,21 @@ Wire notes a client must know:
   `UpdateApplicationRequest` and `PutRuntimeSpecRequest`. It is **orthogonal
   to `responses_mode`**, not a fourth value of it, and it is offered on the
   Responses side only — there is no `/v1/messages` equivalent.
+  - **Nothing reads the value in this cut, so setting it changes no request's
+    behaviour.** What ships here are the WRITE rules below — the capable-only
+    default, the refusal, the clear, absent-preserves — plus the resolution of
+    the stored value onto the request's routing target (spec over application,
+    the same precedence `responses_mode` uses). There it stops: the upstream
+    parameter is **not injected**, nothing gates on it and nothing retries
+    without it. So an application or spec with the flag `true` produces no
+    mid-stream tokens/sec **of its own**: a client that sets
+    `timings_per_token` on the request still gets them exactly as before, and
+    a client that does not gets nothing extra from the flag being on — the
+    injection, the gate and the retry are part 2 of issue #81. This is
+    consistent with, and does not weaken, the standing rule that
+    `timings_per_token` is read when the client set it and never injected
+    ([Telemetry, Usage & Observability
+    §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
   - On all three request shapes **absent is not the same as `false`**. Absent
     on a create — or on a **first** spec write, which is what a full-document
     upsert means by "create" — takes the kind-dependent default: `true` for

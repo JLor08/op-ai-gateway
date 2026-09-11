@@ -60,9 +60,11 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // "table applications has no column named ...". So the raw insert below is
 // REQUIRED by those four -- and it is valid for the other four as well, by
 // construction rather than by luck: it names exactly the thirteen applications
-// columns that the frozen-at-v60 baseline declares with no DDL default
-// (migrate.go:654-679 -- the primary key, the not-null scalars, the two
-// timestamps). That makes it a complete insert at the baseline and a complete
+// columns that the frozen-at-v60 baseline declares with no DDL default -- the
+// `create table if not exists applications` statement in
+// baselineCreateStatements, whose primary key, not-null scalars and two
+// timestamps are the thirteen, every other column there carrying `not null
+// default`. That makes it a complete insert at the baseline and a complete
 // insert at every version above it, since every applications column added
 // since, 80's included, arrives `not null default`. Version-independent in
 // both directions, for all eight callers. The application row is therefore

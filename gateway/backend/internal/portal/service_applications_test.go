@@ -3446,13 +3446,25 @@ func TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn(t *testing.T) {
 	}
 }
 
-// TestApplicationDTOCarriesResponsesLiveTimings is the only guard on the
-// hand-written applicationDTO mapper: a field present on the DTO but missing
-// from the mapper is the Go zero value on the wire, with no compile error and
-// a 200 OK. The row is seeded straight through the routes store -- the same
-// direct-store seeding seedServerAgentApplication uses, and for the same
-// reason -- so this reads the mapper rather than the write path that produced
-// the value.
+// TestApplicationDTOCarriesResponsesLiveTimings guards the hand-written
+// applicationDTO mapper, where a field present on the DTO but missing from the
+// mapper is the Go zero value on the wire, with no compile error and a 200 OK.
+// The row is seeded straight through the routes store -- the same direct-store
+// seeding seedServerAgentApplication uses, and for the same reason -- so this
+// reads the mapper rather than the write path that produced the value.
+//
+// It is NOT the only guard on that mapper, and an earlier version of this
+// comment claimed it was. Measured by deleting the mapper's
+// ResponsesLiveTimingsEnabled line and running both full packages: NINE tests
+// fail -- eight in internal/portal (the two create tests, the two update
+// value tests, both retype tests, the stored-row clear test and this one) and
+// one in internal/gateway (TestPortalApplicationLiveTimingsJSONKeyReachesThe-
+// Wire). Every create and update test reads the mapper too, because
+// CreateApplication and UpdateApplication both return applicationDTO. What is
+// exclusive to this test is the SEED: it is the only one whose row was written
+// outside the service, so it still speaks if the write path's whole resolution
+// is gone -- the same division of labour its spec-side twin,
+// TestRuntimeSpecDTOCarriesResponsesLiveTimings, records.
 //
 // Both read paths are checked, because ListApplications and GetApplication
 // are two separate call sites of the same mapper.

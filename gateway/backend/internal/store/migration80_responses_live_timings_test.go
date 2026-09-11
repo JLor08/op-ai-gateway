@@ -147,12 +147,25 @@ func TestMigration80SnapshotsTheSpecFromItsParentApplication(t *testing.T) {
 				t.Fatalf("upsert spec %s: %v", row.specID, err)
 			}
 		}
-		// The pre-80 shape the backfill exists for: app_m80 is ON, its first
-		// spec is still 0, and its second is already 1 so the idempotency
-		// guard has something to protect. app_m80_off is OFF and so is its
-		// spec -- that pair is the wrong-parent control, and the explicit
-		// zeroes are written rather than left to the DDL default so the
-		// fixture states the whole starting state.
+		// The pre-80 shape the backfill exists for: app_m80 is ON and its
+		// first spec is still 0, so the snapshot has something to do.
+		// app_m80_off is OFF and so is its spec -- that pair is the
+		// wrong-parent control -- and the explicit zeroes are written rather
+		// than left to the DDL default so the fixture states the whole
+		// starting state.
+		//
+		// spec_m80_on starts at 1, and an earlier version of this comment
+		// claimed that row is what protects the `= 0` idempotency guard. It is
+		// not. Measured by dropping the guard from BOTH dialects and running
+		// this whole package with the PostgreSQL DSN set: the only assertion
+		// that fails is the REPLAY one below, on sqlite and on postgres alike.
+		// spec_m80_on's own assertion passes unguarded, because its parent
+		// (app_m80) is also 1 at the first invocation, so an unguarded
+		// backfill writes that same 1 straight back -- which makes it a
+		// coherence check, satisfied by the guard and by an unguarded write
+		// alike, rather than a pin. What holds the guard in place is the replay
+		// below, where app_m80 has been turned OFF first and only the guard
+		// keeps spec_m80 at 1.
 		mustExec(ctx, t, s, `update applications set responses_live_timings_enabled = 1 where id = ?`, "app_m80")
 		mustExec(ctx, t, s, `update applications set responses_live_timings_enabled = 0 where id = ?`, "app_m80_off")
 		mustExec(ctx, t, s, `update agent_runtime_specs set responses_live_timings_enabled = 0 where id = ?`, "spec_m80")
