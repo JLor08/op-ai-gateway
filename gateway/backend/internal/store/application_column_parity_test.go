@@ -40,6 +40,12 @@ const applicationParityRows = 3
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows up
 //     as a mismatch somewhere.
+//
+// The responses_live_timings_enabled row carries one further constraint, which
+// is about MEANING rather than about distinguishability and therefore lives at
+// the seeding site: whichever row it is true in must have a type that
+// routing.LiveTimingsCapableKind calls INCAPABLE. See the guard next to the
+// types fixture in TestConformanceApplicationReadersAgreeOnEveryColumn.
 var applicationParityBools = [5][applicationParityRows]bool{
 	{true, true, false},  // always_reachable
 	{false, true, true},  // benchmark_schedule_enabled
@@ -99,7 +105,37 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 		// flavor), so a non-active row could not appear in the third reader at
 		// all and the comparison would have nothing to make. Every other
 		// same-typed column is varied instead.
-		types := [applicationParityRows]string{routing.ProviderVLLM, routing.ProviderOllama, routing.ProviderLlamaCPP}
+		//
+		// The row carrying responses_live_timings_enabled = true is deliberately
+		// an INCAPABLE type (ollama), which is why ollama leads this list. The
+		// store is policy-free about that flag: issue #81 decision (e) puts the
+		// "an incapable kind may not store true" refusal in the portal, as a 400
+		// naming the type, never in SQL -- so every store path has to round-trip
+		// a true for ANY kind, and something has to seed one.
+		//
+		// Nothing did before: every ResponsesLiveTimingsEnabled: true in this
+		// package sat on llama_cpp or vllm (here, in
+		// TestConformanceApplicationResponsesLiveTimings, and on the spec side in
+		// TestRoutingStoreRuntimeSpecs, whose /usr/bin/llama-server binary detects
+		// to llama_cpp), so a store path that "helpfully" cleared the flag for an
+		// incapable kind would have passed the entire suite.
+		types := [applicationParityRows]string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP}
+		// Checked rather than asserted in prose, so the tie to the real
+		// definition of "capable" cannot rot: if routing's capable set ever grew to
+		// include the type of every row that seeds a true (today just ollama),
+		// this fixture would silently stop proving the paragraph above -- it says
+		// so here instead. Stated over the whole table rather than over row 0, so
+		// reordering the patterns or the types keeps the property under guard.
+		capableOnly := true
+		for i, on := range applicationParityBools[4] {
+			if on && !routing.LiveTimingsCapableKind(types[i]) {
+				capableOnly = false
+			}
+		}
+		if capableOnly {
+			t.Fatalf("every row seeding responses_live_timings_enabled true (pattern %v) has a live-timings-capable type (%v): put the true on a row whose type is NOT capable, or this fixture passes even when a store path clears the flag by kind",
+				applicationParityBools[4], types)
+		}
 		schemes := [applicationParityRows]string{"http", "http", "https"}
 		// proxy_listen_port respects the portal's excluded => port 0 invariant
 		// (proxy_excluded is true only in the third row), and still carries two
