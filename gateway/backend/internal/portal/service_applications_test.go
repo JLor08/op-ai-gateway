@@ -3494,16 +3494,21 @@ func TestApplicationDTOCarriesResponsesLiveTimings(t *testing.T) {
 // The refusal is brand new; every check in this test is not. A new check
 // placed ahead of them does not merely add a rejection -- it CHANGES the
 // answer to a body that was already invalid, and the change is silent because
-// the body is still refused, just with a different status and code. Both legs
-// below would pass with the refusal in either position if they asserted only
-// "some error"; they assert the SPECIFIC pre-existing error precisely because
-// that is the part the ordering decides.
+// the body is still refused, just with a different status and code. All THREE
+// legs below would pass with the refusal in either position if they asserted
+// only "some error"; they assert the SPECIFIC pre-existing error precisely
+// because that is the part the ordering decides.
 //
 // Leg 1 is the expensive one: ErrServerAgentApplicationExists is a 409, so a
 // refusal running first rewrites a shipped 409 into this 400. Leg 2 is a 400
-// whose CODE would change. Only bodies carrying responses_live_timings_enabled
-// are affected at all, which is why this ordering is free to fix today and
-// would be a breaking change once a client depends on it.
+// whose CODE would change. Leg 3 is ErrApplicationProxyExcludedPortConflict,
+// a second shipped 409, and it is the leg that pins the refusal BELOW
+// applyProxyExclusion -- a position that only became reachable once the opt-in
+// stopped being a field of the routing.Application literal, and one nothing
+// but this leg holds in place. Only bodies carrying
+// responses_live_timings_enabled are affected at all, which is why this
+// ordering is free to fix today and would be a breaking change once a client
+// depends on it.
 func TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newServerTestService(t, now)
@@ -3554,15 +3559,23 @@ func TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 
 // TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations is
 // the update-path half of the same ordering pin, and the path where the
-// problem is worse: the refusal sits in the validate-before-mutate block,
-// which is exactly where every other PATCH validation lives, so "first in that
-// block" is an easy accident.
+// problem is worse: this path refuses bodies from TWO places -- the
+// validate-before-mutate block, and then checkPathSuffix, checkHeaderName,
+// the token seal and applyProxyExclusion from INSIDE the mutation block -- so
+// every position ahead of applyProxyExclusion masks something. This refusal
+// started midway through the validate-before-mutate block, where most PATCH
+// validation lives, which is what makes such a position an easy accident; it
+// now sits BELOW applyProxyExclusion, at the end of the mutation block, and
+// the four legs below are what hold it there.
 //
 // Leg 1 rewrites a shipped 409 (ErrServerAgentApplicationExists, reached by
 // retyping onto a server that already has its server_agent application); leg 2
 // rewrites a shipped 400 (ErrApplicationBenchmarkIntervalInvalid) and, unlike
 // leg 1, reaches the 409 arm of the refusal rather than the 400 arm -- so the
-// two legs together cover both sentinels.
+// first two legs together cover both sentinels. Legs 3 and 4 reach past the
+// validate-before-mutate block entirely: ErrPathSuffixInvalid, raised from
+// inside the mutation block, and ErrApplicationProxyExcludedPortConflict,
+// raised by applyProxyExclusion below the block's two-arm clear.
 func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newServerTestService(t, now)
@@ -3635,10 +3648,31 @@ func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 		t.Errorf("err = %v: the refusal still runs ahead of applyProxyExclusion", err)
 	}
 
-	// No refused PATCH may have written anything. The refusal now sits INSIDE
-	// the mutation block and BELOW the clear, so this is the assertion that
-	// the block's writes land on a local copy and never reach the store
-	// without s.routes.UpdateApplication.
+	// No refused PATCH may have written anything -- and which leg that
+	// actually tests is worth being exact about, because only one of the four
+	// stages anything before it is refused.
+	//
+	// Legs 1-3 all return BEFORE staging any field: leg 1 at the server_agent
+	// 409, which is above app.Type = appType; leg 2 inside the
+	// validate-before-mutate block; leg 3 inside checkPathSuffix, which runs
+	// before app.AppPathSuffix = v. So the Type, interval and path-suffix
+	// assertions below pin the pre-existing validations' own
+	// validate-before-stage discipline, not the position of this refusal.
+	//
+	// Leg 4 is the one that stages first and is refused after:
+	// app.ProxyListenPort = 9000 lands, then applyProxyExclusion's RULE 1
+	// refuses above its own writes. The ProxyListenPort assertion is
+	// therefore the one that actually tests the claim the refusal's own
+	// comment makes -- that the mutation block writes a LOCAL copy and only
+	// s.routes.UpdateApplication persists anything. Measured: persisting the
+	// staged copy on applyProxyExclusion's refusal path fires this assertion
+	// and no other one in this test. (It does fire two tests in
+	// service_applications_proxy_excluded_test.go, which guard the same
+	// escape from the exclusion invariant's side; what was missing is a leg
+	// of THIS test able to see it at all. Leg 4 also stages the flag itself,
+	// and that half is pinned by
+	// TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind,
+	// which reloads after a refusal raised below the clear.)
 	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
@@ -3651,6 +3685,12 @@ func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 	}
 	if reloaded.AppPathSuffix != "" {
 		t.Errorf("a refused PATCH wrote the invalid path suffix: %q", reloaded.AppPathSuffix)
+	}
+	// Leg 4's staged write. This application was created with no proxy port
+	// at all, so a non-zero value here can only be leg 4's staged 9000
+	// surviving applyProxyExclusion's refusal.
+	if reloaded.ProxyListenPort != 0 {
+		t.Errorf("a refused PATCH wrote the staged proxy listen port: %d, want 0 -- the mutation block's writes must stay on the local copy", reloaded.ProxyListenPort)
 	}
 }
 

@@ -32,11 +32,12 @@ import (
 // The likely implementation slip is ONE sentinel returned for both PATCH
 // shapes -- a version that passes every service-level errors.Is check written
 // loosely. Each exact-status assertion below is what catches it: collapsing to
-// the 400 breaks the 409 subtest, collapsing to the 409 breaks all three 400
-// ones. A separate subtest asserting only that the two statuses DIFFER was
-// tried here and removed: it could not fail unless one of those subtests
-// already had, and "differ" is also satisfied by a 500, so it restated the
-// invariant without testing it.
+// the 400 breaks the 409 subtest, and collapsing to the 409 breaks the two
+// PATCH 400 subtests -- plus the create one, if the collapse reaches the
+// create path too, which is the direction round 0 measured. A separate subtest
+// asserting only that the two statuses DIFFER was tried here and removed: it
+// could not fail unless one of those subtests already had, and "differ" is
+// also satisfied by a 500, so it restated the invariant without testing it.
 //
 // The message assertion is not decoration either: the whole reason this
 // request is refused instead of quietly stored as false is that the caller
@@ -83,9 +84,17 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 	// retype above -- is the body an operator actually produces by ticking the
 	// box on an incapable application. It is an ordinary HTTP request, and it
 	// is the only wire shape that separates "the request supplied the type"
-	// from "the request CHANGED the type": a service reading the branch off
-	// *req.Type != app.Type answers 409 here while every other subtest in this
-	// file stays green.
+	// from "the request CHANGED the type".
+	//
+	// That makes it the subtest that catches a value comparison, and WHICH
+	// comparison decides how much else goes with it. The service now judges
+	// the type from inside the mutation block, where app.Type is already the
+	// RESULTING type, so the shape a future editor would reach for is
+	// *req.Type != previousType -- and measured, that breaks this subtest and
+	// nothing else in either package. The older spelling
+	// *req.Type != app.Type breaks this subtest AND the retype one above,
+	// because a retype makes those two equal at that position. Either way
+	// this subtest fails; it is the only one that fails under both.
 	t.Run("restating the stored incapable type alongside true is 400", func(t *testing.T) {
 		appID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8105,"scheme":"http"}`)
 		rec := httptest.NewRecorder()

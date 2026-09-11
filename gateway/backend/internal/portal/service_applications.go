@@ -561,15 +561,16 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	// who says nothing gets the default rather than an error.
 	//
 	// POSITION, deliberately: after EVERY check on this path that can refuse
-	// the body -- status, tuning, the health-check fields and interval, the
-	// benchmark interval, the app-path suffix, the token header, the
-	// proxy-port 409, the one-server_agent-per-server 409, the token seal
-	// (capture.ErrKeyRequired) and applyProxyExclusion's own two 409s -- and
-	// immediately before the single store write. Each of those returns rather
-	// than falling through, so this brand-new refusal cannot rewrite the
-	// answer to a body that was already invalid for a SHIPPED reason. The only
-	// refusal left downstream is CreateApplication's own conflict
-	// classification, which by definition cannot precede the write it
+	// the body -- the managed-runtime gate, type, scheme, port, flavors, the
+	// two endpoint modes, status, tuning, the health-check fields and
+	// interval, the benchmark interval, the app-path suffix, the token header,
+	// the proxy-port 400 and 409, the one-server_agent-per-server 409, the
+	// token seal (capture.ErrKeyRequired) and applyProxyExclusion's own two
+	// 409s -- and immediately before the single store write. Each of those
+	// returns rather than falling through, so this brand-new refusal cannot
+	// rewrite the answer to a body that was already invalid for a SHIPPED
+	// reason. The only refusal left downstream is CreateApplication's own
+	// conflict classification, which by definition cannot precede the write it
 	// classifies. No residue remains on this path.
 	//
 	// That last position is what the trailing assignment buys, and the reason
@@ -870,11 +871,23 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	//     applyProxyExclusion now, so at this line a true has NOT been
 	//     checked yet and this arm may legitimately stage one an incapable
 	//     type cannot honour. That is safe only because nothing between here
-	//     and the refusal persists anything. Two consequences, both load
-	//     bearing: this arm must stay FIRST (see the refusal's HAZARD note --
-	//     reordering it silences the refusal), and the refusal must keep
-	//     reading req.ResponsesLiveTimingsEnabled rather than the value this
-	//     arm just staged;
+	//     and the refusal persists anything.
+	//
+	//     Exactly ONE consequence is load bearing, and it is not this arm's
+	//     position: the refusal must keep reading
+	//     req.ResponsesLiveTimingsEnabled rather than the value this arm just
+	//     staged. GIVEN that read, the two arms are free to swap -- measured
+	//     in fix round 4, swapping them and changing nothing else leaves
+	//     internal/portal and internal/gateway both ok. They can only
+	//     disagree on an incapable resulting type, where this arm stages the
+	//     caller's value and a swapped incapable arm stages false; the
+	//     caller's value is then either false (same row) or the true the
+	//     refusal below rejects (no row at all). So the arm order and the
+	//     request-read are ALTERNATIVE guards, not two halves of one, and it
+	//     is keeping the read that makes the order free. Change the read to
+	//     the staged flag and this arm's position starts deciding whether the
+	//     refusal fires at all -- which is why the refusal's HAZARD note
+	//     states the reorder conditionally rather than as a prohibition;
 	//   - nil with an incapable resulting type: the stored value is CLEARED,
 	//     so a retype away from llama_cpp/vllm cannot leave a stale true
 	//     behind for a kind that can never honour it (LiteLLM, for one,
@@ -933,9 +946,12 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// refused on the NEW type rather than accepted against the old one.
 	//
 	// POSITION, deliberately: after EVERY check on this path that can refuse
-	// the body -- the two endpoint modes, the benchmark interval, the
-	// proxy-port 400 and 409, the one-server_agent-per-server 409 and, inside
-	// the mutation block, checkPathSuffix, checkHeaderName, the token seal and
+	// the body -- the pre-mutation normalizers and validators (type, scheme,
+	// port, flavors, status, the five tuning bounds, the health-check path,
+	// mode and interval, the two endpoint modes, the benchmark interval and
+	// the proxy-port 400), the proxy-port 409, the
+	// one-server_agent-per-server 409 and, inside the mutation block,
+	// checkPathSuffix, checkHeaderName, the token seal and
 	// applyProxyExclusion's own two 409s -- and immediately before the store
 	// write. Downstream there is only warnProxyExclusionOwnTLS (which logs and
 	// returns nothing), the UpdatedAt stamp, and UpdateApplication's conflict
@@ -943,12 +959,26 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// remains on this path, and the create half says the same of its own: the
 	// two are symmetric again.
 	//
-	// It took three positions to get here, which is the useful part of the
-	// history: at the HEAD of the pre-mutation block this refusal masked every
-	// check in that list; at the END of that block it still masked
-	// checkPathSuffix, checkHeaderName and the seal, because those three
-	// validate AFTER staging their own field and so cannot be outrun from
-	// outside the block; below applyProxyExclusion it masks nothing.
+	// It took four positions to get here, which is the useful part of the
+	// history. It started MIDWAY through the pre-mutation block, immediately
+	// after the two endpoint modes, where it masked the NINE checks below it:
+	// the benchmark interval, the proxy-port 400 and 409, the
+	// one-server_agent-per-server 409, checkPathSuffix, checkHeaderName, the
+	// seal and applyProxyExclusion's two 409s. (Not the whole list -- type,
+	// scheme, port, flavors, status, the tuning bounds, the health-check
+	// fields and the endpoint modes already ran above it.)
+	//
+	// At the END of that block it still masked FIVE: checkPathSuffix,
+	// checkHeaderName, the seal and applyProxyExclusion's own two 409s. The
+	// first three because they run from INSIDE the mutation block -- each
+	// validates its own field before staging that field, but only after
+	// earlier fields have been staged -- so a check that stays outside the
+	// mutation block necessarily runs ahead of all three; the two 409s
+	// because applyProxyExclusion runs at the very END of the mutation block,
+	// below its two-arm clear. Moved inside the block but still above that
+	// clear, only applyProxyExclusion's two 409s were left, and that residue
+	// is what made the fourth move necessary. Below applyProxyExclusion it
+	// masks nothing.
 	//
 	// It sits BEFORE warnProxyExclusionOwnTLS deliberately, not incidentally:
 	// that warning tells the operator their application has left the TLS
@@ -973,12 +1003,18 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// applyProxyExclusion only ProxyExcluded, ProxyListenPort and Scheme). The
 	// FLAG is not safe. Reading it happens to be equivalent today, purely
 	// because the clear's value arm comes first and therefore stages an
-	// explicit true unchanged; swap the clear's two arms -- the exact mutation
-	// this task already measured once -- and the incapable arm stages false
-	// instead, a staged-state refusal sees false, refuses nothing, and the
-	// impossible true answers 200 with a stored false. Measured, not
-	// hypothesised. Reading the REQUEST makes the refusal independent of the
-	// clear's internal order; reading the staged flag couples them silently.
+	// explicit true unchanged; swap the clear's two arms and the incapable arm
+	// stages false instead, a staged-state refusal sees false, refuses
+	// nothing, and the impossible true answers 200 with a stored false.
+	// Measured -- but measured as the COMPOUND of both changes (fix round 3's
+	// (H2)), and the compound is the only thing the suite catches. Neither
+	// half alone is caught, for opposite reasons: the staged read on its own
+	// is behaviourally equivalent to the request read, and the arm swap on its
+	// own leaves both packages ok (fix round 4 measured it alone). So this is
+	// a prohibition on the READ, conditional on nothing; the arm order matters
+	// only once the read has already been changed. Reading the REQUEST makes
+	// the refusal independent of the clear's internal order; reading the
+	// staged flag couples them silently.
 	//
 	// WHETHER to refuse is a property of the resulting ROW; WHICH sentinel to
 	// refuse with is a property of the REQUEST, and the two must not be
@@ -1003,7 +1039,9 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// app.Type is the RESULTING type here, so *req.Type != app.Type is no
 	// longer the round-0 slip: normalizeApplicationType only trims, so the two
 	// differ solely for a type padded with whitespace, which leaves the 400
-	// arm all but unreachable and fails four tests at once. The type this row
+	// arm all but unreachable and fails four test cases at once -- two test
+	// functions in internal/portal plus two subtests of internal/gateway's
+	// wire refusal test, re-measured in fix round 4. The type this row
 	// used to have survives only in previousType, so *req.Type != previousType
 	// is the shape a future editor would actually reach for -- the same
 	// mistake, respelled. The pointer is the whole test.
