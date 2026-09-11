@@ -3565,8 +3565,19 @@ func TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t
 // every position ahead of applyProxyExclusion masks something. This refusal
 // started midway through the validate-before-mutate block, where most PATCH
 // validation lives, which is what makes such a position an easy accident; it
-// now sits BELOW applyProxyExclusion, at the end of the mutation block, and
-// the four legs below are what hold it there.
+// now sits BELOW applyProxyExclusion, at the end of the mutation block.
+//
+// The four legs pin four DIFFERENT lower bounds, and only the strictest of
+// them reaches that position: leg 2 is satisfied by anything below the
+// benchmark-interval check, leg 1 by anything below the server_agent 409,
+// leg 3 by anything below checkPathSuffix -- and LEG 4 by no position above
+// applyProxyExclusion at all. So leg 4 alone holds the position this refusal
+// now occupies, which is how fix round 3 measured the move: with the refusal
+// put back above the two-arm clear, legs 1-3 all passed and leg 4 alone
+// failed. (Fix round 2 measured the weaker move -- back to the end of the
+// pre-mutation block -- as failing leg 3 alone, but leg 4 did not exist yet:
+// that position sits above BOTH checkPathSuffix and applyProxyExclusion, so
+// it satisfies neither of those two legs.)
 //
 // Leg 1 rewrites a shipped 409 (ErrServerAgentApplicationExists, reached by
 // retyping onto a server that already has its server_agent application); leg 2

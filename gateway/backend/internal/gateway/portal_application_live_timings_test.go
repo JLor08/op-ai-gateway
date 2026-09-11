@@ -90,11 +90,18 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 	// comparison decides how much else goes with it. The service now judges
 	// the type from inside the mutation block, where app.Type is already the
 	// RESULTING type, so the shape a future editor would reach for is
-	// *req.Type != previousType -- and measured, that breaks this subtest and
-	// nothing else in either package. The older spelling
-	// *req.Type != app.Type breaks this subtest AND the retype one above,
-	// because a retype makes those two equal at that position. Either way
-	// this subtest fails; it is the only one that fails under both.
+	// *req.Type != previousType. PACKAGE SCOPE, measured on the full
+	// internal/portal and internal/gateway packages: that breaks exactly two
+	// test cases -- this subtest and its service-level twin
+	// TestUpdateApplicationResponsesLiveTimingsRestatingTheSameIncapableTypeIsTheRequestsOwnAssertion.
+	// FILE SCOPE: this subtest is the only failure here.
+	//
+	// The older spelling *req.Type != app.Type reaches wider. PACKAGE SCOPE,
+	// same two full packages: four test cases -- two test functions in
+	// internal/portal plus, in this file, this subtest AND the retype one
+	// above, because a retype makes *req.Type and app.Type equal at that
+	// position. FILE SCOPE: two failures here. Either way this subtest fails,
+	// so within this file it is the only one that fails under both spellings.
 	t.Run("restating the stored incapable type alongside true is 400", func(t *testing.T) {
 		appID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8105,"scheme":"http"}`)
 		rec := httptest.NewRecorder()

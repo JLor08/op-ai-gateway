@@ -873,21 +873,31 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	//     type cannot honour. That is safe only because nothing between here
 	//     and the refusal persists anything.
 	//
-	//     Exactly ONE consequence is load bearing, and it is not this arm's
-	//     position: the refusal must keep reading
-	//     req.ResponsesLiveTimingsEnabled rather than the value this arm just
-	//     staged. GIVEN that read, the two arms are free to swap -- measured
-	//     in fix round 4, swapping them and changing nothing else leaves
-	//     internal/portal and internal/gateway both ok. They can only
-	//     disagree on an incapable resulting type, where this arm stages the
-	//     caller's value and a swapped incapable arm stages false; the
-	//     caller's value is then either false (same row) or the true the
-	//     refusal below rejects (no row at all). So the arm order and the
-	//     request-read are ALTERNATIVE guards, not two halves of one, and it
-	//     is keeping the read that makes the order free. Change the read to
-	//     the staged flag and this arm's position starts deciding whether the
-	//     refusal fires at all -- which is why the refusal's HAZARD note
-	//     states the reorder conditionally rather than as a prohibition;
+	//     This arm's position is NOT load bearing on its own, and neither is
+	//     the refusal's read. The four combinations are symmetric, and each
+	//     single change was measured on the FULL internal/portal and
+	//     internal/gateway packages: with the refusal reading
+	//     req.ResponsesLiveTimingsEnabled, swapping these two arms leaves
+	//     both packages ok (fix round 4); with the arms in this order,
+	//     rewriting the refusal to read the STAGED flag also leaves both
+	//     packages ok (fix round 5). Only the two changes TOGETHER break, and
+	//     then they break loudly (fix round 3's (H2)). The arms can disagree
+	//     only on an incapable resulting type, where this arm stages the
+	//     caller's value and a swapped incapable arm stages false -- and the
+	//     caller's value is then either false (same row) or the true a
+	//     request-reading refusal below rejects (no row at all).
+	//
+	//     So the order and the read are ALTERNATIVE guards, not two halves of
+	//     one, and "keep the order and the read is free" is exactly as true
+	//     as "keep the read and the order is free". This file picks the read,
+	//     and that is a PREFERENCE among symmetric alternatives rather than a
+	//     measured asymmetry. The reason is reach, not correctness: reading
+	//     the request keeps the refusal independent of ANY later edit to this
+	//     switch -- a third arm, a different predicate, the clear moved
+	//     somewhere else -- while keeping the arm order guards only the one
+	//     edit that swaps these two. Change the read and this arm's position
+	//     becomes load bearing for real, which is what the refusal's HAZARD
+	//     note says and why it says it conditionally;
 	//   - nil with an incapable resulting type: the stored value is CLEARED,
 	//     so a retype away from llama_cpp/vllm cannot leave a stale true
 	//     behind for a kind that can never honour it (LiteLLM, for one,
@@ -1008,13 +1018,16 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// nothing, and the impossible true answers 200 with a stored false.
 	// Measured -- but measured as the COMPOUND of both changes (fix round 3's
 	// (H2)), and the compound is the only thing the suite catches. Neither
-	// half alone is caught, for opposite reasons: the staged read on its own
-	// is behaviourally equivalent to the request read, and the arm swap on its
-	// own leaves both packages ok (fix round 4 measured it alone). So this is
-	// a prohibition on the READ, conditional on nothing; the arm order matters
-	// only once the read has already been changed. Reading the REQUEST makes
-	// the refusal independent of the clear's internal order; reading the
-	// staged flag couples them silently.
+	// half alone is caught, and the two halves are SYMMETRIC: on the full
+	// internal/portal and internal/gateway packages the staged read alone
+	// leaves both ok (fix round 5), and so does the arm swap alone (fix round
+	// 4). So "never read the staged flag" is a CONVENTION this file adopts,
+	// not an asymmetry the code has -- pinning the arm order instead would be
+	// equally correct today. It is preferred because it reaches further:
+	// reading the REQUEST makes the refusal independent of the clear
+	// altogether, and stays so through any later edit of that switch, while
+	// reading the staged flag couples the two silently and rests the whole
+	// guarantee on the clear's internal order.
 	//
 	// WHETHER to refuse is a property of the resulting ROW; WHICH sentinel to
 	// refuse with is a property of the REQUEST, and the two must not be
