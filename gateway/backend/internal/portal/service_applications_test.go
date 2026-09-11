@@ -3457,7 +3457,8 @@ func TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn(t *testing.T) {
 // comment claimed it was. Measured by deleting the mapper's
 // ResponsesLiveTimingsEnabled line and running both full packages: NINE tests
 // fail -- eight in internal/portal (the two create tests, the two update
-// value tests, both retype tests, the stored-row clear test and this one) and
+// value tests, two of the three retype tests -- the third asserts false, so
+// the zero value satisfies it -- the stored-row clear test and this one) and
 // one in internal/gateway (TestPortalApplicationLiveTimingsJSONKeyReachesThe-
 // Wire). Every create and update test reads the mapper too, because
 // CreateApplication and UpdateApplication both return applicationDTO. What is

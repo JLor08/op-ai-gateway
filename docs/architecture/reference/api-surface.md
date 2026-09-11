@@ -533,8 +533,8 @@ Wire notes a client must know:
   `UpdateApplicationRequest` and `PutRuntimeSpecRequest`. It is **orthogonal
   to `responses_mode`**, not a fourth value of it, and it is offered on the
   Responses side only — there is no `/v1/messages` equivalent.
-  - **Nothing reads the value in this cut, so setting it changes no request's
-    behaviour.** What ships here are the WRITE rules below — the capable-only
+  - **Nothing acts on the value in this cut, so setting it changes no
+    inference request's behaviour.** What ships here are the WRITE rules below — the capable-only
     default, the refusal, the clear, absent-preserves — plus the resolution of
     the stored value onto the request's routing target (spec over application,
     the same precedence `responses_mode` uses). There it stops: the upstream
